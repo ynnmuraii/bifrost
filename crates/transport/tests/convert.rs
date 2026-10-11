@@ -6,8 +6,9 @@ use geometry::{NodeId, Position};
 use input_model::{HidKey, InputEvent, KeyState, MouseButton};
 use protocol::wire;
 use transport::convert::{
-    claim_reason_from_i32, error_code_from_i32, from_envelope, inject_status_from_i32, lease_id_of,
-    lease_id_of_message, leave_reason_from_i32, to_envelope, ConvertError, PeerInfo,
+    batch_display_after, claim_reason_from_i32, error_code_from_i32, from_envelope,
+    inject_status_from_i32, lease_id_of, lease_id_of_message, leave_reason_from_i32, to_envelope,
+    ConvertError, PeerInfo,
 };
 
 const CONNECTION: [u8; 16] = [0xaa; 16];
@@ -872,4 +873,46 @@ fn peer_info_reads_the_hello_fields_it_needs() {
         PeerInfo::from_hello(&short_owner),
         Err(ConvertError::Unsupported("owner_node_id is not 32 bytes"))
     );
+}
+
+#[test]
+fn the_entry_display_of_a_lease_becomes_the_batch_display() {
+    // `docs/03-architecture.md`, «Топология и движение»: the source integrates the deltas
+    // and sends an absolute position *on the target display*, and `protocol.proto`
+    // `Position` is «local to display top-left». The lease names that display once, in
+    // `EnterPrepare.position`, so the link remembers it for every later batch.
+    let prepare = fr::Message::EnterPrepare {
+        lease_id: LEASE,
+        topology_revision: 3,
+        position: Position::new("eDP-1", 10.0, 20.0),
+        owner_serial: 1,
+    };
+    let display = batch_display_after(&prepare, "");
+    assert_eq!(display, "eDP-1", "the entry display is the batch display");
+
+    // Nothing else changes it: a batch keeps whatever display the link already has, so the
+    // id stays pinned to the lease's entry point until the next `EnterPrepare`.
+    let batch = fr::Message::InputBatch {
+        lease_id: LEASE,
+        input_batch_seq: 1,
+        events: vec![InputEvent::PointerAbsolute(input_model::Position::new(
+            640.0, 360.0,
+        ))],
+    };
+    assert_eq!(batch_display_after(&batch, &display), "eDP-1");
+    assert_eq!(batch_display_after(&batch, ""), "");
+
+    // And a batch built with that display carries it, with the target-local coordinates
+    // the source resolved.
+    let envelope = to_envelope(&batch, 2, &CONNECTION, Some(&LEASE), &display).expect("convert");
+    let Some(wire::envelope::Payload::InputBatch(wire_batch)) = envelope.payload else {
+        panic!("expected an InputBatch payload");
+    };
+    let Some(wire::input_event::Event::PointerAbsolute(position)) =
+        wire_batch.events[0].event.as_ref()
+    else {
+        panic!("expected a PointerAbsolute event");
+    };
+    assert_eq!(position.display_id, "eDP-1");
+    assert_eq!((position.x, position.y), (640.0, 360.0));
 }

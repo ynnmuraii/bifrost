@@ -62,6 +62,19 @@ fn unknown(field: &'static str, value: i32) -> ConvertError {
 /// `input-model` grows the field; until then the transport passes an empty string, which a
 /// receiver must treat as "resolve from the zone/geometry you know". `EnterPrepare.position`
 /// is unaffected: it is a `geometry::Position` and keeps its own `display_id`.
+/// The display an outbound `InputBatch`'s absolute positions belong to.
+///
+/// A lease is entered on one display of the peer — `EnterPrepare.position` is a
+/// `geometry::Position` and carries it — and every absolute position the source sends until
+/// the next transition is local to that display. Keeping the id here is what lets
+/// [`to_envelope`] stamp it instead of passing an empty string.
+pub fn batch_display_after(message: &fr::Message, current: &str) -> String {
+    match message {
+        fr::Message::EnterPrepare { position, .. } => position.display_id.to_string(),
+        _ => current.to_owned(),
+    }
+}
+
 pub fn to_envelope(
     message: &fr::Message,
     seq: u64,
