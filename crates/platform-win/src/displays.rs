@@ -154,6 +154,8 @@ fn device_name(buffer: &[u16; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the cross-check test reads the desktop metrics.
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CMONITORS};
 
     #[test]
     fn a_device_name_is_read_up_to_its_nul() {
@@ -165,6 +167,55 @@ mod tests {
 
         let empty = [0u16; 32];
         assert_eq!(device_name(&empty), "");
+    }
+
+    /// The invariant that catches a monitor being silently dropped: the number of
+    /// callbacks `EnumDisplayMonitors` makes must equal the number of monitors we
+    /// describe (a failing `GetMonitorInfoW`, a wrong `cbSize` or an early `FALSE`
+    /// would all show up here), and the desktop must have at least one.
+    ///
+    /// Deliberately no assertion on *how many* monitors this host has: the count depends
+    /// on what is switched on at the moment, which is exactly what the KVM-001 inventory
+    /// has to be read against.
+    #[test]
+    fn nothing_the_os_reports_is_dropped() {
+        let mut raw = 0usize;
+        let pointer = &mut raw as *mut usize as isize;
+        // SAFETY: the callback only increments the counter behind `data`, which outlives
+        // the call.
+        let ok = unsafe { EnumDisplayMonitors(None, None, Some(count_monitor), LPARAM(pointer)) };
+        assert!(ok.as_bool(), "EnumDisplayMonitors returned false");
+
+        let monitors = enumerate().expect("a Windows host always has a monitor");
+        assert_eq!(
+            raw,
+            monitors.len(),
+            "the OS offered {raw} monitors and {} were described",
+            monitors.len()
+        );
+        assert!(raw >= 1, "a desktop always has at least one monitor");
+        // The OS agrees with itself; SM_CMONITORS counts the monitors of the desktop
+        // (and may include a mirroring pseudo-device, so it is reported, not asserted).
+        // SAFETY: no preconditions.
+        let system_metric = unsafe { GetSystemMetrics(SM_CMONITORS) };
+        assert!(system_metric >= 1);
+        println!(
+            "monitors: raw={raw} described={} SM_CMONITORS={system_metric}",
+            monitors.len()
+        );
+    }
+
+    /// Counts one `MONITORENUMPROC` call without describing anything.
+    unsafe extern "system" fn count_monitor(
+        _monitor: HMONITOR,
+        _hdc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `data` is the `*mut usize` the test passed and keeps alive.
+        let count = unsafe { &mut *(data.0 as *mut usize) };
+        *count += 1;
+        TRUE
     }
 
     #[test]
