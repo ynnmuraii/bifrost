@@ -63,6 +63,9 @@ pub struct Supervisor {
     backend_override: ipc::BackendKind,
     require_emergency_hotkey: bool,
     core_silence_ms: u32,
+    /// Portal restore tokens, persisted in `portal-restore.toml` and shipped in
+    /// `AgentAttach.restore_tokens`; new ones arrive back as `PortalGrantChanged`.
+    portal: crate::portal::PortalGrants,
     launches: u64,
     child: Option<tokio::process::Child>,
     link: Option<AgentLink<AgentStream>>,
@@ -82,6 +85,7 @@ impl Supervisor {
         backend_override: ipc::BackendKind,
         require_emergency_hotkey: bool,
         core_silence_ms: u32,
+        portal: crate::portal::PortalGrants,
     ) -> Self {
         Supervisor {
             program,
@@ -93,6 +97,7 @@ impl Supervisor {
             backend_override,
             require_emergency_hotkey,
             core_silence_ms,
+            portal,
             launches: 0,
             child: None,
             link: None,
@@ -103,6 +108,12 @@ impl Supervisor {
     /// The agent's state word for the status line.
     pub const fn state(&self) -> AgentState {
         self.state
+    }
+
+    /// The portal token store: the session writes back what the agent reported and
+    /// clears it when the user forgets the grants.
+    pub fn portal(&mut self) -> &mut crate::portal::PortalGrants {
+        &mut self.portal
     }
 
     /// Spawns one agent, waits for it to connect and sends the `AgentAttach`.
@@ -164,6 +175,7 @@ impl Supervisor {
             self.backend_override,
             self.core_silence_ms,
             self.require_emergency_hotkey,
+            self.portal.to_ipc(),
         );
         if let Err(error) = link.attach(attach).await {
             self.stop().await;
@@ -474,6 +486,7 @@ mod launch_tests {
             ipc::BackendKind::Auto,
             true,
             300,
+            crate::portal::PortalGrants::default(),
         );
         assert_eq!(
             supervisor.state(),

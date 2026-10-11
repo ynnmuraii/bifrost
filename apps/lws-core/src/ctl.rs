@@ -104,6 +104,9 @@ pub enum Request {
     Status,
     /// Ask for a manual transition to a peer.
     Switch(PeerRef),
+    /// Drop every stored portal token, in core and in the agent
+    /// (`ForgetPortalGrants`/`ResetPortalGrants`).
+    ResetPortals,
     /// Stop core.
     Quit,
     /// Liveness of the control channel itself.
@@ -122,6 +125,8 @@ impl Request {
             "status" if argument.is_empty() => Ok(Request::Status),
             "ping" if argument.is_empty() => Ok(Request::Ping),
             "quit" if argument.is_empty() => Ok(Request::Quit),
+            "reset-portals" if argument.is_empty() => Ok(Request::ResetPortals),
+            "reset-portals" => Err("reset-portals takes no argument".to_owned()),
             "switch" if !argument.is_empty() => Ok(Request::Switch(PeerRef::new(argument))),
             "switch" => Err("switch needs a peer id or display name".to_owned()),
             other => Err(format!("unknown request {other:?}")),
@@ -257,11 +262,15 @@ pub struct StatusInput<'a> {
     pub owner: &'a str,
     /// The owner claim serial.
     pub serial: u64,
+    /// The last thing the agent reported that a human should see: an `AgentError`
+    /// code (`PORTAL_DENIED`, `CAPTURE_FAILED`, …) or a portal hint. Empty when the
+    /// agent has said nothing of the sort.
+    pub refusal: &'a str,
 }
 
 /// Formats the one-line `status` answer.
 pub fn status_line(input: &StatusInput<'_>) -> String {
-    format!(
+    let base = format!(
         "focus={} role={} peer={} members={} agent={} backend={} node={} owner={} serial={}",
         input.focus,
         input.role,
@@ -280,7 +289,14 @@ pub fn status_line(input: &StatusInput<'_>) -> String {
             input.owner
         },
         input.serial,
-    )
+    );
+    // The refusal is appended only when there is one, so the common line stays short
+    // and the field never looks like an empty setting.
+    if input.refusal.is_empty() {
+        base
+    } else {
+        format!("{base} refusal={}", input.refusal)
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +306,8 @@ mod tests {
     #[test]
     fn requests_round_trip_through_one_line() {
         assert_eq!(Request::parse("status"), Ok(Request::Status));
+        assert_eq!(Request::parse("reset-portals"), Ok(Request::ResetPortals));
+        assert!(Request::parse("reset-portals now").is_err());
         assert_eq!(Request::parse("  ping  "), Ok(Request::Ping));
         assert_eq!(Request::parse("quit"), Ok(Request::Quit));
         assert_eq!(
@@ -337,10 +355,33 @@ mod tests {
             node_id: "aaaa",
             owner: "aaaa",
             serial: 3,
+            refusal: "",
         });
         assert!(line.contains("focus=REMOTE"));
         assert!(line.contains("peer=laptop"));
         assert!(line.contains("agent=ready"));
         assert!(line.contains("serial=3"));
+        assert!(
+            !line.contains("refusal="),
+            "nothing to report must not add an empty field: {line}"
+        );
+
+        // An agent refusal is what the GUI has to show next to the node.
+        let with_refusal = status_line(&StatusInput {
+            focus: "LOCAL",
+            role: "follower",
+            lease_peer: None,
+            members: 0,
+            agent: AgentState::Ready,
+            backend: "platform-wayland",
+            node_id: "bbbb",
+            owner: "",
+            serial: 0,
+            refusal: "PORTAL_DENIED: the user dismissed the InputCapture dialog",
+        });
+        assert!(
+            with_refusal.contains("refusal=PORTAL_DENIED"),
+            "{with_refusal}"
+        );
     }
 }

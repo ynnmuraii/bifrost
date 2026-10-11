@@ -157,15 +157,16 @@ pub fn attach(
     backend_override: ipc::BackendKind,
     core_silence_ms: u32,
     require_emergency_hotkey: bool,
+    restore_tokens: Vec<ipc::PortalGrant>,
 ) -> ipc::AgentAttach {
     ipc::AgentAttach {
         launch_token,
         mode: mode as i32,
         emergency_hotkey: emergency_hotkey.to_owned(),
         backend_override: backend_override as i32,
-        // Portal restore tokens are Wayland-only and live in
-        // `portal-restore.toml`, which the E2 slice does not read or write.
-        restore_tokens: Vec::new(),
+        // Wayland-only tokens, loaded from and persisted to `portal-restore.toml` by
+        // [`crate::portal::PortalGrants`].
+        restore_tokens,
         require_emergency_hotkey,
         core_silence_ms,
     }
@@ -320,8 +321,10 @@ pub enum AgentSignal {
     Captured(Vec<InputEvent>),
     /// The agent's display set changed.
     Displays(ipc::DisplaysReport),
-    /// A portal hint for the GUI (`PortalPermissionRequired`/`PortalGrantChanged`).
+    /// A portal hint for the GUI (`PortalPermissionRequired`).
     Portal { interface: String, detail: String },
+    /// A portal restore token the agent received or lost; the session stores it.
+    Grant(ipc::PortalGrantChanged),
     /// Nothing for the loop beyond the watchdog having seen the frame.
     Ignored,
 }
@@ -429,18 +432,9 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
             interface: permission.portal_interface.clone(),
             detail: format!("portal permission required for {}", permission.purpose),
         },
-        Msg::PortalGrant(grant) => AgentSignal::Portal {
-            interface: grant
-                .grant
-                .as_ref()
-                .map(|grant| grant.portal_interface.clone())
-                .unwrap_or_default(),
-            detail: if grant.revoked {
-                "portal grant revoked".to_owned()
-            } else {
-                "portal grant changed".to_owned()
-            },
-        },
+        // The token itself is a secret: it is stored, never logged, so this signal
+        // carries the message rather than a description of it.
+        Msg::PortalGrant(changed) => AgentSignal::Grant(changed.clone()),
         Msg::Error(error) => AgentSignal::Fsm(fr::AgentEvent::Error {
             lease_id: context.prepared.take(),
             code: error_code(&error.code),
@@ -452,6 +446,50 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
             lease_id: None,
             code: fr::ErrorCode::InvalidFrame,
         }),
+    }
+}
+
+/// The human-facing note an agent frame implies, or `None` when it says nothing new.
+///
+/// This is what `status` shows next to the node: the last `AgentError` the agent
+/// reported (`PORTAL_DENIED`, `CAPTURE_FAILED`, …) and the portal hints
+/// (`PortalPermissionRequired`, `PortalGrantChanged`). The text is derived here, from
+/// the frame alone, so it can be unit-tested; the token in `PortalGrantChanged` is
+/// never part of it.
+pub fn agent_note(message: &ipc::agent_frame::Msg) -> Option<String> {
+    use ipc::agent_frame::Msg;
+
+    /// Keep the one-line status one line.
+    const LIMIT: usize = 120;
+
+    let shorten = |text: &str| -> String {
+        if text.chars().count() <= LIMIT {
+            return text.to_owned();
+        }
+        text.chars().take(LIMIT).collect::<String>() + "…"
+    };
+
+    match message {
+        Msg::PortalPermission(permission) => Some(shorten(&format!(
+            "permission required for {} ({})",
+            permission.portal_interface, permission.purpose
+        ))),
+        Msg::PortalGrant(changed) => {
+            let interface = changed
+                .grant
+                .as_ref()
+                .map(|grant| grant.portal_interface.as_str())
+                .unwrap_or("");
+            Some(if changed.revoked {
+                format!("portal grant revoked: {interface}")
+            } else if changed.grant.is_some() {
+                format!("portal grant received: {interface}")
+            } else {
+                "portal grants cleared".to_owned()
+            })
+        }
+        Msg::Error(error) => Some(shorten(&format!("{}: {}", error.code, error.detail.trim()))),
+        _ => None,
     }
 }
 
