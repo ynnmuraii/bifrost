@@ -1,0 +1,17 @@
+[package]
+name = "protocol"
+version = "0.0.0"
+description = "LAN Workspace wire protocol: framed Protobuf, limits, sequence and Hello rules (KVM-031)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.10"
