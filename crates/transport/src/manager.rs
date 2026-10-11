@@ -61,6 +61,16 @@ struct LiveLink {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// The settings every link task needs: the outbound queue capacity, the liveness cadence
+/// and the reconnect backoff bounds. One bundle instead of three more parameters, so the
+/// task signatures stay readable.
+#[derive(Debug, Clone, Copy)]
+struct LinkSettings {
+    queue_capacity: usize,
+    liveness: policy::LinkLiveness,
+    backoff: policy::BackoffBounds,
+}
+
 /// A registered-but-not-yet-established link.
 struct PendingLink {
     handle: LinkHandle,
@@ -167,17 +177,18 @@ impl LinkManager {
         let local = self.config.identity.node_id();
 
         // One dialer per configured peer.
+        let settings = LinkSettings {
+            queue_capacity: self.config.queue_capacity,
+            liveness: self.config.liveness,
+            backoff: self.config.backoff,
+        };
         for address in self.config.peers.clone() {
             let messages = self.messages_tx.clone();
             let identity = Arc::clone(&self.config.identity);
             let trust = self.config.trust.clone();
             let hello = local_hello.clone();
-            let capacity = self.config.queue_capacity;
-            let liveness = self.config.liveness;
-            let backoff = self.config.backoff;
             tokio::spawn(async move {
-                dial_loop(address, identity, trust, hello, messages, capacity, liveness, backoff)
-                    .await;
+                dial_loop(address, identity, trust, hello, messages, settings).await;
             });
         }
 
@@ -189,13 +200,9 @@ impl LinkManager {
                     let identity = Arc::clone(&self.config.identity);
                     let acceptor = acceptor.clone();
                     let hello = local_hello.clone();
-                    let capacity = self.config.queue_capacity;
-                    let liveness = self.config.liveness;
                     tokio::spawn(async move {
-                        accept_one(
-                            acceptor, tcp, address, identity, hello, messages, capacity, liveness,
-                        )
-                        .await;
+                        accept_one(acceptor, tcp, address, identity, hello, messages, settings)
+                            .await;
                     });
                 }
                 message = async { self.messages_rx.lock().await.recv().await } => {
@@ -346,8 +353,7 @@ async fn accept_one(
     identity: Arc<NodeIdentity>,
     hello: wire::Hello,
     messages: mpsc::Sender<ManagerMessage>,
-    queue_capacity: usize,
-    liveness: policy::LinkLiveness,
+    settings: LinkSettings,
 ) {
     let _ = address;
     let stream = match acceptor.accept(tcp).await {
@@ -373,8 +379,7 @@ async fn accept_one(
         identity.node_id(),
         hello,
         messages,
-        queue_capacity,
-        liveness,
+        settings,
     )
     .await;
 }
@@ -385,9 +390,7 @@ async fn dial_loop(
     trust: TrustStore,
     hello: wire::Hello,
     messages: mpsc::Sender<ManagerMessage>,
-    queue_capacity: usize,
-    liveness: policy::LinkLiveness,
-    backoff: policy::BackoffBounds,
+    settings: LinkSettings,
 ) {
     let client_config = match identity::trusted_client_config(&identity, &trust) {
         Ok(config) => config,
@@ -419,15 +422,14 @@ async fn dial_loop(
                     identity.node_id(),
                     hello.clone(),
                     messages.clone(),
-                    queue_capacity,
-                    liveness,
+                    settings,
                 )
                 .await;
                 attempt = 0;
             }
         }
         attempt = attempt.saturating_add(1);
-        tokio::time::sleep(policy::reconnect_delay(attempt, backoff)).await;
+        tokio::time::sleep(policy::reconnect_delay(attempt, settings.backoff)).await;
     }
 }
 
@@ -439,8 +441,7 @@ async fn start_link(
     local: NodeId,
     local_hello: wire::Hello,
     messages: mpsc::Sender<ManagerMessage>,
-    queue_capacity: usize,
-    liveness: policy::LinkLiveness,
+    settings: LinkSettings,
 ) {
     let (reports_tx, mut reports_rx) = mpsc::channel::<LinkReport>(64);
     let Ok(link) = crate::link::spawn(LinkConfig {
@@ -450,8 +451,8 @@ async fn start_link(
         local_hello,
         stream,
         reports: reports_tx,
-        queue_capacity,
-        liveness,
+        queue_capacity: settings.queue_capacity,
+        liveness: settings.liveness,
     }) else {
         return;
     };
