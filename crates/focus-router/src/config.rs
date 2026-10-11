@@ -26,9 +26,6 @@ pub struct Timing {
     /// current owner to hand off before self-granting
     /// (`docs/03-architecture.md`, «Владение вводом»).
     pub claim_grant_timeout_ms: u64,
-    /// `repeat_guard_ms` (default 150): receiver-side autorepeat stops after this much
-    /// silence in both input and renew (AC-14).
-    pub repeat_guard_ms: u64,
 }
 
 impl Default for Timing {
@@ -37,12 +34,19 @@ impl Default for Timing {
             prepare_timeout_ms: 200,
             lease_ttl_ms: 500,
             claim_grant_timeout_ms: 600,
-            repeat_guard_ms: 150,
         }
     }
 }
 
 impl Timing {
+    /// `repeat_guard_ms`: receiver-side autorepeat stops after this much silence in
+    /// both input and renew (AC-14).
+    ///
+    /// A protocol limit, **not** a tunable: «Пределы протокола (размер фрейма, 128
+    /// событий, chunk 16 KiB) не настраиваются» and «`repeat_guard_ms` 150»
+    /// (`docs/03-architecture.md`, «Что параметризуется, а что нет»; `docs/05-protocol.md`).
+    pub const REPEAT_GUARD_MS: u64 = 150;
+
     /// Challenge period: `lease_ttl_ms / 5` (default 100 ms).
     ///
     /// Computed, never configured — «`challenge = lease_ttl/5` вычисляется, а не
@@ -68,13 +72,6 @@ impl Timing {
             return Err(ConfigError {
                 field: "claim_grant_timeout_ms",
                 value: self.claim_grant_timeout_ms,
-                expected: "> 0",
-            });
-        }
-        if self.repeat_guard_ms == 0 {
-            return Err(ConfigError {
-                field: "repeat_guard_ms",
-                value: self.repeat_guard_ms,
                 expected: "> 0",
             });
         }

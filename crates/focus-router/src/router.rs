@@ -924,7 +924,7 @@ impl<I: Identifiers> FocusRouter<I> {
                         && now_ms
                             >= lease
                                 .last_activity_ms
-                                .saturating_add(self.timing.repeat_guard_ms)
+                                .saturating_add(Timing::REPEAT_GUARD_MS)
                     {
                         // AC-14: stop autorepeat after `repeat_guard_ms` of silence in
                         // both input and renew.
@@ -1593,7 +1593,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 });
                 out.push(Output::ArmTimer {
                     timer: Timer::RepeatGuard,
-                    deadline_ms: now_ms.saturating_add(self.timing.repeat_guard_ms),
+                    deadline_ms: now_ms.saturating_add(Timing::REPEAT_GUARD_MS),
                 });
                 if let Some(lease) = self.lease.receiver_mut() {
                     lease.state = ReceiverState::Active;
@@ -1663,7 +1663,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 });
                 out.push(Output::ArmTimer {
                     timer: Timer::RepeatGuard,
-                    deadline_ms: now_ms.saturating_add(self.timing.repeat_guard_ms),
+                    deadline_ms: now_ms.saturating_add(Timing::REPEAT_GUARD_MS),
                 });
             }
             None => {
@@ -1725,7 +1725,7 @@ impl<I: Identifiers> FocusRouter<I> {
         lease.note_activity(now_ms);
         out.push(Output::ArmTimer {
             timer: Timer::RepeatGuard,
-            deadline_ms: now_ms.saturating_add(self.timing.repeat_guard_ms),
+            deadline_ms: now_ms.saturating_add(Timing::REPEAT_GUARD_MS),
         });
         out.push(Output::Agent(AgentCommand::Inject {
             lease_id,
