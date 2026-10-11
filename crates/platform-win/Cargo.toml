@@ -1,0 +1,25 @@
+[package]
+name = "platform-win"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Windows capture (low-level hooks + Raw Input) and SendInput injection spikes for LAN Workspace (KVM-010/KVM-011)."
+
+[lints]
+workspace = true
+
+# The Windows bindings are only needed for the real Windows targets; on any other
+# target the crate compiles to the platform-neutral part only (tables, ledger,
+# injection plan) and pulls in no FFI at all.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
