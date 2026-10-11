@@ -1,0 +1,42 @@
+[package]
+name = "ipc"
+version = "0.0.0"
+description = "LAN Workspace local IPC: framed AgentFrame/GuiFrame transport, peer checks, heartbeat watchdog (KVM-023/024)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+protocol = { path = "../protocol" }
+prost = "0.14"
+# `net` covers Unix sockets and Windows named pipes; tokio has no separate
+# feature for them, so it also compiles TCP/UDP. The agent's "no network
+# sockets" invariant is therefore enforced by the CI symbol check described in
+# the crate documentation, not by feature selection.
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+# geteuid(3) for the SO_PEERCRED comparison; libc is already in the graph
+# through tokio and adds no build weight.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "net",
+    "io-util",
+] }
