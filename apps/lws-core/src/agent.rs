@@ -1,0 +1,360 @@
+//! Core's supervision of `lws-agent`: the per-launch channel, the launch token and
+//! the `RECOVERY` restart.
+//!
+//! `docs/03-architecture.md` («Кто кого запускает»): «`lws-agent` — Только core
+//! (`spawn`)», and «Core — единственный supervisor. Agent никогда не запускается
+//! сам, поэтому не может быть «сиротой» с активным grab». Scenario S4 fixes what a
+//! restart looks like: spawn in `RECOVERY`, send `ReleaseKeys` from core's
+//! conservative ledger, wait for `Released`, then start a `NORMAL` agent.
+//!
+//! # The channel and the token
+//!
+//! Core creates the endpoint *before* spawning, so the agent can only ever connect
+//! to a channel core already owns: a per-launch named pipe with the current user's
+//! DACL, `FILE_FLAG_FIRST_PIPE_INSTANCE` and one instance on Windows (the documented
+//! mechanism), and a per-launch socket in the 0700 runtime directory with a 0600
+//! mode and a `SO_PEERCRED` check on Unix. The 32-byte launch token stays the second
+//! check and never travels in `argv` or the environment: it goes into a file inside
+//! a user-only directory, whose path is what the agent receives, and the agent
+//! deletes it on read.
+//!
+//! # Deviation, stated
+//!
+//! The documents specify a `socketpair(AF_UNIX)` with an inherited descriptor for
+//! the Unix agent channel. Handing a raw descriptor to a child needs `pre_exec` (an
+//! `unsafe` block, which the apps must not contain), so the Unix channel is a
+//! per-launch named socket instead; the security properties the documents care about
+//! (nobody can pre-create or join it, only this user can connect) are the same,
+//! because the socket lives in a 0700 directory with mode 0600 and every accepted
+//! connection is checked with `SO_PEERCRED`.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use ::ipc::transport::{self, Endpoint};
+use ::ipc::{AgentLink, IpcError};
+use protocol::ipc::{self, agent_frame::Msg, AgentMode};
+
+use crate::command::AgentState;
+use crate::FRAME_MAJOR;
+
+/// The stream an agent connection arrives on.
+#[cfg(unix)]
+pub type AgentStream = tokio::net::UnixStream;
+/// See [`AgentStream`].
+#[cfg(windows)]
+pub type AgentStream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// How long core waits for the agent to connect and answer the attach.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a `RECOVERY` release exchange may take before core gives up on it.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The agent process and its channel.
+pub struct Supervisor {
+    program: PathBuf,
+    /// Directory for the per-launch token file (user-only).
+    private_dir: PathBuf,
+    /// Directory/namespace for the per-launch endpoint.
+    runtime_dir: PathBuf,
+    dry_inject: bool,
+    dry_input_events: usize,
+    emergency_hotkey: String,
+    backend_override: ipc::BackendKind,
+    require_emergency_hotkey: bool,
+    core_silence_ms: u32,
+    launches: u64,
+    child: Option<tokio::process::Child>,
+    link: Option<AgentLink<AgentStream>>,
+    state: AgentState,
+}
+
+impl Supervisor {
+    /// Builds the supervisor; nothing is spawned until [`Supervisor::start`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        program: PathBuf,
+        private_dir: PathBuf,
+        runtime_dir: PathBuf,
+        dry_inject: bool,
+        dry_input_events: usize,
+        emergency_hotkey: String,
+        backend_override: ipc::BackendKind,
+        require_emergency_hotkey: bool,
+        core_silence_ms: u32,
+    ) -> Self {
+        Supervisor {
+            program,
+            private_dir,
+            runtime_dir,
+            dry_inject,
+            dry_input_events,
+            emergency_hotkey,
+            backend_override,
+            require_emergency_hotkey,
+            core_silence_ms,
+            launches: 0,
+            child: None,
+            link: None,
+            state: AgentState::Starting,
+        }
+    }
+
+    /// The agent's state word for the status line.
+    pub const fn state(&self) -> AgentState {
+        self.state
+    }
+
+    /// Spawns one agent, waits for it to connect and sends the `AgentAttach`.
+    pub async fn start(&mut self, mode: AgentMode) -> Result<(), String> {
+        self.stop().await;
+        self.launches += 1;
+        let endpoint = launch_endpoint(&self.runtime_dir, self.launches)?;
+        let mut listener = transport::listen(&endpoint).map_err(|error| error.to_string())?;
+        let token = random_token()?;
+        let token_path = token_file(&self.private_dir, self.launches);
+        write_token_file(&token_path, &token)?;
+
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .arg("--ipc-endpoint")
+            .arg(endpoint_spec(&endpoint))
+            .arg("--token-file")
+            .arg(&token_path)
+            // The agent explains itself on stderr; stdout stays quiet.
+            .stdout(std::process::Stdio::null());
+        if self.dry_inject {
+            command.arg("--dry-inject");
+            if self.dry_input_events > 0 {
+                command
+                    .arg("--dry-input-events")
+                    .arg(self.dry_input_events.to_string());
+            }
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| format!("cannot spawn {}: {error}", self.program.display()))?;
+        self.child = Some(child);
+        self.state = match mode {
+            AgentMode::Recovery => AgentState::Recovery,
+            _ => AgentState::Starting,
+        };
+
+        let stream = match tokio::time::timeout(
+            LAUNCH_TIMEOUT,
+            listener.accept(&::ipc::peer::SameUser::current()),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                self.stop().await;
+                return Err(format!("agent did not connect: {error}"));
+            }
+            Err(_) => {
+                self.stop().await;
+                return Err("agent did not connect within the launch timeout".to_owned());
+            }
+        };
+        let mut link = AgentLink::new(stream, FRAME_MAJOR, protocol::limits::PROTOCOL_MINOR);
+        let attach = crate::routing::attach(
+            token.to_vec(),
+            mode,
+            &self.emergency_hotkey,
+            self.backend_override,
+            self.core_silence_ms,
+            self.require_emergency_hotkey,
+        );
+        if let Err(error) = link.attach(attach).await {
+            self.stop().await;
+            return Err(format!("AgentAttach failed: {error}"));
+        }
+        tracing::info!(
+            mode = mode.as_str_name(),
+            program = self.program.display().to_string().as_str(),
+            "agent started"
+        );
+        self.link = Some(link);
+        Ok(())
+    }
+
+    /// Whether an agent is attached right now.
+    pub const fn is_attached(&self) -> bool {
+        self.link.is_some()
+    }
+
+    /// Sends one frame.
+    pub async fn send(&mut self, message: Msg) -> Result<(), String> {
+        match self.link.as_mut() {
+            Some(link) => link.send(message).await.map_err(|error| match error {
+                IpcError::Closed => "the agent channel is closed".to_owned(),
+                other => other.to_string(),
+            }),
+            None => Err("no agent is attached".to_owned()),
+        }
+    }
+
+    /// Receives one frame, or reports why the channel ended.
+    pub async fn recv(&mut self) -> Result<ipc::AgentFrame, String> {
+        match self.link.as_mut() {
+            Some(link) => link.recv().await.map_err(|error| error.to_string()),
+            None => Err("no agent is attached".to_owned()),
+        }
+    }
+
+    /// Whether the child process has exited (the channel may not have noticed yet).
+    pub fn child_exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => false,
+        }
+    }
+
+    /// Kills the agent and drops the channel.
+    pub async fn stop(&mut self) {
+        self.link = None;
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
+        if matches!(self.state, AgentState::Ready | AgentState::Starting) {
+            self.state = AgentState::Lost;
+        }
+    }
+
+    /// Marks the agent as attached and ready (after `AgentReady`).
+    pub fn mark_ready(&mut self) {
+        self.state = AgentState::Ready;
+    }
+
+    /// Marks the agent as lost.
+    pub fn mark_lost(&mut self) {
+        self.state = AgentState::Lost;
+    }
+
+    /// The `RECOVERY` restart of scenario S4: release the ledger, then a fresh
+    /// `NORMAL` agent.
+    ///
+    /// Returns the number of keys and buttons the recovery agent reported letting go
+    /// of, for the log.
+    pub async fn restart_recovery(
+        &mut self,
+        keys: &[input_model::HidKey],
+        buttons: &[input_model::MouseButton],
+    ) -> Result<(u32, u32), String> {
+        self.start(AgentMode::Recovery).await?;
+        // The agent reports `AgentReady` right after the attach; then core sends the
+        // ledger (`docs/03-architecture.md`, S4).
+        let ready = tokio::time::timeout(RECOVERY_TIMEOUT, self.recv()).await;
+        match ready {
+            Ok(Ok(frame)) => {
+                if !matches!(frame.msg, Some(Msg::Ready(_))) {
+                    tracing::warn!("recovery agent did not report AgentReady first");
+                }
+            }
+            Ok(Err(error)) => {
+                self.stop().await;
+                return Err(format!("recovery agent failed: {error}"));
+            }
+            Err(_) => {
+                self.stop().await;
+                return Err("recovery agent stayed silent".to_owned());
+            }
+        }
+        self.send(crate::routing::release_keys(keys, buttons))
+            .await?;
+        let released = tokio::time::timeout(RECOVERY_TIMEOUT, self.recv()).await;
+        let counts = match released {
+            Ok(Ok(frame)) => match frame.msg {
+                Some(Msg::Released(released)) => {
+                    (released.keys_released, released.buttons_released)
+                }
+                _ => (0, 0),
+            },
+            Ok(Err(error)) => {
+                self.stop().await;
+                return Err(format!("recovery release failed: {error}"));
+            }
+            Err(_) => (0, 0),
+        };
+        tracing::info!(
+            keys = counts.0,
+            buttons = counts.1,
+            "recovery release reported"
+        );
+        // A `RECOVERY` agent accepts nothing else (rule 7), so the node gets a fresh
+        // `NORMAL` one rather than trying to promote it.
+        self.start(AgentMode::Normal).await?;
+        Ok(counts)
+    }
+}
+
+/// The per-launch endpoint core owns before the agent exists.
+///
+/// Windows uses the documented `\\.\pipe\lan-workspace-agent-<pid>-<n>` name; Unix
+/// uses a socket in the runtime directory (`agent-<pid>-<n>.sock`).
+#[cfg(windows)]
+fn launch_endpoint(_runtime_dir: &Path, launch: u64) -> Result<Endpoint, String> {
+    Ok(Endpoint::pipe(format!(
+        "{}{}agent-{}-{launch}",
+        transport::PIPE_PATH_PREFIX,
+        transport::PIPE_NAME_PREFIX,
+        std::process::id(),
+    )))
+}
+
+/// See the Windows variant.
+#[cfg(unix)]
+fn launch_endpoint(runtime_dir: &Path, launch: u64) -> Result<Endpoint, String> {
+    let path = transport::gui_socket_path(runtime_dir)
+        .with_file_name(format!("agent-{}-{launch}.sock", std::process::id()));
+    Ok(Endpoint::socket(path))
+}
+
+/// What the agent is told on the command line: the endpoint, never a secret.
+fn endpoint_spec(endpoint: &Endpoint) -> String {
+    endpoint.describe()
+}
+
+/// 32 random bytes for the first `AgentAttach`.
+fn random_token() -> Result<[u8; 32], String> {
+    let first = identity::random16().map_err(|error| error.to_string())?;
+    let second = identity::random16().map_err(|error| error.to_string())?;
+    let mut token = [0u8; 32];
+    token[..16].copy_from_slice(&first);
+    token[16..].copy_from_slice(&second);
+    Ok(token)
+}
+
+/// `launch-<n>.token` inside the private directory.
+fn token_file(private_dir: &Path, launch: u64) -> PathBuf {
+    private_dir.join(format!("launch-{launch}.token"))
+}
+
+/// Writes the token where only this user can read it and the agent deletes it.
+fn write_token_file(path: &Path, token: &[u8]) -> Result<(), String> {
+    std::fs::write(path, token).map_err(|error| format!("writing {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("setting {} to 0600: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// The default agent program: `lws-agent` next to `lws-core`.
+pub fn default_agent_program() -> Result<PathBuf, String> {
+    let current = std::env::current_exe().map_err(|error| error.to_string())?;
+    let directory = current
+        .parent()
+        .ok_or_else(|| format!("{} has no directory", current.display()))?;
+    let name = if cfg!(windows) {
+        "lws-agent.exe"
+    } else {
+        "lws-agent"
+    };
+    Ok(directory.join(name))
+}

@@ -1,0 +1,33 @@
+[package]
+name = "lws-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+config = { path = "../../crates/config" }
+focus-router = { path = "../../crates/focus-router" }
+geometry = { path = "../../crates/geometry" }
+identity = { path = "../../crates/identity" }
+input-model = { path = "../../crates/input-model" }
+ipc = { path = "../../crates/ipc" }
+platform-probe = { path = "../../crates/platform-probe" }
+protocol = { path = "../../crates/protocol" }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+transport = { path = "../../crates/transport" }
+
+[lints]
+workspace = true
