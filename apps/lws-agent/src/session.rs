@@ -83,6 +83,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         backend::BackendKindArg(attach.backend_override),
         args.dry_inject,
         args.dry_input_events,
+        args.dry_motion,
         attach.emergency_hotkey.as_str(),
         attach.restore_tokens.as_slice(),
     )
@@ -591,6 +592,7 @@ mod tests {
                 BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
                 true,
                 0,
+                false,
                 HOTKEY,
                 &[],
             )

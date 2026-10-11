@@ -221,11 +221,17 @@ pub struct Dry {
     ready: Ready,
     /// Synthetic events still to be reported (`--dry-input-events`, a smoke aid).
     scheduled: Vec<InputEvent>,
+    /// One entry per poll tick: an event, or `None` for a tick that says nothing.
+    ///
+    /// Only `--dry-motion` fills this, and it is emitted whether or not a capture is
+    /// armed: the whole point of the aid is that the pointer moves while the node is
+    /// `Local`, and core's edge trigger is what notices it.
+    motion: std::collections::VecDeque<Option<InputEvent>>,
     capturing: bool,
 }
 
 impl Dry {
-    fn new(ready: Ready, synthetic: usize) -> Self {
+    fn new(ready: Ready, synthetic: usize, motion: bool) -> Self {
         let mut scheduled = Vec::new();
         // Alternating down/up of HID usage 0x04: visibly synthetic, payload-free and
         // never text. It exists to exercise the batch path without a human at the
@@ -243,6 +249,11 @@ impl Dry {
         Dry {
             ready,
             scheduled,
+            motion: if motion {
+                motion_schedule()
+            } else {
+                std::collections::VecDeque::new()
+            },
             capturing: false,
         }
     }
@@ -262,6 +273,7 @@ impl Backend {
         override_kind: BackendKindArg,
         dry: bool,
         synthetic_events: usize,
+        dry_motion: bool,
         emergency_hotkey: &str,
         restore_tokens: &[ipc::PortalGrant],
     ) -> (Self, Ready, Vec<Refusal>) {
@@ -290,7 +302,11 @@ impl Backend {
                 let ready = Ready::from_session(&session, String::new());
                 if dry {
                     return (
-                        Backend::Dry(Box::new(Dry::new(ready.clone(), synthetic_events))),
+                        Backend::Dry(Box::new(Dry::new(
+                            ready.clone(),
+                            synthetic_events,
+                            dry_motion,
+                        ))),
                         ready,
                         Vec::new(),
                     );
@@ -527,6 +543,16 @@ impl Backend {
                 if dry.capturing && !dry.scheduled.is_empty() {
                     return Some(Event::Input(dry.scheduled.remove(0)));
                 }
+                if let Some(step) = dry.motion.pop_front() {
+                    return match step {
+                        Some(event) => Some(Event::Input(event)),
+                        // A tick that only passes time (`--dry-motion`'s pauses).
+                        None => {
+                            tokio::time::sleep(POLL_TICK).await;
+                            None
+                        }
+                    };
+                }
                 tokio::time::sleep(POLL_TICK).await;
                 None
             }
@@ -540,6 +566,43 @@ impl Backend {
     }
 }
 
+/// The `--dry-motion` pattern, in the node's logical space.
+///
+/// Ten steps to the right from x = 1600 (crossing a 1920-wide display at its right edge),
+/// a pause long enough for a full `Local -> Preparing -> Remote` transition, twenty steps
+/// back to the left (the first of them takes the virtual pointer out of the target display
+/// through the entry edge, which is the return), and a final pause so the transcript is
+/// stable. `None` entries are ticks that pass the time.
+fn motion_schedule() -> std::collections::VecDeque<Option<InputEvent>> {
+    /// Height to walk along: the middle of a 1080-tall display.
+    const Y: f64 = 540.0;
+    /// One second at the loop's tick rate (`POLL_TICK` is 5 ms).
+    const TRANSITION_PAUSE: usize = 200;
+    let mut schedule = std::collections::VecDeque::new();
+
+    let mut x = 1600.0;
+    for _ in 0..10 {
+        schedule.push_back(Some(InputEvent::PointerAbsolute(
+            input_model::Position::new(x, Y),
+        )));
+        x += 40.0;
+    }
+    for _ in 0..TRANSITION_PAUSE {
+        schedule.push_back(None);
+    }
+    let mut x = 1960.0;
+    for _ in 0..20 {
+        schedule.push_back(Some(InputEvent::PointerAbsolute(
+            input_model::Position::new(x, Y),
+        )));
+        x -= 40.0;
+    }
+    for _ in 0..400 {
+        schedule.push_back(None);
+    }
+    schedule
+}
+
 /// The selected backend cannot be driven here: keep the node usable and say why.
 fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready, Vec<Refusal>) {
     let (platform, session_kind) = describe_session(snapshot);
@@ -551,7 +614,7 @@ fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready, Vec<Refusal>
     );
     let ready = Ready::degraded(reason, &platform, &session_kind);
     (
-        Backend::Dry(Box::new(Dry::new(ready.clone(), 0))),
+        Backend::Dry(Box::new(Dry::new(ready.clone(), 0, false))),
         ready,
         Vec::new(),
     )
@@ -690,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn the_synthetic_aid_only_fires_once_capture_is_remote() {
         let ready = Ready::degraded("test", "platform-test", "windows");
-        let mut backend = Backend::Dry(Box::new(Dry::new(ready, 3)));
+        let mut backend = Backend::Dry(Box::new(Dry::new(ready, 3, false)));
 
         // `TEMPORARY` is the window in which core is not yet a remote source and drops
         // captured input, so the aid must not be spent there: it is documented as «after

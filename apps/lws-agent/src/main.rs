@@ -42,6 +42,16 @@ struct Args {
     dry_inject: bool,
     /// Test aid: emit this many synthetic key edges after `BeginCapture(REMOTE)`.
     dry_input_events: usize,
+    /// Test aid: walk the synthetic pointer across this node's right edge and back.
+    ///
+    /// The edge trigger needs a pointer that *moves* in `Local`, which no OS call is
+    /// involved in for a dry session, so this emits a fixed pattern in the node's logical
+    /// space: right from x = 1600 to 1960 (crossing a 1920-wide display at the right
+    /// edge), a one-second pause, then left back to 1200 and a two-second pause. It needs
+    /// a display that covers those coordinates — the smoke uses the
+    /// `[[topology.displays]]` snapshot, which is exactly what core falls back to when
+    /// the agent reports nothing.
+    dry_motion: bool,
 }
 
 const USAGE: &str = "\
@@ -56,6 +66,7 @@ OPTIONS:
     --token-file <path>     file with the 32-byte launch token (deleted on read)
     --dry-inject            no capture hooks and no injection; log Inject instead
     --dry-input-events <n>  with --dry-inject: emit n synthetic key edges (smoke aid)
+    --dry-motion            with --dry-inject: walk the pointer over the right edge and back
     --help                  print this help
 ";
 
@@ -64,6 +75,7 @@ fn parse_args() -> Result<Args, String> {
     let mut token_file = None;
     let mut dry_inject = false;
     let mut dry_input_events = 0usize;
+    let mut dry_motion = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -81,6 +93,7 @@ fn parse_args() -> Result<Args, String> {
                 ));
             }
             "--dry-inject" => dry_inject = true,
+            "--dry-motion" => dry_motion = true,
             "--dry-input-events" => {
                 let value = args.next().ok_or("--dry-input-events needs a value")?;
                 dry_input_events = value
@@ -96,6 +109,7 @@ fn parse_args() -> Result<Args, String> {
         token_file: token_file.ok_or("--token-file is required")?,
         dry_inject,
         dry_input_events,
+        dry_motion,
     })
 }
 

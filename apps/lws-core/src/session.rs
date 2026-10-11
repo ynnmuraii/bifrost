@@ -65,6 +65,31 @@ pub struct Session {
     /// The last agent `AgentError`/portal hint, shown by `status`
     /// (`routing::agent_note`). Cleared when a fresh `AgentReady` arrives.
     refusal: Option<String>,
+    /// The assembled layout document. `None` means edge-triggered transitions are
+    /// disabled: a document that breaks «Правила целостности» is never half-applied.
+    topology: Option<geometry::Topology>,
+    /// `[topology]` from `config.toml`: the links and the display snapshot the document
+    /// is assembled from.
+    layout: config::TopologyConfig,
+    /// `input.pointer_gain`, applied to captured deltas while a source lease is remote.
+    pointer_gain: f64,
+    /// The agent's last display report; it replaces the snapshot for this node.
+    agent_displays: Vec<protocol::ipc::DisplayInfo>,
+    /// The last captured local position: the input of an edge crossing in `Local`.
+    local_pointer: Option<geometry::Position>,
+    /// While a source lease is remote: the virtual position on the peer's display.
+    remote_pointer: Option<geometry::Position>,
+    /// The node that virtual position lives on (the lease peer, or the peer of a chain).
+    remote_node: Option<NodeId>,
+    /// A link the pointer left through *while remote*; applied once the lease is
+    /// released, which is how a chain A→B→C is walked as two leases and no relay.
+    pending_target: Option<(NodeId, geometry::Position)>,
+    /// Whether the agent was asked to observe the local pointer (`BeginCapture(OBSERVE)`).
+    ///
+    /// The FSM only asks for capture when a transition starts, but an edge has to be
+    /// *noticed* before there is any transition: «OBSERVE: Local: watch edges, no
+    /// suppression», so core arms the observation itself for the node that owns input.
+    observe_armed: bool,
 }
 
 impl Session {
@@ -80,8 +105,10 @@ impl Session {
         node_id: NodeId,
         backend: String,
         trust: identity::TrustStore,
+        layout: config::TopologyConfig,
+        pointer_gain: f64,
     ) -> Self {
-        Session {
+        let mut session = Session {
             router,
             manager,
             link_events,
@@ -99,6 +126,59 @@ impl Session {
             stopping: false,
             agent_restart_due: None,
             agent_lost_reported: false,
+            topology: None,
+            layout,
+            pointer_gain,
+            agent_displays: Vec::new(),
+            local_pointer: None,
+            remote_pointer: None,
+            remote_node: None,
+            pending_target: None,
+            observe_armed: false,
+        };
+        session.rebuild_topology();
+        session
+    }
+
+    /// Assembles the layout document from everything known right now.
+    ///
+    /// The local manifest is the agent's report when there is one and the
+    /// `[[topology.displays]]` snapshot otherwise; the peers' manifests come from the same
+    /// snapshot until their `Hello` carries displays. A document that fails validation is
+    /// logged and dropped, which disables edge-triggered transitions instead of
+    /// mis-resolving them.
+    fn rebuild_topology(&mut self) {
+        let snapshot = crate::topology::snapshot_displays(&self.layout, self.node_id.as_bytes());
+        let displays = if self.agent_displays.is_empty() {
+            snapshot
+        } else {
+            self.agent_displays.clone()
+        };
+        let peers = crate::topology::snapshot_peers(&self.layout, self.node_id.as_bytes());
+        let documents = crate::topology::Documents {
+            local_node_id: *self.node_id.as_bytes(),
+            topology: &self.layout,
+            local_displays: &displays,
+            peer_displays: &peers,
+        };
+        match crate::topology::build(&documents) {
+            Ok(document) => {
+                self.router.set_topology_revision(document.revision);
+                tracing::info!(
+                    revision = document.revision,
+                    links = document.links.len(),
+                    nodes = document.nodes.len(),
+                    "layout document assembled"
+                );
+                self.topology = Some(document);
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "layout document unusable; edge-triggered transitions are disabled"
+                );
+                self.topology = None;
+            }
         }
     }
 
@@ -150,7 +230,7 @@ impl Session {
                 Step::Control(Err(error)) => {
                     tracing::warn!(%error, "control channel error");
                 }
-                Step::Tick => {}
+                Step::Tick => self.arm_observation().await,
             }
         }
     }
@@ -407,13 +487,24 @@ impl Session {
                 self.feed(fr::Input::Agent(event)).await;
             }
             AgentSignal::Local(local) => self.feed(fr::Input::Local(local)).await,
-            AgentSignal::Captured(events) => self.forward_captured(events).await,
+            AgentSignal::Captured(events) => {
+                // The tracker needs the display id, which only the wire form has; the
+                // wire itself needs the normalised events.
+                self.track_pointer(&events).await;
+                let converted: Vec<InputEvent> =
+                    events.iter().filter_map(routing::input_event_of).collect();
+                self.forward_captured(converted).await;
+            }
             AgentSignal::Displays(report) => {
                 tracing::info!(
                     displays = report.displays.len(),
                     revision = report.local_revision,
                     "agent display report"
                 );
+                // The report replaces the snapshot for this node, so the document is
+                // assembled again: a hot-plug can add or remove a link endpoint.
+                self.agent_displays = report.displays.clone();
+                self.rebuild_topology();
             }
             AgentSignal::Portal { interface, detail } => {
                 tracing::info!(
@@ -426,6 +517,190 @@ impl Session {
             AgentSignal::Ignored => {}
         }
         Ok(())
+    }
+
+    /// Follows the captured pointer and turns a link edge into a transition.
+    ///
+    /// `docs/03-architecture.md`, «Топология и движение»: «Локально использовать
+    /// фактическую позицию курсора ОС», and a transition is resolved by
+    /// `geometry::resolve_motion`, which is also what makes the reverse direction of a
+    /// bidirectional link the return edge.
+    async fn track_pointer(&mut self, events: &[protocol::ipc::LocalEvent]) {
+        // A link the pointer left through while remote waits for the current lease to be
+        // released: a chain is two leases, not a relay.
+        if matches!(self.router.lease(), fr::LeaseSlot::Idle) {
+            if let Some((target, entry_position)) = self.pending_target.take() {
+                tracing::info!(peer = %target, "walking the chained link");
+                let topology_revision = self.router.topology_revision();
+                self.remote_pointer = Some(entry_position.clone());
+                self.remote_node = Some(target);
+                self.feed(fr::Input::Local(fr::LocalInput::SwitchRequest {
+                    trigger: fr::SwitchTrigger::Edge,
+                    target,
+                    entry_position,
+                    topology_revision,
+                }))
+                .await;
+                return;
+            }
+        }
+        let remote = matches!(
+            self.router.lease().source(),
+            Some(lease) if lease.state == fr::SourceState::Remote
+        );
+        for event in events {
+            // Only absolute positions are tracked: the wire carries no relative motion
+            // (`docs/ipc.proto`: the source integrates deltas into a `PointerAbs`).
+            let Some(protocol::ipc::local_event::Ev::Pointer(pointer)) = event.ev.as_ref() else {
+                continue;
+            };
+            // The captured position is in the node's logical space, so it is resolved
+            // against the manifests before anything geometric happens.
+            let position = match self.topology.as_ref().and_then(|topology| {
+                crate::topology::position_on(topology, &self.node_id, pointer.x, pointer.y)
+            }) {
+                Some(position) => position,
+                None => continue,
+            };
+            let position = &position;
+            let motion = match self
+                .local_pointer
+                .as_ref()
+                .filter(|last| last.display_id == position.display_id)
+            {
+                Some(last) => geometry::Point::new(position.x - last.x, position.y - last.y),
+                None => {
+                    // A new display: the first event seeds the position, there is no step.
+                    self.local_pointer = Some(position.clone());
+                    continue;
+                }
+            };
+            self.local_pointer = Some(position.clone());
+            if remote {
+                self.track_remote(motion).await;
+            } else {
+                self.track_local(position, motion).await;
+            }
+        }
+    }
+
+    /// Asks the agent to watch the local pointer, once, for the node that owns input.
+    ///
+    /// An observation has no lease and no suppression, so its `lease_id` is empty — which
+    /// is also why the FSM ignores the `CaptureReady` that answers it
+    /// (`routing::agent_signal`: an empty lease id is not a transition).
+    async fn arm_observation(&mut self) {
+        if self.observe_armed || !self.router.is_owner() {
+            return;
+        }
+        let command = fr::AgentCommand::BeginCapture {
+            kind: input_model::CaptureKind::Observe,
+            // An observation has no lease; `agent_command` sends an empty `lease_id` for
+            // it, so its `CaptureReady` answer is ignored by the FSM.
+            lease_id: [0u8; 16],
+            self_timeout_ms: 0,
+        };
+        let frame = routing::agent_command(&command);
+        match self.agent.send(frame).await {
+            Ok(()) => {
+                self.observe_armed = true;
+                tracing::info!("asked the agent to observe the local pointer");
+            }
+            Err(error) => tracing::warn!(%error, "cannot arm the local observation"),
+        }
+    }
+
+    /// `Local`: a step that leaves a display through a link endpoint opens the transition.
+    async fn track_local(&mut self, position: &geometry::Position, motion: geometry::Point) {
+        // Only the owner opens leases, so only the owner reacts to an edge; a follower
+        // watches its own pointer without acting on it.
+        if !self.router.is_owner() {
+            return;
+        }
+        let step = match self.topology.as_ref() {
+            Some(topology) => geometry::resolve_motion(topology, &self.node_id, position, motion),
+            None => None,
+        };
+        let Some(transition) = step else {
+            return;
+        };
+        let target = transition.target.node;
+        if target == self.node_id {
+            return;
+        }
+        let entry_position = transition.target_position;
+        let topology_revision = self.router.topology_revision();
+        tracing::info!(
+            peer = %target,
+            x = entry_position.x,
+            y = entry_position.y,
+            "the pointer reached a link edge; asking for a transition"
+        );
+        self.remote_pointer = Some(entry_position.clone());
+        self.remote_node = Some(target);
+        self.feed(fr::Input::Local(fr::LocalInput::SwitchRequest {
+            trigger: fr::SwitchTrigger::Edge,
+            target,
+            entry_position,
+            topology_revision,
+        }))
+        .await;
+    }
+
+    /// Remote: the virtual position follows the captured deltas inside the peer's display
+    /// until it leaves through the entry edge (the return) or through another link (a
+    /// chain).
+    async fn track_remote(&mut self, motion: geometry::Point) {
+        let (Some(node), Some(position), Some(topology)) = (
+            self.remote_node,
+            self.remote_pointer.clone(),
+            self.topology.as_ref(),
+        ) else {
+            return;
+        };
+        let step = geometry::Point::new(motion.x * self.pointer_gain, motion.y * self.pointer_gain);
+        let crossing = geometry::resolve_motion(topology, &node, &position, step);
+        let advanced = geometry::Position::new(
+            position.display_id.clone(),
+            position.x + step.x,
+            position.y + step.y,
+        );
+        let Some(transition) = crossing else {
+            self.remote_pointer = Some(advanced);
+            return;
+        };
+        let target = transition.target.node;
+        let entry_position = transition.target_position;
+        let topology_revision = self.router.topology_revision();
+        if target == self.node_id {
+            // The reverse direction of the link we came in on: back to Local, with the
+            // reason the FSM takes from the trigger (`RETURN_EDGE`).
+            tracing::info!("the pointer came back over the entry edge; returning to Local");
+            self.remote_pointer = None;
+            self.remote_node = None;
+        } else {
+            // A link that leads further on: the lease has to be released first, so the
+            // target is remembered and walked once the FSM is Local again.
+            tracing::info!(peer = %target, "the pointer crossed a chained link");
+            self.pending_target = Some((target, entry_position.clone()));
+            self.remote_pointer = None;
+            self.remote_node = None;
+        }
+        let peer = self
+            .router
+            .lease()
+            .source()
+            .map(|lease| lease.peer)
+            .unwrap_or(target);
+        self.feed(fr::Input::Local(fr::LocalInput::SwitchRequest {
+            trigger: fr::SwitchTrigger::Edge,
+            target: peer,
+            // The receiver ignores the position of a return (the pointer is already
+            // there); the chained entry point is carried by `pending_target`.
+            entry_position: geometry::Position::new(entry_position.display_id.clone(), 0.0, 0.0),
+            topology_revision,
+        }))
+        .await;
     }
 
     /// Captured input goes on the wire as `InputBatch` for the active source lease.

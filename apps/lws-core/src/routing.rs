@@ -85,7 +85,14 @@ pub fn agent_command(command: &fr::AgentCommand) -> ipc::agent_frame::Msg {
             self_timeout_ms,
         } => Msg::BeginCapture(ipc::BeginCapture {
             kind: capture_kind_to_i32(*kind),
-            lease_id: lease_id.to_vec(),
+            // `ipc.proto`: `lease_id` is «16 bytes for TEMPORARY/REMOTE» — an
+            // observation has no lease, and an empty id is what makes its `CaptureReady`
+            // answer not look like a transition (`agent_signal` ignores it).
+            lease_id: if *kind == input_model::CaptureKind::Observe {
+                Vec::new()
+            } else {
+                lease_id.to_vec()
+            },
             // `ipc.proto`: the agent ends capture by itself, max 1000 ms.
             self_timeout_ms: u32::try_from(*self_timeout_ms)
                 .unwrap_or(u32::MAX)
@@ -340,7 +347,13 @@ pub enum AgentSignal {
     /// A local condition the FSM models as `LocalInput`.
     Local(fr::LocalInput),
     /// Captured input to forward on the active source lease.
-    Captured(Vec<InputEvent>),
+    /// Captured input, in its **wire** form.
+    ///
+    /// The display id matters: a pointer position is display-local, and the edge trigger
+    /// has to know which display the step happened on to resolve it against the layout
+    /// document. `input_model::InputEvent` carries no display id, so the wire event is
+    /// what travels here and the session converts it for the `InputBatch` it forwards.
+    Captured(Vec<ipc::LocalEvent>),
     /// The agent's display set changed.
     Displays(ipc::DisplaysReport),
     /// A portal hint for the GUI (`PortalPermissionRequired`).
@@ -422,13 +435,7 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
             Some(lease_id) => AgentSignal::Fsm(fr::AgentEvent::CaptureReady { lease_id }),
             None => AgentSignal::Ignored,
         },
-        Msg::Captured(batch) => AgentSignal::Captured(
-            batch
-                .events
-                .iter()
-                .filter_map(input_event_of)
-                .collect::<Vec<_>>(),
-        ),
+        Msg::Captured(batch) => AgentSignal::Captured(batch.events.clone()),
         Msg::Released(released) => match lease_id(&released.lease_id) {
             // `ReleaseKeys` answers with an empty lease id: it is a RECOVERY ack and
             // never drives the FSM (the counts are logged by the caller).
@@ -983,13 +990,56 @@ mod tests {
             at_edge: true,
         });
         match agent_signal(&batch, &mut context) {
-            AgentSignal::Captured(events) => assert_eq!(
-                events,
-                vec![InputEvent::Key {
-                    key: input_model::HidKey::keyboard(0x04),
-                    state: KeyState::Down,
-                }]
-            ),
+            // The wire form is kept on purpose: the display id is what the edge trigger
+            // needs and `input_model::InputEvent` has no room for it.
+            AgentSignal::Captured(events) => {
+                assert_eq!(events.len(), 1);
+                match events[0].ev.as_ref() {
+                    Some(ipc::local_event::Ev::Key(key)) => {
+                        assert_eq!(key.usage, 0x04);
+                        assert!(key.down);
+                    }
+                    other => panic!("expected a key event, got {other:?}"),
+                }
+                // The normalised form is still one call away, which is what the
+                // `InputBatch` core forwards needs.
+                assert_eq!(
+                    input_event_of(&events[0]),
+                    Some(InputEvent::Key {
+                        key: input_model::HidKey::keyboard(0x04),
+                        state: KeyState::Down,
+                    })
+                );
+            }
+            other => panic!("expected captured events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_captured_pointer_keeps_its_display_id() {
+        // A `Position` is display-local, so the id decides which display's edges the step
+        // is resolved against; it survives into the agent signal precisely because the
+        // signal carries the wire event.
+        let batch = ipc::agent_frame::Msg::Captured(ipc::CapturedBatch {
+            events: vec![ipc::LocalEvent {
+                monotonic_us: 0,
+                ev: Some(ipc::local_event::Ev::Pointer(ipc::PointerAbs {
+                    display_id: "edid:7a3f".to_owned(),
+                    x: 1919.0,
+                    y: 540.0,
+                })),
+            }],
+            at_edge: false,
+        });
+        let mut context = AgentContext::default();
+        match agent_signal(&batch, &mut context) {
+            AgentSignal::Captured(events) => match events[0].ev.as_ref() {
+                Some(ipc::local_event::Ev::Pointer(pointer)) => {
+                    assert_eq!(pointer.display_id, "edid:7a3f");
+                    assert_eq!((pointer.x, pointer.y), (1919.0, 540.0));
+                }
+                other => panic!("expected a pointer event, got {other:?}"),
+            },
             other => panic!("expected captured events, got {other:?}"),
         }
     }
