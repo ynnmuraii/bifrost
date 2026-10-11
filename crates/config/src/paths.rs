@@ -1,5 +1,14 @@
 //! Per-OS file locations.
 //!
+//! This module is the **single source** of the documented path and file names
+//! (`docs/03-architecture.md`, «Файлы и пути»): `ipc` imports [`APP_DIR`] and
+//! [`GUI_SOCKET_FILE`] from here instead of repeating the literals, and `identity` imports
+//! [`IDENTITY_DPAPI_FILE`], [`IDENTITY_KEY_FILE`] and [`TRUST_FILE`]. The alternative — an
+//! identity-owned `KEY_FILE_NAME` — was rejected because `identity` pulls in `rustls`/`ring`
+//! and `config` must keep cross-checking against `x86_64-unknown-linux-gnu` (ring needs a
+//! C toolchain there), so the dependency direction is `ipc`/`identity` → `config`, never the
+//! other way.
+//!
 //! `docs/03-architecture.md`, «Файлы и пути»:
 //!
 //! | Назначение | Windows | Linux |
