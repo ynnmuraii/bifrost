@@ -1,0 +1,32 @@
+[package]
+name = "lws-agent"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+input-model = { path = "../../crates/input-model" }
+ipc = { path = "../../crates/ipc" }
+platform-probe = { path = "../../crates/platform-probe" }
+platform-wayland = { path = "../../crates/platform-wayland" }
+platform-win = { path = "../../crates/platform-win" }
+platform-x11 = { path = "../../crates/platform-x11" }
+protocol = { path = "../../crates/protocol" }
+tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true
