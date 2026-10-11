@@ -232,6 +232,9 @@ pub fn capability_bits(capabilities: Capabilities) -> Vec<i32> {
     if capabilities.physical_hid_keys {
         bits.push(wire::Capability::PhysicalHidKeys as i32);
     }
+    if capabilities.text_clipboard {
+        bits.push(wire::Capability::TextClipboard as i32);
+    }
     if capabilities.native_repeat {
         bits.push(wire::Capability::NativeRepeat as i32);
     }
