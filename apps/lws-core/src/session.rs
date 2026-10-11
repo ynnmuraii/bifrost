@@ -504,25 +504,22 @@ impl Session {
     }
 
     /// One CLI request.
+    ///
+    /// One request, one reply, one connection: the daemon reads a single line and writes a
+    /// single line, so it never reads again after answering (that second read is what used
+    /// to race the client's close and log every answer as a failure).
     async fn on_control(&mut self, mut stream: ctl::ClientStream) {
-        use tokio::io::AsyncBufReadExt;
-        let mut line = String::new();
-        let read = {
-            let mut reader = tokio::io::BufReader::new(&mut stream);
-            match reader.read_line(&mut line).await {
-                Ok(read) => read,
-                Err(error) => {
-                    tracing::warn!(%error, "cannot read a control request");
-                    return;
-                }
+        let line = match ctl::read_line(&mut stream).await {
+            Ok(Some(line)) => line,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "cannot read a control request");
+                return;
             }
         };
-        if read == 0 {
-            return;
-        }
         let response = self.handle_request(&line).await;
         let reply = response.render();
-        if let Err(error) = ctl::serve_line(&mut stream, &reply).await {
+        if let Err(error) = ctl::write_line(&mut stream, &reply).await {
             tracing::warn!(%error, "cannot answer a control request");
         }
     }
