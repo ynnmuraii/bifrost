@@ -1,0 +1,290 @@
+syntax = "proto3";
+package lan_workspace.ipc.v1;
+
+// Local IPC of LAN Workspace: lws-core <-> lws-agent (AgentFrame) and
+// lws-core <-> lws-gui (GuiFrame). See 03-architecture.md, section "Локальный IPC".
+// Framing: 4-byte unsigned big-endian length + serialized AgentFrame / GuiFrame.
+// Max frame: 65536 bytes. Never sent over the network.
+// Backend selection and portal restore tokens travel in AgentAttach; portal
+// messages carry no key, pointer or clipboard payload, only interface names,
+// versions and opaque tokens.
+
+// ---------- core <-> input-agent ----------
+message AgentFrame {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint64 seq = 3; // per direction, starts at 1, contiguous
+  oneof msg {
+    // core -> agent
+    AgentAttach attach = 10;
+    BeginCapture begin_capture = 11;
+    EndCapture end_capture = 12;
+    PrepareInject prepare_inject = 13;
+    Inject inject = 14;
+    ArmDeadline arm_deadline = 15;
+    ReleaseSession release_session = 16;
+    ReleaseKeys release_keys = 17;
+    QueryDisplays query_displays = 18;
+    AgentShutdown shutdown = 19;
+    Ping ping = 20;
+    ForgetPortalGrants forget_portal_grants = 21; // drop stored restore tokens, re-ask the user
+
+    // agent -> core
+    AgentReady ready = 40;
+    CaptureReady capture_ready = 41;
+    CapturedBatch captured = 42;
+    EmergencyFired emergency = 43;
+    InjectResult inject_result = 44;
+    DeadlineExpired deadline_expired = 45;
+    Released released = 46;
+    DisplaysReport displays = 47;
+    LocalInputDetected local_input = 48;
+    SessionEvent session_event = 49;
+    Pong pong = 50;
+    AgentError error = 51;
+    PortalPermissionRequired portal_permission = 52; // GUI hint: portal dialog is on screen
+    PortalGrantChanged portal_grant = 53;            // fresh restore token to persist
+  }
+}
+
+enum AgentMode {
+  AGENT_MODE_UNSPECIFIED = 0;
+  AGENT_MODE_NORMAL = 1;
+  AGENT_MODE_RECOVERY = 2; // only ReleaseKeys / Shutdown accepted
+}
+
+// Platform backend selection from config; the agent still verifies the environment.
+enum BackendKind {
+  BACKEND_KIND_UNSPECIFIED = 0;
+  BACKEND_KIND_AUTO = 1;    // default: detect Windows / X11 / Wayland
+  BACKEND_KIND_X11 = 2;     // override; refused if the session is Wayland/Xwayland
+  BACKEND_KIND_WAYLAND = 3; // override; refused if the session is a real X11 session
+}
+
+message PortalGrant {
+  string portal_interface = 1; // org.freedesktop.portal.InputCapture / RemoteDesktop
+  string restore_token = 2;    // opaque, persisted by core; never logged or exported
+  string compositor_signature = 3; // compositor + portal version at issue time
+}
+
+message AgentAttach {
+  bytes launch_token = 1; // 32 random bytes, passed via inherited pipe/stdin, never argv
+  AgentMode mode = 2;
+  string emergency_hotkey = 3; // e.g. "Ctrl+Alt+Shift+F12"
+  BackendKind backend_override = 4;
+  repeated PortalGrant restore_tokens = 5; // Wayland only; empty on other backends
+  bool require_emergency_hotkey = 6;       // source refuses Remote when the portal lacks it
+  uint32 core_silence_ms = 7;              // 200..500, default 300; agent ends capture after this much
+                                           // core silence (IPC heartbeat = value / 4, see 03-architecture.md)
+}
+
+enum CaptureKind {
+  CAPTURE_KIND_UNSPECIFIED = 0;
+  CAPTURE_KIND_OBSERVE = 1;   // Local: watch edges, no suppression.
+                              // Wayland: keep the InputCapture session armed (barriers set, Enable).
+  CAPTURE_KIND_TEMPORARY = 2; // Preparing: suppress + buffer, self-timeout.
+                              // Wayland: the compositor already activated capture; abort = Release + local replay.
+  CAPTURE_KIND_REMOTE = 3;    // Remote: suppress, forward to core
+}
+
+message BeginCapture {
+  CaptureKind kind = 1;
+  bytes lease_id = 2;          // 16 bytes for TEMPORARY/REMOTE
+  uint32 self_timeout_ms = 3;  // agent ends capture by itself, max 1000;
+                               // on Wayland bounds how long an activated (diverted) capture is held
+}
+message EndCapture { bytes lease_id = 1; bool replay_buffered_locally = 2; }
+message PrepareInject { bytes lease_id = 1; }
+
+message HidKey { uint32 usage_page = 1; uint32 usage = 2; bool down = 3; }
+message PointerAbs { string display_id = 1; double x = 2; double y = 3; }
+message ButtonEv { uint32 button = 1; bool down = 2; }
+message ScrollEv { sint32 h120 = 1; sint32 v120 = 2; }
+message LocalEvent {
+  uint64 monotonic_us = 1;
+  oneof ev { PointerAbs pointer = 10; HidKey key = 11; ButtonEv button = 12; ScrollEv scroll = 13; }
+}
+
+message Inject { bytes lease_id = 1; uint64 input_batch_seq = 2; repeated LocalEvent events = 3; }
+message ArmDeadline { bytes lease_id = 1; uint32 remaining_ms = 2; } // 1..1000, agent clock
+message ReleaseSession { bytes lease_id = 1; }
+message ReleaseKeys { repeated HidKey keys = 1; repeated uint32 buttons = 2; } // recovery
+message QueryDisplays {}
+message AgentShutdown {}
+message ForgetPortalGrants {} // drop stored restore tokens and let the portal ask again
+message Ping { uint64 nonce = 1; }
+
+message AgentReady {
+  repeated string capabilities = 1;
+  string platform = 2;
+  string session_kind = 3;
+  BackendInfo backend = 4; // structured backend detail, required for capability mapping
+}
+
+message PortalInterface { string name = 1; uint32 version = 2; } // D-Bus interface version
+
+message BackendInfo {
+  string backend = 1;      // "platform-win" | "platform-x11" | "platform-wayland"
+  string compositor = 2;   // "mutter" | "kwin" | "" when not Wayland
+  repeated PortalInterface portals = 3;
+  bool has_emergency_hotkey = 4;   // GlobalShortcuts available and bound
+  bool has_portal_persistence = 5; // restore tokens accepted by the portal
+  bool has_receiver_takeover = 6;  // local physical input can end a lease
+  bool has_absolute_injection = 7; // EIS absolute pointer region established
+  bool has_portal_clipboard = 8;   // session returned clipboard_enabled = true
+  string degraded_reason = 9;      // payload-free actionable text when a capability is missing
+}
+message CaptureReady { bytes lease_id = 1; CaptureKind kind = 2; }
+message CapturedBatch { repeated LocalEvent events = 1; bool at_edge = 2; }
+message EmergencyFired { bytes lease_id = 1; } // agent has already restored local control
+message InjectResult { bytes lease_id = 1; uint64 input_batch_seq = 2; uint32 applied_count = 3; string os_error = 4; PointerAbs actual = 5; }
+message DeadlineExpired { bytes lease_id = 1; }
+message Released { bytes lease_id = 1; uint32 keys_released = 2; uint32 buttons_released = 3; }
+message DisplaysReport { repeated DisplayInfo displays = 1; uint64 local_revision = 2; }
+message DisplayInfo {
+  string id = 1;
+  double lx = 2; double ly = 3; double lw = 4; double lh = 5;
+  int32 nx = 6; int32 ny = 7; int32 nw = 8; int32 nh = 9;
+  uint32 rotation = 10; double scale = 11; bool primary = 12;
+}
+message LocalInputDetected { bytes lease_id = 1; }
+enum SessionEventKind {
+  SESSION_EVENT_UNSPECIFIED = 0;
+  SESSION_EVENT_SUSPEND = 1;
+  SESSION_EVENT_RESUME = 2;
+  SESSION_EVENT_LOCK = 3;
+  SESSION_EVENT_UNLOCK = 4;
+}
+message SessionEvent { SessionEventKind kind = 1; }
+message Pong { uint64 nonce = 1; }
+message PortalPermissionRequired { string portal_interface = 1; string purpose = 2; } // purpose: capture | inject | clipboard | hotkey
+message PortalGrantChanged { PortalGrant grant = 1; bool revoked = 2; }
+// code: PORTAL_DENIED, PORTAL_UNAVAILABLE, PORTAL_SESSION_LOST, PORTAL_FRONTEND_STUCK, QUEUE_OVERFLOW, ...
+message AgentError { string code = 1; string detail = 2; } // never contains key/clipboard payload
+
+// ---------- gui <-> core ----------
+message GuiFrame {
+  uint64 seq = 1;
+  uint64 request_id = 2; // correlates request/response; 0 for events
+  reserved 11; reserved "set_role"; // roles are per-lease in v0.3; the GUI no longer sets a role
+  oneof msg {
+    GetStatus get_status = 10;
+    StartPairing start_pairing = 12;
+    PairWith pair_with = 13;
+    PairingAnswer pairing_answer = 14;
+    UpdateTopology update_topology = 15; // any node; the edit is forwarded to the coordinator
+    SetClipboard set_clipboard = 16;
+    RevokePeer revoke_peer = 17;
+    ExportDiagnostics export_diagnostics = 18;
+    ResetPortalGrants reset_portal_grants = 19; // forget restore tokens, re-ask the portal
+    ClaimOwnership claim_ownership = 20;  // make this node the owner (GUI button)
+    AbandonOwnership abandon_ownership = 21; // give up ownership, stay a follower
+    GetTopology get_topology = 22;        // read the applied layout document (editor model)
+    ListPendingEdits list_pending_edits = 23; // divergent edits kept after a partition
+    ApplyPendingEdit apply_pending_edit = 24;
+    DiscardPendingEdit discard_pending_edit = 25;
+
+    Status status = 40;          // response and pushed event
+    PairingPrompt pairing_prompt = 41;
+    OpResult op_result = 42;
+    TopologyDoc topology_doc = 43;   // response to GetTopology and pushed on every applied revision
+    PendingEdits pending_edits = 44; // response to ListPendingEdits
+  }
+}
+message GetStatus {}
+message ClaimOwnership {}
+message AbandonOwnership {}
+message StartPairing { uint32 window_s = 1; } // max 120
+message PairWith { string address = 1; }
+message PairingAnswer { bytes attempt_id = 1; bool approve = 2; }
+message UpdateTopology { bytes layout_toml = 1; uint64 expected_revision = 2; bytes expected_author = 3; } // any node; coordinator applies (CAS)
+message SetClipboard { bool enabled = 1; }
+message RevokePeer { bytes peer_node_id = 1; }
+message ExportDiagnostics { string target_path = 1; }
+message ResetPortalGrants {} // GUI: drop portal permissions for this node
+message Status {
+  string role = 1;           // "owner" | "follower" (per-lease source/receiver is derived from focus)
+  string focus = 2;          // LOCAL / PREPARING / REMOTE / BLOCKED
+  string active_peer = 3;    // display name
+  bool connected = 4;
+  bool clipboard_enabled = 5;
+  string emergency_hotkey = 6;
+  uint32 rtt_p95_us = 7;
+  uint32 rtt_jitter_us = 8;
+  string last_error_code = 9;
+  string backend = 10;                     // "platform-win" | "platform-x11" | "platform-wayland"
+  repeated string capabilities_unavailable = 11; // e.g. EMERGENCY_HOTKEY, RECEIVER_TAKEOVER
+  string portal_state = 12;                // "" | "permission_required" | "denied" | "unavailable"
+  bool is_owner = 13;
+  string owner_node_id = 14;               // hex or short form; empty when none known
+  uint64 owner_serial = 15;
+  repeated MemberStatus members = 16;
+  uint64 layout_revision = 17;
+  string layout_author = 18;
+  uint32 layout_pending_edits = 19;        // divergent local edits kept after a partition
+  bool layout_editable = 20;               // false when no coordinator is reachable
+  string active_layout = 21;               // receiver's active keyboard layout while focus is REMOTE ("" otherwise); e.g. "ru"
+}
+message MemberStatus {
+  string node_id = 1;
+  string display_name = 2;
+  bool online = 3;
+  bool is_owner = 4;
+  string link_state = 5;   // CONNECTING / TLS / HELLO / READY / CLOSING
+}
+message PairingPrompt { bytes attempt_id = 1; string peer_name = 2; string sas_code = 3; string local_fingerprint = 4; string peer_fingerprint = 5; }
+message OpResult { bool ok = 1; string error_code = 2; }
+
+// ---------- layout editor model (gui <-> core) ----------
+// TopologyDoc is the applied layout document plus the display geometry of every
+// member; it is the model the GUI edits. It answers GetTopology and is pushed on
+// every applied revision. The GUI serializes its edited model back into
+// UpdateTopology.layout_toml (same schema as config.example.toml [topology]).
+message GetTopology {}
+message TopologyDoc {
+  uint64 revision = 1;
+  string author_node_id = 2;         // author of the applied revision
+  repeated MemberTopology members = 3;
+  repeated LinkView links = 4;
+}
+message MemberTopology {
+  string node_id = 1;
+  string display_name = 2;
+  bool online = 3;                   // advisory, as NodeDisplays.online
+  repeated DisplayView displays = 4;
+}
+message DisplayView {
+  string id = 1;                     // stable display id
+  double logical_x = 2; double logical_y = 3; double logical_w = 4; double logical_h = 5;
+  uint32 rotation_degrees = 6;       // 0, 90, 180, 270
+  bool primary = 7;
+  bool native_known = 8;             // false on Wayland portals
+  double scale = 9;                  // native/logical when known; GUI only
+}
+message LinkView {
+  string id = 1;
+  EndpointView from = 2;
+  EndpointView to = 3;
+  bool bidirectional = 4;
+}
+message EndpointView {
+  string node_id = 1;
+  string display_id = 2;
+  string edge = 3;                   // LEFT | RIGHT | TOP | BOTTOM
+  double segment_start = 4;          // distance along the edge from its start
+  double segment_end = 5;
+}
+
+// Divergent local edits kept after a partition (layout.pending.toml). Apply asks
+// the coordinator to re-apply one as a new CAS revision; Discard drops it.
+message ListPendingEdits {}
+message PendingEdit {
+  bytes edit_id = 1;                 // random16
+  uint64 base_revision = 2;          // (base_revision, base_author) the edit was based on
+  string base_author = 3;
+  string author_node_id = 4;         // who edited in the GUI
+  bytes layout_toml = 5;             // full document of the divergent edit
+}
+message PendingEdits { repeated PendingEdit edits = 1; }
+message ApplyPendingEdit { bytes edit_id = 1; }
+message DiscardPendingEdit { bytes edit_id = 1; }

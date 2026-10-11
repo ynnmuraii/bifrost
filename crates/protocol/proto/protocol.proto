@@ -1,0 +1,346 @@
+syntax = "proto3";
+package lan_workspace.v1;
+
+// Design draft v0.3. Limits and semantic validation are in 05-protocol.md.
+// Field numbers are never reused; removed fields are reserved. Enum-value and
+// field renames are wire-compatible (numbers unchanged).
+// v0.3 semantics: links form a full mesh among workspace members (N_max = 4,
+// 3 nodes supported and tested in MVP; a 5th is refused) instead
+// of a star around a fixed source; roles (source/receiver) are per-lease, not per
+// node; one owner node at a time drives input and authors the layout document.
+// There is no compatibility shim for earlier drafts of this document: none of
+// them was ever implemented, so v0.3 is the first wire contract.
+// This is not an implementation or compatibility promise with another KVM.
+
+message Envelope {
+  uint32 major = 1;
+  uint32 minor = 2;
+  bytes connection_id = 3; // exactly 16 bytes, chosen by the dialing node
+  uint64 seq = 4;          // starts at 1, per direction per channel, contiguous
+  bytes lease_id = 5;      // exactly 16 on lease messages, empty otherwise
+  oneof payload {          // empty payload (e.g. unknown field) => ERROR_CODE_INVALID_FRAME
+    Hello hello = 10;
+    Topology topology = 11;
+    EnterPrepare enter_prepare = 12;
+    EnterAck enter_ack = 13;
+    EnterCommit enter_commit = 14;
+    Leave leave = 15;              // allowed in both directions
+    LeaveAck leave_ack = 16;
+    InputBatch input_batch = 17;
+    InjectAck inject_ack = 18;
+    LeaseChallenge lease_challenge = 19;
+    LeaseRenew lease_renew = 20;
+    LeaseStatus lease_status = 21;
+    StateSnapshot state_snapshot = 22;
+    ProtocolError error = 23;
+    Shutdown shutdown = 24;
+    ClipboardGrant clipboard_grant = 25;
+    ClipboardBind clipboard_bind = 26;
+    ClipboardOffer clipboard_offer = 27;
+    ClipboardRequest clipboard_request = 28;
+    ClipboardData clipboard_data = 29;
+    ClipboardComplete clipboard_complete = 30;
+    ClipboardCancel clipboard_cancel = 31;
+    DisplaysChanged displays_changed = 32;   // any member -> all links (own displays)
+    TopologyApplied topology_applied = 33;   // any member -> coordinator
+    OwnerClaim owner_claim = 34;             // any member -> peers
+    OwnerState owner_state = 35;             // owner -> all links
+    LayoutEdit layout_edit = 36;             // editing member -> coordinator
+    TopologyRequest topology_request = 37;   // member -> coordinator (current revision), or coordinator -> author of a newer stored revision
+    Ping ping = 38;                          // link liveness
+    Pong pong = 39;
+    ActiveLayout active_layout = 40;         // receiver -> owner: receiver's active keyboard layout
+  }
+}
+
+// Unused in v0.3: the owner/follower relation is a workspace-wide ownership state
+// (OwnerState), and source/receiver are per-lease roles derived from the direction
+// of EnterPrepare. Values are kept so numbers are never reused.
+enum Role { ROLE_UNSPECIFIED = 0; ROLE_SOURCE = 1; ROLE_RECEIVER = 2; }
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_CAPTURE = 1;
+  CAPABILITY_INJECT = 2;
+  CAPABILITY_ABSOLUTE_POINTER = 3;
+  CAPABILITY_PHYSICAL_HID_KEYS = 4;
+  CAPABILITY_TEXT_CLIPBOARD = 5;
+  CAPABILITY_NATIVE_REPEAT = 6;
+  CAPABILITY_SOFTWARE_REPEAT = 7;
+  CAPABILITY_RECEIVER_TAKEOVER = 8;
+  CAPABILITY_DISPLAYS_CHANGED = 9;
+  // Source can always release capture with a local hotkey, without core or network.
+  // Absent on a Wayland source whose compositor exposes no GlobalShortcuts backend.
+  CAPABILITY_EMERGENCY_HOTKEY = 10;
+}
+
+enum SessionKind {
+  SESSION_KIND_UNSPECIFIED = 0;
+  SESSION_KIND_WINDOWS = 1;
+  SESSION_KIND_X11 = 2;       // a real X server; a DISPLAY alone is not proof
+  SESSION_KIND_XWAYLAND = 3;  // reported for diagnostics; never Ready
+  SESSION_KIND_WAYLAND = 4;   // GNOME and KDE share this value: backend differences are capability bits
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_UNSUPPORTED_VERSION = 1;
+  ERROR_CODE_WRONG_ROLE = 2;
+  ERROR_CODE_UNKNOWN_PEER = 3;
+  ERROR_CODE_CHANGED_KEY = 4;
+  ERROR_CODE_UNSUPPORTED_SESSION = 5;
+  ERROR_CODE_CAPTURE_FAILED = 6;
+  ERROR_CODE_INVALID_TOPOLOGY = 7;
+  ERROR_CODE_TOPOLOGY_CHANGED = 8;
+  ERROR_CODE_INVALID_FRAME = 9;
+  ERROR_CODE_INVALID_SEQUENCE = 10;
+  ERROR_CODE_LEASE_MISMATCH = 11;
+  ERROR_CODE_INJECTION_FAILED = 12;
+  ERROR_CODE_LEASE_EXPIRED = 13;
+  ERROR_CODE_AGENT_LOST = 14;
+  ERROR_CODE_CLIPBOARD_TOO_LARGE = 15;
+  ERROR_CODE_CLIPBOARD_DISABLED = 16;
+  ERROR_CODE_UNSUPPORTED_KEY = 17;
+  ERROR_CODE_RATE_LIMITED = 18;
+  // User dismissed/denied the desktop portal dialog (capture or injection session).
+  ERROR_CODE_PORTAL_DENIED = 19;
+  ERROR_CODE_NOT_OWNER = 20;          // EnterPrepare from a node that is not the owner
+  ERROR_CODE_STALE_OWNER_SERIAL = 21; // claim/lease carries an owner serial older than known
+  ERROR_CODE_LAYOUT_CONFLICT = 22;    // LayoutEdit base revision/author is not current
+  ERROR_CODE_MEMBERSHIP_FULL = 23;    // N_max = 4 reached (max_members <= 4); link refused
+  ERROR_CODE_NO_COORDINATOR = 24;     // no owner reachable to apply a layout edit
+  ERROR_CODE_CANNOT_OWN = 25;         // OwnerClaim from a node whose Hello.can_own = false; the claim is refused
+}
+
+enum LeaveReason {
+  LEAVE_REASON_UNSPECIFIED = 0;
+  LEAVE_REASON_RETURN_EDGE = 1;
+  LEAVE_REASON_HOTKEY = 2;
+  LEAVE_REASON_EMERGENCY = 3;
+  LEAVE_REASON_RECEIVER_LOCAL_INPUT = 4; // receiver -> source, takeover
+  LEAVE_REASON_AGENT_LOST = 5;
+  LEAVE_REASON_TOPOLOGY_CHANGED = 6;
+  LEAVE_REASON_SUSPEND_OR_LOCK = 7;
+  LEAVE_REASON_SHUTDOWN = 8;
+  LEAVE_REASON_OWNERSHIP_LOST = 9; // a higher (serial, node_id) owner appeared
+}
+
+message Hello {
+  bytes node_id = 1;                       // exactly 32: SHA256(SPKI DER)
+  string display_name = 2;                 // UTF-8 <= 128 bytes, non-authoritative
+  reserved 3; reserved "role";             // role is per-lease in v0.3
+  repeated Capability capabilities = 4;
+  repeated Display displays = 5;           // max 16
+  repeated Capability required_capabilities = 6; // unknown => ERROR_CODE_UNSUPPORTED_VERSION
+  SessionKind session_kind = 7;
+  uint64 displays_revision = 8;            // local counter of own display set
+  uint64 owner_serial = 9;                 // last known owner claim serial (0 = none)
+  bytes owner_node_id = 10;                // last known owner (32 bytes, empty = none)
+  bool can_own = 11;                       // this node may claim ownership
+  uint64 topology_revision = 12;           // applied layout revision
+  bytes topology_author = 13;              // author node_id of the applied revision
+}
+
+message Rect { double x = 1; double y = 2; double width = 3; double height = 4; }
+
+message Display {
+  string id = 1;                 // stable within node, UTF-8 <= 128 bytes
+  Rect logical_bounds = 2;       // node logical space, authoritative for topology
+  Rect native_bounds = 3;        // diagnostic when native_known is false
+  uint32 rotation_degrees = 4;   // 0, 90, 180, 270
+  double scale_x = 5;            // positive finite logical -> native scale, GUI only
+  double scale_y = 6;
+  bool primary = 7;              // origin of the node logical space
+  bool native_known = 8;         // false when the platform exposes logical bounds only (Wayland portals)
+}
+
+enum Edge { EDGE_UNSPECIFIED = 0; EDGE_LEFT = 1; EDGE_RIGHT = 2; EDGE_TOP = 3; EDGE_BOTTOM = 4; }
+
+message Endpoint {
+  bytes node_id = 1;
+  string display_id = 2;
+  Edge edge = 3;
+  double segment_start = 4;  // distance along the edge from its start, display logical units
+  double segment_end = 5;    // strictly greater than start, <= edge length
+}
+
+message TransitionLink {
+  Endpoint source_endpoint = 1;
+  Endpoint target_endpoint = 2;
+}
+
+message Topology {
+  uint64 revision = 1;                // authored only by the current owner (coordinator)
+  repeated NodeDisplays nodes = 2;
+  repeated TransitionLink links = 3;
+  bytes author_node_id = 4;           // applied order is (revision, author_node_id)
+}
+message NodeDisplays { bytes node_id = 1; repeated Display displays = 2; bool online = 3; }
+
+message DisplaysChanged {                // a member's own display set changed
+  uint64 displays_revision = 1;
+  repeated Display displays = 2;
+}
+message TopologyApplied { uint64 revision = 1; }
+
+message Position {
+  string display_id = 1;
+  double x = 2; // local to display top-left, logical units, [0, width)
+  double y = 3;
+}
+
+message EnterPrepare { uint64 topology_revision = 1; Position position = 2; uint64 owner_serial = 3; }
+message EnterAck {
+  bool accepted = 1;
+  reserved 2; reserved "reason_code";
+  ErrorCode reason = 3;           // enum instead of string
+}
+message EnterCommit {}
+message Leave {
+  reserved 1; reserved "reason_code";
+  LeaveReason reason = 2;
+}
+message LeaveAck {}
+
+message InputBatch { repeated InputEvent events = 1; } // 1..128
+message InputEvent {
+  uint64 capture_monotonic_us = 1; // diagnostic origin-clock only
+  oneof event {
+    Position pointer_absolute = 10;
+    Key key = 11;
+    Button button = 12;
+    Scroll scroll = 13;
+  }
+}
+enum KeyState { KEY_STATE_UNSPECIFIED = 0; KEY_STATE_DOWN = 1; KEY_STATE_UP = 2; }
+message Key { uint32 usage_page = 1; uint32 usage = 2; KeyState state = 3; } // page 0x07 only; source drops others
+enum ButtonKind {
+  BUTTON_KIND_UNSPECIFIED = 0;
+  BUTTON_KIND_LEFT = 1;
+  BUTTON_KIND_RIGHT = 2;
+  BUTTON_KIND_MIDDLE = 3;
+  BUTTON_KIND_BACK = 4;
+  BUTTON_KIND_FORWARD = 5;
+}
+message Button { ButtonKind button = 1; KeyState state = 2; }
+message Scroll { sint32 horizontal_units120 = 1; sint32 vertical_units120 = 2; }
+
+enum InjectStatus {
+  INJECT_STATUS_UNSPECIFIED = 0;
+  INJECT_STATUS_OK = 1;
+  INJECT_STATUS_PARTIAL = 2;  // lease is aborted
+  INJECT_STATUS_FAILED = 3;   // lease is aborted
+}
+message InjectAck {
+  uint64 input_batch_seq = 1;   // Envelope.seq of the acknowledged InputBatch
+  uint32 applied_count = 2;
+  Position actual_position = 3;
+  reserved 4; reserved "error_code";
+  InjectStatus status = 5;
+}
+
+message LeaseChallenge { bytes nonce = 1; uint32 ttl_ms = 2; } // nonce16
+message LeaseRenew { bytes nonce = 1; } // one-use receiver-issued nonce
+message LeaseStatus { bytes nonce = 1; bool accepted = 2; uint64 last_input_batch_seq = 3; }
+message StateSnapshot {
+  repeated Key pressed_keys = 1; // each state KEY_STATE_DOWN
+  repeated ButtonKind pressed_buttons = 2;
+}
+message ProtocolError {
+  reserved 1; // string code in earlier drafts; name reused with enum type
+  uint64 related_seq = 2;
+  ErrorCode code = 3;
+}
+message Shutdown {
+  reserved 1; reserved "reason_code";
+  LeaveReason reason = 2;
+}
+
+// ---------- Ownership and layout (v0.3) ----------
+// The owner is the single node allowed to open leases and to author the layout.
+// Correctness order for ownership is the lexicographic pair (serial, node_id):
+// a candidate is newer only if it compares greater. Claiming is a Lamport counter,
+// not an election: there is no quorum, no voting and no majority.
+message OwnerClaim {
+  uint64 serial = 1;          // claimant's max_seen_serial + 1
+  ClaimReason reason = 2;
+}
+enum ClaimReason {
+  CLAIM_REASON_UNSPECIFIED = 0;
+  CLAIM_REASON_STARTUP = 1;   // automatic claim when claim_on_startup = true
+  CLAIM_REASON_USER = 2;      // GUI button or claim_hotkey
+  CLAIM_REASON_TAKEOVER = 3;  // user took over a physical machine
+}
+message OwnerState {
+  uint64 serial = 1;
+  bytes owner_node_id = 2;    // 32 bytes
+  bool granted = 3;           // false from a peer that observed a higher candidate, or that refuses the claim (can_own = false by Hello)
+}
+message LayoutEdit {          // sent by the editing member to the coordinator
+  uint64 expected_revision = 1;
+  bytes expected_author = 2;  // 32 bytes; the applied (revision, author) pair
+  bytes author_node_id = 3;   // informational: who edited in the GUI
+  bytes layout_toml = 4;      // full document; validated by the coordinator
+}
+message TopologyRequest {} // member -> coordinator for the current revision, or coordinator -> the author of a higher stored revision (partition rejoin)
+message Ping { uint64 nonce = 1; }
+message Pong { uint64 nonce = 1; }
+
+// Receiver-owned keyboard layout (ADR-006). Sent receiver -> owner after
+// EnterAck{accepted} and on every change of the receiver's active layout while the
+// lease is alive, so the owner's GUI can show "typing goes to <PC>, layout <xx>".
+message ActiveLayout {
+  string layout_id = 1;        // receiver-owned, e.g. "us", "ru", "de(nodeadkeys)"; UTF-8 <= 64 bytes
+  uint64 layout_revision = 2;  // monotonic counter of the receiver's own layout changes
+}
+
+message ClipboardGrant { bytes channel_id = 1; bytes binding_token = 2; uint32 ttl_ms = 3; }
+message ClipboardBind {
+  bytes parent_connection_id = 1;
+  bytes channel_id = 2;
+  bytes binding_token = 3;
+}
+message ClipboardOffer {
+  bytes offer_id = 1;          // random16
+  bytes origin_node_id = 2;    // 32 bytes
+  uint64 origin_version = 3;
+  string mime = 4;             // text/plain;charset=utf-8
+  uint64 size_bytes = 5;       // <= 1048576
+  reserved 6; reserved "sha256"; // hash moved to ClipboardComplete
+}
+message ClipboardRequest { bytes offer_id = 1; }
+message ClipboardData {
+  bytes offer_id = 1;
+  uint32 chunk_index = 2;      // zero-based
+  uint32 chunk_count = 3;      // 1..64
+  bytes data = 4;              // <= 16384 bytes
+}
+message ClipboardComplete { bytes offer_id = 1; bytes sha256 = 2; }
+message ClipboardCancel {
+  bytes offer_id = 1;
+  reserved 2; reserved "reason_code";
+  ErrorCode reason = 3;
+}
+
+// ---------- Pairing: ALPN lan-workspace/pair/1, max frame 8192 bytes ----------
+message PairingEnvelope {
+  uint64 seq = 1;
+  bytes attempt_id = 2;        // random16 from the window opener (TLS server), lifetime 120 s
+  uint32 major = 3;
+  uint32 minor = 4;
+  oneof payload {
+    PairHello hello = 10;      // the node that opened the pairing window (TLS server) sends first; the dialer replies
+    PairDecision decision = 11;
+    ProtocolError error = 12;
+  }
+}
+message PairHello {
+  bytes node_id = 1;           // must equal SHA256 of actual TLS peer SPKI
+  string display_name = 2;
+  reserved 3; reserved "desired_role"; // roles are per-lease in v0.3
+  bool supports_sas = 4;       // 6-digit comparison code from TLS exporter
+}
+message PairDecision {
+  bool approved = 1;           // only after local user decision
+  bytes peer_node_id = 2;
+}
