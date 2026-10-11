@@ -244,6 +244,21 @@ impl Session {
                 }
                 Effect::Arm { timer, deadline_ms } => {
                     self.timers.arm(timer, deadline_ms);
+                    // Rule 4: the agent enforces the receiver's lease deadline on its own
+                    // clock, and its `ArmDeadline` from `EnterCommit` is a one-shot. Every
+                    // re-arm here — each valid `LeaseRenew` moves it — has to travel, or
+                    // the agent's deadline fires `lease_ttl_ms` after the commit while
+                    // renewals keep arriving.
+                    let rearm = routing::deadline_rearm_ms(timer, deadline_ms, self.now_ms())
+                        .and_then(|remaining_ms| {
+                            self.router
+                                .lease()
+                                .receiver()
+                                .map(|lease| (lease.lease_id, remaining_ms))
+                        });
+                    if let Some((lease_id, remaining_ms)) = rearm {
+                        self.send_agent_deadline(lease_id, remaining_ms).await;
+                    }
                 }
                 Effect::Cancel { timer } => {
                     self.timers.cancel(timer);
@@ -256,6 +271,23 @@ impl Session {
                 }
                 Effect::Notice(notice) => self.log_notice(&notice),
             }
+        }
+    }
+
+    /// Arms (or re-arms) the agent's own lease deadline.
+    ///
+    /// Rule 4 puts the deadline on the agent's monotonic clock and bounds the frame at
+    /// `1..=1000` ms; the core owns the deadline itself, so this is the translation step of
+    /// the IPC mapping table, not a second source of truth.
+    async fn send_agent_deadline(&mut self, lease_id: fr::LeaseId, remaining_ms: u32) {
+        let frame = Msg::ArmDeadline(protocol::ipc::ArmDeadline {
+            lease_id: lease_id.to_vec(),
+            remaining_ms,
+        });
+        tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
+        if let Err(error) = self.agent.send(frame).await {
+            tracing::warn!(%error, "cannot reach the agent");
+            self.on_agent_lost().await;
         }
     }
 
