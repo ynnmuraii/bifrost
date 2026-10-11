@@ -77,7 +77,7 @@ pub enum LinkEvent {
 }
 
 /// Who dialled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Direction {
     /// This node dialled.
     Outgoing,
@@ -270,6 +270,9 @@ pub enum LinkReport {
     Down {
         /// The peer.
         peer: NodeId,
+        /// Who dialled *this* link, so the manager tells a `Down` from one of two
+        /// simultaneous links to the same peer apart.
+        direction: Direction,
         /// Why.
         reason: LinkDownReason,
     },
@@ -320,7 +323,13 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
         match identity::random16() {
             Ok(id) => id,
             Err(error) => {
-                report_down(&reports, peer, LinkDownReason::Protocol(error.to_string())).await;
+                report_down(
+                    &reports,
+                    peer,
+                    direction,
+                    LinkDownReason::Protocol(error.to_string()),
+                )
+                .await;
                 return;
             }
         }
@@ -354,7 +363,7 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
             Ok(()) => {}
             Err(reason) => {
                 reader_task.abort();
-                report_down(&reports, peer, reason).await;
+                report_down(&reports, peer, direction, reason).await;
                 return;
             }
         }
@@ -420,7 +429,7 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
     };
 
     reader_task.abort();
-    report_down(&reports, peer, reason).await;
+    report_down(&reports, peer, direction, reason).await;
 }
 
 /// The coordinator's mutable state.
@@ -580,9 +589,6 @@ impl LinkState {
                 .map_err(|_| LinkDownReason::LocalClosed);
         }
 
-        self.rx_seq
-            .accept(envelope.seq)
-            .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
         validate::envelope(envelope)
             .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
         match &envelope.payload {
@@ -591,6 +597,18 @@ impl LinkState {
             }
             Some(wire::envelope::Payload::Hello(_)) => {
                 return Err(LinkDownReason::Protocol("a second Hello".into()));
+            }
+            // «пятый член получает `MEMBERSHIP_FULL`»: the refusal is the reason this link
+            // ends, so the refused side reports it as such instead of a bare `Shutdown`
+            // (or a protocol failure). Every other `ProtocolError` code stays an ordinary
+            // message: only the membership refusal terminates the link.
+            Some(wire::envelope::Payload::Error(error))
+                if matches!(
+                    convert::error_code_from_i32(error.code),
+                    Ok(fr::ErrorCode::MembershipFull)
+                ) =>
+            {
+                return Err(LinkDownReason::MembershipFull);
             }
             _ => {}
         }
@@ -690,6 +708,17 @@ fn reason_from(error: TransportError) -> LinkDownReason {
     }
 }
 
-async fn report_down(reports: &mpsc::Sender<LinkReport>, peer: NodeId, reason: LinkDownReason) {
-    let _ = reports.send(LinkReport::Down { peer, reason }).await;
+async fn report_down(
+    reports: &mpsc::Sender<LinkReport>,
+    peer: NodeId,
+    direction: Direction,
+    reason: LinkDownReason,
+) {
+    let _ = reports
+        .send(LinkReport::Down {
+            peer,
+            direction,
+            reason,
+        })
+        .await;
 }

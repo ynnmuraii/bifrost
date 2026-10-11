@@ -430,13 +430,18 @@ async fn a_focus_message_is_delivered_after_the_link_has_been_alive() {
     tokio::time::sleep(transport::PING_INTERVAL * 2).await;
 
     // A key-up must arrive as a key-up: the whole product promise rests on that.
+    let batch_events = vec![input_model::InputEvent::Button {
+        button: input_model::MouseButton::Left,
+        state: input_model::KeyState::Up,
+    }];
     let batch = Message::InputBatch {
         lease_id: [7u8; 16],
+        // Deliberately not the envelope sequence: `InputBatch.input_batch_seq` **is** the
+        // envelope `seq` on the wire («Sender's envelope sequence of this batch»), so the
+        // transport stamps it and this field never travels (`to_envelope` documents it and
+        // `tests/convert.rs` pins it). The assertion below is that the stamping happened.
         input_batch_seq: 1,
-        events: vec![input_model::InputEvent::Button {
-            button: input_model::MouseButton::Left,
-            state: input_model::KeyState::Up,
-        }],
+        events: batch_events.clone(),
     };
     let handle = a.manager.handle(&id_b).await.expect("a handle to b");
     handle
@@ -462,7 +467,24 @@ async fn a_focus_message_is_delivered_after_the_link_has_been_alive() {
     match received {
         Some(LinkEvent::Message { peer, message }) => {
             assert_eq!(peer, id_a);
-            assert_eq!(message, batch, "the first message must arrive unchanged");
+            let Message::InputBatch {
+                lease_id,
+                input_batch_seq,
+                events,
+            } = &message
+            else {
+                panic!("the first message must be the batch, got {message:?}");
+            };
+            assert_eq!(lease_id, &[7u8; 16], "the lease id travels on the envelope");
+            assert_eq!(events, &batch_events, "the events must arrive unchanged");
+            // The link spent `seq = 1` on `Hello` and more on liveness frames, so a batch
+            // numbered `1` would mean the sender's field had been trusted and the peer's
+            // `SeqValidator` skipped. It must carry the envelope sequence instead.
+            assert!(
+                *input_batch_seq > 1,
+                "the batch carries the envelope sequence, not the caller's field: \
+                 {input_batch_seq}"
+            );
         }
         Some(other) => panic!("unexpected event {other:?}"),
         None => panic!(
