@@ -59,6 +59,8 @@ pub struct Supervisor {
     runtime_dir: PathBuf,
     dry_inject: bool,
     dry_input_events: usize,
+    /// With `--dry-inject`: let the agent's synthetic pointer cross the right edge.
+    dry_motion: bool,
     emergency_hotkey: String,
     backend_override: ipc::BackendKind,
     require_emergency_hotkey: bool,
@@ -81,6 +83,7 @@ impl Supervisor {
         runtime_dir: PathBuf,
         dry_inject: bool,
         dry_input_events: usize,
+        dry_motion: bool,
         emergency_hotkey: String,
         backend_override: ipc::BackendKind,
         require_emergency_hotkey: bool,
@@ -93,6 +96,7 @@ impl Supervisor {
             runtime_dir,
             dry_inject,
             dry_input_events,
+            dry_motion,
             emergency_hotkey,
             backend_override,
             require_emergency_hotkey,
@@ -140,6 +144,9 @@ impl Supervisor {
                 command
                     .arg("--dry-input-events")
                     .arg(self.dry_input_events.to_string());
+            }
+            if self.dry_motion {
+                command.arg("--dry-motion");
             }
         }
         let child = command
@@ -482,6 +489,7 @@ mod launch_tests {
             runtime.clone(),
             false,
             0,
+            false,
             "Ctrl+Alt+Shift+F12".to_owned(),
             ipc::BackendKind::Auto,
             true,
