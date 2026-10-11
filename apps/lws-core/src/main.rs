@@ -23,6 +23,7 @@
 mod agent;
 mod command;
 mod ctl;
+mod ids;
 mod pair;
 mod portal;
 mod routing;
@@ -36,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use config::Paths;
-use focus_router::{FocusRouter, SequentialIds};
+use focus_router::FocusRouter;
 use identity::{IdentityPaths, NodeIdentity, TrustStore};
 use ipc::Watchdog;
 use platform_probe::BackendOverride;
@@ -343,7 +344,11 @@ async fn run_async(
         lease_ttl_ms: u64::from(config.timing.lease_ttl_ms),
         claim_grant_timeout_ms: u64::from(config.workspace.claim_grant_timeout_ms),
     };
-    let mut router = FocusRouter::new(node_id, timing, SequentialIds::default(), session.fsm)
+    // `SequentialIds` is the replay/test source; production ids are random16
+    // (`docs/05-protocol.md`), and a counter that restarts at 1 after a crash makes a peer
+    // answer `LEASE_MISMATCH` because it remembers the burned ids.
+    let ids = ids::RandomIds::new()?;
+    let mut router = FocusRouter::new(node_id, timing, ids, session.fsm)
         .with_claim_on_startup(config.node.claim_on_startup)
         .with_require_emergency_hotkey(config.input.require_emergency_hotkey);
     if let Some(owner) = owner_pair(&config) {

@@ -43,7 +43,7 @@ const RESTART_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
-    router: fr::FocusRouter,
+    router: crate::ids::Router,
     manager: Arc<LinkManager>,
     link_events: mpsc::Receiver<LinkEvent>,
     agent: Supervisor,
@@ -71,7 +71,7 @@ impl Session {
     /// Builds the loop from its parts.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        router: fr::FocusRouter,
+        router: crate::ids::Router,
         manager: Arc<LinkManager>,
         link_events: mpsc::Receiver<LinkEvent>,
         agent: Supervisor,
