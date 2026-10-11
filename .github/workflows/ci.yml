@@ -29,23 +29,24 @@ jobs:
       # only so they exist before cargo runs.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools
           targets: x86_64-unknown-linux-gnu
 
       - name: Cache cargo and target
         uses: Swatinem/rust-cache@v2
 
       # The only native code in the dependency graph is ring (rustls), which
-      # needs a C compiler and an archiver for its C and assembly parts.
-      # Everything else on Linux is pure Rust: x11rb builds its RustConnection,
-      # and zbus, ashpd and reis have no C counterpart, so no X11/Wayland -dev
-      # packages are installed and no X or D-Bus session is needed — the
-      # platform tests assert pure contracts against injected environment data.
+      # needs a C compiler and an archiver for its C and assembly parts;
+      # binutils supplies `nm` for the agent symbol check below. Everything else
+      # on Linux is pure Rust: x11rb builds its RustConnection, and zbus, ashpd
+      # and reis have no C counterpart, so no X11/Wayland -dev packages are
+      # installed and no X or D-Bus session is needed — the platform tests assert
+      # pure contracts against injected environment data.
       - name: System dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential
+          sudo apt-get install --yes --no-install-recommends build-essential binutils
 
       - name: Format
         run: cargo fmt --all --check
@@ -55,3 +56,52 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # docs/03-architecture.md, rule 1: «Нет сетевых сокетов. В Windows-сборке не
+      # линкуется winsock; на Linux — проверка в CI по списку символов.»
+      #
+      # Windows states it exactly: the import table of the agent must not name
+      # winsock at all. `SendInput` from user32 is expected and is why the pattern
+      # matches DLL names and unambiguous winsock entry points by name rather than
+      # the substrings "send" or "connect".
+      - name: Agent links no winsock
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build -p lws-agent
+          $host_triple = (rustc -vV | Select-String '^host: ') -replace '.*host: ', ''
+          $readobj = Join-Path (rustc --print sysroot) "lib\rustlib\$host_triple\bin\llvm-readobj.exe"
+          if (-not (Test-Path $readobj)) { throw "llvm-readobj is missing; install the llvm-tools component" }
+          $forbidden = & $readobj --coff-imports target\debug\lws-agent.exe |
+            Select-String -Pattern 'ws2_32|wsock32|mswsock|WSAStartup|WSACleanup|WSAGetLastError|closesocket|ioctlsocket|WSAPoll|WSARecv|WSASend|__WSAFDIsSet'
+          if ($forbidden) {
+            $forbidden | ForEach-Object { Write-Host $_ }
+            throw 'lws-agent links winsock; rule 1 forbids network sockets in the agent'
+          }
+          Write-Host 'agent import table contains no winsock entry point'
+
+      # Linux needs nuance, and this step records it instead of pretending a
+      # symbol list can separate AF_UNIX from AF_INET: `socket`, `connect`,
+      # `socketpair` and the message calls are the documented local transports
+      # (the core<->agent socketpair, the GUI Unix socket), and `getaddrinfo`,
+      # `freeaddrinfo` and `getsockopt` arrive with the X11 and EIS clients that
+      # must dial their compositor. Every symbol the agent may legitimately have
+      # is listed below, so the check is an approval gate: a new network symbol
+      # fails the build and has to be added here on purpose. What it cannot catch
+      # is a TCP client reusing `socket`/`connect` — see the note in the report.
+      - name: Agent links only the documented local-transport symbols
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p lws-agent
+          printf '%s\n' connect freeaddrinfo getaddrinfo getsockopt recv recvmsg send sendmsg shutdown socket socketpair | sort > /tmp/allowed-network-symbols
+          nm -u target/debug/lws-agent | awk '{print $NF}' \
+            | grep -E '(socket|connect|bind|listen|accept|send|recv|shutdown|addrinfo|gethostby|inet_|if_name|sockopt|nameinfo|servby)' \
+            | sort -u > /tmp/agent-network-symbols
+          echo "network symbols in lws-agent:"; sed 's/^/  /' /tmp/agent-network-symbols
+          unexpected=$(comm -13 /tmp/allowed-network-symbols /tmp/agent-network-symbols)
+          if [ -n "$unexpected" ]; then
+            echo "::error::lws-agent gained network symbols that are not on the documented list:"
+            echo "$unexpected"
+            echo "If a new symbol is legitimate for a local transport, add it to the list in this step and say why."
+            exit 1
+          fi
