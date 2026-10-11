@@ -74,12 +74,23 @@
 //! channel; «private identity keys» never leave [`key`] and are never logged
 //! ([`key::IdentityPaths`] exposes paths, never bytes).
 
-#![forbid(unsafe_code)]
+// The crate is unsafe-free except for two Windows-only modules that must call Win32 to
+// protect the private key and to set the owner-only DACL: `#[allow(unsafe_code)]` is granted
+// on exactly `acl` and `keystore`, where every block carries its own SAFETY comment. A
+// `forbid` cannot be relaxed by an inner attribute, hence `deny` here.
+#![deny(unsafe_code)]
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod acl;
 pub mod atomic;
 pub mod config;
 pub mod drive;
 pub mod key;
+// `#[allow(unsafe_code)]`: only the `#[cfg(windows)]` half of this module calls Win32
+// (`CryptProtectData`/`CryptUnprotectData`); the Linux half is a plain copy.
+#[allow(unsafe_code)]
+pub mod keystore;
 pub mod pairing;
 pub mod sas;
 pub mod spki;
@@ -94,6 +105,7 @@ pub use drive::{accept_one, bind, dial, open_window, PairError, PairedPeer, Pair
 pub use key::{
     key_file_of, random16, trust_file_at, IdentityError, IdentityLoad, IdentityPaths, NodeIdentity,
 };
+pub use keystore::{KeystoreError, DPAPI_ENTROPY};
 pub use pairing::{
     AttemptId, PairingFsm, PairingInput, PairingOutcome, PairingOutput, PairingRole, PairingState,
     PairingWindow, RejectionReason, MAX_ATTEMPTS, MAX_PENDING_PEERS, WINDOW_MS,

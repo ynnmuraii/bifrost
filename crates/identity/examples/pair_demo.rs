@@ -13,6 +13,11 @@
 //!    `revoked_at` stamp.
 //!
 //! Run with: `cargo run -p identity --example pair_demo`
+//!
+//! The state directory is **stable** (`%TEMP%/lan-workspace-pair-demo`, not per-process), so
+//! running the demo twice proves the second run *loads* the stored identity: it prints
+//! `Loaded` instead of `Created` and the same `node_id`, and on Windows the key file is
+//! `identity.dpapi` (a DPAPI blob, not a DER sequence — the demo prints its first bytes).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -27,7 +32,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::env::temp_dir().join(format!("lan-workspace-pair-demo-{}", std::process::id()));
+    // Stable on purpose: the second run must find (and load) what the first one stored.
+    let root = std::env::temp_dir().join("lan-workspace-pair-demo");
     let dir_a = root.join("node-a");
     let dir_b = root.join("node-b");
     let dir_c = root.join("node-c");
@@ -36,7 +42,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (identity_a, load_a) = NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&dir_a))?;
     let (identity_b, load_b) = NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&dir_b))?;
     let (identity_c, _) = NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&dir_c))?;
-    println!("== identities ==");
+    println!("== identities (state dir {}) ==", root.display());
+    for (label, identity_paths) in [("A", &dir_a), ("B", &dir_b), ("C", &dir_c)] {
+        let key_file = identity_paths.join(identity::key::KEY_FILE_NAME);
+        match std::fs::read(&key_file) {
+            Ok(bytes) => {
+                let head: Vec<String> = bytes
+                    .iter()
+                    .take(16)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                println!(
+                    "  {label} key file {} : {} bytes, head {} (raw PKCS#8 DER? {})",
+                    key_file.display(),
+                    bytes.len(),
+                    head.join(" "),
+                    bytes.first() == Some(&0x30)
+                );
+            }
+            Err(error) => println!("  {label} key file {} : {error}", key_file.display()),
+        }
+    }
     println!(
         "A (window opener): {} ({:?}) fingerprint {}",
         identity_a.node_id(),
@@ -93,7 +119,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identity::fingerprint_grouped(&paired_b.node_id)
     );
 
-    let mut trust_a = TrustStore::new();
+    // Load what a previous run left behind (the demo is re-runnable), then commit the new
+    // pairing; `trust()` replaces the record wholesale, which is what
+    // «повторное сопряжение создаёт новую запись» requires.
+    let trust_file_a = IdentityPaths::rooted_at(&dir_a).trust_file;
+    let mut trust_a = match TrustStore::load(&trust_file_a)? {
+        identity::atomic::LoadResult::Loaded(store) => store,
+        _ => TrustStore::new(),
+    };
     trust_a.trust(paired_a.trusted_peer(now_unix_ms(), Some(address.to_string())));
     trust_a.save(&IdentityPaths::rooted_at(&dir_a).trust_file)?;
     let mut trust_b = TrustStore::new();
@@ -164,8 +197,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "«TRUSTED_PEER с revoked_at не может открыть сеанс»"
     );
 
-    std::fs::remove_dir_all(&root).ok();
-    println!("\nPAIR DEMO OK");
+    println!(
+        "\nstate dir kept at {} (delete it to start over)",
+        root.display()
+    );
+    println!("PAIR DEMO OK");
     Ok(())
 }
 

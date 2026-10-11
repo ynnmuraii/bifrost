@@ -4,7 +4,7 @@
 //!
 //! | | path |
 //! |---|---|
-//! | Windows | `%APPDATA%\lan-workspace\identity.dpapi` (DPAPI CurrentUser) |
+//! | Windows | `%APPDATA%\lan-workspace\identity.dpapi` (DPAPI CurrentUser, owner-only ACL) |
 //! | Linux | Secret Service; otherwise `$XDG_DATA_HOME/lan-workspace/identity.key` (0600) |
 //!
 //! «Каталоги создаются с правами только для пользователя: ACL на текущий SID в Windows,
@@ -12,14 +12,12 @@
 //! ошибку» — so [`NodeIdentity::load_or_create`] enforces 0700/0600 on Linux and refuses
 //! a key file that a group or another user could read.
 //!
-//! **Two documented gaps** (both are follow-ups, not silent substitutions):
+//! The key is stored under the platform's own protection: `identity.dpapi` is a DPAPI
+//! CurrentUser blob ([`crate::keystore`]) and the directory/file get an owner-only ACL on
+//! Windows ([`crate::acl`]) or `0700`/`0600` on Linux ([`crate::atomic`]).
 //!
-//! * Windows stores the PKCS#8 key as `identity.key` under `%APPDATA%\lan-workspace`
-//!   with the profile ACL. The docs' `identity.dpapi` needs `CryptProtectData`
-//!   (DPAPI CurrentUser) wrapping, which is not implemented here; naming an unprotected
-//!   file `.dpapi` would be a lie.
-//! * Linux uses the documented 0600-file fallback. The Secret Service path (D-Bus) is
-//!   not implemented.
+//! **One documented gap**: Linux uses the documented 0600-file fallback; the Secret Service
+//! path (D-Bus) is not implemented.
 //!
 //! # Why Ed25519
 //!
@@ -37,6 +35,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use geometry::NodeId;
 
 use crate::atomic;
+use crate::keystore;
 use crate::spki::{fingerprint, fingerprint_grouped, node_id_from_certificate, SpkiError};
 
 /// Failures while loading or creating the node identity.
@@ -68,7 +67,8 @@ impl std::fmt::Display for IdentityError {
             IdentityError::Tls(detail) => write!(f, "tls configuration error: {detail}"),
             IdentityError::InsecurePermissions { path } => write!(
                 f,
-                "{} is readable by other users; expected 0600 for the identity key",
+                "{} is accessible to other users (Linux: expected mode 0600, the directory 0700; \
+                 Windows: the ACL may name only the current user SID); refusing to start",
                 path.display()
             ),
         }
@@ -88,6 +88,19 @@ impl From<SpkiError> for IdentityError {
         IdentityError::Spki(error)
     }
 }
+
+/// The file the private key lives in.
+///
+/// `docs/03-architecture.md`: `%APPDATA%\lan-workspace\identity.dpapi` (DPAPI CurrentUser)
+/// on Windows, `$XDG_DATA_HOME/lan-workspace/identity.key` (0600) on Linux. The two are
+/// different formats, which is why the *name* differs too: a reader must be able to tell a
+/// DPAPI blob from a bare PKCS#8 file.
+#[cfg(windows)]
+pub const KEY_FILE_NAME: &str = "identity.dpapi";
+
+/// See the Windows variant for the reasoning; this is the documented Linux path.
+#[cfg(unix)]
+pub const KEY_FILE_NAME: &str = "identity.key";
 
 /// Where this node keeps its identity and its trust store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +133,7 @@ impl IdentityPaths {
                 })?;
             let data_dir = data_root.join("lan-workspace");
             Ok(Self {
-                key_file: data_dir.join("identity.key"),
+                key_file: data_dir.join(KEY_FILE_NAME),
                 trust_file: config_root.join("lan-workspace").join("trust.toml"),
                 data_dir,
             })
@@ -132,7 +145,7 @@ impl IdentityPaths {
                 .ok_or_else(|| IdentityError::Key("%APPDATA% is not set".into()))?;
             let dir = appdata.join("lan-workspace");
             Ok(Self {
-                key_file: dir.join("identity.key"),
+                key_file: dir.join(KEY_FILE_NAME),
                 trust_file: dir.join("trust.toml"),
                 data_dir: dir,
             })
@@ -144,7 +157,7 @@ impl IdentityPaths {
     pub fn rooted_at(directory: impl Into<PathBuf>) -> Self {
         let data_dir = directory.into();
         Self {
-            key_file: data_dir.join("identity.key"),
+            key_file: data_dir.join(KEY_FILE_NAME),
             trust_file: data_dir.join("trust.toml"),
             data_dir,
         }
@@ -214,17 +227,26 @@ impl NodeIdentity {
     /// from the *public key* (the SPKI), so peers pin an identity that survives, while
     /// the self-signed certificate bytes (serial, validity) never need to be persisted.
     pub fn load_or_create(paths: &IdentityPaths) -> Result<(Self, IdentityLoad), IdentityError> {
-        if let Some(bytes) = atomic::read(&paths.key_file)? {
+        if let Some(sealed) = atomic::read(&paths.key_file)? {
             if atomic::is_wider_than_owner(&paths.key_file)? {
                 return Err(IdentityError::InsecurePermissions {
                     path: paths.key_file.clone(),
                 });
             }
-            return Ok((Self::from_pkcs8(&bytes)?, IdentityLoad::Loaded));
+            // Windows: DPAPI CurrentUser; Linux: the bytes as stored (the file mode is the
+            // protection there). A blob sealed for another user or with other entropy fails
+            // here instead of silently producing a different identity.
+            let pkcs8 =
+                keystore::unseal(&sealed).map_err(|error| IdentityError::Key(error.to_string()))?;
+            return Ok((Self::from_pkcs8(&pkcs8)?, IdentityLoad::Loaded));
         }
         let identity = Self::generate()?;
+        // The directory is created with an owner-only ACL *before* the key is written, so
+        // the sealed key never exists in a world-readable place.
         atomic::create_private_dir(&paths.data_dir)?;
-        atomic::write_atomic(&paths.key_file, &identity.pkcs8_der())?;
+        let sealed = keystore::seal(&identity.pkcs8_der())
+            .map_err(|error| IdentityError::Key(error.to_string()))?;
+        atomic::write_atomic(&paths.key_file, &sealed)?;
         Ok((identity, IdentityLoad::Created))
     }
 
