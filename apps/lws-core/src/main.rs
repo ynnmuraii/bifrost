@@ -368,6 +368,7 @@ async fn run_async(
         private_root(paths).to_path_buf(),
         options.dry_inject,
         options.dry_input_events,
+        options.dry_motion,
         config.input.emergency_hotkey.clone(),
         backend_kind(&config),
         config.input.require_emergency_hotkey,
@@ -431,6 +432,9 @@ async fn run_async(
 struct RunOptions {
     dry_inject: bool,
     dry_input_events: usize,
+    /// With `--dry-inject`: also walk the synthetic pointer over the right edge, so the
+    /// edge-triggered transition can be exercised without a human at the keyboard.
+    dry_motion: bool,
     agent: PathBuf,
     listen: Option<String>,
 }
@@ -439,6 +443,7 @@ impl RunOptions {
     fn parse(rest: &[String]) -> Result<Self, Failure> {
         let mut dry_inject = false;
         let mut dry_input_events = 0usize;
+        let mut dry_motion = false;
         let mut agent = None;
         let mut listen = None;
         let mut index = 0;
@@ -447,6 +452,10 @@ impl RunOptions {
             match argument {
                 "--dry-inject" => {
                     dry_inject = true;
+                    index += 1;
+                }
+                "--dry-motion" => {
+                    dry_motion = true;
                     index += 1;
                 }
                 "--dry-input-events" => {
@@ -483,6 +492,7 @@ impl RunOptions {
         Ok(RunOptions {
             dry_inject,
             dry_input_events,
+            dry_motion,
             agent,
             listen,
         })
