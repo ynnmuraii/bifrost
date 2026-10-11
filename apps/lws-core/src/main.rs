@@ -182,6 +182,14 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
         rest,
     };
 
+    // A command that writes must be able to start with an empty root (`--root DIR`
+    // promises a self-contained tree): the launcher writes its token into `run/`, the
+    // identity and the trust store into `data/`/`config/`, logs into `state/`, and all of
+    // them are owner-only («ACL на текущий SID в Windows», 0700 on Linux).
+    if matches!(args.command.as_str(), "run" | "pair" | "peers") {
+        prepare_dirs(&args.paths)?;
+    }
+
     match args.command.as_str() {
         "run" => run(&args),
         "pair" => pair::main(&args.paths, &args.rest),
@@ -505,6 +513,27 @@ impl RunOptions {
 }
 
 /// The private directory the launch token lives in.
+/// Creates the per-user directories a writing command needs.
+///
+/// Idempotent, and on Linux it also tightens the mode of an existing directory, which is
+/// what makes a fresh `--root` usable without the caller preparing anything.
+fn prepare_dirs(paths: &Paths) -> Result<(), Failure> {
+    let mut dirs = vec![
+        paths.config_dir().to_path_buf(),
+        paths.data_dir().to_path_buf(),
+        paths.state_dir().to_path_buf(),
+        paths.logs_dir(),
+    ];
+    if let Some(runtime) = paths.runtime_dir() {
+        dirs.push(runtime.to_path_buf());
+    }
+    for dir in dirs {
+        identity::atomic::create_private_dir(&dir)
+            .map_err(|error| Failure::Run(format!("cannot create {}: {error}", dir.display())))?;
+    }
+    Ok(())
+}
+
 fn private_root(paths: &Paths) -> &std::path::Path {
     paths.runtime_dir().unwrap_or_else(|| paths.state_dir())
 }
