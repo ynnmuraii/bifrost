@@ -212,33 +212,59 @@ impl Server {
 }
 
 /// Sends one request line and returns the reply line.
+///
+/// The client owns the whole exchange: it writes one line, reads the reply *until the
+/// newline*, and only then closes the connection. Closing earlier is what made the daemon's
+/// reply write fail, and what made a `status` come back as «core closed the control channel
+/// without an answer».
 pub async fn request(endpoint: &Endpoint, line: &str) -> std::io::Result<String> {
     let mut stream = transport::connect(endpoint)
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    serve_line(&mut stream, line).await
+    write_line(&mut stream, line).await?;
+    let reply = read_line(&mut stream).await?;
+    // Half-close the write side now that the request is complete: the reply is already in
+    // hand, and on Unix the peer sees a clean EOF instead of a reset.
+    tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
+    reply.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "core closed the control channel without an answer",
+        )
+    })
 }
 
-/// One request/reply exchange on an accepted connection.
-pub async fn serve_line<S>(stream: &mut S, line: &str) -> std::io::Result<String>
+/// Writes one line and flushes it, so the peer can read it before this side goes away.
+pub async fn write_line<S>(stream: &mut S, line: &str) -> std::io::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncWrite + Unpin,
 {
     stream
         .write_all(format!("{line}\n").as_bytes())
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    stream.flush().await.ok();
+    stream
+        .flush()
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// Reads one line; `Ok(None)` means the peer closed before sending one.
+///
+/// Both sides use exactly this and never a second line on the same connection: the daemon
+/// answers one request per connection, so reading again after the reply only raced the
+/// client's close and turned every answer into a logged failure.
+pub async fn read_line<S>(stream: &mut S) -> std::io::Result<Option<String>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut reader = BufReader::new(stream);
-    let mut reply = String::new();
-    let read = reader.read_line(&mut reply).await?;
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).await?;
     if read == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "core closed the control channel without an answer",
-        ));
+        return Ok(None);
     }
-    Ok(reply)
+    Ok(Some(line))
 }
 
 /// What the session loop tells the status line about itself.
