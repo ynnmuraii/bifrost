@@ -78,9 +78,8 @@ pub fn endpoint(runtime_dir: &std::path::Path) -> Result<Endpoint, String> {
 #[cfg(windows)]
 fn runtime_tag(runtime_dir: &std::path::Path) -> Option<String> {
     let defaults = config::Config::default_paths().ok()?;
-    let canonical = |path: &std::path::Path| {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    };
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let ours = canonical(runtime_dir);
     let is_default = [defaults.runtime_dir(), Some(defaults.state_dir())]
         .into_iter()
