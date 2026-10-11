@@ -25,10 +25,6 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::error::IpcError;
 use crate::peer::{PeerCheck, PeerCredentials};
 
-/// Application directory inside `$XDG_RUNTIME_DIR`.
-pub const APP_DIR: &str = "lan-workspace";
-/// GUI socket file name.
-pub const GUI_SOCKET: &str = "gui.sock";
 /// Mode of the runtime directory (owner only).
 pub const DIR_MODE: u32 = 0o700;
 /// Mode of the GUI socket (owner only).
@@ -75,8 +71,13 @@ impl Endpoint {
 }
 
 /// `runtime_dir/lan-workspace/gui.sock`.
+///
+/// The two names come from [`config::paths`], the single source of the documented file
+/// names; this function only adds the `$XDG_RUNTIME_DIR` prefix.
 pub fn gui_socket_path(runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join(APP_DIR).join(GUI_SOCKET)
+    runtime_dir
+        .join(config::paths::APP_DIR)
+        .join(config::paths::GUI_SOCKET_FILE)
 }
 
 /// The listening side of the GUI channel.

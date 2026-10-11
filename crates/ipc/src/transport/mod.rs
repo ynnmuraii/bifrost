@@ -17,8 +17,8 @@
 mod unix;
 #[cfg(unix)]
 pub use unix::{
-    agent_pair, connect, gui_socket_path, listen, peer_credentials, Endpoint, GuiListener, APP_DIR,
-    DIR_MODE, GUI_SOCKET, SOCKET_MODE,
+    agent_pair, connect, gui_socket_path, listen, peer_credentials, Endpoint, GuiListener,
+    DIR_MODE, SOCKET_MODE,
 };
 
 #[cfg(windows)]

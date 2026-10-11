@@ -11,6 +11,10 @@ workspace = true
 
 [dependencies]
 protocol = { path = "../protocol" }
+# `config::paths` owns the documented application directory and socket names, so `ipc`
+# imports them instead of repeating the literals. The dependency is light (`config` pulls
+# only geometry, protocol, serde and toml) and one-way.
+config = { path = "../config" }
 prost = "0.14"
 # `net` covers Unix sockets and Windows named pipes; tokio has no separate
 # feature for them, so it also compiles TCP/UDP. The agent's "no network
