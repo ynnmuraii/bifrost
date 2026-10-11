@@ -64,8 +64,7 @@ pub use capture::{CapturedEvent, X11Capture};
 pub use inject::{InjectResult, PressedLedger, X11Injector};
 #[cfg(target_os = "linux")]
 pub use keymap::{
-    evdev_to_x11_keycode, hid_usage_to_x11_keycode, x11_keycode_to_hid_usage,
-    EMERGENCY_F12_X11_KEYCODE,
+    evdev_to_x11_keycode, hid_key_to_x11_keycode, x11_keycode_to_hid_key, EMERGENCY_F12_X11_KEYCODE,
 };
 
 #[cfg(target_os = "linux")]
@@ -83,6 +82,13 @@ mod error {
         Reply(x11rb::errors::ReplyError),
         /// The server lacks something this backend requires (e.g. XInput2).
         Unsupported(String),
+        /// Relative pointer injection was requested.
+        ///
+        /// Relative injection is deliberately not part of the input contract
+        /// (`docs/03-architecture.md`: a source integrates deltas and sends an
+        /// absolute [`input_model::Position`]), so the backend refuses the event
+        /// rather than guessing at a coordinate.
+        RelativePointerUnsupported,
         /// The backend reached a state it cannot continue from.
         Internal(String),
         /// Waiting for the X connection's file descriptor failed.
@@ -96,6 +102,11 @@ mod error {
                 X11Error::Connection(err) => write!(f, "X connection error: {err}"),
                 X11Error::Reply(err) => write!(f, "X request failed: {err}"),
                 X11Error::Unsupported(what) => write!(f, "unsupported X server: {what}"),
+                X11Error::RelativePointerUnsupported => write!(
+                    f,
+                    "relative pointer injection is not part of the input contract (a source \
+                     integrates deltas into PointerAbsolute); refusing instead of guessing"
+                ),
                 X11Error::Internal(what) => write!(f, "X11 backend error: {what}"),
                 X11Error::Poll(err) => write!(f, "polling the X connection failed: {err}"),
             }
@@ -109,7 +120,9 @@ mod error {
                 X11Error::Connection(err) => Some(err),
                 X11Error::Reply(err) => Some(err),
                 X11Error::Poll(err) => Some(err),
-                X11Error::Unsupported(_) | X11Error::Internal(_) => None,
+                X11Error::Unsupported(_)
+                | X11Error::RelativePointerUnsupported
+                | X11Error::Internal(_) => None,
             }
         }
     }

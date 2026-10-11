@@ -9,6 +9,9 @@ description = "Windows capture (low-level hooks + Raw Input) and SendInput injec
 [lints]
 workspace = true
 
+[dependencies]
+input-model = { path = "../input-model" }
+
 # The Windows bindings are only needed for the real Windows targets; on any other
 # target the crate compiles to the platform-neutral part only (tables, ledger,
 # injection plan) and pulls in no FFI at all.

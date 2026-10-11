@@ -27,7 +27,7 @@
 //!
 //! # Cursor hold
 //!
-//! Entering [`CaptureMode::Remote`] records the current cursor position. From
+//! Entering [`CaptureKind::Remote`] records the current cursor position. From
 //! then on the mouse hook swallows `WM_MOUSEMOVE` and the timer re-warps the
 //! cursor to the recorded point if anything else moved it. See the crate-level
 //! notes for why the warp is not done inside the hook.
@@ -66,8 +66,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDCLASS_STYLES,
 };
 
-use crate::event::{CaptureMode, EmergencyCombo, HidKey, InputEvent, MouseButton};
+use crate::event::EmergencyCombo;
 use crate::{hid, synth, INJECT_TAG};
+use input_model::{CaptureKind, HidKey, InputEvent, KeyState, MouseButton, Position};
 
 /// Windows uses this `dwExtraInfo` value for the fake Shift that `PrintScreen`
 /// and `Pause` synthesise; it is not a real keystroke and is skipped.
@@ -83,7 +84,7 @@ const MOD_SHIFT: u32 = 1 << 1;
 const MOD_ALT: u32 = 1 << 2;
 
 /// Everything the capture thread publishes to the agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// A normalised input event.
     Input(InputEvent),
@@ -97,7 +98,12 @@ pub enum CaptureEvent {
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureConfig {
     /// Starting mode.
-    pub mode: CaptureMode,
+    ///
+    /// [`CaptureKind::Temporary`] is suppression-wise identical to
+    /// [`CaptureKind::Remote`] (REMOTE plus a self-timeout and a local replay of
+    /// the buffer, both of which belong to the agent, not to this adapter); no
+    /// self-timeout is implemented here.
+    pub mode: CaptureKind,
     /// Emergency combination.
     pub emergency: EmergencyCombo,
     /// Bound of the event queue. The architecture document fixes it at 4096.
@@ -118,7 +124,7 @@ pub struct CaptureConfig {
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            mode: CaptureMode::Observe,
+            mode: CaptureKind::Observe,
             emergency: EmergencyCombo::default(),
             queue_capacity: 4096,
             raw_input: true,
@@ -312,22 +318,20 @@ impl Capture {
 
     /// Current mode.
     #[must_use]
-    pub fn mode(&self) -> CaptureMode {
-        if self.shared.mode.load(Ordering::SeqCst) == CaptureMode::Remote as u8 {
-            CaptureMode::Remote
-        } else {
-            CaptureMode::Observe
-        }
+    pub fn mode(&self) -> CaptureKind {
+        capture_kind(&self.shared)
     }
 
     /// Switch mode.
     ///
-    /// Entering [`CaptureMode::Remote`] snapshots the cursor position as the hold
-    /// point; leaving it releases the hold. The mode flip itself is a single
-    /// atomic store, so the hook sees it immediately.
-    pub fn set_mode(&self, mode: CaptureMode) {
+    /// Entering [`CaptureKind::Remote`] snapshots the cursor position as the hold
+    /// point; leaving it releases the hold. [`CaptureKind::Temporary`] suppresses
+    /// identically to `.Remote` (its self-timeout and buffer replay belong to the
+    /// agent, not to this adapter) and so shares the hold branch. The mode flip
+    /// itself is a single atomic store, so the hook sees it immediately.
+    pub fn set_mode(&self, mode: CaptureKind) {
         match mode {
-            CaptureMode::Remote => {
+            CaptureKind::Temporary | CaptureKind::Remote => {
                 let mut point = POINT { x: 0, y: 0 };
                 // SAFETY: `GetCursorPos` writes into a valid `POINT`.
                 if unsafe { GetCursorPos(&mut point) }.is_ok() {
@@ -340,7 +344,7 @@ impl Capture {
                 }
                 self.shared.emergency_fired.store(false, Ordering::SeqCst);
             }
-            CaptureMode::Observe => {
+            CaptureKind::Observe => {
                 self.shared.hold_valid.store(false, Ordering::SeqCst);
             }
         }
@@ -595,8 +599,19 @@ fn unpack(value: i64) -> (i32, i32) {
     ((value >> 32) as i32, value as u32 as i32)
 }
 
+/// Decode the atomic mode byte back into a [`CaptureKind`].
+fn capture_kind(shared: &Shared) -> CaptureKind {
+    match shared.mode.load(Ordering::Relaxed) {
+        mode if mode == CaptureKind::Temporary as u8 => CaptureKind::Temporary,
+        mode if mode == CaptureKind::Remote as u8 => CaptureKind::Remote,
+        _ => CaptureKind::Observe,
+    }
+}
+
+/// Whether local input is currently suppressed. `Temporary` suppresses exactly
+/// like `Remote`; its self-timeout and buffer replay belong to the agent.
 fn remote(shared: &Shared) -> bool {
-    shared.mode.load(Ordering::Relaxed) == CaptureMode::Remote as u8
+    capture_kind(shared).is_suppressed()
 }
 
 fn update_modifiers(shared: &Shared, vk: u16, down: bool) {
@@ -634,7 +649,7 @@ fn is_emergency(shared: &Shared, vk: u16) -> bool {
 fn fire_emergency(shared: &Shared) {
     shared
         .mode
-        .store(CaptureMode::Observe as u8, Ordering::SeqCst);
+        .store(CaptureKind::Observe as u8, Ordering::SeqCst);
     shared.hold_valid.store(false, Ordering::SeqCst);
     if !shared.emergency_fired.swap(true, Ordering::SeqCst) {
         shared.emergencies.fetch_add(1, Ordering::Relaxed);
@@ -679,7 +694,7 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
             shared,
             InputEvent::Key {
                 key: HidKey::keyboard(usage),
-                down,
+                state: KeyState::from_down(down),
             },
         ),
         None => {
@@ -718,10 +733,7 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
             // coordinates are the authoritative absolute position.
             push(
                 shared,
-                InputEvent::PointerAbs {
-                    x: ms.pt.x,
-                    y: ms.pt.y,
-                },
+                InputEvent::PointerAbsolute(Position::new(ms.pt.x as f64, ms.pt.y as f64)),
             );
             Some(false)
         }
@@ -731,7 +743,7 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
                 shared,
                 InputEvent::Button {
                     button: MouseButton::Left,
-                    down,
+                    state: KeyState::from_down(down),
                 },
             );
             Some(swallow)
@@ -742,7 +754,7 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
                 shared,
                 InputEvent::Button {
                     button: MouseButton::Right,
-                    down,
+                    state: KeyState::from_down(down),
                 },
             );
             Some(swallow)
@@ -753,7 +765,7 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
                 shared,
                 InputEvent::Button {
                     button: MouseButton::Middle,
-                    down,
+                    state: KeyState::from_down(down),
                 },
             );
             Some(swallow)
@@ -766,18 +778,24 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
             } else {
                 MouseButton::Forward
             };
-            push(shared, InputEvent::Button { button, down });
+            push(
+                shared,
+                InputEvent::Button {
+                    button,
+                    state: KeyState::from_down(down),
+                },
+            );
             Some(swallow)
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let delta = ((ms.mouseData >> 16) as u16 as i16) as i32;
             let event = if message == WM_MOUSEWHEEL {
-                InputEvent::Wheel {
+                InputEvent::Scroll {
                     h120: 0,
                     v120: delta,
                 }
             } else {
-                InputEvent::Wheel {
+                InputEvent::Scroll {
                     h120: delta,
                     v120: 0,
                 }
@@ -836,7 +854,7 @@ fn handle_raw_input(shared: &Shared, lparam: LPARAM) {
     }
 
     shared.raw_mouse_moves.fetch_add(1, Ordering::Relaxed);
-    push(shared, InputEvent::PointerRel { dx, dy });
+    push(shared, InputEvent::PointerRelative { dx, dy });
 }
 
 /// Re-assert the cursor hold point while in Remote.

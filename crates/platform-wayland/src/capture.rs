@@ -33,7 +33,7 @@ use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
 use futures_util::stream::StreamExt;
 use futures_util::Stream;
-use input_model::{evdev_to_hid_usage, ButtonKind, HidUsage, InputEvent, KeyState, Position};
+use input_model::{evdev_to_hid_usage, HidKey, InputEvent, KeyState, MouseButton, Position};
 use reis::ei;
 use reis::event::{self, DeviceCapability, EiEvent};
 use tokio::sync::OnceCell;
@@ -743,7 +743,7 @@ impl WaylandCapture {
             EiEvent::KeyboardKey(key) => {
                 match u16::try_from(key.key).ok().and_then(evdev_to_hid_usage) {
                     Some(usage) => Some(CapturedEvent::Input(InputEvent::Key {
-                        usage: HidUsage::keyboard(usage),
+                        key: HidKey::keyboard(usage),
                         state: key_state(key.state),
                     })),
                     None => {
@@ -754,7 +754,7 @@ impl WaylandCapture {
             }
             EiEvent::Button(button) => match u16::try_from(button.button)
                 .ok()
-                .and_then(ButtonKind::from_evdev_code)
+                .and_then(MouseButton::from_evdev_code)
             {
                 Some(kind) => Some(CapturedEvent::Input(InputEvent::Button {
                     button: kind,

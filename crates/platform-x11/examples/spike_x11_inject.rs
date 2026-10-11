@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-use input_model::{ButtonKind, HidUsage, InputEvent, KeyState, Position};
+use input_model::{HidKey, InputEvent, KeyState, MouseButton, Position};
 #[cfg(target_os = "linux")]
 use platform_x11::{InjectResult, X11Injector};
 
@@ -218,13 +218,13 @@ fn run_observe(injector: &mut X11Injector, start: Position, deadline: Instant) {
 #[cfg(target_os = "linux")]
 fn run_live(injector: &mut X11Injector, deadline: Instant) {
     for usage in [0x0F_u16, 0x1A, 0x16] {
-        let key = HidUsage::keyboard(usage);
+        let key = HidKey::keyboard(usage);
         let press = injector.inject(&[InputEvent::Key {
-            usage: key,
+            key,
             state: KeyState::Down,
         }]);
         let release = injector.inject(&[InputEvent::Key {
-            usage: key,
+            key,
             state: KeyState::Up,
         }]);
         println!(
@@ -235,11 +235,11 @@ fn run_live(injector: &mut X11Injector, deadline: Instant) {
 
     let click = injector.inject(&[
         InputEvent::Button {
-            button: ButtonKind::Left,
+            button: MouseButton::Left,
             state: KeyState::Down,
         },
         InputEvent::Button {
-            button: ButtonKind::Left,
+            button: MouseButton::Left,
             state: KeyState::Up,
         },
     ]);

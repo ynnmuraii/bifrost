@@ -37,10 +37,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use crate::event::{InputEvent, MouseButton};
 use crate::inject_plan::{self, Plan, Record, VirtualDesktop};
 use crate::ledger::PressedLedger;
 use crate::{synth, INJECT_TAG};
+use input_model::{InputEvent, MouseButton};
 
 /// What went wrong with an injection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +74,7 @@ impl fmt::Display for InjectError {
 }
 
 /// Outcome of one `SendInput` call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InjectStatus {
     /// How many events were offered.
     pub requested: usize,
@@ -197,11 +197,10 @@ impl Injector {
 
         for event in &status.not_injected {
             match *event {
-                InputEvent::Key { key, down: false } => self.ledger.mark_held(key),
-                InputEvent::Button {
-                    button,
-                    down: false,
-                } => self.ledger.mark_held_button(button),
+                InputEvent::Key { key, state } if state.is_up() => self.ledger.mark_held(key),
+                InputEvent::Button { button, state } if state.is_up() => {
+                    self.ledger.mark_held_button(button);
+                }
                 _ => {}
             }
         }
@@ -414,17 +413,22 @@ pub fn describe_record(record: Record) -> String {
 #[must_use]
 pub fn describe_event(event: &InputEvent) -> String {
     match *event {
-        InputEvent::Key { key, down } => format!(
+        InputEvent::Key { key, state } => format!(
             "KEY page=0x{:04X} usage=0x{:04X} {}",
             key.page,
             key.usage,
-            if down { "down" } else { "up" }
+            if state.is_down() { "down" } else { "up" }
         ),
-        InputEvent::Button { button, down } => {
-            format!("BTN {button:?} {}", if down { "down" } else { "up" })
+        InputEvent::Button { button, state } => {
+            format!(
+                "BTN {button:?} {}",
+                if state.is_down() { "down" } else { "up" }
+            )
         }
-        InputEvent::PointerRel { dx, dy } => format!("MOV rel dx={dx} dy={dy}"),
-        InputEvent::PointerAbs { x, y } => format!("MOV abs x={x} y={y}"),
-        InputEvent::Wheel { h120, v120 } => format!("WHEEL h120={h120} v120={v120}"),
+        InputEvent::PointerRelative { dx, dy } => format!("MOV rel dx={dx} dy={dy}"),
+        InputEvent::PointerAbsolute(position) => {
+            format!("MOV abs x={} y={}", position.x, position.y)
+        }
+        InputEvent::Scroll { h120, v120 } => format!("WHEEL h120={h120} v120={v120}"),
     }
 }

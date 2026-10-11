@@ -511,6 +511,7 @@ dependencies = [
 name = "platform-win"
 version = "0.0.1"
 dependencies = [
+ "input-model",
  "windows",
 ]
 

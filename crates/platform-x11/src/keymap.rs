@@ -24,9 +24,9 @@
 //!   buttons 1..3 are left/middle/right, 4..7 are the wheel axes
 //!   (up/down/left/right), and 8/9 are back/forward. Reusing 4/5 for
 //!   back/forward — as some "1..5" tables do — would collide with vertical
-//!   scrolling, so [`button_kind_to_x11_button`] uses 1/2/3/8/9.
+//!   scrolling, so [`mouse_button_to_x11_button`] uses 1/2/3/8/9.
 
-use input_model::{evdev_to_hid_usage, hid_usage_to_evdev_code, ButtonKind, HidUsage, KeyState};
+use input_model::{evdev_to_hid_usage, hid_key_to_evdev, HidKey, KeyState, MouseButton};
 
 /// Offset between a Linux evdev code and the X11 keycode of the current XKB
 /// keymap under the standard `evdev` rules.
@@ -35,11 +35,11 @@ pub const X11_KEYCODE_OFFSET: u16 = 8;
 /// One wheel notch in the Windows/`wl_pointer` unit (KVM DoD: 120 units = 1 notch).
 pub const WHEEL_UNITS_PER_NOTCH: i32 = 120;
 
-/// X11 button number for [`ButtonKind::Left`].
+/// X11 button number for [`MouseButton::Left`].
 pub const X11_BUTTON_LEFT: u8 = 1;
-/// X11 button number for [`ButtonKind::Middle`].
+/// X11 button number for [`MouseButton::Middle`].
 pub const X11_BUTTON_MIDDLE: u8 = 2;
-/// X11 button number for [`ButtonKind::Right`].
+/// X11 button number for [`MouseButton::Right`].
 pub const X11_BUTTON_RIGHT: u8 = 3;
 /// X11 wheel button: vertical scroll up (one notch per press/release pair).
 pub const X11_BUTTON_WHEEL_UP: u8 = 4;
@@ -49,9 +49,9 @@ pub const X11_BUTTON_WHEEL_DOWN: u8 = 5;
 pub const X11_BUTTON_WHEEL_LEFT: u8 = 6;
 /// X11 wheel button: horizontal scroll right.
 pub const X11_BUTTON_WHEEL_RIGHT: u8 = 7;
-/// X11 button number for [`ButtonKind::Back`] (browser back).
+/// X11 button number for [`MouseButton::Back`] (browser back).
 pub const X11_BUTTON_BACK: u8 = 8;
-/// X11 button number for [`ButtonKind::Forward`] (browser forward).
+/// X11 button number for [`MouseButton::Forward`] (browser forward).
 pub const X11_BUTTON_FORWARD: u8 = 9;
 
 /// HID keyboard-page usage of `F12`.
@@ -101,7 +101,7 @@ pub const SHIFT_KEYCODES: [u8; 2] = [LEFT_SHIFT_X11_KEYCODE, RIGHT_SHIFT_X11_KEY
 /// the shared `input-model` table does not map. Only used for the constants above,
 /// where a failure is a programming error and must break the build.
 const fn keycode_for_hid_usage(usage: u16) -> u8 {
-    match hid_usage_to_evdev_code(HidUsage::keyboard(usage)) {
+    match hid_key_to_evdev(HidKey::keyboard(usage)) {
         Some(evdev) => {
             let keycode = evdev + X11_KEYCODE_OFFSET;
             if keycode > u8::MAX as u16 {
@@ -128,8 +128,8 @@ pub fn evdev_to_x11_keycode(evdev: u16) -> Option<u8> {
 /// devices with no key here. A reserved usage mapped to the kernel sentinel
 /// `KEY_UNKNOWN` (240) does produce `Some(248)`; that keycode is what the kernel
 /// would use, and it is normally unbound in the keymap.
-pub fn hid_usage_to_x11_keycode(usage: HidUsage) -> Option<u8> {
-    evdev_to_x11_keycode(hid_usage_to_evdev_code(usage)?)
+pub fn hid_key_to_x11_keycode(key: HidKey) -> Option<u8> {
+    evdev_to_x11_keycode(hid_key_to_evdev(key)?)
 }
 
 /// X11 keycode -> evdev code (keycode - 8).
@@ -140,40 +140,40 @@ pub fn x11_keycode_to_evdev(keycode: u8) -> Option<u16> {
     u16::from(keycode).checked_sub(X11_KEYCODE_OFFSET)
 }
 
-/// X11 keycode -> HID usage (the inverse of [`hid_usage_to_x11_keycode`]).
+/// X11 keycode -> HID usage (the inverse of [`hid_key_to_x11_keycode`]).
 ///
 /// `None` when the keycode has no evdev equivalent, when no table entry maps to
 /// that evdev code, and for `KEY_RESERVED`.
-pub fn x11_keycode_to_hid_usage(keycode: u8) -> Option<HidUsage> {
+pub fn x11_keycode_to_hid_key(keycode: u8) -> Option<HidKey> {
     let evdev = x11_keycode_to_evdev(keycode)?;
-    Some(HidUsage::keyboard(evdev_to_hid_usage(evdev)?))
+    Some(HidKey::keyboard(evdev_to_hid_usage(evdev)?))
 }
 
-/// [`ButtonKind`] -> X11 core button number.
+/// [`MouseButton`] -> X11 core button number.
 ///
 /// Left/middle/right are 1/2/3; back/forward are 8/9 because 4..7 are the wheel
 /// axes in the core protocol (see the module docs).
-pub const fn button_kind_to_x11_button(kind: ButtonKind) -> u8 {
-    match kind {
-        ButtonKind::Left => X11_BUTTON_LEFT,
-        ButtonKind::Middle => X11_BUTTON_MIDDLE,
-        ButtonKind::Right => X11_BUTTON_RIGHT,
-        ButtonKind::Back => X11_BUTTON_BACK,
-        ButtonKind::Forward => X11_BUTTON_FORWARD,
+pub const fn mouse_button_to_x11_button(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => X11_BUTTON_LEFT,
+        MouseButton::Middle => X11_BUTTON_MIDDLE,
+        MouseButton::Right => X11_BUTTON_RIGHT,
+        MouseButton::Back => X11_BUTTON_BACK,
+        MouseButton::Forward => X11_BUTTON_FORWARD,
     }
 }
 
-/// X11 core button number -> [`ButtonKind`], the inverse of
-/// [`button_kind_to_x11_button`].
+/// X11 core button number -> [`MouseButton`], the inverse of
+/// [`mouse_button_to_x11_button`].
 ///
 /// `None` for the wheel buttons 4..7 and for buttons the product does not carry.
-pub const fn x11_button_to_button_kind(button: u8) -> Option<ButtonKind> {
+pub const fn x11_button_to_mouse_button(button: u8) -> Option<MouseButton> {
     match button {
-        X11_BUTTON_LEFT => Some(ButtonKind::Left),
-        X11_BUTTON_MIDDLE => Some(ButtonKind::Middle),
-        X11_BUTTON_RIGHT => Some(ButtonKind::Right),
-        X11_BUTTON_BACK => Some(ButtonKind::Back),
-        X11_BUTTON_FORWARD => Some(ButtonKind::Forward),
+        X11_BUTTON_LEFT => Some(MouseButton::Left),
+        X11_BUTTON_MIDDLE => Some(MouseButton::Middle),
+        X11_BUTTON_RIGHT => Some(MouseButton::Right),
+        X11_BUTTON_BACK => Some(MouseButton::Back),
+        X11_BUTTON_FORWARD => Some(MouseButton::Forward),
         _ => None,
     }
 }

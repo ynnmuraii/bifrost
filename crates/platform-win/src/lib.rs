@@ -8,11 +8,14 @@
 //!
 //! # What is here
 //!
-//! * [`event`] — the normalised event vocabulary that maps 1:1 onto the
-//!   `HidKey` / `PointerAbs` / `ButtonEv` / `ScrollEv` / `LocalEvent` messages of
-//!   `outputs/ipc.proto`. Keys are physical USB HID usages (ADR-006): no text
-//!   ever exists in this crate, so EN/RU/AltGr layouts are irrelevant to capture
-//!   and injection and no keylogging payload can be produced by accident.
+//! * [`event`] — the Windows-specific part of the event vocabulary: the
+//!   emergency combination in virtual-key space. The normalised vocabulary
+//!   itself (`HidKey` / `InputEvent` / `PointerAbsolute` …), which maps 1:1 onto
+//!   the `HidKey` / `PointerAbs` / `ButtonEv` / `ScrollEv` / `LocalEvent`
+//!   messages of `outputs/ipc.proto`, lives in the shared `input-model` crate.
+//!   Keys are physical USB HID usages (ADR-006): no text ever exists in this
+//!   crate, so EN/RU/AltGr layouts are irrelevant to capture and injection and
+//!   no keylogging payload can be produced by accident.
 //! * [`hid`] — scancode set 1 (make codes) ⇄ USB HID keyboard/keypad usage IDs,
 //!   full 104/105-key ISO/ANSI set including the `E0`-prefixed extended keys.
 //! * [`ledger`] — the pressed-set ledger that backs "release everything we

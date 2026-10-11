@@ -31,8 +31,8 @@ mod win {
     use std::process::ExitCode;
     use std::time::Duration;
 
+    use input_model::{HidKey, InputEvent, KeyState};
     use platform_win::dpi;
-    use platform_win::event::{HidKey, InputEvent};
     use platform_win::inject::{describe_event, describe_record, InjectStatus, Injector};
 
     /// A usage that is deliberately absent from the scancode table, used by
@@ -80,13 +80,13 @@ mod win {
                 events.len() / 2,
                 InputEvent::Key {
                     key: HidKey::keyboard(UNMAPPED_USAGE),
-                    down: true,
+                    state: KeyState::Down,
                 },
             );
         }
         if args.do_move {
-            events.push(InputEvent::PointerRel { dx: 8, dy: 8 });
-            events.push(InputEvent::PointerRel { dx: -8, dy: -8 });
+            events.push(InputEvent::PointerRelative { dx: 8, dy: 8 });
+            events.push(InputEvent::PointerRelative { dx: -8, dy: -8 });
         }
 
         let plan = Injector::plan_for(&events);
@@ -128,7 +128,7 @@ mod win {
             println!("--hold-demo: holding Left Shift for 1.5s, then releasing everything");
             let hold = injector.inject(&[InputEvent::Key {
                 key: HidKey::keyboard(0xE1),
-                down: true,
+                state: KeyState::Down,
             }]);
             report(&hold);
             std::thread::sleep(Duration::from_millis(1500));
@@ -169,8 +169,14 @@ mod win {
         let mut events = Vec::with_capacity(USAGES.len() * 2);
         for usage in USAGES {
             let key = HidKey::keyboard(usage);
-            events.push(InputEvent::Key { key, down: true });
-            events.push(InputEvent::Key { key, down: false });
+            events.push(InputEvent::Key {
+                key,
+                state: KeyState::Down,
+            });
+            events.push(InputEvent::Key {
+                key,
+                state: KeyState::Up,
+            });
         }
         events
     }

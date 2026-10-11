@@ -25,7 +25,7 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
 use crate::keymap::{
-    button_kind_to_x11_button, hid_usage_to_x11_keycode, WHEEL_UNITS_PER_NOTCH,
+    hid_key_to_x11_keycode, mouse_button_to_x11_button, WHEEL_UNITS_PER_NOTCH,
     X11_BUTTON_WHEEL_DOWN, X11_BUTTON_WHEEL_LEFT, X11_BUTTON_WHEEL_RIGHT, X11_BUTTON_WHEEL_UP,
 };
 use crate::X11Error;
@@ -297,19 +297,20 @@ impl X11Injector {
     fn apply(&mut self, event: &InputEvent) -> Result<(), X11Error> {
         match *event {
             InputEvent::PointerAbsolute(position) => self.fake_absolute_motion(position),
-            InputEvent::Key { usage, state } => {
-                let keycode = hid_usage_to_x11_keycode(usage).ok_or_else(|| {
+            InputEvent::Key { key, state } => {
+                let keycode = hid_key_to_x11_keycode(key).ok_or_else(|| {
                     X11Error::Internal(format!(
                         "no X11 keycode for HID usage 0x{:02X} on page 0x{:02X}",
-                        usage.usage, usage.page
+                        key.usage, key.page
                     ))
                 })?;
                 self.fake_key(keycode, state)
             }
             InputEvent::Button { button, state } => {
-                self.fake_button(button_kind_to_x11_button(button), state)
+                self.fake_button(mouse_button_to_x11_button(button), state)
             }
             InputEvent::Scroll { h120, v120 } => self.fake_scroll(h120, v120),
+            InputEvent::PointerRelative { .. } => Err(X11Error::RelativePointerUnsupported),
         }
     }
 
