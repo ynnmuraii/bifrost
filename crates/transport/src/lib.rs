@@ -14,7 +14,7 @@ pub use link::{
 pub use manager::{LinkManager, ManagerConfig};
 pub use policy::{
     admit_member, liveness_action, next_liveness_wakeup, prefer_incoming, reconnect_delay,
-    winning_dialer, LivenessAction, MembershipFull, OFFLINE_AFTER, PING_INTERVAL,
+    winning_dialer, BackoffBounds, LinkLiveness, LivenessAction, MembershipFull,
 };
 pub use queue::{
     classify, coalesce_motion, is_motion, merge_motion_batches, MessageClass, Outbound,

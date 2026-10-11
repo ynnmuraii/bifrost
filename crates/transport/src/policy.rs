@@ -9,16 +9,53 @@ use std::time::Duration;
 
 use geometry::NodeId;
 
-/// `Ping` period: «`Ping` каждую 1 s» (`docs/06-development-plan.md`, KVM-070).
-pub const PING_INTERVAL: Duration = Duration::from_secs(1);
+/// Liveness cadence of one link: how often this node sends a `Ping` while the link is idle,
+/// and how long a silent peer may go without a `Pong` before it is offline.
+///
+/// The transport is not the owner of these numbers: `crates/config` carries them as
+/// `workspace.link_ping_ms` / `workspace.link_timeout_ms` and validates them
+/// (`link_timeout_ms > link_ping_ms >= 1`), and the application passes them in. The
+/// [`Default`] is what a caller without a configuration gets (the tests, the demo) and
+/// holds the documented `1 s` / `3 s` of `docs/06-development-plan.md`, KVM-070.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkLiveness {
+    /// `Ping` period in milliseconds: «`Ping` каждую 1 s по каждому линку».
+    pub ping_ms: u64,
+    /// No `Pong` within this many milliseconds marks the peer offline: «офлайн через 3 s
+    /// без `Pong`».
+    pub offline_ms: u64,
+}
 
-/// A peer without a `Pong` for this long is offline: «офлайн через 3 s без `Pong`».
-pub const OFFLINE_AFTER: Duration = Duration::from_secs(3);
+impl Default for LinkLiveness {
+    fn default() -> Self {
+        Self {
+            ping_ms: 1_000,
+            offline_ms: 3_000,
+        }
+    }
+}
 
-/// Backoff bounds from the transport diagram: «backoff 0.5..5 s, all configured peers».
-pub const BACKOFF_MIN_MS: u64 = 500;
-/// See [`BACKOFF_MIN_MS`].
-pub const BACKOFF_MAX_MS: u64 = 5_000;
+/// Reconnect backoff bounds in milliseconds: `network.reconnect_backoff_ms`.
+///
+/// `crates/config` owns the documented range («backoff 0.5..5 s») and refuses a pair outside
+/// it; the transport only uses the two numbers it is handed. [`Default`] is the documented
+/// `[500, 5000]` for a caller without a configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackoffBounds {
+    /// The first retry delay.
+    pub min_ms: u64,
+    /// The ceiling every later retry is clamped to.
+    pub max_ms: u64,
+}
+
+impl Default for BackoffBounds {
+    fn default() -> Self {
+        Self {
+            min_ms: 500,
+            max_ms: 5_000,
+        }
+    }
+}
 
 /// Who wins when both peers dialled each other at the same time.
 ///
@@ -72,10 +109,14 @@ pub struct MembershipFull {
 /// Exponential backoff schedule for reconnecting to an unreachable peer.
 ///
 /// `attempt` is the number of failed attempts so far (0 for the first retry). The result
-/// stays inside `0.5..=5 s`, per the transport diagram.
-pub fn reconnect_delay(attempt: u32) -> Duration {
-    let doubled = BACKOFF_MIN_MS.saturating_mul(1u64 << attempt.min(4));
-    Duration::from_millis(doubled.clamp(BACKOFF_MIN_MS, BACKOFF_MAX_MS))
+/// stays inside the bounds `crates/config` validated.
+pub fn reconnect_delay(attempt: u32, bounds: BackoffBounds) -> Duration {
+    // `crates/config` rejects `min > max`; normalising here only keeps a hand-built
+    // `BackoffBounds` from making `clamp` panic.
+    let low = bounds.min_ms.min(bounds.max_ms);
+    let high = bounds.max_ms.max(bounds.min_ms);
+    let doubled = low.saturating_mul(1u64 << attempt.min(4));
+    Duration::from_millis(doubled.clamp(low, high))
 }
 
 /// What a link's liveness state machine wants next.
@@ -92,31 +133,36 @@ pub enum LivenessAction {
 /// Decides the next liveness action from monotonic milliseconds.
 ///
 /// `last_pong_ms` is when the peer last answered (or when the link came up), `last_ping_ms`
-/// when we last sent a `Ping` (`None` before the first one).
+/// when we last sent a `Ping` (`None` before the first one). `liveness` is the configured
+/// cadence, so nothing here hard-codes a period.
 pub fn liveness_action(
     now_ms: u64,
     last_pong_ms: u64,
     last_ping_ms: Option<u64>,
+    liveness: LinkLiveness,
 ) -> LivenessAction {
     let since_pong = now_ms.saturating_sub(last_pong_ms);
-    if since_pong >= OFFLINE_AFTER.as_millis() as u64 {
+    if since_pong >= liveness.offline_ms {
         return LivenessAction::Offline;
     }
     match last_ping_ms {
-        Some(last) if now_ms.saturating_sub(last) < PING_INTERVAL.as_millis() as u64 => {
-            LivenessAction::Idle
-        }
+        Some(last) if now_ms.saturating_sub(last) < liveness.ping_ms => LivenessAction::Idle,
         _ => LivenessAction::Ping,
     }
 }
 
 /// How long to sleep before the next liveness check, so the caller can drive the state
 /// machine with a single `sleep` instead of a busy loop.
-pub fn next_liveness_wakeup(now_ms: u64, last_pong_ms: u64, last_ping_ms: Option<u64>) -> u64 {
+pub fn next_liveness_wakeup(
+    now_ms: u64,
+    last_pong_ms: u64,
+    last_ping_ms: Option<u64>,
+    liveness: LinkLiveness,
+) -> u64 {
     let ping_due = match last_ping_ms {
-        Some(last) => last.saturating_add(PING_INTERVAL.as_millis() as u64),
+        Some(last) => last.saturating_add(liveness.ping_ms),
         None => now_ms,
     };
-    let offline_due = last_pong_ms.saturating_add(OFFLINE_AFTER.as_millis() as u64);
+    let offline_due = last_pong_ms.saturating_add(liveness.offline_ms);
     ping_due.min(offline_due).max(now_ms)
 }
