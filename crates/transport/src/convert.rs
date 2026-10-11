@@ -1,0 +1,626 @@
+//! The mapping between [`focus_router`]'s message vocabulary and `protocol::wire`.
+//!
+//! `focus-router` owns a **1:1 mirror** of the `docs/protocol.proto` messages it needs
+//! (built that way on purpose, see its `wire` module), and a swap to `protocol::wire` is a
+//! mechanical change of that module. It is not done here: the committed focus-router test
+//! suites (`tests/scenarios.rs`, `tests/wire_numbers.rs`) pin its own vocabulary and its
+//! `as_u32()` numbers, so replacing it would rewrite another author's tests. This module is
+//! therefore the single conversion point, and it is the only place that knows both shapes —
+//! when the mirror is eventually swapped, this file shrinks to nothing.
+//!
+//! Rules that are *not* a plain field copy:
+//!
+//! * `lease_id` lives on the `Envelope` on the wire («exactly 16 on lease messages»), while
+//!   focus-router carries it inside the message. `to_envelope` therefore takes an explicit
+//!   `lease_id`, and `from_envelope` lifts it back out.
+//! * `InputBatch.input_batch_seq` **is** the envelope `seq` («Sender's envelope sequence of
+//!   this batch»), so the two are kept equal in both directions.
+//! * [`focus_router::InputEvent::PointerRelative`] has no wire form: a source integrates
+//!   deltas into an absolute position before sending
+//!   (`docs/03-architecture.md`: relative-only injection «в протоколе нет и не
+//!   добавляется»), so it is a conversion error rather than a silent drop.
+//! * `capture_monotonic_us` is diagnostic and set to 0: the normalized event has no
+//!   timestamp, and nothing may derive timing from it.
+
+use focus_router as fr;
+use geometry::{NodeId, Position};
+use input_model::{HidKey, InputEvent, KeyState, MouseButton};
+use protocol::wire;
+
+/// A message that cannot be expressed on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConvertError {
+    /// A relative pointer event has no wire representation.
+    #[error("relative pointer events are not part of the wire contract (integrate them into an absolute position)")]
+    RelativePointerNotOnWire,
+    /// A `oneof` arm or enum value the contract does not define.
+    #[error("unsupported wire value: {0}")]
+    Unsupported(&'static str),
+    /// An enum field carried an unknown number.
+    #[error("{field} has unknown value {value}")]
+    UnknownEnum {
+        /// Field name.
+        field: &'static str,
+        /// The offending number.
+        value: i32,
+    },
+}
+
+fn unknown(field: &'static str, value: i32) -> ConvertError {
+    ConvertError::UnknownEnum { field, value }
+}
+
+/// `focus_router` message -> wire envelope.
+///
+/// `seq` is the caller's per-direction sequence; `connection_id` is the 16 bytes the dialer
+/// chose; `lease_id` is empty for the messages that are not lease-scoped.
+///
+/// `batch_display` is the display a `InputBatch`'s absolute positions belong to. **Known
+/// model gap**: the wire's `Position` carries `display_id`, while the normalized
+/// `input_model::Position` inside [`input_model::InputEvent::PointerAbsolute`] does not, so
+/// this layer has nothing to fill it with. The parameter is the seam for the day
+/// `input-model` grows the field; until then the transport passes an empty string, which a
+/// receiver must treat as "resolve from the zone/geometry you know". `EnterPrepare.position`
+/// is unaffected: it is a `geometry::Position` and keeps its own `display_id`.
+pub fn to_envelope(
+    message: &fr::Message,
+    seq: u64,
+    connection_id: &[u8; 16],
+    lease_id: Option<&[u8; 16]>,
+    batch_display: &str,
+) -> Result<wire::Envelope, ConvertError> {
+    use wire::envelope::Payload;
+
+    let mut envelope = wire::Envelope {
+        major: protocol::limits::PROTOCOL_MAJOR,
+        minor: protocol::limits::PROTOCOL_MINOR,
+        connection_id: connection_id.to_vec(),
+        seq,
+        lease_id: lease_id.map(|id| id.to_vec()).unwrap_or_default(),
+        payload: None,
+    };
+    envelope.payload = Some(match message {
+        fr::Message::EnterPrepare {
+            topology_revision,
+            position,
+            owner_serial,
+            ..
+        } => Payload::EnterPrepare(wire::EnterPrepare {
+            topology_revision: *topology_revision,
+            position: Some(to_wire_position(position)),
+            owner_serial: *owner_serial,
+        }),
+        fr::Message::EnterAck {
+            accepted, reason, ..
+        } => Payload::EnterAck(wire::EnterAck {
+            accepted: *accepted,
+            reason: reason.map(|code| code.as_u32() as i32).unwrap_or(0),
+        }),
+        fr::Message::EnterCommit { .. } => Payload::EnterCommit(wire::EnterCommit {}),
+        fr::Message::Leave { reason, .. } => Payload::Leave(wire::Leave {
+            reason: reason.as_u32() as i32,
+        }),
+        fr::Message::LeaveAck { .. } => Payload::LeaveAck(wire::LeaveAck {}),
+        fr::Message::InputBatch { events, .. } => {
+            // The transport owns the envelope sequence for every frame of a link, and the
+            // wire defines the batch sequence *as* the envelope sequence («Sender's envelope
+            // sequence of this batch»), so the message's own field is stamped over rather
+            // than trusted: a caller that numbered batches independently would otherwise
+            // collide with the control frames' numbering and trip the peer's `SeqValidator`.
+            Payload::InputBatch(wire::InputBatch {
+                events: events
+                    .iter()
+                    .map(|event| to_wire_event(event, batch_display))
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        fr::Message::InjectAck {
+            input_batch_seq,
+            applied_count,
+            actual_position,
+            status,
+            ..
+        } => Payload::InjectAck(wire::InjectAck {
+            input_batch_seq: *input_batch_seq,
+            applied_count: *applied_count,
+            actual_position: actual_position.as_ref().map(to_wire_position),
+            status: status.as_u32() as i32,
+        }),
+        fr::Message::LeaseChallenge { nonce, ttl_ms, .. } => {
+            Payload::LeaseChallenge(wire::LeaseChallenge {
+                nonce: nonce.to_vec(),
+                ttl_ms: *ttl_ms,
+            })
+        }
+        fr::Message::LeaseRenew { nonce, .. } => Payload::LeaseRenew(wire::LeaseRenew {
+            nonce: nonce.to_vec(),
+        }),
+        fr::Message::LeaseStatus {
+            nonce,
+            accepted,
+            last_input_batch_seq,
+            ..
+        } => Payload::LeaseStatus(wire::LeaseStatus {
+            nonce: nonce.to_vec(),
+            accepted: *accepted,
+            last_input_batch_seq: *last_input_batch_seq,
+        }),
+        fr::Message::OwnerClaim { serial, reason, .. } => Payload::OwnerClaim(wire::OwnerClaim {
+            serial: *serial,
+            reason: reason.as_u32() as i32,
+        }),
+        fr::Message::OwnerState {
+            serial,
+            owner,
+            granted,
+            ..
+        } => Payload::OwnerState(wire::OwnerState {
+            serial: *serial,
+            owner_node_id: owner.map(|id| id.as_bytes().to_vec()).unwrap_or_default(),
+            granted: *granted,
+        }),
+        fr::Message::ProtocolError {
+            code, related_seq, ..
+        } => Payload::Error(wire::ProtocolError {
+            related_seq: *related_seq,
+            code: code.as_u32() as i32,
+        }),
+        fr::Message::Shutdown { reason, .. } => Payload::Shutdown(wire::Shutdown {
+            reason: reason.as_u32() as i32,
+        }),
+    });
+    Ok(envelope)
+}
+
+/// Wire envelope -> `focus_router` message.
+pub fn from_envelope(envelope: &wire::Envelope) -> Result<fr::Message, ConvertError> {
+    use wire::envelope::Payload;
+
+    let lease_id = lease_id_of(envelope)?;
+    let payload = envelope
+        .payload
+        .as_ref()
+        .ok_or(ConvertError::Unsupported("empty payload"))?;
+    Ok(match payload {
+        Payload::EnterPrepare(prepare) => fr::Message::EnterPrepare {
+            lease_id: [0u8; 16],
+            topology_revision: prepare.topology_revision,
+            position: from_wire_position(prepare.position.as_ref())?,
+            owner_serial: prepare.owner_serial,
+        },
+        Payload::EnterAck(ack) => fr::Message::EnterAck {
+            lease_id: [0u8; 16],
+            accepted: ack.accepted,
+            reason: if ack.accepted {
+                None
+            } else {
+                Some(error_code_from_i32(ack.reason)?)
+            },
+        },
+        Payload::EnterCommit(_) => fr::Message::EnterCommit {
+            lease_id: [0u8; 16],
+        },
+        Payload::Leave(leave) => fr::Message::Leave {
+            lease_id: [0u8; 16],
+            reason: leave_reason_from_i32(leave.reason)?,
+        },
+        Payload::LeaveAck(_) => fr::Message::LeaveAck {
+            lease_id: [0u8; 16],
+        },
+        Payload::InputBatch(batch) => fr::Message::InputBatch {
+            lease_id: [0u8; 16],
+            input_batch_seq: envelope.seq,
+            events: batch
+                .events
+                .iter()
+                .map(from_wire_event)
+                .collect::<Result<_, _>>()?,
+        },
+        Payload::InjectAck(ack) => fr::Message::InjectAck {
+            lease_id: [0u8; 16],
+            input_batch_seq: ack.input_batch_seq,
+            applied_count: ack.applied_count,
+            actual_position: ack
+                .actual_position
+                .as_ref()
+                .map(|position| from_wire_position(Some(position)))
+                .transpose()?,
+            status: inject_status_from_i32(ack.status)?,
+        },
+        Payload::LeaseChallenge(challenge) => fr::Message::LeaseChallenge {
+            lease_id: [0u8; 16],
+            nonce: nonce_of(&challenge.nonce)?,
+            ttl_ms: challenge.ttl_ms,
+        },
+        Payload::LeaseRenew(renew) => fr::Message::LeaseRenew {
+            lease_id: [0u8; 16],
+            nonce: nonce_of(&renew.nonce)?,
+        },
+        Payload::LeaseStatus(status) => fr::Message::LeaseStatus {
+            lease_id: [0u8; 16],
+            nonce: nonce_of(&status.nonce)?,
+            accepted: status.accepted,
+            last_input_batch_seq: status.last_input_batch_seq,
+        },
+        Payload::OwnerClaim(claim) => fr::Message::OwnerClaim {
+            serial: claim.serial,
+            reason: claim_reason_from_i32(claim.reason)?,
+        },
+        Payload::OwnerState(state) => {
+            fr::Message::OwnerState {
+                serial: state.serial,
+                owner: if state.owner_node_id.is_empty() {
+                    None
+                } else {
+                    Some(NodeId::new(
+                        state.owner_node_id.as_slice().try_into().map_err(|_| {
+                            ConvertError::Unsupported("owner_node_id is not 32 bytes")
+                        })?,
+                    ))
+                },
+                granted: state.granted,
+            }
+        }
+        Payload::Error(error) => fr::Message::ProtocolError {
+            code: error_code_from_i32(error.code)?,
+            related_seq: error.related_seq,
+        },
+        Payload::Shutdown(shutdown) => fr::Message::Shutdown {
+            reason: leave_reason_from_i32(shutdown.reason)?,
+        },
+        // Hello, topology, clipboard and the rest belong to other layers.
+        Payload::Hello(_) => {
+            return Err(ConvertError::Unsupported(
+                "Hello is handled by the handshake",
+            ))
+        }
+        _ => {
+            return Err(ConvertError::Unsupported(
+                "payload is not a focus/lease message",
+            ))
+        }
+    })
+    .map(|message| attach_lease(message, lease_id))
+}
+
+/// The lease id of an envelope, when it carries one.
+pub fn lease_id_of(envelope: &wire::Envelope) -> Result<Option<[u8; 16]>, ConvertError> {
+    if envelope.lease_id.is_empty() {
+        return Ok(None);
+    }
+    envelope
+        .lease_id
+        .as_slice()
+        .try_into()
+        .map(Some)
+        .map_err(|_| ConvertError::Unsupported("lease_id is not 16 bytes"))
+}
+
+fn attach_lease(message: fr::Message, lease_id: Option<[u8; 16]>) -> fr::Message {
+    match message {
+        fr::Message::EnterPrepare {
+            topology_revision,
+            position,
+            owner_serial,
+            ..
+        } => fr::Message::EnterPrepare {
+            lease_id: lease_id.unwrap_or_default(),
+            topology_revision,
+            position,
+            owner_serial,
+        },
+        fr::Message::EnterAck {
+            accepted, reason, ..
+        } => fr::Message::EnterAck {
+            lease_id: lease_id.unwrap_or_default(),
+            accepted,
+            reason,
+        },
+        fr::Message::EnterCommit { .. } => fr::Message::EnterCommit {
+            lease_id: lease_id.unwrap_or_default(),
+        },
+        fr::Message::Leave { reason, .. } => fr::Message::Leave {
+            lease_id: lease_id.unwrap_or_default(),
+            reason,
+        },
+        fr::Message::LeaveAck { .. } => fr::Message::LeaveAck {
+            lease_id: lease_id.unwrap_or_default(),
+        },
+        fr::Message::InputBatch {
+            input_batch_seq,
+            events,
+            ..
+        } => fr::Message::InputBatch {
+            lease_id: lease_id.unwrap_or_default(),
+            input_batch_seq,
+            events,
+        },
+        fr::Message::InjectAck {
+            input_batch_seq,
+            applied_count,
+            actual_position,
+            status,
+            ..
+        } => fr::Message::InjectAck {
+            lease_id: lease_id.unwrap_or_default(),
+            input_batch_seq,
+            applied_count,
+            actual_position,
+            status,
+        },
+        fr::Message::LeaseChallenge { nonce, ttl_ms, .. } => fr::Message::LeaseChallenge {
+            lease_id: lease_id.unwrap_or_default(),
+            nonce,
+            ttl_ms,
+        },
+        fr::Message::LeaseRenew { nonce, .. } => fr::Message::LeaseRenew {
+            lease_id: lease_id.unwrap_or_default(),
+            nonce,
+        },
+        fr::Message::LeaseStatus {
+            nonce,
+            accepted,
+            last_input_batch_seq,
+            ..
+        } => fr::Message::LeaseStatus {
+            lease_id: lease_id.unwrap_or_default(),
+            nonce,
+            accepted,
+            last_input_batch_seq,
+        },
+        other => other,
+    }
+}
+
+/// The lease id a `focus_router` message must travel with.
+pub fn lease_id_of_message(message: &fr::Message) -> Option<[u8; 16]> {
+    let empty = [0u8; 16];
+    match message {
+        fr::Message::EnterPrepare { lease_id, .. }
+        | fr::Message::EnterAck { lease_id, .. }
+        | fr::Message::EnterCommit { lease_id }
+        | fr::Message::Leave { lease_id, .. }
+        | fr::Message::LeaveAck { lease_id }
+        | fr::Message::InputBatch { lease_id, .. }
+        | fr::Message::InjectAck { lease_id, .. }
+        | fr::Message::LeaseChallenge { lease_id, .. }
+        | fr::Message::LeaseRenew { lease_id, .. }
+        | fr::Message::LeaseStatus { lease_id, .. } => {
+            if *lease_id == empty {
+                None
+            } else {
+                Some(*lease_id)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn to_wire_position(position: &Position) -> wire::Position {
+    wire::Position {
+        display_id: position.display_id.as_str().to_owned(),
+        x: position.x,
+        y: position.y,
+    }
+}
+
+/// An absolute pointer position from a batch, which carries no display id.
+fn to_wire_event_position(position: &input_model::Position, display_id: &str) -> wire::Position {
+    wire::Position {
+        display_id: display_id.to_owned(),
+        x: position.x,
+        y: position.y,
+    }
+}
+
+fn from_wire_position(position: Option<&wire::Position>) -> Result<Position, ConvertError> {
+    let position = position.ok_or(ConvertError::Unsupported("missing Position"))?;
+    Ok(Position::new(
+        position.display_id.clone(),
+        position.x,
+        position.y,
+    ))
+}
+
+fn to_wire_event(
+    event: &InputEvent,
+    batch_display: &str,
+) -> Result<wire::InputEvent, ConvertError> {
+    use wire::input_event::Event;
+    let arm = match event {
+        InputEvent::PointerAbsolute(position) => {
+            Event::PointerAbsolute(to_wire_event_position(position, batch_display))
+        }
+        InputEvent::PointerRelative { .. } => return Err(ConvertError::RelativePointerNotOnWire),
+        InputEvent::Key { key, state } => Event::Key(wire::Key {
+            usage_page: u32::from(key.page),
+            usage: u32::from(key.usage),
+            state: key_state_to_i32(*state),
+        }),
+        InputEvent::Button { button, state } => Event::Button(wire::Button {
+            button: *button as i32,
+            state: key_state_to_i32(*state),
+        }),
+        InputEvent::Scroll { h120, v120 } => Event::Scroll(wire::Scroll {
+            horizontal_units120: *h120,
+            vertical_units120: *v120,
+        }),
+    };
+    Ok(wire::InputEvent {
+        // Diagnostic field; the normalized event carries no timestamp and nothing may
+        // derive timing from this.
+        capture_monotonic_us: 0,
+        event: Some(arm),
+    })
+}
+
+fn from_wire_event(event: &wire::InputEvent) -> Result<InputEvent, ConvertError> {
+    use wire::input_event::Event;
+    match event.event.as_ref() {
+        Some(Event::PointerAbsolute(position)) => {
+            // The display id is part of the wire contract; the normalized event has no field
+            // for it (see `to_envelope`), so it is checked here and then dropped.
+            if position.display_id.is_empty() {
+                return Err(ConvertError::Unsupported(
+                    "PointerAbsolute without display_id",
+                ));
+            }
+            Ok(InputEvent::PointerAbsolute(input_model::Position::new(
+                position.x, position.y,
+            )))
+        }
+        Some(Event::Key(key)) => {
+            let state = match key.state {
+                1 => KeyState::Down,
+                2 => KeyState::Up,
+                other => return Err(unknown("Key.state", other)),
+            };
+            Ok(InputEvent::Key {
+                key: HidKey {
+                    page: u16::try_from(key.usage_page)
+                        .map_err(|_| ConvertError::Unsupported("usage_page does not fit u16"))?,
+                    usage: u16::try_from(key.usage)
+                        .map_err(|_| ConvertError::Unsupported("usage does not fit u16"))?,
+                },
+                state,
+            })
+        }
+        Some(Event::Button(button)) => {
+            let state = match button.state {
+                1 => KeyState::Down,
+                2 => KeyState::Up,
+                other => return Err(unknown("Button.state", other)),
+            };
+            // The wire numbering is the `ButtonKind` enum (LEFT = 1 .. FORWARD = 5), which is
+            // also `MouseButton`'s discriminant order.
+            let kind = match button.button {
+                1 => MouseButton::Left,
+                2 => MouseButton::Right,
+                3 => MouseButton::Middle,
+                4 => MouseButton::Back,
+                5 => MouseButton::Forward,
+                other => return Err(unknown("Button.button", other)),
+            };
+            Ok(InputEvent::Button {
+                button: kind,
+                state,
+            })
+        }
+        Some(Event::Scroll(scroll)) => Ok(InputEvent::Scroll {
+            h120: scroll.horizontal_units120,
+            v120: scroll.vertical_units120,
+        }),
+        None => Err(ConvertError::Unsupported("empty InputEvent")),
+    }
+}
+
+fn key_state_to_i32(state: KeyState) -> i32 {
+    match state {
+        KeyState::Down => 1,
+        KeyState::Up => 2,
+    }
+}
+
+fn nonce_of(bytes: &[u8]) -> Result<[u8; 16], ConvertError> {
+    bytes
+        .try_into()
+        .map_err(|_| ConvertError::Unsupported("nonce is not 16 bytes"))
+}
+
+/// `ErrorCode` numbers (`docs/protocol.proto`).
+pub fn error_code_from_i32(value: i32) -> Result<fr::ErrorCode, ConvertError> {
+    Ok(match value {
+        5 => fr::ErrorCode::UnsupportedSession,
+        6 => fr::ErrorCode::CaptureFailed,
+        8 => fr::ErrorCode::TopologyChanged,
+        9 => fr::ErrorCode::InvalidFrame,
+        10 => fr::ErrorCode::InvalidSequence,
+        11 => fr::ErrorCode::LeaseMismatch,
+        12 => fr::ErrorCode::InjectionFailed,
+        13 => fr::ErrorCode::LeaseExpired,
+        14 => fr::ErrorCode::AgentLost,
+        20 => fr::ErrorCode::NotOwner,
+        21 => fr::ErrorCode::StaleOwnerSerial,
+        25 => fr::ErrorCode::CannotOwn,
+        other => return Err(unknown("ErrorCode", other)),
+    })
+}
+
+/// `LeaveReason` numbers.
+pub fn leave_reason_from_i32(value: i32) -> Result<fr::LeaveReason, ConvertError> {
+    Ok(match value {
+        1 => fr::LeaveReason::ReturnEdge,
+        2 => fr::LeaveReason::Hotkey,
+        3 => fr::LeaveReason::Emergency,
+        4 => fr::LeaveReason::ReceiverLocalInput,
+        5 => fr::LeaveReason::AgentLost,
+        6 => fr::LeaveReason::TopologyChanged,
+        7 => fr::LeaveReason::SuspendOrLock,
+        8 => fr::LeaveReason::Shutdown,
+        9 => fr::LeaveReason::OwnershipLost,
+        other => return Err(unknown("LeaveReason", other)),
+    })
+}
+
+/// `ClaimReason` numbers.
+pub fn claim_reason_from_i32(value: i32) -> Result<fr::ClaimReason, ConvertError> {
+    Ok(match value {
+        1 => fr::ClaimReason::Startup,
+        2 => fr::ClaimReason::User,
+        3 => fr::ClaimReason::Takeover,
+        other => return Err(unknown("ClaimReason", other)),
+    })
+}
+
+/// `InjectStatus` numbers.
+pub fn inject_status_from_i32(value: i32) -> Result<fr::InjectStatus, ConvertError> {
+    Ok(match value {
+        1 => fr::InjectStatus::Ok,
+        2 => fr::InjectStatus::Partial,
+        3 => fr::InjectStatus::Failed,
+        other => return Err(unknown("InjectStatus", other)),
+    })
+}
+
+/// The `Hello` fields this layer needs to identify a peer and gate membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInfo {
+    /// `Hello.node_id`, checked against the certificate's SPKI hash.
+    pub node_id: NodeId,
+    /// `Hello.display_name` (non-authoritative).
+    pub display_name: String,
+    /// `Hello.can_own`.
+    pub can_own: bool,
+    /// `Hello.owner_serial`.
+    pub owner_serial: u64,
+    /// `Hello.owner_node_id`.
+    pub owner: Option<NodeId>,
+}
+
+impl PeerInfo {
+    /// Extracts the fields from a validated `Hello`.
+    pub fn from_hello(hello: &wire::Hello) -> Result<Self, ConvertError> {
+        let node_id: [u8; 32] = hello
+            .node_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| ConvertError::Unsupported("Hello.node_id is not 32 bytes"))?;
+        Ok(Self {
+            node_id: NodeId::new(node_id),
+            display_name: hello.display_name.clone(),
+            can_own: hello.can_own,
+            owner_serial: hello.owner_serial,
+            owner: if hello.owner_node_id.is_empty() {
+                None
+            } else {
+                Some(NodeId::new(
+                    hello
+                        .owner_node_id
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| ConvertError::Unsupported("owner_node_id is not 32 bytes"))?,
+                ))
+            },
+        })
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "transport"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "LAN Workspace transport: pinned TLS links, mesh dedup, liveness (KVM-032/070)"
+
+[lints]
+workspace = true
+
+[dependencies]
+geometry = { path = "../geometry" }
+identity = { path = "../identity" }
+input-model = { path = "../input-model" }
+focus-router = { path = "../focus-router" }
+protocol = { path = "../protocol" }
+
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+thiserror = "2"
+
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

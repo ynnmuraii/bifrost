@@ -1,0 +1,44 @@
+//! LAN Workspace transport: pinned TLS links, mesh dedup and liveness (KVM-032/070).
+
+pub mod convert;
+pub mod link;
+pub mod manager;
+pub mod policy;
+pub mod queue;
+
+pub use convert::{ConvertError, PeerInfo};
+pub use link::{
+    read_frame, write_frame, Direction, Link, LinkConfig, LinkDownReason, LinkEvent, LinkHandle,
+    LinkReport, Stream,
+};
+pub use manager::{LinkManager, ManagerConfig};
+pub use policy::{
+    admit_member, liveness_action, next_liveness_wakeup, prefer_incoming, reconnect_delay,
+    winning_dialer, LivenessAction, MembershipFull, OFFLINE_AFTER, PING_INTERVAL,
+};
+pub use queue::{
+    classify, coalesce_motion, is_motion, merge_motion_batches, MessageClass, Outbound,
+};
+
+pub use geometry::NodeId;
+pub use identity::random16;
+
+/// Transport failures.
+#[derive(Debug, thiserror::Error)]
+pub enum TransportError {
+    /// Socket or TLS stream error.
+    #[error("link i/o error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Framing, sequence or conversion violation.
+    #[error("protocol violation: {0}")]
+    Protocol(String),
+    /// The link's task is gone.
+    #[error("the link is closed")]
+    LinkClosed,
+    /// TLS configuration or handshake failure.
+    #[error("tls error: {0}")]
+    Tls(#[from] rustls::Error),
+    /// Identity/key store failure.
+    #[error("identity error: {0}")]
+    Identity(#[from] identity::IdentityError),
+}
