@@ -731,6 +731,9 @@ impl Session {
             }
         };
         let (peer, lease_id) = lease;
+        // The peer receives *its* display's local coordinates: the tracker's virtual
+        // position, not the source's node-space numbers (see `topology::forward_events`).
+        let events = crate::topology::forward_events(events, self.remote_pointer.as_ref());
         let message = fr::Message::InputBatch {
             lease_id,
             // Stamped over by the transport (the wire defines the batch sequence as
