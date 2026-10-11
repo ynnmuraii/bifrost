@@ -432,3 +432,22 @@ pub fn describe_event(event: &InputEvent) -> String {
         InputEvent::Scroll { h120, v120 } => format!("WHEEL h120={h120} v120={v120}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{classify, InjectErrorKind};
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, WIN32_ERROR};
+
+    #[test]
+    fn access_denied_is_classified_and_raw_error_codes_are_preserved() {
+        let denied = classify(ERROR_ACCESS_DENIED);
+        assert_eq!(denied.kind, InjectErrorKind::AccessDenied);
+        assert_eq!(denied.win32, 5);
+        // Windows may leave GetLastError at zero even when injection failed.
+        for raw in [0, 1, 6, 87, u32::MAX] {
+            let error = classify(WIN32_ERROR(raw));
+            assert_eq!(error.kind, InjectErrorKind::Other);
+            assert_eq!(error.win32, raw);
+        }
+    }
+}

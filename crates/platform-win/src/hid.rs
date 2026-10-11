@@ -201,3 +201,16 @@ static TABLE: &[(u16, u16)] = &[
 pub const fn table_len() -> usize {
     TABLE.len()
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scancode_table_is_strictly_sorted_and_usages_are_unique() {
+        // Binary search requires strict ordering. Inspect the actual rows so a
+        // duplicate hidden by a successful public lookup cannot escape detection.
+        assert!(super::TABLE.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let usages: std::collections::BTreeSet<_> =
+            super::TABLE.iter().map(|&(_, usage)| usage).collect();
+        assert_eq!(usages.len(), super::TABLE.len());
+    }
+}
