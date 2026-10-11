@@ -658,18 +658,33 @@ impl PeerInfo {
 
 /// The four `focus_router::Capabilities` flags carried by `Hello.capabilities`.
 ///
-/// The wire enum has ten bits; the FSM only models `CAPTURE`, `INJECT`,
-/// `ABSOLUTE_POINTER` and `EMERGENCY_HOTKEY`, so the other bits are informational for this
-/// layer and are dropped rather than guessed at.
+/// The wire enum has ten bits; the FSM only models `CAPTURE`, `INJECT`, `ABSOLUTE_POINTER`
+/// and `EMERGENCY_HOTKEY`, so the other bits are informational for this layer and are
+/// dropped rather than guessed at. The numbers are read through the generated
+/// `protocol::wire::Capability`, never as bare literals, and the match below is exhaustive
+/// over that enum: a bit added to the `.proto` fails the build until its mapping is
+/// decided.
 pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
+    use protocol::wire::Capability as WireCapability;
     let mut out = fr::Capabilities::default();
     for bit in bits {
-        match *bit {
-            1 => out.capture = true,
-            2 => out.inject = true,
-            3 => out.absolute_pointer = true,
-            10 => out.emergency_hotkey = true,
-            _ => {}
+        let Ok(capability) = WireCapability::try_from(*bit) else {
+            // A number the contract does not define is ignored: this layer has no flag for
+            // it and must not invent one.
+            continue;
+        };
+        match capability {
+            WireCapability::Capture => out.capture = true,
+            WireCapability::Inject => out.inject = true,
+            WireCapability::AbsolutePointer => out.absolute_pointer = true,
+            WireCapability::EmergencyHotkey => out.emergency_hotkey = true,
+            WireCapability::Unspecified
+            | WireCapability::PhysicalHidKeys
+            | WireCapability::TextClipboard
+            | WireCapability::NativeRepeat
+            | WireCapability::SoftwareRepeat
+            | WireCapability::ReceiverTakeover
+            | WireCapability::DisplaysChanged => {}
         }
     }
     out
