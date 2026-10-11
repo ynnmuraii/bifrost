@@ -606,3 +606,83 @@ impl Timers {
         due
     }
 }
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+
+    #[test]
+    fn a_timer_fires_once_at_its_deadline() {
+        let mut timers = Timers::default();
+        timers.arm(fr::Timer::PrepareTimeout, 100);
+
+        assert!(timers.due(99).is_empty(), "not yet due");
+        assert_eq!(timers.due(100).to_vec(), vec![fr::Timer::PrepareTimeout]);
+        assert!(
+            timers.due(1_000).is_empty(),
+            "a fired timer is removed from the wheel"
+        );
+        assert_eq!(timers.next(), None);
+    }
+
+    #[test]
+    fn cancelling_removes_a_timer_and_re_arming_moves_its_deadline() {
+        let mut timers = Timers::default();
+        timers.arm(fr::Timer::ReleaseGuard, 500);
+        assert_eq!(timers.next(), Some((fr::Timer::ReleaseGuard, 500)));
+
+        timers.cancel(fr::Timer::ReleaseGuard);
+        assert_eq!(timers.next(), None);
+        assert!(timers.due(10_000).is_empty());
+
+        // Cancelling something that was never armed is a no-op.
+        timers.cancel(fr::Timer::ClaimGrant);
+        assert_eq!(timers.next(), None);
+
+        timers.arm(fr::Timer::ClaimGrant, 600);
+        timers.arm(fr::Timer::ClaimGrant, 900);
+        assert_eq!(
+            timers.next(),
+            Some((fr::Timer::ClaimGrant, 900)),
+            "re-arming replaces the deadline"
+        );
+        assert!(timers.due(600).is_empty(), "the old deadline is gone");
+        assert_eq!(timers.due(900).to_vec(), vec![fr::Timer::ClaimGrant]);
+    }
+
+    #[test]
+    fn several_timers_fire_in_one_turn_and_leave_the_future_ones_armed() {
+        let mut timers = Timers::default();
+        timers.arm(fr::Timer::PrepareTimeout, 100);
+        timers.arm(fr::Timer::ReceiverChallenge, 100);
+        timers.arm(fr::Timer::ReceiverLeaseDeadline, 900);
+
+        let mut due = timers.due(100);
+        due.sort_by_key(|timer| format!("{timer:?}"));
+        assert_eq!(
+            due,
+            vec![fr::Timer::PrepareTimeout, fr::Timer::ReceiverChallenge]
+        );
+        assert_eq!(
+            timers.next(),
+            Some((fr::Timer::ReceiverLeaseDeadline, 900)),
+            "the future timer stays armed"
+        );
+    }
+
+    /// `next()` feeds `Session::next_deadline`, whose contract is «When the loop must wake
+    /// next»: the earliest deadline, whatever the timer's name is.
+    #[test]
+    fn the_next_wakeup_is_the_earliest_deadline_not_the_first_timer_name() {
+        let mut timers = Timers::default();
+        // `PrepareTimeout` sorts first in `fr::Timer`, but its deadline is the later one.
+        timers.arm(fr::Timer::PrepareTimeout, 400);
+        timers.arm(fr::Timer::ReceiverChallenge, 20);
+
+        assert_eq!(
+            timers.next(),
+            Some((fr::Timer::ReceiverChallenge, 20)),
+            "a wheel keyed by timer name must still report the earliest deadline"
+        );
+    }
+}
