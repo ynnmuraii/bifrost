@@ -501,3 +501,401 @@ fn monotonic_us() -> u64 {
     static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
     START.elapsed().as_micros() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendKindArg;
+    use tokio::io::duplex;
+
+    const HOTKEY: &str = "Ctrl+Alt+Shift+F12";
+
+    fn lease(byte: u8) -> Vec<u8> {
+        vec![byte; 16]
+    }
+
+    /// One agent session over an in-memory link and the dry backend.
+    struct Harness {
+        agent: AgentLink<tokio::io::DuplexStream>,
+        core: AgentLink<tokio::io::DuplexStream>,
+        backend: Backend,
+        ready: backend::Ready,
+        deadline: Option<(Instant, Vec<u8>)>,
+        self_timeout: Option<(Instant, Vec<u8>)>,
+        held: Option<Vec<u8>>,
+        batch: Vec<LocalEvent>,
+    }
+
+    impl Harness {
+        async fn new() -> Self {
+            let (agent_io, core_io) = duplex(8 * 1024);
+            let (backend, ready) = Backend::select(
+                BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
+                true,
+                0,
+                HOTKEY,
+            )
+            .await;
+            Self {
+                agent: AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR),
+                core: AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR),
+                backend,
+                ready,
+                deadline: None,
+                self_timeout: None,
+                held: None,
+                batch: Vec::new(),
+            }
+        }
+
+        async fn send(&mut self, message: Msg) {
+            handle_message(
+                &mut self.agent,
+                &mut self.backend,
+                &self.ready,
+                &message,
+                &mut self.deadline,
+                &mut self.self_timeout,
+                &mut self.held,
+                &mut self.batch,
+            )
+            .await
+            .expect("a valid frame must not fail the handler");
+        }
+
+        async fn recv(&mut self) -> Msg {
+            self.core
+                .recv()
+                .await
+                .expect("the agent must answer")
+                .msg
+                .expect("an answered frame carries a payload")
+        }
+
+        async fn event(&mut self, event: Event) {
+            handle_backend_event(
+                &mut self.agent,
+                &mut self.backend,
+                event,
+                &mut self.held,
+                &mut self.batch,
+            )
+            .await
+            .expect("a backend event must not fail the handler");
+        }
+    }
+
+    fn before(ms: u64) -> Instant {
+        Instant::now() + Duration::from_millis(ms)
+    }
+
+    #[tokio::test]
+    async fn a_temporary_capture_arms_the_self_timeout_and_a_remote_capture_clears_it() {
+        let mut harness = Harness::new().await;
+
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ::protocol::ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(7),
+                self_timeout_ms: 500,
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::CaptureReady(ready) => {
+                assert_eq!(ready.lease_id, lease(7));
+                assert_eq!(ready.kind, ::protocol::ipc::CaptureKind::Temporary as i32);
+            }
+            other => panic!("expected CaptureReady, got {other:?}"),
+        }
+        assert_eq!(
+            harness.held,
+            Some(lease(7)),
+            "the lease is held while capturing"
+        );
+        let (due, lease_id) = harness
+            .self_timeout
+            .clone()
+            .expect("rule 5 arms a self-timeout");
+        assert_eq!(lease_id, lease(7));
+        assert!(
+            due <= before(500) && due > before(400),
+            "the deadline is ~500 ms away: {due:?}"
+        );
+
+        // The bound of rule 4/`ipc.proto`: the agent never arms more than 1000 ms.
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ::protocol::ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(8),
+                self_timeout_ms: 60_000,
+            }))
+            .await;
+        harness.recv().await;
+        let (due, _) = harness.self_timeout.clone().expect("armed");
+        assert!(
+            due <= before(1000),
+            "a self-timeout is clamped to 1000 ms: {due:?}"
+        );
+
+        // REMOTE has no self-timeout: it ends only when core says so.
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ::protocol::ipc::CaptureKind::Remote as i32,
+                lease_id: lease(9),
+                self_timeout_ms: 9000,
+            }))
+            .await;
+        harness.recv().await;
+        assert!(
+            harness.self_timeout.is_none(),
+            "a remote capture is not temporary"
+        );
+        assert_eq!(harness.held, Some(lease(9)));
+    }
+
+    #[tokio::test]
+    async fn end_capture_releases_the_lease_and_clears_the_self_timeout_but_not_the_deadline() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ::protocol::ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(1),
+                self_timeout_ms: 500,
+            }))
+            .await;
+        harness.recv().await;
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(1),
+                remaining_ms: 900,
+            }))
+            .await;
+        assert!(harness.deadline.is_some());
+
+        harness
+            .send(Msg::EndCapture(ipc::EndCapture {
+                lease_id: lease(1),
+                replay_buffered_locally: true,
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Released(released) => assert_eq!(released.lease_id, lease(1)),
+            other => panic!("expected Released, got {other:?}"),
+        }
+        assert!(harness.self_timeout.is_none(), "capture is over");
+        assert!(harness.held.is_none(), "the lease is no longer held");
+        assert!(
+            harness.deadline.is_some(),
+            "only ReleaseSession clears the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_deadline_uses_the_agents_own_clock_within_the_protocol_bound() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(3),
+                remaining_ms: 750,
+            }))
+            .await;
+        let (due, lease_id) = harness.deadline.clone().expect("rule 4 arms the deadline");
+        assert_eq!(lease_id, lease(3), "the deadline belongs to the lease");
+        assert!(due > before(700) && due <= before(750), "{due:?}");
+
+        // `ArmDeadline.remaining_ms` is 1..=1000, so a longer value is clamped, not trusted.
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(3),
+                remaining_ms: 60_000,
+            }))
+            .await;
+        let (due, _) = harness.deadline.clone().expect("re-armed");
+        assert!(due <= before(1000), "clamped to 1000 ms: {due:?}");
+
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(3),
+                remaining_ms: 0,
+            }))
+            .await;
+        let (due, _) = harness.deadline.clone().expect("armed at the floor");
+        assert!(
+            due <= before(1) && due >= Instant::now(),
+            "the floor is 1 ms: {due:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_session_clears_both_clocks_and_the_lease() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ::protocol::ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(4),
+                self_timeout_ms: 400,
+            }))
+            .await;
+        harness.recv().await;
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(4),
+                remaining_ms: 400,
+            }))
+            .await;
+
+        harness
+            .send(Msg::ReleaseSession(ipc::ReleaseSession {
+                lease_id: lease(4),
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Released(released) => assert_eq!(released.lease_id, lease(4)),
+            other => panic!("expected Released, got {other:?}"),
+        }
+        assert!(harness.deadline.is_none());
+        assert!(harness.self_timeout.is_none());
+        assert!(harness.held.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_emergency_releases_the_capture_and_reports_the_held_lease() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ::protocol::ipc::CaptureKind::Remote as i32,
+                lease_id: lease(5),
+                self_timeout_ms: 0,
+            }))
+            .await;
+        harness.recv().await;
+
+        harness.event(Event::Emergency).await;
+        match harness.recv().await {
+            Msg::Emergency(fired) => assert_eq!(fired.lease_id, lease(5)),
+            other => panic!("expected EmergencyFired, got {other:?}"),
+        }
+        assert!(
+            harness.held.is_none(),
+            "local control is restored first (rule 3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_overflow_ends_the_capture_and_is_reported() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ::protocol::ipc::CaptureKind::Remote as i32,
+                lease_id: lease(6),
+                self_timeout_ms: 0,
+            }))
+            .await;
+        harness.recv().await;
+
+        harness.event(Event::QueueOverflow).await;
+        match harness.recv().await {
+            Msg::Error(error) => {
+                assert_eq!(error.code, "QUEUE_OVERFLOW", "rule 2 names the overflow");
+                assert!(!error.detail.is_empty());
+            }
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_capture_failure_is_reported_as_capture_failed() {
+        let mut harness = Harness::new().await;
+        harness
+            .event(Event::Failed("no X connection".to_owned()))
+            .await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "CAPTURE_FAILED"),
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ping_is_answered_with_the_same_nonce() {
+        let mut harness = Harness::new().await;
+        harness.send(Msg::Ping(ipc::Ping { nonce: 42 })).await;
+        match harness.recv().await {
+            Msg::Pong(pong) => assert_eq!(pong.nonce, 42),
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_attach_and_an_unknown_capture_kind_are_protocol_errors() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::Attach(ipc::AgentAttach {
+                launch_token: vec![0u8; 32],
+                mode: AgentMode::Normal as i32,
+                emergency_hotkey: HOTKEY.to_owned(),
+                backend_override: ::protocol::ipc::BackendKind::Auto as i32,
+                restore_tokens: Vec::new(),
+                require_emergency_hotkey: true,
+                core_silence_ms: 300,
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "PROTOCOL"),
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: 0,
+                lease_id: lease(1),
+                self_timeout_ms: 100,
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "PROTOCOL"),
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_allows_only_the_release_and_the_shutdown() {
+        let recovery = AgentMode::Recovery as i32;
+        let normal = AgentMode::Normal as i32;
+
+        for allowed in [
+            Msg::ReleaseKeys(ipc::ReleaseKeys {
+                keys: Vec::new(),
+                buttons: Vec::new(),
+            }),
+            Msg::Shutdown(ipc::AgentShutdown {}),
+        ] {
+            assert!(
+                ::ipc::agent::mode_allows(recovery, &allowed),
+                "{allowed:?} is part of the RECOVERY allow-list (rule 7)"
+            );
+        }
+
+        let refused = [
+            Msg::Attach(ipc::AgentAttach::default()),
+            Msg::BeginCapture(ipc::BeginCapture::default()),
+            Msg::EndCapture(ipc::EndCapture::default()),
+            Msg::PrepareInject(ipc::PrepareInject::default()),
+            Msg::Inject(ipc::Inject::default()),
+            Msg::ArmDeadline(ipc::ArmDeadline::default()),
+            Msg::ReleaseSession(ipc::ReleaseSession::default()),
+            Msg::Ping(ipc::Ping::default()),
+            Msg::QueryDisplays(ipc::QueryDisplays {}),
+            Msg::ForgetPortalGrants(ipc::ForgetPortalGrants {}),
+        ];
+        for message in refused {
+            assert!(
+                !::ipc::agent::mode_allows(recovery, &message),
+                "{message:?} must be refused in RECOVERY"
+            );
+            assert!(
+                ::ipc::agent::mode_allows(normal, &message),
+                "{message:?} is allowed in NORMAL"
+            );
+        }
+    }
+}

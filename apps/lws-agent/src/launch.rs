@@ -46,3 +46,66 @@ pub fn take_launch_token(path: &Path) -> std::io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lws-agent-launch-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        dir
+    }
+
+    #[test]
+    fn the_token_is_read_once_and_the_file_is_gone_afterwards() {
+        let dir = temp_dir();
+        let path = dir.join("launch-1.token");
+        let token: Vec<u8> = (0u8..32).collect();
+        std::fs::write(&path, &token).expect("write the token file");
+
+        assert_eq!(take_launch_token(&path).expect("first read"), token);
+        assert!(
+            !path.exists(),
+            "one launch must leave at most one usable copy"
+        );
+
+        // A second read finds nothing: the file was deleted, not merely consumed.
+        let second = take_launch_token(&path).expect_err("the file is gone");
+        assert_eq!(second.kind(), std::io::ErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_token_of_the_wrong_length_is_refused_and_still_deleted() {
+        let dir = temp_dir();
+        let path = dir.join("launch-2.token");
+        std::fs::write(&path, b"too short").expect("write");
+
+        let error = take_launch_token(&path).expect_err("a short token is not a token");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            !path.exists(),
+            "a rejected token must not stay behind for a retry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_token_file_reports_not_found() {
+        let dir = temp_dir();
+        let error = take_launch_token(&dir.join("never-written.token")).expect_err("missing file");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
