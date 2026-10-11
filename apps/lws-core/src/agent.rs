@@ -358,3 +358,137 @@ pub fn default_agent_program() -> Result<PathBuf, String> {
     };
     Ok(directory.join(name))
 }
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lws-core-agent-{}-{}-{label}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        dir
+    }
+
+    #[test]
+    fn each_launch_gets_its_own_endpoint() {
+        let runtime = temp_dir("runtime");
+        let first = endpoint_spec(&launch_endpoint(&runtime, 1).expect("endpoint"));
+        let second = endpoint_spec(&launch_endpoint(&runtime, 2).expect("endpoint"));
+        assert_ne!(first, second, "two launches must not share a channel");
+
+        #[cfg(windows)]
+        {
+            // `docs/03-architecture.md`: `\\.\pipe\lan-workspace-agent-<pid>-<n>`.
+            assert!(first.contains("lan-workspace-agent-"), "{first}");
+            assert!(first.ends_with("-1"), "{first}");
+            assert!(second.ends_with("-2"), "{second}");
+        }
+        #[cfg(unix)]
+        {
+            let pid = std::process::id();
+            assert!(first.ends_with(&format!("agent-{pid}-1.sock")), "{first}");
+            assert!(second.ends_with(&format!("agent-{pid}-2.sock")), "{second}");
+            // The socket lives in the 0700 runtime directory, next to the GUI socket.
+            assert!(
+                std::path::Path::new(&first).starts_with(&runtime),
+                "{first} is not inside {}",
+                runtime.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_token_file_is_per_launch_and_written_owner_only() {
+        let private = temp_dir("private");
+        let path = token_file(&private, 7);
+        assert_eq!(path, private.join("launch-7.token"));
+        assert_ne!(path, token_file(&private, 8));
+
+        let mut token = [0u8; 32];
+        for (index, byte) in token.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        write_token_file(&path, &token).expect("write");
+        assert_eq!(std::fs::read(&path).expect("read back"), token);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the token file is owner-only");
+        }
+
+        let _ = std::fs::remove_dir_all(&private);
+    }
+
+    #[test]
+    fn tokens_are_32_bytes_and_never_repeat() {
+        let first = random_token().expect("entropy");
+        let second = random_token().expect("entropy");
+        assert_eq!(first.len(), 32);
+        assert_eq!(second.len(), 32);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_default_agent_program_sits_next_to_core() {
+        let program = default_agent_program().expect("path");
+        let name = program
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        assert_eq!(
+            name,
+            if cfg!(windows) {
+                "lws-agent.exe"
+            } else {
+                "lws-agent"
+            }
+        );
+        assert!(program.parent().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_cannot_be_spawned_is_reported_as_an_error() {
+        let runtime = temp_dir("runtime");
+        let private = temp_dir("private");
+        let mut supervisor = Supervisor::new(
+            PathBuf::from("definitely-not-an-agent-program"),
+            private.clone(),
+            runtime.clone(),
+            false,
+            0,
+            "Ctrl+Alt+Shift+F12".to_owned(),
+            ipc::BackendKind::Auto,
+            true,
+            300,
+        );
+        assert_eq!(
+            supervisor.state(),
+            AgentState::Starting,
+            "nothing spawned yet"
+        );
+
+        let error = supervisor
+            .start(AgentMode::Normal)
+            .await
+            .expect_err("a missing program cannot be started");
+        assert!(error.contains("cannot spawn"), "{error}");
+        assert!(!supervisor.is_attached());
+
+        let _ = std::fs::remove_dir_all(&runtime);
+        let _ = std::fs::remove_dir_all(&private);
+    }
+}

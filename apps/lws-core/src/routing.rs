@@ -878,3 +878,411 @@ mod tests {
         assert!(hello.can_own);
     }
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    // Explicit, so `ipc` cannot be ambiguous between the glob import and the crate name.
+    use protocol::ipc;
+
+    fn lease(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    #[test]
+    fn every_output_variant_becomes_its_effect() {
+        let peer = NodeId::new([1; 32]);
+        let outputs = [
+            fr::Output::Send {
+                peer,
+                message: fr::Message::LeaveAck { lease_id: lease(1) },
+            },
+            // The only output that fans out; it must survive as `Broadcast`, not become
+            // a `Send` to a single peer.
+            fr::Output::Broadcast(fr::Message::OwnerState {
+                serial: 2,
+                owner: Some(peer),
+                granted: true,
+            }),
+            fr::Output::Agent(fr::AgentCommand::ReleaseSession { lease_id: lease(1) }),
+            fr::Output::ArmTimer {
+                timer: fr::Timer::ClaimGrant,
+                deadline_ms: 600,
+            },
+            fr::Output::CancelTimer(fr::Timer::ClaimGrant),
+            fr::Output::CloseLink {
+                peer,
+                code: fr::ErrorCode::CannotOwn,
+            },
+            fr::Output::Notice(fr::Notice::Focus(fr::FocusState::Local)),
+        ];
+        let effects = effects(&outputs);
+        assert_eq!(effects.len(), outputs.len(), "no output may be swallowed");
+        assert!(matches!(effects[0], Effect::Send { peer: p, .. } if p == peer));
+        assert!(matches!(effects[1], Effect::Broadcast { .. }));
+        assert!(matches!(effects[2], Effect::Agent(_)));
+        assert!(matches!(
+            effects[3],
+            Effect::Arm {
+                timer: fr::Timer::ClaimGrant,
+                deadline_ms: 600
+            }
+        ));
+        assert!(matches!(
+            effects[4],
+            Effect::Cancel {
+                timer: fr::Timer::ClaimGrant
+            }
+        ));
+        assert!(matches!(
+            effects[5],
+            Effect::CloseLink {
+                code: fr::ErrorCode::CannotOwn,
+                ..
+            }
+        ));
+        assert!(matches!(effects[6], Effect::Notice(_)));
+    }
+
+    #[test]
+    fn an_agent_error_carries_the_outstanding_prepare_lease_once() {
+        let mut context = AgentContext::default();
+        context.on_command(&fr::AgentCommand::PrepareInject { lease_id: lease(4) });
+
+        let error = ipc::agent_frame::Msg::Error(ipc::AgentError {
+            code: "CAPTURE_FAILED".to_owned(),
+            detail: "no capture".to_owned(),
+        });
+        assert_eq!(
+            agent_signal(&error, &mut context),
+            AgentSignal::Fsm(fr::AgentEvent::Error {
+                lease_id: Some(lease(4)),
+                code: fr::ErrorCode::CaptureFailed,
+            }),
+            "the lease the failure belongs to is remembered"
+        );
+        assert_eq!(
+            agent_signal(&error, &mut context),
+            AgentSignal::Fsm(fr::AgentEvent::Error {
+                lease_id: None,
+                code: fr::ErrorCode::CaptureFailed,
+            }),
+            "and it is consumed, so a later failure cannot claim it"
+        );
+
+        // With nothing outstanding, a `Ready` frame is the attach-time `AgentReady`.
+        assert_eq!(
+            agent_signal(
+                &ipc::agent_frame::Msg::Ready(ipc::AgentReady::default()),
+                &mut context
+            ),
+            AgentSignal::Fsm(fr::AgentEvent::AgentReady)
+        );
+    }
+
+    #[test]
+    fn every_wire_message_has_its_own_log_name() {
+        let peer = NodeId::new([2; 32]);
+        let cases: [(fr::Message, &str); 14] = [
+            (
+                fr::Message::EnterPrepare {
+                    lease_id: lease(1),
+                    topology_revision: 1,
+                    position: geometry::Position::new("", 0.0, 0.0),
+                    owner_serial: 1,
+                },
+                "EnterPrepare",
+            ),
+            (
+                fr::Message::EnterAck {
+                    lease_id: lease(1),
+                    accepted: true,
+                    reason: None,
+                },
+                "EnterAck",
+            ),
+            (
+                fr::Message::EnterCommit { lease_id: lease(1) },
+                "EnterCommit",
+            ),
+            (
+                fr::Message::Leave {
+                    lease_id: lease(1),
+                    reason: fr::LeaveReason::Emergency,
+                },
+                "Leave",
+            ),
+            (fr::Message::LeaveAck { lease_id: lease(1) }, "LeaveAck"),
+            (
+                fr::Message::InputBatch {
+                    lease_id: lease(1),
+                    input_batch_seq: 1,
+                    events: Vec::new(),
+                },
+                "InputBatch",
+            ),
+            (
+                fr::Message::InjectAck {
+                    lease_id: lease(1),
+                    input_batch_seq: 1,
+                    applied_count: 0,
+                    actual_position: None,
+                    status: fr::InjectStatus::Ok,
+                },
+                "InjectAck",
+            ),
+            (
+                fr::Message::LeaseChallenge {
+                    lease_id: lease(1),
+                    nonce: [0; 16],
+                    ttl_ms: 500,
+                },
+                "LeaseChallenge",
+            ),
+            (
+                fr::Message::LeaseRenew {
+                    lease_id: lease(1),
+                    nonce: [0; 16],
+                },
+                "LeaseRenew",
+            ),
+            (
+                fr::Message::LeaseStatus {
+                    lease_id: lease(1),
+                    nonce: [0; 16],
+                    accepted: true,
+                    last_input_batch_seq: 1,
+                },
+                "LeaseStatus",
+            ),
+            (
+                fr::Message::OwnerClaim {
+                    serial: 1,
+                    reason: fr::ClaimReason::Startup,
+                },
+                "OwnerClaim",
+            ),
+            (
+                fr::Message::OwnerState {
+                    serial: 1,
+                    owner: Some(peer),
+                    granted: true,
+                },
+                "OwnerState",
+            ),
+            (
+                fr::Message::ProtocolError {
+                    code: fr::ErrorCode::NotOwner,
+                    related_seq: 1,
+                },
+                "ProtocolError",
+            ),
+            (
+                fr::Message::Shutdown {
+                    reason: fr::LeaveReason::Shutdown,
+                },
+                "Shutdown",
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(message_name(&message), expected, "{message:?}");
+        }
+    }
+
+    #[test]
+    fn every_agent_frame_has_a_distinct_log_name() {
+        use ipc::agent_frame::Msg;
+        let frames: Vec<(Msg, &str)> = vec![
+            (Msg::Attach(ipc::AgentAttach::default()), "AgentAttach"),
+            (
+                Msg::BeginCapture(ipc::BeginCapture::default()),
+                "BeginCapture",
+            ),
+            (Msg::EndCapture(ipc::EndCapture::default()), "EndCapture"),
+            (
+                Msg::PrepareInject(ipc::PrepareInject::default()),
+                "PrepareInject",
+            ),
+            (Msg::Inject(ipc::Inject::default()), "Inject"),
+            (Msg::ArmDeadline(ipc::ArmDeadline::default()), "ArmDeadline"),
+            (
+                Msg::ReleaseSession(ipc::ReleaseSession::default()),
+                "ReleaseSession",
+            ),
+            (Msg::ReleaseKeys(ipc::ReleaseKeys::default()), "ReleaseKeys"),
+            (Msg::QueryDisplays(ipc::QueryDisplays {}), "QueryDisplays"),
+            (Msg::Shutdown(ipc::AgentShutdown {}), "AgentShutdown"),
+            (Msg::Ping(ipc::Ping::default()), "Ping"),
+            (
+                Msg::ForgetPortalGrants(ipc::ForgetPortalGrants {}),
+                "ForgetPortalGrants",
+            ),
+            (Msg::Ready(ipc::AgentReady::default()), "AgentReady"),
+            (
+                Msg::CaptureReady(ipc::CaptureReady::default()),
+                "CaptureReady",
+            ),
+            (
+                Msg::Captured(ipc::CapturedBatch::default()),
+                "CapturedBatch",
+            ),
+            (
+                Msg::Emergency(ipc::EmergencyFired::default()),
+                "EmergencyFired",
+            ),
+            (
+                Msg::InjectResult(ipc::InjectResult::default()),
+                "InjectResult",
+            ),
+            (
+                Msg::DeadlineExpired(ipc::DeadlineExpired::default()),
+                "DeadlineExpired",
+            ),
+            (Msg::Released(ipc::Released::default()), "Released"),
+            (
+                Msg::Displays(ipc::DisplaysReport::default()),
+                "DisplaysReport",
+            ),
+            (
+                Msg::LocalInput(ipc::LocalInputDetected::default()),
+                "LocalInputDetected",
+            ),
+            (
+                Msg::SessionEvent(ipc::SessionEvent::default()),
+                "SessionEvent",
+            ),
+            (Msg::Pong(ipc::Pong::default()), "Pong"),
+            (Msg::Error(ipc::AgentError::default()), "AgentError"),
+            (
+                Msg::PortalPermission(ipc::PortalPermissionRequired::default()),
+                "PortalPermissionRequired",
+            ),
+            (
+                Msg::PortalGrant(ipc::PortalGrantChanged::default()),
+                "PortalGrantChanged",
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (frame, expected) in frames {
+            assert_eq!(agent_frame_name(&frame), expected, "{frame:?}");
+            assert!(seen.insert(expected), "`{expected}` is used twice");
+        }
+    }
+
+    /// Every capability the probe models must reach `Hello.capabilities`, otherwise a peer
+    /// cannot learn what this node offers.
+    #[test]
+    fn capability_bits_cover_every_bit_the_probe_models() {
+        let capabilities = platform_probe::Capabilities {
+            capture: true,
+            inject: true,
+            absolute_pointer: true,
+            physical_hid_keys: true,
+            text_clipboard: true,
+            native_repeat: true,
+            software_repeat: true,
+            receiver_takeover: true,
+            displays_changed: true,
+            emergency_hotkey: true,
+        };
+
+        let expected: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(
+            capability_bits(capabilities),
+            expected,
+            "capability_bits must map every bit `Capabilities::advertised()` names"
+        );
+    }
+
+    #[test]
+    fn error_codes_map_or_fall_back_to_invalid_frame() {
+        assert_eq!(error_code("CAPTURE_FAILED"), fr::ErrorCode::CaptureFailed);
+        assert_eq!(error_code("QUEUE_OVERFLOW"), fr::ErrorCode::CaptureFailed);
+        assert_eq!(
+            error_code("UNSUPPORTED_SESSION"),
+            fr::ErrorCode::UnsupportedSession
+        );
+        assert_eq!(
+            error_code("INJECTION_FAILED"),
+            fr::ErrorCode::InjectionFailed
+        );
+        assert_eq!(error_code("AGENT_LOST"), fr::ErrorCode::AgentLost);
+        assert_eq!(error_code("ANYTHING_ELSE"), fr::ErrorCode::InvalidFrame);
+        assert_eq!(error_code(""), fr::ErrorCode::InvalidFrame);
+    }
+
+    #[test]
+    fn local_events_round_trip_or_are_refused() {
+        let button = |number: u32, down: bool| ipc::LocalEvent {
+            monotonic_us: 0,
+            ev: Some(ipc::local_event::Ev::Button(ipc::ButtonEv {
+                button: number,
+                down,
+            })),
+        };
+        assert_eq!(
+            input_event_of(&button(5, false)),
+            Some(InputEvent::Button {
+                button: MouseButton::Forward,
+                state: KeyState::Up,
+            })
+        );
+        assert_eq!(
+            input_event_of(&button(9, true)),
+            None,
+            "an unknown button is refused, not relabelled"
+        );
+
+        let scroll = ipc::LocalEvent {
+            monotonic_us: 0,
+            ev: Some(ipc::local_event::Ev::Scroll(ipc::ScrollEv {
+                h120: -120,
+                v120: 240,
+            })),
+        };
+        assert_eq!(
+            input_event_of(&scroll),
+            Some(InputEvent::Scroll {
+                h120: -120,
+                v120: 240
+            })
+        );
+
+        // Out of range for the normalised model: refused rather than truncated.
+        let huge = ipc::LocalEvent {
+            monotonic_us: 0,
+            ev: Some(ipc::local_event::Ev::Key(ipc::HidKey {
+                usage_page: 0x1_0000,
+                usage: 0x04,
+                down: true,
+            })),
+        };
+        assert_eq!(input_event_of(&huge), None);
+
+        let empty = ipc::LocalEvent {
+            monotonic_us: 0,
+            ev: None,
+        };
+        assert_eq!(input_event_of(&empty), None);
+    }
+
+    #[test]
+    fn relative_motion_is_the_only_event_without_a_wire_form() {
+        assert_eq!(
+            to_local_event(&InputEvent::PointerRelative { dx: 1, dy: 2 }),
+            None,
+            "relative motion is integrated before it is sent, never forwarded"
+        );
+        let absolute = to_local_event(&InputEvent::PointerAbsolute(input_model::Position::new(
+            1.0, 2.0,
+        )))
+        .expect("an absolute position has a wire form");
+        match absolute.ev {
+            Some(ipc::local_event::Ev::Pointer(pointer)) => {
+                assert_eq!(pointer.display_id, "", "the receiver resolves the display");
+                assert_eq!((pointer.x, pointer.y), (1.0, 2.0));
+            }
+            other => panic!("expected a pointer event, got {other:?}"),
+        }
+    }
+}
