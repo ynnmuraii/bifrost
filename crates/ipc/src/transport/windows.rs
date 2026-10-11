@@ -349,16 +349,20 @@ pub struct GuiListener {
 /// Create the GUI pipe with the current user's DACL and
 /// `PIPE_REJECT_REMOTE_CLIENTS`.
 ///
-/// Fails with [`IpcError::AlreadyRunning`] when another process already created
-/// an instance of the name, because the first instance carries
-/// `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+/// Fails with [`IpcError::AlreadyRunning`] when another process already owns the
+/// name. Two shapes of that are possible: with
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` the creation is refused outright
+/// (`ERROR_ACCESS_DENIED`), while a name whose instances are all taken fails
+/// earlier with `ERROR_PIPE_BUSY`. Both mean "somebody else is there".
 pub fn listen(endpoint: &Endpoint) -> Result<GuiListener, IpcError> {
     let security = PipeSecurity::for_current_user()?;
     let options = PipeOptions::gui();
     let pending = security
         .create(endpoint.name(), &options)
         .map_err(|error| match error {
-            IpcError::Io { source, .. } if source.raw_os_error() == Some(5) => {
+            IpcError::Io { source, .. }
+                if matches!(source.raw_os_error(), Some(5) | Some(ERROR_PIPE_BUSY)) =>
+            {
                 IpcError::AlreadyRunning {
                     endpoint: endpoint.describe(),
                 }
