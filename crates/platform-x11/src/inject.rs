@@ -403,7 +403,7 @@ impl X11Injector {
 
 /// Consumes whole 120-unit notches out of an accumulator, leaving the remainder
 /// (and anything beyond [`MAX_NOTCHES_PER_EVENT`]) in place.
-fn take_notches(remainder: &mut i32) -> i32 {
+pub(crate) fn take_notches(remainder: &mut i32) -> i32 {
     let notches =
         (*remainder / WHEEL_UNITS_PER_NOTCH).clamp(-MAX_NOTCHES_PER_EVENT, MAX_NOTCHES_PER_EVENT);
     *remainder -= notches * WHEEL_UNITS_PER_NOTCH;
@@ -415,10 +415,95 @@ fn take_notches(remainder: &mut i32) -> i32 {
 /// `NaN` becomes 0 and infinities saturate to an edge, so the injected coordinate
 /// is always a valid absolute position inside the root; the server would clamp
 /// anyway, but a defined value is what [`InjectResult::actual`] is compared with.
-fn clamp_coordinate(value: f64, extent: u16) -> i16 {
+pub(crate) fn clamp_coordinate(value: f64, extent: u16) -> i16 {
     let max = f64::from(extent.saturating_sub(1).min(i16::MAX as u16));
     if value.is_nan() {
         return 0;
     }
     value.clamp(0.0, max).round() as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_coordinate, take_notches};
+
+    #[test]
+    fn notches_conserve_units_and_bound_work_even_at_integer_limits() {
+        for input in [
+            i32::MIN,
+            -3841,
+            -3840,
+            -121,
+            -120,
+            -119,
+            0,
+            119,
+            120,
+            121,
+            3840,
+            3841,
+            i32::MAX,
+        ] {
+            let mut remainder = input;
+            let notches = take_notches(&mut remainder);
+            assert_eq!(
+                i64::from(notches) * 120 + i64::from(remainder),
+                i64::from(input)
+            );
+            assert!(notches.abs() <= 32);
+            if notches.abs() < 32 {
+                assert!(remainder.abs() < 120);
+            }
+            if input > 0 {
+                assert!(notches >= 0 && remainder >= 0);
+            }
+            if input < 0 {
+                assert!(notches <= 0 && remainder <= 0);
+            }
+        }
+    }
+
+    #[test]
+    fn subnotch_streams_and_capped_backlogs_drain_without_losing_units() {
+        let mut remainder = 0;
+        for (delta, expected_notches, expected_remainder) in [
+            (119, 0, 119),
+            (1, 1, 0),
+            (-119, 0, -119),
+            (-2, -1, -1),
+            (1, 0, 0),
+            (7801, 32, 3961),
+            (0, 32, 121),
+            (0, 1, 1),
+        ] {
+            remainder += delta;
+            assert_eq!(take_notches(&mut remainder), expected_notches);
+            assert_eq!(remainder, expected_remainder);
+        }
+    }
+
+    #[test]
+    fn injected_coordinates_round_and_saturate_to_root_and_protocol_bounds() {
+        for extent in [0, 1, 1920, u16::MAX] {
+            for value in [
+                f64::NAN,
+                f64::NEG_INFINITY,
+                -0.5,
+                0.0,
+                0.5,
+                1919.9,
+                f64::INFINITY,
+            ] {
+                let actual = clamp_coordinate(value, extent);
+                assert!(actual >= 0);
+                assert!(u16::try_from(actual).unwrap() <= extent.saturating_sub(1));
+            }
+        }
+        assert_eq!(clamp_coordinate(f64::NAN, 1920), 0);
+        assert_eq!(clamp_coordinate(f64::NEG_INFINITY, 1920), 0);
+        assert_eq!(clamp_coordinate(f64::INFINITY, 1920), 1919);
+        assert_eq!(clamp_coordinate(f64::INFINITY, u16::MAX), i16::MAX);
+        assert_eq!(clamp_coordinate(10.49, 1920), 10);
+        assert_eq!(clamp_coordinate(10.5, 1920), 11);
+    }
 }
