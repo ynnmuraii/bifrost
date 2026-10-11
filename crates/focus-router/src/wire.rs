@@ -52,6 +52,10 @@ pub enum ErrorCode {
     /// `ERROR_CODE_CANNOT_OWN = 25` — `OwnerClaim` from a node whose `Hello.can_own`
     /// is `false`.
     CannotOwn,
+    /// `ERROR_CODE_MEMBERSHIP_FULL = 23` — `N_max = 4` reached; the link is refused
+    /// (`docs/05-protocol.md`). Emitted by the link manager, carried here so a peer can be
+    /// told why it was not admitted.
+    MembershipFull,
 }
 
 impl ErrorCode {
@@ -70,6 +74,7 @@ impl ErrorCode {
             ErrorCode::NotOwner => 20,
             ErrorCode::StaleOwnerSerial => 21,
             ErrorCode::CannotOwn => 25,
+            ErrorCode::MembershipFull => 23,
         }
     }
 }

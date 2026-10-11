@@ -1651,6 +1651,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "transport"
+version = "0.0.0"
+dependencies = [
+ "focus-router",
+ "geometry",
+ "identity",
+ "input-model",
+ "protocol",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "uds_windows"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
