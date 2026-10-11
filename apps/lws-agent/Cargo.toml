@@ -30,3 +30,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true
+
+# Only to classify portal failures for `AgentError.code`: `ashpd::Error::Response(
+# ResponseError::Cancelled)` is what a dismissed permission dialog looks like, and
+# `docs/03-architecture.md` S8 requires `PORTAL_DENIED` (not generic text) plus the
+# interface name. The crate is already in the tree through `platform-wayland`, and it
+# is Linux-only (`std::os::unix`), so it must not be an unconditional dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = "0.13"

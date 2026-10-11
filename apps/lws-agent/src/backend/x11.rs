@@ -136,7 +136,12 @@ impl X11 {
                 Ok(Some(CapturedEvent::Input(event))) => return Some(Event::Input(event)),
                 Ok(Some(CapturedEvent::Emergency)) => return Some(Event::Emergency),
                 Ok(None) => {}
-                Err(error) => return Some(Event::Failed(error.to_string())),
+                Err(error) => {
+                    return Some(Event::Failed {
+                        code: "CAPTURE_FAILED",
+                        detail: error.to_string(),
+                    })
+                }
             }
         }
         tokio::time::sleep(POLL_TICK).await;
