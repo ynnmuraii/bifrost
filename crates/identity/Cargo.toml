@@ -12,6 +12,10 @@ workspace = true
 [dependencies]
 geometry = { path = "../geometry" }
 protocol = { path = "../protocol" }
+# `config::paths` owns the documented application directory and file names, so this crate
+# imports them instead of repeating the literals. The edge is one-way and light: `config`
+# pulls only geometry, protocol, serde and toml, all already in this crate's graph.
+config = { path = "../config" }
 
 # TLS 1.3 only, `ring` backend: no cmake/nasm, so the Windows and Linux builds need no
 # extra toolchain (the docs leave the algorithm open - see the crate docs for the

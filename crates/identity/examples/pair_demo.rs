@@ -43,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (identity_b, load_b) = NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&dir_b))?;
     let (identity_c, _) = NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&dir_c))?;
     println!("== identities (state dir {}) ==", root.display());
-    for (label, identity_paths) in [("A", &dir_a), ("B", &dir_b), ("C", &dir_c)] {
-        let key_file = identity_paths.join(identity::key::KEY_FILE_NAME);
+    for (label, identity_dir) in [("A", &dir_a), ("B", &dir_b), ("C", &dir_c)] {
+        let key_file = IdentityPaths::rooted_at(identity_dir).key_file;
         match std::fs::read(&key_file) {
             Ok(bytes) => {
                 let head: Vec<String> = bytes
