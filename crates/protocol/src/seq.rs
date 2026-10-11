@@ -26,6 +26,28 @@ pub enum SeqError {
     Exhausted,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reaching this boundary through accept alone would need 2^64 calls.
+    #[test]
+    fn maximum_sequence_is_accepted_once_and_never_wraps() {
+        let mut seq = SeqValidator {
+            next: u64::MAX - 1,
+            exhausted: false,
+        };
+        assert_eq!(seq.accept(u64::MAX - 1), Ok(()));
+        assert!(!seq.is_exhausted());
+        assert_eq!(seq.accept(u64::MAX), Ok(()));
+        assert!(seq.is_exhausted());
+        for value in [0, 1, u64::MAX - 1, u64::MAX] {
+            assert_eq!(seq.accept(value), Err(SeqError::Exhausted));
+            assert_eq!(seq.expected(), u64::MAX);
+        }
+    }
+}
+
 impl SeqError {
     /// Every sequence violation is `ERROR_CODE_INVALID_SEQUENCE`; the session is
     /// closed and no payload is logged.
