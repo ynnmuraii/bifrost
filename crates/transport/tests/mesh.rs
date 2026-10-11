@@ -637,15 +637,16 @@ async fn a_deliberate_shutdown_is_reported_as_such() {
 }
 
 #[test]
-fn the_membership_refusal_cannot_be_read_back_from_the_wire() {
-    // The manager refuses an extra member with `ProtocolError { code: MembershipFull }`, but
-    // the transport's own reader rejects number 23, so a peer cannot classify the refusal.
+fn the_membership_refusal_can_be_read_back_from_the_wire() {
+    // The manager refuses an extra member with `ProtocolError { code: MembershipFull }`;
+    // the reader has to classify number 23, or the refused member cannot tell a full
+    // workspace apart from a protocol failure. (This test used to pin the opposite, the
+    // asymmetry where 23 fell through to `UnknownEnum`.)
     assert_eq!(ErrorCode::MembershipFull.as_u32(), 23);
     assert_eq!(
         transport::convert::error_code_from_i32(ErrorCode::MembershipFull.as_u32() as i32),
-        Err(transport::convert::ConvertError::UnknownEnum {
-            field: "ErrorCode",
-            value: 23
-        })
+        Ok(ErrorCode::MembershipFull)
     );
+    // An undefined number is still rejected, so the check did not become "anything goes".
+    assert!(transport::convert::error_code_from_i32(23_000).is_err());
 }

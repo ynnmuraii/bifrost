@@ -528,22 +528,46 @@ fn nonce_of(bytes: &[u8]) -> Result<[u8; 16], ConvertError> {
 }
 
 /// `ErrorCode` numbers (`docs/protocol.proto`).
+///
+/// The number check comes from the generated enum
+/// (`protocol::wire::ErrorCode::try_from`), and the match below is exhaustive over that
+/// enum, so a code added to the `.proto` cannot slip through unnoticed: the build fails
+/// until its mapping is decided. `MembershipFull` is a code the FSM carries on purpose
+/// (`fr::ErrorCode::MembershipFull` exists so a refused peer can be *told* why), while
+/// the codes `focus_router` has no variant for are refused explicitly — mapping them to
+/// some other code would mislabel them.
 pub fn error_code_from_i32(value: i32) -> Result<fr::ErrorCode, ConvertError> {
-    Ok(match value {
-        5 => fr::ErrorCode::UnsupportedSession,
-        6 => fr::ErrorCode::CaptureFailed,
-        8 => fr::ErrorCode::TopologyChanged,
-        9 => fr::ErrorCode::InvalidFrame,
-        10 => fr::ErrorCode::InvalidSequence,
-        11 => fr::ErrorCode::LeaseMismatch,
-        12 => fr::ErrorCode::InjectionFailed,
-        13 => fr::ErrorCode::LeaseExpired,
-        14 => fr::ErrorCode::AgentLost,
-        20 => fr::ErrorCode::NotOwner,
-        21 => fr::ErrorCode::StaleOwnerSerial,
-        25 => fr::ErrorCode::CannotOwn,
-        other => return Err(unknown("ErrorCode", other)),
-    })
+    use protocol::wire::ErrorCode as WireCode;
+    let code = WireCode::try_from(value).map_err(|_| unknown("ErrorCode", value))?;
+    let mapped = match code {
+        WireCode::UnsupportedSession => Some(fr::ErrorCode::UnsupportedSession),
+        WireCode::CaptureFailed => Some(fr::ErrorCode::CaptureFailed),
+        WireCode::TopologyChanged => Some(fr::ErrorCode::TopologyChanged),
+        WireCode::InvalidFrame => Some(fr::ErrorCode::InvalidFrame),
+        WireCode::InvalidSequence => Some(fr::ErrorCode::InvalidSequence),
+        WireCode::LeaseMismatch => Some(fr::ErrorCode::LeaseMismatch),
+        WireCode::InjectionFailed => Some(fr::ErrorCode::InjectionFailed),
+        WireCode::LeaseExpired => Some(fr::ErrorCode::LeaseExpired),
+        WireCode::AgentLost => Some(fr::ErrorCode::AgentLost),
+        WireCode::NotOwner => Some(fr::ErrorCode::NotOwner),
+        WireCode::StaleOwnerSerial => Some(fr::ErrorCode::StaleOwnerSerial),
+        WireCode::MembershipFull => Some(fr::ErrorCode::MembershipFull),
+        WireCode::CannotOwn => Some(fr::ErrorCode::CannotOwn),
+        WireCode::Unspecified
+        | WireCode::UnsupportedVersion
+        | WireCode::WrongRole
+        | WireCode::UnknownPeer
+        | WireCode::ChangedKey
+        | WireCode::InvalidTopology
+        | WireCode::ClipboardTooLarge
+        | WireCode::ClipboardDisabled
+        | WireCode::UnsupportedKey
+        | WireCode::RateLimited
+        | WireCode::PortalDenied
+        | WireCode::LayoutConflict
+        | WireCode::NoCoordinator => None,
+    };
+    mapped.ok_or_else(|| unknown("ErrorCode", value))
 }
 
 /// `LeaveReason` numbers.
