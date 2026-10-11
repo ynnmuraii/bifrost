@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
     name: ${{ matrix.os }}
@@ -12,14 +15,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Both operating systems run the whole workspace: the Unix-socket
+        # transport of crates/ipc, platform-x11, platform-wayland and
+        # platform-probe only execute on ubuntu-latest, where their cfg gates
+        # select them; on Windows the same commands compile them to no tests.
         os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
+      # The toolchain is not pinned here on purpose: rust-toolchain.toml in the
+      # repository is the source of truth and names the channel "stable", the
+      # same channel this action installs. `components`/`targets` are repeated
+      # only so they exist before cargo runs.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+
+      # The only native code in the dependency graph is ring (rustls), which
+      # needs a C compiler and an archiver for its C and assembly parts.
+      # Everything else on Linux is pure Rust: x11rb builds its RustConnection,
+      # and zbus, ashpd and reis have no C counterpart, so no X11/Wayland -dev
+      # packages are installed and no X or D-Bus session is needed — the
+      # platform tests assert pure contracts against injected environment data.
+      - name: System dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential
 
       - name: Format
         run: cargo fmt --all --check
