@@ -46,7 +46,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
 
-    use input_model::{HidUsage, InputEvent, KeyState, Position};
+    use input_model::{HidKey, InputEvent, KeyState, Position};
     use platform_wayland::{
         compositor_signature, portal_versions, Compositor, GrantStore, WaylandInjector,
         REMOTE_DESKTOP_INTERFACE,
@@ -238,12 +238,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // A modifier tap: harmless on its own, and it exercises HID -> evdev mapping.
-        let shift = HidUsage::keyboard(0xE1);
+        let shift = HidKey::keyboard(0xE1);
         for state in [KeyState::Down, KeyState::Up] {
-            let outcome = injector.inject(&[InputEvent::Key {
-                usage: shift,
-                state,
-            }]);
+            let outcome = injector.inject(&[InputEvent::Key { key: shift, state }]);
             println!(
                 "shift {state:?}: applied={} error={:?}",
                 outcome.applied_count,

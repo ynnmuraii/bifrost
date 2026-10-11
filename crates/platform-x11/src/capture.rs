@@ -40,7 +40,7 @@
 
 use std::time::{Duration, Instant};
 
-use input_model::{InputEvent, KeyState, Position};
+use input_model::{CaptureKind, InputEvent, KeyState, Position};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, Window};
@@ -50,7 +50,7 @@ use x11rb::rust_connection::RustConnection;
 
 use crate::inject::PressedLedger;
 use crate::keymap::{
-    wheel_from_x11_button, x11_button_to_button_kind, x11_keycode_to_hid_usage, ModifierState,
+    wheel_from_x11_button, x11_button_to_mouse_button, x11_keycode_to_hid_key, ModifierState,
     EMERGENCY_F12_X11_KEYCODE,
 };
 use crate::X11Error;
@@ -86,7 +86,7 @@ pub struct X11Capture {
     root_height: u16,
     xi2_version: (u16, u16),
     xtest_device_ids: Vec<u16>,
-    observe_only: bool,
+    kind: CaptureKind,
     grab_active: bool,
     recenters: u64,
     filtered_injected: u64,
@@ -103,10 +103,11 @@ impl X11Capture {
     /// Connects to `$DISPLAY`, negotiates XI2, finds the XTEST virtual devices and
     /// selects the raw events on the root window.
     ///
-    /// `observe_only` only records the caller's intent for reporting and for
+    /// `kind` records the caller's intent ([`CaptureKind`]) for reporting and for
     /// [`Self::is_suppressed`]; the grab itself is always an explicit
-    /// [`Self::grab`] call.
-    pub fn new(observe_only: bool) -> Result<Self, X11Error> {
+    /// [`Self::grab`] call, so an `Observe` capture never moves the user's pointer
+    /// and a `Remote`/`Temporary` capture suppresses nothing until `grab` succeeds.
+    pub fn new(kind: CaptureKind) -> Result<Self, X11Error> {
         let (conn, screen_num) = x11rb::connect(None)?;
         let (root, root_width, root_height) = {
             let screen = &conn.setup().roots[screen_num];
@@ -143,7 +144,7 @@ impl X11Capture {
             root_height,
             xi2_version: (version.major_version, version.minor_version),
             xtest_device_ids,
-            observe_only,
+            kind,
             grab_active: false,
             recenters: 0,
             filtered_injected: 0,
@@ -177,9 +178,12 @@ impl X11Capture {
         (self.root_width, self.root_height)
     }
 
-    /// `true` when the caller asked for observe-only construction.
-    pub fn observe_only(&self) -> bool {
-        self.observe_only
+    /// The capture mode the caller asked for.
+    ///
+    /// [`CaptureKind::is_suppressed`] describes the *intent*; whether input is
+    /// actually suppressed is [`Self::is_suppressed`], which is the grab state.
+    pub fn capture_kind(&self) -> CaptureKind {
+        self.kind
     }
 
     /// `true` while this capture holds the pointer and keyboard grab.
@@ -418,8 +422,8 @@ impl X11Capture {
             self.fire_emergency();
             return Some(CapturedEvent::Emergency);
         }
-        let usage = x11_keycode_to_hid_usage(keycode)?;
-        Some(CapturedEvent::Input(InputEvent::Key { usage, state }))
+        let key = x11_keycode_to_hid_key(keycode)?;
+        Some(CapturedEvent::Input(InputEvent::Key { key, state }))
     }
 
     fn capture_button(
@@ -439,7 +443,7 @@ impl X11Capture {
             }
             return Some(CapturedEvent::Input(InputEvent::Scroll { h120, v120 }));
         }
-        let kind = x11_button_to_button_kind(button)?;
+        let kind = x11_button_to_mouse_button(button)?;
         self.ledger.note_button(button, state);
         Some(CapturedEvent::Input(InputEvent::Button {
             button: kind,

@@ -234,6 +234,17 @@ pub enum WaylandError {
         /// HID usage id.
         usage: u16,
     },
+    /// Relative pointer injection was requested.
+    ///
+    /// Relative injection is deliberately not part of the input contract
+    /// (`docs/03-architecture.md`: a source integrates deltas and sends an absolute
+    /// [`input_model::Position`]), so the backend refuses the event rather than
+    /// silently substituting `ei_pointer.motion_relative`.
+    #[error(
+        "relative pointer injection is not part of the input contract (a source integrates \
+         deltas into PointerAbsolute); refusing instead of guessing"
+    )]
+    RelativePointerUnsupported,
     /// A persisted grant blob could not be parsed.
     #[error("malformed grant store: {0}")]
     InvalidGrant(String),

@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-use input_model::InputEvent;
+use input_model::{CaptureKind, InputEvent};
 #[cfg(target_os = "linux")]
 use platform_x11::capture::RECENTER_THRESHOLD_PX;
 #[cfg(target_os = "linux")]
@@ -75,7 +75,11 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    let mut capture = match X11Capture::new(!options.grab) {
+    let mut capture = match X11Capture::new(if options.grab {
+        CaptureKind::Remote
+    } else {
+        CaptureKind::Observe
+    }) {
         Ok(capture) => capture,
         Err(err) => {
             eprintln!("cannot start XI2 capture: {err}");
@@ -167,14 +171,14 @@ fn print_event(capture: &X11Capture, event: InputEvent) {
                 capture.recenter_count()
             );
         }
-        InputEvent::Key { usage, state } => {
-            let keycode = input_model::hid_usage_to_evdev_code(usage)
+        InputEvent::Key { key, state } => {
+            let keycode = input_model::hid_key_to_evdev(key)
                 .and_then(evdev_to_x11_keycode)
                 .map(|keycode| format!("{keycode}"))
                 .unwrap_or_else(|| "?".to_string());
             println!(
                 "device {device}: key HID usage 0x{:02X} (page 0x{:02X}) -> X11 keycode {keycode} {state:?}",
-                usage.usage, usage.page
+                key.usage, key.page
             );
         }
         InputEvent::Button { button, state } => {
@@ -182,6 +186,9 @@ fn print_event(capture: &X11Capture, event: InputEvent) {
         }
         InputEvent::Scroll { h120, v120 } => {
             println!("device {device}: wheel h120={h120} v120={v120}");
+        }
+        InputEvent::PointerRelative { dx, dy } => {
+            println!("device {device}: raw relative delta ({dx:+}, {dy:+})");
         }
     }
 }

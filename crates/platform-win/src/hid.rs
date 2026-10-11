@@ -31,7 +31,7 @@
 //! Both are out of the MVP keyboard contract (AC-07 covers ANSI/ISO, EN/RU,
 //! AltGr, numpad) and show up as "unmapped" rather than as a random key.
 
-use crate::event::HID_PAGE_KEYBOARD;
+use input_model::{HidKey, HID_PAGE_KEYBOARD};
 
 /// Marker bit for `E0`-prefixed scancodes in the 16-bit scancode space used here.
 pub const SCANCODE_EXTENDED: u16 = 0xE000;
@@ -77,9 +77,9 @@ pub fn hid_to_scancode(usage: u16) -> Option<u16> {
         .map(|&(scan, _)| scan)
 }
 
-/// Convenience wrapper for a full [`crate::event::HidKey`].
+/// Convenience wrapper for a full [`HidKey`].
 #[must_use]
-pub fn hid_key_to_scancode(key: crate::event::HidKey) -> Option<u16> {
+pub fn hid_key_to_scancode(key: HidKey) -> Option<u16> {
     if key.page == HID_PAGE_KEYBOARD {
         hid_to_scancode(key.usage)
     } else {

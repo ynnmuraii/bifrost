@@ -31,7 +31,7 @@ use ashpd::desktop::{CreateSessionOptions, PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
 use futures_util::stream::StreamExt;
 use futures_util::Stream;
-use input_model::{hid_usage_to_evdev_code, InputEvent, KeyState, Position};
+use input_model::{hid_key_to_evdev, InputEvent, KeyState, Position};
 use reis::ei;
 use reis::event::{self, DeviceCapability, EiEvent};
 
@@ -695,10 +695,10 @@ impl WaylandInjector {
                 self.commit_frame();
                 Ok(Some(position))
             }
-            InputEvent::Key { usage, state } => {
-                let code = hid_usage_to_evdev_code(usage).ok_or(WaylandError::UnmappedUsage {
-                    page: usage.page,
-                    usage: usage.usage,
+            InputEvent::Key { key, state } => {
+                let code = hid_key_to_evdev(key).ok_or(WaylandError::UnmappedUsage {
+                    page: key.page,
+                    usage: key.usage,
                 })?;
                 let keyboard = self
                     .keyboard
@@ -741,6 +741,7 @@ impl WaylandInjector {
                 }
                 Ok(None)
             }
+            InputEvent::PointerRelative { .. } => Err(WaylandError::RelativePointerUnsupported),
         }
     }
 

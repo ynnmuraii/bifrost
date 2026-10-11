@@ -17,7 +17,7 @@
 //!    only accounting that is meaningful to the caller: `applied` events plus the
 //!    list of events that were not injected, in input order.
 
-use crate::event::{InputEvent, MouseButton};
+use input_model::{InputEvent, MouseButton};
 
 /// The Windows virtual desktop, in physical pixels. Negative origin is normal
 /// when a monitor sits left of or above the primary one.
@@ -158,7 +158,7 @@ pub fn plan(events: &[InputEvent], vd: VirtualDesktop) -> Plan {
     for (index, event) in events.iter().enumerate() {
         let before = plan.records.len();
         match *event {
-            InputEvent::Key { key, down } => {
+            InputEvent::Key { key, state } => {
                 if let Some(scancode) = crate::hid::hid_key_to_scancode(key) {
                     let (scan, extended) = crate::hid::scancode_parts(scancode);
                     plan.push(
@@ -166,22 +166,28 @@ pub fn plan(events: &[InputEvent], vd: VirtualDesktop) -> Plan {
                         Record::Key {
                             scan,
                             extended,
-                            up: !down,
+                            up: state.is_up(),
                         },
                     );
                 }
             }
-            InputEvent::Button { button, down } => {
-                plan.push(index, Record::Button { button, up: !down });
+            InputEvent::Button { button, state } => {
+                plan.push(
+                    index,
+                    Record::Button {
+                        button,
+                        up: state.is_up(),
+                    },
+                );
             }
-            InputEvent::PointerRel { dx, dy } => {
+            InputEvent::PointerRelative { dx, dy } => {
                 plan.push(index, Record::MoveRel { dx, dy });
             }
-            InputEvent::PointerAbs { x, y } => {
-                let (nx, ny) = vd.normalize(x, y);
+            InputEvent::PointerAbsolute(position) => {
+                let (nx, ny) = vd.normalize(position.x.round() as i32, position.y.round() as i32);
                 plan.push(index, Record::MoveAbsNorm { x: nx, y: ny });
             }
-            InputEvent::Wheel { h120, v120 } => {
+            InputEvent::Scroll { h120, v120 } => {
                 if v120 != 0 {
                     plan.push(
                         index,

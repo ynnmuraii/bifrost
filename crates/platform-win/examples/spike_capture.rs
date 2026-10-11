@@ -28,16 +28,14 @@ mod win {
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
+    use input_model::{CaptureKind, HidKey, InputEvent, KeyState};
     use platform_win::capture::{Capture, CaptureConfig, CaptureEvent, CaptureStats};
     use platform_win::dpi;
-    use platform_win::event::{CaptureMode, EmergencyCombo, HidKey, InputEvent};
+    use platform_win::event::EmergencyCombo;
 
     /// `F11` (HID usage `0x44`), the spike's mode-toggle key; the emergency
     /// combination stays `Ctrl+Alt+Shift+F12`.
-    const TOGGLE_KEY: HidKey = HidKey {
-        page: 0x07,
-        usage: 0x44,
-    };
+    const TOGGLE_KEY: HidKey = HidKey::keyboard(0x44);
 
     /// How many events are printed verbatim before only counters are shown.
     const VERBOSE_EVENTS: u64 = 25;
@@ -64,7 +62,7 @@ mod win {
         report_dpi();
 
         let config = CaptureConfig {
-            mode: CaptureMode::Observe,
+            mode: CaptureKind::Observe,
             emergency: EmergencyCombo::default(),
             queue_capacity: args.queue_capacity,
             raw_input: args.raw_input,
@@ -178,11 +176,17 @@ mod win {
                         println!("  {}", describe(&event));
                     }
                     window.note(&event);
-                    if let InputEvent::Key { key, down: true } = event {
+                    if let InputEvent::Key {
+                        key,
+                        state: KeyState::Down,
+                    } = event
+                    {
                         if key == TOGGLE_KEY {
                             let next = match capture.mode() {
-                                CaptureMode::Observe => CaptureMode::Remote,
-                                CaptureMode::Remote => CaptureMode::Observe,
+                                CaptureKind::Observe => CaptureKind::Remote,
+                                CaptureKind::Temporary | CaptureKind::Remote => {
+                                    CaptureKind::Observe
+                                }
                             };
                             capture.set_mode(next);
                             println!("F11: mode -> {next:?}");
@@ -248,7 +252,7 @@ mod win {
             std::thread::sleep(Duration::from_secs(1));
         }
 
-        capture.set_mode(CaptureMode::Remote);
+        capture.set_mode(CaptureKind::Remote);
         match capture.hold_point() {
             Some((x, y)) => println!("REMOTE: cursor held at ({x},{y})"),
             None => println!("REMOTE: no hold point (GetCursorPos failed)"),
@@ -260,7 +264,7 @@ mod win {
             args.remote_secs,
             0,
         );
-        capture.set_mode(CaptureMode::Observe);
+        capture.set_mode(CaptureKind::Observe);
         println!(
             "left Remote (emergency={}), local input restored",
             outcome.emergency
@@ -269,18 +273,23 @@ mod win {
 
     fn describe(event: &InputEvent) -> String {
         match *event {
-            InputEvent::Key { key, down } => format!(
+            InputEvent::Key { key, state } => format!(
                 "key page=0x{:04X} usage=0x{:04X} {}",
                 key.page,
                 key.usage,
-                if down { "down" } else { "up" }
+                if state.is_down() { "down" } else { "up" }
             ),
-            InputEvent::Button { button, down } => {
-                format!("button {button:?} {}", if down { "down" } else { "up" })
+            InputEvent::Button { button, state } => {
+                format!(
+                    "button {button:?} {}",
+                    if state.is_down() { "down" } else { "up" }
+                )
             }
-            InputEvent::PointerRel { dx, dy } => format!("pointer rel dx={dx} dy={dy}"),
-            InputEvent::PointerAbs { x, y } => format!("pointer abs x={x} y={y}"),
-            InputEvent::Wheel { h120, v120 } => format!("wheel h120={h120} v120={v120}"),
+            InputEvent::PointerRelative { dx, dy } => format!("pointer rel dx={dx} dy={dy}"),
+            InputEvent::PointerAbsolute(position) => {
+                format!("pointer abs x={} y={}", position.x, position.y)
+            }
+            InputEvent::Scroll { h120, v120 } => format!("wheel h120={h120} v120={v120}"),
         }
     }
 
@@ -298,9 +307,9 @@ mod win {
             match event {
                 InputEvent::Key { .. } => self.keys += 1,
                 InputEvent::Button { .. } => self.buttons += 1,
-                InputEvent::PointerRel { .. } => self.rel += 1,
-                InputEvent::PointerAbs { .. } => self.abs += 1,
-                InputEvent::Wheel { .. } => self.wheel += 1,
+                InputEvent::PointerRelative { .. } => self.rel += 1,
+                InputEvent::PointerAbsolute(_) => self.abs += 1,
+                InputEvent::Scroll { .. } => self.wheel += 1,
             }
         }
 

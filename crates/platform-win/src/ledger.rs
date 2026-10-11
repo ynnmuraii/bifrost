@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::event::{HidKey, InputEvent, MouseButton};
+use input_model::{HidKey, InputEvent, KeyState, MouseButton};
 
 /// Everything a session is holding down.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -35,23 +35,23 @@ impl PressedLedger {
     /// never pressed is ignored — the ledger only ever describes *our* presses.
     pub fn note(&mut self, event: &InputEvent) {
         match *event {
-            InputEvent::Key { key, down } => {
-                if down {
+            InputEvent::Key { key, state } => {
+                if state.is_down() {
                     self.keys.insert(key);
                 } else {
                     self.keys.remove(&key);
                 }
             }
-            InputEvent::Button { button, down } => {
-                if down {
+            InputEvent::Button { button, state } => {
+                if state.is_down() {
                     self.buttons.insert(button);
                 } else {
                     self.buttons.remove(&button);
                 }
             }
-            InputEvent::PointerRel { .. }
-            | InputEvent::PointerAbs { .. }
-            | InputEvent::Wheel { .. } => {}
+            InputEvent::PointerRelative { .. }
+            | InputEvent::PointerAbsolute(_)
+            | InputEvent::Scroll { .. } => {}
         }
     }
 
@@ -131,14 +131,13 @@ impl ReleaseBatch {
     #[must_use]
     pub fn to_events(&self) -> Vec<InputEvent> {
         let mut events = Vec::with_capacity(self.len());
-        events.extend(
-            self.keys
-                .iter()
-                .map(|&key| InputEvent::Key { key, down: false }),
-        );
+        events.extend(self.keys.iter().map(|&key| InputEvent::Key {
+            key,
+            state: KeyState::Up,
+        }));
         events.extend(self.buttons.iter().map(|&button| InputEvent::Button {
             button,
-            down: false,
+            state: KeyState::Up,
         }));
         events
     }
