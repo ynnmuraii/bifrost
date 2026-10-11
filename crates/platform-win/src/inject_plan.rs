@@ -231,16 +231,18 @@ pub fn account(plan: &Plan, accepted_records: usize) -> (usize, Vec<usize>) {
 
     for (index, &count) in plan.per_event.iter().enumerate() {
         let count = usize::from(count);
-        if count == 0 {
-            missing.push(index);
-        } else if consumed + count <= accepted {
+        if count > 0 && consumed + count <= accepted {
             applied += 1;
-            consumed += count;
         } else {
-            // Records are laid out in event order, so once one event does not fit
-            // none of the later ones can either.
+            // `count == 0` (no record at all) and an event whose records only *partly* fit
+            // are both "not applied": a wheel that got one of its two axes through was not
+            // injected.
             missing.push(index);
         }
+        // Records are laid out in event order, so every event occupies its slot whether or
+        // not the OS accepted its records. Advancing `consumed` only on success used to let
+        // a later event look accepted after an earlier one was partially accepted.
+        consumed += count;
     }
 
     (applied, missing)
