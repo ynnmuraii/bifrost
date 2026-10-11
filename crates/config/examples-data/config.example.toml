@@ -1,0 +1,95 @@
+# LAN Workspace — пример config.toml (config_version = 2, см. 03-architecture.md)
+# Файл пишется атомарно: tmp + fsync + rename; предыдущая версия -> config.toml.bak
+
+config_version = 2
+
+[node]
+display_name = "Workstation"        # не является идентичностью
+can_own = true                      # этот узел может становиться владельцем ввода (owner)
+claim_on_startup = true             # при старте заявить владение (Windows: true, ноутбуки: false); serial = max_seen + 1
+
+[platform]
+backend = "auto"                    # "auto" | "x11" | "wayland"; выбранный вручную обязан совпасть с сеансом
+# Wayland: restore token порталов лежит отдельно от этого файла —
+# $XDG_STATE_HOME/lan-workspace/portal-restore.toml (0600, каталог 0700);
+# в config.toml и в diagnostic export он не попадает.
+
+[network]
+listen_address = "192.168.1.10"     # конкретный LAN-интерфейс, не 0.0.0.0; слушают все узлы
+port_input = 47901
+port_clipboard = 47902
+reconnect_backoff_ms = [500, 5000]
+max_members = 3                     # поддержано и тестируется 3 узла; допустимо 1..4 (N_max = 4); пятый отвергается (MEMBERSHIP_FULL)
+
+# Список доверенных пиров; заполняется сопряжением, адрес можно поправить вручную.
+# Ручной IP при первичном сопряжении вводится один раз на пару. mDNS нет.
+[[network.peers]]
+node_id = "9c1e…"                   # SHA-256(SPKI DER) доверенного узла
+address = "192.168.1.11"            # пусто = адрес ещё неизвестен
+
+[workspace]                         # владение вводом и координация layout
+claim_hotkey = "Ctrl+Alt+Shift+F11" # «управлять отсюда»; пусто = только кнопка в GUI
+owner_claim_serial = 0              # персистится: последний известный serial владения
+owner_node_id = ""                  # персистится: последний известный owner
+link_ping_ms = 1000                 # Ping по каждому линку в простое
+link_timeout_ms = 3000              # нет Pong -> член считается офлайн
+claim_grant_timeout_ms = 600        # после этого claim становится self-grant
+
+[timing]                             # пределы проверяются при загрузке
+prepare_timeout_ms = 200             # 150..400
+lease_ttl_ms = 500                   # 300..1000; все дедлайны lease выводятся отсюда, challenge = ttl / 5; повышение для Wi-Fi видно в GUI и диагностике
+agent_core_silence_ms = 300          # 200..500; порог тишины core для агента (передаётся в AgentAttach); IPC-heartbeat = это значение / 4
+repeat_guard_ms = 150                # нет input/renew дольше — receiver прекращает автоповтор (гарантия по времени: лишние символы ~ rate × это значение)
+
+[input]
+emergency_hotkey = "Ctrl+Alt+Shift+F12"
+switch_hotkey = "Ctrl+Alt+Shift+Right"     # Wayland-источник: не поддерживается, захват активирует композитор
+pointer_gain = 1.0
+edge_dwell_ms = 0                    # задержка у края против случайного перехода
+edge_hysteresis_px = 8
+takeover_threshold_px = 12           # receiver: физическое движение для takeover
+repeat_mode = "receiver_software"    # "receiver_native" | "receiver_software"
+require_emergency_hotkey = true      # Wayland-источник без портала GlobalShortcuts не входит в Remote
+takeover_detection = "auto"          # "auto" | "evdev" | "off"; "evdev" требует членства в группе input
+
+[clipboard]
+enabled = false                      # opt-in на обеих сторонах; на Wayland доступен только пока жива портальная сессия
+skip_secret_marked = true            # маркеры менеджеров паролей
+max_bytes = 1048576
+rate_bytes_per_s = 262144
+transfer = "on_offer"                # "on_offer" | "on_focus_enter"
+
+[ui]
+language = "ru"                      # "ru" | "en"
+autostart = false                    # включается только после успешного теста
+
+[log]
+level = "info"                       # никогда не логирует клавиши и clipboard
+max_file_mb = 5
+max_files = 5
+
+# ---- Layout: правит любой узел, сериализует координатор (текущий owner) ----
+[topology]
+revision = 7
+author = "…"                        # node_id автора применённой ревизии
+max_seen_revision = 7               # монотонный пол; ревизия назад не идёт
+max_seen_author = "…"               # автор, применённый вместе с max_seen_revision
+
+[[topology.displays]]                # снимок для GUI; источник истины — агент узла
+node = "self"                       # здесь: node_id этого узла
+id = "edid:7a3f…"
+logical = [0, 0, 2560, 1440]
+primary = true
+
+# Граф переходов произвольной формы; узел A в середине, B справа от A.
+[[topology.links]]
+id = "win-right-to-a-left"
+from = { node = "self", display = "edid:7a3f…", edge = "right", start = 200, end = 1240 }
+to   = { node = "peer:9c1e…", display = "eDP-1", edge = "left", start = 0, end = 1080 }
+bidirectional = true
+
+[[topology.links]]
+id = "a-right-to-b-left"
+from = { node = "peer:9c1e…", display = "eDP-1", edge = "right", start = 0, end = 1080 }
+to   = { node = "peer:4f70…", display = "eDP-1", edge = "left", start = 0, end = 1080 }
+bidirectional = true

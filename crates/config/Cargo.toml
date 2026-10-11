@@ -1,0 +1,16 @@
+[package]
+name = "config"
+version = "0.0.0"
+description = "LAN Workspace configuration: config_version 2 schema, validation, paths and atomic save"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+geometry = { path = "../geometry" }
+protocol = { path = "../protocol" }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
