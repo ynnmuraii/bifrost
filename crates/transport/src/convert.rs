@@ -595,6 +595,12 @@ pub struct PeerInfo {
     pub owner_serial: u64,
     /// `Hello.owner_node_id`.
     pub owner: Option<NodeId>,
+    /// The capability bits `Hello.capabilities`, in the four flags `focus-router` knows.
+    ///
+    /// The FSM gates a transition on them — «Preparing → …: receiver не поддержан» uses
+    /// `Capabilities::receiver_ready()` and a source needs `source_ready()` — so an
+    /// application that fed `Input::Hello` without them could never enter `Remote`.
+    pub capabilities: fr::Capabilities,
 }
 
 impl PeerInfo {
@@ -621,6 +627,26 @@ impl PeerInfo {
                         .map_err(|_| ConvertError::Unsupported("owner_node_id is not 32 bytes"))?,
                 ))
             },
+            capabilities: capabilities_from_wire(&hello.capabilities),
         })
     }
+}
+
+/// The four `focus_router::Capabilities` flags carried by `Hello.capabilities`.
+///
+/// The wire enum has ten bits; the FSM only models `CAPTURE`, `INJECT`,
+/// `ABSOLUTE_POINTER` and `EMERGENCY_HOTKEY`, so the other bits are informational for this
+/// layer and are dropped rather than guessed at.
+pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
+    let mut out = fr::Capabilities::default();
+    for bit in bits {
+        match *bit {
+            1 => out.capture = true,
+            2 => out.inject = true,
+            3 => out.absolute_pointer = true,
+            10 => out.emergency_hotkey = true,
+            _ => {}
+        }
+    }
+    out
 }
