@@ -49,6 +49,7 @@ pub struct ManagerConfig {
 /// What the manager keeps per live link.
 struct LiveLink {
     handle: LinkHandle,
+    direction: Direction,
     initiator: NodeId,
     /// The link's task, so [`LinkManager::kill_all`] can drop it without a `Shutdown`.
     task: tokio::task::JoinHandle<()>,
@@ -88,7 +89,13 @@ pub struct LinkManager {
 #[derive(Default)]
 struct Inner {
     links: BTreeMap<NodeId, LiveLink>,
-    pending: BTreeMap<NodeId, PendingLink>,
+    /// Keyed by peer **and** direction: two nodes that dial each other have two links
+    /// between them at the same time, and both are registered before either `Hello`
+    /// exchange finishes. Keying by the peer alone let the second registration clobber
+    /// the first one's handle — which killed the first link, made the manager drop its
+    /// `Up`, and left the pair split across two different TCP connections instead of the
+    /// one the dedup rule picked.
+    pending: BTreeMap<(NodeId, Direction), PendingLink>,
 }
 
 impl LinkManager {
@@ -196,7 +203,7 @@ impl LinkManager {
             } => {
                 let initiator = if direction.is_outgoing() { local } else { peer };
                 self.inner.lock().await.pending.insert(
-                    peer,
+                    (peer, direction),
                     PendingLink {
                         handle,
                         initiator,
@@ -207,20 +214,33 @@ impl LinkManager {
             ManagerMessage::Report(report) => match report {
                 LinkReport::Up {
                     peer,
-                    direction: _,
+                    direction,
                     hello,
-                } => self.on_up(peer, hello).await,
+                } => self.on_up(peer, direction, hello).await,
                 LinkReport::Message { peer, message } => {
                     let _ = self
                         .events_tx
                         .send(LinkEvent::Message { peer, message })
                         .await;
                 }
-                LinkReport::Down { peer, reason } => {
+                LinkReport::Down {
+                    peer,
+                    direction,
+                    reason,
+                } => {
                     let removed = {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.remove(&peer);
-                        inner.links.remove(&peer).is_some()
+                        inner.pending.remove(&(peer, direction));
+                        // Only the link that went down may leave the member list: with two
+                        // links to one peer, the other direction's `Down` must not evict the
+                        // live one.
+                        match inner.links.get(&peer) {
+                            Some(live) if live.direction == direction => {
+                                inner.links.remove(&peer);
+                                true
+                            }
+                            _ => false,
+                        }
                     };
                     if removed || reason == LinkDownReason::MembershipFull {
                         let _ = self.events_tx.send(LinkEvent::Down { peer, reason }).await;
@@ -230,8 +250,8 @@ impl LinkManager {
         }
     }
 
-    async fn on_up(&self, peer: NodeId, hello: PeerInfo) {
-        let incoming = self.inner.lock().await.pending.remove(&peer);
+    async fn on_up(&self, peer: NodeId, direction: Direction, hello: PeerInfo) {
+        let incoming = self.inner.lock().await.pending.remove(&(peer, direction));
         let Some(pending) = incoming else {
             return;
         };
@@ -297,6 +317,7 @@ impl LinkManager {
             peer,
             LiveLink {
                 handle: pending.handle,
+                direction,
                 initiator: pending.initiator,
                 task: pending.task,
             },
