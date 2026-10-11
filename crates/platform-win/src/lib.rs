@@ -139,6 +139,8 @@ pub mod synth;
 #[cfg(windows)]
 pub mod capture;
 #[cfg(windows)]
+pub mod displays;
+#[cfg(windows)]
 pub mod dpi;
 #[cfg(windows)]
 pub mod inject;

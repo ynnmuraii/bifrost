@@ -145,6 +145,29 @@ impl Win {
         }
     }
 
+    /// Win32 monitors in logical (DIP) coordinates (KVM-040).
+    ///
+    /// A failure is reported as an empty set so core can fall back to the
+    /// `[[topology.displays]]` snapshot.
+    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+        match platform_win::displays::enumerate() {
+            Ok(monitors) => monitors
+                .into_iter()
+                .map(|monitor| crate::displays::RawDisplay {
+                    id: monitor.id,
+                    logical: monitor.logical,
+                    native: Some(monitor.native),
+                    scale: monitor.scale,
+                    primary: monitor.primary,
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "cannot enumerate Win32 monitors");
+                Vec::new()
+            }
+        }
+    }
+
     pub async fn next_event(&mut self) -> Option<Event> {
         if let Some(capture) = &self.capture {
             match capture.try_recv() {
