@@ -218,6 +218,26 @@ pub fn hello(
     }
 }
 
+/// `ArmDeadline.remaining_ms` for a local timer the *agent* enforces, or `None`.
+///
+/// Rule 4 puts the receiver's lease deadline on the agent's own clock and bounds the frame
+/// at `1..=1000` ms (`docs/ipc.proto`), and the IPC mapping table of
+/// `docs/03-architecture.md` asks for `ArmDeadline(issue_time + lease_ttl_ms − now)` on
+/// every valid renew. The deadline itself stays in the core (the FSM owns it); this only
+/// translates it for the clock that enforces it, so `EnterCommit` and each `LeaseRenew`
+/// re-arm the agent with the remaining time instead of letting its one-shot frame from
+/// `EnterCommit` fire `lease_ttl_ms` later.
+pub fn deadline_rearm_ms(timer: fr::Timer, deadline_ms: u64, now_ms: u64) -> Option<u32> {
+    match timer {
+        fr::Timer::ReceiverLeaseDeadline => Some(
+            u32::try_from(deadline_ms.saturating_sub(now_ms))
+                .unwrap_or(u32::MAX)
+                .clamp(1, 1000),
+        ),
+        _ => None,
+    }
+}
+
 /// The `Hello.capabilities` numbers for the bits the FSM and the product use.
 pub fn capability_bits(capabilities: Capabilities) -> Vec<i32> {
     let mut bits = Vec::new();
@@ -685,6 +705,30 @@ mod tests {
             ipc::agent_frame::Msg::ArmDeadline(arm) => assert_eq!(arm.remaining_ms, 1000),
             other => panic!("expected ArmDeadline, got {other:?}"),
         }
+        // The receiver's lease deadline is enforced by the agent (rule 4), so the core has
+        // to translate every re-arm of it into a fresh `ArmDeadline`: the frame sent at
+        // `EnterCommit` is a one-shot on the agent's clock, and a `LeaseRenew` that only
+        // moved the core's timer would still let the agent's deadline fire.
+        assert_eq!(
+            deadline_rearm_ms(fr::Timer::ReceiverLeaseDeadline, 1_500, 1_000),
+            Some(500),
+            "a renew moves the deadline, so the agent gets the remaining time"
+        );
+        assert_eq!(
+            deadline_rearm_ms(fr::Timer::ReceiverLeaseDeadline, 1_000, 1_000),
+            Some(1),
+            "rule 4: the frame is never 0"
+        );
+        assert_eq!(
+            deadline_rearm_ms(fr::Timer::ReceiverLeaseDeadline, 9_000, 1_000),
+            Some(1_000),
+            "rule 4: the frame is never above 1000 ms"
+        );
+        assert_eq!(
+            deadline_rearm_ms(fr::Timer::PrepareTimeout, 1_500, 1_000),
+            None,
+            "only the timer the agent enforces travels to it"
+        );
 
         match agent_command(&fr::AgentCommand::BeginCapture {
             kind: input_model::CaptureKind::Remote,
