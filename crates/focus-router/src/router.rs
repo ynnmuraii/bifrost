@@ -101,6 +101,16 @@ enum PendingOwnership {
     },
     /// The user abandoned ownership; the announcement waits for the release.
     Abandon { serial: u64 },
+    /// Our `claim_grant_timeout_ms` ran out and the claim still wins: the self-grant is
+    /// published from [`FocusRouter::settle_ownership`], i.e. only once the lease slot is
+    /// idle.
+    ///
+    /// This is what makes «смена owner-а возможна только когда все узлы в Local»
+    /// (`docs/03-architecture.md`) structural rather than incidental: a claimant can be
+    /// the receiver of the outgoing owner's lease, so even a self-grant has to release
+    /// first — and routing it through the same settle point is what
+    /// `invariant_5_grants_require_idle_slot_after_release` checks.
+    SelfGrant { serial: u64 },
 }
 
 /// One node's focus/lease/ownership router.
@@ -779,6 +789,22 @@ impl<I: Identifiers> FocusRouter<I> {
                     granted: false,
                 }));
             }
+            PendingOwnership::SelfGrant { .. } => {
+                // The release has landed; the claim must still exist and still win (a
+                // refusal or a higher pair may have arrived while we were releasing).
+                if self.ownership.pending_claim().is_some() && self.claim_still_wins() {
+                    if let Some((serial, owner)) = self.ownership.self_grant() {
+                        out.push(Output::Broadcast(Message::OwnerState {
+                            serial,
+                            owner: Some(owner),
+                            granted: true,
+                        }));
+                    }
+                } else {
+                    self.ownership.abandon_claim();
+                    out.push(Output::Notice(Notice::ClaimRefused { code: None }));
+                }
+            }
         }
         self.pending_ownership = None;
     }
@@ -920,13 +946,13 @@ impl<I: Identifiers> FocusRouter<I> {
                     out.push(Output::Notice(Notice::ClaimRefused { code: None }));
                     return;
                 }
-                if let Some((serial, owner)) = self.ownership.self_grant() {
-                    out.push(Output::Broadcast(Message::OwnerState {
-                        serial,
-                        owner: Some(owner),
-                        granted: true,
-                    }));
-                }
+                // Release first, grant from `settle_ownership`. The old owner is
+                // unreachable (that is why we are self-granting), but we may still be the
+                // receiver of its lease, and a node must be in Local before it becomes the
+                // owner.
+                let serial = claim.serial;
+                self.pending_ownership = Some(PendingOwnership::SelfGrant { serial });
+                self.release_lease_for_ownership(out);
             }
             Timer::ReleaseGuard => match &self.lease {
                 LeaseSlot::Source(lease) if lease.state == SourceState::Releasing => {
@@ -999,26 +1025,86 @@ impl<I: Identifiers> FocusRouter<I> {
             AgentEvent::DeadlineExpired { lease_id } => {
                 self.on_agent_deadline_expired(lease_id, out);
             }
-            AgentEvent::Error { lease_id, code } => {
-                if code == ErrorCode::AgentLost {
+            AgentEvent::Error { lease_id, code } => match code {
+                ErrorCode::AgentLost => {
                     self.on_session_end(now_ms, LeaveReason::AgentLost, out);
                     self.blocked = true;
-                } else if let Some(lease_id) = lease_id {
-                    out.push(Output::Notice(Notice::Rejected {
+                }
+                // «Preparing --> Local: timeout 200 ms or capture failed or NACK»
+                // (`docs/05-protocol.md`): the agent's capture/session failure cancels the
+                // transition, and a buffered press is replayed locally («Нельзя «потерять»
+                // нажатие в Preparing»).
+                ErrorCode::CaptureFailed | ErrorCode::UnsupportedSession => match lease_id {
+                    Some(lease_id) => self.cancel_failed_transition(lease_id, code, out),
+                    None => out.push(Output::Notice(Notice::Rejected {
                         peer: self.local,
                         code,
-                    }));
-                    let _ = lease_id;
-                }
-            }
+                    })),
+                },
+                _ => out.push(Output::Notice(Notice::Rejected {
+                    peer: self.local,
+                    code,
+                })),
+            },
         }
+    }
+
+    /// Cancels the lease an agent failure was reported for.
+    fn cancel_failed_transition(
+        &mut self,
+        lease_id: LeaseId,
+        code: ErrorCode,
+        out: &mut Vec<Output>,
+    ) {
+        match &self.lease {
+            LeaseSlot::Source(lease) if lease.lease_id == lease_id => {
+                // A temporary capture that failed can be replayed locally; a live capture
+                // cannot, so it is only released.
+                let replay = lease.state != SourceState::Remote;
+                out.push(Output::Agent(AgentCommand::EndCapture {
+                    lease_id,
+                    replay_buffered_locally: replay,
+                }));
+                out.push(Output::CancelTimer(Timer::PrepareTimeout));
+                out.push(Output::CancelTimer(Timer::SourceLeaseWatchdog));
+                self.lease = LeaseSlot::Idle;
+                self.burned.insert(lease_id);
+            }
+            LeaseSlot::Receiver(lease) if lease.lease_id == lease_id => {
+                out.push(Output::Agent(AgentCommand::ReleaseSession { lease_id }));
+                out.push(Output::CancelTimer(Timer::PrepareTimeout));
+                out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
+                out.push(Output::CancelTimer(Timer::ReceiverChallenge));
+                out.push(Output::CancelTimer(Timer::RepeatGuard));
+                if let Some(lease) = self.lease.receiver_mut() {
+                    lease.state = ReceiverState::Releasing;
+                }
+                self.burned.insert(lease_id);
+            }
+            _ => {}
+        }
+        out.push(Output::Notice(Notice::Rejected {
+            peer: self.local,
+            code,
+        }));
     }
 
     fn on_capture_ready(&mut self, now_ms: u64, lease_id: LeaseId, out: &mut Vec<Output>) {
         let Some(lease) = self.lease.source() else {
             return;
         };
-        if lease.lease_id != lease_id || lease.state != SourceState::Preparing {
+        if lease.lease_id != lease_id {
+            return;
+        }
+        if lease.state == SourceState::Releasing {
+            // `docs/03-architecture.md` («Смена владения и роли lease»): the owner
+            // «дожидается `Released`/`CaptureReady` (то есть Local)», so a source that was
+            // asked to end its capture may be answered by either message. Treating the
+            // capture-ready confirmation as the release is what lets a hand-off finish.
+            self.on_released(lease_id, out);
+            return;
+        }
+        if lease.state != SourceState::Preparing {
             return;
         }
         if !lease.capture_ready {
