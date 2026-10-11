@@ -31,6 +31,7 @@ use transport::{LinkEvent, LinkManager};
 use crate::agent::Supervisor;
 use crate::command::PeerRef;
 use crate::ctl;
+use crate::ownership_store::OwnershipStore;
 use crate::routing::{self, AgentSignal, Effect};
 
 /// How long the loop sleeps when nothing else has a deadline.
@@ -56,6 +57,8 @@ pub struct Session {
     node_id: NodeId,
     backend: String,
     trust: identity::TrustStore,
+    /// Persists the ownership pair across restarts (`config.toml`).
+    ownership_store: OwnershipStore,
     /// Set by `quit` on the control channel.
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
@@ -107,6 +110,7 @@ impl Session {
         trust: identity::TrustStore,
         layout: config::TopologyConfig,
         pointer_gain: f64,
+        ownership_store: OwnershipStore,
     ) -> Self {
         let mut session = Session {
             router,
@@ -123,6 +127,7 @@ impl Session {
             node_id,
             backend,
             trust,
+            ownership_store,
             stopping: false,
             agent_restart_due: None,
             agent_lost_reported: false,
@@ -352,6 +357,9 @@ impl Session {
                 Effect::Notice(notice) => self.log_notice(&notice),
             }
         }
+        // Ownership is a persisted counter, not only FSM state: a restart that forgot the
+        // pair would claim serial 1 again and look stale to the survivor (`ownership_store`).
+        self.ownership_store.observe(self.router.ownership());
     }
 
     /// Arms (or re-arms) the agent's own lease deadline.
