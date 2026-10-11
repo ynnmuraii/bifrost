@@ -375,12 +375,8 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
     let mut outbound = outbound;
     let reason = loop {
         let now_ms = state.started.elapsed().as_millis() as u64;
-        let wake = policy::next_liveness_wakeup(
-            now_ms,
-            state.last_pong_ms,
-            state.last_ping_ms,
-            liveness,
-        );
+        let wake =
+            policy::next_liveness_wakeup(now_ms, state.last_pong_ms, state.last_ping_ms, liveness);
         let sleep = Duration::from_millis(wake.saturating_sub(now_ms).max(1));
 
         enum Step {
@@ -702,14 +698,19 @@ async fn write_message<W: AsyncWrite + Unpin>(
 ) -> Result<(), LinkDownReason> {
     let lease_id = convert::lease_id_of_message(&message);
     let seq = state.tx_seq;
+    // A lease is entered on one of the peer's displays, and every absolute position the
+    // source sends afterwards is local to it; `EnterPrepare` is where that display is
+    // known, so it becomes the batch display of this link (see `convert::batch_display_after`).
+    let batch_display = convert::batch_display_after(&message, state.batch_display.as_str());
     let envelope = convert::to_envelope(
         &message,
         seq,
         &state.connection_id,
         lease_id.as_ref(),
-        state.batch_display.as_str(),
+        batch_display.as_str(),
     )
     .map_err(|error| LinkDownReason::Protocol(error.to_string()))?;
+    state.batch_display = batch_display;
     state.tx_seq += 1;
     write_frame(writer, &envelope).await.map_err(reason_from)
 }
