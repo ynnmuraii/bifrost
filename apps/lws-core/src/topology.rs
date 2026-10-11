@@ -138,6 +138,35 @@ fn author_of(documents: &Documents<'_>) -> Option<NodeId> {
     config::node_id_from_hex(hex).map(NodeId::new)
 }
 
+/// A captured position in the node's logical space → a display-local
+/// [`geometry::Position`].
+///
+/// The capture path carries no display id: `input-model`'s `Position` is two numbers and
+/// the agent sends `PointerAbs.display_id` empty on purpose («the receiver resolves the
+/// display from its own zones/geometry»), because what the OS reports is a position in
+/// the *node's* space (the Windows virtual desktop, the X11 root window). Resolving an
+/// edge needs the display-local form, and this is that conversion: find the display whose
+/// rectangle contains the point. A point outside every display (a gap between monitors,
+/// which the documents allow) has no local position and cannot open a transition.
+pub fn position_on(
+    topology: &Topology,
+    node: &NodeId,
+    x: f64,
+    y: f64,
+) -> Option<geometry::Position> {
+    let member = topology.node(node)?;
+    let point = geometry::Point::new(x, y);
+    let display = member
+        .displays
+        .iter()
+        .find(|display| display.logical_bounds.contains(point))?;
+    Some(geometry::Position::new(
+        display.id.clone(),
+        x - display.logical_bounds.x,
+        y - display.logical_bounds.y,
+    ))
+}
+
 /// `DisplayInfo` (IPC) → [`Display`].
 ///
 /// The IPC message has no `native_known` flag, so a non-positive native width or height
@@ -221,6 +250,58 @@ fn rect_of(rect: &protocol::wire::Rect) -> Rect {
     }
 }
 
+/// The `[[topology.displays]]` snapshot of every *other* node, as wire displays.
+///
+/// A `[[topology.links]]` endpoint names a peer display, so the snapshot already declares
+/// that it exists; until the peer's `Hello` arrives with its own manifest (or when a dry
+/// session never sends one), this is what keeps the document complete instead of failing
+/// validation. Rows whose `node` reference does not parse are skipped with a log, because
+/// the example file carries truncated placeholders.
+pub fn snapshot_peers(
+    topology: &config::TopologyConfig,
+    local_node_id: &[u8; 32],
+) -> Vec<(NodeId, Vec<wire::Display>)> {
+    let local = config::peer_reference(local_node_id);
+    let mut by_node: BTreeMap<NodeId, Vec<wire::Display>> = BTreeMap::new();
+    for row in &topology.displays {
+        if row.node == "self" || row.node == local {
+            continue;
+        }
+        let Some(bytes) = node_reference(&row.node) else {
+            tracing::warn!(
+                node = row.node.as_str(),
+                "a [[topology.displays]] row names a node that is not a hex id; skipped"
+            );
+            continue;
+        };
+        by_node
+            .entry(NodeId::new(bytes))
+            .or_default()
+            .push(wire::Display {
+                id: row.id.clone(),
+                logical_bounds: Some(wire::Rect {
+                    x: row.logical[0],
+                    y: row.logical[1],
+                    width: row.logical[2],
+                    height: row.logical[3],
+                }),
+                native_bounds: None,
+                rotation_degrees: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                primary: row.primary,
+                native_known: false,
+            });
+    }
+    by_node.into_iter().collect()
+}
+
+/// A `"self"`/`"peer:<hex>"`/bare-hex reference as 32 bytes.
+fn node_reference(reference: &str) -> Option<[u8; 32]> {
+    let hex = reference.strip_prefix("peer:").unwrap_or(reference);
+    config::node_id_from_hex(hex)
+}
+
 /// The `[[topology.displays]]` snapshot of this node as `DisplayInfo` values.
 ///
 /// Used when the agent has not reported anything yet (dry mode, or a session without an
@@ -256,6 +337,152 @@ pub fn snapshot_displays(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_space_point_becomes_a_display_local_one() {
+        let config = config::TopologyConfig::default();
+        let displays = vec![
+            info(
+                "primary",
+                [0.0, 0.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                true,
+            ),
+            info(
+                "left",
+                [-1280.0, 0.0, 1280.0, 1024.0],
+                [0, 0, 1280, 1024],
+                false,
+            ),
+        ];
+        let document = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &displays,
+            peer_displays: &[],
+        })
+        .expect("two displays and no links");
+
+        // Inside the primary: display-local means subtracting its origin.
+        let local = position_on(&document, &NodeId::new(local_id()), 1919.0, 540.0).unwrap();
+        assert_eq!(local.display_id.as_str(), "primary");
+        assert_eq!((local.x, local.y), (1919.0, 540.0));
+
+        // On the display to the left, with its negative origin.
+        let left = position_on(&document, &NodeId::new(local_id()), -1279.0, 512.0).unwrap();
+        assert_eq!(left.display_id.as_str(), "left");
+        assert_eq!((left.x, left.y), (1.0, 512.0));
+
+        // A point in the gap between monitors belongs to no display.
+        assert!(position_on(&document, &NodeId::new(local_id()), -2000.0, 512.0).is_none());
+    }
+
+    #[test]
+    fn the_snapshot_of_other_nodes_becomes_their_manifest() {
+        let text = format!(
+            r#"
+config_version = 2
+[network]
+listen_address = "192.168.1.10"
+[topology]
+revision = 1
+author = "self"
+[[topology.displays]]
+node = "self"
+id = "edid:self"
+logical = [0, 0, 1920, 1080]
+primary = true
+[[topology.displays]]
+node = "{peer}"
+id = "DP-1"
+logical = [0, 0, 2560, 1440]
+primary = true
+[[topology.displays]]
+node = "peer:not-hex"
+id = "ignored"
+logical = [0, 0, 800, 600]
+"#,
+            peer = config::peer_reference(&peer_id())
+        );
+        let config = config::Config::from_str(&text).expect("parses").topology;
+        let peers = snapshot_peers(&config, &local_id());
+        assert_eq!(
+            peers.len(),
+            1,
+            "the placeholder row is skipped, not guessed"
+        );
+        assert_eq!(peers[0].0, NodeId::new(peer_id()));
+        assert_eq!(peers[0].1.len(), 1);
+        assert_eq!(peers[0].1[0].id, "DP-1");
+        assert_eq!(peers[0].1[0].logical_bounds.as_ref().unwrap().width, 2560.0);
+        assert!(
+            !peers[0].1[0].native_known,
+            "a snapshot has no physical size"
+        );
+    }
+
+    #[test]
+    fn a_dry_document_needs_only_the_configuration() {
+        // The smoke case: the agent reports nothing, so both manifests come from the
+        // snapshot and the link still resolves.
+        let text = format!(
+            r#"
+config_version = 2
+[network]
+listen_address = "192.168.1.10"
+[topology]
+revision = 1
+author = "self"
+[[topology.displays]]
+node = "self"
+id = "dry-0"
+logical = [0, 0, 1920, 1080]
+primary = true
+[[topology.displays]]
+node = "{peer}"
+id = "dry-0"
+logical = [0, 0, 1920, 1080]
+primary = true
+[[topology.links]]
+id = "win-right-to-b-left"
+from = {{ node = "self", display = "dry-0", edge = "right", start = 0, end = 1080 }}
+to = {{ node = "{peer}", display = "dry-0", edge = "left", start = 0, end = 1080 }}
+bidirectional = true
+"#,
+            peer = config::peer_reference(&peer_id())
+        );
+        let config = config::Config::from_str(&text).expect("parses").topology;
+        let self_displays = snapshot_displays(&config, &local_id());
+        let peers = snapshot_peers(&config, &local_id());
+        let document = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &self_displays,
+            peer_displays: &peers,
+        })
+        .expect("the snapshot alone is a complete document");
+
+        // A step from just inside the right edge leaves the node.
+        let position = geometry::Position::new("dry-0", 1910.0, 540.0);
+        let motion = geometry::Point::new(20.0, 0.0);
+        let out = geometry::resolve_motion(&document, &NodeId::new(local_id()), &position, motion)
+            .expect("right edge");
+        assert_eq!(out.target.node, NodeId::new(peer_id()));
+        assert!(
+            out.target_position.x >= 0.0 && out.target_position.x < 8.0,
+            "2 px inside the target"
+        );
+
+        // And from 2 px inside the peer's left edge, a step back leaves it in reverse.
+        let back = geometry::resolve_motion(
+            &document,
+            &NodeId::new(peer_id()),
+            &out.target_position,
+            geometry::Point::new(-20.0, 0.0),
+        )
+        .expect("the reverse direction of a bidirectional link");
+        assert_eq!(back.target.node, NodeId::new(local_id()));
+    }
 
     fn local_id() -> [u8; 32] {
         [0x11; 32]

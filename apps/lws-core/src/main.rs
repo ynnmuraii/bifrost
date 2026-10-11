@@ -419,6 +419,10 @@ async fn run_async(
         node_id,
         session.backend,
         trust,
+        // The layout document and the pointer gain: what edge-triggered transitions
+        // resolve against (`docs/03-architecture.md`, «Топология и движение»).
+        config.topology.clone(),
+        config.input.pointer_gain,
     );
     session.run().await.map_err(|error| error.to_string())
 }
