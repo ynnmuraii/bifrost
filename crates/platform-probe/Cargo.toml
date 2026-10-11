@@ -1,0 +1,18 @@
+[package]
+name = "platform-probe"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "LAN Workspace: session/compositor/portal detection and backend selection (KVM-014/025)"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+# The decision itself is pure Rust and compiled everywhere; only the environment
+# gathering (env vars, D-Bus portal `version` properties, X11 extensions) is Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+x11rb = { version = "0.14", features = ["xtest", "xinput", "randr"] }

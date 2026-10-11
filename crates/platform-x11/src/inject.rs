@@ -1,0 +1,423 @@
+//! XTest-based injection (KVM-012).
+//!
+//! [`X11Injector`] is a thin, honest wrapper around the XTest extension:
+//!
+//! * keys are pressed/released with `XTestFakeKeyEvent` using the X11 keycode of
+//!   the current XKB keymap (ADR-006, see [`crate::keymap`]),
+//! * buttons use the core button numbers 1..3/8/9,
+//! * wheel movement is one press/release pair per 120-unit notch on buttons
+//!   4/5 (vertical) and 6/7 (horizontal), with the sub-notch remainder kept
+//!   between calls so a slow stream of `±40` still produces notches,
+//! * absolute pointer moves use `XTestFakeMotionEvent` with the root window and
+//!   root coordinates.
+//!
+//! Everything that was actually pressed is recorded in a [`PressedLedger`]. That
+//! ledger is the recovery path: [`X11Injector::release_all`] releases exactly the
+//! keys and buttons this process pushed, so a transfer that dies halfway (or an
+//! emergency abort) never leaves the remote desktop with a stuck key.
+
+use std::collections::HashSet;
+
+use input_model::{InputEvent, KeyState, Position};
+use x11rb::connection::Connection as _;
+use x11rb::protocol::xproto::{self, ConnectionExt as _, Window};
+use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::rust_connection::RustConnection;
+
+use crate::keymap::{
+    button_kind_to_x11_button, hid_usage_to_x11_keycode, WHEEL_UNITS_PER_NOTCH,
+    X11_BUTTON_WHEEL_DOWN, X11_BUTTON_WHEEL_LEFT, X11_BUTTON_WHEEL_RIGHT, X11_BUTTON_WHEEL_UP,
+};
+use crate::X11Error;
+
+/// Upper bound on wheel notches synthesised for a single `Scroll` event. A peer
+/// that asks for thousands of notches in one event would otherwise stall the
+/// injector inside a loop; the remainder stays in the accumulator and drains on
+/// the following events.
+const MAX_NOTCHES_PER_EVENT: i32 = 32;
+
+/// XTest `deviceid` argument meaning "use the default (core) device".
+const XTEST_DEFAULT_DEVICE: u8 = 0;
+
+/// The outcome of one injection batch.
+///
+/// Mirrors the adapter contract: a batch is applied event by event, and a partial
+/// failure reports how many events made it *and* the error, so the caller can
+/// decide to abort without replaying the whole batch (which would double-apply the
+/// events that already landed).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InjectResult {
+    /// Number of events from the batch that were consumed, in order.
+    ///
+    /// A `Scroll` whose 120-unit remainder has not yet reached a whole notch is
+    /// consumed (the remainder is retained for the next event) without sending a
+    /// request, and still counts here — nothing is lost either way.
+    pub applied_count: usize,
+    /// `Some` when the batch stopped early (or the flush failed); the failing
+    /// event and everything after it were not applied.
+    pub os_error: Option<String>,
+    /// The pointer position the server reports after a batch that contained an
+    /// absolute move. `None` when the batch moved nothing, or when the batch
+    /// failed before the position could be read back.
+    pub actual: Option<Position>,
+}
+
+/// Which keys and buttons this process has pushed and not yet released.
+///
+/// Invariants:
+///
+/// * a keycode/button is present iff the last successful injection for it was a
+///   press,
+/// * an entry only leaves the set on a *successful* release (a failed release
+///   must stay, or the key stays down on the server forever),
+/// * wheel press/release pairs are instantaneous, so a complete notch leaves no
+///   trace — but a wheel button whose release failed stays in the ledger.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PressedLedger {
+    keys: HashSet<u8>,
+    buttons: HashSet<u8>,
+}
+
+impl PressedLedger {
+    /// An empty ledger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a key edge.
+    pub fn note_key(&mut self, keycode: u8, state: KeyState) {
+        if state.is_down() {
+            self.keys.insert(keycode);
+        } else {
+            self.keys.remove(&keycode);
+        }
+    }
+
+    /// Records a button edge.
+    pub fn note_button(&mut self, button: u8, state: KeyState) {
+        if state.is_down() {
+            self.buttons.insert(button);
+        } else {
+            self.buttons.remove(&button);
+        }
+    }
+
+    /// Keycodes currently held down, ascending. Deterministic, unlike the set.
+    pub fn keys(&self) -> Vec<u8> {
+        let mut keys: Vec<u8> = self.keys.iter().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Button numbers currently held down, ascending.
+    pub fn buttons(&self) -> Vec<u8> {
+        let mut buttons: Vec<u8> = self.buttons.iter().copied().collect();
+        buttons.sort_unstable();
+        buttons
+    }
+
+    /// `true` when nothing is held down.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.buttons.is_empty()
+    }
+
+    /// Total number of held keys and buttons.
+    pub fn len(&self) -> usize {
+        self.keys.len() + self.buttons.len()
+    }
+
+    /// Forgets every entry without touching the server. Only for tests and for
+    /// callers that released the input by other means.
+    pub fn clear(&mut self) {
+        self.keys.clear();
+        self.buttons.clear();
+    }
+}
+
+/// XTest-backed input injector.
+pub struct X11Injector {
+    conn: RustConnection,
+    root: Window,
+    root_width: u16,
+    root_height: u16,
+    xtest_version: (u8, u16),
+    ledger: PressedLedger,
+    scroll_remainder_h: i32,
+    scroll_remainder_v: i32,
+}
+
+impl X11Injector {
+    /// Connects to the display named by `$DISPLAY` and verifies that XTest is
+    /// available.
+    ///
+    /// Fails when there is no usable display or when the server does not offer the
+    /// XTest extension, since injection is then impossible.
+    pub fn new() -> Result<Self, X11Error> {
+        let (conn, screen_num) = x11rb::connect(None)?;
+        let (root, root_width, root_height) = {
+            let screen = &conn.setup().roots[screen_num];
+            (screen.root, screen.width_in_pixels, screen.height_in_pixels)
+        };
+        let version = conn.xtest_get_version(2, 2)?.reply()?;
+        Ok(Self {
+            conn,
+            root,
+            root_width,
+            root_height,
+            xtest_version: (version.major_version, version.minor_version),
+            ledger: PressedLedger::new(),
+            scroll_remainder_h: 0,
+            scroll_remainder_v: 0,
+        })
+    }
+
+    /// The XTest version advertised by the server (`major`, `minor`).
+    pub fn xtest_version(&self) -> (u8, u16) {
+        self.xtest_version
+    }
+
+    /// The root window used for absolute motion.
+    pub fn root(&self) -> Window {
+        self.root
+    }
+
+    /// Root window size in pixels.
+    pub fn root_size(&self) -> (u16, u16) {
+        (self.root_width, self.root_height)
+    }
+
+    /// The pressed-state ledger.
+    pub fn ledger(&self) -> &PressedLedger {
+        &self.ledger
+    }
+
+    /// Keycodes currently held down, ascending.
+    pub fn pressed_keys(&self) -> Vec<u8> {
+        self.ledger.keys()
+    }
+
+    /// Buttons currently held down, ascending.
+    pub fn pressed_buttons(&self) -> Vec<u8> {
+        self.ledger.buttons()
+    }
+
+    /// `true` when nothing this injector pushed is still held down.
+    pub fn is_empty(&self) -> bool {
+        self.ledger.is_empty()
+    }
+
+    /// Sends every buffered request to the server.
+    pub fn flush(&mut self) -> Result<(), X11Error> {
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// The current pointer position, read back from the server.
+    pub fn pointer_position(&self) -> Result<Position, X11Error> {
+        let reply = self.conn.query_pointer(self.root)?.reply()?;
+        Ok(Position::new(
+            f64::from(reply.root_x),
+            f64::from(reply.root_y),
+        ))
+    }
+
+    /// Applies a batch of normalized events in order.
+    ///
+    /// Stops at the first event that could not be pushed and reports it; events
+    /// before it are already on the wire and are *not* rolled back or replayed.
+    pub fn inject(&mut self, events: &[InputEvent]) -> InjectResult {
+        let mut applied_count = 0usize;
+        let mut os_error = None;
+        let mut moved = false;
+        for event in events {
+            if matches!(event, InputEvent::PointerAbsolute(_)) {
+                moved = true;
+            }
+            match self.apply(event) {
+                Ok(()) => applied_count += 1,
+                Err(err) => {
+                    os_error = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+        if let Err(err) = self.flush() {
+            os_error.get_or_insert_with(|| err.to_string());
+        }
+        let actual = if moved && os_error.is_none() {
+            self.pointer_position().ok()
+        } else {
+            None
+        };
+        InjectResult {
+            applied_count,
+            os_error,
+            actual,
+        }
+    }
+
+    /// Releases every key and button still held down by this injector.
+    ///
+    /// This is the watchdog/recovery path and must be callable at any time,
+    /// including right after a failed batch. Every entry is attempted even if one
+    /// release fails (the first error is reported); entries whose release failed
+    /// stay in the ledger so a later attempt can retry them.
+    pub fn release_all(&mut self) -> InjectResult {
+        let keys = self.ledger.keys();
+        let buttons = self.ledger.buttons();
+        let mut applied_count = 0usize;
+        let mut os_error = None;
+        for keycode in keys {
+            match self.fake_key(keycode, KeyState::Up) {
+                Ok(()) => applied_count += 1,
+                Err(err) => {
+                    os_error.get_or_insert_with(|| err.to_string());
+                }
+            }
+        }
+        for button in buttons {
+            match self.fake_button(button, KeyState::Up) {
+                Ok(()) => applied_count += 1,
+                Err(err) => {
+                    os_error.get_or_insert_with(|| err.to_string());
+                }
+            }
+        }
+        if let Err(err) = self.flush() {
+            os_error.get_or_insert_with(|| err.to_string());
+        }
+        InjectResult {
+            applied_count,
+            os_error,
+            actual: None,
+        }
+    }
+
+    /// Applies exactly one event, updating the ledger on success.
+    fn apply(&mut self, event: &InputEvent) -> Result<(), X11Error> {
+        match *event {
+            InputEvent::PointerAbsolute(position) => self.fake_absolute_motion(position),
+            InputEvent::Key { usage, state } => {
+                let keycode = hid_usage_to_x11_keycode(usage).ok_or_else(|| {
+                    X11Error::Internal(format!(
+                        "no X11 keycode for HID usage 0x{:02X} on page 0x{:02X}",
+                        usage.usage, usage.page
+                    ))
+                })?;
+                self.fake_key(keycode, state)
+            }
+            InputEvent::Button { button, state } => {
+                self.fake_button(button_kind_to_x11_button(button), state)
+            }
+            InputEvent::Scroll { h120, v120 } => self.fake_scroll(h120, v120),
+        }
+    }
+
+    fn fake_absolute_motion(&self, position: Position) -> Result<(), X11Error> {
+        let x = clamp_coordinate(position.x, self.root_width);
+        let y = clamp_coordinate(position.y, self.root_height);
+        self.conn.xtest_fake_input(
+            xproto::MOTION_NOTIFY_EVENT,
+            0,
+            x11rb::CURRENT_TIME,
+            self.root,
+            x,
+            y,
+            XTEST_DEFAULT_DEVICE,
+        )?;
+        Ok(())
+    }
+
+    fn fake_key(&mut self, keycode: u8, state: KeyState) -> Result<(), X11Error> {
+        let type_ = if state.is_down() {
+            xproto::KEY_PRESS_EVENT
+        } else {
+            xproto::KEY_RELEASE_EVENT
+        };
+        self.conn.xtest_fake_input(
+            type_,
+            keycode,
+            x11rb::CURRENT_TIME,
+            x11rb::NONE,
+            0,
+            0,
+            XTEST_DEFAULT_DEVICE,
+        )?;
+        self.ledger.note_key(keycode, state);
+        Ok(())
+    }
+
+    fn fake_button(&mut self, button: u8, state: KeyState) -> Result<(), X11Error> {
+        let type_ = if state.is_down() {
+            xproto::BUTTON_PRESS_EVENT
+        } else {
+            xproto::BUTTON_RELEASE_EVENT
+        };
+        self.conn.xtest_fake_input(
+            type_,
+            button,
+            x11rb::CURRENT_TIME,
+            x11rb::NONE,
+            0,
+            0,
+            XTEST_DEFAULT_DEVICE,
+        )?;
+        self.ledger.note_button(button, state);
+        Ok(())
+    }
+
+    /// Turns 120-unit wheel deltas into press/release pairs, keeping the
+    /// sub-notch remainder for the next call.
+    fn fake_scroll(&mut self, h120: i32, v120: i32) -> Result<(), X11Error> {
+        self.scroll_remainder_h = self.scroll_remainder_h.saturating_add(h120);
+        self.scroll_remainder_v = self.scroll_remainder_v.saturating_add(v120);
+        let horizontal = take_notches(&mut self.scroll_remainder_h);
+        let vertical = take_notches(&mut self.scroll_remainder_v);
+        let (h_button, v_button) = (
+            if horizontal >= 0 {
+                X11_BUTTON_WHEEL_RIGHT
+            } else {
+                X11_BUTTON_WHEEL_LEFT
+            },
+            if vertical >= 0 {
+                X11_BUTTON_WHEEL_UP
+            } else {
+                X11_BUTTON_WHEEL_DOWN
+            },
+        );
+        for _ in 0..vertical.unsigned_abs() {
+            self.wheel_notch(v_button)?;
+        }
+        for _ in 0..horizontal.unsigned_abs() {
+            self.wheel_notch(h_button)?;
+        }
+        Ok(())
+    }
+
+    fn wheel_notch(&mut self, button: u8) -> Result<(), X11Error> {
+        self.fake_button(button, KeyState::Down)?;
+        self.fake_button(button, KeyState::Up)
+    }
+}
+
+/// Consumes whole 120-unit notches out of an accumulator, leaving the remainder
+/// (and anything beyond [`MAX_NOTCHES_PER_EVENT`]) in place.
+fn take_notches(remainder: &mut i32) -> i32 {
+    let notches =
+        (*remainder / WHEEL_UNITS_PER_NOTCH).clamp(-MAX_NOTCHES_PER_EVENT, MAX_NOTCHES_PER_EVENT);
+    *remainder -= notches * WHEEL_UNITS_PER_NOTCH;
+    notches
+}
+
+/// Clamps a logical coordinate into the root window and to the XTest `i16` range.
+///
+/// `NaN` becomes 0 and infinities saturate to an edge, so the injected coordinate
+/// is always a valid absolute position inside the root; the server would clamp
+/// anyway, but a defined value is what [`InjectResult::actual`] is compared with.
+fn clamp_coordinate(value: f64, extent: u16) -> i16 {
+    let max = f64::from(extent.saturating_sub(1).min(i16::MAX as u16));
+    if value.is_nan() {
+        return 0;
+    }
+    value.clamp(0.0, max).round() as i16
+}

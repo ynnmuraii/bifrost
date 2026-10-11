@@ -1,0 +1,20 @@
+[package]
+name = "platform-x11"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "LAN Workspace X11 backend: XTest injection and XI2 raw capture (KVM-012/013)"
+
+[lints]
+workspace = true
+
+[dependencies]
+input-model = { path = "../input-model" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.14", features = ["xtest", "xinput", "randr", "xfixes"] }
+# Safe `poll(2)` wrapper, used to give `X11Capture::next_event` a real timeout
+# without `unsafe`. x11rb already depends on rustix (same major) so this adds no
+# new compilation units.
+rustix = { version = "1.0", features = ["event"] }
