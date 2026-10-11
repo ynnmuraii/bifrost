@@ -48,14 +48,53 @@ pub fn endpoint(runtime_dir: &std::path::Path) -> Result<Endpoint, String> {
 }
 
 /// See the Unix variant.
+///
+/// The GUI pipe is per user (`\\.\pipe\lan-workspace-<SID>`) because a desktop has one
+/// GUI, but this channel belongs to *one core*, and `--root` promises to put «config/,
+/// data/, state/ and run/ under DIR»: two cores for the same user — the loopback smoke,
+/// a test host — must not fight over one name. A `--root` therefore adds a tag derived
+/// from the runtime directory, exactly as the Unix socket path is derived from it; the
+/// default directories keep the documented per-user name, and the SID stays in it so the
+/// DACL's owner is recognisable.
 #[cfg(windows)]
-pub fn endpoint(_runtime_dir: &std::path::Path) -> Result<Endpoint, String> {
+pub fn endpoint(runtime_dir: &std::path::Path) -> Result<Endpoint, String> {
     let sid = transport::current_user_sid_string().map_err(|error| error.to_string())?;
+    let tag = runtime_tag(runtime_dir);
     Ok(Endpoint::pipe(format!(
-        "{}{}ctl-{sid}",
+        "{}{}ctl-{sid}{}",
         transport::PIPE_PATH_PREFIX,
-        transport::PIPE_NAME_PREFIX
+        transport::PIPE_NAME_PREFIX,
+        tag.map(|tag| format!("-{tag}")).unwrap_or_default()
     )))
+}
+
+/// The `--root` tag for the control pipe, or `None` for the default directories.
+///
+/// FNV-1a over the canonical runtime directory: the daemon and the CLI client build it
+/// from the same [`config::Paths`], so they agree without touching the filesystem, and a
+/// pipe name cannot carry the path's `\` itself. The default runtime directory is `None`
+/// on Windows and the core then lives in the state directory (`private_root`), so both
+/// defaults count as "not a `--root`".
+#[cfg(windows)]
+fn runtime_tag(runtime_dir: &std::path::Path) -> Option<String> {
+    let defaults = config::Config::default_paths().ok()?;
+    let canonical = |path: &std::path::Path| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let ours = canonical(runtime_dir);
+    let is_default = [defaults.runtime_dir(), Some(defaults.state_dir())]
+        .into_iter()
+        .flatten()
+        .any(|default| canonical(default) == ours);
+    if is_default {
+        return None;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in ours.as_os_str().to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(format!("{hash:016x}"))
 }
 
 /// One line of the request protocol.
