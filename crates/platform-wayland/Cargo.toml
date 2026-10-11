@@ -1,0 +1,27 @@
+[package]
+name = "platform-wayland"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "LAN Workspace Wayland backend: portal InputCapture/RemoteDesktop + EIS via reis (KVM-015..018)"
+
+[lints]
+workspace = true
+
+[dependencies]
+input-model = { path = "../input-model" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# ashpd: XDG desktop portal client (pure Rust, MIT). Chosen runtime: tokio, because
+# reis' `tokio` feature gives the EIS event streams directly (see ADR-002/report).
+# `clipboard` is only used to read the Clipboard portal's version (KVM-017 records it);
+# the clipboard stream itself is never driven here.
+# `screencast` is not optional: ashpd 0.13's `remote_desktop` module imports
+# `screencast::Stream` unconditionally, so the module does not compile without the
+# feature. It only pulls `serde_repr` (pure Rust), not pipewire.
+ashpd = { version = "0.13", features = ["input_capture", "remote_desktop", "global_shortcuts", "clipboard", "screencast"] }
+reis = { version = "0.7", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+futures-util = "0.3"
+thiserror = "2"
