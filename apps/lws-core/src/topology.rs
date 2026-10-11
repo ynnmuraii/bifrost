@@ -167,6 +167,37 @@ pub fn position_on(
     ))
 }
 
+/// The events a peer receives while a source lease is remote.
+///
+/// `protocol.proto` `Position` is «local to display top-left, logical units», and the
+/// peer's display is the *target* one, so an absolute position the source captured in its
+/// own node space must be replaced by the virtual position on the target display (which is
+/// where the deltas have already carried it). Sending the node-space position instead was
+/// the bug this function exists for: the receiver would inject at whatever its own
+/// geometry made of those numbers.
+///
+/// Without a virtual position (no resolved transition yet) the events are passed through
+/// unchanged: there is nothing better to send, and dropping a key edge would be worse.
+pub fn forward_events(
+    events: Vec<input_model::InputEvent>,
+    virtual_position: Option<&geometry::Position>,
+) -> Vec<input_model::InputEvent> {
+    let Some(position) = virtual_position else {
+        return events;
+    };
+    events
+        .into_iter()
+        .map(|event| match event {
+            input_model::InputEvent::PointerAbsolute(_) => {
+                input_model::InputEvent::PointerAbsolute(input_model::Position::new(
+                    position.x, position.y,
+                ))
+            }
+            other => other,
+        })
+        .collect()
+}
+
 /// `DisplayInfo` (IPC) → [`Display`].
 ///
 /// The IPC message has no `native_known` flag, so a non-positive native width or height
@@ -337,6 +368,36 @@ pub fn snapshot_displays(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forwarded_batch_carries_the_target_display_position() {
+        use input_model::{InputEvent, KeyState, MouseButton, Position};
+
+        let virtual_position = geometry::Position::new("peer-display", 640.0, 360.0);
+        let events = vec![
+            InputEvent::PointerAbsolute(Position::new(1919.0, 540.0)),
+            InputEvent::Key {
+                key: input_model::HidKey::keyboard(0x04),
+                state: KeyState::Down,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: KeyState::Down,
+            },
+            InputEvent::Scroll { h120: 0, v120: 120 },
+        ];
+        let forwarded = forward_events(events.clone(), Some(&virtual_position));
+        assert_eq!(
+            forwarded[0],
+            InputEvent::PointerAbsolute(Position::new(640.0, 360.0)),
+            "the source's own coordinates must not reach the peer"
+        );
+        // Everything that is not a position is passed through untouched.
+        assert_eq!(&forwarded[1..], &events[1..]);
+
+        // A batch with no resolved position is not silently emptied.
+        assert_eq!(forward_events(events.clone(), None), events);
+    }
 
     #[test]
     fn a_node_space_point_becomes_a_display_local_one() {
