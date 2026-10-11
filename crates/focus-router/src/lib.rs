@@ -55,10 +55,12 @@
 //!
 //! # Times, and what is *not* here
 //!
-//! `prepare_timeout_ms`, `lease_ttl_ms` (with `challenge = lease_ttl / 5` computed),
-//! `claim_grant_timeout_ms` and `repeat_guard_ms` are the whole timing surface
-//! ([`config::Timing`], bounds checked). The agent's own `core_silence_ms` watchdog is
-//! deliberately not modelled: it belongs to the agent's IPC layer.
+//! `prepare_timeout_ms`, `lease_ttl_ms` (with `challenge = lease_ttl / 5` computed) and
+//! `claim_grant_timeout_ms` are the whole configurable timing surface
+//! ([`config::Timing`], bounds checked). `repeat_guard_ms` is **not** configurable: it is
+//! the protocol limit [`config::Timing::REPEAT_GUARD_MS`] (150 ms). The agent's own
+//! `core_silence_ms` watchdog is deliberately not modelled: it belongs to the agent's IPC
+//! layer.
 //!
 //! Resolved doc ambiguities are noted at the code that had to choose (search for
 //! "ambiguity" below and in [`router`]).
