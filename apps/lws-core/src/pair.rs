@@ -113,7 +113,7 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
                 .await
                 .map_err(|error| Failure::Run(error.to_string()))?
         };
-        confirm(driver, &mut trust, &trust_path).await
+        confirm(driver, &mut trust, &trust_path, open).await
     })
 }
 
@@ -122,6 +122,7 @@ async fn confirm(
     driver: PairingDriver,
     trust: &mut TrustStore,
     trust_path: &Path,
+    opener: bool,
 ) -> Result<(), Failure> {
     println!("SAS: {}", driver.sas().text());
     println!("peer: {}", driver.peer_display_name());
@@ -130,7 +131,7 @@ async fn confirm(
     print!("codes match? [y/N] ");
     std::io::stdout().flush().ok();
 
-    let address = driver.address().map(str::to_owned);
+    let address = peer_address(opener, driver.address());
     let approved = ask().await?;
     if !approved {
         driver
@@ -156,6 +157,22 @@ async fn confirm(
     Ok(())
 }
 
+/// The address to remember for the peer.
+///
+/// The dialer typed the opener's address, so the address it observed *is* the peer's input
+/// endpoint and its port is real. The opener only sees the dialer's *source* address, whose
+/// port is ephemeral, and `PairHello` carries no address at all (`docs/protocol.proto`:
+/// `node_id`, `display_name`, `supports_sas`), so the only address it can record honestly is
+/// the dialer's IP with the documented input port (`docs/05-protocol.md`: «Адреса для
+/// `network.peers` берутся из сопряжения, поэтому ручной IP вводится один раз на пару»).
+fn peer_address(opener: bool, observed: Option<&str>) -> Option<String> {
+    let mut address: SocketAddr = observed?.parse().ok()?;
+    if opener {
+        address.set_port(protocol::PORT_INPUT_CONTROL);
+    }
+    Some(address.to_string())
+}
+
 /// Reads one y/n answer from stdin without blocking the runtime.
 async fn ask() -> Result<bool, Failure> {
     tokio::task::spawn_blocking(|| {
@@ -168,4 +185,32 @@ async fn ask() -> Result<bool, Failure> {
     })
     .await
     .map_err(|error| Failure::Run(format!("cannot read the answer: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_opener_records_the_documented_port_and_the_dialer_keeps_the_typed_one() {
+        // The dialer typed the opener's address: that port is the peer's input port.
+        assert_eq!(
+            peer_address(false, Some("192.168.1.11:47931")),
+            Some("192.168.1.11:47931".to_owned())
+        );
+
+        // The opener saw an ephemeral source port, and `PairHello` has no address field,
+        // so it records the documented input port instead of an unusable one.
+        assert_eq!(
+            peer_address(true, Some("192.168.1.11:56175")),
+            Some(format!("192.168.1.11:{}", protocol::PORT_INPUT_CONTROL))
+        );
+
+        assert_eq!(peer_address(true, None), None);
+        assert_eq!(
+            peer_address(false, Some("not an address")),
+            None,
+            "an unparsable address is not stored"
+        );
+    }
 }
