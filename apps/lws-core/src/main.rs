@@ -24,6 +24,7 @@ mod agent;
 mod command;
 mod ctl;
 mod ids;
+mod ownership_store;
 mod pair;
 mod portal;
 mod routing;
@@ -45,6 +46,7 @@ use protocol::ipc::{AgentMode, BackendKind};
 use transport::{BackoffBounds, LinkLiveness, LinkManager, ManagerConfig};
 
 use crate::agent::Supervisor;
+use crate::ownership_store::OwnershipStore;
 use crate::session::Session;
 
 /// The framed-IPC version core speaks (`AgentFrame.major`/`minor`).
@@ -424,6 +426,9 @@ async fn run_async(
         // resolve against (`docs/03-architecture.md`, «Топология и движение»).
         config.topology.clone(),
         config.input.pointer_gain,
+        // The ownership pair belongs in the configuration file, so a restart resumes the
+        // counter it learned instead of claiming serial 1 again (`ownership_store`).
+        OwnershipStore::new(paths.config_file(), config.clone()),
     );
     session.run().await.map_err(|error| error.to_string())
 }
