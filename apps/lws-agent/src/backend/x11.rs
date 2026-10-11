@@ -129,6 +129,29 @@ impl X11 {
         }
     }
 
+    /// X11 monitors through RandR 1.5 (KVM-040).
+    ///
+    /// A failure is reported as an empty set: core then falls back to the
+    /// `[[topology.displays]]` snapshot instead of losing the node.
+    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+        match platform_x11::displays::enumerate() {
+            Ok(monitors) => monitors
+                .into_iter()
+                .map(|monitor| crate::displays::RawDisplay {
+                    id: monitor.id,
+                    logical: monitor.logical,
+                    native: Some(monitor.native),
+                    scale: monitor.scale,
+                    primary: monitor.primary,
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "cannot enumerate X11 monitors");
+                Vec::new()
+            }
+        }
+    }
+
     pub async fn next_event(&mut self) -> Option<Event> {
         if let Some(capture) = &mut self.capture {
             // A non-blocking poll; the loop's tick provides the wait.

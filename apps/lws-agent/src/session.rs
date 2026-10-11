@@ -149,6 +149,8 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     // because the crossing itself is the news.
     let mut at_edge = false;
     let mut released_after_silence = false;
+    // The node's own display set and its revision (`Hello.displays_revision`).
+    let mut displays = crate::displays::DisplaysState::default();
 
     loop {
         tokio::select! {
@@ -177,7 +179,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 if let Some(stop) = handle_message(
                     link, backend, ready, message, &mut deadline, &mut self_timeout,
-                    &mut held_lease, &mut batch,
+                    &mut held_lease, &mut batch, &mut displays,
                 ).await? {
                     return Ok(stop);
                 }
@@ -268,6 +270,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
     self_timeout: &mut Option<(Instant, Vec<u8>)>,
     held_lease: &mut Option<Vec<u8>>,
     batch: &mut Vec<LocalEvent>,
+    displays: &mut crate::displays::DisplaysState,
 ) -> anyhow::Result<Option<Stop>> {
     match message {
         Msg::Attach(_) => {
@@ -421,15 +424,16 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         }
         Msg::QueryDisplays(_) => {
-            // `enumerate_displays` does not exist yet in the platform crates
-            // (`docs/06-development-plan.md` KVM-040). An empty report would mean
-            // "this node has no screens", so it is an explicit refusal instead.
-            send_error(
-                link,
-                "DISPLAYS_UNAVAILABLE",
-                "display enumeration is KVM-040; this slice reports nothing",
-            )
-            .await?;
+            // KVM-040: the backend enumerates its monitors; the revision only moves
+            // when the set does, so core can tell a re-query from a hot-plug.
+            let current = backend.displays();
+            let report = displays.observe(&current);
+            tracing::info!(
+                displays = report.displays.len(),
+                revision = report.local_revision,
+                "display report"
+            );
+            link.send(Msg::Displays(report)).await?;
         }
         Msg::ForgetPortalGrants(_) => {
             backend.forget_portal_grants().await;
@@ -577,6 +581,7 @@ mod tests {
         held: Option<Vec<u8>>,
         batch: Vec<LocalEvent>,
         at_edge: bool,
+        displays: crate::displays::DisplaysState,
     }
 
     impl Harness {
@@ -600,6 +605,7 @@ mod tests {
                 held: None,
                 batch: Vec::new(),
                 at_edge: false,
+                displays: crate::displays::DisplaysState::default(),
             }
         }
 
@@ -613,6 +619,7 @@ mod tests {
                 &mut self.self_timeout,
                 &mut self.held,
                 &mut self.batch,
+                &mut self.displays,
             )
             .await
             .expect("a valid frame must not fail the handler");

@@ -20,6 +20,7 @@
 //! keyboard (see `docs/work/e2-slice-procedure.md`).
 
 mod backend;
+mod displays;
 mod events;
 mod launch;
 mod session;

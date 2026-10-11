@@ -309,6 +309,39 @@ impl Wayland {
         Ok(self.release_session())
     }
 
+    /// The portal zones as displays (KVM-040).
+    ///
+    /// `docs/03-architecture.md`, «Дисплеи и координаты»: «Порталы не отдают физическое
+    /// разрешение. Набор дисплеев строится по зонам (логические границы)», so the zones
+    /// are the display set and the native bounds stay unknown (`native_known = false`).
+    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+        let Some(capture) = self.capture.as_ref() else {
+            return Vec::new();
+        };
+        let zones = zones_of(capture);
+        if zones.is_empty() {
+            return Vec::new();
+        }
+        // The first zone is the one the pointer starts in; without a better signal it is
+        // reported as primary, which only decides where the node logical origin sits.
+        zones
+            .iter()
+            .enumerate()
+            .map(|(index, zone)| {
+                crate::displays::RawDisplay::without_native(
+                    format!("zone-{index}"),
+                    [
+                        f64::from(zone.x),
+                        f64::from(zone.y),
+                        f64::from(zone.width),
+                        f64::from(zone.height),
+                    ],
+                    index == 0,
+                )
+            })
+            .collect()
+    }
+
     /// `PrepareInject`: the inject session is already up; the absolute region is what
     /// decides whether this node can be a receiver at all.
     pub async fn prepare_inject(&mut self) -> Result<(), String> {

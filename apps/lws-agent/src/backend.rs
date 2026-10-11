@@ -485,6 +485,22 @@ impl Backend {
         }
     }
 
+    /// The monitors of this node, for `DisplaysReport` (KVM-040).
+    ///
+    /// Dry mode reports nothing: it touches no OS input path, and inventing a display
+    /// would make core's topology disagree with the machine.
+    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+        match self {
+            Backend::Dry(_) => Vec::new(),
+            #[cfg(windows)]
+            Backend::Win(backend) => backend.displays(),
+            #[cfg(target_os = "linux")]
+            Backend::X11(backend) => backend.displays(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.displays(),
+        }
+    }
+
     /// `RECOVERY`: let go of exactly these keys and buttons (rule 7).
     pub async fn release_keys(&mut self, keys: &[HidKey], buttons: &[MouseButton]) -> Released {
         match self {
