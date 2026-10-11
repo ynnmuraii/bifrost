@@ -16,7 +16,7 @@
 //! через `scale_*`». Native pixels are only produced on demand by
 //! [`Transition::target_native`] / [`Display::logical_to_native`].
 
-use crate::display::{Display, Edge, NodeId, Point, GEOMETRY_EPSILON};
+use crate::display::{Display, Edge, NodeId, Point, Rect, GEOMETRY_EPSILON};
 use crate::topology::{Endpoint, Position, Topology, TransitionLink};
 
 /// Distance the pointer is placed inside the target display, in logical units.
@@ -78,20 +78,24 @@ impl Transition {
 
 /// Edge a *position* has already left, if any.
 ///
-/// A point inside `[left, right) × [top, bottom)` is not a crossing. A point on
-/// an edge counts as that edge (overshoot `0`). A point beyond a corner is
-/// attributed to the edge with the largest overshoot; ties resolve in the order
-/// `Right`, `Left`, `Bottom`, `Top`. `along` is clamped to the edge.
+/// `position` is display-local (`protocol.proto`: `Position.x // local to display
+/// top-left`; `03-architecture.md`, «Координаты»), so the four edges are at `0` and
+/// at the display's logical size.
+///
+/// A point inside `[0, width) × [0, height)` is not a crossing. A point on an edge
+/// counts as that edge (overshoot `0`). A point beyond a corner is attributed to
+/// the edge with the largest overshoot; ties resolve in the order `Right`, `Left`,
+/// `Bottom`, `Top`. `along` is clamped to the edge.
 pub fn crossing(display: &Display, position: &Position) -> Option<EdgeCrossing> {
     if display.id != position.display_id {
         return None;
     }
-    let bounds = display.logical_bounds;
+    let size = display.logical_size();
     let candidates = [
-        (Edge::Right, position.x - bounds.right()),
-        (Edge::Left, bounds.left() - position.x),
-        (Edge::Bottom, position.y - bounds.bottom()),
-        (Edge::Top, bounds.top() - position.y),
+        (Edge::Right, position.x - size.width),
+        (Edge::Left, 0.0 - position.x),
+        (Edge::Bottom, position.y - size.height),
+        (Edge::Top, 0.0 - position.y),
     ];
 
     let mut best: Option<(Edge, f64)> = None;
@@ -103,9 +107,9 @@ pub fn crossing(display: &Display, position: &Position) -> Option<EdgeCrossing> 
     let (edge, overshoot) = best?;
 
     let along = if edge.is_vertical() {
-        (position.y - bounds.top()).clamp(0.0, bounds.height)
+        position.y.clamp(0.0, size.height)
     } else {
-        (position.x - bounds.left()).clamp(0.0, bounds.width)
+        position.x.clamp(0.0, size.width)
     };
     Some(EdgeCrossing {
         edge,
@@ -130,9 +134,12 @@ pub fn crossing_with_motion(
     if display.id != position.display_id {
         return None;
     }
-    let bounds = display.logical_bounds;
+    // Display-local again, as in `crossing`: `position` is relative to the display's
+    // top-left, so the local rectangle starts at the origin.
+    let size = display.logical_size();
+    let local = Rect::new(0.0, 0.0, size.width, size.height);
     let start = Point::new(position.x, position.y);
-    if !bounds.contains(start) {
+    if !local.contains(start) {
         return None;
     }
     let (dx, dy) = (motion.x, motion.y);
@@ -141,16 +148,16 @@ pub fn crossing_with_motion(
     }
 
     let exit_x = if dx > 0.0 {
-        (bounds.right() - start.x) / dx
+        (size.width - start.x) / dx
     } else if dx < 0.0 {
-        (bounds.left() - start.x) / dx
+        (0.0 - start.x) / dx
     } else {
         f64::INFINITY
     };
     let exit_y = if dy > 0.0 {
-        (bounds.bottom() - start.y) / dy
+        (size.height - start.y) / dy
     } else if dy < 0.0 {
-        (bounds.top() - start.y) / dy
+        (0.0 - start.y) / dy
     } else {
         f64::INFINITY
     };
@@ -166,9 +173,9 @@ pub fn crossing_with_motion(
 
     let hit = Point::new(start.x + dx * t, start.y + dy * t);
     let along = if edge.is_vertical() {
-        (hit.y - bounds.top()).clamp(0.0, bounds.height)
+        hit.y.clamp(0.0, size.height)
     } else {
-        (hit.x - bounds.left()).clamp(0.0, bounds.width)
+        hit.x.clamp(0.0, size.width)
     };
     Some(EdgeCrossing {
         edge,

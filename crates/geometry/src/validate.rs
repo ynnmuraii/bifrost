@@ -658,16 +658,40 @@ fn shared_corner(first: &EdgeSegment, second: &EdgeSegment) -> Option<Corner> {
     })
 }
 
+/// Whether `segment` on `edge` reaches `corner`.
+///
+/// An edge is parameterised from the top when it is vertical and from the left when
+/// it is horizontal (`03-architecture.md`, «Координаты»: `Endpoint.segment_start/end`
+/// is «расстояние вдоль ребра от его начала (левый край для TOP/BOTTOM, верхний — для
+/// LEFT/RIGHT)»). The corner therefore sits at distance `0` — the start of the
+/// parameterisation — when it is on the edge's near side, and at `edge_length` when
+/// it is on the far side:
+///
+/// | edge | near corner (`0`) | far corner (`edge_length`) |
+/// |---|---|---|
+/// | `Left` | `TopLeft` | `BottomLeft` |
+/// | `Right` | `TopRight` | `BottomRight` |
+/// | `Top` | `TopLeft` | `TopRight` |
+/// | `Bottom` | `BottomLeft` | `BottomRight` |
+///
+/// A corner that does not lie on this edge's own side of the display (for example
+/// `Top` with `BottomLeft`) is not reached at all.
 fn touches_corner(edge: Edge, segment: Segment, edge_length: f64, corner: Corner) -> bool {
-    match (edge, corner) {
-        (Edge::Left | Edge::Top, Corner::TopLeft) => segment.start <= GEOMETRY_EPSILON,
-        (Edge::Right | Edge::Top, Corner::TopRight) => {
-            segment.end >= edge_length - GEOMETRY_EPSILON
-        }
-        (Edge::Right | Edge::Bottom, Corner::BottomRight) => {
-            segment.end >= edge_length - GEOMETRY_EPSILON
-        }
-        (Edge::Left | Edge::Bottom, Corner::BottomLeft) => segment.start <= GEOMETRY_EPSILON,
-        _ => false,
+    let far_end = match (edge, corner) {
+        (Edge::Left, Corner::TopLeft)
+        | (Edge::Right, Corner::TopRight)
+        | (Edge::Top, Corner::TopLeft)
+        | (Edge::Bottom, Corner::BottomLeft) => false,
+        (Edge::Left, Corner::BottomLeft)
+        | (Edge::Right, Corner::BottomRight)
+        | (Edge::Top, Corner::TopRight)
+        | (Edge::Bottom, Corner::BottomRight) => true,
+        // The corner is off this edge's axis: the edge cannot reach it.
+        _ => return false,
+    };
+    if far_end {
+        segment.end >= edge_length - GEOMETRY_EPSILON
+    } else {
+        segment.start <= GEOMETRY_EPSILON
     }
 }
