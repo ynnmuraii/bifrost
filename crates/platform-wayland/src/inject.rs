@@ -782,7 +782,7 @@ fn declare_device_ready(device: &event::Device) {
 
 /// Splits `value` (in 120ths of a wheel detent) into whole detents, keeping the
 /// sub-detent remainder in `remainder` for the next event.
-fn split_detents(value: i32, remainder: &mut i32) -> i32 {
+pub(crate) fn split_detents(value: i32, remainder: &mut i32) -> i32 {
     let total = value.saturating_add(*remainder);
     let steps = total / DETENT_UNITS;
     *remainder = total - steps * DETENT_UNITS;
@@ -802,5 +802,55 @@ fn button_state(state: KeyState) -> ei::button::ButtonState {
         ei::button::ButtonState::Press
     } else {
         ei::button::ButtonState::Released
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_detents;
+
+    #[test]
+    fn detents_truncate_toward_zero_and_keep_signed_remainders() {
+        for (input, steps, leftover) in [
+            (-121, -1, -1),
+            (-120, -1, 0),
+            (-119, 0, -119),
+            (0, 0, 0),
+            (119, 0, 119),
+            (120, 1, 0),
+            (121, 1, 1),
+            (i32::MAX, 17895697, 7),
+            (i32::MIN, -17895697, -8),
+        ] {
+            let mut remainder = 0;
+            assert_eq!(split_detents(input, &mut remainder), steps);
+            assert_eq!(remainder, leftover);
+        }
+    }
+
+    #[test]
+    fn detent_streams_conserve_units_across_direction_changes() {
+        let mut remainder = 0;
+        let mut input_sum = 0_i64;
+        let mut output_sum = 0_i64;
+        for delta in [119, 1, -40, -40, -41, 2, 239, -119, -121, 0] {
+            input_sum += i64::from(delta);
+            output_sum += i64::from(split_detents(delta, &mut remainder)) * 120;
+            assert_eq!(output_sum + i64::from(remainder), input_sum);
+            assert!(remainder.abs() < 120);
+        }
+    }
+
+    #[test]
+    fn detents_preserve_existing_remainder_at_integer_limits() {
+        for (input, previous) in [(i32::MAX, 119), (i32::MIN, -119)] {
+            let mut remainder = previous;
+            let steps = split_detents(input, &mut remainder);
+            assert_eq!(
+                i64::from(steps) * 120 + i64::from(remainder),
+                i64::from(input) + i64::from(previous)
+            );
+            assert!(remainder.abs() < 120);
+        }
     }
 }

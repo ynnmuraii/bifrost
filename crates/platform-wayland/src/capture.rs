@@ -798,7 +798,7 @@ impl WaylandCapture {
 }
 
 /// Clamps a 120th-of-a-detent count into `i32`.
-fn clamp_h120(units: f64) -> i32 {
+pub(crate) fn clamp_h120(units: f64) -> i32 {
     units.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
@@ -813,5 +813,30 @@ fn button_state(state: ei::button::ButtonState) -> KeyState {
     match state {
         ei::button::ButtonState::Press => KeyState::Down,
         ei::button::ButtonState::Released => KeyState::Up,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_h120;
+
+    #[test]
+    fn captured_scroll_units_saturate_and_truncate_without_overflow() {
+        for (input, expected) in [
+            (f64::NEG_INFINITY, i32::MIN),
+            (f64::from(i32::MIN) - 1.0, i32::MIN),
+            (f64::from(i32::MIN), i32::MIN),
+            (-119.9, -119),
+            (-0.9, 0),
+            (0.0, 0),
+            (0.9, 0),
+            (119.9, 119),
+            (f64::from(i32::MAX), i32::MAX),
+            (f64::from(i32::MAX) + 1.0, i32::MAX),
+            (f64::INFINITY, i32::MAX),
+            (f64::NAN, 0),
+        ] {
+            assert_eq!(clamp_h120(input), expected);
+        }
     }
 }
