@@ -62,6 +62,9 @@ pub struct Session {
     agent_restart_due: Option<Instant>,
     /// Whether core told the FSM about the current agent loss.
     agent_lost_reported: bool,
+    /// The last agent `AgentError`/portal hint, shown by `status`
+    /// (`routing::agent_note`). Cleared when a fresh `AgentReady` arrives.
+    refusal: Option<String>,
 }
 
 impl Session {
@@ -85,6 +88,7 @@ impl Session {
             agent,
             ctl,
             timers: Timers::default(),
+            refusal: None,
             context: routing::AgentContext::default(),
             watchdog,
             started: Instant::now(),
@@ -334,6 +338,11 @@ impl Session {
             return Ok(());
         };
         tracing::info!(frame = routing::agent_frame_name(&message), "agent -> core");
+        // `status` shows the last thing the agent had to report; the note is derived
+        // from the frame and never contains a token (`routing::agent_note`).
+        if let Some(note) = routing::agent_note(&message) {
+            self.refusal = Some(note);
+        }
         match routing::agent_signal(&message, &mut self.context) {
             AgentSignal::Fsm(event) => {
                 if matches!(event, fr::AgentEvent::AgentReady) {
@@ -341,6 +350,9 @@ impl Session {
                     self.agent_lost_reported = false;
                     self.agent_restart_due = None;
                     self.watchdog.on_frame(now);
+                    // A new session starts with a clean slate; the previous crash's
+                    // error is not this session's state.
+                    self.refusal = None;
                 }
                 self.feed(fr::Input::Agent(event)).await;
             }
@@ -360,6 +372,7 @@ impl Session {
                     "portal"
                 );
             }
+            AgentSignal::Grant(changed) => self.on_portal_grant(changed).await,
             AgentSignal::Ignored => {}
         }
         Ok(())
@@ -478,6 +491,7 @@ impl Session {
         match request {
             ctl::Request::Ping => ctl::Response::Pong,
             ctl::Request::Status => ctl::Response::Status(self.status_line().await),
+            ctl::Request::ResetPortals => self.reset_portals().await,
             ctl::Request::Quit => {
                 self.stopping = true;
                 ctl::Response::Stopping
@@ -533,6 +547,82 @@ impl Session {
         }
     }
 
+    /// Stores or drops a portal token the agent reported.
+    ///
+    /// `docs/03-architecture.md`: core owns `portal-restore.toml`, so the token is
+    /// written back atomically here and never logged; a revocation drops the interface
+    /// it names, and an empty grant drops everything.
+    async fn on_portal_grant(&mut self, changed: protocol::ipc::PortalGrantChanged) {
+        let (changed_store, note) = match (changed.grant, changed.revoked) {
+            (Some(grant), false) => {
+                let interface = grant.portal_interface.clone();
+                let stored = self.agent.portal().accept(grant);
+                (
+                    stored,
+                    if stored {
+                        format!("portal grant received: {interface}")
+                    } else {
+                        format!("portal grant unchanged: {interface}")
+                    },
+                )
+            }
+            (Some(grant), true) => {
+                let interface = grant.portal_interface.clone();
+                let dropped = self.agent.portal().revoke(&interface);
+                (dropped, format!("portal grant revoked: {interface}"))
+            }
+            (None, _) => {
+                self.agent.portal().clear();
+                (true, "portal grants cleared".to_owned())
+            }
+        };
+        if changed_store {
+            if let Err(error) = self.agent.portal().save() {
+                tracing::warn!(error = error.as_str(), "cannot persist the portal tokens");
+            }
+        }
+        let tokens = self.agent.portal().len();
+        let interfaces = self.agent.portal().interfaces().join(",");
+        tracing::info!(
+            note = note.as_str(),
+            tokens,
+            interfaces = interfaces.as_str(),
+            "portal token store updated"
+        );
+        self.refusal = Some(note);
+    }
+
+    /// `reset-portals`: forget every stored token, in core and in the agent.
+    ///
+    /// This is the `ResetPortalGrants`/`ForgetPortalGrants` path of `docs/ipc.proto`:
+    /// the agent drops its in-memory copy and the portal asks again on the next
+    /// session, which is what a user wants after changing the compositor or denying a
+    /// dialog by mistake.
+    async fn reset_portals(&mut self) -> ctl::Response {
+        self.agent.portal().clear();
+        if let Err(error) = self.agent.portal().save() {
+            return ctl::Response::Error {
+                code: "PORTAL_STORE".to_owned(),
+                detail: error,
+            };
+        }
+        if let Err(error) = self
+            .agent
+            .send(Msg::ForgetPortalGrants(
+                protocol::ipc::ForgetPortalGrants {},
+            ))
+            .await
+        {
+            return ctl::Response::Error {
+                code: "AGENT_LOST".to_owned(),
+                detail: error,
+            };
+        }
+        self.refusal = Some("portal grants cleared".to_owned());
+        tracing::info!("portal grants cleared in core and in the agent");
+        ctl::Response::Status(self.status_line().await)
+    }
+
     async fn status_line(&mut self) -> String {
         let focus = self.router.focus();
         let lease_peer = match self.router.lease() {
@@ -558,6 +648,7 @@ impl Session {
             node_id: node_id.as_str(),
             owner: owner_hex.as_deref().unwrap_or(""),
             serial: self.router.serial(),
+            refusal: self.refusal.as_deref().unwrap_or(""),
         })
     }
 }

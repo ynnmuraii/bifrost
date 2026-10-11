@@ -24,6 +24,7 @@ mod agent;
 mod command;
 mod ctl;
 mod pair;
+mod portal;
 mod routing;
 mod session;
 
@@ -39,7 +40,7 @@ use identity::{IdentityPaths, NodeIdentity, TrustStore};
 use ipc::Watchdog;
 use platform_probe::BackendOverride;
 use protocol::ipc::{AgentMode, BackendKind};
-use transport::{BackoffBounds, LinkManager, LinkLiveness, ManagerConfig};
+use transport::{BackoffBounds, LinkLiveness, LinkManager, ManagerConfig};
 
 use crate::agent::Supervisor;
 use crate::session::Session;
@@ -365,6 +366,9 @@ async fn run_async(
         backend_kind(&config),
         config.input.require_emergency_hotkey,
         config.timing.agent_core_silence_ms,
+        // The portal tokens core ships to the agent: `portal-restore.toml`, which only
+        // a Wayland session ever fills (`docs/03-architecture.md`).
+        portal::PortalGrants::load(paths.portal_restore_file()),
     );
     supervisor.start(AgentMode::Normal).await?;
 

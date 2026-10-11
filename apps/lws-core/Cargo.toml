@@ -15,6 +15,9 @@ input-model = { path = "../../crates/input-model" }
 ipc = { path = "../../crates/ipc" }
 platform-probe = { path = "../../crates/platform-probe" }
 protocol = { path = "../../crates/protocol" }
+# `portal-restore.toml` is a small TOML document owned by core (serde + toml are
+# already in the tree through `config`, so this adds no new crates).
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = [
     "io-util",
     "macros",
@@ -25,6 +28,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 transport = { path = "../../crates/transport" }
