@@ -25,10 +25,15 @@ use input_model::{CaptureKind, HidKey, InputEvent, MouseButton, Position};
 use platform_probe::{BackendOverride, EnvSnapshot, SessionInfo};
 use protocol::ipc;
 
+#[cfg(target_os = "linux")]
+mod wayland;
 #[cfg(windows)]
 mod win;
 #[cfg(target_os = "linux")]
 mod x11;
+// Pure geometry, so its unit tests run on every host; only the Linux backend calls it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod wayland_barriers;
 
 /// The platform input path this agent drives.
 ///
@@ -42,6 +47,9 @@ pub enum Backend {
     Win(Box<win::Win>),
     #[cfg(target_os = "linux")]
     X11(Box<x11::X11>),
+    /// Portal capture (`InputCapture`) plus EIS injection (`RemoteDesktop`).
+    #[cfg(target_os = "linux")]
+    Wayland(Box<wayland::Wayland>),
 }
 
 /// What the agent reports in `AgentReady` right after the attach.
@@ -65,21 +73,55 @@ pub enum Event {
     /// The emergency combination was recognised; the agent already restored local
     /// control (rule 3).
     Emergency,
+    /// The pointer reached the edge of this node and the compositor handed input over.
+    ///
+    /// `docs/05-protocol.md` opens a transition with «`CapturedBatch`, pointer reaches
+    /// link edge», and [`at_edge`](ipc::CapturedBatch::at_edge) is that signal. On
+    /// Wayland it is the only one there is: the compositor activates capture at the
+    /// barrier, so the pointer never leaves the node on its own.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    AtEdge {
+        /// The barrier the compositor named, when it named one.
+        barrier_id: Option<u32>,
+    },
     /// The bounded capture queue overflowed; the agent must end capture (rule 2).
     ///
     /// Only the Windows capture has a bounded queue that can report overflow; the
     /// X11 backend reads from the X connection and has no equivalent signal.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     QueueOverflow,
-    /// The capture path itself failed; the agent ends capture and reports it.
+    /// The capture path failed or lost its session; the agent ends capture and reports
+    /// it to core with `code` (`AgentError.code`: `CAPTURE_FAILED`, `PORTAL_DENIED`,
+    /// `PORTAL_SESSION_LOST`, `PORTAL_FRONTEND_STUCK`, …).
     ///
-    /// Only the X11 backend can produce it: its event poll returns a `Result`, while
-    /// the Windows capture reports through `BeginCapture` instead. Receiver takeover
-    /// (`LocalInputDetected`, rule 9) and `ZonesChanged` have no signal in the E1
-    /// backends yet and are therefore not variants here — KVM-035 and KVM-026 add
-    /// them together with the detector that raises them.
+    /// Receiver takeover (`LocalInputDetected`, rule 9) still has no signal in any
+    /// backend — KVM-035 adds it together with the detector that raises it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Failed(String),
+    Failed {
+        /// The `AgentError.code` core should see.
+        code: &'static str,
+        /// Payload-free, actionable text.
+        detail: String,
+    },
+    /// A fresh portal restore token the agent received and core has to persist.
+    ///
+    /// Only a portal backend can produce it, so on other platforms the variant exists
+    /// for the session loop's exhaustive match and is never built.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    PortalGrant(ipc::PortalGrant),
+}
+
+/// Something the selected backend wants core to know without ending the session: a
+/// portal that is unavailable, a dialog the user dismissed, a capability the
+/// compositor refused.
+///
+/// The session loop turns each one into an `AgentError` frame after `AgentReady`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// `AgentError.code` (`docs/ipc.proto`: `PORTAL_DENIED`, `PORTAL_UNAVAILABLE`, …).
+    pub code: &'static str,
+    /// Payload-free, actionable text: never a token, a key or clipboard content.
+    pub detail: String,
 }
 
 /// The outcome of one `Inject` batch.
@@ -212,13 +254,36 @@ impl Backend {
     /// `dry` selects [`Backend::Dry`] whatever the session is; a session this build
     /// cannot drive also ends up in [`Backend::Dry`], but with no capabilities and
     /// the reason in `AgentReady.backend.degraded_reason`.
+    /// `restore_tokens` are the portal tokens core persisted; only the Wayland
+    /// backend uses them (`AgentAttach.restore_tokens`), so on other platforms the
+    /// parameter is accepted and ignored.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub async fn select(
         override_kind: BackendKindArg,
         dry: bool,
         synthetic_events: usize,
         emergency_hotkey: &str,
-    ) -> (Self, Ready) {
-        let snapshot = snapshot();
+        restore_tokens: &[ipc::PortalGrant],
+    ) -> (Self, Ready, Vec<Refusal>) {
+        // The probe reads D-Bus and X11 before the session is even known, and its
+        // zbus path is the *blocking* API, which builds a tokio runtime of its own:
+        // calling it from inside ours panics with «Cannot start a runtime from within a
+        // runtime» (measured on Linux). It is blocking work by nature, so it belongs on
+        // a blocking thread, where that nested runtime is legal.
+        let snapshot = match tokio::task::spawn_blocking(snapshot).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "reading the environment snapshot failed; the session is undetectable"
+                );
+                EnvSnapshot::new(if cfg!(windows) {
+                    platform_probe::HostOs::Windows
+                } else {
+                    platform_probe::HostOs::Linux
+                })
+            }
+        };
         let requested = override_kind.into_backend_override();
         match platform_probe::decide(&snapshot, requested) {
             Ok(session) => {
@@ -227,6 +292,7 @@ impl Backend {
                     return (
                         Backend::Dry(Box::new(Dry::new(ready.clone(), synthetic_events))),
                         ready,
+                        Vec::new(),
                     );
                 }
                 match session.backend {
@@ -234,7 +300,7 @@ impl Backend {
                         #[cfg(windows)]
                         {
                             match win::Win::new(&ready, emergency_hotkey) {
-                                Ok(backend) => (Backend::Win(Box::new(backend)), ready),
+                                Ok(backend) => (Backend::Win(Box::new(backend)), ready, Vec::new()),
                                 Err(reason) => refuse(&snapshot, &reason),
                             }
                         }
@@ -250,7 +316,7 @@ impl Backend {
                         #[cfg(target_os = "linux")]
                         {
                             match x11::X11::new(&ready, emergency_hotkey) {
-                                Ok(backend) => (Backend::X11(Box::new(backend)), ready),
+                                Ok(backend) => (Backend::X11(Box::new(backend)), ready, Vec::new()),
                                 Err(reason) => refuse(&snapshot, &reason),
                             }
                         }
@@ -262,11 +328,33 @@ impl Backend {
                             )
                         }
                     }
-                    platform_probe::Backend::Wayland { .. } => refuse(
-                        &snapshot,
-                        "platform-wayland (portal InputCapture and EIS injection) is KVM-026/027 \
-                         in stage E3; the E2 slice is Windows to Linux X11",
-                    ),
+                    platform_probe::Backend::Wayland { .. } => {
+                        #[cfg(target_os = "linux")]
+                        {
+                            match wayland::Wayland::connect(
+                                &session,
+                                emergency_hotkey,
+                                restore_tokens,
+                            )
+                            .await
+                            {
+                                Ok((backend, ready, refusals)) => {
+                                    (Backend::Wayland(Box::new(backend)), ready, refusals)
+                                }
+                                Err(refusal) => {
+                                    let (backend, ready, _) = refuse(&snapshot, &refusal.detail);
+                                    (backend, ready, vec![refusal])
+                                }
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            refuse(
+                                &snapshot,
+                                "platform-wayland is a Linux-only backend (XDG portals and EIS)",
+                            )
+                        }
+                    }
                 }
             }
             Err(unsupported) => refuse(&snapshot, &unsupported.to_string()),
@@ -281,6 +369,22 @@ impl Backend {
             Backend::Win(backend) => backend.ready(),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.ready(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.ready(),
+        }
+    }
+
+    /// `ForgetPortalGrants`: drop in-memory portal tokens so the next session asks
+    /// again. Core stays the owner of the persisted file.
+    pub async fn forget_portal_grants(&mut self) {
+        match self {
+            Backend::Dry(_) => {}
+            #[cfg(windows)]
+            Backend::Win(_) => {}
+            #[cfg(target_os = "linux")]
+            Backend::X11(_) => {}
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.forget_portal_grants(),
         }
     }
 
@@ -301,6 +405,8 @@ impl Backend {
             Backend::Win(backend) => backend.begin_capture(kind),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.begin_capture(kind),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.begin_capture(kind).await,
         }
     }
 
@@ -318,6 +424,8 @@ impl Backend {
             Backend::Win(backend) => backend.end_capture(),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.end_capture(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.end_capture(replay_buffered_locally).await,
         }
     }
 
@@ -329,6 +437,8 @@ impl Backend {
             Backend::Win(backend) => backend.prepare_inject(),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.prepare_inject(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.prepare_inject().await,
         }
     }
 
@@ -353,6 +463,8 @@ impl Backend {
             Backend::Win(backend) => backend.inject(events),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.inject(events),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.inject(events).await,
         }
     }
 
@@ -364,6 +476,8 @@ impl Backend {
             Backend::Win(backend) => backend.release_session(),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.release_session(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.release_session(),
         }
     }
 
@@ -378,6 +492,8 @@ impl Backend {
             Backend::Win(backend) => backend.release_keys(keys, buttons),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.release_keys(keys, buttons),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.release_keys(keys, buttons).await,
         }
     }
 
@@ -398,12 +514,14 @@ impl Backend {
             Backend::Win(backend) => backend.next_event().await,
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.next_event().await,
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.next_event().await,
         }
     }
 }
 
 /// The selected backend cannot be driven here: keep the node usable and say why.
-fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready) {
+fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready, Vec<Refusal>) {
     let (platform, session_kind) = describe_session(snapshot);
     tracing::warn!(
         reason,
@@ -412,7 +530,11 @@ fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready) {
         "session not supported by this build: staying local"
     );
     let ready = Ready::degraded(reason, &platform, &session_kind);
-    (Backend::Dry(Box::new(Dry::new(ready.clone(), 0))), ready)
+    (
+        Backend::Dry(Box::new(Dry::new(ready.clone(), 0))),
+        ready,
+        Vec::new(),
+    )
 }
 
 /// How long a non-blocking backend poll waits before reporting "no event".

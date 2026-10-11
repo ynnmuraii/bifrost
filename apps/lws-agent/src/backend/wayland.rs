@@ -1,0 +1,759 @@
+//! `platform-wayland` backend: XDG-portal `InputCapture` for capture and
+//! `RemoteDesktop` + EIS for injection (KVM-026/KVM-027).
+//!
+//! `docs/03-architecture.md` («Linux Wayland (GNOME и KDE через XDG-порталы)») is the
+//! contract this module implements; the platform crate `platform-wayland` owns the
+//! D-Bus and EIS details, and this module only decides *when* to call it and how to
+//! map its events onto the agent's vocabulary.
+//!
+//! # Two sessions, two roles
+//!
+//! * **inject** (`RemoteDesktop`): connected first and kept for the whole run. A
+//!   receiver needs it to inject, and a source needs it for the local replay of a
+//!   cancelled transition — «Инъекционная сессия нужна и источнику — ей проигрывается
+//!   буфер отменённого перехода».
+//! * **capture** (`InputCapture`): armed with barriers on the outer zone edges and
+//!   `Enable`d. The *compositor* decides when it becomes active («Активирует захват
+//!   композитор, когда указатель доходит до барьера: `Activated(activation_id,
+//!   cursor_position, barrier_id)`. Запросить активацию немедленно приложение не
+//!   может»), so `begin_capture` never starts suppression by itself: it checks that
+//!   the session is already active and only decides what to do with the events.
+//!
+//! # What this slice does and does not do
+//!
+//! * Events captured while a transition is being prepared are buffered; cancelling
+//!   the transition replays them locally through the inject session, so «нельзя
+//!   «потерять» нажатие в Preparing» holds on Wayland too.
+//! * A `ZonesChanged` signal re-arms the barriers. On GNOME 46 that needs the capture
+//!   session to be recreated (`SetPointerBarriers` is refused while the session is
+//!   enabled, and `Disable` cannot be undone — XDP-gnome #126), and recreating it
+//!   means a new portal dialog; the code does it and logs the cost.
+//! * `ZonesChanged` is *not* turned into `DisplaysChanged`: display enumeration is
+//!   KVM-040 and `QueryDisplays` is answered with an explicit refusal by the session
+//!   loop.
+//! * No display geometry is invented here: `EnterPrepare` positions are resolved by
+//!   `platform-wayland`'s absolute region, and a position outside it is refused with
+//!   `PositionOutOfRegion` instead of being clamped.
+//! * `RECEIVER_TAKEOVER` is never advertised (a portal receiver cannot see physical
+//!   input) and `EMERGENCY_HOTKEY` only when `GlobalShortcuts` registered the
+//!   combination.
+
+use std::collections::{HashSet, VecDeque};
+
+use input_model::{CaptureKind, HidKey, InputEvent, KeyState, MouseButton, Position};
+use platform_probe::SessionInfo;
+use platform_wayland::{
+    compositor_signature, portal_versions, Barrier, BarrierID, BarrierPosition, CapturedEvent,
+    Compositor, EmergencyShortcuts, GrantStore, PortalGrant, WaylandCapture, WaylandError,
+    WaylandInjector, INPUT_CAPTURE_INTERFACE, REMOTE_DESKTOP_INTERFACE,
+};
+
+use crate::backend::wayland_barriers::{self, BarrierSegment, Zone};
+use crate::backend::{Event, Injected, Ready, Refusal, Released, POLL_TICK};
+
+/// Which role the agent currently plays on this desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Local: the session is armed, nothing is suppressed and nothing is forwarded.
+    Observe,
+    /// Preparing: the compositor diverted input to us and core has not committed yet.
+    Temporary,
+    /// Remote: the lease is active and captured input goes to the peer.
+    Remote,
+}
+
+/// The activation the compositor granted, kept until `Release`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Activation {
+    id: u32,
+    cursor: Option<Position>,
+    barrier_id: Option<u32>,
+}
+
+/// The Wayland input path.
+pub struct Wayland {
+    ready: Ready,
+    /// `None` while no capture session exists (never connected, or dropped because it
+    /// had to be recreated).
+    capture: Option<WaylandCapture>,
+    injector: WaylandInjector,
+    /// `None` when this compositor has no `GlobalShortcuts` portal (GNOME 46).
+    shortcuts: Option<EmergencyShortcuts>,
+    /// Restore tokens handed over by core in `AgentAttach`; kept in memory, because
+    /// `docs/03-architecture.md` has *core* own `portal-restore.toml`.
+    grants: GrantStore,
+    mode: Mode,
+    activation: Option<Activation>,
+    /// The barriers currently registered, so an activation id can be traced back.
+    barriers: Vec<BarrierSegment>,
+    /// Events the compositor handed us that are not (yet) on the wire.
+    buffered: Vec<InputEvent>,
+    /// Events already mapped to the agent vocabulary, waiting for `next_event`.
+    pending: VecDeque<Event>,
+    pressed_keys: HashSet<(u16, u16)>,
+    pressed_buttons: HashSet<MouseButton>,
+}
+
+impl Wayland {
+    /// Connects the inject session (fatal if it fails) and arms the capture session
+    /// (degradable), then reports what the portals actually allow.
+    ///
+    /// `restore_tokens` are the ones core persisted; a token is only used when it
+    /// belongs to this compositor and these portal versions.
+    pub async fn connect(
+        session: &SessionInfo,
+        emergency_hotkey: &str,
+        restore_tokens: &[protocol::ipc::PortalGrant],
+    ) -> Result<(Self, Ready, Vec<Refusal>), Refusal> {
+        let mut refusals = Vec::new();
+
+        let compositor = Compositor::detect().map_err(|error| fatal(&error))?;
+        let versions = portal_versions().await;
+        let signature = compositor_signature(compositor, &versions);
+
+        // A token is only usable for the compositor and portal versions it was issued
+        // for (`docs/03-architecture.md`: «при смене композитора или несовпадении
+        // `compositor_signature` токен отбрасывается, а не переиспользуется»).
+        let mut grants = GrantStore::new();
+        for token in restore_tokens {
+            grants.accept(
+                PortalGrant::new(
+                    token.portal_interface.clone(),
+                    token.restore_token.clone(),
+                    token.compositor_signature.clone(),
+                ),
+                &signature,
+            );
+        }
+
+        // Injection first: a source needs it too, for the local replay, and a node
+        // that cannot inject cannot be part of a lease in either role.
+        let inject_grant = grants.get(REMOTE_DESKTOP_INTERFACE, &signature).cloned();
+        let injector = WaylandInjector::connect(inject_grant.as_ref())
+            .await
+            .map_err(|error| fatal(&error))?;
+
+        // The emergency hotkey is registered for the whole run (KVM-018); its absence
+        // is the documented reason a GNOME 46 node cannot be a source.
+        let shortcuts = match EmergencyShortcuts::register(emergency_hotkey).await {
+            Ok(shortcuts) => Some(shortcuts),
+            Err(error) => {
+                refusals.push(Refusal {
+                    code: "PORTAL_UNAVAILABLE",
+                    detail: format!(
+                        "emergency hotkey {emergency_hotkey:?} is not available: {error}; \
+                         this node cannot be the source while require_emergency_hotkey is true"
+                    ),
+                });
+                None
+            }
+        };
+
+        // Capture: degradable. A denied dialog is reported and names its interface,
+        // which is what the GUI needs (scenario S8).
+        let capture_grant = grants.get(INPUT_CAPTURE_INTERFACE, &signature).cloned();
+        let mut capture = match WaylandCapture::connect(capture_grant.as_ref()).await {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                refusals.push(Refusal {
+                    code: portal_code(&error),
+                    detail: format!("portal {INPUT_CAPTURE_INTERFACE} is not usable here: {error}"),
+                });
+                None
+            }
+        };
+
+        let mut barriers = Vec::new();
+        let mut armed = false;
+        if let Some(session) = capture.as_mut() {
+            match arm_capture(session, &mut barriers).await {
+                Ok(()) => armed = true,
+                Err(error) => refusals.push(Refusal {
+                    code: portal_code(&error),
+                    detail: format!("cannot arm the capture session: {error}"),
+                }),
+            }
+        }
+        if !armed {
+            // A session that cannot be armed cannot produce activations; drop it rather
+            // than leave a half-armed one behind.
+            capture = None;
+        }
+
+        // New tokens are core's to persist: `AgentAttach.restore_tokens` arrive from
+        // it and `PortalGrantChanged` goes back, so `portal-restore.toml` stays core's
+        // file (the agent never reads the configuration).
+        let mut pending = VecDeque::new();
+        let mut reported: Vec<PortalGrant> = Vec::new();
+        if let Some(capture) = capture.as_ref() {
+            reported.extend(capture.grant());
+        }
+        reported.extend(injector.grant());
+        for grant in reported {
+            grants.accept(grant.clone(), &signature);
+            pending.push_back(Event::PortalGrant(protocol::ipc::PortalGrant {
+                portal_interface: grant.portal_interface.clone(),
+                restore_token: grant.restore_token.clone(),
+                compositor_signature: grant.compositor_signature.clone(),
+            }));
+        }
+
+        let ready = refine_ready(
+            session,
+            capture.is_some(),
+            &injector,
+            shortcuts.is_some(),
+            &refusals,
+        );
+        let wayland = Wayland {
+            ready: ready.clone(),
+            capture,
+            injector,
+            shortcuts,
+            grants,
+            mode: Mode::Observe,
+            activation: None,
+            barriers,
+            buffered: Vec::new(),
+            pending,
+            pressed_keys: HashSet::new(),
+            pressed_buttons: HashSet::new(),
+        };
+        Ok((wayland, ready, refusals))
+    }
+
+    /// The capability report sent right after the attach.
+    pub fn ready(&self) -> Ready {
+        self.ready.clone()
+    }
+
+    /// Starts (or re-arms) capture for the requested kind.
+    ///
+    /// `OBSERVE` only makes sure the session is armed; `TEMPORARY` and `REMOTE` require
+    /// an activation the compositor already granted, because a Wayland source cannot
+    /// suppress input on its own.
+    pub async fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
+        match kind {
+            CaptureKind::Observe => {
+                if self.capture.is_none() {
+                    return Err(
+                        "the Wayland capture session is not available on this compositor"
+                            .to_owned(),
+                    );
+                }
+                self.mode = Mode::Observe;
+                self.buffered.clear();
+                self.pending.clear();
+                Ok(())
+            }
+            CaptureKind::Temporary | CaptureKind::Remote => {
+                let active = self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.is_active());
+                if !active {
+                    return Err(
+                        "the compositor has not activated the Wayland capture; a portal source \
+                         cannot suppress input on demand (activation happens when the pointer \
+                         reaches a barrier)"
+                            .to_owned(),
+                    );
+                }
+                self.mode = if kind == CaptureKind::Temporary {
+                    Mode::Temporary
+                } else {
+                    // A committed transition forwards what was buffered while
+                    // preparing; dropping it would lose the press that started it.
+                    for event in std::mem::take(&mut self.buffered) {
+                        self.pending.push_back(Event::Input(event));
+                    }
+                    Mode::Remote
+                };
+                Ok(())
+            }
+        }
+    }
+
+    /// Ends capture. `replay_locally` plays buffered events through the inject session
+    /// instead of forwarding them, which is the documented cancellation path.
+    pub async fn end_capture(&mut self, replay_locally: bool) -> Result<Released, String> {
+        if replay_locally && !self.buffered.is_empty() {
+            let buffered: Vec<InputEvent> = std::mem::take(&mut self.buffered);
+            let outcome = self.injector.inject(&buffered);
+            let replayed = outcome.applied_count;
+            if let Some(error) = outcome.os_error {
+                tracing::warn!(%error, "the local replay of the buffered edge failed");
+            }
+            tracing::info!(events = replayed, "replayed the cancelled edge locally");
+        }
+        self.buffered.clear();
+        self.pending.clear();
+        self.mode = Mode::Observe;
+
+        if let Some(capture) = self.capture.as_mut() {
+            if capture.is_active() {
+                let cursor = capture
+                    .cursor()
+                    .or_else(|| self.activation.and_then(|activation| activation.cursor))
+                    .unwrap_or(Position::new(0.0, 0.0));
+                if let Err(error) = capture.release(cursor).await {
+                    tracing::warn!(%error, "releasing the Wayland capture failed");
+                    self.activation = None;
+                    return Err(format!("Release of the capture session failed: {error}"));
+                }
+            }
+        }
+        self.activation = None;
+        // `Release` returns input to the compositor; keys and buttons this agent
+        // emulated are released here so nothing stays logically pressed.
+        Ok(self.release_session())
+    }
+
+    /// `PrepareInject`: the inject session is already up; the absolute region is what
+    /// decides whether this node can be a receiver at all.
+    pub async fn prepare_inject(&mut self) -> Result<(), String> {
+        self.injector.pump().await;
+        if self.injector.absolute_region().is_none() {
+            return Err(WaylandError::NoAbsoluteRegion.to_string());
+        }
+        Ok(())
+    }
+
+    /// Injects one batch through EIS.
+    ///
+    /// A point outside every region is refused by the platform crate with
+    /// [`WaylandError::PositionOutOfRegion`], which stops the batch and becomes
+    /// `InjectAck.os_error`; `docs/06-development-plan.md` KVM-027 makes a partial
+    /// failure the end of the lease, so the caller must not retry the batch.
+    pub async fn inject(&mut self, events: &[InputEvent]) -> Injected {
+        // Keep the EIS stream drained: a paused device would silently discard input.
+        self.injector.pump().await;
+        let outcome = self.injector.inject(events);
+        for event in events.iter().take(outcome.applied_count) {
+            match event {
+                InputEvent::Key { key, state } => {
+                    if state.is_down() {
+                        self.pressed_keys.insert((key.page, key.usage));
+                    } else {
+                        self.pressed_keys.remove(&(key.page, key.usage));
+                    }
+                }
+                InputEvent::Button { button, state } => {
+                    if state.is_down() {
+                        self.pressed_buttons.insert(*button);
+                    } else {
+                        self.pressed_buttons.remove(button);
+                    }
+                }
+                InputEvent::PointerAbsolute(_)
+                | InputEvent::PointerRelative { .. }
+                | InputEvent::Scroll { .. } => {}
+            }
+        }
+        Injected {
+            applied: outcome.applied_count,
+            os_error: outcome
+                .os_error
+                .map(|error| error.to_string())
+                .unwrap_or_default(),
+            actual: outcome.actual,
+        }
+    }
+
+    /// Releases everything this session emulated, which is what a receiver must do when
+    /// it loses the lease.
+    pub fn release_session(&mut self) -> Released {
+        let outcome = self.injector.release_all();
+        let released = Released {
+            keys: self.pressed_keys.len() as u32,
+            buttons: self.pressed_buttons.len() as u32,
+        };
+        self.pressed_keys.clear();
+        self.pressed_buttons.clear();
+        if let Some(error) = outcome.os_error {
+            tracing::warn!(%error, "releasing the emulated devices failed");
+        }
+        released
+    }
+
+    /// `RECOVERY` (rule 7): release exactly these keys and buttons.
+    ///
+    /// The counts come from what the EIS socket accepted, not from the request, so a
+    /// paused device is visible instead of being reported as released.
+    pub async fn release_keys(&mut self, keys: &[HidKey], buttons: &[MouseButton]) -> Released {
+        let mut events = Vec::with_capacity(keys.len() + buttons.len());
+        for key in keys {
+            events.push(InputEvent::Key {
+                key: *key,
+                state: KeyState::Up,
+            });
+        }
+        for button in buttons {
+            events.push(InputEvent::Button {
+                button: *button,
+                state: KeyState::Up,
+            });
+        }
+        let applied = self.inject(&events).await.applied;
+        let key_total = keys.len().min(applied) as u32;
+        let button_total = applied.saturating_sub(keys.len()) as u32;
+        for key in keys {
+            self.pressed_keys.remove(&(key.page, key.usage));
+        }
+        for button in buttons {
+            self.pressed_buttons.remove(button);
+        }
+        Released {
+            keys: key_total,
+            buttons: button_total,
+        }
+    }
+
+    /// `ForgetPortalGrants`: drop the in-memory tokens so the next session asks again.
+    pub fn forget_portal_grants(&mut self) {
+        self.grants.clear();
+        tracing::info!("portal restore tokens dropped; the next session will ask again");
+    }
+
+    /// The next thing the session loop should act on.
+    pub async fn next_event(&mut self) -> Option<Event> {
+        // Anything already mapped outranks a new portal event: it is older.
+        if let Some(event) = self.pending.pop_front() {
+            return Some(event);
+        }
+        // The EIS stream carries resumptions and the cursor; it must not stall.
+        self.injector.pump().await;
+
+        let Wayland {
+            capture, shortcuts, ..
+        } = self;
+        let shortcut = async {
+            match shortcuts.as_mut() {
+                Some(shortcuts) => shortcuts.next_activation().await,
+                None => std::future::pending().await,
+            }
+        };
+
+        enum Step {
+            Captured(Option<CapturedEvent>),
+            Shortcut,
+            Tick,
+        }
+
+        let step = match capture {
+            Some(capture) => tokio::select! {
+                biased;
+                event = capture.next_event() => Step::Captured(event),
+                _ = shortcut => Step::Shortcut,
+                () = tokio::time::sleep(POLL_TICK) => Step::Tick,
+            },
+            None => tokio::select! {
+                biased;
+                _ = shortcut => Step::Shortcut,
+                () = tokio::time::sleep(POLL_TICK) => Step::Tick,
+            },
+        };
+
+        match step {
+            Step::Tick => None,
+            Step::Shortcut => {
+                if let Some(capture) = self.capture.as_ref() {
+                    capture.notify_emergency();
+                    tracing::warn!("emergency shortcut fired; releasing the capture locally");
+                }
+                None
+            }
+            Step::Captured(None) => {
+                // The portal session ended (the compositor closed or disabled it).
+                self.capture = None;
+                if self.mode == Mode::Observe {
+                    tracing::info!("the Wayland capture session ended");
+                    None
+                } else {
+                    self.mode = Mode::Observe;
+                    Some(Event::Failed {
+                        code: "PORTAL_SESSION_LOST",
+                        detail: "the compositor ended the capture session during a lease"
+                            .to_owned(),
+                    })
+                }
+            }
+            Step::Captured(Some(event)) => self.map_event(event).await,
+        }
+    }
+
+    /// Turns one portal event into at most one agent event, doing the async work
+    /// (re-arming barriers) that `ZoneChanged` needs.
+    async fn map_event(&mut self, event: CapturedEvent) -> Option<Event> {
+        match event {
+            CapturedEvent::Input(input) => {
+                if self.mode == Mode::Remote {
+                    Some(Event::Input(input))
+                } else {
+                    // Preparing (or a hand-off with no lease yet): keep it for a local
+                    // replay if the transition is cancelled.
+                    self.buffered.push(input);
+                    None
+                }
+            }
+            CapturedEvent::Activated {
+                activation_id,
+                cursor,
+                barrier_id,
+            } => {
+                tracing::info!(
+                    activation_id,
+                    barrier_id,
+                    has_cursor = cursor.is_some(),
+                    "the compositor activated the capture session"
+                );
+                self.activation = Some(Activation {
+                    id: activation_id,
+                    cursor,
+                    barrier_id,
+                });
+                if let Some((zone, edge)) =
+                    barrier_id.and_then(|id| wayland_barriers::locate(&self.barriers, id))
+                {
+                    tracing::info!(
+                        zone,
+                        edge = edge.as_str(),
+                        "activation came from this barrier"
+                    );
+                }
+                // The activation *is* the edge crossing on Wayland; core needs it to
+                // start the transition.
+                Some(Event::AtEdge { barrier_id })
+            }
+            CapturedEvent::Deactivated => {
+                self.activation = None;
+                if self.mode == Mode::Observe {
+                    // The pointer left the barrier; the session stays armed.
+                    tracing::debug!("the compositor deactivated the capture session");
+                    None
+                } else {
+                    self.mode = Mode::Observe;
+                    Some(Event::Failed {
+                        code: "PORTAL_SESSION_LOST",
+                        detail: "the compositor deactivated the capture session during a lease"
+                            .to_owned(),
+                    })
+                }
+            }
+            CapturedEvent::ZonesChanged { zone_set } => {
+                tracing::info!(zone_set, "the zone set changed; re-arming the barriers");
+                // `ZonesChanged` is the Wayland equivalent of a RandR notify
+                // (`docs/03-architecture.md`), but display enumeration is KVM-040, so
+                // nothing is reported to core here.
+                match self.rearm().await {
+                    Ok(()) => None,
+                    Err(detail) => Some(Event::Failed {
+                        code: "PORTAL_FRONTEND_STUCK",
+                        detail,
+                    }),
+                }
+            }
+            CapturedEvent::Emergency => Some(Event::Emergency),
+        }
+    }
+
+    /// Re-reads the zones and sets the barriers again, recreating the session when the
+    /// compositor refuses to change barriers on a live one (GNOME 46).
+    async fn rearm(&mut self) -> Result<(), String> {
+        let Some(capture) = self.capture.as_mut() else {
+            return Err("there is no capture session to re-arm".to_owned());
+        };
+        if let Err(error) = capture.refresh_zones().await {
+            return Err(format!("GetZones failed: {error}"));
+        }
+        let zones: Vec<Zone> = zones_of(capture);
+        let barriers = wayland_barriers::derive(&zones);
+        let request: Vec<Barrier> = barriers
+            .iter()
+            .filter_map(|segment| {
+                let id = BarrierID::new(segment.id)?;
+                Some(Barrier::new(
+                    id,
+                    BarrierPosition::new(segment.x1, segment.y1, segment.x2, segment.y2),
+                ))
+            })
+            .collect();
+
+        match capture.set_barriers(&request).await {
+            Ok(rejected) => {
+                if !rejected.is_empty() {
+                    tracing::warn!(
+                        rejected = ?rejected,
+                        "the compositor refused some barriers"
+                    );
+                }
+                self.barriers = barriers;
+                Ok(())
+            }
+            Err(WaylandError::BarriersWhileEnabled) => {
+                // GNOME 46: a live session cannot take new barriers and `Disable` cannot
+                // be undone, so the session has to be recreated — which costs a portal
+                // dialog (XDP-gnome #126).
+                tracing::warn!(
+                    "the capture session must be recreated to install new barriers; a portal \
+                     dialog will appear again (GNOME 46, XDP-gnome #126)"
+                );
+                self.capture = None;
+                let grant = self
+                    .grants
+                    .get(INPUT_CAPTURE_INTERFACE, &self.signature())
+                    .cloned();
+                let mut fresh = match WaylandCapture::connect(grant.as_ref()).await {
+                    Ok(fresh) => fresh,
+                    Err(error) => {
+                        return Err(format!("recreating the capture session failed: {error}"))
+                    }
+                };
+                let mut installed = Vec::new();
+                arm_capture(&mut fresh, &mut installed)
+                    .await
+                    .map_err(|error| {
+                        format!("arming the recreated capture session failed: {error}")
+                    })?;
+                self.barriers = installed;
+                self.capture = Some(fresh);
+                Ok(())
+            }
+            Err(error) => Err(format!("SetPointerBarriers failed: {error}")),
+        }
+    }
+
+    /// The compositor signature the current grants were issued for.
+    fn signature(&self) -> String {
+        match (self.capture.as_ref(), self.injector.compositor()) {
+            (Some(capture), _) => compositor_signature(capture.compositor(), &capture.versions()),
+            (None, Some(compositor)) => compositor_signature(compositor, &self.injector.versions()),
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// The portal zones as the pure geometry's own type.
+///
+/// `ashpd`'s `Region` is `(width, height, x, y)` behind accessors; the sign of the
+/// offsets is whatever the compositor uses and is carried through.
+fn zones_of(capture: &WaylandCapture) -> Vec<Zone> {
+    capture
+        .zones()
+        .iter()
+        .map(|region| {
+            Zone::new(
+                region.x_offset(),
+                region.y_offset(),
+                region.width() as i32,
+                region.height() as i32,
+            )
+        })
+        .collect()
+}
+
+/// Fresh zones, derived barriers and `Enable` — the arming sequence of
+/// «Сессии порталов»: `GetZones` → `SetPointerBarriers` → `Enable`.
+async fn arm_capture(
+    capture: &mut WaylandCapture,
+    installed: &mut Vec<BarrierSegment>,
+) -> Result<(), WaylandError> {
+    capture.refresh_zones().await?;
+    let zones: Vec<Zone> = zones_of(capture);
+    let segments = wayland_barriers::derive(&zones);
+    let request: Vec<Barrier> = segments
+        .iter()
+        .filter_map(|segment| {
+            let id = BarrierID::new(segment.id)?;
+            Some(Barrier::new(
+                id,
+                BarrierPosition::new(segment.x1, segment.y1, segment.x2, segment.y2),
+            ))
+        })
+        .collect();
+    let rejected = capture.set_barriers(&request).await?;
+    if !rejected.is_empty() {
+        tracing::warn!(rejected = ?rejected, "the compositor refused some barriers");
+    }
+    // A session that is already enabled cannot be enabled twice.
+    if !capture.is_enabled() {
+        capture.enable().await?;
+    }
+    *installed = segments;
+    Ok(())
+}
+
+/// The capability list after the portals have answered.
+///
+/// The probe can only reason about the session; these rules are the ones the documents
+/// attach to the *runtime* answers:
+///
+/// * `ABSOLUTE_POINTER` only with an absolute region — «Если регион не удаётся
+///   установить … бэкенд не объявляет `CAPABILITY_ABSOLUTE_POINTER`, и узел не может
+///   быть получателем».
+/// * `EMERGENCY_HOTKEY` only when `GlobalShortcuts` registered the combination —
+///   «Если backend отсутствует, `CAPABILITY_EMERGENCY_HOTKEY` не объявляется».
+/// * `RECEIVER_TAKEOVER` never: «Портальный получатель не видит физический ввод …
+///   Автоматический takeover поэтому не объявляется».
+/// * `CAPTURE` only while a capture session is armed.
+fn refine_ready(
+    session: &SessionInfo,
+    has_capture: bool,
+    injector: &WaylandInjector,
+    has_hotkey: bool,
+    refusals: &[Refusal],
+) -> Ready {
+    let mut ready = Ready::from_session(session, String::new());
+    let absolute = injector.absolute_region().is_some();
+    ready.capabilities.retain(|name| match name.as_str() {
+        "CAPTURE" => has_capture,
+        "ABSOLUTE_POINTER" => absolute,
+        "EMERGENCY_HOTKEY" => has_hotkey,
+        "RECEIVER_TAKEOVER" => false,
+        _ => true,
+    });
+    // A clipboard capability is declared only once the portal says so (ADR-008); the
+    // capture session is the only place that answer exists, and clipboard is outside
+    // this slice, so it stays off.
+    ready.capabilities.retain(|name| name != "TEXT_CLIPBOARD");
+
+    if !absolute {
+        ready.capabilities.retain(|name| name != "ABSOLUTE_POINTER");
+    }
+    ready.backend.has_absolute_injection = absolute;
+    ready.backend.has_emergency_hotkey = has_hotkey;
+    ready.backend.has_receiver_takeover = false;
+    ready.backend.degraded_reason = refusals
+        .iter()
+        .map(|refusal| refusal.detail.as_str())
+        .filter(|detail| !detail.is_empty())
+        .collect::<Vec<&str>>()
+        .join("; ");
+    ready
+}
+
+/// The `AgentError.code` for a portal failure (`docs/ipc.proto`: `PORTAL_DENIED,
+/// PORTAL_UNAVAILABLE, PORTAL_SESSION_LOST, PORTAL_FRONTEND_STUCK, …`).
+fn portal_code(error: &WaylandError) -> &'static str {
+    match error {
+        WaylandError::Portal(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
+            "PORTAL_DENIED"
+        }
+        WaylandError::PortalUnavailable { .. }
+        | WaylandError::PortalTooOld { .. }
+        | WaylandError::HotkeyUnavailable { .. }
+        | WaylandError::UnsupportedCompositor { .. }
+        | WaylandError::NoAbsoluteRegion => "PORTAL_UNAVAILABLE",
+        WaylandError::BarriersWhileEnabled => "PORTAL_FRONTEND_STUCK",
+        WaylandError::EiDisconnected | WaylandError::EiSocketUnavailable => "PORTAL_SESSION_LOST",
+        _ => "CAPTURE_FAILED",
+    }
+}
+
+/// A failure that keeps the node local, carrying the code core should report.
+fn fatal(error: &WaylandError) -> Refusal {
+    Refusal {
+        code: portal_code(error),
+        detail: format!("platform-wayland is not usable on this session: {error}"),
+    }
+}

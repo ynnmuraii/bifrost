@@ -25,7 +25,7 @@ use ::ipc::{AgentLink, Watchdog};
 use protocol::ipc::agent_frame::Msg;
 use protocol::ipc::{
     self, AgentError, AgentFrame, AgentMode, CaptureReady, CapturedBatch, DeadlineExpired,
-    EmergencyFired, InjectResult, LocalEvent, Pong, Released,
+    EmergencyFired, InjectResult, LocalEvent, Pong, PortalGrantChanged, Released,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -79,11 +79,12 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         }
     };
 
-    let (mut backend, ready) = Backend::select(
+    let (mut backend, ready, refusals) = Backend::select(
         backend::BackendKindArg(attach.backend_override),
         args.dry_inject,
         args.dry_input_events,
         attach.emergency_hotkey.as_str(),
+        attach.restore_tokens.as_slice(),
     )
     .await;
     if args.dry_inject {
@@ -96,6 +97,17 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         );
     }
     link.send(Msg::Ready(ready.to_ipc())).await?;
+    // A backend that is usable but incomplete (a missing portal, a dismissed dialog)
+    // says so explicitly: `AgentError` is how `docs/ipc.proto` carries
+    // `PORTAL_DENIED`/`PORTAL_UNAVAILABLE` and the interface they name.
+    for refusal in &refusals {
+        tracing::warn!(
+            code = refusal.code,
+            detail = refusal.detail.as_str(),
+            "backend degraded"
+        );
+        send_error(&mut link, refusal.code, &refusal.detail).await?;
+    }
 
     let stop = loop_forever(
         &mut link,
@@ -132,6 +144,10 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     let mut held_lease: Option<Vec<u8>> = None;
     // Captured events waiting for the next tick, so one tick is one batch.
     let mut batch: Vec<LocalEvent> = Vec::new();
+    // `CapturedBatch.at_edge`: set when the backend reports an edge crossing, cleared
+    // once core has been told. The batch is sent even when it carries no events,
+    // because the crossing itself is the news.
+    let mut at_edge = false;
     let mut released_after_silence = false;
 
     loop {
@@ -169,7 +185,15 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             event = backend.next_event() => {
                 let now = now_ms(started);
                 if let Some(event) = event {
-                    handle_backend_event(link, backend, event, &mut held_lease, &mut batch).await?;
+                    handle_backend_event(
+                        link,
+                        backend,
+                        event,
+                        &mut held_lease,
+                        &mut batch,
+                        &mut at_edge,
+                    )
+                    .await?;
                 }
 
                 // Rule 4: the deadline is the agent's own monotonic clock.
@@ -218,12 +242,15 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         // One tick, one batch: keeps the frame rate bounded and lets the transport
-        // coalesce motion on the far side.
-        if !batch.is_empty() {
+        // coalesce motion on the far side. A tick that only learned about an edge
+        // crossing still goes out, with no events.
+        if !batch.is_empty() || at_edge {
             let events = std::mem::take(&mut batch);
+            let edge = at_edge;
+            at_edge = false;
             link.send(Msg::Captured(CapturedBatch {
                 events,
-                at_edge: false,
+                at_edge: edge,
             }))
             .await?;
         }
@@ -405,7 +432,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         }
         Msg::ForgetPortalGrants(_) => {
-            tracing::info!("ForgetPortalGrants: this build holds no portal grants");
+            backend.forget_portal_grants().await;
         }
         Msg::Shutdown(_) => {
             tracing::info!("shutdown requested by core");
@@ -426,18 +453,39 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Handles one backend event.
+#[allow(clippy::too_many_arguments)]
 async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
     link: &mut AgentLink<S>,
     backend: &mut Backend,
     event: Event,
     held_lease: &mut Option<Vec<u8>>,
     batch: &mut Vec<LocalEvent>,
+    at_edge: &mut bool,
 ) -> anyhow::Result<()> {
     match event {
         Event::Input(input) => match crate::events::to_local_event(&input, monotonic_us()) {
             Some(event) => batch.push(event),
             None => tracing::trace!("event has no wire form and was dropped"),
         },
+        Event::AtEdge { barrier_id } => {
+            // `docs/05-protocol.md`: the source's `CapturedBatch` with `at_edge` is what
+            // opens a transition. On a Wayland source this is the only edge signal
+            // there is, because the compositor diverts the pointer at the barrier.
+            *at_edge = true;
+            tracing::info!(barrier_id, "the pointer reached the edge; telling core");
+        }
+        Event::PortalGrant(grant) => {
+            // Core owns `portal-restore.toml`; the agent only hands the token over.
+            tracing::info!(
+                interface = grant.portal_interface.as_str(),
+                "reporting a fresh portal restore token to core"
+            );
+            link.send(Msg::PortalGrant(PortalGrantChanged {
+                grant: Some(grant),
+                revoked: false,
+            }))
+            .await?;
+        }
         Event::Emergency => {
             // Rule 3: agent restores local control itself, then tells core.
             tracing::warn!("emergency combination: releasing local capture");
@@ -453,10 +501,14 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
             let _ = backend.end_capture(false).await;
             send_error(link, "QUEUE_OVERFLOW", "capture queue overflowed").await?;
         }
-        Event::Failed(detail) => {
-            tracing::error!(detail = detail.as_str(), "capture failed; ending capture");
+        Event::Failed { code, detail } => {
+            tracing::error!(
+                code,
+                detail = detail.as_str(),
+                "capture failed; ending capture"
+            );
             let _ = backend.end_capture(false).await;
-            send_error(link, "CAPTURE_FAILED", &detail).await?;
+            send_error(link, code, &detail).await?;
         }
     }
     Ok(())
@@ -524,16 +576,18 @@ mod tests {
         self_timeout: Option<(Instant, Vec<u8>)>,
         held: Option<Vec<u8>>,
         batch: Vec<LocalEvent>,
+        at_edge: bool,
     }
 
     impl Harness {
         async fn new() -> Self {
             let (agent_io, core_io) = duplex(8 * 1024);
-            let (backend, ready) = Backend::select(
+            let (backend, ready, _refusals) = Backend::select(
                 BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
                 true,
                 0,
                 HOTKEY,
+                &[],
             )
             .await;
             Self {
@@ -545,6 +599,7 @@ mod tests {
                 self_timeout: None,
                 held: None,
                 batch: Vec::new(),
+                at_edge: false,
             }
         }
 
@@ -579,6 +634,7 @@ mod tests {
                 event,
                 &mut self.held,
                 &mut self.batch,
+                &mut self.at_edge,
             )
             .await
             .expect("a backend event must not fail the handler");
@@ -807,7 +863,10 @@ mod tests {
     async fn a_capture_failure_is_reported_as_capture_failed() {
         let mut harness = Harness::new().await;
         harness
-            .event(Event::Failed("no X connection".to_owned()))
+            .event(Event::Failed {
+                code: "CAPTURE_FAILED",
+                detail: "no X connection".to_owned(),
+            })
             .await;
         match harness.recv().await {
             Msg::Error(error) => assert_eq!(error.code, "CAPTURE_FAILED"),

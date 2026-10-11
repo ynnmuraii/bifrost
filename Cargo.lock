@@ -643,6 +643,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 name = "identity"
 version = "0.0.0"
 dependencies = [
+ "config",
  "geometry",
  "protocol",
  "rcgen",
@@ -675,6 +676,7 @@ version = "0.0.0"
 name = "ipc"
 version = "0.0.0"
 dependencies = [
+ "config",
  "libc",
  "prost",
  "protocol",
@@ -763,6 +765,7 @@ name = "lws-agent"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ashpd",
  "input-model",
  "ipc",
  "platform-probe",
@@ -773,6 +776,25 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lws-core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "focus-router",
+ "geometry",
+ "identity",
+ "input-model",
+ "ipc",
+ "platform-probe",
+ "protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "transport",
 ]
 
 [[package]]
