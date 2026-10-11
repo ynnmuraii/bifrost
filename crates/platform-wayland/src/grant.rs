@@ -15,10 +15,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::WaylandError;
+use serde::{Deserialize, Serialize};
 
-/// The TOML table that starts one grant record.
-const GRANT_TABLE: &str = "[[grant]]";
+use crate::WaylandError;
 
 /// One `PortalGrant` from `docs/ipc.proto`: the restore token for a single portal
 /// interface, valid for a single compositor/portal signature.
@@ -176,162 +175,102 @@ impl GrantStore {
     /// The returned text contains bearer tokens; treat it as a secret.
     #[must_use]
     pub fn to_toml(&self) -> String {
-        let mut out = String::from(
-            "# LAN Workspace portal restore-token grants (KVM-017).\n\
-             # SECURITY: contains bearer tokens; restrict file permissions.\n",
-        );
-        for grant in self.grants.values() {
-            out.push('\n');
-            out.push_str(GRANT_TABLE);
-            out.push('\n');
-            push_entry(&mut out, "portal_interface", &grant.portal_interface);
-            push_entry(&mut out, "restore_token", &grant.restore_token);
-            push_entry(
-                &mut out,
-                "compositor_signature",
-                &grant.compositor_signature,
-            );
-        }
-        out
+        let file = GrantFile {
+            grant: self.grants.values().map(GrantRecord::from).collect(),
+        };
+        // Serializing a `Vec` of three `String`s cannot fail; the header carries the
+        // security note, which the TOML encoder does not emit by itself.
+        let body = toml::to_string_pretty(&file).expect("a grant store always serializes");
+        format!("{FILE_HEADER}{body}")
     }
 
     /// Parses the text produced by [`GrantStore::to_toml`].
     ///
-    /// Unknown keys, unknown tables and unterminated strings are reported as
-    /// [`WaylandError::InvalidGrant`] rather than ignored. A record without a token
-    /// (the portal can hand back an empty token for an expired grant) is skipped.
+    /// Parsing is done by the `toml` crate with `deny_unknown_fields`, so unknown keys,
+    /// unknown tables, malformed strings (an unescaped quote inside a basic string, an
+    /// unterminated literal) and wrong value types are all reported as
+    /// [`WaylandError::InvalidGrant`] instead of being silently accepted. A record
+    /// without a token (the portal can hand back an empty token for an expired grant) is
+    /// skipped.
+    ///
+    /// A store may only ever describe **one** portal endpoint: records carrying different
+    /// `compositor_signature`s are refused here, which keeps the
+    /// [`GrantStore::accept`] invariant (one signature per store) true for loaded files as
+    /// well.
     pub fn from_toml(text: &str) -> Result<Self, WaylandError> {
+        let file: GrantFile =
+            toml::from_str(text).map_err(|error| WaylandError::InvalidGrant(error.to_string()))?;
         let mut store = Self::new();
-        let mut pending: Option<PendingGrant> = None;
-        for (index, raw) in text.lines().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
+        let mut signature: Option<&str> = None;
+        for record in &file.grant {
+            if record.portal_interface.is_empty() {
+                return Err(WaylandError::InvalidGrant(
+                    "grant record without portal_interface".into(),
+                ));
+            }
+            if record.restore_token.is_empty() {
+                // Tokens can legitimately come back empty (revoked/expired); such a record
+                // is not a grant at all.
                 continue;
             }
-            if line == GRANT_TABLE {
-                finish_pending(&mut store, pending.take())?;
-                pending = Some(PendingGrant::default());
-                continue;
+            if record.compositor_signature.is_empty() {
+                return Err(WaylandError::InvalidGrant(format!(
+                    "{}: empty compositor_signature (can never match this endpoint)",
+                    record.portal_interface
+                )));
             }
-            let Some(record) = pending.as_mut() else {
-                return Err(invalid(index, "key outside of a [[grant]] table"));
-            };
-            let Some((key, value)) = line.split_once('=') else {
-                return Err(invalid(index, "expected `key = \"value\"`"));
-            };
-            let key = key.trim();
-            let value = parse_string(value.trim())
-                .ok_or_else(|| invalid(index, "value must be a quoted string"))?;
-            match key {
-                "portal_interface" => record.portal_interface = Some(value),
-                "restore_token" => record.restore_token = Some(value),
-                "compositor_signature" => record.compositor_signature = Some(value),
-                other => return Err(invalid(index, &format!("unknown key `{other}`"))),
+            match signature {
+                None => signature = Some(&record.compositor_signature),
+                Some(existing) if existing == record.compositor_signature => {}
+                Some(_) => {
+                    return Err(WaylandError::InvalidGrant(
+                        "grant records carry different compositor signatures; a store may only \
+                         hold one portal endpoint"
+                            .into(),
+                    ))
+                }
             }
+            store.grants.insert(
+                record.portal_interface.clone(),
+                PortalGrant::new(
+                    record.portal_interface.clone(),
+                    record.restore_token.clone(),
+                    record.compositor_signature.clone(),
+                ),
+            );
         }
-        finish_pending(&mut store, pending)?;
         Ok(store)
     }
 }
 
-/// One grant record while it is being parsed.
-#[derive(Default)]
-struct PendingGrant {
-    portal_interface: Option<String>,
-    restore_token: Option<String>,
-    compositor_signature: Option<String>,
+/// The persisted document: a `[[grant]]` array of tables.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantFile {
+    /// One record per portal interface.
+    #[serde(default)]
+    grant: Vec<GrantRecord>,
 }
 
-fn invalid(line: usize, message: &str) -> WaylandError {
-    WaylandError::InvalidGrant(format!("line {}: {message}", line + 1))
+/// One persisted grant. Field names are the on-disk schema.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantRecord {
+    portal_interface: String,
+    restore_token: String,
+    compositor_signature: String,
 }
 
-fn finish_pending(
-    store: &mut GrantStore,
-    pending: Option<PendingGrant>,
-) -> Result<(), WaylandError> {
-    let Some(pending) = pending else {
-        return Ok(());
-    };
-    let portal_interface = pending.portal_interface.ok_or_else(|| {
-        WaylandError::InvalidGrant("grant record without portal_interface".into())
-    })?;
-    if portal_interface.is_empty() {
-        return Err(WaylandError::InvalidGrant(
-            "grant record with empty portal_interface".into(),
-        ));
-    }
-    let restore_token = pending.restore_token.ok_or_else(|| {
-        WaylandError::InvalidGrant(format!("{portal_interface}: no restore_token"))
-    })?;
-    if restore_token.is_empty() {
-        // Tokens can legitimately come back empty (revoked/expired); such a record is
-        // not a grant at all.
-        return Ok(());
-    }
-    let compositor_signature = pending.compositor_signature.ok_or_else(|| {
-        WaylandError::InvalidGrant(format!("{portal_interface}: no compositor_signature"))
-    })?;
-    if compositor_signature.is_empty() {
-        return Err(WaylandError::InvalidGrant(format!(
-            "{portal_interface}: empty compositor_signature (can never match this endpoint)"
-        )));
-    }
-    // Loaded records are stored as-is: their own signature is what they were issued
-    // for, and `GrantStore::get` is what compares it against the live endpoint.
-    store.grants.insert(
-        portal_interface.clone(),
-        PortalGrant::new(portal_interface, restore_token, compositor_signature),
-    );
-    Ok(())
-}
-
-fn push_entry(out: &mut String, key: &str, value: &str) {
-    out.push_str(key);
-    out.push_str(" = \"");
-    escape_into(out, value);
-    out.push_str("\"\n");
-}
-
-fn escape_into(out: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(ch))),
-            ch => out.push(ch),
+impl From<&PortalGrant> for GrantRecord {
+    fn from(grant: &PortalGrant) -> Self {
+        Self {
+            portal_interface: grant.portal_interface.clone(),
+            restore_token: grant.restore_token.clone(),
+            compositor_signature: grant.compositor_signature.clone(),
         }
     }
 }
 
-/// Parses a double-quoted TOML basic string. Returns `None` if it is malformed.
-fn parse_string(value: &str) -> Option<String> {
-    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next()? {
-            '\\' => out.push('\\'),
-            '"' => out.push('"'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'u' => {
-                let hex: String = chars.by_ref().take(4).collect();
-                if hex.chars().count() != 4 {
-                    return None;
-                }
-                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
-            }
-            _ => return None,
-        }
-    }
-    Some(out)
-}
+/// Header of the persisted file, including the security note.
+const FILE_HEADER: &str = "# LAN Workspace portal restore-token grants (KVM-017).\n\
+                           # SECURITY: contains bearer tokens; restrict file permissions.\n";

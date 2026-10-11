@@ -25,3 +25,5 @@ reis = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 futures-util = "0.3"
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"

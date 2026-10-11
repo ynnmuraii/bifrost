@@ -783,10 +783,16 @@ fn declare_device_ready(device: &event::Device) {
 /// Splits `value` (in 120ths of a wheel detent) into whole detents, keeping the
 /// sub-detent remainder in `remainder` for the next event.
 pub(crate) fn split_detents(value: i32, remainder: &mut i32) -> i32 {
-    let total = value.saturating_add(*remainder);
-    let steps = total / DETENT_UNITS;
-    *remainder = total - steps * DETENT_UNITS;
-    steps
+    // `i64` accumulator on purpose: the previous `i32::saturating_add` *lost* units at the
+    // integer limits (a remainder of `i32::MAX` plus a positive value saturated instead of
+    // carrying the excess into the next event), which broke the conservation invariant
+    // `steps * 120 + remainder == value + previous_remainder`.
+    let total = i64::from(value) + i64::from(*remainder);
+    let steps = total / i64::from(DETENT_UNITS);
+    *remainder = (total - steps * i64::from(DETENT_UNITS)) as i32;
+    // `|total| <= 2 * i32::MAX` and `DETENT_UNITS == 120`, so `|steps| < 2^31` by a wide
+    // margin; the cast cannot truncate.
+    steps as i32
 }
 
 fn key_state(state: KeyState) -> ei::keyboard::KeyState {

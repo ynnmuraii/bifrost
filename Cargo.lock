@@ -956,8 +956,10 @@ dependencies = [
  "futures-util",
  "input-model",
  "reis",
+ "serde",
  "thiserror",
  "tokio",
+ "toml",
 ]
 
 [[package]]
