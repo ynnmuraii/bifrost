@@ -585,10 +585,13 @@ impl Timers {
         self.deadlines.remove(&timer);
     }
 
+    /// The timer the loop must service first: the earliest deadline, with the timer name
+    /// as a deterministic tie-break (`Session::next_deadline` uses this to bound its sleep,
+    /// so a name-ordered map must not decide it).
     fn next(&self) -> Option<(fr::Timer, u64)> {
         self.deadlines
             .iter()
-            .next()
+            .min_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))
             .map(|(timer, deadline)| (*timer, *deadline))
     }
 
