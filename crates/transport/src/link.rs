@@ -507,6 +507,18 @@ impl LinkState {
         local_hello: &wire::Hello,
         reports: &mpsc::Sender<LinkReport>,
     ) -> Result<(), LinkDownReason> {
+        // «`rx_seq` строго +1. Нарушение приводит к закрытию CONNECTION» counts *every*
+        // frame of the peer's direction, and the sender bumps its `tx_seq` for `Ping`
+        // and `Pong` as well (they are ordinary envelopes there). Accepting the
+        // sequence only for the frames that reach the application would therefore
+        // leave every liveness frame unaccounted for and make the next real frame
+        // look like a gap.
+        if self.announced {
+            self.rx_seq
+                .accept(envelope.seq)
+                .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
+        }
+
         // Liveness frames belong to the transport and never reach the application.
         match &envelope.payload {
             Some(wire::envelope::Payload::Ping(ping)) => {

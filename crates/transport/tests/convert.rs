@@ -465,19 +465,21 @@ fn the_error_code_reader_accepts_exactly_its_documented_domain() {
         E::NotOwner,
         E::StaleOwnerSerial,
         E::CannotOwn,
+        // The link manager emits this one and the refused peer has to classify it, or a
+        // full workspace is indistinguishable from a protocol failure.
+        E::MembershipFull,
     ] {
         assert_eq!(error_code_from_i32(code.as_u32() as i32), Ok(code));
     }
 
-    // `MembershipFull` is emitted by the link manager, never read back: the reader refuses
-    // the number, so a peer's refusal surfaces as a conversion error rather than as a
-    // message. Anything the contract does not define is refused the same way.
+    // Codes the contract defines but `focus_router` has no variant for stay refused:
+    // accepting them would mean silently relabelling them. `0` is the wire's
+    // "unspecified" (an absent reason, not a code).
     for value in [
         0, 7,  // InvalidTopology
         15, // ClipboardTooLarge
         18, // RateLimited
         22, // LayoutConflict
-        23, // MembershipFull
         24, // NoCoordinator
         26, -1,
     ] {
