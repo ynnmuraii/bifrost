@@ -311,6 +311,24 @@ impl Session {
                     },
                 })
                 .await;
+                // `Hello` carries the ownership pair as it was when this node started, so
+                // a peer that joins after a local claim (the normal case: the owner claims
+                // at startup, the link forms later) would know no owner and refuse our
+                // `EnterPrepare` with `NOT_OWNER`. The owner therefore states its pair to
+                // every link that comes up, in the same shape the FSM broadcasts when the
+                // claim lands.
+                let ownership = self.router.ownership();
+                if ownership.is_owner() {
+                    self.send_to(
+                        peer,
+                        fr::Message::OwnerState {
+                            serial: ownership.serial(),
+                            owner: ownership.owner().copied(),
+                            granted: true,
+                        },
+                    )
+                    .await;
+                }
             }
             LinkEvent::Message { peer, message } => {
                 tracing::info!(
