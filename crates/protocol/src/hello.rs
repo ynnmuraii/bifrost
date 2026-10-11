@@ -192,13 +192,15 @@ impl HelloHandshake {
         else {
             return Err(HandshakeError::BadConnectionId);
         };
-        match self.connection_id {
-            Some(chosen) if chosen != connection_id => {
-                return Err(HandshakeError::ConnectionIdMismatch)
+        // Every check happens *before* the state is touched: a rejected `Hello` must not
+        // count as received and must not adopt the dialer's `connection_id`. That field is
+        // what gates the acceptor's own `Hello` (`local_hello` returns `NotYourTurn` while
+        // it is unset), so committing it early would let a malformed or version-mismatched
+        // frame unlock our first frame on a link the peer never opened correctly.
+        if let Some(chosen) = self.connection_id {
+            if chosen != connection_id {
+                return Err(HandshakeError::ConnectionIdMismatch);
             }
-            // An acceptor adopts the dialer's id here.
-            None => self.connection_id = Some(connection_id),
-            Some(_) => {}
         }
         if !matches!(envelope.payload, Some(wire::envelope::Payload::Hello(_))) {
             return Err(HandshakeError::NotHello);
@@ -208,6 +210,10 @@ impl HelloHandshake {
                 local: self.local_major,
                 remote: envelope.major,
             });
+        }
+        // Accepted: an acceptor adopts the dialer's id here.
+        if self.connection_id.is_none() {
+            self.connection_id = Some(connection_id);
         }
         self.remote_received = true;
         self.remote_major = envelope.major;
