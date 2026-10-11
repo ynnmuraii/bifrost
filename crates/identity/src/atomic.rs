@@ -133,11 +133,10 @@ fn restrict_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn restrict_file(_path: &Path) -> io::Result<()> {
-    // The file lives under the user's profile (`%APPDATA%`), whose ACL already excludes
-    // other users; tightening it further needs `SetNamedSecurityInfo`, which the key
-    // storage task (DPAPI wrapping) can add together with the blob format.
-    Ok(())
+fn restrict_file(path: &Path) -> io::Result<()> {
+    // Owner-only DACL on the file itself, mirroring `0600`: a permissive parent directory
+    // must not be able to expose the sealed key.
+    crate::acl::apply_owner_only(path).map_err(io::Error::other)
 }
 
 /// Creates `path` with owner-only permissions when it does not exist yet.
@@ -154,7 +153,10 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        fs::create_dir_all(path)
+        fs::create_dir_all(path)?;
+        // `docs/03-architecture.md`: «ACL на текущий SID в Windows». The ACE inherits into
+        // files and subdirectories, so everything created here stays owner-only.
+        crate::acl::apply_owner_only(path).map_err(io::Error::other)
     }
 }
 
@@ -171,8 +173,10 @@ pub fn is_wider_than_owner(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-pub fn is_wider_than_owner(_path: &Path) -> io::Result<bool> {
-    Ok(false)
+pub fn is_wider_than_owner(path: &Path) -> io::Result<bool> {
+    // The mirror of `mode & 0o077 != 0`: `false` only when every allow ACE names the
+    // current user SID.
+    Ok(!crate::acl::is_owner_only(path).map_err(io::Error::other)?)
 }
 
 #[cfg(unix)]

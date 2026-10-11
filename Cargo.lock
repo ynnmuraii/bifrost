@@ -653,6 +653,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "windows",
  "x509-cert",
 ]
 
@@ -669,6 +670,17 @@ dependencies = [
 [[package]]
 name = "input-model"
 version = "0.0.0"
+
+[[package]]
+name = "ipc"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "prost",
+ "protocol",
+ "tokio",
+ "windows",
+]
 
 [[package]]
 name = "itertools"
