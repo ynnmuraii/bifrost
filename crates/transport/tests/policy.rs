@@ -4,18 +4,32 @@ use geometry::NodeId;
 use protocol::limits::N_MAX;
 use transport::{
     admit_member, liveness_action, next_liveness_wakeup, prefer_incoming, reconnect_delay,
-    winning_dialer, LivenessAction, MembershipFull, OFFLINE_AFTER, PING_INTERVAL,
+    winning_dialer, BackoffBounds, LinkLiveness, LivenessAction, MembershipFull,
 };
 
 fn id(byte: u8) -> NodeId {
     NodeId::new([byte; 32])
 }
 
+/// The cadence a caller without a configuration gets; every call below is explicit about it
+/// now that the transport takes it as a parameter instead of owning constants.
+const LIVENESS: LinkLiveness = LinkLiveness {
+    ping_ms: 1_000,
+    offline_ms: 3_000,
+};
+
+/// The bounds `crates/config` validates and hands to the transport.
+const BACKOFF: BackoffBounds = BackoffBounds {
+    min_ms: 500,
+    max_ms: 5_000,
+};
+
 #[test]
-fn the_liveness_constants_are_the_documented_ones() {
+fn the_liveness_defaults_are_the_documented_ones() {
     // docs/06-development-plan.md, KVM-070: «Ping каждую 1 s; офлайн через 3 s без Pong».
-    assert_eq!(PING_INTERVAL, std::time::Duration::from_secs(1));
-    assert_eq!(OFFLINE_AFTER, std::time::Duration::from_secs(3));
+    // `crates/config` (`workspace.link_ping_ms` / `workspace.link_timeout_ms`) is the owner
+    // of the real numbers; this default is what a caller with no configuration gets.
+    assert_eq!(LIVENESS, LinkLiveness::default());
 }
 
 #[test]
@@ -112,20 +126,22 @@ fn membership_is_capped_at_min_max_members_and_n_max() {
 
 #[test]
 fn the_reconnect_schedule_stays_inside_half_a_second_to_five_seconds() {
-    // «backoff 0.5..5 s, все настроенные пиры».
-    assert_eq!(reconnect_delay(0).as_millis(), 500);
-    assert_eq!(reconnect_delay(1).as_millis(), 1_000);
-    assert_eq!(reconnect_delay(2).as_millis(), 2_000);
-    assert_eq!(reconnect_delay(3).as_millis(), 4_000);
+    // «backoff 0.5..5 s, все настроенные пиры». `crates/config`
+    // (`network.reconnect_backoff_ms`) owns the range; this is the documented default.
+    assert_eq!(BACKOFF, BackoffBounds::default());
+    assert_eq!(reconnect_delay(0, BACKOFF).as_millis(), 500);
+    assert_eq!(reconnect_delay(1, BACKOFF).as_millis(), 1_000);
+    assert_eq!(reconnect_delay(2, BACKOFF).as_millis(), 2_000);
+    assert_eq!(reconnect_delay(3, BACKOFF).as_millis(), 4_000);
     assert_eq!(
-        reconnect_delay(4).as_millis(),
+        reconnect_delay(4, BACKOFF).as_millis(),
         5_000,
         "8 s is clamped to the maximum"
     );
 
-    let mut previous = reconnect_delay(0);
+    let mut previous = reconnect_delay(0, BACKOFF);
     for attempt in 0..64u32 {
-        let delay = reconnect_delay(attempt);
+        let delay = reconnect_delay(attempt, BACKOFF);
         assert!(
             delay >= std::time::Duration::from_millis(500)
                 && delay <= std::time::Duration::from_millis(5_000),
@@ -138,7 +154,7 @@ fn the_reconnect_schedule_stays_inside_half_a_second_to_five_seconds() {
         previous = delay;
     }
     assert_eq!(
-        reconnect_delay(u32::MAX).as_millis(),
+        reconnect_delay(u32::MAX, BACKOFF).as_millis(),
         5_000,
         "no shift overflow"
     );
@@ -147,39 +163,39 @@ fn the_reconnect_schedule_stays_inside_half_a_second_to_five_seconds() {
 #[test]
 fn liveness_pings_after_the_period_and_goes_offline_after_the_timeout() {
     // Nothing sent yet: the first check wants a Ping immediately.
-    assert_eq!(liveness_action(1_000, 1_000, None), LivenessAction::Ping);
+    assert_eq!(liveness_action(1_000, 1_000, None, LIVENESS), LivenessAction::Ping);
 
     // A Ping that is younger than the period suppresses the next one.
     assert_eq!(
-        liveness_action(1_000, 1_000, Some(1_000)),
+        liveness_action(1_000, 1_000, Some(1_000), LIVENESS),
         LivenessAction::Idle
     );
     assert_eq!(
-        liveness_action(1_999, 1_000, Some(1_000)),
+        liveness_action(1_999, 1_000, Some(1_000), LIVENESS),
         LivenessAction::Idle
     );
     assert_eq!(
-        liveness_action(2_000, 1_000, Some(1_000)),
+        liveness_action(2_000, 1_000, Some(1_000), LIVENESS),
         LivenessAction::Ping
     );
 
     // The offline deadline is the silence since the last Pong, not since the last Ping.
     assert_eq!(
-        liveness_action(3_999, 1_000, Some(2_000)),
+        liveness_action(3_999, 1_000, Some(2_000), LIVENESS),
         LivenessAction::Ping
     );
     assert_eq!(
-        liveness_action(4_000, 1_000, Some(3_900)),
+        liveness_action(4_000, 1_000, Some(3_900), LIVENESS),
         LivenessAction::Offline
     );
     assert_eq!(
-        liveness_action(4_000, 1_000, None),
+        liveness_action(4_000, 1_000, None, LIVENESS),
         LivenessAction::Offline,
         "an unanswered link goes offline even when no Ping was ever sent"
     );
 
     // A fresh Pong resets the offline clock.
-    assert_eq!(liveness_action(8_000, 7_999, None), LivenessAction::Ping);
+    assert_eq!(liveness_action(8_000, 7_999, None, LIVENESS), LivenessAction::Ping);
 }
 
 #[test]
@@ -189,7 +205,7 @@ fn the_next_wakeup_is_the_first_moment_something_can_change() {
     for now in [0u64, 500, 1_000, 2_500, 3_000, 5_000, 60_000] {
         for last_pong in [0u64, 500, 2_500, 2_999, 5_000] {
             for last_ping in [None, Some(0u64), Some(500), Some(2_500), Some(5_000)] {
-                let wakeup = next_liveness_wakeup(now, last_pong, last_ping);
+                let wakeup = next_liveness_wakeup(now, last_pong, last_ping, LIVENESS);
 
                 assert!(wakeup >= now, "never wake in the past: {now} -> {wakeup}");
                 assert!(
@@ -203,14 +219,14 @@ fn the_next_wakeup_is_the_first_moment_something_can_change() {
                         continue;
                     }
                     assert_eq!(
-                        liveness_action(probe, last_pong, last_ping),
+                        liveness_action(probe, last_pong, last_ping, LIVENESS),
                         LivenessAction::Idle,
                         "state changed before the wakeup ({probe} < {wakeup})"
                     );
                 }
 
                 // At the wakeup either a Ping is due or the link is offline.
-                let action = liveness_action(wakeup, last_pong, last_ping);
+                let action = liveness_action(wakeup, last_pong, last_ping, LIVENESS);
                 assert_ne!(
                     action,
                     LivenessAction::Idle,

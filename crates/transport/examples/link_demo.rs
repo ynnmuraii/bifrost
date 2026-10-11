@@ -22,7 +22,7 @@ use focus_router::{ClaimReason, ErrorCode, Message};
 use identity::{now_unix_ms, IdentityPaths, NodeIdentity, TrustStore, TrustedPeer};
 use protocol::wire;
 use tokio::task::JoinHandle;
-use transport::{LinkEvent, LinkManager, ManagerConfig, NodeId};
+use transport::{BackoffBounds, LinkEvent, LinkLiveness, LinkManager, ManagerConfig, NodeId};
 
 struct Node {
     name: &'static str,
@@ -79,6 +79,8 @@ async fn spawn_node(
         peers: others.iter().map(|(_, address)| *address).collect(),
         max_members: 3,
         queue_capacity: 64,
+        liveness: LinkLiveness::default(),
+        backoff: BackoffBounds::default(),
     };
     let (manager, events) = LinkManager::new(config).expect("manager");
     let manager = Arc::new(manager);

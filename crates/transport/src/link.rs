@@ -40,7 +40,7 @@ pub enum LinkDownReason {
     LocalClosed,
     /// The peer sent `Shutdown`.
     PeerShutdown,
-    /// No `Pong` within [`policy::OFFLINE_AFTER`].
+    /// No `Pong` within the configured offline window ([`policy::LinkLiveness`]).
     Timeout,
     /// A framing, sequence or conversion violation; the link is closed.
     Protocol(String),
@@ -294,6 +294,8 @@ pub struct LinkConfig {
     pub reports: mpsc::Sender<LinkReport>,
     /// Bounded queue capacity.
     pub queue_capacity: usize,
+    /// The configured liveness cadence for this link.
+    pub liveness: policy::LinkLiveness,
 }
 
 /// Spawns a link and returns its handle and task.
@@ -316,6 +318,7 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
         local_hello,
         stream,
         reports,
+        liveness,
         ..
     } = config;
 
@@ -372,7 +375,12 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
     let mut outbound = outbound;
     let reason = loop {
         let now_ms = state.started.elapsed().as_millis() as u64;
-        let wake = policy::next_liveness_wakeup(now_ms, state.last_pong_ms, state.last_ping_ms);
+        let wake = policy::next_liveness_wakeup(
+            now_ms,
+            state.last_pong_ms,
+            state.last_ping_ms,
+            liveness,
+        );
         let sleep = Duration::from_millis(wake.saturating_sub(now_ms).max(1));
 
         enum Step {
@@ -415,7 +423,12 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
             }
             Step::Tick => {
                 let now_ms = state.started.elapsed().as_millis() as u64;
-                match policy::liveness_action(now_ms, state.last_pong_ms, state.last_ping_ms) {
+                match policy::liveness_action(
+                    now_ms,
+                    state.last_pong_ms,
+                    state.last_ping_ms,
+                    liveness,
+                ) {
                     LivenessAction::Ping => {
                         if let Err(reason) = state.send_ping(&mut writer).await {
                             break reason;

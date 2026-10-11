@@ -39,7 +39,7 @@ use identity::{IdentityPaths, NodeIdentity, TrustStore};
 use ipc::Watchdog;
 use platform_probe::BackendOverride;
 use protocol::ipc::{AgentMode, BackendKind};
-use transport::{LinkManager, ManagerConfig};
+use transport::{BackoffBounds, LinkManager, LinkLiveness, ManagerConfig};
 
 use crate::agent::Supervisor;
 use crate::session::Session;
@@ -311,6 +311,17 @@ async fn run_async(
         peers,
         max_members: config.network.max_members,
         queue_capacity: QUEUE_CAPACITY,
+        // The liveness cadence and the backoff bounds are settings, not transport
+        // constants: `crates/config` validates both (`link_timeout_ms > link_ping_ms`,
+        // `500 <= backoff <= 5000`) and the link layer only uses what it is handed.
+        liveness: LinkLiveness {
+            ping_ms: u64::from(config.workspace.link_ping_ms),
+            offline_ms: u64::from(config.workspace.link_timeout_ms),
+        },
+        backoff: BackoffBounds {
+            min_ms: config.network.reconnect_backoff_ms[0],
+            max_ms: config.network.reconnect_backoff_ms[1],
+        },
     };
     let (manager, link_events) =
         LinkManager::new(manager_config).map_err(|error| format!("link manager: {error}"))?;

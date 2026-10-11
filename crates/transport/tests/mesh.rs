@@ -16,7 +16,7 @@ use identity::{now_unix_ms, IdentityPaths, NodeIdentity, TrustStore, TrustedPeer
 use protocol::wire;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use transport::{LinkDownReason, LinkEvent, LinkManager, ManagerConfig};
+use transport::{BackoffBounds, LinkDownReason, LinkEvent, LinkLiveness, LinkManager, ManagerConfig};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -24,6 +24,13 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 const FORM_TIMEOUT: Duration = Duration::from_secs(20);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFLINE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The cadence every node in these tests runs with: the documented `1 s` / `3 s` that the
+/// application passes in from `workspace.link_ping_ms` / `workspace.link_timeout_ms`.
+const LIVENESS: LinkLiveness = LinkLiveness {
+    ping_ms: 1_000,
+    offline_ms: 3_000,
+};
 
 struct TestNode {
     name: &'static str,
@@ -109,6 +116,8 @@ async fn spawn_node(
         peers: dial.to_vec(),
         max_members,
         queue_capacity: 64,
+        liveness: LIVENESS,
+        backoff: BackoffBounds::default(),
     };
     let (manager, events) = LinkManager::new(config).expect("manager");
     let manager = Arc::new(manager);
@@ -427,7 +436,7 @@ async fn a_focus_message_is_delivered_after_the_link_has_been_alive() {
 
     // Let the link live past its first `Ping` (1 s period): an established link must keep
     // delivering messages, not only during the first second of its life.
-    tokio::time::sleep(transport::PING_INTERVAL * 2).await;
+    tokio::time::sleep(Duration::from_millis(LIVENESS.ping_ms * 2)).await;
 
     // A key-up must arrive as a key-up: the whole product promise rests on that.
     let batch_events = vec![input_model::InputEvent::Button {
