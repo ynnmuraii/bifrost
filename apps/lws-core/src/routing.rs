@@ -15,6 +15,8 @@
 //! dedicated "ready" message in `ipc.proto`) and carries no lease id, and the
 //! `InjectResult` status has to be derived from the batch that was offered.
 
+use std::collections::BTreeMap;
+
 use focus_router as fr;
 use geometry::NodeId;
 use input_model::{InputEvent, KeyState, MouseButton};
@@ -358,7 +360,15 @@ pub enum AgentSignal {
 #[derive(Debug, Default)]
 pub struct AgentContext {
     prepared: Option<[u8; 16]>,
-    offered: Option<(u64, usize)>,
+    /// Events offered per `Inject` batch sequence.
+    ///
+    /// One slot was not enough: a captured burst is several batches in flight (the agent
+    /// answers one `InjectResult` per `Inject`, in order), and with only the newest count
+    /// remembered every earlier result was compared against the wrong batch and reported
+    /// `Partial` — which *aborts the lease* (`InjectStatus::aborts_lease`). The map is
+    /// keyed by the sequence the result carries, and each entry is taken when its result
+    /// arrives, so it only holds the batches still in flight.
+    offered: BTreeMap<u64, usize>,
 }
 
 impl AgentContext {
@@ -370,16 +380,23 @@ impl AgentContext {
                 input_batch_seq,
                 events,
                 ..
-            } => self.offered = Some((*input_batch_seq, events.len())),
+            } => {
+                self.offered.insert(*input_batch_seq, events.len());
+                // A batch the agent never answers (it died mid-flight) must not keep the
+                // map growing: the newest 64 batches are more than one lease can have in
+                // flight.
+                while self.offered.len() > 64 {
+                    self.offered.pop_first();
+                }
+            }
             _ => {}
         }
     }
 
-    /// How many events the `Inject` batch with this sequence offered, if it is known.
-    fn offered_for(&self, input_batch_seq: u64) -> Option<usize> {
-        self.offered
-            .filter(|(sequence, _)| *sequence == input_batch_seq)
-            .map(|(_, count)| count)
+    /// How many events the `Inject` batch with this sequence offered, if it is still in
+    /// flight; the entry is consumed, because the agent answers each `Inject` once.
+    fn take_offered(&mut self, input_batch_seq: u64) -> Option<usize> {
+        self.offered.remove(&input_batch_seq)
     }
 }
 
@@ -424,7 +441,7 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
         },
         Msg::InjectResult(result) => match lease_id(&result.lease_id) {
             Some(lease_id) => {
-                let offered = context.offered_for(result.input_batch_seq);
+                let offered = context.take_offered(result.input_batch_seq);
                 AgentSignal::Fsm(fr::AgentEvent::InjectResult {
                     lease_id,
                     input_batch_seq: result.input_batch_seq,
@@ -854,6 +871,43 @@ mod tests {
                 assert_eq!(status, fr::InjectStatus::Failed);
             }
             other => panic!("expected an InjectResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_result_is_ok_while_an_earlier_batch_is_still_in_flight() {
+        let mut context = AgentContext::default();
+        for seq in [7u64, 8] {
+            context.on_command(&fr::AgentCommand::Inject {
+                lease_id: lease(4),
+                input_batch_seq: seq,
+                events: vec![InputEvent::Scroll { h120: 0, v120: 120 }],
+            });
+        }
+        let result = |seq: u64| {
+            ipc::agent_frame::Msg::InjectResult(ipc::InjectResult {
+                lease_id: lease(4).to_vec(),
+                input_batch_seq: seq,
+                applied_count: 1,
+                os_error: String::new(),
+                actual: None,
+            })
+        };
+
+        // The agent answers the first batch while the second is still in flight. One
+        // remembered slot compared this result against batch 8 and reported `Partial`,
+        // which aborts the lease (`InjectStatus::aborts_lease`).
+        for seq in [7u64, 8] {
+            match agent_signal(&result(seq), &mut context) {
+                AgentSignal::Fsm(fr::AgentEvent::InjectResult { status, .. }) => {
+                    assert_eq!(
+                        status,
+                        fr::InjectStatus::Ok,
+                        "batch {seq} is measured against its own offer"
+                    );
+                }
+                other => panic!("expected an InjectResult, got {other:?}"),
+            }
         }
     }
 
