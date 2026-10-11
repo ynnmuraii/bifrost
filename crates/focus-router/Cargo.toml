@@ -12,3 +12,6 @@ workspace = true
 [dependencies]
 geometry = { path = "../geometry" }
 input-model = { path = "../input-model" }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
