@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["apps/*", "crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.99.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
