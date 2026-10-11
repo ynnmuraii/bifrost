@@ -12,6 +12,16 @@ use identity::{
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// The documented key file name for this platform. `config::paths` owns the names, so the
+/// test reads them from there instead of repeating the literals.
+fn key_file_name() -> &'static str {
+    if cfg!(windows) {
+        config::paths::IDENTITY_DPAPI_FILE
+    } else {
+        config::paths::IDENTITY_KEY_FILE
+    }
+}
+
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "lws-identity-storage-{}-{}-{label}",
@@ -29,15 +39,16 @@ fn rooted_paths_keep_the_key_and_the_trust_store_together() {
     let paths = IdentityPaths::rooted_at(&root);
 
     assert_eq!(paths.data_dir, root);
-    assert_eq!(paths.key_file, root.join(identity::key::KEY_FILE_NAME));
-    assert_eq!(paths.trust_file, root.join("trust.toml"));
+    assert_eq!(paths.key_file, root.join(key_file_name()));
+    assert_eq!(paths.trust_file, root.join(config::paths::TRUST_FILE));
     assert_eq!(key_file_of(&paths), paths.key_file.as_path());
     assert_eq!(trust_file_at(&root), paths.trust_file);
 
+    // The names are the documented ones (docs/03-architecture.md, «Файлы и пути»).
     if cfg!(windows) {
-        assert_eq!(identity::key::KEY_FILE_NAME, "identity.dpapi");
+        assert_eq!(key_file_name(), "identity.dpapi");
     } else {
-        assert_eq!(identity::key::KEY_FILE_NAME, "identity.key");
+        assert_eq!(key_file_name(), "identity.key");
     }
 
     let _ = std::fs::remove_dir_all(&root);
@@ -51,11 +62,11 @@ fn system_paths_resolve_to_documented_roots_without_creating_anything() {
 
     // Both files live in a directory called `lan-workspace`, and the key sits in the data
     // directory.
-    assert!(paths.data_dir.ends_with("lan-workspace"));
+    assert!(paths.data_dir.ends_with(config::paths::APP_DIR));
     assert_eq!(paths.key_file.parent(), Some(paths.data_dir.as_path()));
     assert_eq!(
         paths.key_file.file_name(),
-        Some(std::ffi::OsStr::new(identity::key::KEY_FILE_NAME))
+        Some(std::ffi::OsStr::new(key_file_name()))
     );
     assert_eq!(
         paths.trust_file.file_name(),
@@ -78,7 +89,10 @@ fn system_paths_resolve_to_documented_roots_without_creating_anything() {
         let config_root = documented_root("XDG_CONFIG_HOME", ".config").join("lan-workspace");
         let existed_before = data_root.exists();
 
-        assert_eq!(paths.data_dir, data_root, "the key lives under $XDG_DATA_HOME");
+        assert_eq!(
+            paths.data_dir, data_root,
+            "the key lives under $XDG_DATA_HOME"
+        );
         assert_eq!(
             paths.trust_file,
             config_root.join("trust.toml"),
@@ -110,9 +124,7 @@ fn system_paths_resolve_to_documented_roots_without_creating_anything() {
 fn documented_root(variable: &str, fallback: &str) -> PathBuf {
     std::env::var_os(variable)
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback)))
         .expect("HOME must be set when neither XDG variable is")
 }
 

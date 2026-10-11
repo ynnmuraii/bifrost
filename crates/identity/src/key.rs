@@ -98,18 +98,17 @@ impl From<SpkiError> for IdentityError {
     }
 }
 
-/// The file the private key lives in.
+/// The private key file name of this platform.
 ///
-/// `docs/03-architecture.md`: `%APPDATA%\lan-workspace\identity.dpapi` (DPAPI CurrentUser)
-/// on Windows, `$XDG_DATA_HOME/lan-workspace/identity.key` (0600) on Linux. The two are
-/// different formats, which is why the *name* differs too: a reader must be able to tell a
-/// DPAPI blob from a bare PKCS#8 file.
-#[cfg(windows)]
-pub const KEY_FILE_NAME: &str = "identity.dpapi";
-
-/// See the Windows variant for the reasoning; this is the documented Linux path.
-#[cfg(unix)]
-pub const KEY_FILE_NAME: &str = "identity.key";
+/// The names themselves belong to [`config::paths`], the single source of the documented
+/// file names (`docs/03-architecture.md`, «Файлы и пути»); this crate only picks the one
+/// its platform uses. The two are different formats, which is why the *name* differs too:
+/// a reader must be able to tell a DPAPI blob from a bare PKCS#8 file.
+const KEY_FILE_NAME: &str = if cfg!(windows) {
+    config::paths::IDENTITY_DPAPI_FILE
+} else {
+    config::paths::IDENTITY_KEY_FILE
+};
 
 /// Where this node keeps its identity and its trust store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,10 +139,12 @@ impl IdentityPaths {
                 .ok_or_else(|| {
                     IdentityError::Key("neither XDG_CONFIG_HOME nor HOME is set".into())
                 })?;
-            let data_dir = data_root.join("lan-workspace");
+            let data_dir = data_root.join(config::paths::APP_DIR);
             Ok(Self {
                 key_file: data_dir.join(KEY_FILE_NAME),
-                trust_file: config_root.join("lan-workspace").join("trust.toml"),
+                trust_file: config_root
+                    .join(config::paths::APP_DIR)
+                    .join(config::paths::TRUST_FILE),
                 data_dir,
             })
         }
@@ -152,10 +153,10 @@ impl IdentityPaths {
             let appdata = std::env::var_os("APPDATA")
                 .map(PathBuf::from)
                 .ok_or_else(|| IdentityError::Key("%APPDATA% is not set".into()))?;
-            let dir = appdata.join("lan-workspace");
+            let dir = appdata.join(config::paths::APP_DIR);
             Ok(Self {
                 key_file: dir.join(KEY_FILE_NAME),
-                trust_file: dir.join("trust.toml"),
+                trust_file: dir.join(config::paths::TRUST_FILE),
                 data_dir: dir,
             })
         }
@@ -167,7 +168,7 @@ impl IdentityPaths {
         let data_dir = directory.into();
         Self {
             key_file: data_dir.join(KEY_FILE_NAME),
-            trust_file: data_dir.join("trust.toml"),
+            trust_file: data_dir.join(config::paths::TRUST_FILE),
             data_dir,
         }
     }
