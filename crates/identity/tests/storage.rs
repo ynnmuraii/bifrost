@@ -48,10 +48,72 @@ fn system_paths_resolve_to_documented_roots_without_creating_anything() {
     // Resolution reads the environment and builds names; it must not create directories,
     // so this stays inert even though it looks at the real profile.
     let paths = IdentityPaths::system().expect("APPDATA/HOME must be resolvable here");
+
+    // Both files live in a directory called `lan-workspace`, and the key sits in the data
+    // directory.
     assert!(paths.data_dir.ends_with("lan-workspace"));
     assert_eq!(paths.key_file.parent(), Some(paths.data_dir.as_path()));
-    assert_eq!(paths.trust_file.parent(), Some(paths.data_dir.as_path()));
-    assert!(paths.key_file.ends_with(identity::key::KEY_FILE_NAME));
+    assert_eq!(
+        paths.key_file.file_name(),
+        Some(std::ffi::OsStr::new(identity::key::KEY_FILE_NAME))
+    );
+    assert_eq!(
+        paths.trust_file.file_name(),
+        Some(std::ffi::OsStr::new("trust.toml"))
+    );
+    assert!(paths
+        .trust_file
+        .parent()
+        .expect("trust.toml has a parent")
+        .ends_with("lan-workspace"));
+
+    // «Файлы и пути»: «Приватный ключ | … | `$XDG_DATA_HOME/lan-workspace/identity.key`
+    // (0600)» and «Доверенные узлы | `%APPDATA%\lan-workspace\trust.toml` |
+    // `$XDG_CONFIG_HOME/lan-workspace/trust.toml`» — the key follows the data root, the
+    // trust store the config root. Only on Windows, where both documented rows name
+    // `%APPDATA%\lan-workspace`, do they share a directory.
+    #[cfg(unix)]
+    {
+        let data_root = documented_root("XDG_DATA_HOME", ".local/share").join("lan-workspace");
+        let config_root = documented_root("XDG_CONFIG_HOME", ".config").join("lan-workspace");
+        let existed_before = data_root.exists();
+
+        assert_eq!(paths.data_dir, data_root, "the key lives under $XDG_DATA_HOME");
+        assert_eq!(
+            paths.trust_file,
+            config_root.join("trust.toml"),
+            "the trust store lives under $XDG_CONFIG_HOME"
+        );
+        assert_ne!(
+            paths.trust_file.parent(),
+            Some(paths.data_dir.as_path()),
+            "the two roots are different variables, so the files are not in one directory"
+        );
+        assert_eq!(
+            data_root.exists(),
+            existed_before,
+            "resolving paths must not create the directory"
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        let appdata = PathBuf::from(std::env::var_os("APPDATA").expect("%APPDATA% must be set"));
+        assert_eq!(paths.data_dir, appdata.join("lan-workspace"));
+        assert_eq!(paths.trust_file, paths.data_dir.join("trust.toml"));
+    }
+}
+
+/// The test's own reading of the documented XDG resolution, so the assertion above
+/// compares two independent derivations instead of calling the code under test twice.
+#[cfg(unix)]
+fn documented_root(variable: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback))
+        })
+        .expect("HOME must be set when neither XDG variable is")
 }
 
 #[test]

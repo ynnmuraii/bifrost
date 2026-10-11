@@ -19,6 +19,15 @@
 //! **One documented gap**: Linux uses the documented 0600-file fallback; the Secret Service
 //! path (D-Bus) is not implemented.
 //!
+//! The rest of the same table (`config.toml`, logs, portal tokens, the GUI socket) is
+//! resolved by `config::Paths`, and the trust store — which lives next to `config.toml` —
+//! is named here as well. The two readers are deliberately not merged even though the
+//! dependency direction would allow it: the agent links this crate and never reads
+//! `config.toml` (its settings arrive in `AgentAttach`), so pulling the configuration
+//! parser into the identity crate would drag it into the agent for no benefit. Each side
+//! is pinned to its own row of the table by its own tests
+//! (`crates/identity/tests/storage.rs` here, `crates/config`'s tests there).
+//!
 //! # Why Ed25519
 //!
 //! The docs only require «self-signed keys» and a `SPKI`-derived `node_id`, so the
