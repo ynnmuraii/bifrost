@@ -519,6 +519,30 @@ impl Supervisor {
         }
     }
 
+    /// Requests the agent's orderly shutdown so it releases capture before exiting.
+    pub async fn shutdown(&mut self) {
+        let requested = if let Some(link) = self.link.as_mut() {
+            link.send(Msg::Shutdown(ipc::AgentShutdown {}))
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        if let Some(mut child) = self.child.take() {
+            if !requested
+                || tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            }
+        }
+        self.link = None;
+        self.job = None;
+        self.state = AgentState::Lost;
+    }
+
     /// Marks the agent as attached and ready (after `AgentReady`).
     pub fn mark_ready(&mut self) {
         self.state = AgentState::Ready;

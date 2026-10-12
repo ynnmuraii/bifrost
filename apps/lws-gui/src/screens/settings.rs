@@ -164,32 +164,55 @@ fn lan_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     actions
 }
 
-/// «Перезапустить службу»: the window stops the service it started, and starts a new one.
-///
-/// The pid is the window's own ([`launch_core`]), which is why the offer is honest: with no
-/// such pid it says so instead of stopping a service it knows nothing about.
+/// Service launch, restart and the graceful stop available even for a service started elsewhere.
 fn service_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     block(ui, "Служба", |ui| {
         let restarting = vm.settings.service.restart.is_some();
+        let stopping = vm.settings.service.stopping.is_some();
         if !vm.connection.is_connected() {
             if ui
-                .add_enabled(!restarting, egui::Button::new("Запустить службу"))
+                .add_enabled(
+                    !restarting && !stopping,
+                    egui::Button::new("Запустить службу"),
+                )
                 .clicked()
             {
                 actions.push(Action::StartCore);
             }
-        } else if ui
-            .add_enabled(!restarting, egui::Button::new("Перезапустить службу"))
-            .on_hover_text("Служба остановится и запустится снова — настройки начнут работать")
-            .clicked()
-        {
-            actions.push(Action::RestartCore);
+        } else {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !restarting && !stopping,
+                        egui::Button::new("Перезапустить службу"),
+                    )
+                    .on_hover_text(
+                        "Служба остановится и запустится снова — настройки начнут работать",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::RestartCore);
+                }
+                if ui
+                    .add_enabled(
+                        !restarting && !stopping,
+                        egui::Button::new("Остановить службу"),
+                    )
+                    .on_hover_text("Остановить службу на этом компьютере")
+                    .clicked()
+                {
+                    actions.push(Action::StopCore);
+                }
+            });
         }
         match &vm.settings.service.restart {
             Some(Restart::Stopping { .. }) => hint(ui, "Служба останавливается…"),
             Some(Restart::Starting) => hint(ui, "Служба запускается…"),
             None => hint(ui, "Перезапуск поможет, если служба перестала отвечать"),
+        }
+        if stopping {
+            hint(ui, "Служба останавливается…");
         }
         if let Some(line) = &vm.settings.service.line {
             let color = if line.ok {

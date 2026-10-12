@@ -132,6 +132,8 @@ fn a_disconnected_window_says_what_to_do_about_it() {
             "Нет данных от службы",
         ],
     );
+    let status = draw(&state, Screen::Status);
+    assert!(!status.iter().any(|text| text == "Остановить службу"));
 }
 
 #[test]
@@ -171,6 +173,27 @@ fn a_connected_pair_shows_where_input_goes() {
     // Nothing is thinner than a sentence: the latency line is absent while nobody measures it.
     let status = draw(&state, Screen::Status);
     assert!(!status.iter().any(|text| text.contains("Задержка")));
+}
+
+#[test]
+fn a_degraded_agent_shows_the_core_reason_and_manual_retry() {
+    let mut state = view();
+    state.on_connected("endpoint");
+    let mut status = status_with("BLOCKED");
+    status.agent_degraded_reason = "Портал запретил управление вводом".to_owned();
+    status.agent_restart_circuit_open = true;
+    state.apply(event(Msg::Status(status)));
+
+    expect_on(
+        &state,
+        Screen::Status,
+        &[
+            "Служба ввода остановлена",
+            "Портал запретил управление вводом",
+            "Повторить",
+            "Остановить службу",
+        ],
+    );
 }
 
 #[test]
@@ -432,6 +455,7 @@ fn the_settings_screen_shows_the_address_and_the_service_behind_it() {
             "Применить",
             "Служба",
             "Перезапустить службу",
+            "Остановить службу",
         ],
     );
 

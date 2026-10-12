@@ -17,6 +17,7 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     if !connected {
         actions.extend(offline_block(vm, ui, connected));
     }
+    actions.extend(degraded_banner(vm, ui));
 
     // «Куда идёт ввод» is the question this window exists to answer, so it is the first block
     // and the largest text on the screen, whether the service is up or not.
@@ -29,6 +30,38 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     actions.extend(pending_edits(vm, ui));
     log_block(vm, ui);
 
+    actions
+}
+
+/// Shows only a degraded state the core reported; retry is an explicit button, never a timer.
+fn degraded_banner(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
+    if !vm.connection.is_connected() {
+        return Vec::new();
+    }
+    let Some(reason) = vm.agent_degraded_reason() else {
+        return Vec::new();
+    };
+    let retry_available = vm
+        .status
+        .as_ref()
+        .is_some_and(|status| status.agent_restart_circuit_open);
+    let title = if retry_available {
+        "Служба ввода остановлена"
+    } else {
+        "Служба ввода работает с ограничениями"
+    };
+    let mut actions = Vec::new();
+    block(ui, title, |ui| {
+        important(ui, &format!("Причина: {reason}"));
+        let retry = ui.add_enabled(retry_available, egui::Button::new("Повторить"));
+        if retry_available && retry.clicked() {
+            actions.push(Action::RetryAgent);
+        } else if !retry_available {
+            retry.on_hover_text(
+                "Повтор станет доступен, когда служба ввода остановит автоматические попытки",
+            );
+        }
+    });
     actions
 }
 
