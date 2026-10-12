@@ -365,6 +365,147 @@ pub fn snapshot_displays(
         .collect()
 }
 
+/// The `(revision, author)` pair a wire document carries (KVM-072).
+///
+/// `None` when the author field is not 32 bytes: a document whose identity cannot be read is
+/// not a document, and the caller refuses it instead of guessing an author.
+#[must_use]
+pub fn wire_pair(document: &wire::Topology) -> Option<crate::layout::Pair> {
+    let bytes: [u8; 32] = document.author_node_id.as_slice().try_into().ok()?;
+    Some(crate::layout::Pair::new(
+        document.revision,
+        NodeId::new(bytes),
+    ))
+}
+
+/// Revalidates a document that arrived from a peer.
+///
+/// ADR-013 rejected merging rows for exactly this reason: the invariants are global. The
+/// checks here are the ones a document must satisfy to be *usable* — a node list with no
+/// duplicates, and links whose endpoints name nodes the document declares — while the
+/// configuration validator keeps owning the geometric rules at edit time.
+pub fn validate_wire(document: &wire::Topology) -> Result<(), String> {
+    if document.nodes.is_empty() {
+        return Err("topology with no nodes".to_owned());
+    }
+    let mut seen: Vec<&[u8]> = Vec::with_capacity(document.nodes.len());
+    for node in &document.nodes {
+        if node.node_id.len() != 32 {
+            return Err("topology node_id is not 32 bytes".to_owned());
+        }
+        if seen.contains(&node.node_id.as_slice()) {
+            return Err("topology names the same node twice".to_owned());
+        }
+        seen.push(node.node_id.as_slice());
+    }
+    for link in &document.links {
+        for (side, endpoint) in [
+            ("source", link.source_endpoint.as_ref()),
+            ("target", link.target_endpoint.as_ref()),
+        ] {
+            let Some(endpoint) = endpoint else {
+                return Err(format!("link {side} endpoint is missing"));
+            };
+            if !seen.contains(&endpoint.node_id.as_slice()) {
+                return Err(format!("link {side} endpoint names an unknown node"));
+            }
+            if endpoint.display_id.is_empty() {
+                return Err(format!("link {side} endpoint has no display"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builds the wire document of a `[topology]` section (KVM-072).
+///
+/// This is the coordinator's publish step: the applied revision and its author travel with the
+/// document, and `self_node` is what `"self"` in the configuration means. Everything the
+/// configuration does not carry — native bounds, rotation, scale — is reported as the logical
+/// bounds with `native_known = false`, which is exactly the claim the portals make.
+#[must_use]
+pub fn wire_document(
+    layout: &config::TopologyConfig,
+    revision: u64,
+    author: NodeId,
+    self_node: NodeId,
+) -> wire::Topology {
+    let node_of = |text: &str| -> Option<[u8; 32]> {
+        if text == "self" {
+            return Some(*self_node.as_bytes());
+        }
+        let hex = text.strip_prefix("peer:")?;
+        let mut bytes = [0u8; 32];
+        if hex.len() != 64 {
+            return None;
+        }
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(bytes)
+    };
+    let rect = |logical: [f64; 4]| wire::Rect {
+        x: logical[0],
+        y: logical[1],
+        width: logical[2],
+        height: logical[3],
+    };
+    let edge = |edge: config::Edge| match edge {
+        config::Edge::Left => wire::Edge::Left,
+        config::Edge::Right => wire::Edge::Right,
+        config::Edge::Top => wire::Edge::Top,
+        config::Edge::Bottom => wire::Edge::Bottom,
+    };
+    let endpoint = |endpoint: &config::EndpointConfig| wire::Endpoint {
+        node_id: node_of(&endpoint.node).unwrap_or_default().to_vec(),
+        display_id: endpoint.display.clone(),
+        edge: edge(endpoint.edge) as i32,
+        segment_start: endpoint.start,
+        segment_end: endpoint.end,
+    };
+
+    let mut nodes: Vec<wire::NodeDisplays> = Vec::new();
+    for display in &layout.displays {
+        let Some(node) = node_of(&display.node) else {
+            continue;
+        };
+        let entry = match nodes.iter_mut().find(|entry| entry.node_id == node) {
+            Some(entry) => entry,
+            None => {
+                nodes.push(wire::NodeDisplays {
+                    node_id: node.to_vec(),
+                    displays: Vec::new(),
+                    online: true,
+                });
+                nodes.last_mut().expect("just pushed")
+            }
+        };
+        entry.displays.push(wire::Display {
+            id: display.id.clone(),
+            logical_bounds: Some(rect(display.logical)),
+            native_bounds: Some(rect(display.logical)),
+            rotation_degrees: 0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            primary: display.primary,
+            native_known: false,
+        });
+    }
+    wire::Topology {
+        revision,
+        nodes,
+        links: layout
+            .links
+            .iter()
+            .map(|link| wire::TransitionLink {
+                source_endpoint: Some(endpoint(&link.from)),
+                target_endpoint: Some(endpoint(&link.to)),
+            })
+            .collect(),
+        author_node_id: author.as_bytes().to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
