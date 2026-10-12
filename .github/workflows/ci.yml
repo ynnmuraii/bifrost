@@ -61,6 +61,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `cargo test` builds a package's *test* targets; it does not produce the plain
+      # `lws-agent` binary. `lws-core run` spawns that binary at startup and exits with
+      # «cannot spawn …: No such file or directory» when it is missing, and every test
+      # that starts a core — the control channel under load, the fault-injection harness —
+      # then fails on a clean checkout. Build the workspace first.
+      - name: Build
+        run: cargo build --workspace
+
       # Windows runners have a session; Linux ones need Xvfb (above). The fault
       # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
       # matter: it spawns two cores and waits for real transitions.
