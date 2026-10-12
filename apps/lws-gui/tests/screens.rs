@@ -27,7 +27,10 @@ fn draw(state: &ViewModel, screen: Screen) -> Vec<String> {
     let mut state = state.clone();
     state.screen = screen;
     let mut input = egui::RawInput::default();
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 3000.0));
+    // The viewport is deliberately tall: egui culls a shape that is completely outside the
+    // clip rectangle, and «Настройки» is the tallest screen of the four (every block of it
+    // is one page of the window's own scroll area), so it is the one that sizes this page.
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 5000.0));
     let viewport = egui::ViewportInfo {
         inner_rect: Some(rect),
         ..Default::default()
@@ -394,5 +397,67 @@ fn the_settings_screen_only_offers_what_the_core_can_do() {
             "Да, удалить",
             "Отмена",
         ],
+    );
+}
+
+/// «Адрес в локальной сети»: the value from `config.toml`, the addresses to pick from, the
+/// button that writes it and «Перезапустить службу» behind it.
+#[test]
+fn the_settings_screen_shows_the_address_and_the_service_behind_it() {
+    let mut state = view();
+    state.on_connected("endpoint");
+    state.apply(event(Msg::Status(status_with("LOCAL"))));
+    state.config.listen_address = "192.168.1.10".to_owned();
+    state.settings.lan.candidates = vec!["192.168.1.10".to_owned(), "10.0.0.7".to_owned()];
+
+    expect_on(
+        &state,
+        Screen::Settings,
+        &[
+            "Адрес в локальной сети",
+            "Адрес этого компьютера в локальной сети: 192.168.1.10",
+            "Другой компьютер должен иметь доступ к этому адресу",
+            "Применить",
+            "Служба",
+            "Перезапустить службу",
+        ],
+    );
+
+    // The address the file names, when this computer does not have it, is offered too: the
+    // dropdown of the window holds it, so opening the screen never silently drops it.
+    state.config.listen_address = "10.0.0.5".to_owned();
+    expect_on(
+        &state,
+        Screen::Settings,
+        &["Адрес этого компьютера в локальной сети: 10.0.0.5"],
+    );
+
+    // A machine with no address yet is told so, in the same plain words.
+    state.config.listen_address = String::new();
+    expect_on(
+        &state,
+        Screen::Settings,
+        &["Адрес этого компьютера в локальной сети: не указан"],
+    );
+
+    // «Настройки созданы автоматически»: once, with a way to make it go away.
+    state.settings.first_run = true;
+    expect_on(
+        &state,
+        Screen::Settings,
+        &[
+            "Первый запуск",
+            "Настройки созданы автоматически",
+            "Служба создала файл config.toml при первом запуске",
+            "Понятно",
+        ],
+    );
+    state.local(&Action::DismissFirstRun);
+    let settings = draw(&state, Screen::Settings);
+    assert!(
+        !settings
+            .iter()
+            .any(|text| text.contains("Настройки созданы автоматически")),
+        "the notice is once per session"
     );
 }
