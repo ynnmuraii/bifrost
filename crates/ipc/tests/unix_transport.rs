@@ -193,3 +193,66 @@ async fn recovery_mode_over_a_live_agent_pair() {
         &agent_frame::Msg::ReleaseKeys(protocol::ipc::ReleaseKeys::default())
     ));
 }
+
+/// A cancelled `accept` must keep a client that connects while it was pending.
+///
+/// Windows needed `PendingInstance` for exactly this (`ipc::transport::windows.rs`, «# Cancel
+/// safety»): core polls `GuiListener::accept` as one branch of a `select!`, so a connection
+/// usually arrives while an earlier `accept` is cancelled and dropped, and an implementation
+/// that had already taken the pending instance closed the connection under that client. On Unix
+/// the accept is a single `poll_read_io` that either registers a waker or performs `accept4(2)`,
+/// so nothing can be lost — this test pins that property, and it fails the day the Unix path
+/// grows the Windows window.
+#[tokio::test]
+async fn a_cancelled_accept_keeps_the_client_that_connects_while_it_waits() {
+    use std::future::Future;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let socket = TempSocket::new("cancel");
+    let mut listener = transport::listen(&socket.endpoint).expect("listening");
+
+    // The cancel window: one poll with nothing pending, then drop the future.
+    {
+        let mut pending = std::pin::pin!(listener.accept(&SameUser::current()));
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            pending.as_mut().poll(&mut context).is_pending(),
+            "nothing has connected yet"
+        );
+    }
+
+    // A client that connects *after* that cancellation is still served.
+    let endpoint = socket.endpoint.clone();
+    let client = tokio::spawn(async move {
+        transport::connect(&endpoint)
+            .await
+            .expect("connecting to the GUI socket")
+    });
+    let mut accepted = listener
+        .accept(&SameUser::current())
+        .await
+        .expect("accepting the queued client");
+    let mut client = client.await.expect("the client task");
+
+    // One byte each way proves the accepted end is that connection.
+    client.write_all(b"q").await.expect("writing one byte");
+    let mut byte = [0u8; 1];
+    accepted.read_exact(&mut byte).await.expect("reading it");
+    assert_eq!(&byte, b"q");
+}
+
+/// A waker that never wakes anything: this test drives one poll by hand.
+fn noop_waker() -> std::task::Waker {
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(std::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    // SAFETY: every callback is a no-op on a null pointer, which is the documented contract
+    // for a waker that never wakes.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
