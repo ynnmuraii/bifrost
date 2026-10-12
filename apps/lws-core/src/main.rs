@@ -387,31 +387,9 @@ async fn run_async(
         // a Wayland session ever fills (`docs/03-architecture.md`).
         portal::PortalGrants::load(paths.portal_restore_file()),
     );
-    // The layout document, assembled as far as it can be before any agent has spoken:
-    // the configured `[[topology.links]]` plus the `[[topology.displays]]` snapshot for
-    // this node. The agent's own `DisplaysReport` replaces the snapshot once it arrives,
-    // and a document that breaks «Правила целостности» is reported here and disables edge
-    // transitions instead of being half-applied.
-    let snapshot = topology::snapshot_displays(&config.topology, node_id.as_bytes());
-    let documents = topology::Documents {
-        local_node_id: *node_id.as_bytes(),
-        topology: &config.topology,
-        local_displays: &snapshot,
-        peer_displays: &[],
-    };
-    match topology::build(&documents) {
-        Ok(document) => tracing::info!(
-            links = document.links.len(),
-            nodes = document.nodes.len(),
-            revision = document.revision,
-            "layout document assembled from the configuration"
-        ),
-        Err(error) => tracing::error!(
-            error = %error,
-            "layout document unusable; edge-triggered transitions are disabled"
-        ),
-    }
-
+    // The layout document is assembled by the session (`Session::rebuild_topology`), which
+    // is also where it is rebuilt when the agent reports its displays; doing it here as well
+    // would only produce a second, snapshot-only opinion of the same document.
     supervisor.start(AgentMode::Normal).await?;
 
     tracing::info!(
