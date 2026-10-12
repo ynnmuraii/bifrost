@@ -2104,6 +2104,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "logging"
+version = "0.0.0"
+
+[[package]]
 name = "logos"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2144,6 +2148,7 @@ dependencies = [
  "clipboard",
  "input-model",
  "ipc",
+ "logging",
  "platform-probe",
  "platform-wayland",
  "platform-win",
@@ -2166,6 +2171,7 @@ dependencies = [
  "identity",
  "input-model",
  "ipc",
+ "logging",
  "platform-probe",
  "protocol",
  "serde",

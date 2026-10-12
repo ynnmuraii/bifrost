@@ -71,6 +71,8 @@ pub struct Supervisor {
     private_dir: PathBuf,
     /// Directory/namespace for the per-launch endpoint.
     runtime_dir: PathBuf,
+    /// Where the agent's own rotating log file goes (`[log]`'s directory, `logs/`).
+    logs_dir: PathBuf,
     dry_inject: bool,
     dry_input_events: usize,
     /// With `--dry-inject`: let the agent's synthetic pointer cross the right edge.
@@ -102,6 +104,7 @@ impl Supervisor {
         program: PathBuf,
         private_dir: PathBuf,
         runtime_dir: PathBuf,
+        logs_dir: PathBuf,
         dry_inject: bool,
         dry_input_events: usize,
         dry_motion: bool,
@@ -117,6 +120,7 @@ impl Supervisor {
             program,
             private_dir,
             runtime_dir,
+            logs_dir,
             dry_inject,
             dry_input_events,
             dry_motion,
@@ -162,8 +166,17 @@ impl Supervisor {
             .arg(endpoint_spec(&endpoint))
             .arg("--token-file")
             .arg(&token_path)
+            // The agent writes `<logs>/lws-agent.log` itself; core only says where, because
+            // the agent does not read `config.toml` (docs/03: one log directory per user).
+            .arg("--logs-dir")
+            .arg(&self.logs_dir)
             // The agent explains itself on stderr; stdout stays quiet.
             .stdout(std::process::Stdio::null());
+        // A console window flashing once per agent launch is what a core started by the GUI
+        // would otherwise show: the agent is a console program, and a parent with no console
+        // gives its child a new one unless it says not to.
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         if self.dry_inject {
             command.arg("--dry-inject");
             if self.dry_input_events > 0 {
@@ -540,6 +553,7 @@ mod launch_tests {
             PathBuf::from("definitely-not-an-agent-program"),
             private.clone(),
             runtime.clone(),
+            private.join("logs"),
             false,
             0,
             false,

@@ -61,6 +61,12 @@ struct Args {
     /// user copy), `<dir>/out.txt` is what this node's selection holds afterwards. Without
     /// it a dry agent has no clipboard at all and says so.
     dry_clipboard_dir: Option<PathBuf>,
+    /// Where the rotating log file goes (`<logs>/lws-agent.log`), given by core.
+    ///
+    /// This binary does not read `config.toml` (it is core's file), so the directory is an
+    /// argument; without it the agent logs to stderr alone, which is what a hand-started one
+    /// wants anyway.
+    logs_dir: Option<PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -68,7 +74,8 @@ lws-agent — LAN Workspace input agent (spawned by lws-core)
 
 USAGE:
     lws-agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
-              [--dry-input-events <n>] [--dry-motion] [--dry-clipboard-dir <path>] [--help]
+              [--dry-input-events <n>] [--dry-motion] [--dry-clipboard-dir <path>]
+              [--logs-dir <path>] [--help]
 
 OPTIONS:
     --ipc-endpoint <spec>    local IPC endpoint core created for this launch
@@ -77,6 +84,7 @@ OPTIONS:
     --dry-input-events <n>   with --dry-inject: emit n synthetic key edges (smoke aid)
     --dry-motion             with --dry-inject: walk the pointer over the right edge and back
     --dry-clipboard-dir <p>  with --dry-inject: a clipboard of in.txt/out.txt under <p>
+    --logs-dir <path>        write lws-agent.log there besides stderr
     --help                   print this help
 ";
 
@@ -87,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dry_input_events = 0usize;
     let mut dry_motion = false;
     let mut dry_clipboard_dir = None;
+    let mut logs_dir = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -108,6 +117,11 @@ fn parse_args() -> Result<Args, String> {
             "--dry-clipboard-dir" => {
                 dry_clipboard_dir = Some(PathBuf::from(
                     args.next().ok_or("--dry-clipboard-dir needs a value")?,
+                ));
+            }
+            "--logs-dir" => {
+                logs_dir = Some(PathBuf::from(
+                    args.next().ok_or("--logs-dir needs a value")?,
                 ));
             }
             "--dry-input-events" => {
@@ -132,12 +146,18 @@ fn parse_args() -> Result<Args, String> {
         dry_input_events,
         dry_motion,
         dry_clipboard_dir,
+        logs_dir,
     })
 }
 
-fn init_logging() {
-    // stderr only: stdout stays free for any future stdio channel, and the logs of
-    // this process are never the place for key usages («Никогда: нажатия клавиш»).
+/// Starts the logger: stderr, plus `<logs>/lws-agent.log` when core handed a directory.
+///
+/// stdout stays free for any future stdio channel, and the logs of this process are never the
+/// place for key usages («Никогда: нажатия клавиш»). The rotation sizes are `[log]`'s defaults
+/// (5 MiB, 5 files): the agent does not read `config.toml`, and a log file that rotates at the
+/// documented size is worth more than a flag nobody would set.
+fn init_logging(logs_dir: Option<&std::path::Path>) {
+    let sink = logs_dir.and_then(|dir| logging::file_sink(dir, "lws-agent", 5, 5));
     let filter = tracing_subscriber::EnvFilter::try_from_env("LWS_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -145,13 +165,17 @@ fn init_logging() {
         // Same rule as core: colour is for a terminal, not for the file or pipe the agent
         // is usually redirected into (its stderr is often core's).
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
+        .with_writer({
+            let sink = sink.clone();
+            move || logging::Tee::new(sink.clone())
+        })
         .with_target(false)
         .init();
 }
 
 fn main() -> ExitCode {
-    init_logging();
+    // Arguments first: `--logs-dir` is part of what the logger needs, and a bad argument is
+    // reported on stderr whether or not a file is open.
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
@@ -159,6 +183,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    init_logging(args.logs_dir.as_deref());
     tracing::info!(
         endpoint = args.ipc_endpoint.as_str(),
         dry_inject = args.dry_inject,

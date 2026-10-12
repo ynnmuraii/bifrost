@@ -14,6 +14,7 @@ anyhow = "1"
 clipboard = { path = "../../crates/clipboard" }
 input-model = { path = "../../crates/input-model" }
 ipc = { path = "../../crates/ipc" }
+logging = { path = "../../crates/logging" }
 platform-probe = { path = "../../crates/platform-probe" }
 platform-wayland = { path = "../../crates/platform-wayland" }
 platform-win = { path = "../../crates/platform-win" }
