@@ -1,3 +1,8 @@
+// `fault_injection.rs`, `layout.rs` and `three_nodes.rs` all include this module, so a
+// helper one binary does not use is not dead code — it is unused *here*. That is the one
+// allowance a shared test-support module needs; everything else stays lint-clean.
+#![allow(dead_code)]
+
 //! The two-process harness the fault-injection tests drive.
 //!
 //! `docs/06-development-plan.md` («Рекомендуемая структура repository») puts fault
@@ -224,6 +229,11 @@ impl Node {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The core's process id, for a scenario that kills it.
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// The whole log so far.
@@ -828,6 +838,25 @@ impl Drop for Harness {
     }
 }
 
+/// Prints p50/p95/p99 (and the maximum) of one latency sample.
+pub fn report_latencies(label: &str, values: &[f64]) {
+    if values.is_empty() {
+        println!("{label}: no samples");
+        return;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let pick = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
+    println!(
+        "{label}: n={} p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms",
+        sorted.len(),
+        pick(0.50),
+        pick(0.95),
+        pick(0.99),
+        sorted[sorted.len() - 1],
+    );
+}
+
 /// A directory no other test shares.
 pub fn unique_dir(label: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1056,4 +1085,236 @@ fn spawn_node(root: PathBuf, id: String, dry_motion: bool, label: &str) -> Node 
         child,
         pid,
     }
+}
+
+/// Three cores on loopback, paired pairwise.
+///
+/// `docs/04-decisions.md` ADR-011: trust is pairwise — no shared secret, no `workspace_id`
+/// — so three nodes need three ceremonies, and each ceremony records a usable address on
+/// both sides (`PairHello.listen_port`). The nodes sit in a line `w` — `a` — `b`, which is
+/// what the chain in KVM-074 walks.
+pub struct Cluster {
+    pub dir: PathBuf,
+    /// `w`, `a`, `b` in that order.
+    pub nodes: Vec<Node>,
+    /// Their listening ports, for diagnostics and for a proxy a scenario may need.
+    pub ports: Vec<u16>,
+}
+
+impl Cluster {
+    /// Starts the three nodes with no proxy in the middle.
+    pub fn start(label: &str) -> Cluster {
+        Cluster::start_with(label, |_, _, _| ()).0
+    }
+
+    /// Starts the three nodes, calling `before_run` once the roots are *paired* and the
+    /// topology is written, but before anything dials.
+    ///
+    /// That window is what a partition scenario needs: the hook installs a proxy and
+    /// points the trust records at it, and whatever it returns travels back to the caller
+    /// so the tunnels stay alive.
+    pub fn start_with<T>(
+        label: &str,
+        before_run: impl FnOnce(&[PathBuf], &[u16], &[String]) -> T,
+    ) -> (Cluster, T) {
+        let (dir, roots, ports, ids) = Cluster::prepare(label);
+        let attached = before_run(&roots, &ports, &ids);
+        let nodes = (0..3)
+            .map(|index| {
+                spawn_node(
+                    roots[index].clone(),
+                    ids[index].clone(),
+                    false,
+                    ["w", "a", "b"][index],
+                )
+            })
+            .collect();
+        (Cluster { dir, nodes, ports }, attached)
+    }
+
+    /// Pairs three fresh roots and writes their topology: `w` claims on startup
+    /// (`claim_on_startup`), `a` and `b` follow.
+    fn prepare(label: &str) -> (PathBuf, Vec<PathBuf>, Vec<u16>, Vec<String>) {
+        let dir = unique_dir(label);
+        let names = ["w", "a", "b"];
+        let mut roots = Vec::new();
+        let mut ports = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let root = dir.join(name);
+            std::fs::create_dir_all(root.join("config")).expect("config directory");
+            let port = free_port();
+            write_config(&root, port, &format!("node-{name}"), index == 0, false);
+            roots.push(root);
+            ports.push(port);
+        }
+        // Three ceremonies, one per unordered pair.
+        for (first, second) in [(0usize, 1usize), (0, 2), (1, 2)] {
+            pair(&roots[first], &roots[second], ports[first], ports[second]);
+        }
+        let ids: Vec<String> = roots.iter().map(|root| peers(root)).collect();
+        for index in 0..3 {
+            write_line_topology(&roots[index], &ids, index);
+        }
+        (dir, roots, ports, ids)
+    }
+
+    pub fn node(&self, index: usize) -> &Node {
+        &self.nodes[index]
+    }
+
+    /// Every node sees both peers, each agent is ready, and `w` owns the workspace.
+    pub fn wait_mesh(&self, timeout: Duration) {
+        for (index, node) in self.nodes.iter().enumerate() {
+            node.wait_for(
+                &format!("node {} joins the mesh", index),
+                timeout,
+                |status| {
+                    status.members == 2
+                        && status.agent == "ready"
+                        && status.owner == self.nodes[0].id
+                },
+            )
+            .unwrap_or_else(|error| panic!("node {index} never joined: {error}"));
+        }
+    }
+
+    /// The owner every node reports, as one vector, so a disagreement is visible.
+    pub fn owners(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .map(|node| node.status().map(|status| status.owner).unwrap_or_default())
+            .collect()
+    }
+
+    /// Waits until every node names `index` as the owner.
+    pub fn wait_owner(&self, index: usize, timeout: Duration) {
+        let expected = self.nodes[index].id.clone();
+        for (position, node) in self.nodes.iter().enumerate() {
+            node.wait_for(
+                &format!("node {position} sees {} as the owner", index),
+                timeout,
+                |status| status.owner == expected,
+            )
+            .unwrap_or_else(|error| panic!("node {position}: {error}"));
+        }
+    }
+
+    pub fn claim(&self, index: usize) -> Result<String, String> {
+        self.nodes[index].ctl("claim")
+    }
+
+    pub fn abandon(&self, index: usize) -> Result<String, String> {
+        self.nodes[index].ctl("abandon")
+    }
+
+    pub fn switch(&self, from: usize, to: usize) -> Result<String, String> {
+        let target = self.nodes[to].id.clone();
+        self.nodes[from].switch(&target)
+    }
+
+    /// Every node is `Local`, holds no lease and no keys.
+    pub fn assert_idle(&self) {
+        for (index, node) in self.nodes.iter().enumerate() {
+            let status = node.status().expect("status");
+            assert!(status.is_idle(), "node {index} is not at rest: {status:?}");
+        }
+    }
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        for node in &mut self.nodes {
+            node.stop();
+        }
+        if std::env::var_os("LWS_KEEP_ROOTS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        } else {
+            println!("cluster roots kept at {}", self.dir.display());
+        }
+    }
+}
+
+/// Points one node's trust record for `peer` at `address`.
+///
+/// The two-node `retarget_trust` above replaces the single `last_address`; with three nodes
+/// a root holds two records, so the stanza is matched by `node_id` first.
+pub fn retarget_trust_peer(root: &Path, peer: &str, address: &str) {
+    let path = root.join("config/trust.toml");
+    let text = std::fs::read_to_string(&path).expect("trust store");
+    let mut out = String::with_capacity(text.len());
+    let mut matching = false;
+    let mut replaced = false;
+    for line in text.lines() {
+        if line.starts_with("[[peers]]") {
+            matching = false;
+        } else if let Some(id) = line.strip_prefix("node_id = ") {
+            matching = id.trim().trim_matches('"') == peer;
+        } else if line.starts_with("last_address") {
+            if matching {
+                out.push_str(&format!("last_address = \"{address}\"\n"));
+                replaced = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    assert!(replaced, "no trust record for {peer}:\n{text}");
+    std::fs::write(&path, out).expect("trust store");
+}
+
+/// The `[topology]` document of the three-node line: three screens side by side and the
+/// edges this node owns.
+fn write_line_topology(root: &Path, ids: &[String], index: usize) {
+    let reference = |peer: usize| {
+        if peer == index {
+            "self".to_owned()
+        } else {
+            format!("peer:{}", ids[peer])
+        }
+    };
+    let mut document =
+        std::fs::read_to_string(root.join("config/config.toml")).expect("configuration");
+    document.push_str(
+        "\n[topology]\nrevision = 1\nauthor = \"self\"\nmax_seen_revision = 1\n\
+         max_seen_author = \"self\"\n",
+    );
+    for peer in 0..3 {
+        document.push_str(&format!(
+            "\n[[topology.displays]]\nnode = \"{}\"\nid = \"dry-0\"\n\
+             logical = [{}.0, 0.0, 1920.0, 1080.0]\nprimary = true\n",
+            reference(peer),
+            peer * 1920
+        ));
+    }
+    if index > 0 {
+        document.push_str(&link_block(
+            "left",
+            &reference(index),
+            "left",
+            &reference(index - 1),
+            "right",
+        ));
+    }
+    if index < 2 {
+        document.push_str(&link_block(
+            "right",
+            &reference(index),
+            "right",
+            &reference(index + 1),
+            "left",
+        ));
+    }
+    std::fs::write(root.join("config/config.toml"), document).expect("topology document");
+}
+
+/// One bidirectional link, `from`'s edge to `to`'s edge.
+fn link_block(id: &str, from: &str, from_edge: &str, to: &str, to_edge: &str) -> String {
+    format!(
+        "\n[[topology.links]]\nid = \"{id}\"\nbidirectional = true\n\
+         \n[topology.links.from]\nnode = \"{from}\"\ndisplay = \"dry-0\"\nedge = \"{from_edge}\"\n\
+         start = 0.0\nend = 1080.0\n\
+         \n[topology.links.to]\nnode = \"{to}\"\ndisplay = \"dry-0\"\nedge = \"{to_edge}\"\n\
+         start = 0.0\nend = 1080.0\n"
+    )
 }
