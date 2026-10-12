@@ -357,6 +357,18 @@ fn the_editor_draws_every_member_and_marks_an_approximate_size() {
 }
 
 #[test]
+fn settings_offers_start_when_the_service_is_disconnected() {
+    let state = view();
+    expect_on(&state, Screen::Settings, &["Запустить службу"]);
+    let settings = draw(&state, Screen::Settings);
+    assert!(
+        !settings
+            .iter()
+            .any(|text| text.contains("Перезапустить службу")),
+        "a stopped service cannot be restarted"
+    );
+}
+#[test]
 fn the_settings_screen_only_offers_what_the_core_can_do() {
     let mut state = view();
     state.on_connected("endpoint");
