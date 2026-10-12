@@ -69,6 +69,8 @@ struct Args {
     /// argument; without it the agent logs to stderr alone, which is what a hand-started one
     /// wants anyway.
     logs_dir: Option<PathBuf>,
+    /// Core-authorized development opt-in to capture external SendInput events.
+    dev_capture_injected: bool,
 }
 
 const USAGE: &str = "\
@@ -76,7 +78,7 @@ lws-agent — LAN Workspace input agent (spawned by lws-core)
 
 USAGE:
     lws-agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
-              [--dry-displays]
+              [--dev-capture-injected] [--dry-displays]
 
 OPTIONS:
     --ipc-endpoint <spec>    local IPC endpoint core created for this launch
@@ -87,7 +89,7 @@ OPTIONS:
     --dry-clipboard-dir <p>  with --dry-inject: a clipboard of in.txt/out.txt under <p>
     --dry-displays          with --dry-inject: report one synthetic 1920×1080 monitor
     --logs-dir <path>        write lws-agent.log there besides stderr
-    --help                   print this help
+    --dev-capture-injected  development-only: capture externally injected input
 ";
 
 fn parse_args() -> Result<Args, String> {
@@ -99,7 +101,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dry_motion = false;
     let mut dry_clipboard_dir = None;
     let mut logs_dir = None;
-
+    let mut dev_capture_injected = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -116,6 +118,7 @@ fn parse_args() -> Result<Args, String> {
                 ));
             }
             "--dry-inject" => dry_inject = true,
+            "--dev-capture-injected" => dev_capture_injected = true,
             "--dry-displays" => dry_displays = true,
             "--dry-motion" => dry_motion = true,
             "--dry-clipboard-dir" => {
@@ -155,6 +158,7 @@ fn parse_args() -> Result<Args, String> {
         dry_clipboard_dir,
         logs_dir,
         dry_displays,
+        dev_capture_injected,
     })
 }
 
@@ -192,6 +196,9 @@ fn main() -> ExitCode {
         }
     };
     init_logging(args.logs_dir.as_deref());
+    if args.dev_capture_injected {
+        tracing::warn!("dev: capturing externally injected input");
+    }
     tracing::info!(
         endpoint = args.ipc_endpoint.as_str(),
         dry_inject = args.dry_inject,

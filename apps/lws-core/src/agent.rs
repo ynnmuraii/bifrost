@@ -219,6 +219,7 @@ pub struct Supervisor {
     dry_inject: bool,
     dry_input_events: usize,
     dry_displays: bool,
+    dev_capture_injected: bool,
     /// With `--dry-inject`: let the agent's synthetic pointer cross the right edge.
     dry_motion: bool,
     emergency_hotkey: String,
@@ -258,6 +259,7 @@ impl Supervisor {
         dry_input_events: usize,
         dry_motion: bool,
         dry_displays: bool,
+        dev_capture_injected: bool,
         emergency_hotkey: String,
         backend_override: ipc::BackendKind,
         require_emergency_hotkey: bool,
@@ -275,6 +277,7 @@ impl Supervisor {
             dry_input_events,
             dry_motion,
             dry_displays,
+            dev_capture_injected,
             emergency_hotkey,
             backend_override,
             require_emergency_hotkey,
@@ -337,6 +340,9 @@ impl Supervisor {
         // gives its child a new one unless it says not to.
         #[cfg(windows)]
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        if self.dev_capture_injected {
+            command.arg("--dev-capture-injected");
+        }
         if self.dry_inject {
             command.arg("--dry-inject");
             if self.dry_input_events > 0 {
@@ -791,6 +797,7 @@ mod launch_tests {
             private.join("logs"),
             false,
             0,
+            false,
             false,
             false,
             "Ctrl+Alt+Shift+F12".to_owned(),

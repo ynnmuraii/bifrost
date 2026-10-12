@@ -110,17 +110,12 @@ pub struct CaptureConfig {
     pub queue_capacity: usize,
     /// Whether to register for Raw Input mouse deltas.
     pub raw_input: bool,
-    /// Test-only: capture injected events as if they were physical.
+    /// Development-only opt-in: accept injected events except this process's own.
     ///
-    /// Off by default, and it must stay off in the agent: production semantics
-    /// are that synthetic input never becomes captured input (that is what keeps
-    /// our own replay out of the network and what makes receiver takeover mean
-    /// "a human touched the machine"). The flag exists so the whole capture
-    /// pipeline can be driven by `spike_inject` on a machine with nobody at the
-    /// keyboard.
+    /// Off by default. Own `SendInput` carries `INJECT_TAG` and is always filtered,
+    /// even when this option is enabled.
     pub capture_injected: bool,
 }
-
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
@@ -223,7 +218,7 @@ struct Shared {
     overflowed: AtomicBool,
     raw_input_ok: AtomicBool,
     hook_calls: AtomicU64,
-    capture_injected: bool,
+    capture_injected: AtomicBool,
 }
 
 /// The process-wide handle the hook callbacks use.
@@ -265,13 +260,13 @@ impl Capture {
             hook_mouse_moves: AtomicU64::new(0),
             raw_mouse_moves: AtomicU64::new(0),
             raw_absolute: AtomicU64::new(0),
+            capture_injected: AtomicBool::new(config.capture_injected),
             raw_synth_suppressed: AtomicU64::new(0),
             recenters: AtomicU64::new(0),
             emergencies: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
             raw_input_ok: AtomicBool::new(false),
             hook_calls: AtomicU64::new(0),
-            capture_injected: config.capture_injected,
         });
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -380,6 +375,12 @@ impl Capture {
             raw_input_ok: self.shared.raw_input_ok.load(Ordering::Relaxed),
             hook_calls: self.shared.hook_calls.load(Ordering::Relaxed),
         }
+    }
+    /// Controls whether externally injected events are accepted by the hooks.
+    pub fn set_capture_injected(&self, capture: bool) {
+        self.shared
+            .capture_injected
+            .store(capture, Ordering::Relaxed);
     }
 
     /// Unhook, tear the window down and join the thread.
@@ -671,12 +672,17 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
     if kb.dwExtraInfo == FAKE_SHIFT_TAG {
         return None;
     }
-    let injected = kb.dwExtraInfo == INJECT_TAG || kb.flags.0 & LLKHF_INJECTED.0 != 0;
+    let own_tag = kb.dwExtraInfo == INJECT_TAG;
+    let injected = own_tag || kb.flags.0 & LLKHF_INJECTED.0 != 0;
     if injected {
         shared.injected_seen.fetch_add(1, Ordering::Relaxed);
-        if !shared.capture_injected {
-            return None;
-        }
+    }
+    if !should_capture_event(
+        injected,
+        own_tag,
+        shared.capture_injected.load(Ordering::Relaxed),
+    ) {
+        return None;
     }
 
     let vk = kb.vkCode as u16;
@@ -713,12 +719,17 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
     // SAFETY: for HC_ACTION the OS passes a valid MSLLHOOKSTRUCT pointer.
     let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
 
-    let injected = ms.dwExtraInfo == INJECT_TAG || ms.flags & LLMHF_INJECTED != 0;
+    let own_tag = ms.dwExtraInfo == INJECT_TAG;
+    let injected = own_tag || ms.flags & LLMHF_INJECTED != 0;
     if injected {
         shared.injected_seen.fetch_add(1, Ordering::Relaxed);
-        if !shared.capture_injected {
-            return None;
-        }
+    }
+    if !should_capture_event(
+        injected,
+        own_tag,
+        shared.capture_injected.load(Ordering::Relaxed),
+    ) {
+        return None;
     }
 
     let swallow = remote(shared);
@@ -925,5 +936,22 @@ unsafe extern "system" fn window_proc(
         }
         // SAFETY: default handling for anything else.
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
+}
+fn should_capture_event(injected: bool, own_tag: bool, capture_injected: bool) -> bool {
+    !own_tag && (!injected || capture_injected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_capture_event;
+
+    #[test]
+    fn injected_event_filter_preserves_physical_input_and_drops_own_injection() {
+        assert!(should_capture_event(false, false, false));
+        assert!(!should_capture_event(true, false, false));
+        assert!(should_capture_event(true, false, true));
+        assert!(!should_capture_event(true, true, true));
+        assert!(!should_capture_event(true, true, false));
     }
 }

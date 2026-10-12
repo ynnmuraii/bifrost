@@ -198,9 +198,14 @@ impl Win {
         Ok(())
     }
 
-    pub fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
+    pub fn begin_capture(
+        &mut self,
+        kind: CaptureKind,
+        capture_injected: bool,
+    ) -> Result<(), String> {
         match &self.capture {
             Some(capture) => {
+                capture.set_capture_injected(capture_injected);
                 capture.set_mode(kind);
                 Ok(())
             }
@@ -208,6 +213,7 @@ impl Win {
                 let config = CaptureConfig {
                     mode: kind,
                     emergency: self.emergency,
+                    capture_injected,
                     ..CaptureConfig::default()
                 };
                 match Capture::start(config) {
@@ -252,6 +258,9 @@ impl Win {
     /// the lease» starts to mean something (rule 9). The detector is an observe-only
     /// capture: no suppression, no forwarding, one trigger.
     pub fn prepare_inject(&mut self) -> Result<(), String> {
+        if let Some(capture) = &self.capture {
+            capture.set_capture_injected(false);
+        }
         if let Some(plan) = self.plan {
             if self.detector.is_none() {
                 let config = CaptureConfig {

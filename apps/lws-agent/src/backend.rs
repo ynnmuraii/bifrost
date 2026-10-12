@@ -873,11 +873,16 @@ impl Backend {
     }
 
     /// Starts (or re-arms) capture.
-    pub async fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
+    pub async fn begin_capture(
+        &mut self,
+        kind: CaptureKind,
+        capture_injected: bool,
+    ) -> Result<(), String> {
+        let _ = capture_injected;
         match self {
             Backend::Dry(dry) => {
                 // `--dry-input-events` is documented as «emit this many synthetic key edges
-                // after `BeginCapture(REMOTE)`»: the core drops captured input that arrives
+                // after `BeginCapture(REMOTE)`: the core drops captured input that arrives
                 // outside a remote source lease, and `TEMPORARY` is exactly that window, so
                 // emitting them there would consume the aid before the lease exists.
                 dry.capturing = matches!(kind, CaptureKind::Remote);
@@ -885,7 +890,7 @@ impl Backend {
                 Ok(())
             }
             #[cfg(windows)]
-            Backend::Win(backend) => backend.begin_capture(kind),
+            Backend::Win(backend) => backend.begin_capture(kind, capture_injected),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.begin_capture(kind),
             #[cfg(target_os = "linux")]
@@ -1544,7 +1549,7 @@ mod tests {
         // captured input, so the aid must not be spent there: it is documented as «after
         // `BeginCapture(REMOTE)`».
         backend
-            .begin_capture(CaptureKind::Temporary)
+            .begin_capture(CaptureKind::Temporary, false)
             .await
             .expect("temporary capture");
         assert!(
@@ -1553,7 +1558,7 @@ mod tests {
         );
 
         backend
-            .begin_capture(CaptureKind::Remote)
+            .begin_capture(CaptureKind::Remote, false)
             .await
             .expect("remote capture");
         assert!(

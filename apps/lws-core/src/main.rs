@@ -7,9 +7,8 @@
 //! lws-core [--root DIR] [--config-dir DIR] [--data-dir DIR] [--state-dir DIR]
 //!          [--runtime-dir DIR] <command>
 //!
-//!   run      [--dry-inject] [--dry-displays] [--dry-input-events N] [--agent PATH]
-//!            [--listen IP] [--port-input N] [--port-clipboard N]
-//!   pair     (--open [--listen IP:PORT] | --dial IP:PORT)
+//!          run      [--dev-capture-injected] [--dry-inject] [--dry-displays] [--dry-input-events N] [--agent PATH]
+//!                   [--listen IP] [--port-input N] [--port-clipboard N]
 //!   peers    [--revoke NODE_ID]
 //!   status
 //!   switch   <peer id|display name>
@@ -315,6 +314,9 @@ fn init_logging(paths: &Paths) {
 fn run(args: &Args) -> Result<(), Failure> {
     init_logging(&args.paths);
     let options = RunOptions::parse(&args.rest)?;
+    if options.dev_capture_injected {
+        tracing::warn!("dev: capturing externally injected input");
+    }
     let paths = &args.paths;
 
     // AC-16: the first run must not die on a missing `config.toml`. The owner of the
@@ -503,6 +505,7 @@ async fn run_async(
         options.dry_input_events,
         options.dry_motion,
         options.dry_displays,
+        options.dev_capture_injected,
         config.input.emergency_hotkey.clone(),
         backend_kind(&config),
         config.input.require_emergency_hotkey,
@@ -554,6 +557,7 @@ async fn run_async(
         config.node.display_name.clone(),
         config.input.emergency_hotkey.clone(),
         session.capabilities,
+        options.dev_capture_injected,
         pairing_gate,
     );
     session.run().await.map_err(|error| error.to_string())
@@ -561,6 +565,7 @@ async fn run_async(
 
 /// The `run`-only options.
 struct RunOptions {
+    dev_capture_injected: bool,
     dry_inject: bool,
     dry_input_events: usize,
     /// With `--dry-inject`: also walk the synthetic pointer over the right edge, so the
@@ -574,6 +579,7 @@ struct RunOptions {
 
 impl RunOptions {
     fn parse(rest: &[String]) -> Result<Self, Failure> {
+        let mut dev_capture_injected = false;
         let mut dry_inject = false;
         let mut dry_input_events = 0usize;
         let mut dry_motion = false;
@@ -584,6 +590,10 @@ impl RunOptions {
         while index < rest.len() {
             let argument = rest[index].as_str();
             match argument {
+                "--dev-capture-injected" => {
+                    dev_capture_injected = true;
+                    index += 1;
+                }
                 "--dry-inject" => {
                     dry_inject = true;
                     index += 1;
@@ -633,6 +643,7 @@ impl RunOptions {
             None => agent::default_agent_program().map_err(Failure::Run)?,
         };
         Ok(RunOptions {
+            dev_capture_injected,
             dry_inject,
             dry_input_events,
             dry_motion,
@@ -933,5 +944,23 @@ fn control(paths: &Paths, line: &str) -> Result<(), Failure> {
     match ctl::Response::parse(&reply) {
         Ok(ctl::Response::Error { code, .. }) => Err(Failure::Run(code)),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod run_options_tests {
+    use super::RunOptions;
+
+    #[test]
+    fn dev_capture_injected_is_explicit_and_off_by_default() {
+        let parse = |arguments: &[&str]| {
+            let arguments = arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>();
+            RunOptions::parse(&arguments).unwrap_or_else(|_| panic!("valid run options"))
+        };
+        assert!(!parse(&["--agent", "agent"]).dev_capture_injected);
+        assert!(parse(&["--dev-capture-injected", "--agent", "agent"]).dev_capture_injected);
     }
 }
