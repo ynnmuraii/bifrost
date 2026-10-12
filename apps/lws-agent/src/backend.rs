@@ -347,6 +347,7 @@ pub struct Dry {
     /// armed: the whole point of the aid is that the pointer moves while the node is
     /// `Local`, and core's edge trigger is what notices it.
     motion: std::collections::VecDeque<Option<InputEvent>>,
+    dry_displays: bool,
     capturing: bool,
     /// The clipboard, when `--dry-clipboard-dir` named one. `None` is a dry agent with no
     /// clipboard at all, which is what it reports.
@@ -522,7 +523,13 @@ impl DryClipboard {
 }
 
 impl Dry {
-    fn new(ready: Ready, synthetic: usize, motion: bool, clipboard_dir: Option<PathBuf>) -> Self {
+    fn new(
+        ready: Ready,
+        synthetic: usize,
+        motion: bool,
+        clipboard_dir: Option<PathBuf>,
+        dry_displays: bool,
+    ) -> Self {
         let mut scheduled = Vec::new();
         // Alternating down/up of HID usage 0x04: visibly synthetic, payload-free and
         // never text. It exists to exercise the batch path without a human at the
@@ -550,6 +557,7 @@ impl Dry {
             },
             capturing: false,
             clipboard,
+            dry_displays,
         }
     }
 
@@ -609,6 +617,7 @@ impl Backend {
         override_kind: BackendKindArg,
         dry: bool,
         synthetic_events: usize,
+        dry_displays: bool,
         dry_motion: bool,
         dry_clipboard_dir: Option<PathBuf>,
         emergency_hotkey: &str,
@@ -658,6 +667,7 @@ impl Backend {
                         synthetic_events,
                         dry_motion,
                         dry_clipboard_dir,
+                        dry_displays,
                     );
                     // The adapter is what knows whether it has a clipboard at all, so the
                     // report comes back from it rather than from the probe.
@@ -743,6 +753,7 @@ impl Backend {
                 &snapshot,
                 &unsupported.to_string(),
                 synthetic_events,
+                dry_displays,
                 dry_motion,
                 dry_clipboard_dir,
             ),
@@ -955,14 +966,20 @@ impl Backend {
 
     /// The monitors of this node, for `DisplaysReport` (KVM-040).
     ///
-    /// Dry mode reports nothing: it touches no OS input path, and inventing a display
-    /// would make core's topology disagree with the machine.
-    ///
+    /// Dry mode reports nothing unless `--dry-displays` explicitly opts into the synthetic
+    /// monitor used by multi-core tests.
     /// Async because the real backends enumerate synchronously (GDI, X round-trips); the
     /// enumeration runs on a blocking thread so `QueryDisplays` never stalls the poll tick
     /// and the heartbeat on the way to its answer.
     pub async fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
         match self {
+            Backend::Dry(dry) if dry.dry_displays => vec![crate::displays::RawDisplay {
+                id: "dry-0".to_owned(),
+                logical: [0.0, 0.0, 1920.0, 1080.0],
+                native: Some([0, 0, 1920, 1080]),
+                scale: 1.0,
+                primary: true,
+            }],
             Backend::Dry(_) => Vec::new(),
             #[cfg(windows)]
             Backend::Win(backend) => backend.displays().await,
@@ -1074,6 +1091,7 @@ fn unsupported_dry(
     snapshot: &EnvSnapshot,
     reason: &str,
     synthetic_events: usize,
+    dry_displays: bool,
     dry_motion: bool,
     dry_clipboard_dir: Option<PathBuf>,
 ) -> (Backend, Ready, Vec<Refusal>) {
@@ -1085,7 +1103,13 @@ fn unsupported_dry(
         "session not supported by this build: staying local"
     );
     let ready = Ready::degraded(reason, &platform, &session_kind);
-    let backend = Dry::new(ready, synthetic_events, dry_motion, dry_clipboard_dir);
+    let backend = Dry::new(
+        ready,
+        synthetic_events,
+        dry_motion,
+        dry_clipboard_dir,
+        dry_displays,
+    );
     let ready = backend.ready.clone();
     (Backend::Dry(Box::new(backend)), ready, Vec::new())
 }
@@ -1101,7 +1125,7 @@ fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready, Vec<Refusal>
     );
     let ready = Ready::degraded(reason, &platform, &session_kind);
     (
-        Backend::Dry(Box::new(Dry::new(ready.clone(), 0, false, None))),
+        Backend::Dry(Box::new(Dry::new(ready.clone(), 0, false, None, false))),
         ready,
         Vec::new(),
     )
@@ -1245,6 +1269,19 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn dry_displays_returns_the_synthetic_monitor_only_when_enabled() {
+        let ready = Ready::degraded("test", "platform-test", "windows");
+        let mut backend = Backend::Dry(Box::new(Dry::new(ready.clone(), 0, false, None, true)));
+
+        let displays = backend.displays().await;
+        assert_eq!(displays.len(), 1);
+        assert_eq!(displays[0].id, "dry-0");
+        assert_eq!(displays[0].logical, [0.0, 0.0, 1920.0, 1080.0]);
+
+        let mut empty_backend = Backend::Dry(Box::new(Dry::new(ready, 0, false, None, false)));
+        assert!(empty_backend.displays().await.is_empty());
+    }
     #[test]
     fn explicit_dry_clipboard_survives_an_unsupported_session_probe() {
         let dir = temp_dir("unsupported");
@@ -1257,6 +1294,7 @@ mod tests {
             &snapshot,
             "probe could not detect the session",
             0,
+            false,
             false,
             Some(dir.clone()),
         );
@@ -1295,6 +1333,7 @@ mod tests {
             0,
             false,
             Some(dir.to_path_buf()),
+            false,
         )
     }
 
@@ -1440,6 +1479,7 @@ mod tests {
             0,
             false,
             None,
+            false,
         );
         assert!(!dry.clipboard_available());
         assert!(dry.clipboard_change().is_none());
@@ -1498,7 +1538,7 @@ mod tests {
     #[tokio::test]
     async fn the_synthetic_aid_only_fires_once_capture_is_remote() {
         let ready = Ready::degraded("test", "platform-test", "windows");
-        let mut backend = Backend::Dry(Box::new(Dry::new(ready, 3, false, None)));
+        let mut backend = Backend::Dry(Box::new(Dry::new(ready, 3, false, None, false)));
 
         // `TEMPORARY` is the window in which core is not yet a remote source and drops
         // captured input, so the aid must not be spent there: it is documented as «after

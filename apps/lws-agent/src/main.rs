@@ -56,6 +56,8 @@ struct Args {
     /// `[[topology.displays]]` snapshot, which is exactly what core falls back to when
     /// the agent reports nothing.
     dry_motion: bool,
+    /// Report one synthetic monitor from dry mode for multi-core tests.
+    dry_displays: bool,
     /// Test aid: a clipboard made of two files, so the whole clipboard path can be driven
     /// without a desktop. `<dir>/in.txt` is the outside world copying something (a local
     /// user copy), `<dir>/out.txt` is what this node's selection holds afterwards. Without
@@ -74,8 +76,7 @@ lws-agent — LAN Workspace input agent (spawned by lws-core)
 
 USAGE:
     lws-agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
-              [--dry-input-events <n>] [--dry-motion] [--dry-clipboard-dir <path>]
-              [--logs-dir <path>] [--help]
+              [--dry-displays]
 
 OPTIONS:
     --ipc-endpoint <spec>    local IPC endpoint core created for this launch
@@ -84,6 +85,7 @@ OPTIONS:
     --dry-input-events <n>   with --dry-inject: emit n synthetic key edges (smoke aid)
     --dry-motion             with --dry-inject: walk the pointer over the right edge and back
     --dry-clipboard-dir <p>  with --dry-inject: a clipboard of in.txt/out.txt under <p>
+    --dry-displays          with --dry-inject: report one synthetic 1920×1080 monitor
     --logs-dir <path>        write lws-agent.log there besides stderr
     --help                   print this help
 ";
@@ -93,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
     let mut token_file = None;
     let mut dry_inject = false;
     let mut dry_input_events = 0usize;
+    let mut dry_displays = false;
     let mut dry_motion = false;
     let mut dry_clipboard_dir = None;
     let mut logs_dir = None;
@@ -113,6 +116,7 @@ fn parse_args() -> Result<Args, String> {
                 ));
             }
             "--dry-inject" => dry_inject = true,
+            "--dry-displays" => dry_displays = true,
             "--dry-motion" => dry_motion = true,
             "--dry-clipboard-dir" => {
                 dry_clipboard_dir = Some(PathBuf::from(
@@ -134,6 +138,9 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
+    if dry_displays && !dry_inject {
+        return Err(format!("--dry-displays needs --dry-inject\n\n{USAGE}"));
+    }
     if dry_clipboard_dir.is_some() && !dry_inject {
         // Reporting the mistake beats starting a real session that silently ignores it.
         return Err(format!("--dry-clipboard-dir needs --dry-inject\n\n{USAGE}"));
@@ -147,6 +154,7 @@ fn parse_args() -> Result<Args, String> {
         dry_motion,
         dry_clipboard_dir,
         logs_dir,
+        dry_displays,
     })
 }
 

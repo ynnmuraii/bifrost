@@ -83,6 +83,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         backend::BackendKindArg(attach.backend_override),
         args.dry_inject,
         args.dry_input_events,
+        args.dry_displays,
         args.dry_motion,
         args.dry_clipboard_dir.clone(),
         attach.emergency_hotkey.as_str(),
@@ -1098,6 +1099,7 @@ mod tests {
                 true,
                 0,
                 false,
+                false,
                 clipboard_dir,
                 HOTKEY,
                 &[],
@@ -1579,9 +1581,10 @@ mod tests {
                 // reads them (see `Harness::dry`).
                 let (agent_io, core_io) = duplex(4 * 1024 * 1024);
                 let (mut backend, ready, _refusals) = Backend::select(
-                    BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
+                    backend::BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
                     true,
                     0,
+                    false,
                     false,
                     Some(dir),
                     HOTKEY,
