@@ -715,6 +715,13 @@ impl Backend {
                     }
                 }
             }
+            Err(unsupported) if dry => unsupported_dry(
+                &snapshot,
+                &unsupported.to_string(),
+                synthetic_events,
+                dry_motion,
+                dry_clipboard_dir,
+            ),
             Err(unsupported) => refuse(&snapshot, &unsupported.to_string()),
         }
     }
@@ -1038,6 +1045,27 @@ fn motion_schedule() -> std::collections::VecDeque<Option<InputEvent>> {
     schedule
 }
 
+/// An explicitly requested dry backend remains useful when session detection fails.
+fn unsupported_dry(
+    snapshot: &EnvSnapshot,
+    reason: &str,
+    synthetic_events: usize,
+    dry_motion: bool,
+    dry_clipboard_dir: Option<PathBuf>,
+) -> (Backend, Ready, Vec<Refusal>) {
+    let (platform, session_kind) = describe_session(snapshot);
+    tracing::warn!(
+        reason,
+        platform = platform.as_str(),
+        session_kind = session_kind.as_str(),
+        "session not supported by this build: staying local"
+    );
+    let ready = Ready::degraded(reason, &platform, &session_kind);
+    let backend = Dry::new(ready, synthetic_events, dry_motion, dry_clipboard_dir);
+    let ready = backend.ready.clone();
+    (Backend::Dry(Box::new(backend)), ready, Vec::new())
+}
+
 /// The selected backend cannot be driven here: keep the node usable and say why.
 fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready, Vec<Refusal>) {
     let (platform, session_kind) = describe_session(snapshot);
@@ -1172,6 +1200,36 @@ fn describe_session(snapshot: &EnvSnapshot) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_dry_clipboard_survives_an_unsupported_session_probe() {
+        let dir = temp_dir("unsupported");
+        let snapshot = EnvSnapshot::new(if cfg!(windows) {
+            platform_probe::HostOs::Windows
+        } else {
+            platform_probe::HostOs::Linux
+        });
+        let (backend, ready, _) = unsupported_dry(
+            &snapshot,
+            "probe could not detect the session",
+            0,
+            false,
+            Some(dir.clone()),
+        );
+
+        assert!(backend.clipboard_available());
+        assert!(ready
+            .capabilities
+            .iter()
+            .any(|name| name == "TEXT_CLIPBOARD"));
+        let Backend::Dry(mut backend) = backend else {
+            panic!("an unsupported probe must remain a dry backend");
+        };
+        backend
+            .set_clipboard(Some("received from peer"))
+            .expect("the dry fallback applies a peer payload");
+        assert_eq!(read(&dir.join("out.txt")), "received from peer");
+    }
 
     /// A private directory under the system temp root, for the dry clipboard's files.
     fn temp_dir(label: &str) -> PathBuf {
