@@ -161,3 +161,59 @@ fn two_hundred_sequential_status_calls_are_all_answered() {
         "core closed the control channel without an answer on calls {unanswered:?}"
     );
 }
+
+/// How many clients hammer the channel at once, and how many calls each one makes.
+const CLIENTS: usize = 8;
+/// Calls per client.
+const CALLS_PER_CLIENT: u32 = 50;
+
+/// Eight clients at once, fifty calls each, every call answered.
+///
+/// The sequential test above covers the cancelled accept; this one covers the *window* around
+/// it, which is where the channel really loses clients: a named pipe has one instance per
+/// waiting client, and a client that arrives while the listener has none — the instance it was
+/// waiting on has just been handed to core, and the next one does not exist yet — reads
+/// `ERROR_FILE_NOT_FOUND`, or `ERROR_PIPE_BUSY` when every instance is connected but none is
+/// being served. Both are the listener's bookkeeping, not the client's mistake:
+/// `ipc::transport::windows` creates the next instance *before* the connected one leaves
+/// `accept`, and a client retries a busy or briefly-absent pipe for two seconds before giving
+/// up. Under eight clients at once the old shape lost calls within a few dozen, so the counts
+/// below are the regression.
+#[test]
+fn eight_concurrent_clients_get_fifty_answers_each() {
+    let root = std::env::temp_dir().join(format!("lws-control-stress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    write_config(&root, free_port());
+
+    let mut core = start_core(&root);
+    let started = Instant::now();
+    let unanswered: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..CLIENTS)
+            .map(|_| {
+                scope.spawn(|| {
+                    (0..CALLS_PER_CLIENT)
+                        .filter(|_| status_line(&root).is_none())
+                        .count()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a client thread"))
+            .sum()
+    });
+    let elapsed = started.elapsed();
+
+    let _ = core.kill();
+    let _ = core.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    let total = CLIENTS as u32 * CALLS_PER_CLIENT;
+    println!(
+        "{CLIENTS} clients x {CALLS_PER_CLIENT} calls = {total} in {elapsed:?}; unanswered: {unanswered}"
+    );
+    assert_eq!(
+        unanswered, 0,
+        "{unanswered} of {total} concurrent calls came back without an answer"
+    );
+}

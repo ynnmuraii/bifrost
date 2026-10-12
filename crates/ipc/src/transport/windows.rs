@@ -64,14 +64,26 @@ pub const PIPE_NAME_PREFIX: &str = "lan-workspace-";
 pub const PIPE_PATH_PREFIX: &str = r"\\.\pipe\";
 /// `ERROR_PIPE_BUSY`: every instance is connected, retry shortly.
 const ERROR_PIPE_BUSY: i32 = 231;
+/// `ERROR_FILE_NOT_FOUND`: the name has no instance at all right now, retry shortly.
+///
+/// Windows returns it from `CreateFile` on a pipe name that exists but has nothing listening —
+/// the instant between the listener's accepted instance leaving and the next one arriving.
+const ERROR_FILE_NOT_FOUND: i32 = 2;
 /// Largest instance count `CreateNamedPipeW` accepts (254); 255 is its
 /// "unlimited" sentinel and the tokio builder rejects it.
 const MAX_PIPE_INSTANCES: u32 = 254;
 /// Default pipe buffer, matching the maximum IPC frame plus a frame in flight.
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
-/// How many times [`connect`] retries a busy pipe before giving up.
-const CONNECT_ATTEMPTS: u32 = 20;
-/// Delay between busy-pipe retries.
+/// How long [`connect`] keeps trying a pipe that has no instance for it.
+///
+/// Both retryable errors clear in microseconds when the listener is healthy — the next
+/// instance is created before the accepted one leaves [`GuiListener::accept`] — so the window
+/// only has to outlast a busy machine: a core whose loop is descheduled for a moment must not
+/// lose a client that would have been served. Two seconds is the CLI's own patience for a
+/// whole exchange (`apps/lws-core/src/main.rs`), so a client never waits longer than the
+/// caller was prepared to.
+const CONNECT_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// Delay between retries of a busy or briefly-absent pipe.
 const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// `\\.\pipe\lan-workspace-<SID>`.
@@ -343,7 +355,11 @@ pub struct GuiListener {
     name: String,
     security: PipeSecurity,
     options: PipeOptions,
-    pending: NamedPipeServer,
+    /// The instance that is waiting for the next client.
+    ///
+    /// `None` only while [`GuiListener::accept`] holds it (a named pipe has one instance per
+    /// waiting client, and the instance a client connected to is *not* waiting any more).
+    pending: Option<NamedPipeServer>,
 }
 
 /// Create the GUI pipe with the current user's DACL and
@@ -373,7 +389,7 @@ pub fn listen(endpoint: &Endpoint) -> Result<GuiListener, IpcError> {
         name: endpoint.name().to_owned(),
         security,
         options,
-        pending,
+        pending: Some(pending),
     })
 }
 
@@ -394,6 +410,15 @@ impl GuiListener {
     /// [`PeerCheck`] hook sees [`CredentialSource::PipeDacl`] credentials and the
     /// default [`crate::peer::SameUser`] accepts them.
     ///
+    /// # The instance the next client needs
+    ///
+    /// A named pipe has one instance per client it can hold, and a client that finds none
+    /// *listening* reads `ERROR_FILE_NOT_FOUND` (no instance at all) or `ERROR_PIPE_BUSY`
+    /// (every instance is connected). Both are this listener's bookkeeping, so the next
+    /// instance is created *before* the accepted one leaves this method: a client that
+    /// arrives while core serves the accepted one finds a pipe that is listening. The
+    /// instance a client connected to cannot serve another one, so it is never reused.
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe: core's session loop polls it as one branch of a
@@ -404,21 +429,34 @@ impl GuiListener {
     /// closed pipe instead of its answer («core closed the control channel without an
     /// answer» watched as `lws-core status` failing a few times in two hundred).
     pub async fn accept(&mut self, check: &dyn PeerCheck) -> Result<NamedPipeServer, IpcError> {
-        let server = std::mem::replace(
-            &mut self.pending,
-            // A fresh instance is kept ready while the accepted one is in use;
-            // `max_instances` leaves room for both.
-            self.security
-                .create(&self.name, &self.options.with_first_instance(false))?,
-        );
+        let waiting = self
+            .pending
+            .take()
+            .expect("the listener holds its waiting instance outside `accept`");
         let instance = PendingInstance {
-            server: Some(server),
+            server: Some(waiting),
             pending: &mut self.pending,
         };
-        let connected = instance.server().connect().await;
-        // The wait is over, whichever way it went: the caller owns the instance from here.
+        if let Err(source) = instance.server().connect().await {
+            // The wait ended without a client core can serve: the client that queued on this
+            // instance left (Windows reports `ERROR_NO_DATA`), or the wait itself failed. Such
+            // an instance cannot be waited on again — keeping it would leave the channel
+            // stuck on a dead pipe and every later client refused — so it goes, and a fresh
+            // one takes its place.
+            instance.discard();
+            self.pending = Some(
+                self.security
+                    .create(&self.name, &self.options.with_first_instance(false))?,
+            );
+            return Err(IpcError::io("connecting a GUI pipe client", source));
+        }
+        // The client is on this instance. The next one exists before this one is handed off,
+        // so the pipe is never left without an instance that is listening.
+        let next = self
+            .security
+            .create(&self.name, &self.options.with_first_instance(false))?;
+        *instance.pending = Some(next);
         let server = instance.take();
-        connected.map_err(|source| IpcError::io("connecting a GUI pipe client", source))?;
 
         let credentials = PeerCredentials::pipe_dacl();
         check
@@ -433,11 +471,11 @@ impl GuiListener {
 ///
 /// A [`NamedPipeServer`] that a client has connected to is the client's only way to be
 /// served: dropping it closes the connection under that client. `PendingInstance` exists so a
-/// cancelled [`GuiListener::accept`] cannot do that (`mem::replace` takes the instance out of
-/// the listener before the `await`, which is exactly the window a `select!` cancels in).
+/// cancelled [`GuiListener::accept`] cannot do that (`mem::take` takes the instance out of the
+/// listener before the `await`, which is exactly the window a `select!` cancels in).
 struct PendingInstance<'a> {
     server: Option<NamedPipeServer>,
-    pending: &'a mut NamedPipeServer,
+    pending: &'a mut Option<NamedPipeServer>,
 }
 
 impl PendingInstance<'_> {
@@ -445,42 +483,55 @@ impl PendingInstance<'_> {
     fn server(&self) -> &NamedPipeServer {
         self.server
             .as_ref()
-            .expect("the instance is owned until `take`")
+            .expect("the instance is owned until `take` or `discard`")
     }
 
     /// Ends the wait, whichever way it went: the caller owns the instance.
     fn take(mut self) -> NamedPipeServer {
         self.server
             .take()
-            .expect("the instance is owned until `take`")
+            .expect("the instance is owned until `take` or `discard`")
+    }
+
+    /// The wait failed: the instance is unusable, so dropping it is the point.
+    ///
+    /// Distinct from a cancellation ([`Drop`]), where a client may already be attached and the
+    /// instance must be kept.
+    fn discard(mut self) {
+        self.server = None;
     }
 }
 
 impl Drop for PendingInstance<'_> {
     fn drop(&mut self) {
         if let Some(server) = self.server.take() {
-            // Cancelled: the client is still connected to this instance, so it goes back to
-            // the listener for the next `accept`. The fresh instance that replaced it in
-            // `pending` has no client and is dropped.
-            *self.pending = server;
+            // Cancelled: a client may already be connected to this instance, so it goes back to
+            // the listener for the next `accept` instead of being dropped under that client.
+            *self.pending = Some(server);
         }
     }
 }
 
-/// Connect to a named pipe endpoint, retrying while every instance is busy.
+/// Connect to a named pipe endpoint, retrying while the listener has no instance for us.
 pub async fn connect(endpoint: &Endpoint) -> Result<NamedPipeClient, IpcError> {
-    let mut attempt = 0;
+    let deadline = std::time::Instant::now() + CONNECT_RETRY_WINDOW;
     loop {
         match ClientOptions::new().open(endpoint.name()) {
             Ok(client) => return Ok(client),
-            Err(error)
-                if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
-                    && attempt + 1 < CONNECT_ATTEMPTS =>
-            {
-                attempt += 1;
-                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-            }
             Err(error) => {
+                // `ERROR_PIPE_BUSY`: every instance is connected. `ERROR_FILE_NOT_FOUND`: the
+                // listener has none listening at this instant — the instance it was waiting on
+                // went to another client and the next one is not created yet. Both clear in
+                // microseconds, and refusing a client that hit one would fail a call core
+                // would have answered, so the client waits for the instance to appear.
+                let waiting = matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_PIPE_BUSY) | Some(ERROR_FILE_NOT_FOUND)
+                );
+                if waiting && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                    continue;
+                }
                 return Err(IpcError::io("connecting to the named pipe", error));
             }
         }
@@ -581,5 +632,60 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(line, "ping\n");
+    }
+
+    /// A client that arrives while core is serving the previous one is not stranded.
+    ///
+    /// The shape this replaced kept a second instance listening beside the one `accept` was
+    /// waiting on, and the kernel could hand a client to *that* one: the client was connected,
+    /// so its own retry had nothing to retry, and it waited for core to come back around to
+    /// `accept` — which under load took longer than the client's patience. One instance at a
+    /// time is the fix: every client the kernel accepts is attached to the instance core is
+    /// waiting on, so the next `accept` always serves the client that is there.
+    #[tokio::test]
+    async fn a_client_that_arrives_while_another_is_served_is_not_stranded() {
+        let endpoint = test_endpoint();
+        let mut listener = listen(&endpoint).expect("a listener");
+
+        // The first client: accepted, and held while it is served.
+        let first = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { connect(&endpoint).await }
+        });
+        let mut served = listener.accept(&SameUser::current()).await.expect("accept");
+
+        // A second client arrives while that instance is still in use.
+        let second = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { connect(&endpoint).await }
+        });
+        let mut next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            listener.accept(&SameUser::current()),
+        )
+        .await
+        .expect("the second client must reach the listener that is waiting for it")
+        .expect("accept");
+
+        // Both connections are usable, not merely present.
+        let mut client = first.await.expect("task").expect("connect");
+        client.write_all(b"one\n").await.expect("write");
+        client.flush().await.expect("flush");
+        let mut line = String::new();
+        BufReader::new(&mut served)
+            .read_line(&mut line)
+            .await
+            .expect("read");
+        assert_eq!(line, "one\n");
+
+        let mut client = second.await.expect("task").expect("connect");
+        client.write_all(b"two\n").await.expect("write");
+        client.flush().await.expect("flush");
+        let mut line = String::new();
+        BufReader::new(&mut next)
+            .read_line(&mut line)
+            .await
+            .expect("read");
+        assert_eq!(line, "two\n");
     }
 }
