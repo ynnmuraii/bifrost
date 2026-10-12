@@ -10,7 +10,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use lws_gui::view_model::{Action, Request, Side};
+use lws_gui::view_model::{Action, Request, Side, ViewModel};
 use protocol::ipc::gui_frame::Msg;
 use support::{
     answer, attempt_id, event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE,
@@ -30,10 +30,12 @@ fn a_status_fills_the_screen_and_the_focus_says_where_input_goes() {
         Some("aa11aa11"),
         "the owner's id is this computer's id while this computer owns input"
     );
-    let members = vm.member_lines();
-    assert_eq!(members.len(), 2);
-    assert!(members[0].contains("подключён, владелец"));
-    assert!(members[1].contains("не владелец"));
+    // This computer is not one of its own peers: the list is the *other* computers, and it
+    // says who has the keyboard in words that are not the core's.
+    assert_eq!(
+        vm.member_lines(),
+        vec!["linux-box — в сети, не управляет клавиатурой"]
+    );
     assert!(
         vm.limits()
             .iter()
@@ -45,7 +47,8 @@ fn a_status_fills_the_screen_and_the_focus_says_where_input_goes() {
 
     // The whole point of the screen: the same window, one frame later, says something else.
     vm.apply(event(Msg::Status(status_with("REMOTE"))));
-    assert_eq!(vm.focus_line(), "Ввод идёт на linux-box, раскладка ru");
+    assert_eq!(vm.focus_line(), "Ввод на linux-box");
+    assert_eq!(vm.focus_detail().as_deref(), Some("раскладка ru"));
     assert_eq!(vm.delay_line(), None);
 
     let mut status = status_with("REMOTE");
@@ -214,7 +217,9 @@ fn the_editors_document_round_trips_through_the_configuration_schema() {
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
 
-    // The user says the other computer stands to the right, then nudges its rectangle.
+    // The user says the other computer stands to the right, then nudges its rectangle: a drag
+    // is a gesture that *chooses* the edge, so the peer snaps onto it and the document carries
+    // the snapped position — the picture and «Применить» are the same arrangement.
     vm.local(&Action::SetSide(Side::Right));
     vm.local(&Action::MoveDisplay {
         node_id: PEER_NODE.to_owned(),
@@ -244,9 +249,10 @@ fn the_editors_document_round_trips_through_the_configuration_schema() {
         .expect("the other computer's display is in the document");
     assert_eq!(
         moved.logical,
-        [2040.0, -30.0, 1600.0, 900.0],
-        "the side puts the other computer at this one's right edge (1920) and the drag moves \
-         it from there (+120, -30): both reach the document"
+        [1920.0, 0.0, 1600.0, 900.0],
+        "the peer sits at this computer's right edge (1920) and lines up with it: the drag \
+         +120/-30 pointed right, so the radio still says «Справа» and the block snaps back onto \
+         that edge instead of overlapping"
     );
 
     // 2. The acceptance test: the same text is a valid `[topology]` section of a config file.
@@ -305,17 +311,18 @@ fn a_disconnect_moves_to_the_disconnected_state_and_keeps_the_last_status() {
     vm.apply(event(Msg::Status(status_with("REMOTE"))));
     vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
     vm.on_connected(r"\\.\pipe\lan-workspace-S-1-5-21-0-0-0-1001");
-    assert_eq!(vm.connection_label(), "Связь с ядром установлена");
+    assert_eq!(vm.connection_label(), "Служба работает");
 
     vm.on_disconnected("the pipe was closed".to_owned());
 
-    assert_eq!(vm.connection_label(), "Ядро не запущено");
+    assert_eq!(vm.connection_label(), "Служба не запущена");
     assert!(vm.disconnected_reason().is_some());
     assert_eq!(
         vm.focus_line(),
-        "Ввод идёт на linux-box, раскладка ru",
+        "Ввод на linux-box",
         "the last known state stays visible"
     );
+    assert_eq!(vm.focus_detail().as_deref(), Some("раскладка ru"));
     assert_eq!(
         vm.editor.nodes.len(),
         2,
@@ -331,15 +338,15 @@ fn a_silent_core_is_reported_after_the_timeout() {
     let id = vm.begin_request(Request::GetStatus, now);
 
     vm.tick(now + Duration::from_secs(2));
-    assert_eq!(vm.connection_label(), "Связь с ядром установлена");
+    assert_eq!(vm.connection_label(), "Служба работает");
 
     vm.tick(now + Duration::from_secs(4));
-    assert_eq!(vm.connection_label(), "Ядро не отвечает");
+    assert_eq!(vm.connection_label(), "Служба не отвечает");
 
     // The answer, whenever it comes, clears it.
     vm.apply(answer(id, Msg::Status(status_with("LOCAL"))));
     vm.tick(now + Duration::from_secs(5));
-    assert_eq!(vm.connection_label(), "Связь с ядром установлена");
+    assert_eq!(vm.connection_label(), "Служба работает");
     assert!(vm.inflight.is_empty());
 }
 
@@ -357,7 +364,7 @@ fn a_request_with_no_core_is_reported_as_not_sent() {
     vm.tick(Instant::now() + Duration::from_secs(10));
     assert_eq!(
         vm.connection_label(),
-        "Ядро не запущено",
+        "Служба не запущена",
         "a request that never left is not a silent core"
     );
     assert!(vm.log.iter().any(|line| line.contains("не отправлено")));
@@ -397,7 +404,7 @@ fn a_successful_pairing_promises_what_actually_happens() {
     assert!(outcome.ok);
     assert_eq!(
         outcome.line(),
-        "Готово: linux-box сопряжён. Связь появится после перезапуска ядра"
+        "Готово: linux-box сопряжён. Связь появится после перезапуска службы"
     );
 }
 
@@ -485,4 +492,141 @@ fn every_wire_request_is_the_message_it_names() {
     assert!(Action::ShowScreen(lws_gui::view_model::Screen::Layout)
         .wire()
         .is_none());
+}
+
+/// The preview is the arrangement «Применить» would send: the peer next to the chosen edge,
+/// never on top of this computer, and the radio follows a drag.
+#[test]
+fn the_editor_places_the_peer_at_the_chosen_edge_and_never_over_it() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+
+    // The document places both computers at their own origins; the window cannot draw that as
+    // one picture, so it places the peer itself, on the default side, from the first frame.
+    let bounds = |vm: &ViewModel, node: &str| {
+        let node = vm
+            .editor
+            .nodes
+            .iter()
+            .find(|candidate| candidate.node_id == node)
+            .expect("the node is in the document");
+        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for display in &node.displays {
+            b = (
+                b.0.min(display.x),
+                b.1.min(display.y),
+                b.2.max(display.x + display.w),
+                b.3.max(display.y + display.h),
+            );
+        }
+        b
+    };
+    let overlap = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+        a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+    };
+
+    assert_eq!(vm.editor.side, Side::Right, "the default side");
+    assert_eq!(
+        bounds(&vm, PEER_NODE),
+        (1920.0, 0.0, 3520.0, 900.0),
+        "«Справа»: the peer starts where this computer's screen ends"
+    );
+    assert!(!overlap(bounds(&vm, SELF_NODE), bounds(&vm, PEER_NODE)));
+
+    // Every side moves the picture, and none of them overlaps.
+    let expected = [
+        (Side::Left, (-1600.0, 0.0)),
+        (Side::Top, (0.0, -900.0)),
+        (Side::Bottom, (0.0, 1080.0)),
+        (Side::Right, (1920.0, 0.0)),
+    ];
+    for (side, (x, y)) in expected {
+        vm.local(&Action::SetSide(side));
+        let peer = bounds(&vm, PEER_NODE);
+        assert_eq!((peer.0, peer.1), (x, y), "{}", side.label());
+        assert!(
+            !overlap(bounds(&vm, SELF_NODE), peer),
+            "{} must not overlap",
+            side.label()
+        );
+    }
+
+    // A drag is a way of choosing the edge: dragging the peer up-left from the right side
+    // moves it to the left of this computer, and the radio says so.
+    vm.local(&Action::SetSide(Side::Right));
+    vm.local(&Action::MoveDisplay {
+        node_id: PEER_NODE.to_owned(),
+        display_id: "eDP-1".to_owned(),
+        dx: -2000.0,
+        dy: 0.0,
+    });
+    assert_eq!(vm.editor.side, Side::Left, "the drag chose the edge");
+    assert_eq!(bounds(&vm, PEER_NODE), (-1600.0, 0.0, 0.0, 900.0));
+
+    // And the edge the link crosses is the one the document names, on both sides.
+    vm.local(&Action::SetSide(Side::Right));
+    let (my_display, my_edge, their_display, their_edge, end) =
+        vm.linked_span().expect("two placed computers have a link");
+    assert_eq!(my_display, "\\\\.\\DISPLAY1");
+    assert_eq!(their_display, "eDP-1");
+    assert_eq!(
+        (my_edge, their_edge),
+        (config::Edge::Right, config::Edge::Left)
+    );
+    assert_eq!(
+        end, 900.0,
+        "the shorter of the two screens is the shared edge"
+    );
+}
+
+/// Every line of «Ограничения и деградации» comes from what the core reported, on the four
+/// hosts the pair is meant to run on.
+#[test]
+fn the_limits_follow_the_capabilities_the_core_reported() {
+    let limits = |backend: &str, unavailable: &[&str], portal: &str| {
+        let mut vm = view();
+        let mut status = status_with("LOCAL");
+        status.backend = backend.to_owned();
+        status.capabilities_unavailable =
+            unavailable.iter().map(|code| (*code).to_owned()).collect();
+        status.portal_state = portal.to_owned();
+        vm.apply(event(Msg::Status(status)));
+        vm.limits()
+    };
+
+    // Windows and X11: a receiver that takes the session back on physical input and has the
+    // emergency hotkey reports neither, so neither sentence appears — the old text claimed the
+    // takeover was missing on any host that did not say otherwise.
+    assert_eq!(limits("platform-win", &[], ""), Vec::<String>::new());
+    assert_eq!(limits("platform-x11", &[], ""), Vec::<String>::new());
+
+    // Wayland, GNOME 46: the portal grant is what stands between the user and input, and the
+    // compositor provides neither takeover nor an emergency hotkey of its own.
+    assert_eq!(
+        limits(
+            "platform-wayland",
+            &["RECEIVER_TAKEOVER", "EMERGENCY_HOTKEY"],
+            "permission_required"
+        ),
+        vec![
+            "Физический ввод на этом компьютере не завершает сеанс автоматически — переключение только с источника".to_owned(),
+            "Нет аварийной клавиши: прервать захват клавиатуры на этом компьютере можно только мышью".to_owned(),
+            "На экране диалог разрешения портала — подтвердите его, иначе узел не сможет принять ввод".to_owned(),
+            "Wayland: перехват ввода возможен только через порталы рабочего стола".to_owned(),
+        ]
+    );
+
+    // KDE on Wayland: the same platform, but this desktop *does* hand the session back and
+    // does have the hotkey, so the only Wayland line is the one about portals.
+    let kde = limits("platform-wayland", &[], "");
+    assert_eq!(
+        kde,
+        vec!["Wayland: перехват ввода возможен только через порталы рабочего стола".to_owned()]
+    );
+
+    // A refused grant is a different sentence, and it is the one that points at the settings.
+    let denied = limits("platform-wayland", &[], "denied");
+    assert_eq!(denied.len(), 2, "{denied:?}");
+    assert!(denied[0].contains("Забыть разрешения порталов"));
 }

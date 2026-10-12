@@ -112,7 +112,7 @@ fn a_disconnected_window_says_what_to_do_about_it() {
         &state,
         &[
             "LAN Workspace",
-            "Ядро не запущено",
+            "Служба не запущена",
             "Статус",
             "Сопряжение",
             "Экраны",
@@ -125,8 +125,8 @@ fn a_disconnected_window_says_what_to_do_about_it() {
         &[
             "Запустить",
             "Подключиться снова",
-            "Адрес ядра: \\\\.\\pipe\\lan-workspace-S-1-5-21-0-0-0-1001",
-            "Нет данных от ядра",
+            "Адрес службы: \\\\.\\pipe\\lan-workspace-S-1-5-21-0-0-0-1001",
+            "Нет данных от службы",
         ],
     );
 }
@@ -138,23 +138,32 @@ fn a_connected_pair_shows_where_input_goes() {
     state.apply(event(Msg::Status(status_with("REMOTE"))));
     state.apply(event(Msg::TopologyDoc(two_node_doc(7))));
 
-    expect_everywhere(&state, &["Связь с ядром установлена"]);
+    expect_everywhere(&state, &["Служба работает"]);
     expect_on(
         &state,
         Screen::Status,
         &[
-            "Ввод идёт на linux-box, раскладка ru",
+            // The one line the window exists for, and the peer list without this computer.
+            "Ввод на linux-box",
+            "раскладка ru",
             "Есть связь",
-            "Workstation — подключён, владелец",
-            "linux-box — подключён, не владелец",
-            "Приём ввода: Windows",
+            "linux-box — в сети, не управляет клавиатурой",
+            "Система: Windows",
             "Этот компьютер",
             "Отдать управление",
-            "Короткий номер: aa11aa11",
+            // The numbers a support question needs are one click away, not on the screen.
+            "Подробнее",
             // KVM-056: the degradation the core reported, in words the owner can read.
             "Физический ввод на этом компьютере не завершает сеанс автоматически",
-            "сеанс владельца 7",
         ],
+    );
+    // Neither the short id nor the session number is a line of its own any more.
+    let status = draw(&state, Screen::Status);
+    assert!(
+        !status
+            .iter()
+            .any(|text| text.contains("Короткий номер") || text.contains("сеанс владельца")),
+        "the details are folded away: {status:?}"
     );
     // Nothing is thinner than a sentence: the latency line is absent while nobody measures it.
     let status = draw(&state, Screen::Status);
@@ -247,7 +256,7 @@ fn a_pending_edit_is_visible_from_both_screens_that_can_act_on_it() {
         Screen::Layout,
         &[
             "Непринятая правка после разрыва связи",
-            "Основа: ревизия 6 от компьютер aa11aa11",
+            "Основа: ревизия 6, автор — компьютер aa11aa11",
             "Применить",
             "Отбросить",
         ],
@@ -297,7 +306,7 @@ fn a_document_the_window_cannot_place_asks_the_user_which_computer_is_this_one()
         &state,
         Screen::Layout,
         &[
-            "Ядро не сообщило, какой из компьютеров этот; выберите его сами",
+            "Служба не сообщила, какой из компьютеров этот; выберите его сами",
             "Этот компьютер:",
             "Workstation",
             "linux-box",
@@ -306,7 +315,9 @@ fn a_document_the_window_cannot_place_asks_the_user_which_computer_is_this_one()
     expect_on(
         &state,
         Screen::Status,
-        &["Короткий номер: ядро его не сообщило"],
+        // The details header is drawn open or closed; what must not be on the screen is a
+        // raw number, and without a document there is nothing to show either way.
+        &["Подробнее"],
     );
 }
 
@@ -322,9 +333,10 @@ fn the_editor_draws_every_member_and_marks_an_approximate_size() {
         &state,
         Screen::Layout,
         &[
-            "Применено: ревизия 7 от компьютер aa11aa11",
-            "Workstation — \\\\.\\DISPLAY1",
-            "linux-box — eDP-1",
+            "Применено: ревизия 7, автор — компьютер aa11aa11",
+            // The local screen says whose it is; the peer's carries its own name.
+            "Этот компьютер — Workstation",
+            "linux-box",
             "1920×1080",
             "размер известен приблизительно",
             "Как стоят компьютеры",

@@ -18,10 +18,13 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
         actions.extend(offline_block(vm, ui, connected));
     }
 
+    // «Куда идёт ввод» is the question this window exists to answer, so it is the first block
+    // and the largest text on the screen, whether the service is up or not.
+    input_block(vm, ui);
     this_computer(vm, ui);
     link_block(vm, ui);
-    input_block(vm, ui);
     actions.extend(owner_block(vm, ui, connected));
+    details_block(vm, ui);
     limits_block(vm, ui);
     actions.extend(pending_edits(vm, ui));
     log_block(vm, ui);
@@ -29,18 +32,28 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     actions
 }
 
-/// «Ядро не запущено»: the endpoint, the two buttons that can change that.
+/// «Куда идёт ввод» — the question the window exists to answer, as big as a question can be.
+fn input_block(vm: &ViewModel, ui: &mut egui::Ui) {
+    block(ui, "Куда идёт ввод", |ui| {
+        ui.label(egui::RichText::new(vm.focus_line()).size(26.0).strong());
+        if let Some(detail) = vm.focus_detail() {
+            hint(ui, &detail);
+        }
+    });
+}
+
+/// «Служба не запущена»: the address it would answer on, and the two buttons that change that.
 fn offline_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Action> {
     let mut actions = Vec::new();
-    block(ui, "Ядро", |ui| {
+    block(ui, "Служба", |ui| {
         match vm.disconnected_reason() {
             Some(why) => ui.label(format!(
-                "Ядро не запущено: {}",
+                "Служба не запущена: {}",
                 crate::view_model::short_error(why)
             )),
             None => ui.label(vm.connection_label()),
         };
-        hint(ui, &format!("Адрес ядра: {}", vm.endpoint.description()));
+        hint(ui, &format!("Адрес службы: {}", vm.endpoint.description()));
         if let Some(core) = &vm.core {
             hint(
                 ui,
@@ -50,7 +63,7 @@ fn offline_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Acti
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!connected, egui::Button::new("Запустить"))
-                .on_hover_text("Запустить ядро на этом компьютере в фоне")
+                .on_hover_text("Запустить службу на этом компьютере в фоне")
                 .clicked()
             {
                 actions.push(Action::StartCore);
@@ -63,7 +76,7 @@ fn offline_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Acti
             }
             if ui
                 .button("Обновить")
-                .on_hover_text("Спросить у ядра состояние и раскладку")
+                .on_hover_text("Спросить у службы состояние и раскладку")
                 .clicked()
             {
                 actions.push(Action::Refresh);
@@ -72,7 +85,7 @@ fn offline_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Acti
         if matches!(vm.endpoint, crate::view_model::CoreEndpoint::Failed { .. }) {
             important(
                 ui,
-                "Адрес ядра определить не удалось — «Запустить» здесь не поможет",
+                "Адрес службы определить не удалось — «Запустить» здесь не поможет",
             );
         }
     });
@@ -88,15 +101,37 @@ fn this_computer(vm: &ViewModel, ui: &mut egui::Ui) {
             vm.config.display_name.clone()
         };
         ui.label(name);
-        ui.label(format!("Приём ввода: {}", vm.backend_label()));
-        match vm.short_id_of_self() {
-            Some(id) => hint(ui, &format!("Короткий номер: {id}")),
-            None => hint(ui, "Короткий номер: ядро его не сообщило"),
-        }
+        ui.label(format!("Система: {}", vm.backend_label()));
         if let Some(note) = &vm.config.note {
             hint(ui, note);
         }
     });
+}
+
+/// «Подробнее»: the two numbers that only a support question needs.
+///
+/// The short id and the owner's session number were lines on the main screen, where they read
+/// as instructions to a person who has no use for them; a window whose owner is not a
+/// developer keeps them one click away.
+fn details_block(vm: &ViewModel, ui: &mut egui::Ui) {
+    let short_id = vm.short_id_of_self();
+    let (_, serial) = vm.owner_lines();
+    egui::CollapsingHeader::new("Подробнее")
+        .default_open(false)
+        .show(ui, |ui| {
+            match short_id {
+                Some(id) => hint(ui, &format!("Короткий номер этого компьютера: {id}")),
+                None => hint(
+                    ui,
+                    "Короткий номер этого компьютера: служба его не сообщила",
+                ),
+            }
+            if serial.is_empty() {
+                hint(ui, "Номер сеанса: пока нет");
+            } else {
+                hint(ui, &format!("Номер сеанса: {serial}"));
+            }
+        });
 }
 
 /// «Связь»: whether the pair is up, and who is in it.
@@ -112,22 +147,12 @@ fn link_block(vm: &ViewModel, ui: &mut egui::Ui) {
     });
 }
 
-/// «Куда идёт ввод» — the question the window exists to answer.
-fn input_block(vm: &ViewModel, ui: &mut egui::Ui) {
-    block(ui, "Куда идёт ввод", |ui| {
-        ui.heading(vm.focus_line());
-    });
-}
-
 /// «Владелец»: who coordinates, and the one button that changes it.
 fn owner_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Action> {
     let mut actions = Vec::new();
     block(ui, "Владелец", |ui| {
-        let (owner, serial) = vm.owner_lines();
+        let (owner, _serial) = vm.owner_lines();
         ui.label(owner);
-        if !serial.is_empty() {
-            hint(ui, &serial);
-        }
         let is_owner = vm.status.as_ref().is_some_and(|status| status.is_owner);
         ui.horizontal(|ui| {
             let label = if is_owner {
@@ -160,7 +185,10 @@ fn owner_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Action
             }
         });
         if !connected {
-            hint(ui, "Кнопки станут доступны, когда появится связь с ядром");
+            hint(
+                ui,
+                "Кнопки станут доступны, когда появится связь со службой",
+            );
         }
     });
     actions

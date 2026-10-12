@@ -18,6 +18,10 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let connected = vm.connection.is_connected();
 
     block(ui, "Начать сопряжение", |ui| {
+        ui.label(
+            "На одном компьютере нажмите «Открыть окно сопряжения», на другом введите \
+             показанный адрес в поле «Подключиться по адресу».",
+        );
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(connected, egui::Button::new("Открыть окно сопряжения"))
@@ -87,7 +91,7 @@ fn dial_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Action>
         if !connected {
             hint(
                 ui,
-                "Нужна связь с ядром: без него компьютер не может сопрягаться",
+                "Нужна связь со службой: без неё компьютер не может сопрягаться",
             );
         }
     });
@@ -162,7 +166,7 @@ fn prompt_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Actio
         if attempt.is_none() {
             ui.colored_label(
                 warn_color(),
-                "Ядро не прислало код попытки — ответить нельзя",
+                "Служба не прислала код попытки — ответить нельзя",
             );
         }
     });
