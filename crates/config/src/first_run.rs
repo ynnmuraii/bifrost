@@ -123,8 +123,8 @@ pub fn lan_addresses() -> Vec<Ipv4Addr> {
 /// a network. The filters, in order:
 ///
 /// 1. drop loopback (`127.0.0.0/8`), unspecified (`0.0.0.0`), link-local
-///    (`169.254.0.0/16`) and multicast addresses: none of them is an address
-///    another node on the LAN could dial;
+///    (`169.254.0.0/16`), multicast, and RFC 2544 benchmarking (`198.18.0.0/15`)
+///    addresses: they are not addresses another node on the LAN could dial;
 /// 2. drop candidates whose name contains a virtual-adapter fragment
 ///    ([`VIRTUAL_ADAPTERS`]): a tunnel is a peer's problem, not this node's
 ///    listener;
@@ -205,7 +205,14 @@ fn qualifies(candidate: &&Candidate) -> bool {
         && !address.is_unspecified()
         && !address.is_link_local()
         && !address.is_multicast()
+        && !is_benchmarking(address)
         && !is_virtual(&candidate.name)
+}
+
+/// RFC 2544 reserves 198.18.0.0/15 for benchmarking, not peer-reachable LAN use.
+fn is_benchmarking(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 198 && (18..=19).contains(&octets[1])
 }
 
 /// The preference score of one qualifying candidate: higher is better.
