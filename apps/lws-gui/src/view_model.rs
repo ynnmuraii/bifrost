@@ -1148,9 +1148,7 @@ impl ViewModel {
 
     /// The sentence a successful request is reported with.
     ///
-    /// The pairing answer is the one case where the generic table is not enough: §5.2 of the
-    /// build spec wants the partner named, and — because `ManagerConfig.peers` is read when
-    /// the core starts — the honest promise that the link appears after a restart.
+    /// The pairing answer names the peer; the live link status arrives separately in `Status`.
     fn success_text(&self, request: Request) -> String {
         if request == Request::PairingAnswer {
             let name = self
@@ -1160,7 +1158,7 @@ impl ViewModel {
                 .map(|prompt| prompt.peer_name.clone())
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "Компьютер".to_owned());
-            return format!("{name} сопряжён. Связь появится после перезапуска службы");
+            return format!("{name} сопряжён");
         }
         success_text(request)
     }

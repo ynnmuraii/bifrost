@@ -459,13 +459,19 @@ impl Session {
                             peer = crate::command::node_id_hex(&record.node_id).as_str(),
                             "pairing committed"
                         );
-                        self.trust.trust(record);
+                        self.trust.trust(record.clone());
                         self.pairing_error = None;
-                        // The verdict is sent only after this: a window told "paired" can rely
-                        // on the record being readable, and a write that failed is reported
-                        // instead of being hidden behind a success.
+                        // The verdict follows both durable trust and the live manager update:
+                        // success means the other core can connect without a restart.
                         match self.trust.save(&self.paths.trust_file()) {
-                            Ok(_) => Ok(()),
+                            Ok(_) => match self.manager.add_peer(record).await {
+                                Ok(()) => Ok(()),
+                                Err(error) => {
+                                    tracing::warn!(%error, "cannot start the paired peer link");
+                                    self.pairing_error = Some("LINK_START".to_owned());
+                                    Err(("LINK_START".to_owned(), error.to_string()))
+                                }
+                            },
                             Err(error) => {
                                 tracing::warn!(%error, "cannot write the trust record");
                                 self.pairing_error = Some("TRUST_WRITE".to_owned());
@@ -646,12 +652,9 @@ impl Session {
         ok()
     }
 
-    /// `RevokePeer`: forget the peer and close the links to it.
+    /// `RevokePeer`: remove trust from new handshakes, then close current links.
     ///
-    /// The link manager keeps its own copy of the trust store, so a revoked peer's link would
-    /// otherwise stay open until it reconnects: the links are closed here instead. With three
-    /// nodes that is heavier than it needs to be (a per-peer close is the next step); with the
-    /// two the MVP supports it is exactly right.
+    /// The manager shares this pin set with its live TLS verifiers.
     async fn revoke_peer(&mut self, peer: &[u8]) -> ipc::OpResult {
         let Some(node) = node_id_of(peer) else {
             return bad_request();
@@ -668,6 +671,9 @@ impl Session {
                 ok: false,
                 error_code: "TRUST_WRITE".to_owned(),
             };
+        }
+        if let Err(error) = self.manager.remove_peer(&node).await {
+            tracing::warn!(%error, "cannot remove the live peer pin");
         }
         tracing::info!(
             peer = crate::command::node_id_hex(&node).as_str(),

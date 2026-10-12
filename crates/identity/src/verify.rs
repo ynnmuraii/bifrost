@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
@@ -35,21 +35,42 @@ use geometry::NodeId;
 use crate::spki::{node_id_from_certificate, SpkiError};
 
 /// Who may complete the TLS handshake.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum TrustPolicy {
     /// Only peers whose `node_id` is in this set (the active trust records). Used for
     /// the input/control and clipboard channels.
     Pinned(BTreeSet<NodeId>),
+    /// A pinned set updated while a link manager is running.
+    PinnedShared(Arc<RwLock<BTreeSet<NodeId>>>),
     /// Any well-formed peer certificate; only for `lan-workspace/pair/1`, where the SAS
-    /// ceremony is the authentication step.
+    /// code is the authentication step.
     Pairing,
 }
+
+impl PartialEq for TrustPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TrustPolicy::Pinned(left), TrustPolicy::Pinned(right)) => left == right,
+            (TrustPolicy::PinnedShared(left), TrustPolicy::PinnedShared(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (TrustPolicy::Pairing, TrustPolicy::Pairing) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TrustPolicy {}
 
 impl TrustPolicy {
     /// The pinned `node_id`s, empty for [`TrustPolicy::Pairing`].
     pub fn pinned(&self) -> BTreeSet<NodeId> {
         match self {
             TrustPolicy::Pinned(node_ids) => node_ids.clone(),
+            TrustPolicy::PinnedShared(node_ids) => node_ids
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             TrustPolicy::Pairing => BTreeSet::new(),
         }
     }
@@ -62,6 +83,10 @@ impl TrustPolicy {
     fn allows(&self, node_id: &NodeId) -> bool {
         match self {
             TrustPolicy::Pinned(node_ids) => node_ids.contains(node_id),
+            TrustPolicy::PinnedShared(node_ids) => node_ids
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(node_id),
             TrustPolicy::Pairing => true,
         }
     }

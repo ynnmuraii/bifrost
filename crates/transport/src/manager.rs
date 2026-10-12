@@ -9,17 +9,17 @@
 //! be read without a socket: the dedup winner, the reconnect schedule, the liveness
 //! transitions and the membership gate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use focus_router as fr;
 use geometry::NodeId;
-use identity::{peer_node_id, trust::TrustStore, NodeIdentity};
+use identity::{peer_node_id, trust::TrustStore, NodeIdentity, TrustPolicy, TrustedPeer};
 use protocol::{limits, wire};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
 use crate::convert::PeerInfo;
@@ -151,6 +151,10 @@ enum ManagerMessage {
         peer: NodeId,
         reply: oneshot::Sender<DialTurn>,
     },
+    /// A freshly paired peer to trust and dial without restarting the manager.
+    AddPeer { peer: NodeId, address: SocketAddr },
+    /// Stops the dialer created for a freshly paired peer.
+    RemovePeer { peer: NodeId },
 }
 
 /// What a granted dial permit tells the waiting dialer.
@@ -164,7 +168,16 @@ enum DialTurn {
 
 /// The mesh of links around this node.
 pub struct LinkManager {
-    config: ManagerConfig,
+    identity: Arc<NodeIdentity>,
+    /// The shared pins are read by rustls synchronously during every handshake.
+    trusted_peers: Arc<StdRwLock<BTreeSet<NodeId>>>,
+    /// Replaced by display updates; every future link uses the latest Hello.
+    local_hello: Arc<RwLock<wire::Hello>>,
+    listen: SocketAddr,
+    peers: Vec<SocketAddr>,
+    max_members: u8,
+    pairing: PairingGate,
+    settings: LinkSettings,
     messages_tx: mpsc::Sender<ManagerMessage>,
     /// Taken by [`LinkManager::run`]; behind a mutex so `run` can take `&self` and the
     /// manager can live behind an `Arc` while the application queries it.
@@ -192,6 +205,8 @@ struct Inner {
     /// peer that is gone, and every one of those dials is accepted by a survivor that still
     /// trusts it — the dead peer never looks dead.
     dialers: Vec<tokio::task::JoinHandle<()>>,
+    /// Dynamic dialers are keyed by peer so re-pairing replaces the old loop.
+    peer_dialers: BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
     /// Dial permits not yet granted, per peer: the dialers waiting for that peer's link to go.
     ///
     /// This is what makes a dialer idle while its peer is linked. Without it, a dialer whose
@@ -227,11 +242,37 @@ impl Inner {
 impl LinkManager {
     /// Builds a manager and the receiver of application events.
     pub fn new(config: ManagerConfig) -> Result<(Self, mpsc::Receiver<LinkEvent>), TransportError> {
+        let ManagerConfig {
+            identity,
+            trust,
+            local_hello,
+            listen,
+            peers,
+            max_members,
+            queue_capacity,
+            liveness,
+            backoff,
+            pairing,
+        } = config;
+        let trusted_peers = Arc::new(StdRwLock::new(trust.pinned()));
+        let local_hello = Arc::new(RwLock::new(local_hello));
+        let settings = LinkSettings {
+            queue_capacity,
+            liveness,
+            backoff,
+        };
         let (events_tx, events_rx) = mpsc::channel(256);
         let (messages_tx, messages_rx) = mpsc::channel(256);
         Ok((
             Self {
-                config,
+                identity,
+                trusted_peers,
+                local_hello,
+                listen,
+                peers,
+                max_members,
+                pairing,
+                settings,
                 messages_tx,
                 messages_rx: Mutex::new(messages_rx),
                 events_tx,
@@ -240,6 +281,55 @@ impl LinkManager {
             },
             events_rx,
         ))
+    }
+
+    /// Adds the newly committed trust pin and starts dialing its recorded address.
+    pub async fn add_peer(&self, peer: TrustedPeer) -> Result<(), TransportError> {
+        let raw_address = peer.last_address.as_deref().ok_or_else(|| {
+            TransportError::InvalidPeerAddress("the paired peer has no address".to_owned())
+        })?;
+        let address = raw_address.parse::<SocketAddr>().map_err(|error| {
+            TransportError::InvalidPeerAddress(format!("{raw_address}: {error}"))
+        })?;
+        let peer_id = peer.node_id;
+        self.trusted_peers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer_id);
+        if self
+            .messages_tx
+            .send(ManagerMessage::AddPeer {
+                peer: peer_id,
+                address,
+            })
+            .await
+            .is_err()
+        {
+            self.remove_pin(&peer_id);
+            return Err(TransportError::LinkClosed);
+        }
+        Ok(())
+    }
+
+    /// Removes a peer from the live verifier and stops its dynamic dialer.
+    pub async fn remove_peer(&self, peer: &NodeId) -> Result<(), TransportError> {
+        self.remove_pin(peer);
+        self.messages_tx
+            .send(ManagerMessage::RemovePeer { peer: *peer })
+            .await
+            .map_err(|_| TransportError::LinkClosed)
+    }
+
+    fn remove_pin(&self, peer: &NodeId) {
+        self.trusted_peers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(peer);
+    }
+
+    /// Replaces the Hello carried by links formed from now on.
+    pub async fn update_local_hello(&self, hello: wire::Hello) {
+        *self.local_hello.write().await = hello;
     }
 
     /// The handle to `peer`, when a link to it is up.
@@ -284,35 +374,43 @@ impl LinkManager {
         }
         // The waiters would otherwise hold their dialers' senders until the manager is gone.
         inner.dial_waiters.clear();
+        for (_, dialer) in std::mem::take(&mut inner.peer_dialers) {
+            dialer.abort();
+        }
     }
 
     /// Runs until the process ends: listens, dials, dedups, supervises.
     pub async fn run(&self) -> Result<(), TransportError> {
-        // The two server configs the one listener chooses between, told apart by the ALPN
-        // the ClientHello offers (`docs/05-protocol.md`: `pair/1` shares `47901`).
-        let link_config = Arc::new(identity::trusted_server_config(
-            &self.config.identity,
-            &self.config.trust,
+        // The verifier reads this shared set for each new certificate, so pairing updates
+        // take effect without rebuilding the listener or restarting the process.
+        let link_config = Arc::new(identity::server_config(
+            &self.identity,
+            TrustPolicy::PinnedShared(Arc::clone(&self.trusted_peers)),
+            &identity::LINK_ALPN,
         )?);
-        let pairing_config = Arc::new(identity::pairing_server_config(&self.config.identity)?);
-        let listener = bind_listener(self.config.listen).await?;
-        let local_hello = self.config.local_hello.clone();
-        let local = self.config.identity.node_id();
+        let pairing_config = Arc::new(identity::pairing_server_config(&self.identity)?);
+        let listener = bind_listener(self.listen).await?;
+        let local = self.identity.node_id();
+        let settings = self.settings;
 
         // One dialer per configured peer.
-        let settings = LinkSettings {
-            queue_capacity: self.config.queue_capacity,
-            liveness: self.config.liveness,
-            backoff: self.config.backoff,
-        };
-        let mut dialers = Vec::with_capacity(self.config.peers.len());
-        for address in self.config.peers.clone() {
+        let mut dialers = Vec::with_capacity(self.peers.len());
+        for address in self.peers.clone() {
             let messages = self.messages_tx.clone();
-            let identity = Arc::clone(&self.config.identity);
-            let trust = self.config.trust.clone();
-            let hello = local_hello.clone();
+            let identity = Arc::clone(&self.identity);
+            let trusted_peers = Arc::clone(&self.trusted_peers);
+            let local_hello = Arc::clone(&self.local_hello);
             dialers.push(tokio::spawn(async move {
-                dial_loop(address, identity, trust, hello, messages, settings).await;
+                dial_loop(
+                    address,
+                    None,
+                    identity,
+                    trusted_peers,
+                    local_hello,
+                    messages,
+                    settings,
+                )
+                .await;
             }));
         }
         self.inner.lock().await.dialers = dialers;
@@ -323,11 +421,11 @@ impl LinkManager {
                     let (tcp, address) = accepted?;
                     let messages = self.messages_tx.clone();
                     let events = self.events_tx.clone();
-                    let identity = Arc::clone(&self.config.identity);
+                    let identity = Arc::clone(&self.identity);
                     let link_config = Arc::clone(&link_config);
                     let pairing_config = Arc::clone(&pairing_config);
-                    let gate = self.config.pairing.clone();
-                    let hello = local_hello.clone();
+                    let gate = self.pairing.clone();
+                    let hello = self.local_hello.read().await.clone();
                     let clock = self.clock;
                     tokio::spawn(async move {
                         serve_connection(
@@ -356,6 +454,33 @@ impl LinkManager {
 
     async fn on_message(&self, message: ManagerMessage, local: NodeId) {
         match message {
+            ManagerMessage::AddPeer { peer, address } => {
+                let messages = self.messages_tx.clone();
+                let identity = Arc::clone(&self.identity);
+                let trusted_peers = Arc::clone(&self.trusted_peers);
+                let local_hello = Arc::clone(&self.local_hello);
+                let settings = self.settings;
+                let dialer = tokio::spawn(async move {
+                    dial_loop(
+                        address,
+                        Some(peer),
+                        identity,
+                        trusted_peers,
+                        local_hello,
+                        messages,
+                        settings,
+                    )
+                    .await;
+                });
+                if let Some(previous) = self.inner.lock().await.peer_dialers.insert(peer, dialer) {
+                    previous.abort();
+                }
+            }
+            ManagerMessage::RemovePeer { peer } => {
+                if let Some(dialer) = self.inner.lock().await.peer_dialers.remove(&peer) {
+                    dialer.abort();
+                }
+            }
             ManagerMessage::Register {
                 key,
                 peer,
@@ -498,7 +623,7 @@ impl LinkManager {
             inner.links.contains_key(&peer)
         };
         if !already_member {
-            if let Err(full) = policy::admit_member(member_count, self.config.max_members) {
+            if let Err(full) = policy::admit_member(member_count, self.max_members) {
                 let _ = full;
                 let _ = pending
                     .handle
@@ -720,13 +845,18 @@ async fn accept_one(
 
 async fn dial_loop(
     address: SocketAddr,
+    expected_peer: Option<NodeId>,
     identity: Arc<NodeIdentity>,
-    trust: TrustStore,
-    hello: wire::Hello,
+    trusted_peers: Arc<StdRwLock<BTreeSet<NodeId>>>,
+    local_hello: Arc<RwLock<wire::Hello>>,
     messages: mpsc::Sender<ManagerMessage>,
     settings: LinkSettings,
 ) {
-    let client_config = match identity::trusted_client_config(&identity, &trust) {
+    let client_config = match identity::client_config(
+        &identity,
+        TrustPolicy::PinnedShared(Arc::clone(&trusted_peers)),
+        &identity::LINK_ALPN,
+    ) {
         Ok(config) => config,
         Err(_) => return,
     };
@@ -742,9 +872,9 @@ async fn dial_loop(
     // peer to answer a `Ping` («офлайн через 3 s без `Pong`»): a handshake that cannot finish
     // inside it belongs to an unreachable peer, not a slow one.
     let dial_timeout = Duration::from_millis(settings.liveness.offline_ms);
-    // Who answers at `address`; unknown until the first handshake reveals the certificate, and
-    // until then there is no peer whose link this dialer would have to wait for.
-    let mut peer: Option<NodeId> = None;
+    // A pairing-created dialer knows which key must answer its address; a configured dialer
+    // learns that only after the first handshake.
+    let mut peer = expected_peer;
     let mut attempt = 0u32;
     loop {
         // One dial per peer, at most one link per peer: once the peer is known, dialing is the
@@ -781,9 +911,12 @@ async fn dial_loop(
                 .peer_certificates()
                 .and_then(|certs| certs.first())
                 .and_then(|certificate| peer_node_id(std::slice::from_ref(certificate)).ok());
-            if let Some(dialed) = dialed {
+            if let Some(dialed) =
+                dialed.filter(|dialed| expected_peer.is_none_or(|expected| expected == *dialed))
+            {
                 peer = Some(dialed);
                 if let Ok(key) = identity::random16() {
+                    let hello = local_hello.read().await.clone();
                     start_link(
                         LinkSpawn {
                             key,
@@ -792,7 +925,7 @@ async fn dial_loop(
                         },
                         Stream::Client(Box::new(stream)),
                         identity.node_id(),
-                        hello.clone(),
+                        hello,
                         messages.clone(),
                         settings,
                     )

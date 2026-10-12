@@ -167,10 +167,12 @@ fn check_policy_alpn(policy: &TrustPolicy, alpn: &[&str]) -> Result<(), Identity
         TrustPolicy::Pairing if !uses_pairing_alpn => Err(IdentityError::Tls(
             "the pairing trust policy may only be used on lan-workspace/pair/1".into(),
         )),
-        TrustPolicy::Pinned(_) if uses_pairing_alpn => Err(IdentityError::Tls(
-            "the pairing channel needs the pairing trust policy: its peer is unknown by definition"
-                .into(),
-        )),
+        TrustPolicy::Pinned(_) | TrustPolicy::PinnedShared(_) if uses_pairing_alpn => {
+            Err(IdentityError::Tls(
+                "the pairing channel needs the pairing trust policy: its peer is unknown by definition"
+                    .into(),
+            ))
+        }
         _ => Ok(()),
     }
 }
