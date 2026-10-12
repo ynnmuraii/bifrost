@@ -433,7 +433,6 @@ pub fn describe_event(event: &InputEvent) -> String {
     }
 }
 
-
 /// The OS autorepeat settings, as the two indices `SystemParametersInfo` speaks.
 ///
 /// `(delay_index, speed_index)`: the delay is 0..=3 (250 ms steps) and the speed 0..=31
@@ -477,7 +476,6 @@ pub fn keyboard_timing() -> (u32, u32) {
         _ => (1, 31),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

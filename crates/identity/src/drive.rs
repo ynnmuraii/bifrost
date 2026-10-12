@@ -383,7 +383,14 @@ pub async fn accept_one(
     let (tcp, address) = listener.accept().await?;
     let accepted = acceptor.accept(tcp).await.map_err(PairError::Io)?;
     let stream = Stream::Server(Box::new(accepted));
-    let result = opener_ceremony(stream, identity, window, Some(address.to_string()), listen_port).await;
+    let result = opener_ceremony(
+        stream,
+        identity,
+        window,
+        Some(address.to_string()),
+        listen_port,
+    )
+    .await;
     window.finish();
     result
 }
@@ -614,7 +621,8 @@ fn hello_of(envelope: &PairingEnvelope) -> Result<RemoteHello, PairError> {
                 .map_err(|_| PairError::Protocol("attempt_id must be 16 bytes".into()))?;
             // A peer built by an older draft sends nothing, which protobuf reads as 0 —
             // exactly the documented default.
-            let listen_port = u16::try_from(hello.listen_port).unwrap_or(protocol::PORT_INPUT_CONTROL);
+            let listen_port =
+                u16::try_from(hello.listen_port).unwrap_or(protocol::PORT_INPUT_CONTROL);
             Ok(RemoteHello {
                 attempt_id,
                 node_id: node_id_from_bytes(&hello.node_id)?,
