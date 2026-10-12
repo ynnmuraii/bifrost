@@ -104,10 +104,9 @@ pub struct BarrierSegment {
     pub x1: i32,
     /// First endpoint, inclusive.
     pub y1: i32,
-    /// Second endpoint, inclusive (`x + width - 1` convention, as in the portal's
-    /// own example).
+    /// Second endpoint, inclusive along the zone span.
     pub x2: i32,
-    /// Second endpoint, inclusive.
+    /// Second endpoint, inclusive along the zone span.
     pub y2: i32,
 }
 
@@ -173,13 +172,13 @@ pub fn derive(zones: &[Zone]) -> Vec<BarrierSegment> {
         }
         let x = zone.x_interval();
         let y = zone.y_interval();
-        // In the zone's own frame: `(fixed, along)` where `along` is the interval the
-        // border spans and `fixed` is the coordinate the border sits at.
+        // XDG InputCapture positions the barrier on the half-open zone's outer edge:
+        // right/bottom coordinates are the exclusive extent, not the last pixel.
         let borders: [(Edge, i32, Interval, bool); 4] = [
             (Edge::Left, zone.x, y, false),
-            (Edge::Right, zone.x + zone.width - 1, y, false),
+            (Edge::Right, zone.x + zone.width, y, false),
             (Edge::Top, zone.y, x, true),
-            (Edge::Bottom, zone.y + zone.height - 1, x, true),
+            (Edge::Bottom, zone.y + zone.height, x, true),
         ];
 
         for (edge, fixed, along, horizontal) in borders {
@@ -277,9 +276,9 @@ mod tests {
             barriers,
             vec![
                 segment(1, 0, Edge::Left, 0, 0, 0, 49),
-                segment(2, 0, Edge::Right, 99, 0, 99, 49),
+                segment(2, 0, Edge::Right, 100, 0, 100, 49),
                 segment(3, 0, Edge::Top, 0, 0, 99, 0),
-                segment(4, 0, Edge::Bottom, 0, 49, 99, 49),
+                segment(4, 0, Edge::Bottom, 0, 50, 99, 50),
             ]
         );
     }
@@ -335,8 +334,8 @@ mod tests {
         assert_eq!(
             right,
             vec![
-                segment(2, 0, Edge::Right, 99, 0, 99, 19),
-                segment(3, 0, Edge::Right, 99, 70, 99, 99),
+                segment(2, 0, Edge::Right, 100, 0, 100, 19),
+                segment(3, 0, Edge::Right, 100, 70, 100, 99),
             ]
         );
 
@@ -397,9 +396,9 @@ mod tests {
             barriers,
             vec![
                 segment(1, 0, Edge::Left, -200, -100, -200, -51),
-                segment(2, 0, Edge::Right, -101, -100, -101, -51),
+                segment(2, 0, Edge::Right, -100, -100, -100, -51),
                 segment(3, 0, Edge::Top, -200, -100, -101, -100),
-                segment(4, 0, Edge::Bottom, -200, -51, -101, -51),
+                segment(4, 0, Edge::Bottom, -200, -50, -101, -50),
             ]
         );
         // A one-pixel zone still has four single-point borders.

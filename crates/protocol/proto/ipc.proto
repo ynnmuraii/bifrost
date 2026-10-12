@@ -82,6 +82,7 @@ message AgentAttach {
   TakeoverDetection takeover_detection = 8; // `[input].takeover_detection`; the agent owns the detector
   uint32 takeover_threshold_px = 9;        // `[input].takeover_threshold_px`: physical movement that ends a lease
   RepeatMode repeat_mode = 10;             // `[input].repeat_mode`: which engine repeats a held key here
+  bool allow_portal_sessions = 11;          // false in RECOVERY or after a portal failure until manual retry
 }
 
 // `[input].repeat_mode`: which side repeats a held key. ADR-006: one engine only — the
@@ -244,6 +245,7 @@ message GuiFrame {
     ListPendingEdits list_pending_edits = 23; // divergent edits kept after a partition
     ApplyPendingEdit apply_pending_edit = 24;
     DiscardPendingEdit discard_pending_edit = 25;
+    RetryAgent retry_agent = 26;
 
     Status status = 40;          // response and pushed event
     PairingPrompt pairing_prompt = 41;
@@ -264,6 +266,7 @@ message SetClipboard { bool enabled = 1; }
 message RevokePeer { bytes peer_node_id = 1; }
 message ExportDiagnostics { string target_path = 1; }
 message ResetPortalGrants {} // GUI: drop portal permissions for this node
+message RetryAgent {}
 message Status {
   string role = 1;           // "owner" | "follower" (per-lease source/receiver is derived from focus)
   string focus = 2;          // LOCAL / PREPARING / REMOTE / BLOCKED
@@ -286,6 +289,8 @@ message Status {
   uint32 layout_pending_edits = 19;        // divergent local edits kept after a partition
   bool layout_editable = 20;               // false when no coordinator is reachable
   string active_layout = 21;               // receiver's active keyboard layout while focus is REMOTE ("" otherwise); e.g. "ru"
+  string agent_degraded_reason = 22;        // last typed agent/portal failure or restart breaker reason
+  bool agent_restart_circuit_open = 23;     // automatic restarts stopped; manual retry is available
 }
 message MemberStatus {
   string node_id = 1;

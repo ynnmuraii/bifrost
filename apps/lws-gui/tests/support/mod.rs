@@ -95,6 +95,8 @@ pub fn status_with(focus: &str) -> ipc::Status {
         } else {
             String::new()
         },
+        agent_degraded_reason: String::new(),
+        agent_restart_circuit_open: false,
     }
 }
 

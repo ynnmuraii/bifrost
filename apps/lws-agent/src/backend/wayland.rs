@@ -107,6 +107,9 @@ impl Wayland {
         session: &SessionInfo,
         emergency_hotkey: &str,
         restore_tokens: &[protocol::ipc::PortalGrant],
+        portal_progress: &tokio::sync::mpsc::UnboundedSender<
+            protocol::ipc::PortalPermissionRequired,
+        >,
     ) -> Result<(Self, Ready, Vec<Refusal>), Refusal> {
         let mut refusals = Vec::new();
 
@@ -132,10 +135,13 @@ impl Wayland {
         // Injection first: a source needs it too, for the local replay, and a node
         // that cannot inject cannot be part of a lease in either role.
         let inject_grant = grants.get(REMOTE_DESKTOP_INTERFACE, &signature).cloned();
+        let _ = portal_progress.send(protocol::ipc::PortalPermissionRequired {
+            portal_interface: REMOTE_DESKTOP_INTERFACE.to_owned(),
+            purpose: "inject".to_owned(),
+        });
         let injector = WaylandInjector::connect(inject_grant.as_ref())
             .await
             .map_err(|error| fatal(&error))?;
-
         // The emergency hotkey is registered for the whole run (KVM-018); its absence
         // is the documented reason a GNOME 46 node cannot be a source.
         let shortcuts = match EmergencyShortcuts::register(emergency_hotkey).await {
@@ -155,12 +161,19 @@ impl Wayland {
         // Capture: degradable. A denied dialog is reported and names its interface,
         // which is what the GUI needs (scenario S8).
         let capture_grant = grants.get(INPUT_CAPTURE_INTERFACE, &signature).cloned();
+        let _ = portal_progress.send(protocol::ipc::PortalPermissionRequired {
+            portal_interface: INPUT_CAPTURE_INTERFACE.to_owned(),
+            purpose: "capture".to_owned(),
+        });
         let mut capture = match WaylandCapture::connect(capture_grant.as_ref()).await {
             Ok(capture) => Some(capture),
             Err(error) => {
                 refusals.push(Refusal {
                     code: portal_code(&error),
-                    detail: format!("portal {INPUT_CAPTURE_INTERFACE} is not usable here: {error}"),
+                    detail: format!(
+                        "portal {INPUT_CAPTURE_INTERFACE} is not usable here: {}",
+                        error_chain(&error)
+                    ),
                 });
                 None
             }
@@ -173,7 +186,7 @@ impl Wayland {
                 Ok(()) => armed = true,
                 Err(error) => refusals.push(Refusal {
                     code: portal_code(&error),
-                    detail: format!("cannot arm the capture session: {error}"),
+                    detail: format!("cannot arm the capture session: {}", error_chain(&error)),
                 }),
             }
         }
@@ -654,51 +667,31 @@ impl Wayland {
                 if !rejected.is_empty() {
                     tracing::warn!(
                         rejected = ?rejected,
-                        "the compositor refused some barriers"
+                        "the compositor refused some barriers; retaining accepted barriers"
                     );
                 }
-                self.barriers = barriers;
+                let accepted: Vec<BarrierSegment> = barriers
+                    .into_iter()
+                    .filter(|barrier| !rejected.contains(&barrier.id))
+                    .collect();
+                tracing::info!(zones = ?zones, barriers = ?accepted, "Wayland zones and accepted barriers");
+                self.barriers = accepted;
                 Ok(())
             }
             Err(WaylandError::BarriersWhileEnabled) => {
-                // GNOME 46: a live session cannot take new barriers and `Disable` cannot
-                // be undone, so the session has to be recreated — which costs a portal
-                // dialog (XDP-gnome #126).
                 tracing::warn!(
-                    "the capture session must be recreated to install new barriers; a portal \
-                     dialog will appear again (GNOME 46, XDP-gnome #126)"
+                    "the compositor will not update barriers on this live session; retaining \
+                     the existing accepted barriers rather than opening another portal session"
                 );
-                self.capture = None;
-                let grant = self
-                    .grants
-                    .get(INPUT_CAPTURE_INTERFACE, &self.signature())
-                    .cloned();
-                let mut fresh = match WaylandCapture::connect(grant.as_ref()).await {
-                    Ok(fresh) => fresh,
-                    Err(error) => {
-                        return Err(format!("recreating the capture session failed: {error}"))
-                    }
-                };
-                let mut installed = Vec::new();
-                arm_capture(&mut fresh, &mut installed)
-                    .await
-                    .map_err(|error| {
-                        format!("arming the recreated capture session failed: {error}")
-                    })?;
-                self.barriers = installed;
-                self.capture = Some(fresh);
-                Ok(())
+                Err(
+                    "the active session cannot re-arm barriers without reopening InputCapture"
+                        .to_owned(),
+                )
             }
-            Err(error) => Err(format!("SetPointerBarriers failed: {error}")),
-        }
-    }
-
-    /// The compositor signature the current grants were issued for.
-    fn signature(&self) -> String {
-        match (self.capture.as_ref(), self.injector.compositor()) {
-            (Some(capture), _) => compositor_signature(capture.compositor(), &capture.versions()),
-            (None, Some(compositor)) => compositor_signature(compositor, &self.injector.versions()),
-            (None, None) => String::new(),
+            Err(error) => Err(format!(
+                "SetPointerBarriers failed: {}",
+                error_chain(&error)
+            )),
         }
     }
 }
@@ -743,13 +736,21 @@ async fn arm_capture(
         .collect();
     let rejected = capture.set_barriers(&request).await?;
     if !rejected.is_empty() {
-        tracing::warn!(rejected = ?rejected, "the compositor refused some barriers");
+        tracing::warn!(
+            rejected = ?rejected,
+            "the compositor refused some barriers; retaining accepted barriers"
+        );
     }
+    let accepted: Vec<BarrierSegment> = segments
+        .into_iter()
+        .filter(|segment| !rejected.contains(&segment.id))
+        .collect();
+    tracing::info!(zones = ?zones, barriers = ?accepted, "Wayland zones and accepted barriers");
     // A session that is already enabled cannot be enabled twice.
     if !capture.is_enabled() {
         capture.enable().await?;
     }
-    *installed = segments;
+    *installed = accepted;
     Ok(())
 }
 
@@ -820,10 +821,24 @@ fn portal_code(error: &WaylandError) -> &'static str {
     }
 }
 
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut chain = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        chain.push_str(": ");
+        chain.push_str(&error.to_string());
+        source = error.source();
+    }
+    chain
+}
+
 /// A failure that keeps the node local, carrying the code core should report.
 fn fatal(error: &WaylandError) -> Refusal {
     Refusal {
         code: portal_code(error),
-        detail: format!("platform-wayland is not usable on this session: {error}"),
+        detail: format!(
+            "platform-wayland is not usable on this session: {}",
+            error_chain(error)
+        ),
     }
 }

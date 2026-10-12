@@ -11,15 +11,9 @@
 //! to be checked against the real environment («выбранный вручную бэкенд обязан
 //! соответствовать сеансу»).
 //!
-//! # What this slice does *not* wire
-//!
-//! `platform-wayland` (portal `InputCapture` + EIS through `RemoteDesktop`) is
-//! KVM-026/027 in stage E3, and the E2 slice is the Windows → Linux X11 direction.
-//! A Wayland session is therefore *selected* as Wayland and then refused explicitly:
-//! `AgentReady` carries no capabilities and `degraded_reason` names the task, the
-//! node stays `Local`, and core shows the reason. Refusing loudly is what the
-//! documents require of a backend that cannot honour the session; a half-wired
-//! portal session would look like a defect instead.
+//! Wayland is selected as a real portal-backed backend when `allow_portal_sessions`
+//! is enabled (never in recovery); when suppressed it is refused explicitly.
+//! Recovery agents must not open sessions or prompts that outlive the recovery attempt.
 
 use clipboard::Marker;
 use input_model::{CaptureKind, HidKey, InputEvent, MouseButton, Position};
@@ -598,6 +592,8 @@ impl Backend {
         dry_clipboard_dir: Option<PathBuf>,
         emergency_hotkey: &str,
         restore_tokens: &[ipc::PortalGrant],
+        allow_portal_sessions: bool,
+        portal_progress: tokio::sync::mpsc::UnboundedSender<ipc::PortalPermissionRequired>,
         takeover_detection: ipc::TakeoverDetection,
         takeover_threshold_px: u32,
     ) -> (Self, Ready, Vec<Refusal>) {
@@ -689,10 +685,17 @@ impl Backend {
                     platform_probe::Backend::Wayland { .. } => {
                         #[cfg(target_os = "linux")]
                         {
+                            if !allow_portal_sessions {
+                                return refuse(
+                                    &snapshot,
+                                    "PORTAL_SESSION_SUPPRESSED: portal sessions are disabled in RECOVERY or after a portal failure; use manual retry to try again",
+                                );
+                            }
                             match wayland::Wayland::connect(
                                 &session,
                                 emergency_hotkey,
                                 restore_tokens,
+                                &portal_progress,
                             )
                             .await
                             {

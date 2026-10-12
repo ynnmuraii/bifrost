@@ -128,6 +128,8 @@ impl Session {
             layout_pending_edits: u32::from(self.layout_state.pending().is_some()),
             layout_editable: self.layout_editing_disabled.is_none(),
             active_layout: self.active_layout.clone(),
+            agent_degraded_reason: self.agent_degraded_reason.clone(),
+            agent_restart_circuit_open: self.agent_restart_circuit_open,
         }
     }
 
@@ -267,6 +269,10 @@ impl Session {
             Msg::AbandonOwnership(_) => {
                 let response = self.abandon().await;
                 answer(&out, request_id, Msg::OpResult(op_result(&response))).await;
+            }
+            Msg::RetryAgent(_) => {
+                let result = self.retry_agent().await;
+                answer(&out, request_id, Msg::OpResult(result)).await;
             }
             Msg::ResetPortalGrants(_) => {
                 let response = self.reset_portals().await;

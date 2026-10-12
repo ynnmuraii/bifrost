@@ -336,19 +336,19 @@ fn a_killed_receiver_agent_returns_to_local() {
         "A took {} ms to return to Local after the receiver's agent died",
         a_ms - injected_after
     );
-    // The receiver must have gone through the documented recovery path.
-    let recovery = harness.b.marked("restarting in RECOVERY");
-    assert!(
-        !recovery.is_empty(),
-        "B must report «restarting in RECOVERY»:\n{}",
-        harness.b.log()
-    );
     harness
         .b
         .wait_for("B restarts its agent", Duration::from_secs(20), |s| {
             s.agent == "ready"
         })
         .expect("B must restart its agent");
+    // The receiver must have gone through the documented recovery path.
+    let recovery = harness.b.marked("restarting the agent in RECOVERY");
+    assert!(
+        !recovery.is_empty(),
+        "B must report «restarting in RECOVERY»:\n{}",
+        harness.b.log()
+    );
 }
 
 /// A frozen core cannot send a `Leave`, and the socket stays open: only the source's own
