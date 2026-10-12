@@ -16,6 +16,17 @@ use std::time::{Duration, Instant};
 
 use common::{Harness, Node};
 
+/// The pending file the layout store keeps next to the node's `config.toml`.
+///
+/// This is the contract the GUI reads: «проигравшие правки лежат в локальном
+/// `layout.pending.toml`» (`docs/03-architecture.md`). It exists exactly while the node holds
+/// an edit the coordinator has not applied.
+fn pending_file(node: &Node) -> std::path::PathBuf {
+    node.root
+        .join("config")
+        .join(config::paths::LAYOUT_PENDING_FILE)
+}
+
 /// A valid whole document: one display, which is all the validator requires.
 fn document_toml(label: &str) -> String {
     format!(
@@ -182,6 +193,13 @@ fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
         "no",
         "an edit that reached the coordinator is not pending"
     );
+    // And the document the store writes for the GUI is gone with the slot: an applied edit
+    // must not leave a `layout.pending.toml` claiming otherwise.
+    assert!(
+        !pending_file(&harness.b).exists(),
+        "an applied edit leaves no pending file: {:?}",
+        pending_file(&harness.b)
+    );
     harness.a.stop();
     harness.b.stop();
 }
@@ -240,6 +258,13 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
         field(&pending, "pending"),
         "yes",
         "the edit waits as pending"
+    );
+    // The losing edit is on disk, not only in memory: that is what the GUI's Apply/Discard
+    // buttons read after a restart (`layout.pending.toml`).
+    assert!(
+        pending_file(&harness.b).exists(),
+        "a held edit is written to {:?}",
+        pending_file(&harness.b)
     );
     // The follower applies nothing on its own; the coordinator's edit is where it will land.
     let loser_start = revision(&pending);
@@ -300,6 +325,11 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
         "yes",
         "the refused edit is still there to reload"
     );
+    assert!(
+        pending_file(&harness.b).exists(),
+        "a refused edit keeps its pending file: {:?}",
+        pending_file(&harness.b)
+    );
 
     // The reload: the stale entry goes, and the edit is written against the revision that is
     // applied now — the base the CAS accepts.
@@ -308,6 +338,11 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
         .ctl("layout discard")
         .expect("the stale entry is discarded");
     assert!(discarded.contains("pending=discarded"), "{discarded}");
+    assert!(
+        !pending_file(&harness.b).exists(),
+        "discard takes the file with the slot: {:?}",
+        pending_file(&harness.b)
+    );
     let reply = harness
         .b
         .ctl(&format!(
@@ -328,6 +363,10 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
     );
     assert_eq!(field(&done, "author"), harness.a.id);
     assert_eq!(field(&done, "pending"), "no");
+    assert!(
+        !pending_file(&harness.b).exists(),
+        "the reloaded edit applied: no pending file is left behind"
+    );
     harness.a.stop();
     harness.b.stop();
 }
