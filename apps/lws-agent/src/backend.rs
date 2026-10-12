@@ -573,12 +573,22 @@ impl Backend {
 /// back to the left (the first of them takes the virtual pointer out of the target display
 /// through the entry edge, which is the return), and a final pause so the transcript is
 /// stable. `None` entries are ticks that pass the time.
+///
+/// The pattern starts with a lead-in pause: a peer that has not finished its handshake
+/// cannot accept a transition yet, and the FSM refuses one with `ReceiverUnsupported`
+/// (which is what a real deployment wants — the check is «проверить capability-биты до
+/// EnterPrepare» — but a smoke wants the links up first).
 fn motion_schedule() -> std::collections::VecDeque<Option<InputEvent>> {
     /// Height to walk along: the middle of a 1080-tall display.
     const Y: f64 = 540.0;
     /// One second at the loop's tick rate (`POLL_TICK` is 5 ms).
     const TRANSITION_PAUSE: usize = 200;
+    /// Three seconds for the mesh to establish links and exchange `Hello`.
+    const LEAD_IN: usize = 600;
     let mut schedule = std::collections::VecDeque::new();
+    for _ in 0..LEAD_IN {
+        schedule.push_back(None);
+    }
 
     let mut x = 1600.0;
     for _ in 0..10 {
