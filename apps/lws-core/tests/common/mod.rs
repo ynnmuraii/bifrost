@@ -1168,10 +1168,7 @@ fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
     let dialer_out = dialer.wait_with_output().expect("the dialer finishes");
     let opener_status = opener.wait().expect("the opener finishes");
     let _ = reader.join();
-    let opener_stdout = opener_text
-        .lock()
-        .expect("the opener's output")
-        .clone();
+    let opener_stdout = opener_text.lock().expect("the opener's output").clone();
     let mut opener_stderr = String::new();
     if let Some(mut stderr) = opener.stderr.take() {
         let _ = std::io::Read::read_to_string(&mut stderr, &mut opener_stderr);
