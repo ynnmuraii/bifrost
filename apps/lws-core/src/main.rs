@@ -25,6 +25,7 @@ mod command;
 mod ctl;
 mod ids;
 mod job;
+mod layout;
 mod ownership_store;
 mod pair;
 mod portal;
