@@ -174,6 +174,13 @@ impl Supervisor {
             if self.dry_motion {
                 command.arg("--dry-motion");
             }
+            // The dry backend owns no real selection, so the clipboard suite drives it through
+            // a directory of files: `in.txt` is what a test writes to fake a user's copy, and
+            // `out.txt` is what the agent's clipboard currently holds. It lives beside the
+            // launch token, in the directory core already owns.
+            let clipboard_dir = self.private_dir.join("clipboard-dry");
+            let _ = std::fs::create_dir_all(&clipboard_dir);
+            command.arg("--dry-clipboard-dir").arg(&clipboard_dir);
         }
         let child = command
             .spawn()

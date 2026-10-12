@@ -10,6 +10,7 @@ description = "LAN Workspace transport: pinned TLS links, mesh dedup, liveness (
 workspace = true
 
 [dependencies]
+clipboard = { path = "../clipboard" }
 geometry = { path = "../geometry" }
 identity = { path = "../identity" }
 input-model = { path = "../input-model" }

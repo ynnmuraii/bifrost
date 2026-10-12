@@ -94,7 +94,11 @@ async fn spawn_node(
     let log = tokio::spawn(async move {
         while let Some(event) = log_events.recv().await {
             match event {
-                LinkEvent::Up { peer, hello } => {
+                LinkEvent::Up {
+                    peer,
+                    hello,
+                    connection_id: _,
+                } => {
                     println!(
                         "  [{label}] link up with {peer} (peer hello: {})",
                         hello.display_name

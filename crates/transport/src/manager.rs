@@ -236,7 +236,8 @@ impl LinkManager {
                     peer,
                     direction,
                     hello,
-                } => self.on_up(peer, direction, hello).await,
+                    connection_id,
+                } => self.on_up(peer, direction, hello, connection_id).await,
                 LinkReport::Message { peer, message } => {
                     let _ = self
                         .events_tx
@@ -270,7 +271,13 @@ impl LinkManager {
         }
     }
 
-    async fn on_up(&self, peer: NodeId, direction: Direction, hello: PeerInfo) {
+    async fn on_up(
+        &self,
+        peer: NodeId,
+        direction: Direction,
+        hello: PeerInfo,
+        connection_id: [u8; 16],
+    ) {
         let incoming = self.inner.lock().await.pending.remove(&(peer, direction));
         let Some(pending) = incoming else {
             return;
@@ -342,7 +349,14 @@ impl LinkManager {
                 task: pending.task,
             },
         );
-        let _ = self.events_tx.send(LinkEvent::Up { peer, hello }).await;
+        let _ = self
+            .events_tx
+            .send(LinkEvent::Up {
+                peer,
+                hello,
+                connection_id,
+            })
+            .await;
     }
 }
 
@@ -366,7 +380,7 @@ impl LinkManager {
 /// (the error is reported as `the link manager stopped: … os error 10048` instead of a
 /// silent takeover), not a case to paper over. That failure is not retried: the manager
 /// stops and the core keeps running without links, so the losing core has to be restarted.
-async fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+pub(crate) async fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
     let domain = if address.is_ipv4() {
         socket2::Domain::IPV4
     } else {

@@ -102,6 +102,10 @@ pub enum Outbound {
     Guaranteed(fr::Message),
     /// A layout-document message: always guaranteed, never coalesced (KVM-072).
     Layout(crate::convert::LayoutMessage),
+    /// A clipboard message: always guaranteed, never coalesced, never dropped. The grant is the
+    /// only clipboard message the input link carries, and it decides whether the channel it
+    /// authorises ever exists, so it may not be lost behind motion (`KVM-042`).
+    Clipboard(crate::clipboard::ClipboardMessage),
     /// Coalescible pointer motion; may be dropped when the queue is full.
     Motion(Vec<InputEvent>),
 }
@@ -111,7 +115,7 @@ impl Outbound {
     pub fn motion_events(&self) -> Option<&[InputEvent]> {
         match self {
             Outbound::Motion(events) => Some(events),
-            Outbound::Guaranteed(_) | Outbound::Layout(_) => None,
+            Outbound::Guaranteed(_) | Outbound::Layout(_) | Outbound::Clipboard(_) => None,
         }
     }
 }

@@ -1,11 +1,16 @@
 //! LAN Workspace transport: pinned TLS links, mesh dedup and liveness (KVM-032/070).
 
+pub mod clipboard;
 pub mod convert;
 pub mod link;
 pub mod manager;
 pub mod policy;
 pub mod queue;
 
+pub use clipboard::{
+    dial_clipboard, ClipboardConnection, ClipboardListener, ClipboardMessage, ClipboardReader,
+    ClipboardViolation, ClipboardWriter, Grants, Outgoing,
+};
 pub use convert::{ConvertError, PeerInfo};
 pub use link::{
     read_frame, write_frame, Direction, Link, LinkConfig, LinkDownReason, LinkEvent, LinkHandle,

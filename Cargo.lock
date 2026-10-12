@@ -773,6 +773,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "ashpd",
+ "clipboard",
  "input-model",
  "ipc",
  "platform-probe",
@@ -790,6 +791,7 @@ name = "lws-core"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "clipboard",
  "config",
  "focus-router",
  "geometry",
@@ -1043,6 +1045,7 @@ dependencies = [
 name = "platform-x11"
 version = "0.0.0"
 dependencies = [
+ "clipboard",
  "input-model",
  "rustix",
  "x11rb",
@@ -1777,6 +1780,7 @@ dependencies = [
 name = "transport"
 version = "0.0.0"
 dependencies = [
+ "clipboard",
  "focus-router",
  "geometry",
  "identity",
