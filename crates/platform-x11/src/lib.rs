@@ -67,6 +67,8 @@ pub mod keymap;
 #[cfg(target_os = "linux")]
 pub use capture::{CapturedEvent, X11Capture};
 #[cfg(target_os = "linux")]
+pub use clipboard::{Change, Clipboard, ClipboardError, Snapshot};
+#[cfg(target_os = "linux")]
 pub use inject::{InjectResult, PressedLedger, X11Injector};
 #[cfg(target_os = "linux")]
 pub use keymap::{
