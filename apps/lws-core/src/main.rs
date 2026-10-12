@@ -262,12 +262,18 @@ fn run(args: &Args) -> Result<(), Failure> {
     let paths = &args.paths;
 
     let config = config::Config::load(paths.config_file())?;
+    // The probe runs *before* the runtime exists. On Linux `read_snapshot` reaches the
+    // portals through zbus's blocking client, which drives its own runtime: called from
+    // inside this one it panics («Cannot start a runtime from within a runtime») and core
+    // never starts. `docs/03-architecture.md` puts the probe in the same breath as the
+    // session decision, and that decision needs nothing from the runtime.
+    let session = decide_session(&config);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start the runtime: {error}"))?;
     runtime
-        .block_on(async move { run_async(paths, options, config).await })
+        .block_on(async move { run_async(paths, options, config, session).await })
         .map_err(Failure::Run)
 }
 
@@ -276,6 +282,7 @@ async fn run_async(
     paths: &Paths,
     options: RunOptions,
     config: config::Config,
+    session: LocalSession,
 ) -> Result<(), String> {
     let identity_paths = IdentityPaths {
         data_dir: paths.data_dir().to_path_buf(),
@@ -286,7 +293,6 @@ async fn run_async(
         NodeIdentity::load_or_create(&identity_paths).map_err(|error| error.to_string())?;
     tracing::info!(load = ?load, "identity loaded");
     let trust = load_trust(paths).map_err(failure_message)?;
-    let session = decide_session(&config);
     let node_id = identity.node_id();
 
     let listen: SocketAddr = options
