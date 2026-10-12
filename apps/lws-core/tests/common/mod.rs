@@ -1118,7 +1118,37 @@ fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
         .expect("stdin")
         .write_all(b"y\n")
         .expect("the opener is answered");
-    std::thread::sleep(Duration::from_millis(700));
+
+    // Wait for the window, do not sleep for it. The opener prints this line once its gate is
+    // installed, and a fixed pause loses that race on a loaded machine (two test processes on two
+    // CPUs): the dialer then arrives before the window is open, the listener drops it *before*
+    // the handshake («peer closed the connection without sending TLS close_notify»), and the
+    // opener sits out its whole 120 s window («the pairing window ran out») — which is how the
+    // layout tests failed in `CI` with a pairing error instead of the layout assertion they are
+    // about. Same rule as everywhere else in this harness: wait for the event.
+    let opener_stdout = opener.stdout.take().expect("the opener's stdout");
+    let opener_text = Arc::new(std::sync::Mutex::new(String::new()));
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let reader = {
+        let text = Arc::clone(&opener_text);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(opener_stdout).lines() {
+                let Ok(line) = line else { break };
+                let mut collected = text.lock().expect("the opener's output");
+                collected.push_str(&line);
+                collected.push('\n');
+                drop(collected);
+                if line.contains("waiting for a peer to dial") {
+                    let _ = opened_tx.send(());
+                }
+            }
+        })
+    };
+    opened_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the opener must announce that its pairing window is waiting");
+
     let mut dialer = Command::new(core_exe())
         .arg("--root")
         .arg(a_root)
@@ -1136,17 +1166,29 @@ fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
         .expect("the dialer is answered");
 
     let dialer_out = dialer.wait_with_output().expect("the dialer finishes");
-    let opener_out = opener.wait_with_output().expect("the opener finishes");
+    let opener_status = opener.wait().expect("the opener finishes");
+    let _ = reader.join();
+    let opener_stdout = opener_text
+        .lock()
+        .expect("the opener's output")
+        .clone();
+    let mut opener_stderr = String::new();
+    if let Some(mut stderr) = opener.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut opener_stderr);
+    }
     let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&dialer_out.stdout),
-        String::from_utf8_lossy(&opener_out.stdout)
+        "{}{opener_stdout}",
+        String::from_utf8_lossy(&dialer_out.stdout)
     );
     assert!(
         text.matches("paired with").count() == 2,
         "both sides must pair:\n{text}\n{}{}",
         String::from_utf8_lossy(&dialer_out.stderr),
-        String::from_utf8_lossy(&opener_out.stderr)
+        opener_stderr,
+    );
+    assert!(
+        opener_status.success(),
+        "the opener must exit cleanly:\n{opener_stderr}"
     );
 
     // `PairHello.listen_port` is what makes both records usable: the dialer records the
