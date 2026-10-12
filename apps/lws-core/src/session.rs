@@ -161,6 +161,8 @@ pub struct Session {
     /// *noticed* before there is any transition: «OBSERVE: Local: watch edges, no
     /// suppression», so core arms the observation itself for the node that owns input.
     observe_armed: bool,
+    /// Development-only permission to capture externally injected Windows input.
+    dev_capture_injected: bool,
     /// The clipboard endpoint, when `[clipboard].enabled`: the policy, the offers and the
     /// handle to the runtime that listens on `47902` (ADR-008). `None` keeps every clipboard
     /// path closed, which is the default.
@@ -234,6 +236,7 @@ impl Session {
         display_name: String,
         emergency_hotkey: String,
         capabilities: platform_probe::Capabilities,
+        dev_capture_injected: bool,
         pairing_gate: transport::PairingGate,
     ) -> Self {
         let layout_state = layout_store.restored();
@@ -281,6 +284,7 @@ impl Session {
             remote_node: None,
             pending_target: None,
             observe_armed: false,
+            dev_capture_injected,
             clipboard,
             clipboard_events,
             gui: gui_server,
@@ -543,6 +547,20 @@ impl Session {
         Box::pin(self.apply(outputs)).await;
     }
 
+    /// Adds the dev-only capture permission only to a source owner's BeginCapture.
+    ///
+    /// This ownership check is the boundary that makes the flag inert on receivers.
+    fn agent_frame(&self, command: &fr::AgentCommand) -> protocol::ipc::agent_frame::Msg {
+        let mut frame = routing::agent_command(command);
+        if let Msg::BeginCapture(begin) = &mut frame {
+            begin.dev_capture_injected = source_owner_may_capture_injected(
+                self.dev_capture_injected,
+                self.router.is_owner(),
+            );
+        }
+        frame
+    }
+
     /// Performs the side effects of one decision batch, in order.
     async fn apply(&mut self, outputs: Vec<fr::Output>) {
         for effect in routing::effects(&outputs) {
@@ -555,7 +573,7 @@ impl Session {
                 }
                 Effect::Agent(command) => {
                     self.context.on_command(&command);
-                    let frame = routing::agent_command(&command);
+                    let frame = self.agent_frame(&command);
                     tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
                     if let Err(error) = self.agent.send(frame).await {
                         tracing::warn!(%error, "cannot reach the agent");
@@ -1995,7 +2013,7 @@ impl Session {
             lease_id: [0u8; 16],
             self_timeout_ms: 0,
         };
-        let frame = routing::agent_command(&command);
+        let frame = self.agent_frame(&command);
         match self.agent.send(frame).await {
             Ok(()) => {
                 self.observe_armed = true;
@@ -2874,5 +2892,21 @@ mod timer_tests {
         assert!(!is_agent_ready(&fr::AgentEvent::Ready {
             lease_id: [0; 16]
         }));
+    }
+}
+
+fn source_owner_may_capture_injected(dev_flag: bool, is_owner: bool) -> bool {
+    dev_flag && is_owner
+}
+
+#[cfg(test)]
+mod dev_capture_tests {
+    use super::source_owner_may_capture_injected;
+
+    #[test]
+    fn external_injection_requires_both_dev_flag_and_source_ownership() {
+        assert!(!source_owner_may_capture_injected(false, true));
+        assert!(!source_owner_may_capture_injected(true, false));
+        assert!(source_owner_may_capture_injected(true, true));
     }
 }

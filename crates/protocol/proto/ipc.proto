@@ -120,6 +120,7 @@ message BeginCapture {
   bytes lease_id = 2;          // 16 bytes for TEMPORARY/REMOTE
   uint32 self_timeout_ms = 3;  // agent ends capture by itself, max 1000;
                                // on Wayland bounds how long an activated (diverted) capture is held
+  bool dev_capture_injected = 4; // core dev-only opt-in; meaningful only on the source owner
 }
 message EndCapture { bytes lease_id = 1; bool replay_buffered_locally = 2; }
 message PrepareInject { bytes lease_id = 1; }

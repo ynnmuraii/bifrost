@@ -92,11 +92,9 @@
 //! explicit, documented approximation — the honest limitation of the platform.
 //!
 //! Recognising injections is also what makes receiver takeover mean "a human
-//! touched this machine", so the drop happens before any mode logic. The spike
-//! exposes one opt-in escape hatch for machines with nobody at the keyboard:
-//! `CaptureConfig::capture_injected`, used by `examples/spike_capture
-//! --capture-injected` to drive the whole pipeline with `spike_inject`. It must
-//! never be enabled in an agent.
+//! touched this machine", so the drop happens before any mode logic. The
+//! `CaptureConfig::capture_injected` escape hatch is development-only; even when
+//! enabled, the `INJECT_TAG` used by this process is always dropped.
 //!
 //! ## DPI awareness
 //!

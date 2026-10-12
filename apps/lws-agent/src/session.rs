@@ -133,6 +133,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         attach.repeat_mode,
         &mut watchdog,
         started,
+        args.dev_capture_injected,
     )
     .await?;
 
@@ -192,6 +193,7 @@ where
 }
 
 /// The loop in one place so every exit path releases through the same code.
+#[allow(clippy::too_many_arguments)]
 async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     link: &mut AgentLink<S>,
     backend: &mut Backend,
@@ -200,6 +202,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     repeat_mode: i32,
     watchdog: &mut Watchdog,
     started: Instant,
+    dev_capture_injected: bool,
 ) -> anyhow::Result<Stop> {
     // `ArmDeadline` arms this; rule 4 fixes the bound at 1000 ms.
     let mut deadline: Option<(Instant, Vec<u8>)> = None;
@@ -277,7 +280,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 if let Some(stop) = handle_message(
                     link, backend, ready, message, &mut deadline, &mut self_timeout,
                     &mut held_lease, &mut batch, &mut displays, &mut repeat,
-                    &mut clipboard, now,
+                    &mut clipboard, dev_capture_injected, now,
                 ).await? {
                     return Ok(stop);
                 }
@@ -428,6 +431,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
     displays: &mut crate::displays::DisplaysState,
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     clipboard: &mut ClipboardState,
+    dev_capture_injected: bool,
     now: u64,
 ) -> anyhow::Result<Option<Stop>> {
     match message {
@@ -445,7 +449,10 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                     return Ok(None);
                 }
             };
-            match backend.begin_capture(kind).await {
+            match backend
+                .begin_capture(kind, dev_capture_injected && begin.dev_capture_injected)
+                .await
+            {
                 Ok(()) => {
                     *held_lease = Some(begin.lease_id.clone());
                     if kind == input_model::CaptureKind::Temporary && begin.self_timeout_ms > 0 {
@@ -1143,6 +1150,7 @@ mod tests {
                 &mut self.displays,
                 &mut self.repeat,
                 &mut self.clipboard,
+                false,
                 self.clock,
             )
             .await
@@ -1610,6 +1618,7 @@ mod tests {
                         ::protocol::ipc::RepeatMode::ReceiverSoftware as i32,
                         &mut watchdog,
                         started,
+                        false,
                     )
                     .await
                 });
@@ -1698,6 +1707,7 @@ mod tests {
                 kind: ::protocol::ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(7),
                 self_timeout_ms: 500,
+                dev_capture_injected: false,
             }))
             .await;
         match harness.recv().await {
@@ -1728,6 +1738,7 @@ mod tests {
                 kind: ::protocol::ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(8),
                 self_timeout_ms: 60_000,
+                dev_capture_injected: false,
             }))
             .await;
         harness.recv().await;
@@ -1743,6 +1754,7 @@ mod tests {
                 kind: ::protocol::ipc::CaptureKind::Remote as i32,
                 lease_id: lease(9),
                 self_timeout_ms: 9000,
+                dev_capture_injected: false,
             }))
             .await;
         harness.recv().await;
@@ -1761,6 +1773,7 @@ mod tests {
                 kind: ::protocol::ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(1),
                 self_timeout_ms: 500,
+                dev_capture_injected: false,
             }))
             .await;
         harness.recv().await;
@@ -1834,6 +1847,7 @@ mod tests {
                 kind: ::protocol::ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(4),
                 self_timeout_ms: 400,
+                dev_capture_injected: false,
             }))
             .await;
         harness.recv().await;
@@ -1866,6 +1880,7 @@ mod tests {
                 kind: ::protocol::ipc::CaptureKind::Remote as i32,
                 lease_id: lease(5),
                 self_timeout_ms: 0,
+                dev_capture_injected: false,
             }))
             .await;
         harness.recv().await;
@@ -1959,6 +1974,7 @@ mod tests {
                 kind: ::protocol::ipc::CaptureKind::Remote as i32,
                 lease_id: lease(6),
                 self_timeout_ms: 0,
+                dev_capture_injected: false,
             }))
             .await;
         harness.recv().await;
@@ -2026,6 +2042,7 @@ mod tests {
                 kind: 0,
                 lease_id: lease(1),
                 self_timeout_ms: 100,
+                dev_capture_injected: false,
             }))
             .await;
         match harness.recv().await {

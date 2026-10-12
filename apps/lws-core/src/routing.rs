@@ -97,6 +97,7 @@ pub fn agent_command(command: &fr::AgentCommand) -> ipc::agent_frame::Msg {
             self_timeout_ms: u32::try_from(*self_timeout_ms)
                 .unwrap_or(u32::MAX)
                 .min(1000),
+            dev_capture_injected: false,
         }),
         fr::AgentCommand::EndCapture {
             lease_id,
