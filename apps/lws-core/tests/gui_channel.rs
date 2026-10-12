@@ -74,17 +74,26 @@ impl Window {
         }
     }
 
-    /// Sends one request and returns the answer with its `request_id`.
+    /// Sends one request and returns its `request_id` without waiting for the answer.
     ///
-    /// Pushed events (`request_id == 0`) that arrive first are collected in [`Window::events`],
-    /// exactly as a window would: they are not answers, and dropping them would hide the state
-    /// the GUI lives on.
-    fn request(&mut self, message: gui_frame::Msg) -> gui_frame::Msg {
+    /// This is what the real window does: `docs/03-architecture.md` («GUI ↔ core») makes every
+    /// request fire-and-forget with a `request_id`, and the answer is folded when it arrives.
+    /// A caller that must act on *two* computers at once (the pairing ceremony's two
+    /// «Да, совпадают») has to send the second request before reading the first answer: the
+    /// verdict of a ceremony only exists once both sides answered.
+    fn send(&mut self, message: gui_frame::Msg) -> u64 {
         let request_id = self.next_request;
         self.next_request += 1;
         self.runtime
             .block_on(self.link.send(request_id, message))
             .expect("the request is sent");
+        request_id
+    }
+
+    /// The answer to one request, collecting the pushed events that arrive first (see
+    /// [`Window::events`]): they are not answers, and dropping them would hide the state the
+    /// GUI lives on.
+    fn await_answer(&mut self, request_id: u64) -> gui_frame::Msg {
         loop {
             let frame = self.recv(&format!("no answer to request {request_id}"));
             if frame.request_id == request_id {
@@ -97,6 +106,12 @@ impl Window {
             self.events
                 .push(frame.msg.expect("an event carries a message"));
         }
+    }
+
+    /// Sends one request and returns its answer.
+    fn request(&mut self, message: gui_frame::Msg) -> gui_frame::Msg {
+        let request_id = self.send(message);
+        self.await_answer(request_id)
     }
 
     /// Waits for a pushed event of one kind.
@@ -333,13 +348,11 @@ fn the_wizard_opens_a_window_and_pushes_the_address_to_type() {
 
 /// The whole pairing ceremony between two unpaired cores, driven as the wizard drives it.
 ///
-/// KNOWN GAP, ignored on purpose rather than deleted: with the window open and the address
-/// pushed (the test above), `PairWith` from the other window never produces a `PairingPrompt` —
-/// the dialer's ceremony is entered, but no answer to the `PairWith` request (which the core
-/// resolves when the prompt appears) arrives within the test's 20 s deadline. The steps that do
-/// work are asserted here up to that point; everything after it (both prompts, both answers,
-/// both `TrustedPeer` records) is unverified and must be fixed before the wizard is called done.
-#[ignore = "the dialer's ceremony does not reach PairingPrompt over the GUI path yet"]
+/// The one thing this test has to do that a single window does not: the ceremony only has a
+/// verdict once *both* users answered, and the answer to `PairingAnswer` is that verdict
+/// (`OpResult`), so the two answers are **sent** before either reply is read. The real wizard
+/// does the same — its requests are fire-and-forget (`docs/03-architecture.md`, «GUI ↔ core»),
+/// and two computers cannot wait for each other's click.
 #[test]
 fn the_pairing_wizard_pairs_two_cores_over_the_gui_endpoint() {
     let _guard = common::serial();
@@ -418,23 +431,26 @@ fn the_pairing_wizard_pairs_two_cores_over_the_gui_endpoint() {
     assert_eq!(left.peer_name, right.peer_name);
     assert_ne!(left.local_fingerprint, left.peer_fingerprint);
 
-    // 6. Both users confirm.
-    let left_answer = opener.request(gui_frame::Msg::PairingAnswer(
+    // 6. Both users confirm. Neither window can wait for its own answer before the other
+    //    confirms, so both answers go out first, exactly as two windows on two computers do.
+    let left_id = opener.send(gui_frame::Msg::PairingAnswer(
         protocol::ipc::PairingAnswer {
             attempt_id: left.attempt_id.clone(),
             approve: true,
         },
     ));
-    match left_answer {
-        gui_frame::Msg::OpResult(result) => assert!(result.ok, "the opener's answer: {result:?}"),
-        other => panic!("PairingAnswer answered {other:?}"),
-    }
-    let right_answer = dialer.request(gui_frame::Msg::PairingAnswer(
+    let right_id = dialer.send(gui_frame::Msg::PairingAnswer(
         protocol::ipc::PairingAnswer {
             attempt_id: right.attempt_id.clone(),
             approve: true,
         },
     ));
+    let left_answer = opener.await_answer(left_id);
+    match left_answer {
+        gui_frame::Msg::OpResult(result) => assert!(result.ok, "the opener's answer: {result:?}"),
+        other => panic!("PairingAnswer answered {other:?}"),
+    }
+    let right_answer = dialer.await_answer(right_id);
     match right_answer {
         gui_frame::Msg::OpResult(result) => assert!(result.ok, "the dialer's answer: {result:?}"),
         other => panic!("PairingAnswer answered {other:?}"),
