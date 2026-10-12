@@ -231,6 +231,8 @@ pub struct Supervisor {
     /// Portal restore tokens, persisted in `portal-restore.toml` and shipped in
     /// `AgentAttach.restore_tokens`; new ones arrive back as `PortalGrantChanged`.
     portal: crate::portal::PortalGrants,
+    /// A portal failure disables new portal sessions across automatic agent restarts.
+    allow_portal_sessions: bool,
     /// Rule 11's heartbeat, with the startup grace; the supervisor marks every launch
     /// and every received frame, so the state survives a session's watchdog questions.
     heartbeat: AgentHeartbeat,
@@ -277,6 +279,7 @@ impl Supervisor {
             portal,
             takeover,
             repeat_mode,
+            allow_portal_sessions: true,
             heartbeat: AgentHeartbeat::new(core_silence_ms),
             launches: 0,
             child: None,
@@ -295,6 +298,10 @@ impl Supervisor {
     /// clears it when the user forgets the grants.
     pub fn portal(&mut self) -> &mut crate::portal::PortalGrants {
         &mut self.portal
+    }
+    /// Prevents automatic agent restarts from re-opening failed portal sessions.
+    pub fn set_portal_sessions_allowed(&mut self, allowed: bool) {
+        self.allow_portal_sessions = allowed;
     }
 
     /// Spawns one agent, waits for it to connect and sends the `AgentAttach`.
@@ -396,6 +403,7 @@ impl Supervisor {
             self.takeover.detection,
             self.takeover.threshold_px,
             self.repeat_mode,
+            self.allow_portal_sessions,
         );
         if let Err(error) = link.attach(attach).await {
             self.stop().await;
@@ -439,6 +447,20 @@ impl Supervisor {
                 Ok(frame)
             }
             None => Err("no agent is attached".to_owned()),
+        }
+    }
+    /// Drains already-queued portal changes before a restart drops this channel.
+    pub async fn drain_portal_grants(&mut self) -> Vec<ipc::PortalGrantChanged> {
+        let mut grants = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), self.recv()).await {
+                Ok(Ok(frame)) => {
+                    if let Some(Msg::PortalGrant(changed)) = frame.msg {
+                        grants.push(changed);
+                    }
+                }
+                Ok(Err(_)) | Err(_) => return grants,
+            }
         }
     }
 
@@ -500,11 +522,6 @@ impl Supervisor {
     /// Marks the agent as attached and ready (after `AgentReady`).
     pub fn mark_ready(&mut self) {
         self.state = AgentState::Ready;
-    }
-
-    /// Marks the agent as lost.
-    pub fn mark_lost(&mut self) {
-        self.state = AgentState::Lost;
     }
 
     /// The `RECOVERY` restart of scenario S4: release the ledger, then a fresh

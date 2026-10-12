@@ -2804,6 +2804,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::RevokePeer(_) => "RevokePeer",
         Msg::ExportDiagnostics(_) => "ExportDiagnostics",
         Msg::ResetPortalGrants(_) => "ResetPortalGrants",
+        Msg::RetryAgent(_) => "RetryAgent",
         Msg::ClaimOwnership(_) => "ClaimOwnership",
         Msg::AbandonOwnership(_) => "AbandonOwnership",
         Msg::ListPendingEdits(_) => "ListPendingEdits",

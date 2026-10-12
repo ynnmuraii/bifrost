@@ -19,6 +19,7 @@
 //! | `Ping` | `Pong` | rule 11 |
 //! | — | `CapturedBatch`, `EmergencyFired`, `LocalInputDetected`, `SessionEvent` | rules 2, 3, 9 |
 
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use ::ipc::{AgentLink, Watchdog};
@@ -77,8 +78,8 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
     );
 
     let started = Instant::now();
-
-    let (mut backend, ready, refusals) = Backend::select(
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let backend_selection = Backend::select(
         backend::BackendKindArg(attach.backend_override),
         args.dry_inject,
         args.dry_input_events,
@@ -86,11 +87,16 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         args.dry_clipboard_dir.clone(),
         attach.emergency_hotkey.as_str(),
         attach.restore_tokens.as_slice(),
+        attach.allow_portal_sessions && mode != AgentMode::Recovery as i32,
+        progress_tx,
         ipc::TakeoverDetection::try_from(attach.takeover_detection)
             .unwrap_or(ipc::TakeoverDetection::Unspecified),
         attach.takeover_threshold_px,
-    )
-    .await;
+    );
+    let selected = complete_backend_startup(&mut link, &mut progress_rx, backend_selection).await?;
+    let Some((mut backend, ready, refusals)) = selected else {
+        return Ok(());
+    };
     if args.dry_inject {
         tracing::warn!("dry mode: no capture hooks, no injection; Inject is only logged");
     }
@@ -113,13 +119,9 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         send_error(&mut link, refusal.code, &refusal.detail).await?;
     }
 
-    // Rule 6's clock starts when the agent is *ready*, not at the attach: the token
-    // check and the backend probe (`spawn_blocking` on every platform, plus the
-    // backend's own setup) sit in between, and a loaded machine spends hundreds of
-    // milliseconds there. That is startup, not core silence — rule 6 is scoped to
-    // REMOTE and capture does not exist before `AgentReady`, so there is nothing the
-    // safety rule could release yet. The pings core sent in the meantime wait in the
-    // link's buffer and reset the clock the moment the loop starts.
+    // Rule 6's clock starts when the agent is ready. Before `AgentReady` the agent has
+    // no capture or injection capability, and `complete_backend_startup` continues to
+    // answer core heartbeats while the user responds to portal prompts.
     let mut watchdog = watchdog_at_ready(attach.core_silence_ms, now_ms(started));
 
     let stop = loop_forever(
@@ -139,6 +141,53 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
     }
     tracing::info!("agent exiting");
     Ok(())
+}
+
+/// Keeps the IPC heartbeat responsive while a portal request awaits user approval.
+async fn complete_backend_startup<S, F, T>(
+    link: &mut AgentLink<S>,
+    progress_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ipc::PortalPermissionRequired>,
+    backend: F,
+) -> anyhow::Result<Option<T>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Future<Output = T>,
+{
+    enum Startup<T> {
+        Backend(T),
+        Progress(Option<ipc::PortalPermissionRequired>),
+        Frame(Result<AgentFrame, ::ipc::IpcError>),
+    }
+    tokio::pin!(backend);
+    loop {
+        let startup = tokio::select! {
+            selected = &mut backend => Startup::Backend(selected),
+            progress = progress_rx.recv() => Startup::Progress(progress),
+            frame = link.recv() => Startup::Frame(frame),
+        };
+        match startup {
+            Startup::Backend(selected) => return Ok(Some(selected)),
+            Startup::Progress(Some(progress)) => {
+                link.send(Msg::PortalPermission(progress)).await?;
+            }
+            Startup::Progress(None) => continue,
+            Startup::Frame(Ok(AgentFrame {
+                msg: Some(Msg::Ping(ping)),
+                ..
+            })) => link.send(Msg::Pong(Pong { nonce: ping.nonce })).await?,
+            Startup::Frame(Ok(AgentFrame {
+                msg: Some(Msg::Shutdown(_)),
+                ..
+            })) => return Ok(None),
+            Startup::Frame(Ok(_)) => {
+                send_error(link, "STARTUP_ONLY", "agent is initializing its backend").await?;
+            }
+            Startup::Frame(Err(error)) => {
+                tracing::warn!(%error, "core IPC ended during backend initialization");
+                return Ok(None);
+            }
+        }
+    }
 }
 
 /// The loop in one place so every exit path releases through the same code.
@@ -971,6 +1020,42 @@ mod tests {
     use tokio::io::duplex;
 
     const HOTKEY: &str = "Ctrl+Alt+Shift+F12";
+    #[tokio::test]
+    async fn backend_startup_answers_pings_while_portal_permission_is_pending() {
+        let (agent_io, core_io) = duplex(4096);
+        let mut agent = AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR);
+        let mut core = AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        progress_tx
+            .send(ipc::PortalPermissionRequired {
+                portal_interface: "org.freedesktop.portal.RemoteDesktop".to_owned(),
+                purpose: "inject".to_owned(),
+            })
+            .expect("progress receiver is open");
+        let (opened, portal_opened) = tokio::sync::oneshot::channel();
+        let startup = tokio::spawn(async move {
+            complete_backend_startup(&mut agent, &mut progress_rx, async move {
+                portal_opened.await.expect("portal approval signal");
+                42
+            })
+            .await
+            .expect("startup IPC")
+        });
+        assert!(matches!(
+            core.recv().await.unwrap().msg,
+            Some(Msg::PortalPermission(permission))
+                if permission.portal_interface == "org.freedesktop.portal.RemoteDesktop"
+        ));
+        for nonce in 1..=3 {
+            core.send(Msg::Ping(ipc::Ping { nonce })).await.unwrap();
+            assert!(matches!(
+                core.recv().await.unwrap().msg,
+                Some(Msg::Pong(Pong { nonce: actual })) if actual == nonce
+            ));
+        }
+        opened.send(()).unwrap();
+        assert_eq!(startup.await.unwrap(), Some(42));
+    }
 
     fn lease(byte: u8) -> Vec<u8> {
         vec![byte; 16]
@@ -1016,6 +1101,8 @@ mod tests {
                 clipboard_dir,
                 HOTKEY,
                 &[],
+                false,
+                tokio::sync::mpsc::unbounded_channel().0,
                 ::protocol::ipc::TakeoverDetection::Auto,
                 12,
             )
@@ -1499,6 +1586,8 @@ mod tests {
                     Some(dir),
                     HOTKEY,
                     &[],
+                    false,
+                    tokio::sync::mpsc::unbounded_channel().0,
                     ::protocol::ipc::TakeoverDetection::Auto,
                     12,
                 )
@@ -1921,6 +2010,7 @@ mod tests {
                 restore_tokens: Vec::new(),
                 require_emergency_hotkey: true,
                 core_silence_ms: 300,
+                allow_portal_sessions: false,
             }))
             .await;
         match harness.recv().await {

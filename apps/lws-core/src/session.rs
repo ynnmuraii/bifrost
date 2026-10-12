@@ -16,7 +16,7 @@
 //! the same scale, which is what makes `ArmDeadline` and the lease watchdog line up
 //! with the agent's own monotonic clock.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,8 +43,24 @@ mod pairing;
 /// It bounds how long a dead agent child can go unnoticed; the IPC heartbeat and the
 /// FSM timers are all shorter than this in the default configuration.
 const IDLE_TICK: Duration = Duration::from_millis(50);
-/// Backoff before a crashed agent is respawned.
 const RESTART_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(8);
+const RESTART_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const RESTART_CIRCUIT_FAILURES: usize = 3;
+fn record_restart_failure(failures: &mut VecDeque<Instant>, now: Instant) -> bool {
+    while failures
+        .front()
+        .is_some_and(|failed| now.duration_since(*failed) > RESTART_FAILURE_WINDOW)
+    {
+        failures.pop_front();
+    }
+    failures.push_back(now);
+    failures.len() >= RESTART_CIRCUIT_FAILURES
+}
+fn next_restart_backoff(current: Duration) -> Duration {
+    (current * 2).min(MAX_RESTART_BACKOFF)
+}
+
 /// How long a `layout edit`/`layout apply` waits for the coordinator's verdict before its
 /// connection is told the verdict has not arrived (`PENDING_VERDICT`).
 ///
@@ -99,6 +115,16 @@ pub struct Session {
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
     agent_restart_due: Option<Instant>,
+    /// Recent automatic restart failures, used by the circuit breaker.
+    agent_restart_failures: VecDeque<Instant>,
+    /// Exponential delay after unsuccessful restart attempts.
+    agent_restart_backoff: Duration,
+    /// Automatic restarts stop here until the user explicitly retries.
+    agent_restart_circuit_open: bool,
+    /// First typed portal/backend error, preserved across automatic restarts.
+    agent_degraded_reason: String,
+    /// Once a portal fails, automatic launches must not open another portal session.
+    portal_failure: bool,
     /// Whether core told the FSM about the current agent loss.
     agent_lost_reported: bool,
     /// The last agent `AgentError`/portal hint, shown by `status`
@@ -231,6 +257,11 @@ impl Session {
             next_layout_nonce: 0,
             stopping: false,
             agent_restart_due: None,
+            agent_restart_failures: VecDeque::new(),
+            agent_restart_backoff: RESTART_BACKOFF,
+            agent_restart_circuit_open: false,
+            agent_degraded_reason: String::new(),
+            portal_failure: false,
             agent_lost_reported: false,
             topology: None,
             layout,
@@ -1605,6 +1636,15 @@ impl Session {
             return Ok(());
         };
         tracing::info!(frame = routing::agent_frame_name(&message), "agent -> core");
+        if let Msg::Error(error) = &message {
+            if error.code.starts_with("PORTAL_") {
+                self.portal_failure = true;
+                self.agent.set_portal_sessions_allowed(false);
+                if self.agent_degraded_reason.is_empty() {
+                    self.agent_degraded_reason = format!("{}: {}", error.code, error.detail.trim());
+                }
+            }
+        }
         // `status` shows the last thing the agent had to report; the note is derived
         // from the frame and never contains a token (`routing::agent_note`).
         if let Some(note) = routing::agent_note(&message) {
@@ -1640,8 +1680,11 @@ impl Session {
                     self.agent_restart_due = None;
                     // A new session starts with a clean slate; the previous crash's
                     // error is not this session's state.
-                    self.refusal = None;
-                    self.portal_state.clear();
+                    if !self.portal_failure && !self.agent_restart_circuit_open {
+                        self.refusal = None;
+                        self.portal_state.clear();
+                        self.agent_degraded_reason.clear();
+                    }
                 }
                 self.feed(fr::Input::Agent(event)).await;
             }
@@ -1671,9 +1714,9 @@ impl Session {
                     detail = detail.as_str(),
                     "portal"
                 );
-                // A dialog is on screen: the GUI says so instead of showing a node that
-                // looks broken while it waits for the user.
                 self.portal_state = "permission_required".to_owned();
+                self.agent_degraded_reason =
+                    format!("Ожидание разрешения портала: {interface} ({detail})");
             }
             AgentSignal::Grant(changed) => self.on_portal_grant(changed).await,
             AgentSignal::Ignored => {}
@@ -1908,15 +1951,26 @@ impl Session {
         if self.agent_lost_reported {
             return;
         }
+        for grant in self.agent.drain_portal_grants().await {
+            self.on_portal_grant(grant).await;
+        }
         self.agent_lost_reported = true;
-        self.agent.mark_lost();
-        tracing::warn!("agent lost; telling the FSM and restarting in RECOVERY");
+        self.agent.stop().await;
         self.feed(fr::Input::Agent(fr::AgentEvent::AgentLost)).await;
-        self.restart_agent().await;
+        if record_restart_failure(&mut self.agent_restart_failures, Instant::now()) {
+            self.open_restart_circuit("agent lost three times within 60 seconds");
+            return;
+        }
+        tracing::warn!("agent lost; scheduling a RECOVERY restart");
+        self.agent_restart_due = Some(Instant::now() + self.agent_restart_backoff);
+        self.agent_restart_backoff = next_restart_backoff(self.agent_restart_backoff);
     }
 
     /// The `RECOVERY` restart from core's conservative ledger.
     async fn restart_agent(&mut self) {
+        if self.agent_restart_circuit_open {
+            return;
+        }
         let keys: Vec<input_model::HidKey> = self.router.pressed().keys().collect();
         let buttons: Vec<input_model::MouseButton> = self.router.pressed().buttons().collect();
         tracing::info!(
@@ -1926,15 +1980,53 @@ impl Session {
         );
         match self.agent.restart_recovery(&keys, &buttons).await {
             Ok(_) => {
-                // The fresh `NORMAL` agent reports `AgentReady`, which clears
-                // `Blocked` and finishes the recovery (S4). Its channel is new, and the
-                // supervisor marked the launch, so the heartbeat's clock starts at that
-                // agent's first frame rather than at the instant the restart finished.
                 self.agent_lost_reported = false;
             }
             Err(error) => {
-                tracing::error!(%error, "agent restart failed; retrying");
-                self.agent_restart_due = Some(Instant::now() + RESTART_BACKOFF);
+                tracing::error!(%error, "agent restart failed");
+                if record_restart_failure(&mut self.agent_restart_failures, Instant::now()) {
+                    self.open_restart_circuit("agent restart failed three times within 60 seconds");
+                } else {
+                    self.agent_restart_due = Some(Instant::now() + self.agent_restart_backoff);
+                    self.agent_restart_backoff = next_restart_backoff(self.agent_restart_backoff);
+                }
+            }
+        }
+    }
+
+    fn open_restart_circuit(&mut self, reason: &str) {
+        self.agent_restart_circuit_open = true;
+        self.agent_restart_due = None;
+        self.agent_degraded_reason =
+            format!("Ввод остановлен: {reason}; нажмите «Повторить» для ручного запуска");
+        tracing::error!(reason, "agent restart circuit breaker opened");
+    }
+    async fn retry_agent(&mut self) -> protocol::ipc::OpResult {
+        self.agent_restart_circuit_open = false;
+        self.agent_restart_failures.clear();
+        self.agent_restart_backoff = RESTART_BACKOFF;
+        self.agent_restart_due = None;
+        self.portal_failure = false;
+        self.agent.set_portal_sessions_allowed(true);
+        self.agent_degraded_reason.clear();
+        self.refusal = None;
+        self.portal_state.clear();
+        let keys: Vec<input_model::HidKey> = self.router.pressed().keys().collect();
+        let buttons: Vec<input_model::MouseButton> = self.router.pressed().buttons().collect();
+        match self.agent.restart_recovery(&keys, &buttons).await {
+            Ok(_) => {
+                self.agent_lost_reported = false;
+                protocol::ipc::OpResult {
+                    ok: true,
+                    error_code: String::new(),
+                }
+            }
+            Err(error) => {
+                self.agent_degraded_reason = format!("manual retry failed: {error}");
+                protocol::ipc::OpResult {
+                    ok: false,
+                    error_code: "AGENT_RETRY_FAILED".to_owned(),
+                }
             }
         }
     }
@@ -2442,6 +2534,73 @@ fn validate_layout_toml(layout_toml: &str) -> Result<(), String> {
 #[cfg(test)]
 mod timer_tests {
     use super::*;
+
+    #[test]
+    fn three_restart_failures_open_the_circuit_only_inside_the_window() {
+        let start = Instant::now();
+        let mut failures = VecDeque::new();
+        assert!(!record_restart_failure(&mut failures, start));
+        assert!(!record_restart_failure(
+            &mut failures,
+            start + Duration::from_secs(10)
+        ));
+        assert!(record_restart_failure(
+            &mut failures,
+            start + Duration::from_secs(20)
+        ));
+
+        let mut failures = VecDeque::new();
+        assert!(!record_restart_failure(&mut failures, start));
+        assert!(!record_restart_failure(
+            &mut failures,
+            start + RESTART_FAILURE_WINDOW + Duration::from_millis(1)
+        ));
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn restart_policy_stops_retries_instead_of_spawning_a_ten_second_storm() {
+        let start = Instant::now();
+        let mut failures = VecDeque::new();
+        let mut backoff = RESTART_BACKOFF;
+        let mut now = start;
+        let mut automatic_spawns = 0;
+        while !record_restart_failure(&mut failures, now)
+            && now.duration_since(start) < Duration::from_secs(10)
+        {
+            now += backoff;
+            automatic_spawns += 1;
+            backoff = next_restart_backoff(backoff);
+        }
+        assert_eq!(automatic_spawns, 2);
+        assert!(now.duration_since(start) < Duration::from_secs(10));
+        assert_eq!(backoff, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn restart_backoff_doubles_and_caps_at_eight_seconds() {
+        let delays = (0..5)
+            .scan(RESTART_BACKOFF, |current, _| {
+                let next = *current;
+                *current = next_restart_backoff(next);
+                Some(next)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ]
+        );
+        assert_eq!(
+            next_restart_backoff(Duration::from_secs(8)),
+            Duration::from_secs(8)
+        );
+    }
 
     #[test]
     fn a_timer_fires_once_at_its_deadline() {

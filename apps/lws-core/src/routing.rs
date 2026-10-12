@@ -173,6 +173,7 @@ pub fn attach(
     takeover_detection: ipc::TakeoverDetection,
     takeover_threshold_px: u32,
     repeat_mode: ipc::RepeatMode,
+    allow_portal_sessions: bool,
 ) -> ipc::AgentAttach {
     ipc::AgentAttach {
         launch_token,
@@ -187,6 +188,7 @@ pub fn attach(
         takeover_detection: takeover_detection as i32,
         takeover_threshold_px,
         repeat_mode: repeat_mode as i32,
+        allow_portal_sessions: allow_portal_sessions && mode != ipc::AgentMode::Recovery,
     }
 }
 
@@ -708,6 +710,26 @@ mod tests {
 
     fn lease(byte: u8) -> [u8; 16] {
         [byte; 16]
+    }
+    #[test]
+    fn recovery_attach_never_allows_portal_sessions() {
+        let make = |mode| {
+            attach(
+                vec![0; 32],
+                mode,
+                "",
+                ipc::BackendKind::Auto,
+                300,
+                false,
+                Vec::new(),
+                ipc::TakeoverDetection::Auto,
+                12,
+                ipc::RepeatMode::ReceiverNative,
+                true,
+            )
+        };
+        assert!(!make(ipc::AgentMode::Recovery).allow_portal_sessions);
+        assert!(make(ipc::AgentMode::Normal).allow_portal_sessions);
     }
 
     #[test]
