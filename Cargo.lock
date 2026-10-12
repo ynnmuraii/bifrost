@@ -1773,9 +1773,11 @@ dependencies = [
  "input-model",
  "protocol",
  "rustls",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@ use focus_router as fr;
 use geometry::NodeId;
 use identity::{peer_node_id, trust::TrustStore, NodeIdentity};
 use protocol::wire;
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -346,23 +346,77 @@ impl LinkManager {
     }
 }
 
-/// Binds the link listener with `SO_REUSEADDR`.
+/// Binds the link listener, refusing to share the port with any other socket.
 ///
-/// `std`/`tokio` set it on Unix but **not** on Windows, where a restart of core within the
-/// TIME_WAIT window of a previous connection fails with `WSAEADDRINUSE` (10048) — a core
-/// that cannot rebind its port after a crash restarts into a permanent failure, which is
-/// exactly the case the backoff loop is for. Reuse address says "bind even though a
-/// connection from that port is still lingering", not "share the port with a live
-/// listener", so it does not weaken the single-instance property the docs rely on.
+/// Unix: `SO_REUSEADDR`, which is what `std`/`tokio` already set there — it only allows a
+/// bind while *closed* connections linger in `TIME_WAIT`, and on Unix a second live listener
+/// still fails with `EADDRINUSE`.
+///
+/// Windows: `SO_EXCLUSIVEADDRUSE`, **not** `SO_REUSEADDR`. The two names are misleadingly
+/// similar and their Windows meanings are nearly opposite (Microsoft, «Using SO_REUSEADDR
+/// and SO_EXCLUSIVEADDRUSE»): with `SO_REUSEADDR` a *second, unprivileged* local process can
+/// bind a port that a live listener is already using and take over its traffic — so every
+/// dial a peer makes to `47901` could be delivered to a hijacker instead of to core. Core
+/// holds exactly one listener per port (docs/05-protocol.md: both nodes listen on `47901`;
+/// docs/07-quality-security.md treats a second instance as an error, not as a peer), and
+/// `SO_EXCLUSIVEADDRUSE` is how the OS enforces that: the second bind fails with
+/// `WSAEADDRINUSE` (10048) instead of silently stealing the port. It also keeps `TIME_WAIT`
+/// connections made *by* this port from blocking the rebind, so a core that restarts after a
+/// crash still comes up; a bind that fails while another core is alive is the answer we want
+/// (the error is reported as `the link manager stopped: … os error 10048` instead of a
+/// silent takeover), not a case to paper over. That failure is not retried: the manager
+/// stops and the core keeps running without links, so the losing core has to be restarted.
 async fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
-    let socket = if address.is_ipv4() {
-        TcpSocket::new_v4()?
+    let domain = if address.is_ipv4() {
+        socket2::Domain::IPV4
     } else {
-        TcpSocket::new_v6()?
+        socket2::Domain::IPV6
     };
-    socket.set_reuseaddr(true)?;
-    socket.bind(address)?;
-    socket.listen(1024)
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if address.is_ipv6() {
+        // Parity with the previous `TcpSocket::new_v6` default.
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    #[cfg(windows)]
+    set_exclusive_address_use(&socket)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+
+    let listener = std::net::TcpListener::from(socket);
+    // `TcpListener::from_std` requires the caller to have set the mode.
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener)
+}
+
+/// Windows: `SO_EXCLUSIVEADDRUSE`, the option that actually means «this port is mine».
+///
+/// Neither `tokio::net::TcpSocket` nor `socket2` 0.6 exposes it, and `SO_REUSEADDR` is its
+/// opposite on Windows — a socket that sets *it* may bind over a live listener. One
+/// `setsockopt` call is cheaper than a whole option-poking dependency.
+#[cfg(windows)]
+fn set_exclusive_address_use(socket: &socket2::Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock;
+
+    let enabled: u32 = 1;
+    // SAFETY: `setsockopt` only reads `enabled` (a live local) and
+    // `size_of::<u32>()` bytes of it; the socket handle comes from a live `socket2::Socket`.
+    let result = unsafe {
+        WinSock::setsockopt(
+            socket.as_raw_socket() as WinSock::SOCKET,
+            WinSock::SOL_SOCKET,
+            WinSock::SO_EXCLUSIVEADDRUSE,
+            std::ptr::addr_of!(enabled).cast(),
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 async fn accept_one(
@@ -501,13 +555,37 @@ async fn start_link(
 mod tests {
     use super::*;
 
-    /// A core that restarts immediately after it had connections on its port must be able
-    /// to bind that port again.
+    /// The port belongs to exactly one listener, even to a process that asks to share it.
     ///
-    /// Windows keeps an accepted connection's local port in `TIME_WAIT` and `std`/`tokio`
-    /// do not set `SO_REUSEADDR` there, so without [`bind_listener`] the second bind fails
-    /// with `WSAEADDRINUSE` — which is what made a loopback smoke of two cores fail with
-    /// «the link manager stopped: link i/o error: … os error 10048».
+    /// On Windows `SO_REUSEADDR` lets a *second* socket bind a port a live listener is using
+    /// — that is the hijack [`bind_listener`] refuses by setting `SO_EXCLUSIVEADDRUSE`, and
+    /// this test performs the hijack attempt (it binds with `SO_REUSEADDR` set). On Unix a
+    /// second live bind fails either way.
+    #[tokio::test]
+    async fn a_live_listener_cannot_be_bound_over() {
+        let first = bind_listener("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+        let address = first.local_addr().expect("local address");
+
+        let hijack = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("socket");
+        hijack.set_reuse_address(true).expect("SO_REUSEADDR");
+        let result = hijack.bind(&address.into());
+
+        assert!(
+            result.is_err(),
+            "a second bind of {address} was allowed while core is listening on it"
+        );
+    }
+
+    /// A core that restarts after it had connections on its port must be able to bind that
+    /// port again — the whole point of the exclusive flag is that it refuses *live*
+    /// competition, not that it keeps a dead core's port reserved.
     #[tokio::test]
     async fn the_listener_rebinds_after_a_connection() {
         let first = bind_listener("127.0.0.1:0".parse().expect("addr"))
