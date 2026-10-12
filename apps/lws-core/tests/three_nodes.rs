@@ -195,8 +195,16 @@ fn a_chain_walks_two_leases_without_a_relay() {
             status.focus == "Remote"
         })
         .expect("a must receive");
-    // Lease two, straight from the owner: `w` -> `b`. `a` is released on the way, so the
-    // middle node is never part of the input path.
+    // The chain re-targets *after* the release, exactly like the pending-target walk: a
+    // switch while `Remote` is the return edge (`scenarios.rs::s07`), so the lease to `b`
+    // starts from `Local`.
+    cluster.switch(0, 1).expect("w returns");
+    cluster
+        .node(0)
+        .wait_for("w is Local again", Duration::from_secs(10), |s| s.is_idle())
+        .expect("the first lease must be released");
+    // Lease two, straight from the owner: `w` -> `b`. `a` is out of the path, and the
+    // middle node sends no input of its own.
     cluster.switch(0, 2).expect("w switches to b");
     cluster
         .node(2)
@@ -204,10 +212,6 @@ fn a_chain_walks_two_leases_without_a_relay() {
             status.focus == "Remote"
         })
         .expect("b must receive");
-    cluster
-        .node(1)
-        .wait_for("a is released", Duration::from_secs(10), |s| s.is_idle())
-        .expect("a must return to Local");
     let owners = cluster.owners();
     assert!(
         owners.iter().all(|reported| reported == &owner),
@@ -255,6 +259,11 @@ fn a_thousand_chain_transitions_keep_the_owner() {
                 s.focus == "Remote"
             })
             .expect("a must receive");
+        cluster.switch(0, 1).expect("return from a");
+        cluster
+            .node(0)
+            .wait_for("w is Local", Duration::from_secs(15), |s| s.is_idle())
+            .expect("the first lease must be released");
         cluster.switch(0, 2).expect("switch to b");
         cluster
             .node(2)

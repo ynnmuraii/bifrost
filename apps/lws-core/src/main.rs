@@ -127,6 +127,8 @@ COMMANDS:
     peers    list trusted peers, or --revoke <node id>
     status   ask a running core for its state
     switch   manual transition: to a peer while local, back to local while remote
+    claim    take ownership of the workspace on this node
+    abandon  give up ownership and stay a follower
     layout   the layout document: show | edit <file> | apply | discard
 ";
 
@@ -225,6 +227,10 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
                 .ok_or_else(|| Failure::Usage("switch needs a peer".to_owned()))?;
             control(&args.paths, &format!("switch {peer}"))
         }
+        // `GuiFrame.ClaimOwnership`/`AbandonOwnership` through the same line protocol the
+        // GUI will use; the three-node harness claims from a script with these.
+        "claim" => control(&args.paths, "claim"),
+        "abandon" => control(&args.paths, "abandon"),
         other => Err(Failure::Usage(format!("unknown command {other:?}"))),
     }
 }
