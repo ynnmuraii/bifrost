@@ -609,14 +609,22 @@ impl Lan {
         options
     }
 
-    /// The chosen address if it remains available, otherwise the first LAN address.
+    /// The picked address, or the valid configured address, or a replacement for a bad one.
     pub fn selected(&self, current: &str) -> Option<String> {
         let options = self.options(current);
-        self.choice
+        if let Some(choice) = self
+            .choice
             .as_ref()
             .filter(|choice| options.contains(choice))
-            .cloned()
-            .or_else(|| options.into_iter().next())
+        {
+            return Some(choice.clone());
+        }
+        if options.iter().any(|option| option == current) {
+            return Some(current.to_owned());
+        }
+        (!current.is_empty())
+            .then(|| options.into_iter().next())
+            .flatten()
     }
 }
 
