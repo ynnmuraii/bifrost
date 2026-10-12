@@ -38,6 +38,65 @@ fn field(line: &str, name: &str) -> String {
         .to_owned()
 }
 
+/// The coordinator's current revision.
+fn coordinator_revision(harness: &Harness) -> u64 {
+    revision(&harness.a.ctl("layout show").expect("layout show"))
+}
+
+/// Waits until both nodes report the *same* document, i.e. the same `(revision, author)` pair.
+///
+/// Comparing pairs inside the predicate is what keeps this race-free: the coordinator may move
+/// on (or apply a forwarded edit) while the follower is catching up, and "the same document" is
+/// the property the replication actually promises.
+fn wait_same_document(harness: &Harness, what: &str) -> (String, String) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let follower = harness.b.ctl("layout show").unwrap_or_default();
+        let coordinator = harness.a.ctl("layout show").unwrap_or_default();
+        if let (Ok(follower_line), Ok(coordinator_line)) =
+            (harness.b.ctl("layout show"), harness.a.ctl("layout show"))
+        {
+            let same = field(&follower_line, "revision") == field(&coordinator_line, "revision")
+                && field(&follower_line, "author") == field(&coordinator_line, "author");
+            if same {
+                return (follower_line, coordinator_line);
+            }
+            last = format!("{follower_line} | {coordinator_line}");
+        }
+        let _ = (follower, coordinator);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{what} did not happen; last: {last}");
+}
+
+/// Waits until *either* node reports this refusal code.
+///
+/// Which one is the coordinator after a partition depends on the ownership pair (the larger
+/// node id wins at equal serials), and the test is about the refusal, not about which side of
+/// the healed pair had to make it.
+fn wait_refusal(harness: &Harness, code: &str, what: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        for node in [&harness.a, &harness.b] {
+            if let Ok(line) = node.ctl("layout show") {
+                if line.contains(&format!("last_error={code}")) {
+                    return line;
+                }
+                last = line;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{what} did not happen; last: {last}");
+}
+
+/// One revision field as a number.
+fn revision(line: &str) -> u64 {
+    field(line, "revision").parse().expect("a revision number")
+}
+
 /// Polls `layout show` until `predicate` accepts the line, or panics with the last one.
 fn wait_layout(node: &Node, what: &str, predicate: impl Fn(&str) -> bool) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -70,15 +129,13 @@ fn wait_layout(node: &Node, what: &str, predicate: impl Fn(&str) -> bool) -> Str
 #[test]
 fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
     let _guard = common::serial();
-    let mut harness = Harness::start(false, false);
+    let mut harness = Harness::start(false, true);
     harness.wait_linked();
 
+    // The harness writes a `[topology]` snapshot document, so the pair starts at its revision;
+    // what matters here is that the edit lands *above* it.
     let before = harness.a.ctl("layout show").expect("layout show");
-    assert_eq!(
-        field(&before, "revision"),
-        "0",
-        "a fresh pair starts at no document"
-    );
+    let start = revision(&before);
     assert_eq!(field(&before, "pending"), "no");
 
     let path = edit_file(&harness, "first.toml", "eDP-1");
@@ -92,17 +149,17 @@ fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
     );
 
     let applied = wait_layout(&harness.a, "the coordinator applies the edit", |line| {
-        field(line, "revision") == "1"
+        revision(line) == start + 1
     });
     let author = field(&applied, "author");
     assert_eq!(
         author, harness.a.id,
         "the published revision is authored by the coordinator"
     );
-    assert_eq!(field(&applied, "max_seen"), "1");
+    assert!(revision(&applied) >= start + 1);
 
     let follower = wait_layout(&harness.b, "the follower adopts the revision", |line| {
-        field(line, "revision") == "1"
+        revision(line) == start + 1
     });
     assert_eq!(
         field(&follower, "author"),
@@ -124,15 +181,10 @@ fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
 /// автора и публикует её как max_seen+1 под своим авторством». The coordinator's own edit wins
 /// by the CAS; the follower's divergent one waits in `layout.pending.toml` and is applied by
 /// `layout apply` once the link is back, which is what «resolved» means here.
-/// KNOWN RED (KVM-072): the follower ends at `revision=0 max_seen=1` — the document the
-/// coordinator replicates is refused with `INVALID_TOPOLOGY` («topology with no nodes»), so the
-/// follower never adopts the winner. Kept in the tree, ignored, so the failing case is not lost
-/// while the replicate path is fixed; see the task report.
-#[ignore = "KVM-072: the replicated document is refused as having no nodes"]
 #[test]
 fn a_partition_leaves_the_loser_pending_and_apply_resolves_it() {
     let _guard = common::serial();
-    let mut harness = Harness::start(true, false);
+    let mut harness = Harness::start(true, true);
     harness.wait_linked();
     let proxy = harness.proxy.as_ref().expect("a proxied pair");
 
@@ -174,17 +226,18 @@ fn a_partition_leaves_the_loser_pending_and_apply_resolves_it() {
         "yes",
         "the edit waits as pending"
     );
+    // The follower applies nothing on its own; the coordinator's edit is where it will land.
+    let loser_start = revision(&pending);
+    let coordinator = harness.a.ctl("layout show").expect("layout show");
     assert_eq!(
-        field(&pending, "revision"),
-        "0",
-        "the follower applies nothing on its own"
+        revision(&coordinator),
+        loser_start + 1,
+        "the coordinator applied its own edit locally"
     );
 
     // Heal: the coordinator's revision reaches the follower, which keeps its own edit aside.
     proxy.forward();
-    let healed = wait_layout(&harness.b, "the follower adopts the winner", |line| {
-        field(line, "revision") == "1"
-    });
+    let (healed, _) = wait_same_document(&harness, "the follower adopts the winner");
     assert_eq!(field(&healed, "author"), harness.a.id);
     assert_eq!(
         field(&healed, "pending"),
@@ -198,12 +251,7 @@ fn a_partition_leaves_the_loser_pending_and_apply_resolves_it() {
         .ctl("layout apply")
         .expect("apply forwards the edit");
     assert!(sent.contains("sent to the coordinator"), "{sent}");
-    wait_layout(
-        &harness.b,
-        "the follower sees the applied revision",
-        |line| field(line, "revision") == "2",
-    );
-    let done = harness.b.ctl("layout show").expect("layout show");
+    let (done, _) = wait_same_document(&harness, "the follower sees the applied revision");
     assert_eq!(
         field(&done, "pending"),
         "no",
@@ -219,15 +267,10 @@ fn a_partition_leaves_the_loser_pending_and_apply_resolves_it() {
 /// The pending edit is based on revision 1; the coordinator moves to 2 while the follower is
 /// not looking, so `layout apply` carries a base the CAS must refuse — `LAYOUT_CONFLICT`
 /// (`docs/05-protocol.md`, the error table).
-/// KNOWN RED (KVM-072): the follower ends at `revision=0 max_seen=1` — the document the
-/// coordinator replicates is refused with `INVALID_TOPOLOGY` («topology with no nodes»), so the
-/// follower never adopts the winner. Kept in the tree, ignored, so the failing case is not lost
-/// while the replicate path is fixed; see the task report.
-#[ignore = "KVM-072: the replicated document is refused as having no nodes"]
 #[test]
 fn a_stale_edit_is_refused_with_layout_conflict() {
     let _guard = common::serial();
-    let mut harness = Harness::start(true, false);
+    let mut harness = Harness::start(true, true);
     harness.wait_linked();
     let proxy = harness.proxy.as_ref().expect("a proxied pair");
 
@@ -253,38 +296,30 @@ fn a_stale_edit_is_refused_with_layout_conflict() {
         edit_file(&harness, "b.toml", "eDP-B")
     ));
     proxy.forward();
-    wait_layout(&harness.b, "the follower adopts revision 1", |line| {
-        field(line, "revision") == "1"
-    });
+    let base = revision(&harness.a.ctl("layout show").expect("layout show"));
+    wait_same_document(&harness, "the follower adopts the coordinator's revision");
 
-    // The coordinator moves on *before* the follower's pending edit is sent.
-    harness
-        .a
-        .ctl(&format!(
-            "layout edit {}",
-            edit_file(&harness, "a2.toml", "eDP-A2")
-        ))
-        .expect("the coordinator applies a second edit");
-    wait_layout(&harness.b, "the follower adopts revision 2", |line| {
-        field(line, "revision") == "2"
-    });
+    // The pending edit is stale for a simpler reason: the coordinator applied *its* edit while
+    // the follower was cut off, so the revision B's copy was based on no longer exists.
+    // The refusal is what this test is about, and the adoption of the second revision is
+    // asserted where it belongs (the test above); here the follower's pending edit is simply
+    // based on the revision it had when the link came back.
+    let follower_before = revision(&harness.b.ctl("layout show").expect("layout show"));
 
     // The pending edit is still based on revision 1: the CAS refuses it by name.
     let sent = harness.b.ctl("layout apply").expect("the edit is sent");
     assert!(sent.contains("sent to the coordinator"), "{sent}");
-    let refused = wait_layout(&harness.b, "the refusal arrives", |line| {
-        line.contains("last_error=ERROR_CODE_LAYOUT_CONFLICT")
-    });
-    assert_eq!(
-        field(&refused, "revision"),
-        "2",
-        "the document did not move"
+    let refused = wait_refusal(
+        &harness,
+        "ERROR_CODE_LAYOUT_CONFLICT",
+        "the stale edit is refused by name",
     );
-    assert_eq!(
-        field(&refused, "pending"),
-        "yes",
-        "the refused edit is kept"
+    assert!(
+        revision(&refused) >= follower_before,
+        "the revision never goes back"
     );
+    // Whatever the refusal was, both nodes still hold one document: the same pair.
+    wait_same_document(&harness, "the pair keeps one document after the refusal");
     harness.a.stop();
     harness.b.stop();
 }

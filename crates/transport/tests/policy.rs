@@ -163,7 +163,10 @@ fn the_reconnect_schedule_stays_inside_half_a_second_to_five_seconds() {
 #[test]
 fn liveness_pings_after_the_period_and_goes_offline_after_the_timeout() {
     // Nothing sent yet: the first check wants a Ping immediately.
-    assert_eq!(liveness_action(1_000, 1_000, None, LIVENESS), LivenessAction::Ping);
+    assert_eq!(
+        liveness_action(1_000, 1_000, None, LIVENESS),
+        LivenessAction::Ping
+    );
 
     // A Ping that is younger than the period suppresses the next one.
     assert_eq!(
@@ -195,7 +198,10 @@ fn liveness_pings_after_the_period_and_goes_offline_after_the_timeout() {
     );
 
     // A fresh Pong resets the offline clock.
-    assert_eq!(liveness_action(8_000, 7_999, None, LIVENESS), LivenessAction::Ping);
+    assert_eq!(
+        liveness_action(8_000, 7_999, None, LIVENESS),
+        LivenessAction::Ping
+    );
 }
 
 #[test]
