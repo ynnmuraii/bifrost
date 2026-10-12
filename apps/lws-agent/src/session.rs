@@ -1355,100 +1355,108 @@ mod tests {
     /// `SetClipboardText` arm behind the same loop that services the deadline and the watchdog.
     #[tokio::test]
     async fn the_running_loop_reports_a_local_copy_and_applies_what_core_sends() {
-        let dir = temp_dir("loop");
-        let in_path = dir.join("in.txt");
-        let out_path = dir.join("out.txt");
-        let (agent_io, core_io) = duplex(256 * 1024);
-        let (mut backend, ready, _refusals) = Backend::select(
-            BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
-            true,
-            0,
-            false,
-            Some(dir),
-            HOTKEY,
-            &[],
-            ::protocol::ipc::TakeoverDetection::Auto,
-            12,
-        )
-        .await;
-        let mut agent = AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR);
-        let mut core = AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR);
-        // 500 ms is the widest the watchdog accepts; the test stays well inside it.
-        let mut watchdog = Watchdog::for_core_silence_ms(500, 0).expect("500 ms is in range");
-        let started = Instant::now();
-        let running = tokio::spawn(async move {
-            loop_forever(
-                &mut agent,
-                &mut backend,
-                &ready,
-                AgentMode::Normal as i32,
-                ::protocol::ipc::RepeatMode::ReceiverSoftware as i32,
-                &mut watchdog,
-                started,
-            )
-            .await
-        });
+        // `Backend` holds the portal streams on Linux, which are not `Send`, so the loop is
+        // driven on a local set: the same task, no cross-thread bound to satisfy.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dir = temp_dir("loop");
+                let in_path = dir.join("in.txt");
+                let out_path = dir.join("out.txt");
+                let (agent_io, core_io) = duplex(256 * 1024);
+                let (mut backend, ready, _refusals) = Backend::select(
+                    BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
+                    true,
+                    0,
+                    false,
+                    Some(dir),
+                    HOTKEY,
+                    &[],
+                    ::protocol::ipc::TakeoverDetection::Auto,
+                    12,
+                )
+                .await;
+                let mut agent = AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR);
+                let mut core = AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR);
+                // 500 ms is the widest the watchdog accepts; the test stays well inside it.
+                let mut watchdog =
+                    Watchdog::for_core_silence_ms(500, 0).expect("500 ms is in range");
+                let started = Instant::now();
+                let running = tokio::task::spawn_local(async move {
+                    loop_forever(
+                        &mut agent,
+                        &mut backend,
+                        &ready,
+                        AgentMode::Normal as i32,
+                        ::protocol::ipc::RepeatMode::ReceiverSoftware as i32,
+                        &mut watchdog,
+                        started,
+                    )
+                    .await
+                });
 
-        // 1. A copy the user makes, with the markers a password manager would set. Nothing has
-        //    been applied from core yet, so it is the first version on the wire.
-        std::fs::write(&in_path, "typed into the file").expect("in.txt is writable");
-        std::fs::write(dir_join(&in_path, "in.markers"), "kde_secret").expect("in.markers");
-        match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {
-            Ok(Ok(frame)) => match frame.msg.expect("a payload") {
-                Msg::ClipboardChanged(changed) => {
-                    assert_eq!(changed.data, b"typed into the file");
-                    assert_eq!(changed.markers, vec!["kde_secret"]);
-                    assert_eq!(changed.origin_version, 1);
-                    assert_eq!(changed.chunk_count, 1);
+                // 1. A copy the user makes, with the markers a password manager would set. Nothing has
+                //    been applied from core yet, so it is the first version on the wire.
+                std::fs::write(&in_path, "typed into the file").expect("in.txt is writable");
+                std::fs::write(dir_join(&in_path, "in.markers"), "kde_secret").expect("in.markers");
+                match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {
+                    Ok(Ok(frame)) => match frame.msg.expect("a payload") {
+                        Msg::ClipboardChanged(changed) => {
+                            assert_eq!(changed.data, b"typed into the file");
+                            assert_eq!(changed.markers, vec!["kde_secret"]);
+                            assert_eq!(changed.origin_version, 1);
+                            assert_eq!(changed.chunk_count, 1);
+                        }
+                        other => panic!("expected ClipboardChanged, got {other:?}"),
+                    },
+                    Ok(Err(error)) => panic!("the link ended: {error}"),
+                    Err(_) => panic!("the local copy never reached core"),
                 }
-                other => panic!("expected ClipboardChanged, got {other:?}"),
-            },
-            Ok(Err(error)) => panic!("the link ended: {error}"),
-            Err(_) => panic!("the local copy never reached core"),
-        }
 
-        // 2. Core applies a payload of its own: it lands on the selection, and the next local
-        //    change is numbered above the version core used.
-        core.send(set_text(9, "from core"))
-            .await
-            .expect("the frame goes out");
-        let mut applied = false;
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            if read(&out_path) == "from core" {
-                applied = true;
-                break;
-            }
-        }
-        assert!(applied, "the payload core sent lands on the selection");
-
-        std::fs::write(&in_path, "a second copy").expect("in.txt is writable");
-        match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {
-            Ok(Ok(frame)) => match frame.msg.expect("a payload") {
-                Msg::ClipboardChanged(changed) => {
-                    assert_eq!(changed.data, b"a second copy");
-                    assert_eq!(
-                        changed.origin_version, 10,
-                        "strictly above the 9 core applied"
-                    );
+                // 2. Core applies a payload of its own: it lands on the selection, and the next local
+                //    change is numbered above the version core used.
+                core.send(set_text(9, "from core"))
+                    .await
+                    .expect("the frame goes out");
+                let mut applied = false;
+                for _ in 0..100 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    if read(&out_path) == "from core" {
+                        applied = true;
+                        break;
+                    }
                 }
-                other => panic!("expected ClipboardChanged, got {other:?}"),
-            },
-            Ok(Err(error)) => panic!("the link ended: {error}"),
-            Err(_) => panic!("the second copy never reached core"),
-        }
+                assert!(applied, "the payload core sent lands on the selection");
 
-        core.send(Msg::Shutdown(ipc::AgentShutdown {}))
-            .await
-            .expect("shutdown goes out");
-        let stop = tokio::time::timeout(Duration::from_secs(2), running)
-            .await
-            .expect("the loop ends on Shutdown")
-            .expect("the task does not panic");
-        assert!(
-            matches!(stop, Ok(Stop::Shutdown)),
-            "the loop ends on Shutdown, not on a lost core"
-        );
+                std::fs::write(&in_path, "a second copy").expect("in.txt is writable");
+                match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {
+                    Ok(Ok(frame)) => match frame.msg.expect("a payload") {
+                        Msg::ClipboardChanged(changed) => {
+                            assert_eq!(changed.data, b"a second copy");
+                            assert_eq!(
+                                changed.origin_version, 10,
+                                "strictly above the 9 core applied"
+                            );
+                        }
+                        other => panic!("expected ClipboardChanged, got {other:?}"),
+                    },
+                    Ok(Err(error)) => panic!("the link ended: {error}"),
+                    Err(_) => panic!("the second copy never reached core"),
+                }
+
+                core.send(Msg::Shutdown(ipc::AgentShutdown {}))
+                    .await
+                    .expect("shutdown goes out");
+                let stop = tokio::time::timeout(Duration::from_secs(2), running)
+                    .await
+                    .expect("the loop ends on Shutdown")
+                    .expect("the task does not panic");
+                assert!(
+                    matches!(stop, Ok(Stop::Shutdown)),
+                    "the loop ends on Shutdown, not on a lost core"
+                );
+            })
+            .await;
     }
 
     /// `dir.join` for the sibling file the test writes, so the intent stays visible.

@@ -731,10 +731,10 @@ impl Backend {
             Backend::Win(backend) => backend.clipboard_available(),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.clipboard_available(),
-            // The portal clipboard is not implemented in this build (KVM-041), and a session
-            // that says otherwise would be lying to core.
+            // `platform-wayland` answers for itself: the portal clipboard is not implemented
+            // in this build, so a Wayland session reports no clipboard (KVM-041).
             #[cfg(target_os = "linux")]
-            Backend::Wayland(_) => false,
+            Backend::Wayland(backend) => backend.clipboard_available(),
         }
     }
 
@@ -754,7 +754,7 @@ impl Backend {
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.clipboard_change(),
             #[cfg(target_os = "linux")]
-            Backend::Wayland(_) => None,
+            Backend::Wayland(backend) => backend.clipboard_change(),
         }
     }
 
@@ -770,10 +770,7 @@ impl Backend {
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.set_clipboard(text),
             #[cfg(target_os = "linux")]
-            Backend::Wayland(_) => Err(
-                "CLIPBOARD_DISABLED: the portal clipboard is not implemented in this build"
-                    .to_owned(),
-            ),
+            Backend::Wayland(backend) => backend.set_clipboard(text),
         }
     }
 
