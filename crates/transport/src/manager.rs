@@ -595,9 +595,11 @@ async fn accept_one(
         return;
     };
     start_link(
-        key,
-        peer,
-        Direction::Incoming,
+        LinkSpawn {
+            key,
+            peer,
+            direction: Direction::Incoming,
+        },
         Stream::Server(Box::new(stream)),
         identity.node_id(),
         hello,
@@ -653,9 +655,11 @@ async fn dial_loop(
             if let Some(peer) = peer {
                 if let Ok(key) = identity::random16() {
                     start_link(
-                        key,
-                        peer,
-                        Direction::Outgoing,
+                        LinkSpawn {
+                            key,
+                            peer,
+                            direction: Direction::Outgoing,
+                        },
                         Stream::Client(Box::new(stream)),
                         identity.node_id(),
                         hello.clone(),
@@ -672,17 +676,28 @@ async fn dial_loop(
     }
 }
 
-/// Spawns a link, registers it with the manager and waits for it to end.
-async fn start_link(
+/// What one spawned link is: which peer, which way it was dialled, and the key the manager
+/// knows it by (see [`LinkConfig::key`]).
+struct LinkSpawn {
     key: [u8; 16],
     peer: NodeId,
     direction: Direction,
+}
+
+/// Spawns a link, registers it with the manager and waits for it to end.
+async fn start_link(
+    spawn: LinkSpawn,
     stream: Stream,
     local: NodeId,
     local_hello: wire::Hello,
     messages: mpsc::Sender<ManagerMessage>,
     settings: LinkSettings,
 ) {
+    let LinkSpawn {
+        key,
+        peer,
+        direction,
+    } = spawn;
     let (reports_tx, mut reports_rx) = mpsc::channel::<LinkReport>(64);
     let Ok(link) = crate::link::spawn(LinkConfig {
         key,

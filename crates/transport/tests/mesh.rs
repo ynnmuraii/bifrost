@@ -17,7 +17,6 @@ use protocol::wire;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use transport::convert::Inbound;
-use transport::policy;
 use transport::{
     BackoffBounds, LinkDownReason, LinkEvent, LinkLiveness, LinkManager, ManagerConfig,
 };
