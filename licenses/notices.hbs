@@ -1,0 +1,36 @@
+# Third-party notices
+
+Generated file — do not edit by hand. It lists the third-party crates a shipped binary
+(`lws-core`, `lws-agent`, `lws-gui`) contains, with the terms each one is distributed under.
+The project itself is MIT: see [`../LICENSE`](../LICENSE).
+
+Regenerate from the repository root, after `cargo fetch`:
+
+```sh
+cargo install cargo-about --locked     # or take the release binary for your target
+cargo about generate --workspace --fail -o licenses/THIRD_PARTY_NOTICES.md licenses/notices.hbs
+```
+
+Dev-dependencies are excluded (`about.toml`: `ignore-dev-dependencies = true`) because they are
+not part of a shipped artifact. The same policy is enforced as a gate by
+`cargo deny check licenses` (see [`../deny.toml`](../deny.toml)); the human-readable audit is
+`docs/08-reuse-and-licenses.md`.
+
+Two entries below need attention when a GUI build is packaged: `epaint_default_fonts` ships the
+Ubuntu font family under the Ubuntu Font Licence and the OFL-1.1, so the licence texts in this
+file must travel with the binary.
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}

@@ -1,0 +1,68 @@
+# cargo-deny policy for LAN Workspace (ADR-009: MIT, permissive dependencies only).
+#
+# Run: `cargo deny check licenses` — the same command the CI job runs. Install the tool with
+# `cargo install cargo-deny --locked`, or fetch the release binary for your target from
+# <https://github.com/EmbarkStudios/cargo-deny/releases>.
+#
+# The point of this file: the product is distributed under MIT, so every crate that ends up in
+# a shipped binary must be redistributable under MIT-compatible terms. The `allow` list is the
+# whitelist of those terms; anything else fails the check rather than silently entering the
+# build. `docs/08-reuse-and-licenses.md` is the human-readable audit this encodes.
+
+[graph]
+# The dependency graph is checked with every feature on, exactly like the audit in
+# `docs/08-reuse-and-licenses.md` (`cargo metadata --all-features`), so the two cannot drift.
+all-features = true
+
+[licenses]
+version = 2
+
+# Copyleft that would reach a shipped binary is denied by omission: GPL, LGPL and AGPL are not
+# in this list, so a crate under any of them fails the check. If one is ever wanted, it has to
+# be added here on purpose, together with the ADR that changes the project's licence.
+allow = [
+    # The project's own choice and its most common pairings.
+    "MIT",
+    "Apache-2.0",
+    # `ring`'s C/asm licence pair and the ISC-derived webpki/untrusted crates.
+    "ISC",
+    # The BSD family: `subtle`, `tiny-skia`, `arrayref`, `moxcms`, `num_enum`, `zerocopy`, `dpi`.
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # Deflate/zlib-family code and the Emscripten-adjacent `0BSD`.
+    "Zlib",
+    "0BSD",
+    # Unicode data tables (`unicode-ident`, the `icu_*` family).
+    "Unicode-3.0",
+    # egui's bundled fonts and the Boost licence of `clipboard-win`/`error-code`.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "BSL-1.0",
+    # Public-domain-ish alternatives used by `memchr`, `aho-corasick`, `walkdir`.
+    "Unlicense",
+    # `rustix`, `linux-raw-sys`, `wasi`, `wit-bindgen`.
+    "Apache-2.0 WITH LLVM-exception",
+]
+
+# Crates whose licence expression offers a permissive alternative are resolved by the `allow`
+# list above (an `A OR B` expression passes when one side is allowed) — no exception needed for
+# `self_cell` (Apache-2.0 OR GPL-2.0-only) or `r-efi` (MIT OR Apache-2.0 OR LGPL-2.1-or-later).
+#
+# MPL-2.0 is the one copyleft licence that exists in *this* tree: `colored 2.2.0` is MPL-2.0, and
+# it is reachable only from dev-dependencies (`lws-gui` → `egui_kittest` → `dify` → `colored`).
+# cargo-deny's `include-dev = false` below is exactly the rule "MPL is allowed for
+# dev-dependencies": a dev-dependency is not part of a shipped artifact, so it is not checked —
+# and `cargo tree --workspace -e normal -i colored` prints nothing, which is the same statement
+# from cargo's side. Consequently no `exceptions` entry is needed (an entry for a crate outside
+# the checked graph is reported as `license-exception-not-encountered`). If a normal dependency
+# ever becomes MPL, the check fails, because MPL-2.0 is not in `allow`.
+#
+# `include-dev = false` is the default; it is spelled out so the MPL decision is visible here
+# rather than implied. `include-build` keeps its default `true`: build scripts do influence the
+# artifacts we ship.
+include-dev = false
+
+# Our own unpublished workspace crates carry `license.workspace = true` (MIT); they are not
+# distributed separately and need no notice of their own.
+[licenses.private]
+ignore = true

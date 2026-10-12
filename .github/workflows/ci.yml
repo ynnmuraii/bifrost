@@ -77,6 +77,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # ADR-009: the product is MIT, so every crate that ends up in a shipped binary must be
+      # redistributable under MIT-compatible terms. `deny.toml` is that policy: it lists the
+      # licences we audited (`docs/08-reuse-and-licenses.md`) and denies everything else by
+      # omission, so GPL/LGPL/AGPL cannot enter the graph unnoticed. The matching notice list a
+      # distributed binary has to carry is `licenses/THIRD_PARTY_NOTICES.md`, generated with
+      # cargo-about from `about.toml`.
+      #
+      # It runs on both runners on purpose: the target graphs differ (Windows pulls
+      # `windows`/`clipboard-win`, Linux `zbus`/`ashpd`/`reis`/`x11rb`), and a licence the
+      # Windows graph never sees still has to be acceptable for the Linux build.
+      - name: Licences
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --all-features
+
       # `cargo test` builds a package's *test* targets; it does not produce the plain
       # `lws-agent` binary. `lws-core run` spawns that binary at startup and exits with
       # «cannot spawn …: No such file or directory» when it is missing, and every test

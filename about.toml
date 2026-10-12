@@ -1,0 +1,34 @@
+# cargo-about configuration for `licenses/THIRD_PARTY_NOTICES.md`.
+#
+# Regenerate from the repository root:
+#   cargo about generate --workspace --fail -o licenses/THIRD_PARTY_NOTICES.md licenses/notices.hbs
+#
+# This is the *listing* counterpart of `deny.toml`: cargo-about writes the notices a distributed
+# binary must carry, cargo-deny enforces the same policy as a gate in CI. Keep `accepted` in
+# step with `deny.toml`'s `allow` list and with `docs/08-reuse-and-licenses.md`.
+
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "BSL-1.0",
+    "Unlicense",
+]
+
+# A shipped binary contains no dev-dependencies, so their notices are not listed — the same rule
+# as `include-dev = false` in `deny.toml`. Build-dependencies stay in: they can end up in what
+# we ship.
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+
+# The workspace's own crates are MIT (`license.workspace = true`) and are not third parties.
+[private]
+ignore = true
