@@ -331,6 +331,27 @@ pub enum LayoutMessage {
     },
     /// `ActiveLayout` — the receiver's keyboard layout, for the owner's GUI.
     ActiveLayout(wire::ActiveLayout),
+    /// `ProtocolError` with a layout code: the refusal of an edit or a document
+    /// (`LAYOUT_CONFLICT`, `INVALID_TOPOLOGY`, `NO_COORDINATOR`).
+    ///
+    /// It travels on this arm and not in the focus mirror: those codes never drive a
+    /// transition, and `focus_router::ErrorCode` deliberately models only the codes the FSM
+    /// emits.
+    Error {
+        /// The wire code, as the contract defines it.
+        code: wire::ErrorCode,
+    },
+}
+
+/// Whether a `ProtocolError` code belongs to the layout half.
+#[must_use]
+pub fn is_layout_code(code: wire::ErrorCode) -> bool {
+    matches!(
+        code,
+        wire::ErrorCode::LayoutConflict
+            | wire::ErrorCode::InvalidTopology
+            | wire::ErrorCode::NoCoordinator
+    )
 }
 
 /// Reads one envelope into the layer that owns its payload.
@@ -356,6 +377,13 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
         Some(Payload::ActiveLayout(layout)) => {
             Ok(Inbound::Layout(LayoutMessage::ActiveLayout(layout.clone())))
         }
+        Some(Payload::Error(error)) => match wire::ErrorCode::try_from(error.code) {
+            // A layout refusal travels on the layout arm; every other `ProtocolError` keeps
+            // its place in the focus vocabulary (`focus_router::ErrorCode` models the codes
+            // the FSM emits, and these are not among them).
+            Ok(code) if is_layout_code(code) => Ok(Inbound::Layout(LayoutMessage::Error { code })),
+            _ => from_envelope(envelope).map(Inbound::Focus),
+        },
         None => Err(ConvertError::Unsupported("empty payload")),
         Some(_) => from_envelope(envelope).map(Inbound::Focus),
     }
@@ -382,6 +410,10 @@ pub fn layout_envelope(
             })
         }
         LayoutMessage::ActiveLayout(layout) => Payload::ActiveLayout(layout.clone()),
+        LayoutMessage::Error { code } => Payload::Error(wire::ProtocolError {
+            related_seq: 0,
+            code: *code as i32,
+        }),
     };
     wire::Envelope {
         major: protocol::limits::PROTOCOL_MAJOR,
