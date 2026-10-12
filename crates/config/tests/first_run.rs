@@ -200,6 +200,16 @@ fn up_outranks_a_quiet_interface_and_the_platform_order_decides() {
 }
 
 #[test]
+fn benchmarking_network_is_not_a_lan_candidate() {
+    let benchmarking = candidate("FlClashX", Ipv4Addr::new(198, 18, 0, 1), true, true);
+    let ethernet = candidate("Ethernet 5", Ipv4Addr::new(192, 168, 31, 37), true, false);
+    assert_eq!(
+        choose(&[benchmarking, ethernet]),
+        Some(Ipv4Addr::new(192, 168, 31, 37))
+    );
+}
+
+#[test]
 fn lan_addresses_offers_only_addresses_a_peer_could_dial() {
     // The platform half is real here; the assertion is about the filter and the
     // order, never about how many addresses this host happens to have.

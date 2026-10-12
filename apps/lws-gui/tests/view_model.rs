@@ -713,6 +713,27 @@ fn the_address_list_keeps_the_value_from_the_file_and_adds_what_this_computer_ha
 }
 
 #[test]
+fn a_loopback_config_value_is_neither_offered_nor_selected() {
+    let mut vm = view();
+    vm.config.listen_address = "127.0.0.1".to_owned();
+    vm.settings.lan.candidates = vec!["192.168.1.37".to_owned(), "127.0.0.1".to_owned()];
+
+    assert_eq!(
+        vm.settings.lan.options(&vm.config.listen_address),
+        vec!["192.168.1.37"],
+        "the LAN picker must never offer loopback, even from a stale config"
+    );
+    assert_eq!(
+        vm.settings
+            .lan
+            .selected(&vm.config.listen_address)
+            .as_deref(),
+        Some("192.168.1.37"),
+        "a valid adapter address replaces a stale loopback selection"
+    );
+}
+
+#[test]
 fn the_address_button_writes_the_file_and_says_so() {
     let mut vm = view();
     let dir = settings_dir("127.0.0.1");

@@ -594,22 +594,37 @@ pub struct Lan {
 }
 
 impl Lan {
-    /// What the dropdown offers: the addresses this computer has, plus the one the file
-    /// names when it is not one of them — the current value is never silently dropped.
+    /// Addresses the computer has plus a valid address named in its config. Loopback is
+    /// never a LAN address, even when an older config still names it.
     pub fn options(&self, current: &str) -> Vec<String> {
-        let mut options = self.candidates.clone();
-        if !current.is_empty() && !options.iter().any(|option| option == current) {
+        let mut options: Vec<String> = self
+            .candidates
+            .iter()
+            .filter(|address| is_lan_address(address))
+            .cloned()
+            .collect();
+        if is_lan_address(current) && !options.iter().any(|option| option == current) {
             options.push(current.to_owned());
         }
         options
     }
 
-    /// The address the dropdown shows: what the user picked, or the value in the file.
+    /// The chosen address if it remains available, otherwise the first LAN address.
     pub fn selected(&self, current: &str) -> Option<String> {
+        let options = self.options(current);
         self.choice
-            .clone()
-            .or_else(|| (!current.is_empty()).then(|| current.to_owned()))
+            .as_ref()
+            .filter(|choice| options.contains(choice))
+            .cloned()
+            .or_else(|| options.into_iter().next())
     }
+}
+
+/// Only a parsed, non-loopback IPv4 address can be offered as a LAN address.
+fn is_lan_address(address: &str) -> bool {
+    address
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|address| !address.is_loopback())
 }
 
 /// The service, and the last word the window had about it.
