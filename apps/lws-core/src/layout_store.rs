@@ -28,11 +28,20 @@ pub struct LayoutStore {
 
 impl LayoutStore {
     /// Seeds the store from the configuration that was just loaded.
-    pub fn new(path: PathBuf, config: config::Config) -> Self {
-        let applied = pair_from_config(config.topology.revision, config.topology.author.as_str());
+    ///
+    /// `self_node` is what the configuration means by `"self"`: a document authored here is
+    /// stored with this node's own fingerprint, and a hand-written `"self"` must mean the same
+    /// thing rather than being dropped as unparsable.
+    pub fn new(path: PathBuf, config: config::Config, self_node: NodeId) -> Self {
+        let applied = pair_from_config(
+            config.topology.revision,
+            config.topology.author.as_str(),
+            self_node,
+        );
         let max_seen = pair_from_config(
             config.topology.max_seen_revision,
             config.topology.max_seen_author.as_str(),
+            self_node,
         );
         Self {
             path,
@@ -94,7 +103,10 @@ impl LayoutStore {
 
 /// A pair from the two `[topology]` fields; revision 0 means "no document", so a missing or
 /// unparsable author is not an error there.
-fn pair_from_config(revision: u64, author: &str) -> Pair {
+fn pair_from_config(revision: u64, author: &str, self_node: NodeId) -> Pair {
+    if author.trim() == "self" {
+        return Pair::new(revision, self_node);
+    }
     match node_id_from_hex(author) {
         Some(author) => Pair::new(revision, author),
         None if revision == 0 => Pair::NONE,
@@ -185,7 +197,7 @@ mod tests {
         store.observe(&layout);
 
         let reloaded = config::Config::load(&path).expect("the file still parses");
-        let restored = LayoutStore::new(path, reloaded).restored();
+        let restored = LayoutStore::new(path, reloaded, node(7)).restored();
         assert_eq!(restored.applied(), Pair::new(1, node(1)));
         assert_eq!(restored.max_seen(), Pair::new(1, node(1)));
     }
@@ -198,7 +210,7 @@ mod tests {
         config.topology.author = identity::fingerprint(&node(1));
         config.topology.max_seen_revision = 2;
         config.topology.max_seen_author = identity::fingerprint(&node(2));
-        let store = LayoutStore::new(path, config);
+        let store = LayoutStore::new(path, config, node(7));
         assert_eq!(store.restored().max_seen(), Pair::new(5, node(1)));
     }
 }

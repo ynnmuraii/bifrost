@@ -1408,6 +1408,8 @@ impl Session {
                 ctl::Response::Stopping
             }
             ctl::Request::Switch(peer) => self.switch_to(&peer).await,
+            ctl::Request::Claim => self.claim().await,
+            ctl::Request::Abandon => self.abandon().await,
             ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()),
             ctl::Request::LayoutEdit(path) => self.layout_edit(&path).await,
             ctl::Request::LayoutApply => self.layout_apply().await,
@@ -1467,6 +1469,51 @@ impl Session {
             },
             None => ctl::Response::Switched(peer.clone()),
         }
+    }
+
+    /// `claim`: the user (GUI button or the claim hotkey) asks this node to own the
+    /// workspace.
+    ///
+    /// `docs/05-protocol.md`: «Владение можно заявить с любого узла» — the FSM runs the
+    /// whole claim itself (`OwnerClaim`, then self-grant after `claim_grant_timeout_ms`
+    /// when the current owner cannot answer), and a refusal (`CANNOT_OWN`,
+    /// `STALE_OWNER_SERIAL`) comes back as an `ERR` instead of a silent no-op.
+    async fn claim(&mut self) -> ctl::Response {
+        let now = self.now_ms();
+        let outputs = self.router.handle(
+            now,
+            fr::Input::Local(fr::LocalInput::Claim {
+                reason: fr::ClaimReason::User,
+            }),
+        );
+        let refusal = outputs.iter().find_map(|output| match output {
+            fr::Output::Notice(fr::Notice::ClaimRefused { code }) => {
+                Some(code.map_or("refused".to_owned(), |code| format!("{code:?}")))
+            }
+            _ => None,
+        });
+        self.apply(outputs).await;
+        match refusal {
+            Some(detail) => ctl::Response::Error {
+                code: "CLAIM_REFUSED".to_owned(),
+                detail,
+            },
+            None => ctl::Response::Claimed,
+        }
+    }
+
+    /// `abandon`: the user gives up ownership and stays a follower.
+    ///
+    /// The FSM releases any lease of ours before it publishes the loss
+    /// (`scenarios.rs::s26_release_precedes_ownership_grant`), so the reply means the
+    /// abandonment was handed over, not that every peer has seen it yet.
+    async fn abandon(&mut self) -> ctl::Response {
+        let now = self.now_ms();
+        let outputs = self
+            .router
+            .handle(now, fr::Input::Local(fr::LocalInput::Abandon));
+        self.apply(outputs).await;
+        ctl::Response::Abandoned
     }
 
     /// Stores or drops a portal token the agent reported.
