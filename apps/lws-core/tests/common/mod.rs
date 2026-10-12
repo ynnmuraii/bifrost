@@ -881,13 +881,21 @@ pub fn free_port() -> u16 {
 
 /// The base configuration, with the topology section left out.
 fn write_config(root: &Path, port: u16, name: &str, can_own: bool, _dry_motion: bool) {
+    // The two-node harness couples them: the source owns and claims, the receiver does
+    // neither. `write_config_sides` is for the cluster, where every node may own but only
+    // one claims on startup.
+    write_config_sides(root, port, name, can_own, can_own);
+}
+
+/// The base configuration with `can_own` and `claim_on_startup` chosen separately.
+fn write_config_sides(root: &Path, port: u16, name: &str, can_own: bool, claim_on_startup: bool) {
     let document = format!(
         "config_version = 2\n\
          \n\
          [node]\n\
          display_name = \"{name}\"\n\
          can_own = {can_own}\n\
-         claim_on_startup = {can_own}\n\
+         claim_on_startup = {claim_on_startup}\n\
          \n\
          [network]\n\
          listen_address = \"127.0.0.1\"\n\
@@ -1143,7 +1151,9 @@ impl Cluster {
             let root = dir.join(name);
             std::fs::create_dir_all(root.join("config")).expect("config directory");
             let port = free_port();
-            write_config(&root, port, &format!("node-{name}"), index == 0, false);
+            // `AC-21`: «владение можно заявить с любого узла» — every node in the cluster
+            // may own; only `w` claims on startup, the other two follow until asked.
+            write_config_sides(&root, port, &format!("node-{name}"), true, index == 0);
             roots.push(root);
             ports.push(port);
         }
