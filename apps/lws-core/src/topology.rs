@@ -605,7 +605,9 @@ pub fn config_from_wire(
         } else {
             Ok(format!(
                 "peer:{}",
-                node.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                node.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
             ))
         }
     };
