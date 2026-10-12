@@ -237,7 +237,11 @@ impl LinkManager {
                     direction,
                     hello,
                     connection_id,
-                } => self.on_up(peer, direction, hello, connection_id).await,
+                    remote,
+                } => {
+                    self.on_up(peer, direction, hello, connection_id, remote)
+                        .await
+                }
                 LinkReport::Message { peer, message } => {
                     let _ = self
                         .events_tx
@@ -277,6 +281,7 @@ impl LinkManager {
         direction: Direction,
         hello: PeerInfo,
         connection_id: [u8; 16],
+        remote: std::net::SocketAddr,
     ) {
         let incoming = self.inner.lock().await.pending.remove(&(peer, direction));
         let Some(pending) = incoming else {
@@ -355,6 +360,7 @@ impl LinkManager {
                 peer,
                 hello,
                 connection_id,
+                remote,
             })
             .await;
     }

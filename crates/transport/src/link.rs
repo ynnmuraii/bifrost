@@ -10,6 +10,7 @@
 //! into a reader task that only reads whole frames, and a coordinator that picks a step with
 //! `select!` and then performs the write *after* the `select!` returned.
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,6 +64,10 @@ pub enum LinkEvent {
         /// adopts. Every `Envelope` of this link carries it, and a clipboard channel is bound
         /// to it as its parent (`docs/05-protocol.md`, «Clipboard канал»).
         connection_id: [u8; 16],
+        /// The peer's address on this connection. A listener the peer owns — the clipboard
+        /// one — is reached at *this* address's IP with the port the peer advertises, not at
+        /// the address a trust record remembers (`docs/05-protocol.md`, «Clipboard канал»).
+        remote: SocketAddr,
     },
     /// One message from the peer, in the layer that owns it.
     Message {
@@ -140,6 +145,17 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Stream::Client(stream) => Pin::new(stream).poll_shutdown(cx),
             Stream::Server(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Stream {
+    /// The peer's address on this connection: the *input link's* remote address, which is
+    /// the address the peer's listeners are reachable at (`docs/05-protocol.md`).
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Stream::Client(stream) => stream.get_ref().0.peer_addr(),
+            Stream::Server(stream) => stream.get_ref().0.peer_addr(),
         }
     }
 }
@@ -298,6 +314,8 @@ pub enum LinkReport {
         hello: PeerInfo,
         /// The negotiated `connection_id` (see [`LinkEvent::Up`]).
         connection_id: [u8; 16],
+        /// The peer's address on this connection (see [`LinkEvent::Up`]).
+        remote: SocketAddr,
     },
     /// A focus/lease message.
     Message {
@@ -391,11 +409,15 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
         HelloHandshake::acceptor(limits::PROTOCOL_MAJOR, limits::PROTOCOL_MINOR)
     };
 
+    // Read before the split: both halves are needed afterwards, and the address is what a
+    // later clipboard dial is built from.
+    let remote = stream.peer_addr().ok();
     let (reader, mut writer) = tokio::io::split(stream);
     let (frames_tx, mut frames_rx) = mpsc::channel::<Result<wire::Envelope, TransportError>>(8);
     let reader_task = tokio::spawn(read_loop(reader, frames_tx));
 
     let mut state = LinkState::new(peer, direction, connection_id);
+    state.remote = remote;
 
     // The dialer speaks first: its `Hello` is the first frame of its direction (`seq = 1`).
     if direction.is_outgoing() {
@@ -498,6 +520,8 @@ struct LinkState {
     /// Per-direction sequence validation: «`rx_seq` строго +1. Нарушение приводит к
     /// закрытию CONNECTION».
     rx_seq: SeqValidator,
+    /// The peer's address on this connection, when the socket reports one.
+    remote: Option<SocketAddr>,
 }
 
 impl LinkState {
@@ -514,6 +538,7 @@ impl LinkState {
             ping_nonce: 0,
             batch_display: String::new(),
             rx_seq: SeqValidator::new(),
+            remote: None,
         }
     }
 
@@ -634,6 +659,7 @@ impl LinkState {
                     direction: self.direction,
                     hello: info,
                     connection_id: self.connection_id,
+                    remote: self.remote.expect("a connected socket has a peer address"),
                 })
                 .await
                 .map_err(|_| LinkDownReason::LocalClosed);

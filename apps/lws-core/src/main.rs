@@ -351,17 +351,12 @@ async fn run_async(
     // sharing a socket, a queue or a task.
     let (clipboard, clipboard_events) = if config.clipboard.enabled {
         let clipboard_listen = SocketAddr::new(listen.ip(), config.network.port_clipboard);
-        let clipboard_peers: Vec<SocketAddr> = peers
-            .iter()
-            .map(|address| SocketAddr::new(address.ip(), config.network.port_clipboard))
-            .collect();
         let (endpoint, events) = clipboard::Clipboard::start(
             node_id,
             clipboard::Settings::from_config(&config.clipboard),
             Arc::clone(&identity),
             trust.clone(),
             clipboard_listen,
-            clipboard_peers,
             QUEUE_CAPACITY,
         )
         .await?;

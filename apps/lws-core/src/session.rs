@@ -1222,6 +1222,7 @@ impl Session {
                 peer,
                 hello,
                 connection_id,
+                remote,
             } => {
                 tracing::info!(
                     peer = %peer,
@@ -1233,7 +1234,7 @@ impl Session {
                 // The clipboard channel of this pair is bound to this connection id as its
                 // parent: the grant carries it, the bind echoes it, and closing the input link
                 // closes the channel (ADR-008, «Clipboard канал»).
-                self.on_clipboard_link_up(peer, connection_id, hello.text_clipboard)
+                self.on_clipboard_link_up(peer, connection_id, hello.text_clipboard, remote)
                     .await;
                 self.feed(fr::Input::Hello {
                     peer,
@@ -1384,11 +1385,12 @@ impl Session {
         peer: NodeId,
         connection_id: [u8; 16],
         text_clipboard: bool,
+        remote: std::net::SocketAddr,
     ) {
         let out = match self.clipboard.as_mut() {
             Some(clipboard) => {
                 clipboard
-                    .on_link_up(peer, connection_id, text_clipboard)
+                    .on_link_up(peer, connection_id, text_clipboard, remote.ip())
                     .await
             }
             None => Vec::new(),
@@ -1436,12 +1438,15 @@ impl Session {
                 }
                 crate::clipboard::Out::Dial {
                     peer,
+                    address,
                     parent,
                     channel_id,
                     token,
                 } => {
                     if let Some(clipboard) = self.clipboard.as_ref() {
-                        clipboard.dial(peer, parent, channel_id, token).await;
+                        clipboard
+                            .dial(peer, address, parent, channel_id, token)
+                            .await;
                     }
                 }
                 crate::clipboard::Out::Agent(frame) => {

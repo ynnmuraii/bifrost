@@ -98,6 +98,7 @@ async fn spawn_node(
                     peer,
                     hello,
                     connection_id: _,
+                    remote: _,
                 } => {
                     println!(
                         "  [{label}] link up with {peer} (peer hello: {})",

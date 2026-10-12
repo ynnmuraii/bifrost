@@ -89,6 +89,9 @@ pub enum Out {
     Dial {
         /// The peer the grant came from.
         peer: NodeId,
+        /// Where its listener is: the address the live input link comes from, at the port the
+        /// grant advertised.
+        address: SocketAddr,
         /// The parent input link's connection id.
         parent: [u8; 16],
         /// The channel id the grant named.
@@ -159,6 +162,9 @@ pub struct Clipboard {
     payload: Vec<u8>,
     /// The outbound queue capacity a channel runtime is given.
     queue_capacity: usize,
+    /// `network.port_clipboard`: the port this node's own listener is bound to, which every
+    /// grant it issues advertises.
+    clipboard_port: u16,
     epoch: Instant,
 }
 
@@ -171,6 +177,8 @@ struct Peer {
     channel: Option<[u8; 16]>,
     /// Whether the peer claimed `CAPABILITY_TEXT_CLIPBOARD` in its `Hello`.
     text_clipboard: bool,
+    /// The IP the peer's input link comes from — where its clipboard listener is reachable.
+    remote_ip: Option<std::net::IpAddr>,
 }
 
 /// A payload we asked a peer for.
@@ -200,10 +208,9 @@ impl Clipboard {
         identity: Arc<identity::NodeIdentity>,
         trust: identity::TrustStore,
         listen: SocketAddr,
-        addresses: Vec<SocketAddr>,
         queue_capacity: usize,
     ) -> Result<(Self, mpsc::Receiver<Inbound>), String> {
-        let (runtime, events) = Handle::start(identity, trust, listen, addresses, queue_capacity)
+        let (runtime, events) = Handle::start(identity, trust, listen, queue_capacity)
             .await
             .map_err(|error| format!("clipboard channel: {error}"))?;
         let endpoint = Clipboard {
@@ -218,6 +225,7 @@ impl Clipboard {
             local: None,
             payload: Vec::new(),
             queue_capacity,
+            clipboard_port: listen.port(),
             epoch: Instant::now(),
         };
         Ok((endpoint, events))
@@ -228,12 +236,20 @@ impl Clipboard {
     pub async fn dial(
         &self,
         peer: NodeId,
+        address: SocketAddr,
         parent: [u8; 16],
         channel_id: [u8; 16],
         token: [u8; 32],
     ) {
         self.runtime
-            .dial(peer, parent, channel_id, token, self.queue_capacity)
+            .dial(
+                peer,
+                address,
+                parent,
+                channel_id,
+                token,
+                self.queue_capacity,
+            )
             .await;
     }
 
@@ -297,9 +313,12 @@ impl Clipboard {
             });
         }
         let assembly = self.local.as_mut().expect("inserted above");
+        // The assembly is bounded by what the agent *declared*, not by the policy's limit: a
+        // copy over the limit has to arrive whole so that the policy can name it
+        // (`CLIPBOARD_TOO_LARGE`), and the declaration itself is bounded by `chunks_of`.
         if message.chunk_index != assembly.next
             || message.data.len() > cb::DECODED_FRAME_BYTES
-            || (assembly.payload.len() + message.data.len()) as u64 > cb::MAX_BYTES
+            || (assembly.payload.len() + message.data.len()) as u64 > assembly.size
         {
             self.local = None;
             return Err(cb::ClipboardError::Invalid);
@@ -396,6 +415,7 @@ impl Clipboard {
                     channel_id,
                     binding_token: token,
                     ttl_ms: cb::CHANNEL_TTL_MS as u32,
+                    clipboard_port: u32::from(self.clipboard_port),
                 },
             });
             self.waiting.insert(peer, (message, self.payload.clone()));
@@ -428,6 +448,7 @@ impl Clipboard {
         let ClipboardMessage::Grant {
             channel_id,
             binding_token,
+            clipboard_port: advertised,
             ..
         } = message
         else {
@@ -443,8 +464,22 @@ impl Clipboard {
             // A disabled node does not open the channel either: nothing would be applied.
             return Vec::new();
         }
+        // The port is the granting node's, so a workspace that moved it off the default still
+        // works; the IP is the one its input link comes from, which is the only address this
+        // node knows is live (`docs/05-protocol.md`, «Clipboard канал»).
+        let port = u16::try_from(*advertised).unwrap_or(0);
+        let port = if port == 0 {
+            protocol::limits::PORT_CLIPBOARD
+        } else {
+            port
+        };
+        let Some(ip) = self.peers.get(&peer).and_then(|peer| peer.remote_ip) else {
+            tracing::warn!(peer = %peer, "no address for the clipboard dial: the input link is gone");
+            return Vec::new();
+        };
         vec![Out::Dial {
             peer,
+            address: SocketAddr::new(ip, port),
             parent,
             channel_id,
             token,
@@ -679,10 +714,12 @@ impl Clipboard {
         peer: NodeId,
         connection_id: [u8; 16],
         text_clipboard: bool,
+        remote_ip: std::net::IpAddr,
     ) -> Vec<Out> {
         let state = self.peers.entry(peer).or_default();
         state.parent = Some(connection_id);
         state.text_clipboard = text_clipboard;
+        state.remote_ip = Some(remote_ip);
         if !self.settings.enabled || self.payload.is_empty() {
             return Vec::new();
         }
@@ -721,9 +758,11 @@ impl Clipboard {
     }
 }
 
-/// `chunk_count` for an IPC payload: `1..=32` (`MAX_FRAME_IPC` is 64 KiB).
+/// `chunk_count` for an IPC payload: `1..=64` (`MAX_FRAME_IPC` is 64 KiB, so 64 frames reach
+/// 2 MiB — more than the 1 MiB the policy refuses, which is what lets a payload over the limit
+/// be answered with `CLIPBOARD_TOO_LARGE` instead of silently truncated).
 fn chunks_of(size: usize) -> u32 {
-    size.div_ceil(IPC_CHUNK_BYTES).clamp(1, 32) as u32
+    size.div_ceil(IPC_CHUNK_BYTES).clamp(1, 64) as u32
 }
 
 /// The proto's marker names as [`cb::Marker`].
@@ -784,7 +823,6 @@ struct Handle {
     inner: Arc<Mutex<Inner>>,
     identity: Arc<identity::NodeIdentity>,
     trust: identity::TrustStore,
-    addresses: Vec<SocketAddr>,
     events: mpsc::Sender<Inbound>,
     epoch: Instant,
 }
@@ -801,7 +839,6 @@ impl Handle {
         identity: Arc<identity::NodeIdentity>,
         trust: identity::TrustStore,
         listen: SocketAddr,
-        addresses: Vec<SocketAddr>,
         queue_capacity: usize,
     ) -> Result<(Self, mpsc::Receiver<Inbound>), String> {
         let (events, receiver) = mpsc::channel(256);
@@ -812,7 +849,6 @@ impl Handle {
             })),
             identity,
             trust,
-            addresses,
             events,
             epoch: Instant::now(),
         };
@@ -971,62 +1007,45 @@ impl Handle {
         }
     }
 
-    /// The dialer: opens the channel a grant authorised, and only to the peer it names.
+    /// The dialer: opens the channel a grant authorised.
     ///
-    /// The address a member answers on is looked up among the configured peers, and the pin in
-    /// the certificate only says it is *a* trusted peer — not that it is the one that granted
-    /// the channel. The two are told apart by what follows the bind: the node that issued the
-    /// grant answers it with the offer it was holding, while a node that never did closes the
-    /// connection (its own `Grants` refuses the token). Each candidate address therefore gets a
-    /// short window to produce that first frame, and the next one is tried otherwise.
+    /// The address is the peer's *as its live input link sees it*, at the port the grant
+    /// advertised. Nothing is guessed: the pin in the certificate would accept any trusted
+    /// peer, so the address has to be the one this node is already talking to, and the port
+    /// has to be the one the peer named (`network.port_clipboard` is configurable, so the
+    /// default 47902 is only the fallback for a grant that names none).
     async fn dial(
         &self,
         peer: NodeId,
+        address: SocketAddr,
         parent: [u8; 16],
         channel_id: [u8; 16],
         token: [u8; 32],
         queue_capacity: usize,
     ) {
-        for address in &self.addresses {
-            let result = dial_clipboard(
-                &self.identity,
-                &self.trust,
-                peer,
-                *address,
-                parent,
-                channel_id,
-                token,
-            )
-            .await;
-            let Ok(mut connection) = result else {
-                continue;
-            };
-            let first = tokio::time::timeout(BIND_ANSWER_TIMEOUT, connection.recv()).await;
-            let Ok(Ok(first)) = first else {
-                // Silent or closed: this address did not issue the grant.
-                connection.close().await;
-                continue;
-            };
-            self.serve(peer, channel_id, connection, queue_capacity)
-                .await;
-            let _ = self
-                .events
-                .send(Inbound::Message {
-                    peer,
-                    message: first,
-                })
-                .await;
-            return;
+        let result = dial_clipboard(
+            &self.identity,
+            &self.trust,
+            peer,
+            address,
+            parent,
+            channel_id,
+            token,
+        )
+        .await;
+        match result {
+            Ok(connection) => {
+                self.serve(peer, channel_id, connection, queue_capacity)
+                    .await
+            }
+            // A refused bind shows up on the peer as a closed connection; the next grant from
+            // that peer opens a fresh one.
+            Err(error) => {
+                tracing::warn!(peer = %peer, %address, %error, "the clipboard bind failed")
+            }
         }
-        tracing::warn!(peer = %peer, "no clipboard address answered the bind");
     }
 }
-
-/// How long a dialed address has to answer a bind with the offer the grant implies.
-///
-/// The answer is one round trip on a LAN link the peer is already running. It is paid only when
-/// a wrong address was tried first, which is why a second is generous rather than tight.
-const BIND_ANSWER_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Writes one channel's queue; the reader is a separate task so a blocked read never stalls a
 /// send (`KVM-042`).
@@ -1066,9 +1085,10 @@ mod tests {
         assert_eq!(chunks_of(IPC_CHUNK_BYTES), 1);
         assert_eq!(chunks_of(IPC_CHUNK_BYTES + 1), 2);
         assert_eq!(chunks_of(cb::MAX_BYTES as usize), 32);
+        assert_eq!(chunks_of(cb::MAX_BYTES as usize + 1), 33);
         assert_eq!(
             chunks_of(cb::MAX_BYTES as usize * 2),
-            32,
+            64,
             "the count is capped: a payload over the limit is refused, never split further"
         );
     }
