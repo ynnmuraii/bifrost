@@ -26,6 +26,7 @@ mod ctl;
 mod ids;
 mod job;
 mod layout;
+mod layout_store;
 mod ownership_store;
 mod pair;
 mod portal;
@@ -49,6 +50,7 @@ use protocol::ipc::{AgentMode, BackendKind};
 use transport::{BackoffBounds, LinkLiveness, LinkManager, ManagerConfig};
 
 use crate::agent::Supervisor;
+use crate::layout_store::LayoutStore;
 use crate::ownership_store::OwnershipStore;
 use crate::session::Session;
 
@@ -125,6 +127,7 @@ COMMANDS:
     peers    list trusted peers, or --revoke <node id>
     status   ask a running core for its state
     switch   manual transition: to a peer while local, back to local while remote
+    layout   the layout document: show | edit <file> | apply | discard
 ";
 
 /// The parsed global options and the command line behind them.
@@ -198,6 +201,23 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
         "pair" => pair::main(&args.paths, &args.rest),
         "peers" => peers(&args),
         "status" => control(&args.paths, "status"),
+        // KVM-072: the layout document's CAS surface, until the GUI owns it.
+        "layout" => {
+            let verb = args.rest.first().ok_or_else(|| {
+                Failure::Usage("layout takes show, edit <file>, apply, or discard".to_owned())
+            })?;
+            let line = match verb.as_str() {
+                "edit" => {
+                    let path = args
+                        .rest
+                        .get(1)
+                        .ok_or_else(|| Failure::Usage("layout edit needs a file".to_owned()))?;
+                    format!("layout edit {path}")
+                }
+                other => format!("layout {other}"),
+            };
+            control(&args.paths, &line)
+        }
         "switch" => {
             let peer = args
                 .rest
@@ -434,6 +454,7 @@ async fn run_async(
         // The ownership pair belongs in the configuration file, so a restart resumes the
         // counter it learned instead of claiming serial 1 again (`ownership_store`).
         OwnershipStore::new(paths.config_file(), config.clone()),
+        LayoutStore::new(paths.config_file(), config.clone()),
     );
     session.run().await.map_err(|error| error.to_string())
 }

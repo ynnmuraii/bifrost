@@ -1,0 +1,204 @@
+//! Persists the layout pair into `[topology]` of `config.toml` (KVM-072).
+//!
+//! `docs/06-development-plan.md`, KVM-072: «персистятся `max_seen_revision`/`max_seen_author`,
+//! ревизия назад не идёт». The file is the same one the rest of the configuration lives in, so
+//! the store keeps the loaded [`config::Config`] and rewrites it whole — exactly the shape
+//! [`crate::ownership_store`] uses for the ownership pair, and for the same reason: a partial
+//! write would drop settings nobody asked to change.
+//!
+//! The authors are stored as the lower-case hex fingerprint (`identity::fingerprint`), which is
+//! what the schema asks for and what a human can compare; [`node_id_from_hex`] is the way back,
+//! and an unparsable author is treated as "no revision" rather than as a panic on startup.
+
+use std::path::PathBuf;
+
+use geometry::NodeId;
+
+use crate::layout::{Layout, Pair};
+
+/// The `[topology]` pair and floor, persisted across restarts.
+pub struct LayoutStore {
+    /// The configuration file this core was started with.
+    path: PathBuf,
+    /// The loaded configuration, kept so a rewrite preserves every other setting in it.
+    config: config::Config,
+    /// What the file holds, so an unchanged pair is not rewritten.
+    saved: (Pair, Pair),
+}
+
+impl LayoutStore {
+    /// Seeds the store from the configuration that was just loaded.
+    pub fn new(path: PathBuf, config: config::Config) -> Self {
+        let applied = pair_from_config(config.topology.revision, config.topology.author.as_str());
+        let max_seen = pair_from_config(
+            config.topology.max_seen_revision,
+            config.topology.max_seen_author.as_str(),
+        );
+        Self {
+            path,
+            config,
+            saved: (applied, max_seen),
+        }
+    }
+
+    /// The view restored from the file: the applied revision and the floor.
+    #[must_use]
+    pub fn restored(&self) -> Layout {
+        Layout::restore(self.saved.0, self.saved.1)
+    }
+
+    /// Writes a divergent local edit to `layout.pending.toml` (KVM-072).
+    ///
+    /// The path comes from `config::Paths` and lives next to the applied document; the caller
+    /// owns the in-memory copy ([`crate::layout::Layout::hold_pending`]), this only survives a
+    /// restart.
+    pub fn write_pending(&self, layout_toml: &str) {
+        let path = self
+            .path
+            .parent()
+            .map(|dir| dir.join(config::paths::LAYOUT_PENDING_FILE))
+            .unwrap_or_else(|| PathBuf::from(config::paths::LAYOUT_PENDING_FILE));
+        if let Err(error) = config::save::save_atomic(&path, layout_toml) {
+            tracing::warn!(%error, "cannot write the pending layout edit");
+        }
+    }
+
+    /// Writes the pair back when it changed.
+    ///
+    /// A failure is logged and left for the next change to retry: a configuration write must
+    /// not stop the session, and the pair is still correct in memory.
+    pub fn observe(&mut self, layout: &Layout) {
+        let applied = layout.applied();
+        let max_seen = layout.max_seen();
+        if (applied, max_seen) == self.saved {
+            return;
+        }
+        self.config.topology.revision = applied.revision;
+        self.config.topology.author = applied
+            .author
+            .map_or_else(String::new, |id| identity::fingerprint(&id));
+        self.config.topology.max_seen_revision = max_seen.revision;
+        self.config.topology.max_seen_author = max_seen
+            .author
+            .map_or_else(String::new, |id| identity::fingerprint(&id));
+        match self.config.save(&self.path) {
+            Ok(()) => self.saved = (applied, max_seen),
+            Err(error) => tracing::warn!(
+                %error,
+                revision = applied.revision,
+                "cannot persist the layout revision; the next change will retry"
+            ),
+        }
+    }
+}
+
+/// A pair from the two `[topology]` fields; revision 0 means "no document", so a missing or
+/// unparsable author is not an error there.
+fn pair_from_config(revision: u64, author: &str) -> Pair {
+    match node_id_from_hex(author) {
+        Some(author) => Pair::new(revision, author),
+        None if revision == 0 => Pair::NONE,
+        None => {
+            tracing::warn!(
+                revision,
+                author,
+                "the stored layout author is not a node id; treating the revision as unseen"
+            );
+            Pair::NONE
+        }
+    }
+}
+
+/// The 32 identity bytes of a lower-case hex fingerprint.
+fn node_id_from_hex(text: &str) -> Option<NodeId> {
+    let text = text.trim();
+    if text.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(text.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(NodeId::new(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn temp_config() -> (PathBuf, config::Config) {
+        static NEXT: AtomicU32 = AtomicU32::new(1);
+        let dir = std::env::temp_dir().join(format!(
+            "lws-layout-store-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("config.toml");
+        let mut config = config::Config::default();
+        config.network.listen_address = "127.0.0.1".to_owned();
+        config.save(&path).expect("a writable config");
+        (path, config)
+    }
+
+    fn node(byte: u8) -> NodeId {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        NodeId::new(id)
+    }
+
+    /// The hex round-trip the schema depends on.
+    #[test]
+    fn a_fingerprint_parses_back() {
+        let id = node(0xab);
+        let text = identity::fingerprint(&id);
+        assert_eq!(node_id_from_hex(&text), Some(id));
+        assert_eq!(node_id_from_hex("nonsense"), None);
+        assert_eq!(node_id_from_hex(&text[..63]), None);
+        assert_eq!(
+            node_id_from_hex(&text.to_uppercase()),
+            Some(id),
+            "reading is lenient about case; writing is not"
+        );
+    }
+
+    /// A stored pair survives a restart: the file is what the next core reads.
+    #[test]
+    fn the_pair_survives_a_reload() {
+        let (path, config) = temp_config();
+        let mut store = LayoutStore::new(path.clone(), config);
+        let mut layout = store.restored();
+        assert_eq!(layout.applied(), Pair::NONE);
+
+        let outcome = layout.apply_edit(
+            &crate::layout::Edit {
+                expected: Pair::NONE,
+                editor: node(9),
+                layout_toml: "links = []".to_owned(),
+            },
+            node(1),
+            true,
+            |_| Ok(()),
+        );
+        assert!(matches!(outcome, crate::layout::EditOutcome::Applied(_)));
+        store.observe(&layout);
+
+        let reloaded = config::Config::load(&path).expect("the file still parses");
+        let restored = LayoutStore::new(path, reloaded).restored();
+        assert_eq!(restored.applied(), Pair::new(1, node(1)));
+        assert_eq!(restored.max_seen(), Pair::new(1, node(1)));
+    }
+
+    /// A hand-edited file whose `max_seen` trails the applied revision cannot lower the floor.
+    #[test]
+    fn a_hand_edited_floor_is_raised() {
+        let (path, mut config) = temp_config();
+        config.topology.revision = 5;
+        config.topology.author = identity::fingerprint(&node(1));
+        config.topology.max_seen_revision = 2;
+        config.topology.max_seen_author = identity::fingerprint(&node(2));
+        let store = LayoutStore::new(path, config);
+        assert_eq!(store.restored().max_seen(), Pair::new(5, node(1)));
+    }
+}

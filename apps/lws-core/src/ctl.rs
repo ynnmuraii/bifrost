@@ -110,6 +110,14 @@ pub enum Request {
     Quit,
     /// Liveness of the control channel itself.
     Ping,
+    /// `layout show`: the applied revision, the floor and the pending edit (KVM-072).
+    LayoutShow,
+    /// `layout edit <file>`: apply a whole document through the coordinator's CAS.
+    LayoutEdit(String),
+    /// `layout apply`: apply the pending edit now that this node coordinates.
+    LayoutApply,
+    /// `layout discard`: drop the pending edit.
+    LayoutDiscard,
 }
 
 impl Request {
@@ -122,6 +130,13 @@ impl Request {
         };
         match verb {
             "status" if argument.is_empty() => Ok(Request::Status),
+            "layout" if argument.trim() == "show" => Ok(Request::LayoutShow),
+            "layout" if argument.starts_with("edit ") => Ok(Request::LayoutEdit(
+                argument["edit ".len()..].trim().to_owned(),
+            )),
+            "layout" if argument.trim() == "apply" => Ok(Request::LayoutApply),
+            "layout" if argument.trim() == "discard" => Ok(Request::LayoutDiscard),
+            "layout" => Err("layout takes show, edit <file>, apply, or discard".to_owned()),
             "ping" if argument.is_empty() => Ok(Request::Ping),
             "quit" if argument.is_empty() => Ok(Request::Quit),
             "reset-portals" if argument.is_empty() => Ok(Request::ResetPortals),
