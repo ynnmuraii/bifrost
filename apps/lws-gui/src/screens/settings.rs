@@ -172,7 +172,14 @@ fn service_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     block(ui, "Служба", |ui| {
         let restarting = vm.settings.service.restart.is_some();
-        if ui
+        if !vm.connection.is_connected() {
+            if ui
+                .add_enabled(!restarting, egui::Button::new("Запустить службу"))
+                .clicked()
+            {
+                actions.push(Action::StartCore);
+            }
+        } else if ui
             .add_enabled(!restarting, egui::Button::new("Перезапустить службу"))
             .on_hover_text("Служба остановится и запустится снова — настройки начнут работать")
             .clicked()
