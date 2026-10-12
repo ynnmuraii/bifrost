@@ -505,7 +505,13 @@ mod tests {
         );
         for index in 1..ONE_MIB_CHUNKS {
             inbound
-                .push(&chunk(1, index, ONE_MIB_CHUNKS, &vec![b'a'; CHUNK_BYTES], None))
+                .push(&chunk(
+                    1,
+                    index,
+                    ONE_MIB_CHUNKS,
+                    &vec![b'a'; CHUNK_BYTES],
+                    None,
+                ))
                 .expect("still within the limit");
         }
         let hash = clipboard::sha256(&vec![b'a'; MAX_BYTES as usize]);
