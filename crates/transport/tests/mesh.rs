@@ -17,6 +17,7 @@ use protocol::wire;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use transport::convert::Inbound;
+use transport::policy;
 use transport::{
     BackoffBounds, LinkDownReason, LinkEvent, LinkLiveness, LinkManager, ManagerConfig,
 };
@@ -821,4 +822,126 @@ async fn a_silent_peer_is_retried_instead_of_parking_the_dialer() {
         "a silent peer parked the dialer: {seen} attempt(s) in {bound:?} — with no deadline on \
          `TcpStream::connect` plus the TLS handshake the reconnect schedule never runs again"
     );
+}
+
+/// A link that replaces a live one must be reported as a replacement, not swapped in silence.
+///
+/// Both sides dial at formation and [`policy::prefer_incoming`] keeps one of the two; the
+/// loser's dialer redials after its link ends, and when that redial *wins* the comparison it
+/// replaces the link the application is using. That replacement used to be silent — the manager
+/// closed the old link and sent only the new `Up` — so the application kept reading a link that
+/// was already gone. In a three-node CI run an in-flight `LeaveAck` died with it and the leaving
+/// node sat in `Releasing` with nothing left to read. The replaced link is now reported
+/// `Down { LocalClosed }`, which is what that reason documents, before the new `Up`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
+    let root = temp_root("replacement");
+    let address_a = free_address().await;
+    let address_b = free_address().await;
+    let identity_a = Arc::new(identity_at(&root, "a"));
+    let identity_b = Arc::new(identity_at(&root, "b"));
+    let (id_a, id_b) = (identity_a.node_id(), identity_b.node_id());
+
+    let mut a = spawn_node(
+        "a",
+        Arc::clone(&identity_a),
+        address_a,
+        &[(id_b, address_b)],
+        &[address_b],
+        3,
+    )
+    .await;
+    let mut b = spawn_node(
+        "b",
+        Arc::clone(&identity_b),
+        address_b,
+        &[(id_a, address_a)],
+        &[address_a],
+        3,
+    )
+    .await;
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+    // Formation's own events are not this test's subject.
+    while a.events.try_recv().is_ok() {}
+    while b.events.try_recv().is_ok() {}
+
+    // `prefer_incoming` keeps the larger initiator, so a second dial from the *other* node wins
+    // against a link this node dialed — and loses against one the peer dialed. Dial second from
+    // the side that wins, and watch that side.
+    let dial_second_from_b = policy::prefer_incoming(&id_a, &id_b);
+    let (watch_a, second_identity, peer_id, peer_address) = if dial_second_from_b {
+        (true, Arc::clone(&identity_b), id_a, address_a)
+    } else {
+        (false, Arc::clone(&identity_a), id_b, address_b)
+    };
+
+    let mut trust = TrustStore::new();
+    trust.trust(TrustedPeer::paired(
+        peer_id,
+        "peer",
+        Some(peer_address.to_string()),
+        now_unix_ms(),
+    ));
+    let second_id = second_identity.node_id();
+    let (second, mut second_events) = LinkManager::new(ManagerConfig {
+        identity: second_identity,
+        trust,
+        local_hello: hello_for(second_id, "second"),
+        listen: free_address().await,
+        peers: vec![peer_address],
+        max_members: 3,
+        queue_capacity: 64,
+        liveness: LIVENESS,
+        backoff: BackoffBounds::default(),
+        pairing: transport::PairingGate::closed(),
+    })
+    .expect("the second manager");
+    let second = Arc::new(second);
+    let second_runner = {
+        let second = Arc::clone(&second);
+        tokio::spawn(async move {
+            let _ = second.run().await;
+        })
+    };
+    // Its own events must be drained or its sends block.
+    let drain = tokio::spawn(async move { while second_events.recv().await.is_some() {} });
+
+    let events = if watch_a {
+        &mut a.events
+    } else {
+        &mut b.events
+    };
+    let replacement = wait_for_event(
+        events,
+        |event| {
+            matches!(
+                event,
+                LinkEvent::Down {
+                    reason: LinkDownReason::LocalClosed,
+                    ..
+                }
+            )
+        },
+        EVENT_TIMEOUT,
+    )
+    .await;
+    assert!(
+        replacement.is_some(),
+        "the replaced link must be reported down, not swapped in silence"
+    );
+    let up = wait_for_event(
+        events,
+        |event| matches!(event, LinkEvent::Up { .. }),
+        EVENT_TIMEOUT,
+    )
+    .await;
+    assert!(
+        up.is_some(),
+        "the replacement must come up after the report"
+    );
+
+    second_runner.abort();
+    drain.abort();
+    let _ = std::fs::remove_dir_all(&root);
 }
