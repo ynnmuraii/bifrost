@@ -786,6 +786,48 @@ mod launch_tests {
         assert!(program.parent().is_some());
     }
 
+    #[test]
+    fn dev_capture_flag_is_independent_of_dry_inject() {
+        let command_args = |dev_capture_injected| {
+            let supervisor = Supervisor::new(
+                PathBuf::from("agent"),
+                PathBuf::from("private"),
+                PathBuf::from("runtime"),
+                PathBuf::from("logs"),
+                false,
+                0,
+                false,
+                false,
+                dev_capture_injected,
+                "Ctrl+Alt+Shift+F12".to_owned(),
+                ipc::BackendKind::Auto,
+                true,
+                300,
+                crate::portal::PortalGrants::default(),
+                TakeoverSettings {
+                    detection: ipc::TakeoverDetection::Auto,
+                    threshold_px: 12,
+                },
+                ipc::RepeatMode::ReceiverSoftware,
+            );
+            let mut command = tokio::process::Command::new(&supervisor.program);
+            if supervisor.dev_capture_injected {
+                command.arg("--dev-capture-injected");
+            }
+            if supervisor.dry_inject {
+                command.arg("--dry-inject");
+            }
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(command_args(true).contains(&"--dev-capture-injected".to_owned()));
+        assert!(!command_args(false).contains(&"--dev-capture-injected".to_owned()));
+        assert!(!command_args(true).contains(&"--dry-inject".to_owned()));
+    }
+
     #[tokio::test]
     async fn an_agent_that_cannot_be_spawned_is_reported_as_an_error() {
         let runtime = temp_dir("runtime");
