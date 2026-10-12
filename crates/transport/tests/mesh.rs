@@ -183,6 +183,20 @@ async fn wait_for_members(node: &TestNode, wanted: usize, timeout: Duration) -> 
     }
 }
 
+/// Waits until a node's own link events go quiet: formation is two dials that race, and the
+/// loser's `Down` — or a late winner's `Up` — can arrive *after* the member count is right. A
+/// test that starts timing before that confuses formation's churn with the event it is about.
+async fn settle(node: &mut TestNode, quiet: Duration) {
+    let deadline = Instant::now() + FORM_TIMEOUT;
+    let mut last = Instant::now();
+    while Instant::now() < deadline && last.elapsed() < quiet {
+        match tokio::time::timeout(quiet, node.events.recv()).await {
+            Ok(Some(_)) => last = Instant::now(),
+            Ok(None) | Err(_) => break,
+        }
+    }
+}
+
 /// Waits for the first event that satisfies `predicate`, ignoring the others.
 async fn wait_for_event(
     events: &mut mpsc::Receiver<LinkEvent>,
@@ -876,9 +890,10 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
     .await;
     assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
     assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
-    // Formation's own events are not this test's subject.
-    while a.events.try_recv().is_ok() {}
-    while b.events.try_recv().is_ok() {}
+    // Formation's own events are not this test's subject — and they are not over when the
+    // member count is right: wait for the churn to stop.
+    settle(&mut a, Duration::from_millis(600)).await;
+    settle(&mut b, Duration::from_millis(600)).await;
 
     // The second dial comes from the *larger* id, and it is the smaller id that watches: its
     // live link is the one that gets replaced.
@@ -998,9 +1013,11 @@ async fn a_second_link_in_the_same_direction_cannot_evict_the_live_one() {
     .await;
     assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
     assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
-    // Formation's own events are not this test's subject.
-    while a.events.try_recv().is_ok() {}
-    while b.events.try_recv().is_ok() {}
+    // Formation's own events are not this test's subject — and they are not over when the
+    // member count is right: wait for the churn to stop, or a late `Up`/`Down` from the race
+    // lands in the window this test measures.
+    settle(&mut a, Duration::from_millis(600)).await;
+    settle(&mut b, Duration::from_millis(600)).await;
 
     // The link that survives a simultaneous dial is the one the *larger* node id dialled
     // (`prefer_incoming` keeps the larger initiator), so a second dial from that same node ties
