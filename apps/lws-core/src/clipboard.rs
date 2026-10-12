@@ -271,6 +271,22 @@ impl Clipboard {
         self.epoch.elapsed().as_millis() as u64
     }
 
+    /// `SetClipboard` from the GUI: transfer clipboard content, or stop transferring it.
+    ///
+    /// This is the same gate `[clipboard].enabled` seeds ([`cb::Policy::enabled`]), flipped at
+    /// runtime: content that arrives while it is off is not offered, and a transfer already in
+    /// flight finishes rather than losing half a payload (`KVM-042`). The listener and the
+    /// bound channels stay up, so turning it back on needs no reconnect.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.settings.enabled = enabled;
+        self.settings.policy.enabled = enabled;
+    }
+
+    /// Whether clipboard transfers are on, for `Status.clipboard_enabled`.
+    pub const fn is_enabled(&self) -> bool {
+        self.settings.enabled
+    }
+
     /// One `ClipboardChanged` chunk from the agent.
     ///
     /// Nothing is decided — and nothing is offered — until the last chunk arrived with a

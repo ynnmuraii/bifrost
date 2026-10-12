@@ -34,6 +34,11 @@ use crate::ctl;
 use crate::ownership_store::OwnershipStore;
 use crate::routing::{self, AgentSignal, Effect};
 
+/// The GUI's half of the session: `GuiFrame` requests and the events pushed to the window.
+mod gui;
+/// The pairing window and its ceremonies (ALPN `pair/1` on the link listener).
+mod pairing;
+
 /// How long the loop sleeps when nothing else has a deadline.
 ///
 /// It bounds how long a dead agent child can go unnoticed; the IPC heartbeat and the
@@ -132,6 +137,42 @@ pub struct Session {
     clipboard: Option<crate::clipboard::Clipboard>,
     /// Events from the clipboard runtime: a bound channel, a message, or a lost channel.
     clipboard_events: mpsc::Receiver<crate::clipboard::Inbound>,
+    /// The GUI's endpoint and the fan-out of pushed events.
+    gui: crate::gui::Server,
+    /// Requests from the connected GUIs, one per turn of the loop.
+    gui_requests: mpsc::Receiver<crate::gui::Request>,
+    /// Keeps `gui_requests` alive when no GUI is connected, so `recv` never returns `None`
+    /// and the loop never spins on a closed channel.
+    gui_requests_tx: mpsc::Sender<crate::gui::Request>,
+    /// Where every pushed event goes ([`crate::gui::Server::publish`]).
+    gui_events: tokio::sync::broadcast::Sender<crate::gui::Outgoing>,
+    /// The last `Status` published, so an unchanged state is not re-sent every 50 ms.
+    gui_status: Option<protocol::ipc::Status>,
+    /// The last `TopologyDoc` revision published.
+    gui_revision: Option<u64>,
+    /// This node's identity: the pairing ceremony needs the key and the certificate.
+    identity: Arc<identity::NodeIdentity>,
+    /// The resolved directories: where the trust record a committed pairing is written.
+    paths: config::Paths,
+    /// The pairing window the link listener serves by ALPN (docs/05-protocol.md).
+    pairing: pairing::Pairing,
+    /// Reports from the ceremony tasks.
+    pairing_events: mpsc::Receiver<pairing::Event>,
+    /// A second handle on the same channel, so a spawned ceremony can report back.
+    pairing_events_tx: mpsc::Sender<pairing::Event>,
+    /// Where this node listens: the address a pairing window shows, and the port it
+    /// advertises in `PairHello.listen_port`.
+    listen: std::net::SocketAddr,
+    /// `input.emergency_hotkey`, shown by `Status` and the settings screen.
+    emergency_hotkey: String,
+    /// This node's declared capabilities: what `Status.capabilities_unavailable` subtracts.
+    capabilities: platform_probe::Capabilities,
+    /// The last agent portal report (`PortalPermissionRequired`), for `Status.portal_state`.
+    portal_state: String,
+    /// The receiver's active keyboard layout while a lease is remote (`ActiveLayout`).
+    active_layout: String,
+    /// The last pairing refusal, for `Status.last_error_code`.
+    pairing_error: Option<String>,
 }
 
 impl Session {
@@ -153,8 +194,18 @@ impl Session {
         layout_store: crate::layout_store::LayoutStore,
         clipboard: Option<crate::clipboard::Clipboard>,
         clipboard_events: mpsc::Receiver<crate::clipboard::Inbound>,
+        gui_server: crate::gui::Server,
+        identity: Arc<identity::NodeIdentity>,
+        paths: config::Paths,
+        listen: std::net::SocketAddr,
+        emergency_hotkey: String,
+        capabilities: platform_probe::Capabilities,
+        pairing_gate: transport::PairingGate,
     ) -> Self {
         let layout_state = layout_store.restored();
+        let (gui_requests_tx, gui_requests) = mpsc::channel(64);
+        let (pairing_events_tx, pairing_events) = mpsc::channel(16);
+        let gui_events = gui_server.publisher();
         let mut session = Session {
             router,
             manager,
@@ -192,6 +243,23 @@ impl Session {
             observe_armed: false,
             clipboard,
             clipboard_events,
+            gui: gui_server,
+            gui_requests,
+            gui_requests_tx,
+            gui_events,
+            gui_status: None,
+            gui_revision: None,
+            identity,
+            paths,
+            pairing: pairing::Pairing::new(pairing_gate),
+            pairing_events,
+            pairing_events_tx,
+            listen,
+            emergency_hotkey,
+            capabilities,
+            portal_state: String::new(),
+            active_layout: String::new(),
+            pairing_error: None,
         };
         session.rebuild_topology();
         session
@@ -272,6 +340,9 @@ impl Session {
                     frame = self.agent.recv(), if attached => Step::Agent(frame),
                     event = self.clipboard_events.recv(), if clipboard_enabled => Step::Clipboard(event),
                     client = self.ctl.accept() => Step::Control(client),
+                    client = self.gui.accept() => Step::GuiClient(client),
+                    request = self.gui_requests.recv() => Step::Gui(request),
+                    event = self.pairing_events.recv() => Step::Pairing(event),
                     () = tokio::time::sleep_until(deadline) => Step::Tick,
                 }
             };
@@ -291,6 +362,25 @@ impl Session {
                 Step::Control(Err(error)) => {
                     tracing::warn!(%error, "control channel error");
                 }
+                Step::GuiClient(Ok(stream)) => {
+                    // The connection is served by its own task: core answers requests as they
+                    // arrive through `gui_requests`, and events reach the window on the same
+                    // `seq`-stamped link.
+                    self.gui.spawn(stream, self.gui_requests_tx.clone());
+                }
+                Step::GuiClient(Err(error)) => {
+                    tracing::warn!(%error, "GUI channel error");
+                }
+                Step::Gui(Some(request)) => self.on_gui_request(request).await,
+                Step::Gui(None) => {
+                    // Unreachable while `gui_requests_tx` lives here; if it ever closes, the
+                    // loop must not spin on it.
+                    tracing::warn!("the GUI request channel stopped");
+                }
+                Step::Pairing(Some(event)) => self.on_pairing_event(event).await,
+                Step::Pairing(None) => {
+                    tracing::warn!("the pairing channel stopped");
+                }
                 Step::Clipboard(Some(event)) => self.on_clipboard(event).await,
                 Step::Clipboard(None) => {
                     // The runtime never closes its channel while core runs; if it did, every
@@ -300,8 +390,12 @@ impl Session {
                 Step::Tick => {
                     self.arm_observation().await;
                     self.clipboard_on_focus().await;
+                    self.expire_pairing_window();
                 }
             }
+            // Once per turn, and only what changed: the GUI's `Status` and, on a new revision,
+            // the document its editor works on.
+            self.publish_gui_state().await;
         }
     }
 
@@ -772,6 +866,7 @@ impl Session {
                     revision = layout.layout_revision,
                     "receiver layout"
                 );
+                self.active_layout = layout.layout_id.clone();
             }
         }
     }
@@ -1097,7 +1192,6 @@ impl Session {
     /// coordinator's own verdict: `OK applied revision=N` and `ERR LAYOUT_CONFLICT …` mean the
     /// same thing on both sides of the link.
     async fn layout_edit(&mut self, path: &str) -> Handled {
-        let is_coordinator = self.router.ownership().is_owner();
         let document_text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
@@ -1107,6 +1201,23 @@ impl Session {
                 })
             }
         };
+        let applied = self.layout_state.applied();
+        self.layout_edit_document(document_text, applied).await
+    }
+
+    /// The whole-document CAS itself, for both front-ends.
+    ///
+    /// `expected` is the pair the editor wrote its document against: the applied revision for
+    /// `layout edit <file>` (which is where the file came from), and the pair the GUI names in
+    /// `UpdateTopology` — a document it may have loaded a revision ago. Whichever it is, it is
+    /// what the coordinator's CAS compares, so a stale base is refused `LAYOUT_CONFLICT`
+    /// instead of silently reverting the winning side (ADR-013).
+    async fn layout_edit_document(
+        &mut self,
+        document_text: String,
+        expected: crate::layout::Pair,
+    ) -> Handled {
+        let is_coordinator = self.router.ownership().is_owner();
         if let Some(reason) = self.layout_editing_disabled.clone() {
             self.hold_layout_pending(&document_text);
             return Handled::Reply(ctl::Response::Error {
@@ -1124,17 +1235,14 @@ impl Session {
                     detail: "no owner is known; the edit is kept as pending".to_owned(),
                 });
             };
-            // The base is the revision this node has applied *now*: the edit was just written
-            // against it, and the coordinator's CAS compares exactly that pair. The edit
-            // occupies the pending slot until the verdict says it was applied, so a refusal or
-            // a lost answer leaves the edit — slot and file — for the user's reload.
-            let applied = self.layout_state.applied();
+            // The edit occupies the pending slot until the verdict says it was applied, so a
+            // refusal or a lost answer leaves the edit — slot and file — for the user's reload.
             self.hold_layout_pending(&document_text);
             let (nonce, verdict) = self.hold_layout_request(document_text.clone());
             let message =
                 transport::convert::LayoutMessage::LayoutEdit(protocol::wire::LayoutEdit {
-                    expected_revision: applied.revision,
-                    expected_author: applied
+                    expected_revision: expected.revision,
+                    expected_author: expected
                         .author
                         .map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
                     author_node_id: self.node_id.as_bytes().to_vec(),
@@ -1152,7 +1260,7 @@ impl Session {
             return Handled::Deferred(verdict);
         }
         let edit = crate::layout::Edit {
-            expected: self.layout_state.applied(),
+            expected,
             editor: self.node_id,
             layout_toml: document_text,
         };
@@ -1218,6 +1326,16 @@ impl Session {
 
     async fn on_link_event(&mut self, event: LinkEvent) {
         match event {
+            // `pair/1` on the link listener: the listener admitted the dialer through the
+            // pairing gate, and the ceremony itself runs in a task of its own so a peer that
+            // never answers cannot stall this loop.
+            LinkEvent::Pairing(connection) => {
+                tracing::info!(
+                    peer = %connection.address,
+                    "pairing: an accepted dialer enters the window"
+                );
+                self.spawn_pair_accept(*connection);
+            }
             LinkEvent::Up {
                 peer,
                 hello,
@@ -1480,6 +1598,18 @@ impl Session {
         // from the frame and never contains a token (`routing::agent_note`).
         if let Some(note) = routing::agent_note(&message) {
             self.refusal = Some(note);
+            // `Status.portal_state`: whether the compositor is asking for permission, the
+            // user refused it, or this backend has no such portal. The GUI shows it next to
+            // the node, which is the only place a Wayland limitation becomes visible
+            // (`docs/03-architecture.md`: «GUI обязан сообщить это заранее, чтобы
+            // ограничение не выглядело дефектом»).
+            if let Some(note) = self.refusal.as_deref() {
+                if note.contains("PORTAL_DENIED") {
+                    self.portal_state = "denied".to_owned();
+                } else if note.contains("PORTAL_UNAVAILABLE") {
+                    self.portal_state = "unavailable".to_owned();
+                }
+            }
         }
         if let Msg::ClipboardChanged(changed) = &message {
             // The clipboard never drives the focus FSM: a copy is core's own business, so it is
@@ -1501,6 +1631,7 @@ impl Session {
                     // A new session starts with a clean slate; the previous crash's
                     // error is not this session's state.
                     self.refusal = None;
+                    self.portal_state.clear();
                 }
                 self.feed(fr::Input::Agent(event)).await;
             }
@@ -1530,6 +1661,9 @@ impl Session {
                     detail = detail.as_str(),
                     "portal"
                 );
+                // A dialog is on screen: the GUI says so instead of showing a node that
+                // looks broken while it waits for the user.
+                self.portal_state = "permission_required".to_owned();
             }
             AgentSignal::Grant(changed) => self.on_portal_grant(changed).await,
             AgentSignal::Ignored => {}
@@ -2126,6 +2260,12 @@ enum Step {
     Link(Option<LinkEvent>),
     Agent(Result<protocol::ipc::AgentFrame, String>),
     Control(Result<ctl::ClientStream, ipc::IpcError>),
+    /// A GUI connected; its connection gets its own task.
+    GuiClient(Result<ipc::transport::ClientStream, ipc::IpcError>),
+    /// One request from a connected GUI.
+    Gui(Option<crate::gui::Request>),
+    /// One report from a pairing ceremony.
+    Pairing(Option<pairing::Event>),
     /// One event from the clipboard runtime: a bound channel, a message, or a lost channel.
     Clipboard(Option<crate::clipboard::Inbound>),
     Tick,

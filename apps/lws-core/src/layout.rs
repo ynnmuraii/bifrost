@@ -121,6 +121,34 @@ pub struct Layout {
 struct Pending {
     base: Pair,
     layout_toml: String,
+    /// The `edit_id` the GUI names back in `ApplyPendingEdit`/`DiscardPendingEdit`.
+    ///
+    /// Derived from the edit itself rather than drawn at random: the pending edit is
+    /// persisted as the document alone (`layout.pending.toml`), so an id that is a function
+    /// of that document is the same id after a restart, while a random one would not be.
+    /// It is an identifier, not a secret — the CAS that decides anything is the pair in
+    /// [`Pending::base`].
+    edit_id: [u8; 16],
+}
+
+/// The `edit_id` of a pending edit: a 128-bit FNV-1a over the base pair and the document.
+fn edit_id(base: Pair, layout_toml: &str) -> [u8; 16] {
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_01b3;
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    let mut mix = |byte: u8| {
+        hash ^= u128::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    };
+    for byte in base.revision.to_be_bytes() {
+        mix(byte);
+    }
+    for byte in base.author.map_or([0u8; 32], |author| *author.as_bytes()) {
+        mix(byte);
+    }
+    for byte in layout_toml.as_bytes() {
+        mix(*byte);
+    }
+    hash.to_be_bytes()
 }
 
 impl Layout {
@@ -155,6 +183,14 @@ impl Layout {
         self.pending
             .as_ref()
             .map(|pending| pending.layout_toml.as_str())
+    }
+
+    /// The same edit with the id the GUI names back when it applies or discards it.
+    #[must_use]
+    pub fn pending_with_id(&self) -> Option<([u8; 16], String)> {
+        self.pending
+            .as_ref()
+            .map(|pending| (pending.edit_id, pending.layout_toml.clone()))
     }
 
     /// The revision the pending edit was written against, when there is one.
@@ -243,9 +279,12 @@ impl Layout {
     /// Keeps a divergent local edit: it cannot be applied (a newer author's revision is
     /// applied), so it waits in `layout.pending.toml` for the user's apply or discard.
     pub fn hold_pending(&mut self, layout_toml: String) {
+        let base = self.applied;
+        let edit_id = edit_id(base, &layout_toml);
         self.pending = Some(Pending {
-            base: self.applied,
+            base,
             layout_toml,
+            edit_id,
         });
     }
 
