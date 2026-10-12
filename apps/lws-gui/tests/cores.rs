@@ -21,15 +21,16 @@
 //! Every wait is event-driven with a deadline and a message naming what was seen, never a
 //! sleep that is hoped to be long enough.
 
+use std::ffi::OsString;
 use std::io::Write;
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use lws_gui::view_model::{boot, Action, Bridge, CliArgs, ViewModel};
+use lws_gui::view_model::{boot, stop_core, Action, Bridge, CliArgs, ViewModel};
 
 /// How long any one state the window has to reach may take.
 ///
@@ -82,6 +83,29 @@ fn program(name: &str) -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Makes `lws-core` in target/debug visible to the GUI worker spawned by this test.
+struct CorePath(Option<OsString>);
+
+impl CorePath {
+    fn expose() -> CorePath {
+        let previous = std::env::var_os("PATH");
+        let mut paths = vec![binaries()];
+        if let Some(previous) = &previous {
+            paths.extend(std::env::split_paths(previous));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).expect("valid PATH"));
+        CorePath(previous)
+    }
+}
+
+impl Drop for CorePath {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            std::env::set_var("PATH", previous);
+        }
+    }
 }
 
 /// A directory no other test of this run shares, under the system temporary directory.
@@ -488,9 +512,9 @@ fn wait_for<T>(
         if Instant::now() >= deadline {
             let view = bridge.view();
             panic!(
-                "{what}: not within {DEADLINE:?}. The window showed: connection={:?}, \
-                 status={:?}, pairing={:?}, outcome={:?}, log={:?}",
-                view.connection, view.status, view.pairing, view.outcome, view.log,
+                "{what}: not within {DEADLINE:?}. The window showed: endpoint={:?}, \
+                 connection={:?}, status={:?}, pairing={:?}, outcome={:?}, log={:?}",
+                view.endpoint, view.connection, view.status, view.pairing, view.outcome, view.log,
             );
         }
         std::thread::sleep(FRAME);
@@ -829,4 +853,77 @@ fn the_claim_button_makes_the_follower_the_owner() {
         a_status.contains(&format!("owner={}", lab.b_id)),
         "the left core must report the new owner: {a_status}"
     );
+}
+
+#[test]
+fn the_window_restarts_its_core_and_applies_a_lan_address() {
+    let _serial = serial();
+    let _core_path = CorePath::expose();
+    let root = unique_dir("gui-restart");
+    std::fs::create_dir_all(root.join("config")).expect("config directory");
+    let ports = free_ports(2);
+    write_config(&root, ports[0], ports[1], "restart", false);
+    let mut bridge = bridge_for(&root);
+
+    bridge.dispatch(Action::StartCore, Instant::now());
+    let first_pid = wait_for(&mut bridge, "initial service and Status", |view| {
+        (view.connection.is_connected() && view.status.is_some() && view.inflight.is_empty())
+            .then(|| view.core.as_ref()?.pid)
+            .flatten()
+    });
+
+    bridge.dispatch(Action::RestartCore, Instant::now());
+    let second_pid = wait_for(
+        &mut bridge,
+        "service after restart and fresh Status",
+        |view| {
+            (view.connection.is_connected()
+                && view.status.is_some()
+                && view.inflight.is_empty()
+                && count_lines(view, "Служба работает") >= 2)
+                .then(|| view.core.as_ref()?.pid.filter(|pid| *pid != first_pid))
+                .flatten()
+        },
+    );
+    assert_ne!(
+        second_pid, first_pid,
+        "restart must launch a new core process"
+    );
+
+    let address = config::first_run::lan_addresses()
+        .into_iter()
+        .next()
+        .expect("the host has a LAN address for the apply scenario");
+    assert!(!address.is_loopback(), "the LAN candidate is not loopback");
+    bridge.dispatch(
+        Action::SelectLanAddress(address.to_string()),
+        Instant::now(),
+    );
+    bridge.dispatch(Action::ApplyLanAddress, Instant::now());
+    let saved =
+        config::Config::load(root.join("config/config.toml")).expect("Apply writes a valid config");
+    assert_eq!(saved.network.listen_address, address.to_string());
+
+    let third_pid = wait_for(
+        &mut bridge,
+        "service after Apply and fresh Status",
+        |view| {
+            (view.connection.is_connected()
+                && view.status.is_some()
+                && view.inflight.is_empty()
+                && count_lines(view, "Служба работает") >= 3)
+                .then(|| view.core.as_ref()?.pid.filter(|pid| *pid != second_pid))
+                .flatten()
+        },
+    );
+    assert_ne!(third_pid, second_pid, "Apply must restart the core");
+    let listener = SocketAddr::from((address, ports[0]));
+    assert!(
+        TcpStream::connect_timeout(&listener, Duration::from_secs(2)).is_ok(),
+        "the restarted core must bind the newly saved address {listener}"
+    );
+
+    stop_core(third_pid).expect("test stops its own core");
+    drop(bridge);
+    let _ = std::fs::remove_dir_all(root);
 }

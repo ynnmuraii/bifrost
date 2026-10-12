@@ -84,8 +84,7 @@ fn endpoint_root(paths: &config::Paths) -> &std::path::Path {
 #[cfg(windows)]
 pub fn root_tag(root: &std::path::Path) -> Option<String> {
     let defaults = config::Config::default_paths().ok()?;
-    let canonical =
-        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = canonical_existing_prefix;
     let ours = canonical(root);
     let is_default = [defaults.runtime_dir(), Some(defaults.state_dir())]
         .into_iter()
@@ -100,6 +99,31 @@ pub fn root_tag(root: &std::path::Path) -> Option<String> {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     Some(format!("{hash:016x}"))
+}
+
+/// Canonicalizes the existing prefix and preserves a missing suffix.
+///
+/// The GUI computes its endpoint before the core creates `<root>/run`; canonicalizing the
+/// raw missing path then hashing it gave the GUI and the started core different pipe names.
+#[cfg(windows)]
+fn canonical_existing_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let mut suffix = Vec::new();
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    let mut resolved = std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for name in suffix.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
 }
 
 /// The documented GUI endpoint of a resolved set of paths.
@@ -165,4 +189,21 @@ pub fn ctl_endpoint(paths: &config::Paths) -> Result<Endpoint, IpcError> {
             .map(|tag| format!("-{tag}"))
             .unwrap_or_default()
     )))
+}
+
+#[cfg(all(test, windows))]
+mod root_tag_tests {
+    use super::root_tag;
+
+    #[test]
+    fn endpoint_tag_is_stable_when_the_runtime_directory_is_created() {
+        let root = std::env::temp_dir().join(format!("lws-ipc-root-tag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = root.join("run");
+        let before = root_tag(&runtime).expect("a tagged non-default path");
+        std::fs::create_dir_all(&runtime).expect("runtime directory");
+        let after = root_tag(&runtime).expect("same tagged path after creation");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(before, after);
+    }
 }
