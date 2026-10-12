@@ -31,25 +31,26 @@
 //! * `ZonesChanged` is *not* turned into `DisplaysChanged`: display enumeration is
 //!   KVM-040 and `QueryDisplays` is answered with an explicit refusal by the session
 //!   loop.
-//! * No display geometry is invented here: `EnterPrepare` positions are resolved by
-//!   `platform-wayland`'s absolute region, and a position outside it is refused with
-//!   `PositionOutOfRegion` instead of being clamped.
+//! * With absolute EIS regions, `EnterPrepare` positions are resolved by
+//!   `platform-wayland` and out-of-region points are refused. Relative-only servers use
+//!   the local logical-zone bounds to estimate cursor position; edge clamping is assumed,
+//!   and exact placement cannot be guaranteed if the compositor behaves differently.
 //! * `RECEIVER_TAKEOVER` is never advertised (a portal receiver cannot see physical
 //!   input) and `EMERGENCY_HOTKEY` only when `GlobalShortcuts` registered the
 //!   combination.
 
 use std::collections::{HashSet, VecDeque};
 
+use crate::backend::wayland_barriers::{self, BarrierSegment, Zone};
+use crate::backend::{ClipboardChange, Event, Injected, Ready, Refusal, Released, POLL_TICK};
 use input_model::{CaptureKind, HidKey, InputEvent, KeyState, MouseButton, Position, RepeatFilter};
 use platform_probe::SessionInfo;
 use platform_wayland::{
-    compositor_signature, portal_versions, Barrier, BarrierID, BarrierPosition, CapturedEvent,
-    Compositor, EmergencyShortcuts, GrantStore, PortalGrant, WaylandCapture, WaylandError,
-    WaylandInjector, INPUT_CAPTURE_INTERFACE, REMOTE_DESKTOP_INTERFACE,
+    compositor_signature, portal_versions, select_pointer_mode, Barrier, BarrierID,
+    BarrierPosition, CapturedEvent, Compositor, EmergencyShortcuts, GrantStore, PointerMode,
+    PortalGrant, RelativeBounds, RelativeCursor, WaylandCapture, WaylandError, WaylandInjector,
+    INPUT_CAPTURE_INTERFACE, REMOTE_DESKTOP_INTERFACE,
 };
-
-use crate::backend::wayland_barriers::{self, BarrierSegment, Zone};
-use crate::backend::{ClipboardChange, Event, Injected, Ready, Refusal, Released, POLL_TICK};
 
 /// Which role the agent currently plays on this desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +87,8 @@ pub struct Wayland {
     activation: Option<Activation>,
     /// The barriers currently registered, so an activation id can be traced back.
     barriers: Vec<BarrierSegment>,
+    /// Local pointer estimate for a relative-only EIS server.
+    relative_cursor: Option<RelativeCursor>,
     /// Events the compositor handed us that are not (yet) on the wire.
     buffered: Vec<InputEvent>,
     /// Events already mapped to the agent vocabulary, waiting for `next_event`.
@@ -230,6 +233,7 @@ impl Wayland {
             mode: Mode::Observe,
             activation: None,
             barriers,
+            relative_cursor: None,
             buffered: Vec::new(),
             pending,
             pressed_keys: HashSet::new(),
@@ -318,10 +322,10 @@ impl Wayland {
     pub async fn end_capture(&mut self, replay_locally: bool) -> Result<Released, String> {
         if replay_locally && !self.buffered.is_empty() {
             let buffered: Vec<InputEvent> = std::mem::take(&mut self.buffered);
-            let outcome = self.injector.inject(&buffered);
-            let replayed = outcome.applied_count;
-            if let Some(error) = outcome.os_error {
-                tracing::warn!(%error, "the local replay of the buffered edge failed");
+            let outcome = self.inject(&buffered).await;
+            let replayed = outcome.applied;
+            if !outcome.os_error.is_empty() {
+                tracing::warn!(error = %outcome.os_error, "the local replay of the buffered edge failed");
             }
             tracing::info!(events = replayed, "replayed the cancelled edge locally");
         }
@@ -384,26 +388,85 @@ impl Wayland {
             .collect()
     }
 
-    /// `PrepareInject`: the inject session is already up; the absolute region is what
-    /// decides whether this node can be a receiver at all.
+    /// `PrepareInject` clears the relative estimate; positioning is deferred until the
+    /// first pointer event, so an aborted prepare does not move the local cursor.
     pub async fn prepare_inject(&mut self) -> Result<(), String> {
         self.injector.pump().await;
-        if self.injector.absolute_region().is_none() {
-            return Err(WaylandError::NoAbsoluteRegion.to_string());
-        }
+        self.relative_cursor = None;
         Ok(())
+    }
+    fn initialize_relative_cursor(&mut self) {
+        if select_pointer_mode(self.injector.capabilities()) != PointerMode::Relative {
+            return;
+        }
+        let bounds = self.capture.as_ref().and_then(relative_bounds_of);
+        let Some(bounds) = bounds else {
+            tracing::warn!(
+                "EIS has relative pointer but no logical capture bounds; keyboard, buttons \
+                 and scroll remain available, pointer motion will be refused"
+            );
+            return;
+        };
+        let (cursor, reset) = RelativeCursor::enter(bounds);
+        let outcome = self.injector.inject(&[InputEvent::PointerRelative {
+            dx: reset.dx,
+            dy: reset.dy,
+        }]);
+        if let Some(error) = outcome.os_error {
+            tracing::warn!(%error, "could not reset relative pointer estimate at entry");
+            return;
+        }
+        self.relative_cursor = Some(cursor);
+        tracing::info!(
+            ?bounds,
+            "using relative EIS pointer injection; cursor position is an estimate"
+        );
     }
 
     /// Injects one batch through EIS.
     ///
-    /// A point outside every region is refused by the platform crate with
-    /// [`WaylandError::PositionOutOfRegion`], which stops the batch and becomes
-    /// `InjectAck.os_error`; `docs/06-development-plan.md` KVM-027 makes a partial
-    /// failure the end of the lease, so the caller must not retry the batch.
+    /// Absolute source positions are converted to clamped relative deltas only when the
+    /// compositor has no absolute region; keyboard, button, and scroll events are unchanged.
     pub async fn inject(&mut self, events: &[InputEvent]) -> Injected {
-        // Keep the EIS stream drained: a paused device would silently discard input.
         self.injector.pump().await;
-        let outcome = self.injector.inject(events);
+        let relative_only =
+            select_pointer_mode(self.injector.capabilities()) == PointerMode::Relative;
+        if relative_only
+            && events
+                .iter()
+                .any(|event| matches!(event, InputEvent::PointerAbsolute(_)))
+        {
+            self.initialize_relative_cursor();
+        }
+        let mapped: Vec<InputEvent> = events
+            .iter()
+            .map(|event| match event {
+                InputEvent::PointerAbsolute(position) if relative_only => self
+                    .relative_cursor
+                    .as_mut()
+                    .map(|cursor| {
+                        let motion = cursor.move_to(*position);
+                        InputEvent::PointerRelative {
+                            dx: motion.dx,
+                            dy: motion.dy,
+                        }
+                    })
+                    .unwrap_or(*event),
+                _ => *event,
+            })
+            .collect();
+        let outcome = self.injector.inject(&mapped);
+        let relative_actual = if outcome.os_error.is_none()
+            && events
+                .iter()
+                .take(outcome.applied_count)
+                .any(|event| matches!(event, InputEvent::PointerAbsolute(_)))
+        {
+            self.relative_cursor.map(|cursor| cursor.position())
+        } else {
+            None
+        };
+        let actual = outcome.actual.or(relative_actual);
         for event in events.iter().take(outcome.applied_count) {
             match event {
                 InputEvent::Key { key, state } => {
@@ -431,7 +494,7 @@ impl Wayland {
                 .os_error
                 .map(|error| error.to_string())
                 .unwrap_or_default(),
-            actual: outcome.actual,
+            actual,
         }
     }
 
@@ -715,8 +778,40 @@ fn zones_of(capture: &WaylandCapture) -> Vec<Zone> {
         .collect()
 }
 
-/// Fresh zones, derived barriers and `Enable` — the arming sequence of
-/// «Сессии порталов»: `GetZones` → `SetPointerBarriers` → `Enable`.
+/// Calculates a bounding box directly from the capture portal's logical zones.
+fn relative_bounds_of(capture: &WaylandCapture) -> Option<RelativeBounds> {
+    relative_bounds(capture.zones().iter().map(|region| {
+        Zone::new(
+            region.x_offset(),
+            region.y_offset(),
+            region.width() as i32,
+            region.height() as i32,
+        )
+    }))
+}
+
+fn relative_bounds(zones: impl Iterator<Item = Zone>) -> Option<RelativeBounds> {
+    let mut usable = zones.filter(Zone::is_usable);
+    let first = usable.next()?;
+    let (mut left, mut top) = (first.x, first.y);
+    let (mut right, mut bottom) = (
+        first.x.checked_add(first.width)?,
+        first.y.checked_add(first.height)?,
+    );
+    for zone in usable {
+        left = left.min(zone.x);
+        top = top.min(zone.y);
+        right = right.max(zone.x.checked_add(zone.width)?);
+        bottom = bottom.max(zone.y.checked_add(zone.height)?);
+    }
+    Some(RelativeBounds {
+        x: left,
+        y: top,
+        width: u32::try_from(right.checked_sub(left)?).ok()?,
+        height: u32::try_from(bottom.checked_sub(top)?).ok()?,
+    })
+}
+
 async fn arm_capture(
     capture: &mut WaylandCapture,
     installed: &mut Vec<BarrierSegment>,
@@ -759,9 +854,8 @@ async fn arm_capture(
 /// The probe can only reason about the session; these rules are the ones the documents
 /// attach to the *runtime* answers:
 ///
-/// * `ABSOLUTE_POINTER` only with an absolute region — «Если регион не удаётся
-///   установить … бэкенд не объявляет `CAPABILITY_ABSOLUTE_POINTER`, и узел не может
-///   быть получателем».
+/// * `ABSOLUTE_POINTER` only with an absolute region; relative-only devices use the
+///   bounded relative fallback and do not advertise this hardware capability.
 /// * `EMERGENCY_HOTKEY` only when `GlobalShortcuts` registered the combination —
 ///   «Если backend отсутствует, `CAPABILITY_EMERGENCY_HOTKEY` не объявляется».
 /// * `RECEIVER_TAKEOVER` never: «Портальный получатель не видит физический ввод …
@@ -775,7 +869,7 @@ fn refine_ready(
     refusals: &[Refusal],
 ) -> Ready {
     let mut ready = Ready::from_session(session, String::new());
-    let absolute = injector.absolute_region().is_some();
+    let absolute = injector.capabilities().has_absolute_injection;
     ready.capabilities.retain(|name| match name.as_str() {
         "CAPTURE" => has_capture,
         "ABSOLUTE_POINTER" => absolute,
