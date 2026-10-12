@@ -8,9 +8,13 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lws_gui::view_model::{Action, Request, Side, ViewModel};
+use lws_gui::view_model::{
+    Action, Bridge, GuiClient, Launch, Request, Restart, RestartStep, Side, ViewModel,
+    RESTART_STOP_TIMEOUT,
+};
 use protocol::ipc::gui_frame::Msg;
 use support::{
     answer, attempt_id, event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE,
@@ -629,4 +633,387 @@ fn the_limits_follow_the_capabilities_the_core_reported() {
     let denied = limits("platform-wayland", &[], "denied");
     assert_eq!(denied.len(), 2, "{denied:?}");
     assert!(denied[0].contains("Забыть разрешения порталов"));
+}
+
+// ---------------------------------------------------------------- the LAN address
+
+/// A directory of this test's own, with a `config.toml` naming `address`.
+fn settings_dir(address: &str) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let dir = std::env::temp_dir().join(format!(
+        "lws-gui-settings-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("config")).expect("a config directory");
+    std::fs::write(
+        dir.join("config/config.toml"),
+        format!("config_version = 2\n\n[network]\nlisten_address = \"{address}\"\n"),
+    )
+    .expect("a config.toml");
+    dir
+}
+
+/// The directories of a configuration this test wrote.
+fn paths_of(dir: &std::path::Path) -> config::Paths {
+    config::Paths::new(
+        dir.join("config"),
+        dir.join("data"),
+        dir.join("state"),
+        None,
+    )
+}
+
+#[test]
+fn the_address_list_keeps_the_value_from_the_file_and_adds_what_this_computer_has() {
+    let mut vm = view();
+    vm.config.listen_address = "10.0.0.5".to_owned();
+    vm.settings.lan.candidates = vec!["192.168.1.10".to_owned(), "10.0.0.7".to_owned()];
+
+    // The file names an address this computer does not have: it is in the list anyway, so the
+    // value the user would lose by opening the dropdown is still offered to them.
+    assert_eq!(
+        vm.settings.lan.options(&vm.config.listen_address),
+        vec!["192.168.1.10", "10.0.0.7", "10.0.0.5"]
+    );
+    assert_eq!(
+        vm.settings
+            .lan
+            .selected(&vm.config.listen_address)
+            .as_deref(),
+        Some("10.0.0.5"),
+        "the dropdown shows the file's own value until the user picks another"
+    );
+    vm.local(&Action::SelectLanAddress("192.168.1.10".to_owned()));
+    assert_eq!(
+        vm.settings
+            .lan
+            .selected(&vm.config.listen_address)
+            .as_deref(),
+        Some("192.168.1.10")
+    );
+
+    // An address that *is* one of this computer's own is not listed twice.
+    vm.config.listen_address = "10.0.0.7".to_owned();
+    assert_eq!(
+        vm.settings.lan.options(&vm.config.listen_address),
+        vec!["192.168.1.10", "10.0.0.7"]
+    );
+
+    // A machine with no file yet offers only its own addresses, and nothing selected while
+    // the user has picked nothing — the pick itself outlives the file's value.
+    vm.settings.lan.choice = None;
+    vm.config.listen_address = String::new();
+    assert_eq!(
+        vm.settings.lan.options(&vm.config.listen_address),
+        vec!["192.168.1.10", "10.0.0.7"]
+    );
+    assert_eq!(vm.settings.lan.selected(&vm.config.listen_address), None);
+}
+
+#[test]
+fn the_address_button_writes_the_file_and_says_so() {
+    let mut vm = view();
+    let dir = settings_dir("127.0.0.1");
+    vm.config.paths = Some(paths_of(&dir));
+    vm.config.listen_address = "127.0.0.1".to_owned();
+    vm.settings.lan.candidates = vec!["192.168.1.10".to_owned(), "10.0.0.7".to_owned()];
+    vm.local(&Action::SelectLanAddress("192.168.1.10".to_owned()));
+
+    vm.local(&Action::ApplyLanAddress);
+
+    // The write went through the configuration's own writer: the file still loads, and it
+    // names the address that was picked.
+    let written = config::Config::load(paths_of(&dir).config_file()).expect("a valid config.toml");
+    assert_eq!(written.network.listen_address, "192.168.1.10");
+    let applied = vm
+        .settings
+        .lan
+        .applied
+        .as_ref()
+        .expect("«Применить» answers in words");
+    assert!(applied.ok, "{}", applied.line());
+    assert_eq!(applied.text, "Адрес сохранён");
+    // What the screen shows is what the file now names, and the pick is spent.
+    assert_eq!(vm.config.listen_address, "192.168.1.10");
+    assert_eq!(vm.settings.lan.choice, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_address_that_cannot_be_written_is_said_in_words() {
+    let mut vm = view();
+    let dir = settings_dir("127.0.0.1");
+    let damaged = "config_version = 2\n\n[network]\nlisten_address = 12\n";
+    std::fs::write(dir.join("config/config.toml"), damaged).expect("a damaged config.toml");
+    vm.config.paths = Some(paths_of(&dir));
+    vm.config.listen_address = "127.0.0.1".to_owned();
+    vm.settings.lan.candidates = vec!["192.168.1.10".to_owned()];
+    vm.local(&Action::SelectLanAddress("192.168.1.10".to_owned()));
+
+    vm.local(&Action::ApplyLanAddress);
+
+    let applied = vm
+        .settings
+        .lan
+        .applied
+        .as_ref()
+        .expect("a failure is a sentence, never a silence");
+    assert!(!applied.ok, "{}", applied.line());
+    assert!(
+        applied.text.starts_with("адрес не сохранён ("),
+        "the sentence carries the reason: {}",
+        applied.text
+    );
+    // The damaged file was not rewritten behind the user's back.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config/config.toml")).expect("the file"),
+        damaged
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- the service
+
+/// A service this window started: the one shape of core the window may stop.
+fn own_core(pid: u32) -> lws_gui::view_model::StartedCore {
+    lws_gui::view_model::StartedCore {
+        program: std::path::PathBuf::from("lws-core.exe"),
+        pid: Some(pid),
+    }
+}
+
+#[test]
+fn the_restart_follows_the_pid_the_window_holds_and_says_so_when_it_holds_none() {
+    let mut vm = view();
+    let now = Instant::now();
+
+    // No service of the window's own: the honest sentence, and nothing stopped.
+    assert_eq!(vm.begin_restart(now), RestartStep::Refused);
+    assert_eq!(
+        vm.settings
+            .service
+            .line
+            .as_ref()
+            .map(|line| line.text.as_str()),
+        Some("служба запущена не этим окном — остановите её сами")
+    );
+    assert_eq!(vm.settings.service.restart, None);
+
+    // A pid the platform never gave is the same story: a guess is not a service to stop.
+    vm.core = Some(lws_gui::view_model::StartedCore {
+        program: std::path::PathBuf::from("lws-core.exe"),
+        pid: None,
+    });
+    vm.on_connected("endpoint");
+    assert_eq!(vm.begin_restart(now), RestartStep::Refused);
+    assert_eq!(
+        vm.settings
+            .service
+            .line
+            .as_ref()
+            .map(|line| line.text.as_str()),
+        Some("номер процесса службы неизвестен — остановите её сами")
+    );
+
+    // The service the window started itself: that pid, and no other, is the one to stop.
+    vm.core = Some(own_core(4242));
+    assert_eq!(vm.begin_restart(now), RestartStep::Stop(4242));
+    assert_eq!(
+        vm.settings.service.restart,
+        Some(Restart::Stopping { since: now })
+    );
+    // A second press while the wait is standing does nothing: there is one restart at a time.
+    assert_eq!(vm.begin_restart(now), RestartStep::Refused);
+
+    // And the wait is event-driven: the link dropping is the proof, and it is what makes the
+    // window ask for the fresh core.
+    assert!(vm.on_disconnected("the pipe was closed".to_owned()));
+    assert_eq!(vm.settings.service.restart, Some(Restart::Starting));
+    assert!(
+        !vm.on_disconnected("the pipe was closed".to_owned()),
+        "a link that drops while no restart waits is not a restart"
+    );
+
+    // The fresh core coming up is the end of it: the service line says it, and the address
+    // sentence «Применить» was waiting for is the one that is left on screen.
+    vm.settings.lan.applied = Some(lws_gui::view_model::Outcome::done("Адрес сохранён"));
+    vm.on_core_started(Ok(own_core(4243)));
+    assert_eq!(
+        vm.settings.service.line.as_ref().expect("a sentence").text,
+        "Служба перезапущена"
+    );
+    assert_eq!(
+        vm.settings.lan.applied.expect("a sentence").text,
+        "Адрес сохранён, служба перезапущена"
+    );
+}
+
+#[test]
+fn a_restart_that_does_not_wait_for_a_service_gives_up_in_words() {
+    let mut vm = view();
+    let now = Instant::now();
+    vm.core = Some(own_core(4242));
+    vm.on_connected("endpoint");
+    vm.begin_restart(now);
+
+    vm.tick(now + Duration::from_secs(5));
+    assert_eq!(
+        vm.settings.service.restart,
+        Some(Restart::Stopping { since: now }),
+        "the wait is still standing before its deadline"
+    );
+
+    vm.tick(now + RESTART_STOP_TIMEOUT);
+    assert_eq!(vm.settings.service.restart, None, "the wait has an end");
+    let line = vm
+        .settings
+        .service
+        .line
+        .as_ref()
+        .expect("the honest sentence");
+    assert!(!line.ok);
+    assert!(
+        line.text.contains("служба не остановилась"),
+        "{:?}",
+        line.text
+    );
+    assert!(line.text.contains("остановите её сами"), "{:?}", line.text);
+}
+
+#[test]
+fn a_restart_with_no_link_starts_the_fresh_core_without_waiting() {
+    let mut vm = view();
+    vm.core = Some(own_core(4242));
+
+    // The window has no link to break, so there is nothing to wait for: the stop would
+    // otherwise cost the user the whole wait for a proof that cannot arrive.
+    assert_eq!(vm.begin_restart(Instant::now()), RestartStep::Start);
+    assert_eq!(vm.settings.service.restart, Some(Restart::Starting));
+}
+
+#[test]
+fn the_window_really_stops_the_process_it_started() {
+    // A process that outlives the test unless it is stopped: `sleep` on Unix, `powershell` on
+    // Windows. A host with neither cannot prove anything here and leaves nothing behind.
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        command
+    } else {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60");
+        command
+    };
+    let Ok(mut child) = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        eprintln!("no sleeper on this host: the stop path is not exercised");
+        return;
+    };
+
+    lws_gui::view_model::stop_core(child.id()).expect("the stop is sent");
+
+    // The window does not wait for the process — it waits for the link to drop — so this test
+    // waits for it instead, with a deadline rather than the minute the sleeper was given.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut stopped = child.try_wait().expect("the child can be asked");
+    while stopped.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the process was still running 20 s after the stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        stopped = child.try_wait().expect("the child can be asked");
+    }
+    assert!(
+        stopped.is_some(),
+        "the core process the window stopped is gone"
+    );
+}
+
+#[test]
+fn the_created_config_file_is_reported_once_in_a_session() {
+    let mut vm = view();
+    vm.config.config_was_missing = true;
+    assert!(
+        !vm.settings.first_run,
+        "the window has not started anything yet"
+    );
+
+    // The core the window started writes the file on its first run; that is worth one
+    // sentence, on the screen where the file is now visible.
+    vm.on_core_started(Ok(own_core(10)));
+    assert!(vm.settings.first_run);
+    vm.local(&Action::DismissFirstRun);
+    assert!(!vm.settings.first_run);
+
+    // A restart of the same window is not a first run, and a second window in this session
+    // would be a session of its own: the sentence does not come back here.
+    vm.on_core_started(Ok(own_core(11)));
+    assert!(
+        !vm.settings.first_run,
+        "once per session, not once per start"
+    );
+}
+
+#[test]
+fn a_machine_that_already_had_its_configuration_says_nothing_about_a_first_run() {
+    let mut vm = view();
+    vm.on_core_started(Ok(own_core(12)));
+    assert!(!vm.settings.first_run);
+    assert!(!vm.settings.first_run_reported);
+}
+
+// ---------------------------------------------------------------- the bridge
+
+/// «Применить» through the window's own wiring: the file is written, and the address is only
+/// in use once the service behind it is the fresh one — which this window did not start.
+#[test]
+fn the_address_button_through_the_bridge_writes_and_says_why_it_cannot_restart() {
+    let mut bridge = Bridge::new(
+        view(),
+        GuiClient::start(None, Launch::with_flags(Vec::new())),
+    );
+    let dir = settings_dir("127.0.0.1");
+    let view = bridge.view_mut();
+    view.config.paths = Some(paths_of(&dir));
+    view.config.listen_address = "127.0.0.1".to_owned();
+    view.settings.lan.candidates = vec!["192.168.1.10".to_owned()];
+    let now = Instant::now();
+
+    bridge.dispatch(Action::SelectLanAddress("192.168.1.10".to_owned()), now);
+    bridge.dispatch(Action::ApplyLanAddress, now);
+
+    let written = config::Config::load(paths_of(&dir).config_file()).expect("a valid config.toml");
+    assert_eq!(written.network.listen_address, "192.168.1.10");
+    assert_eq!(
+        bridge
+            .view()
+            .settings
+            .lan
+            .applied
+            .as_ref()
+            .expect("a sentence")
+            .text,
+        "Адрес сохранён"
+    );
+    // The window holds no service of its own here, so the answer is the honest sentence and
+    // not a process it does not know.
+    assert_eq!(
+        bridge
+            .view()
+            .settings
+            .service
+            .line
+            .as_ref()
+            .expect("a sentence")
+            .text,
+        "служба запущена не этим окном — остановите её сами"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

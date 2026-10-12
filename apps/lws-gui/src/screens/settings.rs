@@ -1,24 +1,50 @@
 //! «Настройки» — the few switches the window owns, and the read-only facts the owner needs.
 //!
 //! What is here is only what the core can actually do: the clipboard switch, the hotkeys
-//! (shown, never written — the window reads `config.toml` for exactly this), forgetting the
+//! (shown, never written — the window reads `config.toml` for exactly this), the LAN address
+//! this computer answers on, a restart of the service the window started, forgetting the
 //! portal permissions, revoking a paired computer and writing the diagnostics. There is no
 //! autostart switch, because the core does not implement autostart (KVM-051).
 
 use eframe::egui;
 
 use super::{block, hint, important, warn_color};
-use crate::view_model::{Action, ViewModel};
+use crate::view_model::{Action, Restart, ViewModel};
 
 /// Draws the settings screen.
 pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let mut actions = Vec::new();
+    actions.extend(first_run_block(vm, ui));
     actions.extend(clipboard_block(vm, ui));
     keys_block(vm, ui);
+    actions.extend(lan_block(vm, ui));
+    actions.extend(service_block(vm, ui));
     actions.extend(portal_block(vm, ui, vm.connection.is_connected()));
     actions.extend(revoke_block(vm, ui, vm.connection.is_connected()));
     actions.extend(diagnostics_block(vm, ui, vm.connection.is_connected()));
     // KVM-051: автозапуск не реализован в ядре — переключателя нет.
+    actions
+}
+
+/// «Настройки созданы автоматически»: the one sentence about a file the core has just made.
+///
+/// It belongs on the screen that shows the file, and once per session — the view model keeps
+/// it shut after «Понятно» and does not raise it again when the service is restarted.
+fn first_run_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
+    let mut actions = Vec::new();
+    if !vm.settings.first_run {
+        return actions;
+    }
+    block(ui, "Первый запуск", |ui| {
+        important(ui, "Настройки созданы автоматически");
+        hint(
+            ui,
+            "Служба создала файл config.toml при первом запуске — проверьте адрес и клавиши",
+        );
+        if ui.button("Понятно").clicked() {
+            actions.push(Action::DismissFirstRun);
+        }
+    });
     actions
 }
 
@@ -73,6 +99,101 @@ fn keys_block(vm: &ViewModel, ui: &mut egui::Ui) {
             important(ui, note);
         }
     });
+}
+
+/// «Адрес этого компьютера в локальной сети»: shown, and changed here.
+///
+/// The list is everything the machine has plus the value the file already names, so an
+/// address that is not one of this computer's own is never quietly replaced by one that is.
+fn lan_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
+    let mut actions = Vec::new();
+    block(ui, "Адрес в локальной сети", |ui| {
+        let current = &vm.config.listen_address;
+        let shown = if current.is_empty() {
+            "не указан"
+        } else {
+            current.as_str()
+        };
+        ui.label(format!("Адрес этого компьютера в локальной сети: {shown}"));
+        hint(
+            ui,
+            "Другой компьютер должен иметь доступ к этому адресу — он вводит его при сопряжении",
+        );
+        let options = vm.settings.lan.options(current);
+        if options.is_empty() {
+            hint(ui, "Этот компьютер не сообщил ни одного адреса");
+            return;
+        }
+        let mut selected = vm.settings.lan.selected(current).unwrap_or_default();
+        let shown_selection = if selected.is_empty() {
+            "выберите адрес".to_owned()
+        } else {
+            selected.clone()
+        };
+        egui::ComboBox::from_label("Адрес")
+            .selected_text(shown_selection)
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                for option in &options {
+                    let picked = ui
+                        .selectable_value(&mut selected, option.clone(), option.as_str())
+                        .clicked();
+                    if picked {
+                        actions.push(Action::SelectLanAddress(option.clone()));
+                    }
+                }
+            });
+        if ui.button("Применить").clicked() {
+            actions.push(Action::ApplyLanAddress);
+        }
+        match &vm.settings.lan.applied {
+            Some(applied) => {
+                let color = if applied.ok {
+                    super::ok_color()
+                } else {
+                    warn_color()
+                };
+                ui.colored_label(color, applied.line());
+            }
+            None => hint(
+                ui,
+                "После «Применить» служба перезапустится с новым адресом",
+            ),
+        }
+    });
+    actions
+}
+
+/// «Перезапустить службу»: the window stops the service it started, and starts a new one.
+///
+/// The pid is the window's own ([`launch_core`]), which is why the offer is honest: with no
+/// such pid it says so instead of stopping a service it knows nothing about.
+fn service_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
+    let mut actions = Vec::new();
+    block(ui, "Служба", |ui| {
+        let restarting = vm.settings.service.restart.is_some();
+        if ui
+            .add_enabled(!restarting, egui::Button::new("Перезапустить службу"))
+            .on_hover_text("Служба остановится и запустится снова — настройки начнут работать")
+            .clicked()
+        {
+            actions.push(Action::RestartCore);
+        }
+        match &vm.settings.service.restart {
+            Some(Restart::Stopping { .. }) => hint(ui, "Служба останавливается…"),
+            Some(Restart::Starting) => hint(ui, "Служба запускается…"),
+            None => hint(ui, "Перезапуск поможет, если служба перестала отвечать"),
+        }
+        if let Some(line) = &vm.settings.service.line {
+            let color = if line.ok {
+                super::ok_color()
+            } else {
+                warn_color()
+            };
+            ui.colored_label(color, line.line());
+        }
+    });
+    actions
 }
 
 /// «Забыть разрешения порталов».

@@ -17,13 +17,14 @@
 //!
 //! # What the window asks the core for
 //!
-//! [`Action`] is the whole vocabulary: the wire requests of `ipc.proto`
-//! (`GetStatus`, `ClaimOwnership`, `StartPairing`, …), the two things the client does by
-//! itself (`StartCore`, `ConnectAgain`), and the local edits the window applies to its own
-//! state (`ShowScreen`, `SetSide`, `MoveDisplay`, …). Only the first group is a `GuiFrame`;
-//! the app sends those to the client and folds the rest into the view model, so no decision
-//! ever happens in drawing code.
-
+/// [`Action`] is the whole vocabulary: the wire requests of `ipc.proto`
+/// (`GetStatus`, `ClaimOwnership`, `StartPairing`, …), the two things the client does by
+/// itself (`StartCore`, `ConnectAgain`), and the local edits the window applies to its own
+/// state (`ShowScreen`, `SetSide`, `MoveDisplay`, …). Only the first group is a `GuiFrame`;
+/// the app sends those to the client and folds the rest into the view model, so no decision
+/// ever happens in drawing code. The service this window started is the one thing that is
+/// neither: it is stopped and started again by the app (`RestartCore`), from the pid
+/// [`ViewModel::core`] holds, and that is the only process the window ever kills.
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -47,6 +48,13 @@ pub const LOG_LINES: usize = 20;
 /// The build spec asks for a 2 s retry, so a core started by hand (or by «Запустить» on
 /// another desktop) makes the window come alive on its own.
 pub const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// How long «Перезапустить службу» waits for the core it stopped to be gone.
+///
+/// The wait is bounded because the window will not sit on a spinner forever: past this
+/// deadline the user is told to stop the service by hand, which is the only thing left
+/// that can be said honestly.
+pub const RESTART_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The oldest requests kept while they wait for an answer.
 const INFLIGHT_LIMIT: usize = 32;
@@ -300,10 +308,23 @@ pub struct LocalConfig {
     pub switch_hotkey: String,
     /// `[workspace].claim_hotkey`.
     pub claim_hotkey: String,
+    /// `[network].listen_address` — «Адрес этого компьютера в локальной сети».
+    pub listen_address: String,
     /// `Paths::config_file()`, so a user can be told which file is being shown.
     pub config_file: PathBuf,
     /// `Paths::state_dir()`, where `ExportDiagnostics` writes.
     pub state_dir: PathBuf,
+    /// The directories the window resolved, when it resolved them.
+    ///
+    /// «Применить» on the address writes through them, so this is the one place the window
+    /// needs more than the display strings above; `None` for a host whose directories could
+    /// not be resolved, where the write is refused in words instead of guessed.
+    pub paths: Option<Paths>,
+    /// `true` when `config.toml` was not there when the window read it.
+    ///
+    /// The core creates the file on its first run, so the window that read nothing comes
+    /// back to it once — see [`ViewModel::on_core_started`].
+    pub config_was_missing: bool,
     /// The reason the file was not used, when it was not.
     pub note: Option<String>,
 }
@@ -314,8 +335,11 @@ impl Default for LocalConfig {
             display_name: "Workstation".to_owned(),
             switch_hotkey: "Ctrl+Alt+Shift+Right".to_owned(),
             claim_hotkey: "Ctrl+Alt+Shift+F11".to_owned(),
+            listen_address: String::new(),
             config_file: PathBuf::new(),
             state_dir: PathBuf::new(),
+            paths: None,
+            config_was_missing: false,
             note: None,
         }
     }
@@ -328,13 +352,16 @@ impl LocalConfig {
         let mut config = LocalConfig {
             config_file: file.clone(),
             state_dir: paths.state_dir().to_path_buf(),
+            paths: Some(paths.clone()),
             ..LocalConfig::default()
         };
+        config.config_was_missing = !file.is_file();
         match config::Config::load(&file) {
             Ok(loaded) => {
                 config.display_name = loaded.node.display_name.clone();
                 config.switch_hotkey = loaded.input.switch_hotkey.clone();
                 config.claim_hotkey = loaded.workspace.claim_hotkey.clone();
+                config.listen_address = loaded.network.listen_address.clone();
             }
             Err(error) => {
                 config.note = Some(format!(
@@ -540,6 +567,82 @@ pub struct Settings {
     pub revoke_confirmed: bool,
     /// What `ExportDiagnostics` answered.
     pub export: Option<Outcome>,
+    /// «Адрес в локальной сети»: what the file names, and what may be picked.
+    pub lan: Lan,
+    /// The service this window started, and what «Перезапустить службу» is doing with it.
+    pub service: Service,
+    /// `true` while «Настройки созданы автоматически» waits for «Понятно».
+    pub first_run: bool,
+    /// `true` once that notice was raised: never twice in one session.
+    pub first_run_reported: bool,
+}
+
+/// «Адрес этого компьютера в локальной сети»: the address the file names, and the ones
+/// that may be picked instead of it.
+///
+/// The current value lives in [`LocalConfig::listen_address`] — one copy of the truth, read
+/// from `config.toml` and written back by «Применить» — so this is only the part of the
+/// block that is not the file's own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lan {
+    /// The addresses this computer has, best first (`first_run::lan_addresses`).
+    pub candidates: Vec<String>,
+    /// The address picked in the dropdown; `None` until the user picks one.
+    pub choice: Option<String>,
+    /// What «Применить» answered, in words.
+    pub applied: Option<Outcome>,
+}
+
+impl Lan {
+    /// What the dropdown offers: the addresses this computer has, plus the one the file
+    /// names when it is not one of them — the current value is never silently dropped.
+    pub fn options(&self, current: &str) -> Vec<String> {
+        let mut options = self.candidates.clone();
+        if !current.is_empty() && !options.iter().any(|option| option == current) {
+            options.push(current.to_owned());
+        }
+        options
+    }
+
+    /// The address the dropdown shows: what the user picked, or the value in the file.
+    pub fn selected(&self, current: &str) -> Option<String> {
+        self.choice
+            .clone()
+            .or_else(|| (!current.is_empty()).then(|| current.to_owned()))
+    }
+}
+
+/// The service, and the last word the window had about it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Service {
+    /// What «Перезапустить службу» is waiting for, while it waits.
+    pub restart: Option<Restart>,
+    /// What the last «Перезапустить службу» answered, in words.
+    pub line: Option<Outcome>,
+}
+
+/// What «Перезапустить службу» is waiting for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restart {
+    /// The stop was sent to the pid this window holds; the window waits for the link to
+    /// drop, which is how it knows the old core is really gone.
+    Stopping {
+        /// When the stop was sent, so the wait has an end.
+        since: Instant,
+    },
+    /// The fresh core was launched; the link is on its way back.
+    Starting,
+}
+
+/// What «Перезапустить службу» is to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartStep {
+    /// Stop this pid, then wait for the link to drop before anything else.
+    Stop(u32),
+    /// There is nothing to wait for: ask the client for a fresh core right now.
+    Start,
+    /// The window must not act; why is already in [`Service::line`].
+    Refused,
 }
 
 /// Everything the screens draw, and every decision behind it.
@@ -616,7 +719,10 @@ impl ViewModel {
     }
 
     /// The link is gone; the last `Status` stays on screen.
-    pub fn on_disconnected(&mut self, why: String) {
+    ///
+    /// Returns `true` while «Перезапустить службу» waits for the core it stopped: a dropped
+    /// link is the proof it was waiting for, and the window then starts the fresh one.
+    pub fn on_disconnected(&mut self, why: String) -> bool {
         self.push_log(format!("Связь со службой потеряна: {}", short_error(&why)));
         self.connection = Connection::Disconnected { why };
         self.inflight.clear();
@@ -625,6 +731,14 @@ impl ViewModel {
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
         self.pairing.prompt = None;
+        if matches!(
+            self.settings.service.restart,
+            Some(Restart::Stopping { .. })
+        ) {
+            self.settings.service.restart = Some(Restart::Starting);
+            return true;
+        }
+        false
     }
 
     /// Records a request that was just handed to the client.
@@ -655,6 +769,21 @@ impl ViewModel {
             .inflight
             .iter()
             .any(|inflight| now >= inflight.deadline);
+        // «Перезапустить службу» waits for the link to drop, and that wait has an end: past
+        // it the service is left to the user rather than watched from a spinner, because
+        // that is the only thing left that can be said honestly.
+        let seconds = RESTART_STOP_TIMEOUT.as_secs();
+        let stalled = matches!(
+            &self.settings.service.restart,
+            Some(Restart::Stopping { since }) if now.duration_since(*since) >= RESTART_STOP_TIMEOUT
+        );
+        if stalled {
+            self.settings.service.restart = None;
+            self.push_log("Служба не остановилась");
+            self.settings.service.line = Some(Outcome::failed(format!(
+                "служба не остановилась за {seconds} c — остановите её сами и нажмите «Перезапустить службу» снова"
+            )));
+        }
     }
 
     /// The core process was started, or could not be.
@@ -668,18 +797,49 @@ impl ViewModel {
                         .map_or_else(|| "не сообщён".to_owned(), |pid| pid.to_string())
                 ));
                 self.core = Some(core);
+                self.report_created_config();
+                if self.settings.service.restart.take().is_some() {
+                    self.settings.service.line = Some(Outcome::done("Служба перезапущена"));
+                    // The sentence «Применить» was waiting for: the address is in the file
+                    // *and* in use, because the fresh core is the one holding it.
+                    if self
+                        .settings
+                        .lan
+                        .applied
+                        .as_ref()
+                        .is_some_and(|applied| applied.ok)
+                    {
+                        self.settings.lan.applied =
+                            Some(Outcome::done("Адрес сохранён, служба перезапущена"));
+                    }
+                }
             }
             Err(why) => {
                 self.push_log(format!(
                     "Не удалось запустить службу: {}",
                     short_error(&why)
                 ));
+                self.settings.service.restart = None;
                 self.outcome = Some(Outcome::failed(format!(
                     "не удалось запустить службу ({})",
                     short_error(&why)
                 )));
             }
         }
+    }
+
+    /// «Настройки созданы автоматически»: once per session, once the window's own core is up.
+    ///
+    /// `LocalConfig::load` read no file on this machine, and the core writes one on its first
+    /// run — so the fact is worth one sentence now that the file exists, on the screen where
+    /// the user can see it. A restart of the same window must not say it again.
+    fn report_created_config(&mut self) {
+        if !self.config.config_was_missing || self.settings.first_run_reported {
+            return;
+        }
+        self.settings.first_run_reported = true;
+        self.settings.first_run = true;
+        self.push_log("Настройки созданы автоматически (config.toml)");
     }
 
     // ------------------------------------------------------------ incoming frames
@@ -1391,8 +1551,101 @@ impl ViewModel {
                 self.settings.revoke_confirmed = false;
             }
             Action::ConfirmRevoke(confirmed) => self.settings.revoke_confirmed = *confirmed,
+            Action::SelectLanAddress(address) => self.settings.lan.choice = Some(address.clone()),
+            Action::ApplyLanAddress => self.apply_lan_address(),
+            // «Перезапустить службу» is not a fold: it decides against the pid the window
+            // holds and asks for a process to be stopped, so `Bridge::dispatch` drives it.
+            Action::RestartCore => {}
+            Action::DismissFirstRun => self.settings.first_run = false,
             Action::Refresh => self.conflict = None,
             _ => {}
+        }
+    }
+
+    /// «Применить» on the LAN address: writes `network.listen_address`, says what happened.
+    ///
+    /// The write goes through the config crate's own writer (`first_run::set_listen_address`),
+    /// so the file this window otherwise only reads is changed by the code that owns its
+    /// rules. A host with no resolved directories or no chosen address is refused in words
+    /// rather than guessed at, and a failed write is a sentence with the reason in it.
+    fn apply_lan_address(&mut self) {
+        let current = self.config.listen_address.clone();
+        let chosen = self.settings.lan.selected(&current).unwrap_or_default();
+        let Some(address) = chosen.parse::<std::net::Ipv4Addr>().ok() else {
+            self.settings.lan.applied = Some(Outcome::failed(
+                "адрес не выбран — выберите адрес в списке и нажмите «Применить» снова",
+            ));
+            return;
+        };
+        let Some(paths) = self.config.paths.clone() else {
+            self.settings.lan.applied = Some(Outcome::failed(
+                "каталоги настроек не определены — перезапустите окно без особых параметров",
+            ));
+            return;
+        };
+        match config::first_run::set_listen_address(&paths, address) {
+            Ok(()) => {
+                self.push_log(format!("Адрес этого компьютера: {address}"));
+                self.config.listen_address = address.to_string();
+                self.settings.lan.choice = None;
+                self.settings.lan.applied = Some(Outcome::done("Адрес сохранён"));
+            }
+            Err(why) => {
+                self.settings.lan.applied = Some(Outcome::failed(format!(
+                    "адрес не сохранён ({})",
+                    short_error(&why)
+                )));
+            }
+        }
+    }
+
+    /// «Перезапустить службу»: stop the core this window started, then start a fresh one.
+    ///
+    /// The pid comes from [`ViewModel::core`] and from nowhere else. A service this window
+    /// did not start — one opened by hand, or by another window — is not the window's to
+    /// stop, so it says so instead of killing a process it only *thinks* it knows.
+    ///
+    /// What to do with the answer is the caller's: stopping a process is the one thing a
+    /// view model cannot be handed back.
+    pub fn begin_restart(&mut self, now: Instant) -> RestartStep {
+        if self.settings.service.restart.is_some() {
+            return RestartStep::Refused;
+        }
+        let Some(core) = &self.core else {
+            self.settings.service.line = Some(Outcome::failed(
+                "служба запущена не этим окном — остановите её сами",
+            ));
+            return RestartStep::Refused;
+        };
+        let Some(pid) = core.pid else {
+            self.settings.service.line = Some(Outcome::failed(
+                "номер процесса службы неизвестен — остановите её сами",
+            ));
+            return RestartStep::Refused;
+        };
+        if !self.connection.is_connected() {
+            // No link to break, so nothing to wait for: the fresh core can be started now.
+            self.push_log(format!("Служба перезапускается (pid {pid})"));
+            self.settings.service.restart = Some(Restart::Starting);
+            return RestartStep::Start;
+        }
+        self.push_log(format!("Служба останавливается (pid {pid})"));
+        self.settings.service.restart = Some(Restart::Stopping { since: now });
+        RestartStep::Stop(pid)
+    }
+
+    /// What the stop of the core process answered, when it answered at all.
+    ///
+    /// A stop that failed ends the restart: the window says why, and leaves the service
+    /// alone. A stop that was sent leaves the [`Restart::Stopping`] wait standing, because
+    /// only a dropped link proves the core is gone.
+    pub fn on_core_stopped(&mut self, stopped: Result<(), String>) {
+        if let Err(why) = stopped {
+            self.settings.service.restart = None;
+            self.push_log(format!("Не удалось остановить службу: {why}"));
+            self.settings.service.line = Some(Outcome::failed(format!(
+                "не удалось остановить службу ({why})"
+            )));
         }
     }
 
@@ -1577,6 +1830,14 @@ pub enum Action {
     SelectRevoke(Option<String>),
     /// Answer the revoke confirmation.
     ConfirmRevoke(bool),
+    /// Pick the LAN address the dropdown shows.
+    SelectLanAddress(String),
+    /// Write `network.listen_address` and restart the service behind it.
+    ApplyLanAddress,
+    /// Stop the core this window started and start a fresh one.
+    RestartCore,
+    /// Close «Настройки созданы автоматически».
+    DismissFirstRun,
 }
 
 impl Action {
@@ -1738,7 +1999,36 @@ impl Bridge {
             Action::ConnectAgain => {
                 self.client.connect_again();
             }
+            Action::RestartCore => self.restart_core(now),
+            // «Применить» has already written the file above (`local`), and a saved address
+            // is not in use until the core that reads it is the fresh one.
+            Action::ApplyLanAddress
+                if self
+                    .view
+                    .settings
+                    .lan
+                    .applied
+                    .as_ref()
+                    .is_some_and(|applied| applied.ok) =>
+            {
+                self.restart_core(now);
+            }
             _ => {}
+        }
+    }
+
+    /// «Перезапустить службу»: stop the core this window started, then ask for a new one.
+    ///
+    /// The stop is the only process this window kills, and the pid for it comes from the
+    /// service the window itself launched ([`launch_core`]); the wait for the old core to be
+    /// gone is event-driven — [`Bridge::pump`] starts the fresh one when the link drops.
+    fn restart_core(&mut self, now: Instant) {
+        match self.view.begin_restart(now) {
+            RestartStep::Stop(pid) => self.view.on_core_stopped(stop_core(pid)),
+            RestartStep::Start => {
+                self.client.start_core();
+            }
+            RestartStep::Refused => {}
         }
     }
 
@@ -1758,7 +2048,12 @@ impl Bridge {
                     // §4 of the build spec: a fresh link asks for the status and the document.
                     self.dispatch(Action::Refresh, Instant::now());
                 }
-                GuiEvent::Disconnected { why } => self.view.on_disconnected(why),
+                GuiEvent::Disconnected { why } => {
+                    // A dropped link is how the window knows the core it stopped is gone.
+                    if self.view.on_disconnected(why) {
+                        self.client.start_core();
+                    }
+                }
                 GuiEvent::Frame(frame) => self.view.apply(*frame),
                 GuiEvent::NotSent { id } => self.view.on_not_sent(id),
                 GuiEvent::CoreStarted { started } => self.view.on_core_started(started),
@@ -2179,6 +2474,66 @@ fn core_program_name() -> &'static str {
     }
 }
 
+/// Stops the core process this window started, by the pid [`StartedCore`] names.
+///
+/// Windows has no signals, so it is `taskkill /PID <pid> /F` — the documented way to stop a
+/// process, and `/F` is what makes it unconditional, because the core has no console to be
+/// asked through. On Unix it is `kill -TERM` and deliberately not `KILL`: the core treats
+/// SIGTERM as the clean shutdown its own `systemd` unit asks for, closing its listeners and
+/// writing what it has, whereas SIGKILL would leave the endpoint bound until the kernel
+/// reaped the process and the fresh core could not take the address over.
+///
+/// The outcome is the window's to report: [`ViewModel::on_core_stopped`] says why in words
+/// when the stop could not be sent at all.
+pub fn stop_core(pid: u32) -> Result<(), String> {
+    #[cfg(windows)]
+    let (program, mut command) = {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/F"]);
+        // The window has no console of its own (`main.rs`), so neither does the helper that
+        // serves it: without this flag a black slab would flash behind the button.
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        }
+        ("taskkill", command)
+    };
+    #[cfg(not(windows))]
+    let (program, mut command) = {
+        let mut command = std::process::Command::new("kill");
+        command.arg("-TERM").arg(pid.to_string());
+        ("kill", command)
+    };
+    // `taskkill` announces what it did on its own streams; nothing in this window prints to a
+    // console (`main.rs`), and the exit status is the only part of the answer the window can
+    // read anyway.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match command.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "{program} не остановил процесс {pid} (код {})",
+            status
+                .code()
+                .map_or("неизвестен".to_owned(), |code| code.to_string())
+        )),
+        Err(error) => Err(format!("{program} не запустился: {error}")),
+    }
+}
+
+/// The addresses this computer has, best first — what «Настройки» offers to pick from.
+///
+/// Plain text because the screens draw strings and never an address type: the config crate
+/// decides which addresses are worth offering.
+pub fn lan_addresses() -> Vec<String> {
+    config::first_run::lan_addresses()
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect()
+}
+
 /// Starts `lws-core run` detached, with the flags the window was given.
 ///
 /// `docs/03-architecture.md`: «Закрытие окна GUI не влияет на активный сеанс». The child gets
@@ -2236,7 +2591,11 @@ pub fn boot(args: CliArgs) -> (ViewModel, GuiClient) {
     let config = LocalConfig::load(&paths);
     let (endpoint, transport) = resolve_endpoint(&paths);
     let client = GuiClient::start(transport, launch);
-    (ViewModel::new(endpoint, config), client)
+    let mut view = ViewModel::new(endpoint, config);
+    // The addresses this computer really has: the dropdown of «Настройки» offers them, and
+    // the address the file names is added next to them by the screen itself.
+    view.settings.lan.candidates = lan_addresses();
+    (view, client)
 }
 
 // ---------------------------------------------------------------- text helpers
