@@ -3,6 +3,7 @@ name = "platform-win"
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish.workspace = true
 description = "Windows capture (low-level hooks + Raw Input) and SendInput injection spikes for LAN Workspace (KVM-010/KVM-011)."
 
