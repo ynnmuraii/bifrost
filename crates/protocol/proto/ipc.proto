@@ -44,9 +44,10 @@ message AgentFrame {
     SessionEvent session_event = 49;
     Pong pong = 50;
     AgentError error = 51;
-    PortalPermissionRequired portal_permission = 52; // GUI hint: portal dialog is on screen
+    PortalPermissionRequired portal_permission = 52; // GUI hint: a permission dialog is expected
     PortalGrantChanged portal_grant = 53;            // fresh restore token to persist
     ClipboardChanged clipboard_changed = 54;         // the local clipboard changed; core offers it to the peers
+    PortalPermissionRestoring portal_permission_restoring = 55; // a persisted restore token is being applied; no dialog is expected
   }
 }
 
@@ -192,6 +193,7 @@ enum SessionEventKind {
 message SessionEvent { SessionEventKind kind = 1; }
 message Pong { uint64 nonce = 1; }
 message PortalPermissionRequired { string portal_interface = 1; string purpose = 2; } // purpose: capture | inject | clipboard | hotkey
+message PortalPermissionRestoring { string portal_interface = 1; string purpose = 2; } // a persisted grant is being restored
 message PortalGrantChanged { PortalGrant grant = 1; bool revoked = 2; }
 // code: PORTAL_DENIED, PORTAL_UNAVAILABLE, PORTAL_SESSION_LOST, PORTAL_FRONTEND_STUCK, QUEUE_OVERFLOW, ...
 message AgentError { string code = 1; string detail = 2; } // never contains key/clipboard payload
