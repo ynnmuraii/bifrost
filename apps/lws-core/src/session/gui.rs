@@ -278,6 +278,10 @@ impl Session {
                 let response = self.reset_portals().await;
                 answer(&out, request_id, Msg::OpResult(op_result(&response))).await;
             }
+            Msg::Shutdown(_) => {
+                answer(&out, request_id, Msg::OpResult(ok())).await;
+                self.shutdown_agent().await;
+            }
             Msg::SetClipboard(set) => {
                 let result = self.set_clipboard(set.enabled);
                 answer(&out, request_id, Msg::OpResult(result)).await;

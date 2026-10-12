@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use lws_gui::view_model::{
     Action, Bridge, GuiClient, Launch, Request, Restart, RestartStep, Side, ViewModel,
-    RESTART_STOP_TIMEOUT,
+    SERVICE_STOP_TIMEOUT,
 };
 use protocol::ipc::gui_frame::Msg;
 use support::{
@@ -795,6 +795,113 @@ fn an_address_that_cannot_be_written_is_said_in_words() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn degraded_agent_status_exposes_its_reason_and_retry_state() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    assert_eq!(vm.agent_degraded_reason(), None);
+
+    let mut degraded = status_with("BLOCKED");
+    degraded.agent_degraded_reason = "Wayland permission was denied".to_owned();
+    vm.apply(event(Msg::Status(degraded)));
+    assert_eq!(
+        vm.agent_degraded_reason(),
+        Some("Wayland permission was denied")
+    );
+
+    let (request, message) = Action::RetryAgent.wire().expect("a retry request");
+    assert_eq!(request, Request::RetryAgent);
+    assert!(matches!(message, Msg::RetryAgent(_)));
+
+    let mut open = status_with("BLOCKED");
+    open.agent_restart_circuit_open = true;
+    vm.apply(event(Msg::Status(open)));
+    assert_eq!(vm.agent_degraded_reason(), Some("Служба ввода остановлена"));
+}
+
+#[test]
+fn stopping_a_core_without_owning_its_pid_uses_shutdown_and_reports_disconnect() {
+    let (request, message) = Action::StopCore.wire().expect("a shutdown request");
+    assert_eq!(request, Request::Shutdown);
+    assert!(matches!(message, Msg::Shutdown(_)));
+
+    let mut vm = view();
+    vm.on_connected("endpoint");
+    let now = Instant::now();
+    assert!(
+        vm.begin_stop(now),
+        "a connected core can be stopped by request"
+    );
+    assert!(vm.core.is_none(), "the window owns no pid");
+    assert!(vm.settings.service.stopping.is_some());
+
+    assert!(
+        !vm.on_disconnected("the pipe was closed".to_owned()),
+        "stopping must not launch a replacement core"
+    );
+    assert_eq!(vm.connection_label(), "Служба не запущена");
+    assert_eq!(
+        vm.settings
+            .service
+            .line
+            .as_ref()
+            .map(|line| line.text.as_str()),
+        Some("Служба остановлена")
+    );
+    assert!(vm.settings.service.stopping.is_none());
+}
+
+#[test]
+fn a_shutdown_timeout_only_falls_back_to_this_windows_pid() {
+    let now = Instant::now();
+    let mut vm = view();
+    vm.on_connected("endpoint");
+    assert!(vm.begin_stop(now));
+    vm.begin_request(Request::Shutdown, now);
+    assert_eq!(
+        vm.take_timed_out_shutdown_pid(now + SERVICE_STOP_TIMEOUT),
+        None,
+        "a service not started by this window must never be killed"
+    );
+    assert!(
+        vm.settings
+            .service
+            .line
+            .as_ref()
+            .is_some_and(|line| !line.ok),
+        "failure is shown when no graceful shutdown answer arrives"
+    );
+
+    let mut owned = view();
+    owned.core = Some(own_core(4242));
+    owned.on_connected("endpoint");
+    assert!(owned.begin_stop(now));
+    owned.begin_request(Request::Shutdown, now);
+    assert_eq!(
+        owned.take_timed_out_shutdown_pid(now + SERVICE_STOP_TIMEOUT),
+        Some(4242)
+    );
+}
+
+#[test]
+fn an_unsent_shutdown_request_releases_the_stop_controls() {
+    let mut vm = view();
+    vm.on_connected("endpoint");
+    let now = Instant::now();
+    assert!(vm.begin_stop(now));
+    let id = vm.begin_request(Request::Shutdown, now);
+
+    vm.on_not_sent(id);
+
+    assert!(vm.settings.service.stopping.is_none());
+    assert!(vm
+        .settings
+        .service
+        .line
+        .as_ref()
+        .is_some_and(|line| !line.ok));
+}
+
 // ---------------------------------------------------------------- the service
 
 /// A service this window started: the one shape of core the window may stop.
@@ -886,7 +993,7 @@ fn a_restart_that_does_not_wait_for_a_service_gives_up_in_words() {
         "the wait is still standing before its deadline"
     );
 
-    vm.tick(now + RESTART_STOP_TIMEOUT);
+    vm.tick(now + SERVICE_STOP_TIMEOUT);
     assert_eq!(vm.settings.service.restart, None, "the wait has an end");
     let line = vm
         .settings

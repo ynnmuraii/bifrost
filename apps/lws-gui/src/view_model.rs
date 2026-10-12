@@ -22,9 +22,8 @@
 /// itself (`StartCore`, `ConnectAgain`), and the local edits the window applies to its own
 /// state (`ShowScreen`, `SetSide`, `MoveDisplay`, …). Only the first group is a `GuiFrame`;
 /// the app sends those to the client and folds the rest into the view model, so no decision
-/// ever happens in drawing code. The service this window started is the one thing that is
-/// neither: it is stopped and started again by the app (`RestartCore`), from the pid
-/// [`ViewModel::core`] holds, and that is the only process the window ever kills.
+/// ever happens in drawing code. `StopCore` asks the core to stop itself, so it also works for
+/// a service started elsewhere; only a timed-out request may use the pid this window started.
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -49,12 +48,8 @@ pub const LOG_LINES: usize = 20;
 /// another desktop) makes the window come alive on its own.
 pub const RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// How long «Перезапустить службу» waits for the core it stopped to be gone.
-///
-/// The wait is bounded because the window will not sit on a spinner forever: past this
-/// deadline the user is told to stop the service by hand, which is the only thing left
-/// that can be said honestly.
-pub const RESTART_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the GUI waits for the core to stop itself before using its owned pid or reporting failure.
+pub const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The oldest requests kept while they wait for an answer.
 const INFLIGHT_LIMIT: usize = 32;
@@ -217,6 +212,10 @@ pub enum Request {
     ExportDiagnostics,
     /// `ResetPortalGrants`.
     ResetPortalGrants,
+    /// `RetryAgent`.
+    RetryAgent,
+    /// `Shutdown`.
+    Shutdown,
     /// `ListPendingEdits`.
     ListPendingEdits,
     /// `ApplyPendingEdit`.
@@ -241,6 +240,8 @@ impl Request {
             Request::RevokePeer => "удалить компьютер из пары",
             Request::ExportDiagnostics => "сохранить диагностику",
             Request::ResetPortalGrants => "забыть разрешения порталов",
+            Request::RetryAgent => "повторить запуск службы ввода",
+            Request::Shutdown => "остановить службу",
             Request::ListPendingEdits => "список непринятых правок",
             Request::ApplyPendingEdit => "применить непринятую правку",
             Request::DiscardPendingEdit => "отбросить непринятую правку",
@@ -569,7 +570,7 @@ pub struct Settings {
     pub export: Option<Outcome>,
     /// «Адрес в локальной сети»: what the file names, and what may be picked.
     pub lan: Lan,
-    /// The service this window started, and what «Перезапустить службу» is doing with it.
+    /// The service controls, including graceful stop for cores started elsewhere.
     pub service: Service,
     /// `true` while «Настройки созданы автоматически» waits for «Понятно».
     pub first_run: bool,
@@ -640,7 +641,9 @@ fn is_lan_address(address: &str) -> bool {
 pub struct Service {
     /// What «Перезапустить службу» is waiting for, while it waits.
     pub restart: Option<Restart>,
-    /// What the last «Перезапустить службу» answered, in words.
+    /// When «Остановить службу» was sent through the core's graceful shutdown request.
+    pub stopping: Option<Instant>,
+    /// What the last service operation answered, in words.
     pub line: Option<Outcome>,
 }
 
@@ -772,6 +775,10 @@ impl ViewModel {
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
         self.pairing.prompt = None;
+        if self.settings.service.stopping.take().is_some() {
+            self.settings.service.line = Some(Outcome::done("Служба остановлена"));
+            return false;
+        }
         if matches!(
             self.settings.service.restart,
             Some(Restart::Stopping { .. })
@@ -780,6 +787,20 @@ impl ViewModel {
             return true;
         }
         false
+    }
+
+    /// Begins stopping a connected core through its graceful GUI request.
+    pub fn begin_stop(&mut self, now: Instant) -> bool {
+        if !self.connection.is_connected()
+            || self.settings.service.stopping.is_some()
+            || self.settings.service.restart.is_some()
+        {
+            return false;
+        }
+        self.settings.service.stopping = Some(now);
+        self.settings.service.line = None;
+        self.push_log("Служба останавливается");
+        true
     }
 
     /// Records a request that was just handed to the client.
@@ -802,6 +823,60 @@ impl ViewModel {
         let request = self.take_inflight(id);
         let name = request.map_or("запрос", Request::label);
         self.push_log(format!("Служба не запущена: {name} не отправлено"));
+        if request == Some(Request::Shutdown) {
+            self.settings.service.stopping = None;
+            self.settings.service.line = Some(Outcome::failed(
+                "служба перестала отвечать до получения просьбы остановиться",
+            ));
+        }
+    }
+
+    /// Uses only this window's pid when a graceful shutdown request has had no effect.
+    pub fn take_timed_out_shutdown_pid(&mut self, now: Instant) -> Option<u32> {
+        let expired = self
+            .settings
+            .service
+            .stopping
+            .is_some_and(|since| now.duration_since(since) >= SERVICE_STOP_TIMEOUT);
+        if !expired {
+            return None;
+        }
+        self.settings.service.stopping = None;
+        if let Some(index) = self
+            .inflight
+            .iter()
+            .position(|inflight| inflight.request == Request::Shutdown)
+        {
+            self.inflight.remove(index);
+        }
+        self.silent = self
+            .inflight
+            .iter()
+            .any(|inflight| now >= inflight.deadline);
+        let Some(pid) = self.core.as_ref().and_then(|core| core.pid) else {
+            self.settings.service.line = Some(Outcome::failed(
+                "служба не ответила на просьбу остановиться; это окно не запускало её и не может остановить процесс",
+            ));
+            self.push_log("Служба не ответила; чужой процесс оставлен без изменений");
+            return None;
+        };
+        self.settings.service.line = Some(Outcome::failed(
+            "служба не ответила на просьбу остановиться; окно завершает свой процесс принудительно",
+        ));
+        self.push_log(format!(
+            "Служба не ответила; окно останавливает свой процесс (pid {pid})"
+        ));
+        Some(pid)
+    }
+
+    /// Records the outcome of the pid-only fallback, used only for this window's process.
+    pub fn on_shutdown_fallback(&mut self, stopped: Result<(), String>) {
+        if let Err(why) = stopped {
+            self.settings.service.line = Some(Outcome::failed(format!(
+                "не удалось принудительно остановить службу ({why})"
+            )));
+            self.push_log(format!("Не удалось принудительно остановить службу: {why}"));
+        }
     }
 
     /// Ages the deadlines; called once per frame.
@@ -813,10 +888,10 @@ impl ViewModel {
         // «Перезапустить службу» waits for the link to drop, and that wait has an end: past
         // it the service is left to the user rather than watched from a spinner, because
         // that is the only thing left that can be said honestly.
-        let seconds = RESTART_STOP_TIMEOUT.as_secs();
+        let seconds = SERVICE_STOP_TIMEOUT.as_secs();
         let stalled = matches!(
             &self.settings.service.restart,
-            Some(Restart::Stopping { since }) if now.duration_since(*since) >= RESTART_STOP_TIMEOUT
+            Some(Restart::Stopping { since }) if now.duration_since(*since) >= SERVICE_STOP_TIMEOUT
         );
         if stalled {
             self.settings.service.restart = None;
@@ -1033,6 +1108,9 @@ impl ViewModel {
         if result.ok {
             let text = self.success_text(request);
             self.outcome = Some(Outcome::done(text.clone()));
+            if request == Request::Shutdown {
+                self.settings.service.line = Some(Outcome::done("Служба останавливается"));
+            }
             self.push_log(format!("{}: готово ({text})", request.label()));
             return;
         }
@@ -1048,6 +1126,10 @@ impl ViewModel {
                 "Раскладку изменили на другом компьютере. Обновите документ и повторите."
                     .to_owned(),
             );
+        }
+        if request == Request::Shutdown {
+            self.settings.service.stopping = None;
+            self.settings.service.line = Some(Outcome::failed(failure.clone()));
         }
         if request == Request::ExportDiagnostics {
             self.settings.export = Some(Outcome::failed(failure.clone()));
@@ -1270,6 +1352,18 @@ impl ViewModel {
             })
             .unwrap_or_else(|| "нет владельца".to_owned());
         (name, serial)
+    }
+
+    /// Why the core reports degraded input service, or `None` while it is healthy.
+    pub fn agent_degraded_reason(&self) -> Option<&str> {
+        let status = self.status.as_ref()?;
+        if !status.agent_degraded_reason.is_empty() {
+            Some(status.agent_degraded_reason.as_str())
+        } else if status.agent_restart_circuit_open {
+            Some("Служба ввода остановлена")
+        } else {
+            None
+        }
     }
 
     /// The «Ограничения и деградации» block (KVM-056): never invented, only `Status`.
@@ -1832,6 +1926,8 @@ pub enum Action {
     DiscardPendingEdit(Vec<u8>),
     /// Forget the portal permissions of this node.
     ResetPortalGrants,
+    /// Ask the core to retry its degraded input agent after the user presses «Повторить».
+    RetryAgent,
     /// Revoke a paired computer.
     RevokePeer(Vec<u8>),
     /// Ask the core to write its diagnostics.
@@ -1875,6 +1971,8 @@ pub enum Action {
     SelectLanAddress(String),
     /// Write `network.listen_address` and restart the service behind it.
     ApplyLanAddress,
+    /// Ask the core to stop itself, regardless of which window started it.
+    StopCore,
     /// Stop the core this window started and start a fresh one.
     RestartCore,
     /// Close «Настройки созданы автоматически».
@@ -1949,6 +2047,7 @@ impl Action {
                 Request::ResetPortalGrants,
                 Msg::ResetPortalGrants(ipc::ResetPortalGrants {}),
             ),
+            Action::RetryAgent => (Request::RetryAgent, Msg::RetryAgent(ipc::RetryAgent {})),
             Action::RevokePeer(node_id) => (
                 Request::RevokePeer,
                 Msg::RevokePeer(ipc::RevokePeer {
@@ -1961,6 +2060,7 @@ impl Action {
                     target_path: target.clone(),
                 }),
             ),
+            Action::StopCore => (Request::Shutdown, Msg::Shutdown(ipc::Shutdown {})),
             _ => return None,
         };
         Some(wire)
@@ -2023,6 +2123,9 @@ impl Bridge {
         // The local half first: a refresh clears the conflict line, and none of the local
         // actions care whether the wire half below succeeds.
         self.view.local(&action);
+        if matches!(&action, Action::StopCore) && !self.view.begin_stop(now) {
+            return;
+        }
         if let Some((request, message)) = action.wire() {
             let id = self.view.begin_request(request, now);
             self.client.send(id, message);
@@ -2060,9 +2163,10 @@ impl Bridge {
 
     /// «Перезапустить службу»: stop the core this window started, then ask for a new one.
     ///
-    /// The stop is the only process this window kills, and the pid for it comes from the
-    /// service the window itself launched ([`launch_core`]); the wait for the old core to be
-    /// gone is event-driven — [`Bridge::pump`] starts the fresh one when the link drops.
+    /// Only the pid from [`ViewModel::core`] is eligible for process termination; «Остановить
+    /// службу» first asks the core to exit and uses that pid only after its timeout.
+    /// The wait for the old core to be gone is event-driven — [`Bridge::pump`] starts the
+    /// fresh one when the link drops.
     fn restart_core(&mut self, now: Instant) {
         match self.view.begin_restart(now) {
             RestartStep::Stop(pid) => self.view.on_core_stopped(stop_core(pid)),
@@ -2099,6 +2203,9 @@ impl Bridge {
                 GuiEvent::NotSent { id } => self.view.on_not_sent(id),
                 GuiEvent::CoreStarted { started } => self.view.on_core_started(started),
             }
+        }
+        if let Some(pid) = self.view.take_timed_out_shutdown_pid(Instant::now()) {
+            self.view.on_shutdown_fallback(stop_core(pid));
         }
         arrived
     }
@@ -2805,6 +2912,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::ExportDiagnostics(_) => "ExportDiagnostics",
         Msg::ResetPortalGrants(_) => "ResetPortalGrants",
         Msg::RetryAgent(_) => "RetryAgent",
+        Msg::Shutdown(_) => "Shutdown",
         Msg::ClaimOwnership(_) => "ClaimOwnership",
         Msg::AbandonOwnership(_) => "AbandonOwnership",
         Msg::ListPendingEdits(_) => "ListPendingEdits",
@@ -2864,6 +2972,8 @@ fn success_text(request: Request) -> String {
         Request::SetClipboard => "буфер обмена переключён".to_owned(),
         Request::RevokePeer => "компьютер удалён из пары".to_owned(),
         Request::ResetPortalGrants => "разрешения порталов забыты".to_owned(),
+        Request::RetryAgent => "повторный запуск службы ввода начат".to_owned(),
+        Request::Shutdown => "остановка службы начата".to_owned(),
         Request::ExportDiagnostics => "диагностика сохранена".to_owned(),
         Request::StartPairing => "окно сопряжения открыто".to_owned(),
         Request::ApplyPendingEdit => "правка отправлена координатору".to_owned(),

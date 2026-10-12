@@ -357,6 +357,7 @@ impl Session {
         loop {
             self.service_clock().await;
             if self.stopping {
+                self.shutdown_agent().await;
                 return Ok(());
             }
 
@@ -442,6 +443,12 @@ impl Session {
             // the document its editor works on.
             self.publish_gui_state().await;
         }
+    }
+
+    /// Stops the agent before this core exits, releasing capture and forwarded input.
+    pub(crate) async fn shutdown_agent(&mut self) {
+        self.stopping = true;
+        self.agent.shutdown().await;
     }
 
     /// Timers, the IPC heartbeat, and the agent restart backoff.

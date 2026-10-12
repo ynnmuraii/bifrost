@@ -246,6 +246,7 @@ message GuiFrame {
     ApplyPendingEdit apply_pending_edit = 24;
     DiscardPendingEdit discard_pending_edit = 25;
     RetryAgent retry_agent = 26;
+    Shutdown shutdown = 27;               // ask this core to shut down cleanly
 
     Status status = 40;          // response and pushed event
     PairingPrompt pairing_prompt = 41;
@@ -267,6 +268,7 @@ message RevokePeer { bytes peer_node_id = 1; }
 message ExportDiagnostics { string target_path = 1; }
 message ResetPortalGrants {} // GUI: drop portal permissions for this node
 message RetryAgent {}
+message Shutdown {}
 message Status {
   string role = 1;           // "owner" | "follower" (per-lease source/receiver is derived from focus)
   string focus = 2;          // LOCAL / PREPARING / REMOTE / BLOCKED

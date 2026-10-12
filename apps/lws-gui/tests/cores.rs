@@ -927,3 +927,35 @@ fn the_window_restarts_its_core_and_applies_a_lan_address() {
     drop(bridge);
     let _ = std::fs::remove_dir_all(root);
 }
+#[test]
+fn the_window_stops_a_core_it_did_not_start() {
+    let _serial = serial();
+    let mut lab = Lab::unpaired("gui-shutdown");
+    let mut window = bridge_for(lab.a_root());
+
+    wait_for(&mut window, "the independently started core", |view| {
+        view.connection.is_connected().then_some(())
+    });
+    assert!(
+        window.view().core.is_none(),
+        "the window did not start this core"
+    );
+
+    window.dispatch(Action::StopCore, Instant::now());
+    wait_for(&mut window, "the stopped service status", |view| {
+        (view.connection_label() == "Служба не запущена").then_some(())
+    });
+
+    let deadline = Instant::now() + DEADLINE;
+    let exit = loop {
+        if let Some(exit) = lab.a.child.try_wait().expect("check the core process") {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the core process did not exit after the GUI shutdown request"
+        );
+        std::thread::sleep(FRAME);
+    };
+    assert!(exit.success(), "the core exited cleanly: {exit}");
+}

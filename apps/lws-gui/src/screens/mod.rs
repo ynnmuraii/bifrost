@@ -42,6 +42,16 @@ pub fn header(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
                 ui.visuals().weak_text_color()
             };
             ui.colored_label(color, vm.connection_label());
+            if vm.screen == Screen::Status && vm.connection.is_connected() {
+                let can_stop =
+                    vm.settings.service.stopping.is_none() && vm.settings.service.restart.is_none();
+                if ui
+                    .add_enabled(can_stop, egui::Button::new("Остановить службу"))
+                    .clicked()
+                {
+                    actions.push(Action::StopCore);
+                }
+            }
         });
     });
     ui.separator();

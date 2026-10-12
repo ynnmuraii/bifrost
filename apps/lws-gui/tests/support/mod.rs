@@ -67,6 +67,8 @@ pub fn status_with(focus: &str) -> ipc::Status {
         backend: "platform-win".to_owned(),
         capabilities_unavailable: vec!["RECEIVER_TAKEOVER".to_owned()],
         portal_state: String::new(),
+        agent_degraded_reason: String::new(),
+        agent_restart_circuit_open: false,
         is_owner: true,
         owner_node_id: SELF_NODE.to_owned(),
         owner_serial: 7,
@@ -95,8 +97,6 @@ pub fn status_with(focus: &str) -> ipc::Status {
         } else {
             String::new()
         },
-        agent_degraded_reason: String::new(),
-        agent_restart_circuit_open: false,
     }
 }
 
