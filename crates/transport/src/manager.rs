@@ -17,7 +17,7 @@ use focus_router as fr;
 use geometry::NodeId;
 use identity::{peer_node_id, trust::TrustStore, NodeIdentity};
 use protocol::wire;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -172,7 +172,7 @@ impl LinkManager {
         let server_config =
             identity::trusted_server_config(&self.config.identity, &self.config.trust)?;
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let listener = TcpListener::bind(self.config.listen).await?;
+        let listener = bind_listener(self.config.listen).await?;
         let local_hello = self.config.local_hello.clone();
         let local = self.config.identity.node_id();
 
@@ -346,6 +346,25 @@ impl LinkManager {
     }
 }
 
+/// Binds the link listener with `SO_REUSEADDR`.
+///
+/// `std`/`tokio` set it on Unix but **not** on Windows, where a restart of core within the
+/// TIME_WAIT window of a previous connection fails with `WSAEADDRINUSE` (10048) — a core
+/// that cannot rebind its port after a crash restarts into a permanent failure, which is
+/// exactly the case the backoff loop is for. Reuse address says "bind even though a
+/// connection from that port is still lingering", not "share the port with a live
+/// listener", so it does not weaken the single-instance property the docs rely on.
+async fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    socket.listen(1024)
+}
+
 async fn accept_one(
     acceptor: TlsAcceptor,
     tcp: TcpStream,
@@ -475,5 +494,37 @@ async fn start_link(
         if messages.send(ManagerMessage::Report(report)).await.is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A core that restarts immediately after it had connections on its port must be able
+    /// to bind that port again.
+    ///
+    /// Windows keeps an accepted connection's local port in `TIME_WAIT` and `std`/`tokio`
+    /// do not set `SO_REUSEADDR` there, so without [`bind_listener`] the second bind fails
+    /// with `WSAEADDRINUSE` — which is what made a loopback smoke of two cores fail with
+    /// «the link manager stopped: link i/o error: … os error 10048».
+    #[tokio::test]
+    async fn the_listener_rebinds_after_a_connection() {
+        let first = bind_listener("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+        let address = first.local_addr().expect("local address");
+
+        let client = TcpStream::connect(address).await.expect("connect");
+        let (accepted, _) = first.accept().await.expect("accept");
+        // The listener "crashes": both sockets go, the connection lingers.
+        drop(accepted);
+        drop(client);
+        drop(first);
+
+        let second = bind_listener(address)
+            .await
+            .expect("the port must be usable again right away");
+        assert_eq!(second.local_addr().expect("addr").port(), address.port());
     }
 }
