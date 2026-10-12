@@ -20,7 +20,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clipboard::Marker;
-use platform_win::clipboard::Clipboard;
+use platform_win::clipboard::{read_clipboard, write_clipboard, Clipboard};
 
 /// Runs PowerShell with one script, or panics with its output.
 fn powershell(script: &str) {
@@ -60,7 +60,7 @@ fn a_plain_change_is_seen_and_a_marked_item_is_a_secret() {
     powershell(&format!("Set-Clipboard -Value '{marker}'"));
     let after = wait_for_change(&listener, before);
     assert!(after != before);
-    let snapshot = listener.read().expect("reading the clipboard");
+    let snapshot = read_clipboard().expect("reading the clipboard");
     assert!(snapshot.has_text, "Set-Clipboard wrote text");
     assert_eq!(snapshot.text, marker);
     assert!(
@@ -100,7 +100,7 @@ try {
     // The format was set on the same item, so the sequence number may not move; the
     // listener's notification is the other signal, and the read is what matters here.
     let _ = wait_for_change(&listener, before);
-    let snapshot = listener.read().expect("reading the marked clipboard");
+    let snapshot = read_clipboard().expect("reading the marked clipboard");
     assert_eq!(
         snapshot.markers,
         vec![Marker::ExcludeFromMonitor],
@@ -133,24 +133,22 @@ fn a_written_text_round_trips_and_clearing_removes_it() {
         std::process::id()
     );
     let before = listener.sequence();
-    listener
-        .set(&text)
-        .expect("the text is put on the clipboard");
+    write_clipboard(Some(&text)).expect("the text is put on the clipboard");
     let after = listener.sequence();
     assert!(
         after != before,
         "SetClipboardData moves the change counter: {after} == {before}"
     );
 
-    let snapshot = listener.read().expect("reading what was written");
+    let snapshot = read_clipboard().expect("reading what was written");
     assert!(snapshot.has_text, "CF_UNICODETEXT is present");
     assert_eq!(snapshot.text, text, "the text round-trips byte for byte");
     assert!(snapshot.markers.is_empty(), "plain text carries no marker");
     println!("set: read {:?} back at sequence {after}", snapshot.text);
 
     // And clearing removes it: no text, and the counter moved again.
-    listener.clear().expect("the clipboard is emptied");
-    let snapshot = listener.read().expect("reading the emptied clipboard");
+    write_clipboard(None).expect("the clipboard is emptied");
+    let snapshot = read_clipboard().expect("reading the emptied clipboard");
     assert!(!snapshot.has_text, "nothing to paste after clear()");
     assert_eq!(snapshot.text, "");
     assert!(

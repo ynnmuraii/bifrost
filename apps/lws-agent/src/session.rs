@@ -77,16 +77,6 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
     );
 
     let started = Instant::now();
-    let mut watchdog = match Watchdog::for_core_silence_ms(attach.core_silence_ms, 0) {
-        Ok(watchdog) => watchdog,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "AgentAttach.core_silence_ms outside 200..=500; using the default"
-            );
-            Watchdog::for_core_silence_ms(::ipc::DEFAULT_CORE_SILENCE_MS, 0)?
-        }
-    };
 
     let (mut backend, ready, refusals) = Backend::select(
         backend::BackendKindArg(attach.backend_override),
@@ -122,6 +112,15 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         );
         send_error(&mut link, refusal.code, &refusal.detail).await?;
     }
+
+    // Rule 6's clock starts when the agent is *ready*, not at the attach: the token
+    // check and the backend probe (`spawn_blocking` on every platform, plus the
+    // backend's own setup) sit in between, and a loaded machine spends hundreds of
+    // milliseconds there. That is startup, not core silence — rule 6 is scoped to
+    // REMOTE and capture does not exist before `AgentReady`, so there is nothing the
+    // safety rule could release yet. The pings core sent in the meantime wait in the
+    // link's buffer and reset the clock the moment the loop starts.
+    let mut watchdog = watchdog_at_ready(attach.core_silence_ms, now_ms(started));
 
     let stop = loop_forever(
         &mut link,
@@ -194,6 +193,14 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
 
     loop {
         tokio::select! {
+            // The IPC arm first: a `Ping` that is already in the link's buffer is
+            // answered before this turn services any deadline, and a turn that woke on
+            // a frame services the time-services with the clock that frame just reset.
+            // Biased for liveness — the heartbeat rides this arm (rule 11: the agent
+            // «отвечает `Pong`»), and a busy poll loop must not delay it. The tick
+            // services below run once per turn whatever arm won, so the bias cannot
+            // starve the deadline (rule 4) either.
+            biased;
             received = link.recv() => {
                 let frame = match received {
                     Ok(frame) => frame,
@@ -226,10 +233,10 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             // ADR-008, agent side: a local copy is *polled*, never waited for, so the
-            // deadline and the core-silence watchdog below keep running on their own tick
+            // deadline and the core-silence watchdog keep running on their own tick
             // while this branch asks the platform whether the user copied something.
             _ = clipboard_tick.tick() => {
-                if let Some(change) = backend.clipboard_change() {
+                if let Some(change) = backend.clipboard_change().await {
                     send_clipboard_change(link, &mut clipboard, change).await?;
                 }
             }
@@ -263,51 +270,20 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                     )
                     .await?;
                 }
-
-                // Rule 4: the deadline is the agent's own monotonic clock.
-                if let Some((due, lease_id)) = deadline.as_ref() {
-                    if Instant::now() >= *due {
-                        let lease_id = lease_id.clone();
-                        deadline = None;
-                        tracing::warn!("deadline expired; releasing the session");
-                        let released = backend.release_session().await;
-                        link.send(Msg::DeadlineExpired(DeadlineExpired { lease_id })).await?;
-                        tracing::info!(keys = released.keys, buttons = released.buttons, "released");
-                        held_lease = None;
-                    }
-                }
-                // Rule 5: a TEMPORARY capture ends by itself and the buffered edge
-                // is played locally rather than reaching the wire.
-                if let Some((due, lease_id)) = &self_timeout {
-                    if Instant::now() >= *due {
-                        let lease_id = lease_id.clone();
-                        self_timeout = None;
-                        tracing::warn!("self-timeout of a temporary capture");
-                        let _ = backend.end_capture(true).await;
-                        send_error(
-                            link,
-                            "CAPTURE_FAILED",
-                            "temporary capture self-timeout expired",
-                        )
-                        .await?;
-                        let _ = lease_id;
-                        held_lease = None;
-                    }
-                }
-                // Rule 6: core went quiet. No frame, not even a Ping.
-                if watchdog.silence_exceeded(now) && !released_after_silence {
-                    released_after_silence = true;
-                    tracing::warn!(
-                        silence_ms = watchdog.silence_ms(now),
-                        "core silent past the limit; releasing locally"
-                    );
-                    release_everything(backend).await;
-                    deadline = None;
-                    self_timeout = None;
-                    held_lease = None;
-                }
             }
         }
+
+        service_timers(
+            link,
+            backend,
+            &mut deadline,
+            &mut self_timeout,
+            &mut held_lease,
+            &mut released_after_silence,
+            watchdog,
+            now_ms(started),
+        )
+        .await?;
 
         // One tick, one batch: keeps the frame rate bounded and lets the transport
         // coalesce motion on the far side. A tick that only learned about an edge
@@ -323,6 +299,69 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         }
     }
+}
+
+/// The time-services of one turn: the deadline of rule 4, the `TEMPORARY` self-timeout of
+/// rule 5, and the core-silence watchdog of rule 6.
+///
+/// They live here, once per turn, rather than inside the poll arm: a turn that woke on an
+/// IPC frame must service the deadline as surely as a turn that woke on the 5 ms tick,
+/// and rule 6 must only judge a clock its own turn just reset.
+#[allow(clippy::too_many_arguments)]
+async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentLink<S>,
+    backend: &mut Backend,
+    deadline: &mut Option<(Instant, Vec<u8>)>,
+    self_timeout: &mut Option<(Instant, Vec<u8>)>,
+    held_lease: &mut Option<Vec<u8>>,
+    released_after_silence: &mut bool,
+    watchdog: &mut Watchdog,
+    now: u64,
+) -> anyhow::Result<()> {
+    // Rule 4: the deadline is the agent's own monotonic clock.
+    if let Some((due, lease_id)) = deadline.as_ref() {
+        if Instant::now() >= *due {
+            let lease_id = lease_id.clone();
+            *deadline = None;
+            tracing::warn!("deadline expired; releasing the session");
+            let released = backend.release_session().await;
+            link.send(Msg::DeadlineExpired(DeadlineExpired { lease_id }))
+                .await?;
+            tracing::info!(keys = released.keys, buttons = released.buttons, "released");
+            *held_lease = None;
+        }
+    }
+    // Rule 5: a TEMPORARY capture ends by itself and the buffered edge
+    // is played locally rather than reaching the wire.
+    if let Some((due, lease_id)) = self_timeout.as_ref() {
+        if Instant::now() >= *due {
+            let lease_id = lease_id.clone();
+            *self_timeout = None;
+            tracing::warn!("self-timeout of a temporary capture");
+            let _ = backend.end_capture(true).await;
+            send_error(
+                link,
+                "CAPTURE_FAILED",
+                "temporary capture self-timeout expired",
+            )
+            .await?;
+            let _ = lease_id;
+            *held_lease = None;
+        }
+    }
+    // Rule 6: core went quiet. No frame, not even a Ping.
+    if watchdog.silence_exceeded(now) && !*released_after_silence {
+        *released_after_silence = true;
+        tracing::warn!(
+            silence_ms = watchdog.silence_ms(now),
+            "core silent past the limit; releasing locally"
+        );
+        release_everything(backend).await;
+        *deadline = None;
+        *self_timeout = None;
+        *held_lease = None;
+    }
+    Ok(())
 }
 
 /// Handles one core → agent frame. `Some(stop)` ends the loop.
@@ -537,7 +576,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         Msg::QueryDisplays(_) => {
             // KVM-040: the backend enumerates its monitors; the revision only moves
             // when the set does, so core can tell a re-query from a hot-plug.
-            let current = backend.displays();
+            let current = backend.displays().await;
             let report = displays.observe(&current);
             tracing::info!(
                 displays = report.displays.len(),
@@ -639,7 +678,7 @@ async fn handle_set_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
     }
     if set.chunk_count == 0 {
         state.inbound = None;
-        match backend.set_clipboard(None) {
+        match backend.set_clipboard(None).await {
             Ok(()) => {
                 state.applied(set.origin_version);
                 tracing::info!(version = set.origin_version, "clipboard released by core");
@@ -678,7 +717,7 @@ async fn handle_set_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
             let inbound = state.inbound.take().expect("checked above");
             match inbound.finish(set) {
                 Err(error) => send_error(link, error.code(), error.detail()).await?,
-                Ok(text) => match backend.set_clipboard(Some(&text)) {
+                Ok(text) => match backend.set_clipboard(Some(&text)).await {
                     Ok(()) => {
                         tracing::info!(
                             version = set.origin_version,
@@ -844,6 +883,74 @@ async fn send_error<S: AsyncRead + AsyncWrite + Unpin>(
 
 fn now_ms(started: Instant) -> u64 {
     started.elapsed().as_millis() as u64
+}
+
+/// Rule 6's watchdog, clocked from `now_ms` — the moment the agent became ready.
+///
+/// The attach, the token check and the platform probe all happen before the agent's
+/// first frame can be expected, and on a loaded machine they outlast the whole silence
+/// limit (measured on CI: over 300 ms between the attach and `AgentReady`). Counting
+/// that as core silence is the false release of CI-38220074904 — the bootstrap worker
+/// saw «core silent past the limit; releasing locally silence_ms=305» on the agent side
+/// of the same failure. Rule 6 is scoped to `REMOTE` («Core молчит в REMOTE дольше
+/// `core_silence_ms` … → agent выполняет release и Local»): before `AgentReady` the
+/// agent holds no capture, so the clock starts here and the frames core already sent
+/// reset it as the loop begins.
+///
+/// `now_ms` is the elapsed value of the session's own `started` at this point, so the
+/// watchdog and the loop share one clock.
+fn watchdog_at_ready(core_silence_ms: u32, now_ms: u64) -> Watchdog {
+    match Watchdog::for_core_silence_ms(core_silence_ms, now_ms) {
+        Ok(watchdog) => watchdog,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "AgentAttach.core_silence_ms outside 200..=500; using the default"
+            );
+            Watchdog::for_core_silence_ms(::ipc::DEFAULT_CORE_SILENCE_MS, now_ms)
+                .expect("the default core_silence_ms is in range")
+        }
+    }
+}
+
+#[cfg(test)]
+mod watchdog_start_tests {
+    use super::watchdog_at_ready;
+
+    /// The CI-38220074904 failure, in integers: the backend probe takes longer than the
+    /// whole silence limit, and that must not read as core silence.
+    #[test]
+    fn the_silence_clock_starts_when_the_agent_is_ready_not_at_the_attach() {
+        // The attach is t = 0; the probe (a `spawn_blocking` snapshot plus the backend's
+        // own setup) finishes at t = 700, past the 300 ms limit.
+        let watchdog = watchdog_at_ready(300, 700);
+
+        assert_eq!(watchdog.silence_ms(700), 0, "the clock starts at ready");
+        assert!(
+            !watchdog.silence_exceeded(700),
+            "a slow start is not silence"
+        );
+        // Rule 6 from ready onwards: the limit is the limit.
+        assert!(
+            !watchdog.silence_exceeded(1_000),
+            "300 ms of silence is the limit"
+        );
+        assert!(
+            watchdog.silence_exceeded(1_001),
+            "and one more millisecond is not"
+        );
+    }
+
+    /// A config value the schema rejects falls back to the default rather than to a
+    /// watchdog that would release on every loop iteration.
+    #[test]
+    fn an_out_of_range_limit_falls_back_to_the_default() {
+        let watchdog = watchdog_at_ready(1_000, 500);
+        assert_eq!(watchdog.silence_limit_ms(), 300, "the documented default");
+        assert_eq!(watchdog.silence_ms(500), 0);
+        assert!(!watchdog.silence_exceeded(800));
+        assert!(watchdog.silence_exceeded(801));
+    }
 }
 
 /// The event's own monotonic timestamp for `LocalEvent.monotonic_us`.
@@ -1049,7 +1156,7 @@ mod tests {
         std::fs::write(&in_path, "from core").expect("in.txt is writable");
         clipboard_tick().await;
         assert!(
-            harness.backend.clipboard_change().is_none(),
+            harness.backend.clipboard_change().await.is_none(),
             "the payload core applied is not a local change"
         );
         assert_eq!(harness.clipboard.applied_version, 41);
@@ -1060,6 +1167,7 @@ mod tests {
         let change = harness
             .backend
             .clipboard_change()
+            .await
             .expect("a local copy surfaces");
         assert_eq!(change.text, "copied by the user");
         assert!(change.markers.is_empty(), "dry mode reports no marker");
@@ -1226,8 +1334,8 @@ mod tests {
             "no clipboard, no capability: {:?}",
             harness.ready.capabilities
         );
-        assert!(harness.backend.clipboard_change().is_none());
-        assert!(harness.backend.set_clipboard(Some("x")).is_err());
+        assert!(harness.backend.clipboard_change().await.is_none());
+        assert!(harness.backend.set_clipboard(Some("x")).await.is_err());
 
         harness.send(set_text(1, "x")).await;
         match harness.recv().await {

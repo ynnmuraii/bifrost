@@ -746,15 +746,19 @@ impl Backend {
     /// ADR-008's echo rule at the agent's edge, which each backend implements with the
     /// mechanism its platform offers (see `clipboard_change` in `backend/win.rs`,
     /// `backend/x11.rs` and [`DryClipboard`]).
-    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+    ///
+    /// Async because the real backends do Win32/X work: the response rides a blocking
+    /// thread (Windows) or the selection's own thread (X11), so the runtime thread — the
+    /// poll tick, the IPC frames and the watchdog — never waits for the platform.
+    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
         match self {
             Backend::Dry(dry) => dry.clipboard_change(),
             #[cfg(windows)]
-            Backend::Win(backend) => backend.clipboard_change(),
+            Backend::Win(backend) => backend.clipboard_change().await,
             #[cfg(target_os = "linux")]
-            Backend::X11(backend) => backend.clipboard_change(),
+            Backend::X11(backend) => backend.clipboard_change().await,
             #[cfg(target_os = "linux")]
-            Backend::Wayland(backend) => backend.clipboard_change(),
+            Backend::Wayland(backend) => backend.clipboard_change().await,
         }
     }
 
@@ -762,15 +766,15 @@ impl Backend {
     /// text.
     ///
     /// The error text is for the `AgentError.detail` of the frame core gets, never a payload.
-    pub fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
         match self {
             Backend::Dry(dry) => dry.set_clipboard(text),
             #[cfg(windows)]
-            Backend::Win(backend) => backend.set_clipboard(text),
+            Backend::Win(backend) => backend.set_clipboard(text).await,
             #[cfg(target_os = "linux")]
-            Backend::X11(backend) => backend.set_clipboard(text),
+            Backend::X11(backend) => backend.set_clipboard(text).await,
             #[cfg(target_os = "linux")]
-            Backend::Wayland(backend) => backend.set_clipboard(text),
+            Backend::Wayland(backend) => backend.set_clipboard(text).await,
         }
     }
 
@@ -922,15 +926,19 @@ impl Backend {
     ///
     /// Dry mode reports nothing: it touches no OS input path, and inventing a display
     /// would make core's topology disagree with the machine.
-    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+    ///
+    /// Async because the real backends enumerate synchronously (GDI, X round-trips); the
+    /// enumeration runs on a blocking thread so `QueryDisplays` never stalls the poll tick
+    /// and the heartbeat on the way to its answer.
+    pub async fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
         match self {
             Backend::Dry(_) => Vec::new(),
             #[cfg(windows)]
-            Backend::Win(backend) => backend.displays(),
+            Backend::Win(backend) => backend.displays().await,
             #[cfg(target_os = "linux")]
-            Backend::X11(backend) => backend.displays(),
+            Backend::X11(backend) => backend.displays().await,
             #[cfg(target_os = "linux")]
-            Backend::Wayland(backend) => backend.displays(),
+            Backend::Wayland(backend) => backend.displays().await,
         }
     }
 

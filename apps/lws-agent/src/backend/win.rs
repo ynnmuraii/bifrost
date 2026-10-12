@@ -121,17 +121,26 @@ impl Win {
     /// The next clipboard change the *user* made, if the listener queued one.
     ///
     /// Non-blocking on purpose: the session polls this from its own tick, and its watchdog and
-    /// deadline live on that tick too.
-    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+    /// deadline live on that tick too. The *notification* never blocks; the read itself is
+    /// Win32 work with a retry loop (`OpenClipboard` refuses while another process holds the
+    /// clipboard), so it runs on a blocking thread. That keeps the runtime thread — the one
+    /// the 5 ms poll tick, the IPC frames and the core-silence watchdog share — free: a busy
+    /// loop must not be able to delay the `Pong`.
+    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
         let clipboard = self.clipboard.as_ref()?;
         clipboard.wait(Duration::ZERO)?;
-        let snapshot = match clipboard.read() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(%error, "the clipboard could not be read; ignoring the change");
-                return None;
-            }
-        };
+        let snapshot =
+            match tokio::task::spawn_blocking(platform_win::clipboard::read_clipboard).await {
+                Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "the clipboard could not be read; ignoring the change");
+                    return None;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "the clipboard read task failed; ignoring the change");
+                    return None;
+                }
+            };
         if Some(snapshot.sequence) == self.applied_sequence {
             // Our own write, arriving as a notification. The next one to be noticed carries a
             // larger counter, so a stale value here can never swallow a later change.
@@ -161,14 +170,22 @@ impl Win {
     }
 
     /// Owns the local selection: `Some` puts `text` on it, `None` empties it.
-    pub fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+    ///
+    /// The write is Win32 work with the same `OpenClipboard` retry loop as the read, so it
+    /// runs on a blocking thread: the session's poll tick and its watchdog must not wait
+    /// for another process's clipboard.
+    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
         let Some(clipboard) = self.clipboard.as_ref() else {
             return Err("CLIPBOARD_DISABLED: this session has no clipboard listener".to_owned());
         };
-        match text {
-            Some(text) => clipboard.set(text),
-            None => clipboard.clear(),
-        }
+        let write = text.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            platform_win::clipboard::write_clipboard(write.as_deref())
+        })
+        .await
+        .map_err(|error| {
+            format!("CLIPBOARD_APPLY_FAILED: the clipboard write task failed: {error}")
+        })?
         .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: the clipboard was not taken: {error}"))?;
         // The counter after our own write is what the notification will carry.
         self.applied_sequence = Some(clipboard.sequence());
@@ -322,23 +339,35 @@ impl Win {
     ///
     /// A failure is reported as an empty set so core can fall back to the
     /// `[[topology.displays]]` snapshot.
-    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
-        match platform_win::displays::enumerate() {
-            Ok(monitors) => monitors
-                .into_iter()
-                .map(|monitor| crate::displays::RawDisplay {
-                    id: monitor.id,
-                    logical: monitor.logical,
-                    native: Some(monitor.native),
-                    scale: monitor.scale,
-                    primary: monitor.primary,
-                })
-                .collect(),
-            Err(error) => {
+    ///
+    /// `EnumDisplayMonitors` is a synchronous GDI enumeration — on a loaded machine it
+    /// takes long enough to matter, and the session answers `QueryDisplays` on the same
+    /// task the heartbeat `Pong` rides, so the enumeration runs on a blocking thread.
+    /// The call is per-desktop and every thread of this process shares one desktop, so
+    /// the result is the same off the runtime thread.
+    pub async fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+        let enumerated = match tokio::task::spawn_blocking(platform_win::displays::enumerate).await
+        {
+            Ok(Ok(monitors)) => monitors,
+            Ok(Err(error)) => {
                 tracing::warn!(%error, "cannot enumerate Win32 monitors");
-                Vec::new()
+                return Vec::new();
             }
-        }
+            Err(error) => {
+                tracing::warn!(%error, "the monitor enumeration task failed");
+                return Vec::new();
+            }
+        };
+        enumerated
+            .into_iter()
+            .map(|monitor| crate::displays::RawDisplay {
+                id: monitor.id,
+                logical: monitor.logical,
+                native: Some(monitor.native),
+                scale: monitor.scale,
+                primary: monitor.primary,
+            })
+            .collect()
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {

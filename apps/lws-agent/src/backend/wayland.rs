@@ -243,13 +243,13 @@ impl Wayland {
     }
 
     /// Never: a Wayland session has no local selection this agent can watch.
-    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
         None
     }
 
     /// Refused with `CLIPBOARD_DISABLED`: the portal clipboard is not implemented in this
     /// build, and core is entitled to an answer rather than silence.
-    pub fn set_clipboard(&mut self, _text: Option<&str>) -> Result<(), String> {
+    pub async fn set_clipboard(&mut self, _text: Option<&str>) -> Result<(), String> {
         Err("CLIPBOARD_DISABLED: the portal clipboard is not implemented in this build".to_owned())
     }
 
@@ -343,7 +343,7 @@ impl Wayland {
     /// `docs/03-architecture.md`, «Дисплеи и координаты»: «Порталы не отдают физическое
     /// разрешение. Набор дисплеев строится по зонам (логические границы)», so the zones
     /// are the display set and the native bounds stay unknown (`native_known = false`).
-    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+    pub async fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
         let Some(capture) = self.capture.as_ref() else {
             return Vec::new();
         };
