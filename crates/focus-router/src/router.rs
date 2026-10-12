@@ -420,6 +420,10 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::SourceLeaseWatchdog));
                 if let Some(lease) = self.lease.source_mut() {
                     lease.state = SourceState::Releasing;
+                    // The receiver has not released yet: the next transition waits for
+                    // its `LeaveAck` (or the release guard once the channel is gone),
+                    // never for our own capture to come back.
+                    lease.awaiting_leave_ack = true;
                 }
             }
             LeaseSlot::Source(lease) if lease.state == SourceState::Preparing => {
@@ -1209,6 +1213,18 @@ impl<I: Identifiers> FocusRouter<I> {
         if !matches {
             return;
         }
+        if let LeaseSlot::Source(lease) = &self.lease {
+            if lease.awaiting_leave_ack {
+                // The local capture is restored, but the lease is not over: the
+                // receiver has not answered `LeaveAck` yet, and `docs/05-protocol.md`
+                // allows the next transition only after that ack (or the release
+                // guard, once the channel is gone). Freeing the slot here is what let
+                // a node open a second lease while the first receiver was still
+                // releasing the first — and a receiver refuses that with
+                // `LEASE_MISMATCH` (S14).
+                return;
+            }
+        }
         let owe_leave_ack = match &self.lease {
             LeaseSlot::Receiver(lease) => {
                 lease.pending_leave.is_none() && lease.state == ReceiverState::Releasing
@@ -1401,6 +1417,20 @@ impl<I: Identifiers> FocusRouter<I> {
                 }
                 // «Переход на другого receiver разрешается после `LeaveAck` либо после
                 // закрытия прежнего канала и консервативного ожидания 600 ms».
+                out.push(Output::ArmTimer {
+                    timer: Timer::ReleaseGuard,
+                    deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),
+                });
+            }
+            LeaseSlot::Source(lease)
+                if lease.state == SourceState::Releasing && lease.awaiting_leave_ack =>
+            {
+                // The receiver's `LeaveAck` can no longer arrive on this channel: the
+                // documented fallback is the conservative wait — «либо после закрытия
+                // прежнего канала и консервативного ожидания 600 ms».
+                if let Some(lease) = self.lease.source_mut() {
+                    lease.channel_gone = true;
+                }
                 out.push(Output::ArmTimer {
                     timer: Timer::ReleaseGuard,
                     deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),

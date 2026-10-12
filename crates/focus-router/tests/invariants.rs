@@ -402,3 +402,88 @@ fn invariant_6_startup_claim_is_one_above_every_observed_serial() {
         )
         .unwrap();
 }
+
+#[test]
+fn invariant_7_a_return_release_waits_for_the_receiver() {
+    // `docs/05-protocol.md`: «Переход на другого receiver разрешается после `LeaveAck`
+    // либо после закрытия прежнего канала и консервативного ожидания 600 ms». The
+    // local capture coming back is neither, so no interleaving of our own agent's
+    // `Released`/`CaptureReady`, further triggers and peer traffic may free the slot
+    // (or open a second lease) before the receiver has released it — that second
+    // `EnterPrepare` is what a receiver answers with `LEASE_MISMATCH` (S14).
+    runner()
+        .run(&prop::collection::vec(0u8..7, 1..80), |steps| {
+            let mut r = remote();
+            r.handle(20, switch(SwitchTrigger::Edge)); // the return edge, lease id(1)
+            let mut released_by_peer = false;
+            let mut guard_armed = false;
+            for (index, op) in steps.into_iter().enumerate() {
+                let now = 21 + index as u64;
+                let input = match op {
+                    0 => Input::Agent(AgentEvent::Released { lease_id: id(1) }),
+                    1 => Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+                    2 => switch(SwitchTrigger::Edge),
+                    3 => net(Message::LeaveAck { lease_id: id(1) }),
+                    // The session only delivers a timer it armed (`S31`), so the
+                    // guard is only ever fed after a link down.
+                    4 if guard_armed => Input::TimerExpired(Timer::ReleaseGuard),
+                    5 => Input::LinkDown { peer: PEER },
+                    _ => Input::Local(LocalInput::Resume),
+                };
+                let awaiting = matches!(
+                    r.lease(),
+                    LeaseSlot::Source(lease)
+                        if lease.awaiting_leave_ack && lease.lease_id == id(1)
+                );
+                let is_leave_ack =
+                    matches!(input, Input::Net { message: Message::LeaveAck { .. }, .. });
+                let is_guard = matches!(input, Input::TimerExpired(Timer::ReleaseGuard));
+                let is_link_down = matches!(input, Input::LinkDown { peer } if peer == PEER);
+                let out = r.handle(now, input);
+                if awaiting {
+                    // A new lease may never be opened while the previous receiver
+                    // still owes its release.
+                    prop_assert!(
+                        !out.iter().any(|o| matches!(
+                            o,
+                            Output::Agent(AgentCommand::BeginCapture { .. })
+                                | Output::Send {
+                                    message: Message::EnterPrepare { .. },
+                                    ..
+                                }
+                        )),
+                        "a lease was opened before the receiver released: {out:?}"
+                    );
+                    if is_leave_ack {
+                        released_by_peer = true;
+                    }
+                    if is_link_down {
+                        guard_armed = true;
+                    }
+                    let fired = is_guard && guard_armed;
+                    if fired {
+                        guard_armed = false;
+                    }
+                    if fired {
+                        prop_assert!(r.lease().is_idle(), "the guard must free the slot");
+                    } else if released_by_peer {
+                        prop_assert!(r.lease().is_idle(), "the ack must free the slot");
+                    } else {
+                        // Our own release, a trigger or peer chatter: still waiting.
+                        prop_assert!(
+                            matches!(
+                                r.lease(),
+                                LeaseSlot::Source(lease)
+                                    if lease.state == SourceState::Releasing
+                                        && lease.lease_id == id(1)
+                            ),
+                            "the return release left the slot in {:?}",
+                            r.lease()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+}

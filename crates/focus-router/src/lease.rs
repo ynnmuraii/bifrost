@@ -124,6 +124,14 @@ pub struct SourceLease {
     pub actual_position: Option<Position>,
     /// The link to the receiver is gone; only the release guard is left.
     pub channel_gone: bool,
+    /// The `Leave` for this lease went out and the receiver still owes its
+    /// `LeaveAck`. While this is set the slot is freed only by that ack or by the
+    /// release guard: «Переход на другого receiver разрешается после `LeaveAck` либо
+    /// после закрытия прежнего канала и консервативного ожидания 600 ms»
+    /// (`docs/05-protocol.md`). Our own agent restoring the local capture is *not*
+    /// the receiver's release — treating it as one let the owner open a second
+    /// lease while the first receiver was still releasing it.
+    pub awaiting_leave_ack: bool,
     /// When the lease was created, for delay accounting in tests.
     pub started_ms: u64,
 }
@@ -151,6 +159,7 @@ impl SourceLease {
             last_applied_batch_seq: 0,
             actual_position: None,
             channel_gone: false,
+            awaiting_leave_ack: false,
             started_ms: now_ms,
         }
     }
