@@ -86,12 +86,17 @@ jobs:
       #
       # It runs on both runners on purpose: the target graphs differ (Windows pulls
       # `windows`/`clipboard-win`, Linux `zbus`/`ashpd`/`reis`/`x11rb`), and a licence the
-      # Windows graph never sees still has to be acceptable for the Linux build.
-      - name: Licences
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # Windows graph never sees still has to be acceptable for the Linux build. That is also
+      # why cargo-deny is installed as a prebuilt binary (`taiki-e/install-action` supports
+      # Windows) instead of `EmbarkStudios/cargo-deny-action`: the latter is a Docker action
+      # and dies with «Container action is only supported on Linux» on the Windows runner.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check licenses
-          arguments: --all-features
+          tool: cargo-deny
+
+      - name: Licences
+        run: cargo deny --all-features check licenses
 
       # `cargo test` builds a package's *test* targets; it does not produce the plain
       # `lws-agent` binary. `lws-core run` spawns that binary at startup and exits with
