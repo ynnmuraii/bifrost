@@ -76,7 +76,9 @@ mod windows_impl {
     use super::{
         classify_names, Snapshot, CAN_INCLUDE_IN_HISTORY, EXCLUDE_FROM_MONITOR, VIEWER_IGNORE,
     };
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::Arc;
     use std::thread::JoinHandle;
 
     use windows::core::w;
@@ -88,6 +90,7 @@ mod windows_impl {
     };
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
         RegisterClassW, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WM_CLIPBOARDUPDATE, WM_DESTROY,
@@ -137,6 +140,9 @@ mod windows_impl {
         /// The listener's thread, joined on drop.
         thread: Option<JoinHandle<()>>,
         window: Option<isize>,
+        /// The listener thread's own id: `WM_QUIT` goes to the *thread*, not to the window,
+        /// or the message pump waits forever (the capture thread does the same).
+        thread_id: Arc<AtomicU32>,
     }
 
     // The window handle travels between threads as an address, which is what the API
@@ -148,18 +154,20 @@ mod windows_impl {
         pub fn listen() -> Result<Self, ClipboardError> {
             let (sender, changes) = mpsc::channel();
             let (ready_sender, ready) = mpsc::channel();
+            let thread_id = Arc::new(AtomicU32::new(0));
+            let thread_id_out = Arc::clone(&thread_id);
             let thread = std::thread::Builder::new()
                 .name("lws-clipboard".to_owned())
                 .spawn(move || {
-                    run_listener(sender, ready_sender);
+                    run_listener(sender, ready_sender, thread_id_out);
                 })
                 .map_err(|_| ClipboardError::Window)?;
-            let window = ready.recv().map_err(|_| ClipboardError::Window)?;
-            match window {
+            match ready.recv().map_err(|_| ClipboardError::Window)? {
                 Ok(window) => Ok(Clipboard {
                     changes,
                     thread: Some(thread),
                     window: Some(window),
+                    thread_id,
                 }),
                 Err(error) => {
                     let _ = thread.join();
@@ -201,6 +209,20 @@ mod windows_impl {
                     );
                 }
             }
+            // `WM_QUIT` ends the pump: without it the thread waits in `GetMessageW`
+            // forever, which is a hang in production and not a test detail.
+            let id = self.thread_id.load(Ordering::SeqCst);
+            if id != 0 {
+                // SAFETY: posting a thread message to a thread this struct owns.
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                        id,
+                        windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                };
+            }
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -208,7 +230,11 @@ mod windows_impl {
     }
 
     /// The listener thread: register, subscribe, pump messages.
-    fn run_listener(changes: Sender<Change>, ready: Sender<Result<isize, ClipboardError>>) {
+    fn run_listener(
+        changes: Sender<Change>,
+        ready: Sender<Result<isize, ClipboardError>>,
+        thread_id_out: Arc<AtomicU32>,
+    ) {
         const CLASS: windows::core::PCWSTR = w!("lws-clipboard-listener");
         let class = WNDCLASSW {
             style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
@@ -216,11 +242,18 @@ mod windows_impl {
             lpszClassName: CLASS,
             ..Default::default()
         };
+        // The first listener registers the class; a second one gets
+        // `ERROR_CLASS_ALREADY_EXISTS`, which is success for our purposes.
         // SAFETY: the class points at a static name and a `'static` window procedure.
         if unsafe { RegisterClassW(&class) } == 0 {
-            let _ = ready.send(Err(ClipboardError::Window));
-            return;
+            use windows::Win32::Foundation::{GetLastError, ERROR_CLASS_ALREADY_EXISTS};
+            if unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
+                let _ = ready.send(Err(ClipboardError::Window));
+                return;
+            }
         }
+        // SAFETY: a documented call with no preconditions.
+        thread_id_out.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
         // A message-only window: it is never shown and exists only for the notification.
         // SAFETY: the class is registered and the name is static.
         let window = unsafe {
