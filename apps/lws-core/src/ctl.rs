@@ -287,6 +287,13 @@ pub struct StatusInput<'a> {
     pub owner: &'a str,
     /// The owner claim serial.
     pub serial: u64,
+    /// How many keys and buttons core currently believes are held.
+    ///
+    /// The agent's ledger is the authority; this is the mirror the FSM refuses a normal
+    /// transition on, so a fault-injection run can assert «the pressed set is empty»
+    /// without reading logs (`docs/03-architecture.md`, «Нормальный переход только с
+    /// пустым physical pressed set»).
+    pub pressed: usize,
     /// The last thing the agent reported that a human should see: an `AgentError`
     /// code (`PORTAL_DENIED`, `CAPTURE_FAILED`, …) or a portal hint. Empty when the
     /// agent has said nothing of the sort.
@@ -296,7 +303,7 @@ pub struct StatusInput<'a> {
 /// Formats the one-line `status` answer.
 pub fn status_line(input: &StatusInput<'_>) -> String {
     let base = format!(
-        "focus={} role={} peer={} members={} agent={} backend={} node={} owner={} serial={}",
+        "focus={} role={} peer={} members={} agent={} backend={} node={} owner={} serial={} pressed={}",
         input.focus,
         input.role,
         input.lease_peer.unwrap_or("-"),
@@ -314,6 +321,7 @@ pub fn status_line(input: &StatusInput<'_>) -> String {
             input.owner
         },
         input.serial,
+        input.pressed,
     );
     // The refusal is appended only when there is one, so the common line stays short
     // and the field never looks like an empty setting.
@@ -380,12 +388,16 @@ mod tests {
             node_id: "aaaa",
             owner: "aaaa",
             serial: 3,
+            pressed: 2,
             refusal: "",
         });
         assert!(line.contains("focus=REMOTE"));
         assert!(line.contains("peer=laptop"));
         assert!(line.contains("agent=ready"));
         assert!(line.contains("serial=3"));
+        // A fault-injection run reads this to prove «the pressed set is empty» after a
+        // transition without parsing logs.
+        assert!(line.contains("pressed=2"), "{line}");
         assert!(
             !line.contains("refusal="),
             "nothing to report must not add an empty field: {line}"
@@ -402,11 +414,13 @@ mod tests {
             node_id: "bbbb",
             owner: "",
             serial: 0,
+            pressed: 0,
             refusal: "PORTAL_DENIED: the user dismissed the InputCapture dialog",
         });
         assert!(
             with_refusal.contains("refusal=PORTAL_DENIED"),
             "{with_refusal}"
         );
+        assert!(with_refusal.contains("pressed=0"), "{with_refusal}");
     }
 }

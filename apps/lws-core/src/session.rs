@@ -988,6 +988,8 @@ impl Session {
             node_id: node_id.as_str(),
             owner: owner_hex.as_deref().unwrap_or(""),
             serial: self.router.serial(),
+            // The mirror of the agent's ledger: what the FSM refuses a normal transition on.
+            pressed: self.router.pressed().keys().count() + self.router.pressed().buttons().count(),
             refusal: self.refusal.as_deref().unwrap_or(""),
         })
     }

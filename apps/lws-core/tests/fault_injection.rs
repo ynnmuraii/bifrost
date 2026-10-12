@@ -1,0 +1,415 @@
+//! Fault injection for the E2 gate: 1000 transitions, a broken link, a dead agent.
+//!
+//! `docs/06-development-plan.md` (gate after E2: «стабилен ли FSM — если есть залипания или
+//! дубли, не добавлять функции до исправления») and `docs/07-quality-security.md`
+//! («Fault injection») ask for exactly these runs, and `AC-01`/`AC-02`/`AC-14` are the
+//! criteria they measure. Every scenario drives two real `lws-core` processes on loopback
+//! through the control channel — the E2 slice as a user runs it, with dry agents standing
+//! in for the OS input.
+//!
+//! ```text
+//! # the fast variant that runs with the workspace suite (50 cycles + the fault cases)
+//! cargo test -p lws-core --test fault_injection
+//!
+//! # the full run: 1000 cycles, and the suspend case
+//! cargo test -p lws-core --test fault_injection -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! The harness is `tests/common/mod.rs`; it polls `status` instead of sleeping, so a slow
+//! host stretches a wait rather than breaking a test, and it reports the latency it
+//! measured even when the assertion passes.
+
+mod common;
+
+use common::{Harness, AC_02_BUDGET_MS, HOST_SLACK_MS, LEASE_TTL_MS};
+use std::time::{Duration, Instant};
+
+/// The budget a shared host may add on top of the product's promise.
+fn budget_with_slack() -> f64 {
+    (AC_02_BUDGET_MS + HOST_SLACK_MS) as f64
+}
+
+/// One of the harness's own numbers, printed so a passing run still reports it.
+fn report(label: &str, values: &[f64]) {
+    if values.is_empty() {
+        println!("{label}: no samples");
+        return;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let pick = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
+    println!(
+        "{label}: n={} p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms",
+        sorted.len(),
+        pick(0.50),
+        pick(0.95),
+        pick(0.99),
+        sorted[sorted.len() - 1],
+    );
+}
+
+/// The first `Local` the node logged at or after `after_ms`.
+fn local_after(node: &common::Node, after_ms: i64) -> Option<i64> {
+    node.focus_events()
+        .into_iter()
+        .find(|(at, value)| *at >= after_ms && value == "Local")
+        .map(|(at, _)| at)
+}
+
+/// Runs `cycles` switch cycles and asserts the invariants of every one of them.
+///
+/// Returns the source's own latencies: `to_remote` and `to_local`, from the log's
+/// `control request request=Switch` to the focus line it produced.
+fn run_cycles(harness: &Harness, cycles: usize) -> (Vec<f64>, Vec<f64>) {
+    let started = Instant::now();
+    for cycle in 0..cycles {
+        harness.cycle();
+        if cycle % 100 == 99 {
+            println!(
+                "  {}/{} cycles ({:?})",
+                cycle + 1,
+                cycles,
+                started.elapsed()
+            );
+        }
+    }
+    let windows = harness.a.switch_windows();
+    let mut to_remote = Vec::new();
+    let mut to_local = Vec::new();
+    for window in &windows {
+        for (state, latency) in window {
+            match state.as_str() {
+                "Remote" => to_remote.push(*latency),
+                "Local" => to_local.push(*latency),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        windows.len(),
+        cycles * 2,
+        "a cycle is two switches (to the peer and back), and each is one window"
+    );
+    (to_remote, to_local)
+}
+
+/// The plain slice: a link, a transition, and a clean return.
+#[test]
+fn a_pair_links_and_returns_to_local_with_an_empty_ledger() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    harness.cycle();
+    let status = harness.a.status().expect("status");
+    assert_eq!(status.focus, "Local");
+    assert_eq!(status.pressed, 0);
+    assert_eq!(status.peer, "-");
+}
+
+/// The CI variant of the 1000-cycle run: fifty transitions, every invariant checked.
+#[test]
+fn fifty_transitions_run_in_ci() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    let (to_remote, to_local) = run_cycles(&harness, 50);
+    assert_eq!(
+        to_remote.len(),
+        50,
+        "every switch to the peer must be logged"
+    );
+    assert_eq!(to_local.len(), 50, "every return must be logged");
+    report("switch -> Remote", &to_remote);
+    report("switch -> Local", &to_local);
+    // A transition is tens of milliseconds on an idle host; five seconds is the
+    // "something is wrong" line, not a performance target.
+    for latency in to_remote.iter().chain(&to_local) {
+        assert!(
+            *latency < 5_000.0,
+            "a transition took {latency} ms, which is a stall rather than a transition"
+        );
+    }
+}
+
+/// `AC-01`: 1000 transitions to the peer and back, with no stuck focus and no lost edges.
+///
+/// Ignored by default because it takes minutes; `docs/07-quality-security.md` asks for it
+/// before the E2 gate is called closed.
+#[test]
+#[ignore = "1000 cycles: cargo test -p lws-core --test fault_injection -- --ignored --nocapture --test-threads=1"]
+fn a_thousand_transitions_leave_no_lease_and_no_held_input() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    let started = Instant::now();
+    let (to_remote, to_local) = run_cycles(&harness, 1000);
+    println!("1000 cycles in {:?}", started.elapsed());
+    report("switch -> Remote", &to_remote);
+    report("switch -> Local", &to_local);
+    assert_eq!(to_remote.len(), 1000);
+    assert_eq!(to_local.len(), 1000);
+    for latency in to_remote.iter().chain(&to_local) {
+        assert!(*latency < 5_000.0, "a transition took {latency} ms");
+    }
+}
+
+/// The edge trigger, without the control channel: `--dry-motion` walks the pointer out
+/// and back, and the geometry resolves both crossings.
+#[test]
+fn the_edge_trigger_drives_a_cycle_without_the_ctl_channel() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, true);
+    harness.wait_linked();
+    // The aid walks 1600 -> 1960 (crossing 1920) after a three-second lead-in, pauses a
+    // second, and walks back to 1200, so the whole round trip is over in ~8 s.
+    harness
+        .a
+        .wait_for("the edge crossing", Duration::from_secs(30), |status| {
+            status.focus == "Remote"
+        })
+        .expect("the pointer must cross the configured edge");
+    harness
+        .b
+        .wait_for(
+            "the peer is the receiver",
+            Duration::from_secs(10),
+            |status| status.focus == "Remote",
+        )
+        .expect("the peer must receive the lease");
+    harness
+        .a
+        .wait_for("the return sweep", Duration::from_secs(30), |status| {
+            status.is_idle()
+        })
+        .expect("the return sweep must release the lease");
+    harness
+        .b
+        .wait_for("the peer returns", Duration::from_secs(10), |status| {
+            status.is_idle()
+        })
+        .expect("the peer must return to Local");
+    harness.assert_idle_or_remote("Local");
+    assert!(
+        harness.a.switch_windows().is_empty(),
+        "the edge cycle must not need the control channel"
+    );
+}
+
+/// `AC-02`, blackhole: the link stays up at the socket level and says nothing.
+#[test]
+fn a_blackholed_link_returns_both_sides_to_local() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(true, false);
+    harness.wait_linked();
+    harness.a.switch(&harness.b.id).expect("switch");
+    harness
+        .a
+        .wait_for("A is Remote", Duration::from_secs(10), |s| {
+            s.focus == "Remote"
+        })
+        .expect("Remote");
+    let proxy = harness.proxy.as_ref().expect("a proxied link");
+    let injected = common::now_millis();
+    proxy.blackhole();
+    let injected_after = common::now_millis();
+
+    harness
+        .a
+        .wait_for("A returns to Local", Duration::from_secs(10), |s| {
+            s.is_idle()
+        })
+        .expect("A must return to Local");
+    harness
+        .b
+        .wait_for("B returns to Local", Duration::from_secs(10), |s| {
+            s.is_idle()
+        })
+        .expect("B must return to Local");
+    let a_ms = local_after(&harness.a, injected).expect("A logs its Local");
+    let b_ms = local_after(&harness.b, injected).expect("B logs its Local");
+    println!(
+        "blackhole: A {} ms, B {} ms (injection {} ms; budget {LEASE_TTL_MS} + 100)",
+        a_ms - injected,
+        b_ms - injected,
+        injected_after - injected,
+    );
+    for (name, value) in [("A", a_ms), ("B", b_ms)] {
+        assert!(
+            (value - injected) as f64 <= budget_with_slack(),
+            "{name} took {} ms to return to Local after the blackhole",
+            value - injected
+        );
+    }
+    // The lease watchdog is the only thing that can have released: the socket is open.
+    assert!(
+        !harness.a.marked("LeaseExpired").is_empty(),
+        "A must report the expired lease, not a link loss"
+    );
+    proxy.forward();
+}
+
+/// `AC-02`, RST: the peer's death is reported as a link failure, not as a lease expiry.
+#[test]
+fn a_reset_link_returns_both_sides_to_local() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(true, false);
+    harness.wait_linked();
+    harness.a.switch(&harness.b.id).expect("switch");
+    harness
+        .a
+        .wait_for("A is Remote", Duration::from_secs(10), |s| {
+            s.focus == "Remote"
+        })
+        .expect("Remote");
+    let proxy = harness.proxy.as_ref().expect("a proxied link");
+    let injected = common::now_millis();
+    proxy.reset();
+
+    harness
+        .a
+        .wait_for("A returns to Local", Duration::from_secs(10), |s| {
+            s.is_idle()
+        })
+        .expect("A must return to Local");
+    harness
+        .b
+        .wait_for("B returns to Local", Duration::from_secs(10), |s| {
+            s.is_idle()
+        })
+        .expect("B must return to Local");
+    let a_ms = local_after(&harness.a, injected).expect("A logs its Local");
+    let b_ms = local_after(&harness.b, injected).expect("B logs its Local");
+    println!(
+        "RST: A {} ms, B {} ms (budget {LEASE_TTL_MS} + 100)",
+        a_ms - injected,
+        b_ms - injected,
+    );
+    for (name, value) in [("A", a_ms), ("B", b_ms)] {
+        assert!(
+            (value - injected) as f64 <= budget_with_slack(),
+            "{name} took {} ms to return to Local after the reset",
+            value - injected
+        );
+    }
+}
+
+/// The receiver's agent dies mid-Remote: core tells the FSM, releases, and restarts it in
+/// `RECOVERY`.
+#[test]
+fn a_killed_receiver_agent_returns_to_local() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    harness.a.switch(&harness.b.id).expect("switch");
+    harness
+        .a
+        .wait_for("A is Remote", Duration::from_secs(10), |s| {
+            s.focus == "Remote"
+        })
+        .expect("Remote");
+    let agent = harness.b.agent_pid().expect("the receiver's agent");
+    let injected = common::now_millis();
+    common::Node::kill_pid(agent).expect("the agent is killed");
+    let injected_after = common::now_millis();
+
+    harness
+        .a
+        .wait_for("A returns to Local", Duration::from_secs(10), |s| {
+            s.is_idle()
+        })
+        .expect("A must return to Local");
+    let a_ms = local_after(&harness.a, injected).expect("A logs its Local");
+    println!(
+        "agent kill: A {} ms (injection {} ms; budget {LEASE_TTL_MS} + 100)",
+        a_ms - injected,
+        injected_after - injected,
+    );
+    assert!(
+        (a_ms - injected_after) as f64 <= budget_with_slack(),
+        "A took {} ms to return to Local after the receiver's agent died",
+        a_ms - injected_after
+    );
+    // The receiver must have gone through the documented recovery path.
+    let recovery = harness.b.marked("restarting in RECOVERY");
+    assert!(
+        !recovery.is_empty(),
+        "B must report «restarting in RECOVERY»:\n{}",
+        harness.b.log()
+    );
+    harness
+        .b
+        .wait_for("B restarts its agent", Duration::from_secs(20), |s| {
+            s.agent == "ready"
+        })
+        .expect("B must restart its agent");
+}
+
+/// A frozen core cannot send a `Leave`, and the socket stays open: only the source's own
+/// watchdog can end the lease.
+#[test]
+#[ignore = "needs process suspension (NtSuspendProcess / SIGSTOP): cargo test -p lws-core --test fault_injection -- --ignored --nocapture --test-threads=1"]
+fn a_suspended_receiver_core_trips_the_source_watchdog() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    harness.a.switch(&harness.b.id).expect("switch");
+    harness
+        .a
+        .wait_for("A is Remote", Duration::from_secs(10), |s| {
+            s.focus == "Remote"
+        })
+        .expect("Remote");
+    let injected = common::now_millis();
+    harness.b.suspend().expect("the receiver is frozen");
+    let injected_after = common::now_millis();
+
+    harness
+        .a
+        .wait_for("A returns to Local", Duration::from_secs(10), |s| {
+            s.is_idle()
+        })
+        .expect("A must return to Local");
+    let a_ms = local_after(&harness.a, injected).expect("A logs its Local");
+    // PowerShell has to compile the `Add-Type` snippet before it can freeze anything, so
+    // the call's return is *after* the freeze. The receiver's last *core* line is the
+    // closest marker before it, and it bounds the watchdog from above: the freeze cannot
+    // have happened before the last thing the core said.
+    let froze = harness
+        .b
+        .last_core_millis()
+        .expect("the receiver logged something before it froze");
+    let path = if !harness.a.marked("LeaseExpired").is_empty() {
+        "the lease watchdog"
+    } else if !harness.a.marked("peer -> core Leave").is_empty() {
+        "a Leave that beat the freeze"
+    } else {
+        "an unrecognised path"
+    };
+    println!(
+        "suspend: A {} ms after the call, {} ms after the receiver's last core line \
+         (the call took {} ms; budget {LEASE_TTL_MS} + 100; released by {path})",
+        a_ms - injected,
+        a_ms - froze,
+        injected_after - injected,
+    );
+    assert!(
+        (a_ms - froze) as f64 <= budget_with_slack(),
+        "A took {} ms to return to Local after the receiver stopped answering",
+        a_ms - froze
+    );
+    harness.b.resume().expect("the receiver is resumed");
+    harness
+        .b
+        .wait_for("B returns to Local", Duration::from_secs(10), |s| {
+            s.is_idle()
+        })
+        .expect("B must return to Local once it runs again");
+}

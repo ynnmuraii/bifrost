@@ -42,11 +42,18 @@ jobs:
       # and reis have no C counterpart, so no X11/Wayland -dev packages are
       # installed and no X or D-Bus session is needed — the platform tests assert
       # pure contracts against injected environment data.
+      #
+      # Xvfb is the one exception, and `docs/06-development-plan.md` («CI и
+      # выпуск») asks for it: «Linux runner Xvfb/XTest проверяет часть
+      # injection/selection». The fault-injection harness drives two real cores
+      # through transitions, and a runner without a session reports
+      # `UnsupportedSession`, so the agent advertises no capabilities and every
+      # switch is refused. `xauth` comes with `xvfb-run`.
       - name: System dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential binutils
+          sudo apt-get install --yes --no-install-recommends build-essential binutils xvfb xauth
 
       - name: Format
         run: cargo fmt --all --check
@@ -54,8 +61,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Windows runners have a session; Linux ones need Xvfb (above). The fault
+      # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
+      # matter: it spawns two cores and waits for real transitions.
       - name: Test
+        if: runner.os == 'Windows'
         run: cargo test --workspace
+
+      - name: Test
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo test --workspace
 
       # docs/03-architecture.md, rule 1: «Нет сетевых сокетов. В Windows-сборке не
       # линкуется winsock; на Linux — проверка в CI по списку символов.»
