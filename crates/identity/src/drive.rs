@@ -370,12 +370,18 @@ impl PairingDriver {
 /// (`docs/05-protocol.md`: «Пользователь открывает окно сопряжения на узле-сервере на
 /// 120 s»), so the caller owns its lifetime; `window` supplies the `attempt_id`, the
 /// deadline and the admission limits («не более 3 ожидающих peers»).
+///
+/// `local_display_name` is this node's `node.display_name`, the name the peer's prompt and
+/// `TRUSTED_PEER` record show (`docs/05-protocol.md`: the name is a *label*, «Название
+/// устройства/адрес не являются идентичностью» — never the identity, but the only name a
+/// human on the other side has).
 pub async fn accept_one(
     listener: &TcpListener,
     identity: &NodeIdentity,
     window: &mut PairingWindow,
     now_ms: u64,
     listen_port: u16,
+    local_display_name: &str,
 ) -> Result<PairingDriver, PairError> {
     window.admit(now_ms).map_err(PairError::Rejected)?;
     let config = pairing_server_config(identity)?;
@@ -388,6 +394,7 @@ pub async fn accept_one(
         window,
         Some(address.to_string()),
         listen_port,
+        local_display_name,
     )
     .await;
     window.finish();
@@ -407,6 +414,7 @@ pub async fn accept_stream(
     window: &PairingWindow,
     address: Option<String>,
     listen_port: u16,
+    local_display_name: &str,
 ) -> Result<PairingDriver, PairError> {
     opener_ceremony(
         Stream::Server(Box::new(stream)),
@@ -414,6 +422,7 @@ pub async fn accept_stream(
         window,
         address,
         listen_port,
+        local_display_name,
     )
     .await
 }
@@ -424,6 +433,7 @@ pub async fn dial(
     identity: &NodeIdentity,
     window: Duration,
     listen_port: u16,
+    local_display_name: &str,
 ) -> Result<PairingDriver, PairError> {
     let config = pairing_client_config(identity)?;
     let connector = TlsConnector::from(Arc::new(config));
@@ -433,7 +443,13 @@ pub async fn dial(
         .await
         .map_err(PairError::Io)?;
     let stream = Stream::Client(Box::new(connected));
-    let ceremony = dialer_ceremony(stream, identity, Some(address.to_string()), listen_port);
+    let ceremony = dialer_ceremony(
+        stream,
+        identity,
+        Some(address.to_string()),
+        listen_port,
+        local_display_name,
+    );
     tokio::time::timeout(window, ceremony)
         .await
         .map_err(|_| PairError::Timeout)?
@@ -445,9 +461,10 @@ async fn opener_ceremony(
     window: &PairingWindow,
     address: Option<String>,
     listen_port: u16,
+    local_display_name: &str,
 ) -> Result<PairingDriver, PairError> {
     let attempt_id: AttemptId = *window.attempt_id();
-    let mut fsm = PairingFsm::window_opener(identity.node_id(), "lan-workspace", attempt_id);
+    let mut fsm = PairingFsm::window_opener(identity.node_id(), local_display_name, attempt_id);
     if let Some(address) = address.clone() {
         fsm.set_address(address);
     }
@@ -491,8 +508,9 @@ async fn dialer_ceremony(
     identity: &NodeIdentity,
     address: Option<String>,
     listen_port: u16,
+    local_display_name: &str,
 ) -> Result<PairingDriver, PairError> {
-    let mut fsm = PairingFsm::dialer(identity.node_id(), "lan-workspace");
+    let mut fsm = PairingFsm::dialer(identity.node_id(), local_display_name);
     fsm.handle(PairingInput::DialStarted { now_ms: 0 });
     if let Some(address) = address.clone() {
         fsm.set_address(address);

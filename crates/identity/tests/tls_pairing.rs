@@ -114,12 +114,12 @@ async fn a_loopback_pairing_commits_on_both_sides_with_one_code() {
     let opener_identity = Arc::clone(&a);
     let opener = tokio::spawn(async move {
         let mut window = open_window(0).expect("window");
-        accept_one(&listener, &opener_identity, &mut window, 0, 47901)
+        accept_one(&listener, &opener_identity, &mut window, 0, 47901, "node-a")
             .await
             .expect("the opener's half of the ceremony")
     });
 
-    let dialer = dial(address, &b, DIAL_TIMEOUT, 47901)
+    let dialer = dial(address, &b, DIAL_TIMEOUT, 47901, "node-b")
         .await
         .expect("the dialer's half of the ceremony");
     let opener = opener.await.expect("the opener task");
@@ -128,6 +128,11 @@ async fn a_loopback_pairing_commits_on_both_sides_with_one_code() {
     assert_eq!(opener.sas(), dialer.sas());
     assert_eq!(opener.peer_node_id(), &b.node_id());
     assert_eq!(dialer.peer_node_id(), &a.node_id());
+    // `PairHello.display_name` carries the *configured* name of the sender, which is the only
+    // name a human on the other side ever sees: each side reads the name it was handed, not a
+    // constant.
+    assert_eq!(opener.peer_display_name(), "node-b");
+    assert_eq!(dialer.peer_display_name(), "node-a");
     assert_eq!(
         opener.peer_fingerprint(),
         identity::fingerprint_grouped(&b.node_id())
@@ -301,11 +306,12 @@ async fn two_independent_sessions_do_not_agree_on_a_code() {
                 &mut window,
                 round * 1_000,
                 47901,
+                "node-a",
             )
             .await
             .expect("opener")
         });
-        let dialer = dial(address, &b, DIAL_TIMEOUT, 47901)
+        let dialer = dial(address, &b, DIAL_TIMEOUT, 47901, "node-b")
             .await
             .expect("dialer");
         let opener = opener.await.expect("task");

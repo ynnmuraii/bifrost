@@ -163,6 +163,9 @@ pub struct Session {
     /// Where this node listens: the address a pairing window shows, and the port it
     /// advertises in `PairHello.listen_port`.
     listen: std::net::SocketAddr,
+    /// `node.display_name`: what a pairing peer's prompt and `TRUSTED_PEER` record show for
+    /// this node. A label, never an identity.
+    display_name: String,
     /// `input.emergency_hotkey`, shown by `Status` and the settings screen.
     emergency_hotkey: String,
     /// This node's declared capabilities: what `Status.capabilities_unavailable` subtracts.
@@ -198,6 +201,7 @@ impl Session {
         identity: Arc<identity::NodeIdentity>,
         paths: config::Paths,
         listen: std::net::SocketAddr,
+        display_name: String,
         emergency_hotkey: String,
         capabilities: platform_probe::Capabilities,
         pairing_gate: transport::PairingGate,
@@ -255,6 +259,7 @@ impl Session {
             pairing_events,
             pairing_events_tx,
             listen,
+            display_name,
             emergency_hotkey,
             capabilities,
             portal_state: String::new(),

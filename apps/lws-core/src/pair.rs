@@ -97,6 +97,13 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
             )
         },
     );
+    // What the other computer's prompt and trust record show for this node. With no readable
+    // configuration there is no configured name, and the documented default stands in for it
+    // rather than an invented one.
+    let display_name = configured.as_ref().map_or_else(
+        || config::Config::default().node.display_name,
+        |config| config.node.display_name.clone(),
+    );
 
     let identity_paths = identity::IdentityPaths {
         data_dir: paths.data_dir().to_path_buf(),
@@ -143,6 +150,7 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
                 &mut window,
                 identity::now_unix_ms() as u64,
                 listen_port,
+                &display_name,
             )
             .await
             .map_err(|error| Failure::Run(error.to_string()))?
@@ -151,7 +159,7 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
                 .expect("checked above")
                 .parse()
                 .map_err(|error| Failure::Run(format!("--dial: {error}")))?;
-            identity::dial(address, &identity, WINDOW, listen_port)
+            identity::dial(address, &identity, WINDOW, listen_port, &display_name)
                 .await
                 .map_err(|error| Failure::Run(error.to_string()))?
         };
