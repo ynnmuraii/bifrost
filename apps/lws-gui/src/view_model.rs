@@ -736,9 +736,27 @@ impl ViewModel {
 
     /// The client reached the core: greeting frames are on their way.
     pub fn on_connected(&mut self, endpoint: &str) {
+        self.reload_first_run_config();
         self.connection = Connection::Connected;
         self.silent = false;
         self.push_log(format!("Служба работает ({endpoint})"));
+    }
+
+    /// The service writes first-run config before opening this connection; read it now so
+    /// Settings does not keep showing the defaults loaded before «Запустить».
+    fn reload_first_run_config(&mut self) {
+        if !self.config.config_was_missing {
+            return;
+        }
+        let Some(paths) = self.config.paths.clone() else {
+            return;
+        };
+        let fresh = LocalConfig::load(&paths);
+        if fresh.config_was_missing {
+            return;
+        }
+        self.report_created_config();
+        self.config = fresh;
     }
 
     /// The link is gone; the last `Status` stays on screen.
