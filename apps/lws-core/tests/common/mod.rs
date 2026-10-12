@@ -340,7 +340,10 @@ impl Node {
                     return Ok(candidate);
                 }
             }
-            return Err(format!("no agent under core {}", self.pid));
+            // The tail expression, not a `return`: this block is the whole body on Unix,
+            // and clippy rejects the redundant `return` (it did not see it on Windows,
+            // where the branch is compiled out).
+            Err(format!("no agent under core {}", self.pid))
         }
         #[cfg(windows)]
         {

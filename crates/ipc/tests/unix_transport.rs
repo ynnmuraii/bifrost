@@ -206,7 +206,7 @@ async fn recovery_mode_over_a_live_agent_pair() {
 #[tokio::test]
 async fn a_cancelled_accept_keeps_the_client_that_connects_while_it_waits() {
     use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::Context;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let socket = TempSocket::new("cancel");
