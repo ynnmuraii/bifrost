@@ -3,7 +3,7 @@
 //! ADR-008 keeps clipboard content off the input path; between core and the agent it still
 //! has to travel, and an `AgentFrame` is at most 64 KiB, so both `ClipboardChanged` (agent →
 //! core) and `SetClipboardText` (core → agent) carry a payload in chunks of ≤ 32768 bytes
-//! with `chunk_count` in `1..=32`, and `sha256` over the whole payload on the last chunk only
+//! with `chunk_count` in `1..=64`, and `sha256` over the whole payload on the last chunk only
 //! (`crates/protocol/proto/ipc.proto`, «clipboard over local IPC»). The two directions are not
 //! symmetric: `ClipboardChanged` also carries `size_bytes` on every chunk (the *agent* is the
 //! one that knows the size of what it copied, and core needs it to verify the assembly),
@@ -13,7 +13,7 @@
 //! [`clipboard`]'s `Assembler` is the same idea for the *network* channel, and it is not
 //! reusable here: it frames 16 KiB chunks, allows `1..=64` of them, keys a transfer by a
 //! 16-byte offer id and caps the payload at what the offer promised. The IPC's numbers are
-//! different (`32 KiB`, `1..=32`) and the key is the sender's `origin_version`, so this module
+//! different (`32 KiB`, `1..=64`) and the key is the sender's `origin_version`, so this module
 //! is the small equivalent that speaks the IPC's own numbers — deliberately still pure, so the
 //! framing and the assembly are unit-tested on any host.
 
@@ -24,8 +24,11 @@ use protocol::ipc;
 
 /// The largest payload one frame carries (`ipc.proto`: «`data`: UTF-8 text, <= 32768 bytes»).
 pub const CHUNK_BYTES: usize = 32768;
-/// `chunk_count` is `1..=32` on this channel: 32 × 32 KiB is exactly the 1 MiB payload limit.
-pub const MAX_CHUNKS: u32 = 32;
+/// `chunk_count` is `1..=64` on this channel — the same range the clipboard channel uses.
+/// 64 × 32 KiB reaches 2 MiB, deliberately more than the 1 MiB the policy refuses: a copy over
+/// the limit is still *reported*, so core can answer `CLIPBOARD_TOO_LARGE` instead of the agent
+/// silently dropping it.
+pub const MAX_CHUNKS: u32 = 64;
 
 /// The marker name this one travels as (`ipc.proto`:
 /// `exclude_from_monitor | no_history | viewer_ignore | kde_secret | portal_secret`).
@@ -117,7 +120,7 @@ pub fn frames(text: &str, origin_version: u64, markers: &[Marker]) -> Vec<ipc::C
 /// selection is not touched on any of these: unverified text is never applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundError {
-    /// `chunk_count` outside `1..=32`.
+    /// `chunk_count` outside `1..=64`.
     BadChunkCount,
     /// A chunk larger than 32768 bytes.
     ChunkTooLarge,
@@ -147,7 +150,7 @@ impl InboundError {
     /// Payload-free, actionable text for the error frame.
     pub const fn detail(self) -> &'static str {
         match self {
-            InboundError::BadChunkCount => "chunk_count is outside 1..=32",
+            InboundError::BadChunkCount => "chunk_count is outside 1..=64",
             InboundError::ChunkTooLarge => "a chunk carried more than 32768 bytes",
             InboundError::OutOfOrder => "a chunk arrived out of order",
             InboundError::KeyChanged => "the chunks disagree about version or count",
@@ -186,7 +189,7 @@ pub struct Inbound {
 impl Inbound {
     /// Opens a transfer with its first chunk.
     pub fn start(frame: &ipc::SetClipboardText) -> Result<Self, InboundError> {
-        debug_assert!(MAX_CHUNKS as u64 * CHUNK_BYTES as u64 <= MAX_BYTES);
+        debug_assert!(MAX_CHUNKS as u64 * CHUNK_BYTES as u64 >= MAX_BYTES);
         if frame.chunk_count == 0 || frame.chunk_count > MAX_CHUNKS {
             return Err(InboundError::BadChunkCount);
         }
@@ -311,11 +314,16 @@ mod tests {
         assert_eq!(chunk_count(1), 1);
         assert_eq!(chunk_count(CHUNK_BYTES), 1);
         assert_eq!(chunk_count(CHUNK_BYTES + 1), 2);
-        assert_eq!(chunk_count(MAX_BYTES as usize), MAX_CHUNKS);
+        assert_eq!(
+            chunk_count(MAX_BYTES as usize),
+            32,
+            "1 MiB is 32 frames of 32 KiB"
+        );
         assert_eq!(
             MAX_CHUNKS as usize * CHUNK_BYTES,
-            MAX_BYTES as usize,
-            "32 chunks of 32 KiB are exactly the 1 MiB payload limit"
+            2 * MAX_BYTES as usize,
+            "the ceiling is 2 MiB on purpose: past the 1 MiB the policy refuses, so a copy over \
+             the limit still has to be *reported* rather than dropped here"
         );
         assert_eq!(chunk_range(100, 0), 0..100);
         assert_eq!(chunk_range(100, 1), 100..100);
@@ -327,12 +335,12 @@ mod tests {
     fn one_mebibyte_is_thirty_two_chunks_and_only_the_last_carries_the_hash() {
         let text = "a".repeat(MAX_BYTES as usize);
         let frames = frames(&text, 9, &[]);
-        assert_eq!(frames.len(), MAX_CHUNKS as usize);
+        assert_eq!(frames.len(), 32);
         let hash = clipboard::sha256(text.as_bytes());
         for (index, frame) in frames.iter().enumerate() {
             assert!(frame.data.len() <= CHUNK_BYTES, "chunk {index} is too big");
             assert_eq!(frame.chunk_index, index as u32);
-            assert_eq!(frame.chunk_count, MAX_CHUNKS);
+            assert_eq!(frame.chunk_count, 32);
             assert_eq!(frame.size_bytes, MAX_BYTES);
             assert_eq!(frame.origin_version, 9);
             if index + 1 == frames.len() {
@@ -485,26 +493,26 @@ mod tests {
             InboundError::ChunkTooLarge
         );
 
-        // The largest legal transfer: 32 chunks of 32 KiB *is* the 1 MiB limit, and the
-        // assembled payload is exactly that — which is what makes a third size check
-        // unnecessary.
-        let chunked = chunk(1, 0, MAX_CHUNKS, &vec![b'a'; CHUNK_BYTES], None);
+        // The 1 MiB boundary: 32 chunks of 32 KiB assemble into exactly the payload the
+        // policy still sends.
+        const ONE_MIB_CHUNKS: u32 = 32;
+        let chunked = chunk(1, 0, ONE_MIB_CHUNKS, &vec![b'a'; CHUNK_BYTES], None);
         let mut inbound = Inbound::start(&chunked).expect("the first chunk is within every limit");
         assert_eq!(
             inbound.push(&chunked).expect("chunk 0"),
             Progress::NeedMore,
             "31 more chunks are expected"
         );
-        for index in 1..MAX_CHUNKS {
+        for index in 1..ONE_MIB_CHUNKS {
             inbound
-                .push(&chunk(1, index, MAX_CHUNKS, &vec![b'a'; CHUNK_BYTES], None))
+                .push(&chunk(1, index, ONE_MIB_CHUNKS, &vec![b'a'; CHUNK_BYTES], None))
                 .expect("still within the limit");
         }
         let hash = clipboard::sha256(&vec![b'a'; MAX_BYTES as usize]);
         let last = chunk(
             1,
-            MAX_CHUNKS - 1,
-            MAX_CHUNKS,
+            ONE_MIB_CHUNKS - 1,
+            ONE_MIB_CHUNKS,
             &vec![b'a'; CHUNK_BYTES],
             Some(&hash),
         );
