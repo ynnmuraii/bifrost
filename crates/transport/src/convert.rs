@@ -351,6 +351,13 @@ fn is_clipboard(payload: &wire::envelope::Payload) -> bool {
 pub enum LayoutMessage {
     /// `Topology{revision, author_node_id, nodes, links}` — the document.
     Topology(wire::Topology),
+    /// A member's refreshed display manifest (`DisplaysChanged`).
+    DisplaysChanged {
+        /// The member-local display revision.
+        revision: u64,
+        /// The current display set.
+        displays: Vec<wire::Display>,
+    },
     /// `LayoutEdit{expected_revision, expected_author, author_node_id, layout_toml}`.
     LayoutEdit(wire::LayoutEdit),
     /// `TopologyRequest{}` — a member asking the coordinator, or the coordinator asking the
@@ -410,6 +417,12 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
         Some(Payload::LayoutEdit(edit)) => {
             Ok(Inbound::Layout(LayoutMessage::LayoutEdit(edit.clone())))
         }
+        Some(Payload::DisplaysChanged(changed)) => {
+            Ok(Inbound::Layout(LayoutMessage::DisplaysChanged {
+                revision: changed.displays_revision,
+                displays: changed.displays.clone(),
+            }))
+        }
         Some(Payload::TopologyRequest(_)) => Ok(Inbound::Layout(LayoutMessage::TopologyRequest)),
         Some(Payload::TopologyApplied(applied)) => {
             Ok(Inbound::Layout(LayoutMessage::TopologyApplied {
@@ -460,6 +473,12 @@ pub fn layout_envelope(
     use wire::envelope::Payload;
 
     let payload = match message {
+        LayoutMessage::DisplaysChanged { revision, displays } => {
+            Payload::DisplaysChanged(wire::DisplaysChanged {
+                displays_revision: *revision,
+                displays: displays.clone(),
+            })
+        }
         LayoutMessage::Topology(topology) => Payload::Topology(topology.clone()),
         LayoutMessage::LayoutEdit(edit) => Payload::LayoutEdit(edit.clone()),
         LayoutMessage::TopologyRequest => Payload::TopologyRequest(wire::TopologyRequest {}),
@@ -816,7 +835,7 @@ pub fn inject_status_from_i32(value: i32) -> Result<fr::InjectStatus, ConvertErr
 }
 
 /// The `Hello` fields this layer needs to identify a peer and gate membership.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PeerInfo {
     /// `Hello.node_id`, checked against the certificate's SPKI hash.
     pub node_id: NodeId,
@@ -832,11 +851,11 @@ pub struct PeerInfo {
     pub topology_revision: u64,
     /// `Hello.topology_author`: the author applied together with that revision.
     pub topology_author: Option<NodeId>,
+    /// `Hello.displays_revision`: the peer's current local display-set revision.
+    pub displays_revision: u64,
+    /// `Hello.displays`: the peer's current local display set.
+    pub displays: Vec<wire::Display>,
     /// The capability bits `Hello.capabilities`, in the four flags `focus-router` knows.
-    ///
-    /// The FSM gates a transition on them — «Preparing → …: receiver не поддержан» uses
-    /// `Capabilities::receiver_ready()` and a source needs `source_ready()` — so an
-    /// application that fed `Input::Hello` without them could never enter `Remote`.
     pub capabilities: fr::Capabilities,
     /// `CAPABILITY_TEXT_CLIPBOARD`.
     ///
@@ -880,6 +899,8 @@ impl PeerInfo {
                     })?,
                 ))
             },
+            displays_revision: hello.displays_revision,
+            displays: hello.displays.clone(),
             capabilities: capabilities_from_wire(&hello.capabilities),
             text_clipboard: hello
                 .capabilities

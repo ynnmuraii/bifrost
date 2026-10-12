@@ -69,6 +69,10 @@ fn next_restart_backoff(current: Duration) -> Duration {
 /// do not look hung.
 const LAYOUT_VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn is_agent_ready(event: &fr::AgentEvent) -> bool {
+    matches!(event, fr::AgentEvent::AgentReady)
+}
+
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
     router: crate::ids::Router,
@@ -81,6 +85,8 @@ pub struct Session {
     started: Instant,
     ping_nonce: u64,
     node_id: NodeId,
+    local_hello: protocol::wire::Hello,
+    peer_displays: BTreeMap<NodeId, (u64, Vec<protocol::wire::Display>)>,
     backend: String,
     trust: identity::TrustStore,
     /// Persists the ownership pair across restarts (`config.toml`).
@@ -140,6 +146,7 @@ pub struct Session {
     pointer_gain: f64,
     /// The agent's last display report; it replaces the snapshot for this node.
     agent_displays: Vec<protocol::ipc::DisplayInfo>,
+    agent_displays_received: bool,
     /// The last captured local position: the input of an edge crossing in `Local`.
     local_pointer: Option<geometry::Position>,
     /// While a source lease is remote: the virtual position on the peer's display.
@@ -172,8 +179,8 @@ pub struct Session {
     gui_events: tokio::sync::broadcast::Sender<crate::gui::Outgoing>,
     /// The last `Status` published, so an unchanged state is not re-sent every 50 ms.
     gui_status: Option<protocol::ipc::Status>,
-    /// The last `TopologyDoc` revision published.
-    gui_revision: Option<u64>,
+    /// The last topology document sent to the GUI, including same-revision display changes.
+    gui_topology: Option<protocol::ipc::TopologyDoc>,
     /// This node's identity: the pairing ceremony needs the key and the certificate.
     identity: Arc<identity::NodeIdentity>,
     /// The resolved directories: where the trust record a committed pairing is written.
@@ -212,6 +219,7 @@ impl Session {
         agent: Supervisor,
         ctl: ctl::Server,
         node_id: NodeId,
+        local_hello: protocol::wire::Hello,
         backend: String,
         trust: identity::TrustStore,
         layout: config::TopologyConfig,
@@ -267,6 +275,9 @@ impl Session {
             layout,
             pointer_gain,
             agent_displays: Vec::new(),
+            agent_displays_received: false,
+            local_hello,
+            peer_displays: BTreeMap::new(),
             local_pointer: None,
             remote_pointer: None,
             remote_node: None,
@@ -279,7 +290,7 @@ impl Session {
             gui_requests_tx,
             gui_events,
             gui_status: None,
-            gui_revision: None,
+            gui_topology: None,
             identity,
             paths,
             pairing: pairing::Pairing::new(pairing_gate),
@@ -297,21 +308,29 @@ impl Session {
         session
     }
 
-    /// Assembles the layout document from everything known right now.
-    ///
-    /// The local manifest is the agent's report when there is one and the
-    /// `[[topology.displays]]` snapshot otherwise; the peers' manifests come from the same
-    /// snapshot until their `Hello` carries displays. A document that fails validation is
-    /// logged and dropped, which disables edge-triggered transitions instead of
-    /// mis-resolving them.
+    /// Assembles the layout from local and peer manifests, retaining configured display
+    /// snapshots until a member's live report arrives.
     fn rebuild_topology(&mut self) {
         let snapshot = crate::topology::snapshot_displays(&self.layout, self.node_id.as_bytes());
-        let displays = if self.agent_displays.is_empty() {
-            snapshot
-        } else {
+        let displays = if self.agent_displays_received {
             self.agent_displays.clone()
+        } else {
+            snapshot
         };
-        let peers = crate::topology::snapshot_peers(&self.layout, self.node_id.as_bytes());
+        let mut peers: BTreeMap<_, _> =
+            crate::topology::snapshot_peers(&self.layout, self.node_id.as_bytes())
+                .into_iter()
+                .map(|(node, displays)| (node, (0, displays)))
+                .collect();
+        peers.extend(
+            self.peer_displays
+                .iter()
+                .map(|(node, (revision, displays))| (*node, (*revision, displays.clone()))),
+        );
+        let peers: Vec<_> = peers
+            .into_iter()
+            .map(|(node, (_, displays))| (node, displays))
+            .collect();
         let documents = crate::topology::Documents {
             local_node_id: *self.node_id.as_bytes(),
             topology: &self.layout,
@@ -327,6 +346,16 @@ impl Session {
                     nodes = document.nodes.len(),
                     "layout document assembled"
                 );
+                if self.applied_wire.is_some() {
+                    let applied = self.layout_state.applied();
+                    self.applied_wire = Some(crate::topology::wire_from_live(
+                        &document,
+                        &self.layout,
+                        applied.revision,
+                        applied.author.unwrap_or(self.node_id),
+                        self.node_id,
+                    ));
+                }
                 self.topology = Some(document);
             }
             Err(error) => {
@@ -594,6 +623,18 @@ impl Session {
             self.on_agent_lost().await;
         }
     }
+    async fn query_agent_displays(&mut self) -> bool {
+        let frame = Msg::QueryDisplays(protocol::ipc::QueryDisplays {});
+        tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
+        match self.agent.send(frame).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "cannot query the agent's displays");
+                self.on_agent_lost().await;
+                false
+            }
+        }
+    }
 
     /// `StopRepeat`: the receiver must stop repeating (`repeat_guard_ms` of silence).
     async fn send_agent_stop_repeat(&mut self, lease_id: fr::LeaseId) {
@@ -668,6 +709,23 @@ impl Session {
         use transport::convert::LayoutMessage;
 
         match message {
+            LayoutMessage::DisplaysChanged { revision, displays } => {
+                if self
+                    .peer_displays
+                    .get(&from)
+                    .is_some_and(|(known, _)| *known >= revision)
+                {
+                    return;
+                }
+                tracing::info!(
+                    peer = %from,
+                    displays = displays.len(),
+                    revision,
+                    "peer display report"
+                );
+                self.peer_displays.insert(from, (revision, displays));
+                self.rebuild_topology();
+            }
             LayoutMessage::Topology(document) => {
                 let Some(pair) = crate::topology::wire_pair(&document) else {
                     tracing::warn!(peer = %from, "topology without a readable author id");
@@ -1398,6 +1456,13 @@ impl Session {
                     receiver_ready = hello.capabilities.receiver_ready(),
                     "link up"
                 );
+                if hello.displays_revision > 0 {
+                    self.peer_displays
+                        .insert(peer, (hello.displays_revision, hello.displays.clone()));
+                } else {
+                    self.peer_displays.remove(&peer);
+                }
+                self.rebuild_topology();
                 // The clipboard channel of this pair is bound to this connection id as its
                 // parent: the grant carries it, the bind echoes it, and closing the input link
                 // closes the channel (ADR-008, «Clipboard канал»).
@@ -1526,6 +1591,8 @@ impl Session {
                 if let Some(clipboard) = self.clipboard.as_mut() {
                     clipboard.on_link_down(peer).await;
                 }
+                self.peer_displays.remove(&peer);
+                self.rebuild_topology();
                 self.feed(fr::Input::LinkDown { peer }).await;
             }
         }
@@ -1681,7 +1748,7 @@ impl Session {
         }
         match routing::agent_signal(&message, &mut self.context) {
             AgentSignal::Fsm(event) => {
-                if matches!(event, fr::AgentEvent::AgentReady) {
+                if is_agent_ready(&event) {
                     self.agent.mark_ready();
                     self.agent_lost_reported = false;
                     self.agent_restart_due = None;
@@ -1691,6 +1758,9 @@ impl Session {
                         self.refusal = None;
                         self.portal_state.clear();
                         self.agent_degraded_reason.clear();
+                    }
+                    if !self.query_agent_displays().await {
+                        return Ok(());
                     }
                 }
                 self.feed(fr::Input::Agent(event)).await;
@@ -1710,10 +1780,31 @@ impl Session {
                     revision = report.local_revision,
                     "agent display report"
                 );
-                // The report replaces the snapshot for this node, so the document is
-                // assembled again: a hot-plug can add or remove a link endpoint.
-                self.agent_displays = report.displays.clone();
+                let displays: Vec<_> = report
+                    .displays
+                    .iter()
+                    .filter_map(crate::topology::display_to_wire)
+                    .collect();
+                let revision = if report.local_revision > self.local_hello.displays_revision {
+                    report.local_revision
+                } else if displays != self.local_hello.displays {
+                    self.local_hello.displays_revision.saturating_add(1)
+                } else {
+                    self.local_hello.displays_revision
+                };
+                self.agent_displays = report.displays;
+                self.agent_displays_received = true;
+                self.local_hello.displays_revision = revision;
+                self.local_hello.displays = displays.clone();
+                self.manager
+                    .update_local_hello(self.local_hello.clone())
+                    .await;
                 self.rebuild_topology();
+                let message =
+                    transport::convert::LayoutMessage::DisplaysChanged { revision, displays };
+                for peer in self.manager.members().await {
+                    self.send_layout_to(peer, message.clone()).await;
+                }
             }
             AgentSignal::Portal { interface, detail } => {
                 tracing::info!(
@@ -2692,5 +2783,12 @@ mod timer_tests {
             Some((fr::Timer::ReceiverChallenge, 20)),
             "a wheel keyed by timer name must still report the earliest deadline"
         );
+    }
+    #[test]
+    fn an_agent_ready_event_triggers_a_display_query() {
+        assert!(is_agent_ready(&fr::AgentEvent::AgentReady));
+        assert!(!is_agent_ready(&fr::AgentEvent::Ready {
+            lease_id: [0; 16]
+        }));
     }
 }

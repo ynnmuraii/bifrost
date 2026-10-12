@@ -45,8 +45,6 @@ pub enum BuildError {
     Links(config::ConfigError),
     /// The document assembled, but breaks the integrity rules of «Доменная модель».
     Invalid(Vec<geometry::TopologyError>),
-    /// The node has no display at all, so no transition can be resolved.
-    NoLocalDisplays,
 }
 
 impl std::fmt::Display for BuildError {
@@ -63,9 +61,6 @@ impl std::fmt::Display for BuildError {
                     write!(f, " {error:?};")?;
                 }
                 Ok(())
-            }
-            BuildError::NoLocalDisplays => {
-                f.write_str("this node reported no displays, so no edge can be resolved")
             }
         }
     }
@@ -92,15 +87,10 @@ pub fn build(documents: &Documents<'_>) -> Result<Topology, BuildError> {
             local_named.push(display);
         }
     }
-    if local_named.is_empty() {
-        return Err(BuildError::NoLocalDisplays);
-    }
     nodes.insert(local, local_named);
     for (peer, displays) in documents.peer_displays {
         let converted: Vec<Display> = displays.iter().filter_map(display_from_wire).collect();
-        if !converted.is_empty() {
-            nodes.insert(*peer, converted);
-        }
+        nodes.insert(*peer, converted);
     }
 
     let revision = documents
@@ -240,6 +230,32 @@ pub fn display_from_ipc(info: &ipc::DisplayInfo) -> Option<Display> {
             .unwrap_or(Rotation::Deg0),
         scale,
         primary: info.primary,
+    })
+}
+
+/// `DisplayInfo` → the member manifest carried by `Hello.displays` and `DisplaysChanged`.
+pub fn display_to_wire(info: &ipc::DisplayInfo) -> Option<wire::Display> {
+    let display = display_from_ipc(info)?;
+    let rect = |rect: Rect| wire::Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    };
+    Some(wire::Display {
+        id: display.id.as_str().to_owned(),
+        logical_bounds: Some(rect(display.logical_bounds)),
+        native_bounds: display.native_bounds.map(rect),
+        rotation_degrees: match display.rotation {
+            Rotation::Deg0 => 0,
+            Rotation::Deg90 => 90,
+            Rotation::Deg180 => 180,
+            Rotation::Deg270 => 270,
+        },
+        scale_x: display.scale.x,
+        scale_y: display.scale.y,
+        primary: display.primary,
+        native_known: display.native_bounds.is_some(),
     })
 }
 
@@ -468,10 +484,9 @@ pub fn wire_from_live(
         })
         .collect();
     let mut document = wire_document(layout, revision, author, self_node);
-    if nodes.is_empty() || nodes.iter().all(|node| node.displays.is_empty()) {
-        // No live manifest at all — a headless runner, an agent that has not reported yet: the
-        // configuration snapshot is what `[[topology.displays]]` exists for, and a document
-        // with no nodes could not be revalidated by anyone.
+    if nodes.is_empty() {
+        // A document with no nodes could not be revalidated; build declares local identity
+        // even before the agent reports any displays.
         return document;
     }
     document.nodes = nodes;
@@ -882,37 +897,37 @@ bidirectional = true
             local_node_id: local_id(),
             topology: &config,
             local_displays: &local,
-            peer_displays: &[],
+            peer_displays: &[(NodeId::new(peer_id()), Vec::new())],
         })
         .expect_err("a link endpoint with no display cannot resolve");
-        match error {
-            // A peer that reported nothing is not added as a node at all, so the link's
-            // target is an unknown *node* rather than an unknown display.
-            BuildError::Invalid(errors) => assert!(
-                errors.iter().any(|error| matches!(
-                    error,
-                    geometry::TopologyError::UnknownNode {
-                        side: geometry::EndpointSide::Target,
-                        ..
-                    }
-                )),
-                "{errors:?}"
+        assert!(
+            matches!(
+                &error,
+                BuildError::Invalid(errors)
+                    if errors.iter().any(|error| matches!(
+                        error,
+                        geometry::TopologyError::UnknownDisplay {
+                            side: geometry::EndpointSide::Target,
+                            ..
+                        }
+                    ))
             ),
-            other => panic!("expected a validation failure, got {other}"),
-        }
+            "{error}"
+        );
     }
 
     #[test]
-    fn no_local_displays_is_its_own_error() {
-        let config = topology_config();
-        let error = build(&Documents {
+    fn an_empty_manifest_still_declares_both_members_for_the_editor() {
+        let topology = build(&Documents {
             local_node_id: local_id(),
-            topology: &config,
+            topology: &config::TopologyConfig::default(),
             local_displays: &[],
-            peer_displays: &[],
+            peer_displays: &[(NodeId::new([2; 32]), Vec::new())],
         })
-        .expect_err("without a local display nothing can be resolved");
-        assert!(matches!(error, BuildError::NoLocalDisplays), "{error}");
+        .expect("empty display manifests still form a document");
+
+        assert_eq!(topology.nodes.len(), 2);
+        assert!(topology.nodes.iter().all(|node| node.displays.is_empty()));
     }
 
     #[test]
