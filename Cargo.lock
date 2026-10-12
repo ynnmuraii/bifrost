@@ -1034,6 +1034,7 @@ dependencies = [
 name = "platform-win"
 version = "0.0.1"
 dependencies = [
+ "clipboard",
  "input-model",
  "windows",
 ]
