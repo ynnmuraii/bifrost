@@ -133,6 +133,72 @@ fn s07_remote_switch_releases_with_trigger_reason() {
         assert_eq!(r.focus(), FocusState::Releasing);
     }
 }
+/// A return edge releases the *receiver* through `LeaveAck`, not through our own
+/// capture coming back: the peer needs its own release round trip, and a second
+/// `EnterPrepare` before that ack is what S14 answers with `LEASE_MISMATCH`.
+#[test]
+fn s35_return_edge_waits_for_the_leave_ack_not_for_our_own_release() {
+    let mut r = remote();
+    assert_eq!(
+        effects(&r.handle(20, switch(SwitchTrigger::Edge))),
+        vec![end(id(1), false), leave(id(1), LeaveReason::ReturnEdge)]
+    );
+    // The agent restored the local capture at once — that is not the receiver's
+    // release, so the lease stays in the slot and nothing may open a new one.
+    assert_eq!(
+        effects(&r.handle(
+            21,
+            Input::Agent(AgentEvent::Released { lease_id: id(1) })
+        )),
+        vec![]
+    );
+    assert_eq!(
+        effects(&r.handle(
+            21,
+            Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) })
+        )),
+        vec![]
+    );
+    assert_eq!(r.focus(), FocusState::Releasing);
+    assert_eq!(
+        effects(&r.handle(22, switch(SwitchTrigger::Edge))),
+        vec![notice(Notice::SwitchRefused {
+            trigger: SwitchTrigger::Edge,
+            reason: TransitionRefusal::NotOwner
+        })]
+    );
+    assert_eq!(r.lease().source().unwrap().lease_id, id(1));
+    // The ack is what frees the slot, and the next transition opens a fresh lease.
+    assert_eq!(
+        effects(&r.handle(23, net(Message::LeaveAck { lease_id: id(1) }))),
+        vec![]
+    );
+    assert!(r.lease().is_idle());
+    assert_eq!(
+        effects(&r.handle(24, switch(SwitchTrigger::Edge))),
+        vec![begin(CaptureKind::Temporary, id(2), 200)]
+    );
+    assert_eq!(r.focus(), FocusState::Preparing);
+
+    // The other half of the same rule: a channel that can no longer deliver the
+    // `LeaveAck` falls back to the conservative `claim_grant_timeout_ms` wait.
+    let mut r = remote();
+    r.handle(20, switch(SwitchTrigger::Edge));
+    r.handle(
+        21,
+        Input::Agent(AgentEvent::Released { lease_id: id(1) }),
+    );
+    let out = r.handle(22, Input::LinkDown { peer: PEER });
+    assert_eq!(effects(&out), vec![]);
+    assert!(out.contains(&arm(Timer::ReleaseGuard, 622)));
+    assert_eq!(r.focus(), FocusState::Releasing);
+    assert_eq!(
+        effects(&r.handle(622, Input::TimerExpired(Timer::ReleaseGuard))),
+        vec![]
+    );
+    assert!(r.lease().is_idle());
+}
+
 #[test]
 fn s08_leave_ack_returns_local_and_burns_old_id() {
     let mut r = remote();

@@ -52,6 +52,15 @@
 //!    source of a claim serial (`1` when `max_seen = 0`), and a self-grant is only
 //!    published from the `ClaimGrant` timer and only while the claim still wins the
 //!    ordering (`claim_still_wins`).
+//! 7. **A return edge frees the source only when the receiver has released.**
+//!    `on_switch` marks the source `SourceLease::awaiting_leave_ack`, and the slot then
+//!    leaves it only on the peer's `LeaveAck` (or on the release guard, once the link is
+//!    gone): restoring the local capture — the agent's own `Released`/`CaptureReady` —
+//!    is not the peer's release («Переход на другого receiver разрешается после
+//!    `LeaveAck`», `docs/05-protocol.md`). Opening a lease earlier is what a receiver
+//!    answers with `LEASE_MISMATCH` (S14), and the ownership paths are unaffected: they
+//!    release without a `Leave` and keep the documented `Released`/`CaptureReady` wait
+//!    (S25/S26/S30).
 //!
 //! # Times, and what is *not* here
 //!
@@ -119,6 +128,7 @@
 //! | S32 | `SuspendOrLock` in `Remote` | `EndCapture`/`ReleaseSession` + `Leave{SUSPEND_OR_LOCK}`, `Local` |
 //! | S33 | agent lost | release, `Blocked`; `AgentReady` returns to `Local` |
 //! | S34 | switch while not the owner / while `Blocked` / with a target that lacks `INJECT` | refused with `NotOwner` / `AgentBlocked` / `ReceiverUnsupported`; nothing sent |
+//! | S35 | return edge: the local capture is restored (`Released`/`CaptureReady`) before the peer's `LeaveAck` | the slot stays `Releasing`: a switch now is refused and nothing is sent, and only the `LeaveAck` (or the release guard, once the channel is gone) frees it |
 
 #![forbid(unsafe_code)]
 
