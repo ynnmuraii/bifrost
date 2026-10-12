@@ -65,6 +65,10 @@ pub const CLIPBOARD_INTERFACE: &str = "org.freedesktop.portal.Clipboard";
 #[cfg(target_os = "linux")]
 pub const GLOBAL_SHORTCUTS_INTERFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
 
+// The clipboard decision is pure (the portal's own constraints are the input), so it builds
+// and tests on any host; the portal stream itself is not driven yet, see the module.
+pub mod clipboard;
+
 #[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
@@ -75,6 +79,8 @@ mod grant;
 mod inject;
 #[cfg(target_os = "linux")]
 mod shortcuts;
+
+pub use clipboard::{availability, Availability, Unavailable};
 
 #[cfg(target_os = "linux")]
 pub use capture::{portal_versions, CapturedEvent, EmergencyHandle, MotionCounts, WaylandCapture};
