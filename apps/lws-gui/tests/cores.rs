@@ -512,13 +512,14 @@ fn count_lines(view: &ViewModel, needle: &str) -> usize {
 /// file held.
 fn read_when_ready(path: &Path, what: &str, ready: impl Fn(&str) -> bool) -> String {
     let deadline = Instant::now() + DEADLINE;
-    let mut last = "the file is not there".to_owned();
     loop {
-        match std::fs::read_to_string(path) {
+        // What the file held, for the panic below: the read itself is the loop's only work,
+        // so there is nothing to carry between turns.
+        let last = match std::fs::read_to_string(path) {
             Ok(text) if ready(&text) => return text,
-            Ok(text) => last = format!("it holds:\n{text}"),
-            Err(error) => last = error.to_string(),
-        }
+            Ok(text) => format!("it holds:\n{text}"),
+            Err(error) => error.to_string(),
+        };
         if Instant::now() >= deadline {
             panic!(
                 "{what}: {} never held it within {DEADLINE:?} — {last}",
