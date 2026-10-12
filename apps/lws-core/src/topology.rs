@@ -3,9 +3,9 @@
 //! `docs/03-architecture.md`, «Топология и движение»: the document is
 //! `Topology{revision, author_node_id, nodes[], links[]}`, the links come from
 //! `config.example.toml`'s `[[topology.links]]` (the GUI edits the same document), and
-//! the manifests are per node: the local one from the agent's `DisplaysReport` (or the
-//! `[[topology.displays]]` snapshot when the agent has not answered), each peer's from
-//! `Hello.displays`.
+//! the manifests are per node: the local one from the agent's last non-empty `DisplaysReport`
+//! (or the `[[topology.displays]]` snapshot before one arrives), each peer's from its last
+//! non-empty `Hello`/display report or the configured snapshot.
 //!
 //! Two rules decide what this module does with bad input:
 //!
@@ -30,10 +30,11 @@ pub struct Documents<'a> {
     pub local_node_id: [u8; 32],
     /// `[topology]` from `config.toml`.
     pub topology: &'a config::TopologyConfig,
-    /// The local display report: the agent's `DisplaysReport`, or the
-    /// `[[topology.displays]]` snapshot when the agent reported nothing.
+    /// The local display list selected by the session: the last non-empty agent report, or
+    /// the configured snapshot while no live manifest is available.
     pub local_displays: &'a [ipc::DisplayInfo],
-    /// One entry per peer whose `Hello` carried displays.
+    /// Peer display lists selected by the session, with configured snapshots retained when
+    /// a peer's hello/report is empty.
     pub peer_displays: &'a [(NodeId, Vec<wire::Display>)],
 }
 
@@ -300,10 +301,10 @@ fn rect_of(rect: &protocol::wire::Rect) -> Rect {
 /// The `[[topology.displays]]` snapshot of every *other* node, as wire displays.
 ///
 /// A `[[topology.links]]` endpoint names a peer display, so the snapshot already declares
-/// that it exists; until the peer's `Hello` arrives with its own manifest (or when a dry
-/// session never sends one), this is what keeps the document complete instead of failing
-/// validation. Rows whose `node` reference does not parse are skipped with a log, because
-/// the example file carries truncated placeholders.
+/// that it exists; until the peer sends a non-empty manifest (or when a dry session never
+/// sends one), this is what keeps the document complete instead of failing validation.
+/// Rows whose `node` reference does not parse are skipped with a log, because the example
+/// file carries truncated placeholders.
 pub fn snapshot_peers(
     topology: &config::TopologyConfig,
     local_node_id: &[u8; 32],
@@ -351,9 +352,9 @@ fn node_reference(reference: &str) -> Option<[u8; 32]> {
 
 /// The `[[topology.displays]]` snapshot of this node as `DisplayInfo` values.
 ///
-/// Used when the agent has not reported anything yet (dry mode, or a session without an
-/// OS input path): the snapshot is what the GUI edited, and the documents call it «снимок
-/// для GUI; источник истины — агент узла» — a snapshot is exactly what a fallback needs.
+/// Used before a non-empty agent report arrives (dry mode, or a session without an OS input
+/// path): the snapshot is what the GUI edited, and the documents call it «снимок для GUI;
+/// источник истины — агент узла» — a snapshot is exactly what a fallback needs.
 pub fn snapshot_displays(
     topology: &config::TopologyConfig,
     local_node_id: &[u8; 32],
