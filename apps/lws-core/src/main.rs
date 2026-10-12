@@ -263,11 +263,19 @@ fn resolve_paths(
     ))
 }
 
-/// Starts the logger at the level the configuration asks for.
+/// Starts the logger at the level the configuration asks for, writing to stderr **and** to
+/// the rotating file `docs/03-architecture.md` documents (`<logs>/lws-core.log`).
+///
+/// The file matters on the trial build: the GUI starts this core with no console at all
+/// (`CREATE_NO_WINDOW`), so stderr goes nowhere, and a person asked "what happened?" has to
+/// have a file to open. stderr is kept beside it, because the integration tests read a core's
+/// log there and a terminal is where a human starts one by hand.
 fn init_logging(paths: &Paths) {
-    let level = std::fs::read_to_string(paths.config_file())
+    let configured = std::fs::read_to_string(paths.config_file())
         .ok()
-        .and_then(|text| config::Config::from_str(&text).ok())
+        .and_then(|text| config::Config::from_str(&text).ok());
+    let level = configured
+        .as_ref()
         .map(|config| match config.log.level {
             config::LogLevel::Trace => "trace",
             config::LogLevel::Debug => "debug",
@@ -276,6 +284,11 @@ fn init_logging(paths: &Paths) {
             config::LogLevel::Error => "error",
         })
         .unwrap_or("info");
+    let (max_file_mb, max_files) = configured
+        .as_ref()
+        .map(|config| (config.log.max_file_mb, config.log.max_files))
+        .unwrap_or((5, 5));
+    let sink = logging::file_sink(&paths.logs_dir(), "lws-core", max_file_mb, max_files);
     let filter = tracing_subscriber::EnvFilter::try_from_env("LWS_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     tracing_subscriber::fmt()
@@ -283,11 +296,20 @@ fn init_logging(paths: &Paths) {
         // Colour only what a human reads. `tracing` colours by default, and a *redirected*
         // stderr is not a terminal: a log file or a pipe would otherwise carry `ESC[…m`
         // around every field, which breaks anything that parses it (the fault-injection
-        // harness did) and wastes bytes in the planned file sink (`[log] max_file_mb`).
+        // harness did) and wastes bytes in the file sink.
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
+        .with_writer({
+            let sink = sink.clone();
+            move || logging::Tee::new(sink.clone())
+        })
         .with_target(false)
         .init();
+    if let Some(sink) = sink {
+        let path = sink.lock().map(|file| file.path().to_path_buf());
+        if let Ok(path) = path {
+            tracing::info!(path = %path.display(), "logging to the state directory");
+        }
+    }
 }
 
 /// `run`: the daemon.
@@ -461,6 +483,7 @@ async fn run_async(
         options.agent.clone(),
         private_root(paths).to_path_buf(),
         private_root(paths).to_path_buf(),
+        paths.logs_dir(),
         options.dry_inject,
         options.dry_input_events,
         options.dry_motion,
