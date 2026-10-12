@@ -20,8 +20,8 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 use transport::convert::Inbound;
 use transport::{
-    dial_clipboard, BackoffBounds, ClipboardListener, ClipboardMessage, ClipboardViolation,
-    Grants, LinkEvent, LinkLiveness, LinkManager, ManagerConfig, Outgoing,
+    dial_clipboard, BackoffBounds, ClipboardListener, ClipboardMessage, ClipboardViolation, Grants,
+    LinkEvent, LinkLiveness, LinkManager, ManagerConfig, Outgoing,
 };
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -49,9 +49,19 @@ fn identity_at(root: &std::path::Path, name: &str) -> NodeIdentity {
 /// Two trust stores in which each identity pins the other.
 fn paired(a: &NodeIdentity, b: &NodeIdentity) -> (TrustStore, TrustStore) {
     let mut a_trust = TrustStore::new();
-    a_trust.trust(TrustedPeer::paired(b.node_id(), "peer", None, now_unix_ms()));
+    a_trust.trust(TrustedPeer::paired(
+        b.node_id(),
+        "peer",
+        None,
+        now_unix_ms(),
+    ));
     let mut b_trust = TrustStore::new();
-    b_trust.trust(TrustedPeer::paired(a.node_id(), "peer", None, now_unix_ms()));
+    b_trust.trust(TrustedPeer::paired(
+        a.node_id(),
+        "peer",
+        None,
+        now_unix_ms(),
+    ));
     (a_trust, b_trust)
 }
 
@@ -196,8 +206,9 @@ async fn a_transfer_round_trips_in_chunks() {
     let expected_payload = payload.clone();
     let receiver_sha = expected_sha.clone();
 
-    let (accept_result, dial_result) =
-        tokio::join!(listener.accept(), dial_clipboard(
+    let (accept_result, dial_result) = tokio::join!(
+        listener.accept(),
+        dial_clipboard(
             &client,
             &client_trust,
             server.node_id(),
@@ -205,7 +216,8 @@ async fn a_transfer_round_trips_in_chunks() {
             parent,
             channel_id,
             token,
-        ));
+        )
+    );
     let (mut server_conn, bind) = accept_result.expect("accept");
     let mut client_conn = dial_result.expect("dial");
 
@@ -239,8 +251,8 @@ async fn a_transfer_round_trips_in_chunks() {
             }
             other => panic!("unexpected message before Request: {other:?}"),
         }
-        let mut outgoing = Outgoing::new(offer_id, payload, 1 << 40, payload_len, 0)
-            .expect("outgoing");
+        let mut outgoing =
+            Outgoing::new(offer_id, payload, 1 << 40, payload_len, 0).expect("outgoing");
         let mut largest_chunk = 0usize;
         while let Some((message, _delay)) = outgoing.next(0) {
             if let ClipboardMessage::Data { data, .. } = &message {
@@ -253,8 +265,7 @@ async fn a_transfer_round_trips_in_chunks() {
     });
 
     let receiver = tokio::spawn(async move {
-        let mut assembler =
-            clipboard::Assembler::new(offer_id, payload_len).expect("assembler");
+        let mut assembler = clipboard::Assembler::new(offer_id, payload_len).expect("assembler");
         loop {
             match server_conn.recv().await.expect("clipboard recv") {
                 ClipboardMessage::Offer {
@@ -483,7 +494,9 @@ async fn the_first_frame_must_be_a_bind() {
     let (offer_sent, offer_seen) = tokio::sync::oneshot::channel();
 
     let bad = tokio::spawn(async move {
-        let tcp = tokio::net::TcpStream::connect(address).await.expect("connect");
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
         let mut stream = connector
             .connect(identity::server_name(address.ip()), tcp)
             .await
@@ -517,7 +530,10 @@ async fn the_first_frame_must_be_a_bind() {
         let (accept_result, bad_result, good_result) = tokio::join!(accept, bad, good);
         bad_result.expect("bad dialer task");
         let client_conn = good_result.expect("good dialer task");
-        (accept_result.expect("accept returns the Bind-first connection"), client_conn)
+        (
+            accept_result.expect("accept returns the Bind-first connection"),
+            client_conn,
+        )
     })
     .await
     .expect("accept() must skip the Offer-first connection and return the next one");
@@ -551,8 +567,22 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
     let (trust_a, trust_b) = paired(&identity_a, &identity_b);
 
     // A normal input/control mesh of two nodes.
-    let a = spawn_node("a", Arc::clone(&identity_a), address_a, &[(id_b, address_b)], &[address_b]).await;
-    let mut b = spawn_node("b", Arc::clone(&identity_b), address_b, &[(id_a, address_a)], &[address_a]).await;
+    let a = spawn_node(
+        "a",
+        Arc::clone(&identity_a),
+        address_a,
+        &[(id_b, address_b)],
+        &[address_b],
+    )
+    .await;
+    let mut b = spawn_node(
+        "b",
+        Arc::clone(&identity_b),
+        address_b,
+        &[(id_a, address_a)],
+        &[address_a],
+    )
+    .await;
     assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await, "a->b up");
     assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await, "b->a up");
 
@@ -571,22 +601,24 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
     let expected_sha = clipboard::sha256(&payload);
     let payload_len = payload.len() as u64;
 
-    let (accept_result, dial_result) = tokio::join!(listener.accept(), dial_clipboard(
-        &identity_b,
-        &trust_b,
-        id_a,
-        clipboard_address,
-        parent,
-        channel_id,
-        token,
-    ));
+    let (accept_result, dial_result) = tokio::join!(
+        listener.accept(),
+        dial_clipboard(
+            &identity_b,
+            &trust_b,
+            id_a,
+            clipboard_address,
+            parent,
+            channel_id,
+            token,
+        )
+    );
     let (mut server_conn, _bind) = accept_result.expect("accept");
     let mut client_conn = dial_result.expect("dial");
 
     // The receiver: assemble 1 MiB while the sender paces it.
     let receiver = tokio::spawn(async move {
-        let mut assembler =
-            clipboard::Assembler::new(offer_id, payload_len).expect("assembler");
+        let mut assembler = clipboard::Assembler::new(offer_id, payload_len).expect("assembler");
         loop {
             match server_conn.recv().await.expect("clipboard recv") {
                 ClipboardMessage::Data {
@@ -667,7 +699,11 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
     );
 
     let received = receiver.await.expect("receiver task");
-    assert_eq!(received.len() as u64, payload_len, "the whole payload arrives");
+    assert_eq!(
+        received.len() as u64,
+        payload_len,
+        "the whole payload arrives"
+    );
     assert_eq!(clipboard::sha256(received.as_bytes()), expected_sha);
     let transfer_time = sender.await.expect("sender task");
     assert!(

@@ -248,12 +248,11 @@ impl Node {
 
     /// Where the dry agent mirrors its clipboard (`--dry-clipboard-dir`).
     ///
-    /// Core owns the directory beside the launch token, so it moves with the rest of the
-    /// node's private state: `run/` on Linux, `state/` on Windows (`config::Paths`, which
-    /// `--root` fills in).
+    /// Core owns the directory beside the launch token, and `--root DIR` puts the runtime
+    /// directory under it (`config::Paths`: `run/`), so this is where the files are for every
+    /// node the harness starts — on Windows as well, where `runtime_dir` is otherwise absent.
     pub fn dry_clipboard_dir(&self) -> PathBuf {
-        let private = if cfg!(windows) { "state" } else { "run" };
-        self.root.join(private).join("clipboard-dry")
+        self.root.join("run").join("clipboard-dry")
     }
 
     /// Writes text into the dry clipboard's `in.txt`, which the agent reads as a **local user

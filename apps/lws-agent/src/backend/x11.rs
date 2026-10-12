@@ -19,7 +19,7 @@ use input_model::{CaptureKind, HidKey, InputEvent, MouseButton};
 use platform_x11::capture::{CapturedEvent, X11Capture};
 use platform_x11::inject::X11Injector;
 
-use crate::backend::{Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
+use crate::backend::{ClipboardChange, Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
 use crate::takeover::Detector;
 use input_model::RepeatFilter;
 
@@ -39,11 +39,27 @@ pub struct X11 {
     /// Source-side autorepeat filter. X11's `raw KeyPress` carries `XIKeyRepeat`, but
     /// `platform_x11::capture` does not expose it, so the pressed-set rule decides here too.
     repeats: RepeatFilter,
+    /// The local clipboard: this backend's own X connection to the CLIPBOARD selection.
+    /// `None` when it could not be established, in which case this backend has no clipboard
+    /// and says so.
+    ///
+    /// # Echo suppression (KVM-041)
+    ///
+    /// A selection owner has no sequence number to compare, so the mechanism is the text
+    /// itself: the payload this backend last put on CLIPBOARD is remembered in `applied_text`,
+    /// and an observed value equal to it is the echo of our own `set` rather than a user's
+    /// copy. (X11 cannot do better without owning a second selection: the `SelectionNotify`
+    /// for our own ownership carries no identity beyond the content.)
+    clipboard: Option<platform_x11::clipboard::Clipboard>,
+    /// The text this backend last applied from core.
+    applied_text: Option<String>,
 }
 
 impl X11 {
-    /// Builds the X11 backend. Both X connections are opened lazily, so a source
-    /// that never injects and a receiver that never captures each pay for one.
+    /// Builds the X11 backend. The capture and injection connections are opened lazily, so a
+    /// source that never injects and a receiver that never captures each pay for one; the
+    /// clipboard's connection is opened here because the capability reported in `AgentReady`
+    /// has to be the truth about what this session will do (ADR-008).
     ///
     /// `emergency_hotkey` is only checked, not honoured: the X11 spike recognises a
     /// fixed F12 keycode (`platform_x11::EMERGENCY_F12_X11_KEYCODE`) and never took
@@ -62,18 +78,105 @@ impl X11 {
                  emergency hotkey is not used by this backend (KVM-013)"
             );
         }
+        // Losing the clipboard connection costs the clipboard and nothing else, so it is
+        // reported in the capability rather than refused.
+        let clipboard = match platform_x11::clipboard::Clipboard::connect() {
+            Ok(clipboard) => Some(clipboard),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "no X connection for the CLIPBOARD selection: this session will not do \
+                     the clipboard"
+                );
+                None
+            }
+        };
+        let mut ready = ready.clone();
+        ready.set_text_clipboard(clipboard.is_some());
         Ok(X11 {
-            ready: ready.clone(),
+            ready,
             capture: None,
             injector: None,
             detector: None,
             plan,
             repeats: RepeatFilter::new(),
+            clipboard,
+            applied_text: None,
         })
     }
 
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    /// Whether this backend owns a connection to the CLIPBOARD selection.
+    pub fn clipboard_available(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// The next clipboard change the *user* made, if the selection informed us of one.
+    ///
+    /// Non-blocking on purpose: the session polls this from its own tick, and its watchdog and
+    /// deadline live on that tick too.
+    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+        let clipboard = self.clipboard.as_ref()?;
+        clipboard.wait(Duration::ZERO)?;
+        let snapshot = match clipboard.read() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "the CLIPBOARD selection could not be read");
+                return None;
+            }
+        };
+        if !snapshot.has_text {
+            tracing::debug!("the CLIPBOARD selection holds no text");
+            return None;
+        }
+        if self.applied_text.as_deref() == Some(snapshot.text.as_str()) {
+            // The text this node itself put there. Cleared after one sighting: a *later* copy
+            // of the same text by the user is then reported, which is the safe direction.
+            self.applied_text = None;
+            tracing::debug!(
+                bytes = snapshot.text.len(),
+                "swallowing the CLIPBOARD selection this node applied"
+            );
+            return None;
+        }
+        tracing::info!(
+            bytes = snapshot.text.len(),
+            markers = snapshot.markers.len(),
+            "local clipboard change"
+        );
+        Some(ClipboardChange {
+            text: snapshot.text,
+            markers: snapshot.markers,
+        })
+    }
+
+    /// Owns the CLIPBOARD selection: `Some` puts `text` on it, `None` gives up the payload.
+    ///
+    /// The adapter has no "release the selection" call in this build (ICCCM release and
+    /// `SelectionClear` handling are not wired), so a release puts the empty string on the
+    /// selection: the previous payload stops being pastable, which is what the command is for.
+    pub fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Err("CLIPBOARD_DISABLED: this session has no CLIPBOARD selection".to_owned());
+        };
+        let text = text.unwrap_or("");
+        clipboard
+            .set(text)
+            .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: CLIPBOARD was not taken: {error}"))?;
+        self.applied_text = if text.is_empty() {
+            None
+        } else {
+            Some(text.to_owned())
+        };
+        tracing::info!(
+            bytes = text.len(),
+            released = text.is_empty(),
+            "CLIPBOARD selection set"
+        );
+        Ok(())
     }
 
     pub fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {

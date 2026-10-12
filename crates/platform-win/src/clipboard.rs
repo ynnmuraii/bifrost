@@ -48,6 +48,14 @@ impl Snapshot {
     }
 }
 
+/// `CF_UNICODETEXT` text as the clipboard block wants it: UTF-16 code units, NUL-terminated.
+///
+/// Pure and host-independent, so the encoding is unit-tested on any host: the only FFI part
+/// of [`Clipboard::set`] is the allocation the units are copied into.
+pub fn to_utf16(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// Classifies the *names* of the registered formats an item carries.
 ///
 /// Pure, so the mapping is unit-testable without a clipboard: the adapter passes the
@@ -69,7 +77,7 @@ pub fn classify_names(names: &[&str], history_allowed_zero: bool) -> Vec<Marker>
 }
 
 #[cfg(windows)]
-pub use windows_impl::{Clipboard, ClipboardError, Change};
+pub use windows_impl::{Change, Clipboard, ClipboardError};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -82,14 +90,14 @@ mod windows_impl {
     use std::thread::JoinHandle;
 
     use windows::core::w;
-    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::Foundation::GlobalFree;
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
     use windows::Win32::System::DataExchange::{
-        AddClipboardFormatListener, CloseClipboard, EnumClipboardFormats, GetClipboardData,
-        GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
-        RegisterClipboardFormatW, RemoveClipboardFormatListener,
+        AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
+        GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+        RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
     };
-    use windows::Win32::Foundation::HGLOBAL;
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -190,6 +198,25 @@ mod windows_impl {
         /// Reads the current text and its secret markers.
         pub fn read(&self) -> Result<Snapshot, ClipboardError> {
             read_clipboard()
+        }
+
+        /// Takes ownership of the clipboard and puts `text` on it as `CF_UNICODETEXT`.
+        ///
+        /// `&self` is enough: the write is a sequence of Win32 calls a thread makes on its
+        /// own, and this struct owns no per-write state — the listener's message loop is
+        /// unaffected (`WM_CLIPBOARDUPDATE` is what announces this write to everyone else,
+        /// including this process; recognising it as our own is the caller's job, see
+        /// `Clipboard::sequence`).
+        pub fn set(&self, text: &str) -> Result<(), ClipboardError> {
+            write_clipboard(Some(text))
+        }
+
+        /// Empties the clipboard, giving up the selection.
+        ///
+        /// The result is an open, empty clipboard: `CF_UNICODETEXT` is gone, so a paste
+        /// finds nothing, and the update counter still moves.
+        pub fn clear(&self) -> Result<(), ClipboardError> {
+            write_clipboard(None)
         }
     }
 
@@ -317,20 +344,7 @@ mod windows_impl {
     /// Reads the clipboard: text, the registered marker formats, and the sequence number.
     pub fn read_clipboard() -> Result<Snapshot, ClipboardError> {
         let sequence = unsafe { GetClipboardSequenceNumber() };
-        // Another process may hold the clipboard for a moment; retry briefly rather than
-        // reporting a busy clipboard as "nothing changed".
-        let mut opened = false;
-        for _ in 0..10 {
-            // SAFETY: a null owner means "this thread"; the handle is closed below.
-            if unsafe { OpenClipboard(None) }.is_ok() {
-                opened = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if !opened {
-            return Err(ClipboardError::Busy);
-        }
+        open_clipboard()?;
         let result = read_open_clipboard(sequence);
         // SAFETY: the clipboard was opened above, on this thread.
         unsafe {
@@ -339,11 +353,80 @@ mod windows_impl {
         result
     }
 
+    /// Opens the clipboard on this thread, retrying briefly while another process holds it.
+    ///
+    /// The caller closes it: an open clipboard blocks every other process, so it is never
+    /// left open across an operation that can fail.
+    fn open_clipboard() -> Result<(), ClipboardError> {
+        for _ in 0..10 {
+            // SAFETY: a null owner means "this thread"; the handle is closed by the caller.
+            if unsafe { OpenClipboard(None) }.is_ok() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Err(ClipboardError::Busy)
+    }
+
+    /// Replaces the clipboard contents with `text`, or empties it for `None`.
+    fn write_clipboard(text: Option<&str>) -> Result<(), ClipboardError> {
+        open_clipboard()?;
+        let result = write_open_clipboard(text);
+        // SAFETY: the clipboard was opened above, on this thread.
+        unsafe {
+            let _ = CloseClipboard();
+        }
+        result
+    }
+
+    /// The body of [`write_clipboard`], with the clipboard already open.
+    fn write_open_clipboard(text: Option<&str>) -> Result<(), ClipboardError> {
+        // SAFETY: the clipboard is open on this thread.
+        unsafe { EmptyClipboard() }.map_err(|_| ClipboardError::Gone)?;
+        let Some(text) = text else {
+            return Ok(());
+        };
+
+        let units = super::to_utf16(text);
+        let bytes = std::mem::size_of_val(units.as_slice());
+        // SAFETY: a movable block of `bytes`, uninitialised by contract; it is freed on
+        // every path below unless the clipboard takes ownership of it.
+        let block =
+            unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }.map_err(|_| ClipboardError::Gone)?;
+        // SAFETY: the block was just allocated and is not owned by anyone else.
+        let pointer = unsafe { GlobalLock(block) };
+        if pointer.is_null() {
+            // SAFETY: this thread still owns the block.
+            unsafe {
+                let _ = GlobalFree(Some(block));
+            }
+            return Err(ClipboardError::Gone);
+        }
+        // SAFETY: the block is `bytes` long, which is exactly the encoded text, and a
+        // locked block may be written.
+        unsafe {
+            std::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, pointer as *mut u8, bytes);
+            let _ = GlobalUnlock(block);
+        }
+        // SAFETY: the clipboard is open and the block is unlocked; on success the clipboard
+        // owns it and must not be freed here.
+        let taken = unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(block.0))) };
+        if taken.is_err() {
+            // SAFETY: the clipboard refused the block, so this thread still owns it.
+            unsafe {
+                let _ = GlobalFree(Some(block));
+            }
+            return Err(ClipboardError::Gone);
+        }
+        Ok(())
+    }
+
+    /// `CF_UNICODETEXT` is the documented predefined format number 13; the bindings'
+    /// constant lives behind a feature this crate does not need for anything else.
+    const CF_UNICODETEXT: u32 = 13;
+
     /// The body of [`read_clipboard`], with the clipboard already open.
     fn read_open_clipboard(sequence: u32) -> Result<Snapshot, ClipboardError> {
-        // `CF_UNICODETEXT` is the documented predefined format number 13; the bindings'
-        // constant lives behind a feature this crate does not need for anything else.
-        const CF_UNICODETEXT: u32 = 13;
         let text_format = CF_UNICODETEXT;
         // SAFETY: the clipboard is open on this thread.
         let has_text = unsafe { IsClipboardFormatAvailable(text_format) }.is_ok();
@@ -481,6 +564,27 @@ mod tests {
         );
         // An unrelated format never becomes a marker.
         assert!(classify_names(&["PNG", "HTML Format"], false).is_empty());
+    }
+
+    #[test]
+    fn the_encoded_text_is_nul_terminated_utf16() {
+        assert_eq!(to_utf16(""), vec![0]);
+        assert_eq!(to_utf16("A"), vec![0x0041, 0]);
+        // Six Cyrillic letters are six code units plus the terminator.
+        assert_eq!(
+            to_utf16("привет"),
+            vec![0x043F, 0x0440, 0x0438, 0x0432, 0x0435, 0x0442, 0]
+        );
+        // Outside the BMP the encoding is a surrogate pair, and there is still one NUL.
+        let crab = to_utf16("🦀");
+        assert_eq!(crab.len(), 3);
+        assert_eq!(crab.last(), Some(&0));
+        assert!(
+            crab[0] != 0 && crab[1] != 0,
+            "a surrogate pair, not the terminator"
+        );
+        // A text that already contains a NUL keeps it and gains no other terminator.
+        assert_eq!(to_utf16("a\u{0}"), vec![0x0061, 0, 0]);
     }
 
     #[test]

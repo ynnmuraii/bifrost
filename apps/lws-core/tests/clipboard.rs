@@ -1,0 +1,289 @@
+//! The clipboard end to end, on the real processes the harness starts.
+//!
+//! ADR-008 (`docs/04-decisions.md`), `docs/05-protocol.md` («Clipboard канал») and the
+//! acceptance criteria this file pins:
+//!
+//! * **AC-28** — a copy on one node reaches every other member, once each;
+//! * **AC-09** — the payload limit is exactly 1 MiB, and one byte more is refused without
+//!   anything being applied;
+//! * **AC-15** — content a password manager marked is not sent;
+//! * **KVM-042** — «объём clipboard не блокирует key-up»: the clipboard has a channel of its
+//!   own, and an input transition during a transfer is not delayed by it.
+//!
+//! # How the runner drives the OS layer
+//!
+//! A CI machine has no clipboard worth the name, so the agent runs `--dry-inject` and core
+//! hands it a directory of files (`--dry-clipboard-dir`). Writing `in.txt` **is** a local user
+//! copy, and `out.txt` is what that node's clipboard holds afterwards. The harness never fakes
+//! the agent or core: the copy travels agent → IPC → core → TLS → core → IPC → agent, and the
+//! only thing missing is the OS selection at either end.
+//!
+//! Every test takes `common::serial()`: the nodes bind fixed loopback ports and start real
+//! processes, so the suite runs one scenario at a time (the same rule the other suites follow).
+//!
+//! # Why every test here is `#[ignore]`d
+//!
+//! `docs/05-protocol.md` gives the clipboard a *well-known* port (47902), so a node reaches a
+//! peer at `port_clipboard` on **the peer's** address. `common` gives every node its own
+//! loopback port instead — one address, one random port per node — which works for the input
+//! link (whose addresses travel in the trust records) but not for the clipboard: the dialer
+//! would have to know the peer's port, and nothing in the protocol carries it.
+//!
+//! The fix is in `common`: give each node its own loopback address (`127.0.0.1`, `127.0.0.2`,
+//! `127.0.0.3`) and one shared `port_clipboard`, and let `Proxy` take addresses rather than
+//! ports (`Cluster::prepare`, `Harness::start_with`, `pair`, `tunnel`). That change reaches
+//! `three_nodes.rs`, so it needs its own run of the existing suites; until it is made and
+//! verified, these seven scenarios are written but not executed, and the ignore reason names
+//! the blocker so it cannot be mistaken for a flaky test.
+
+mod common;
+
+use std::time::Duration;
+
+use common::{enable_clipboard, write_clipboard_rate, Cluster, Harness};
+
+/// How long a copy may take to settle. The default rate is 256 KiB/s, so a 1 MiB payload
+/// legitimately needs about four seconds on top of the round trip.
+const SETTLE: Duration = Duration::from_secs(60);
+
+/// Two nodes, both with the clipboard enabled and linked.
+fn two_nodes_with_clipboard() -> Harness {
+    let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
+        enable_clipboard(a_root);
+        enable_clipboard(b_root);
+    });
+    harness.wait_linked();
+    harness
+}
+
+/// Distinct payloads, so a later assertion cannot pass on an earlier copy.
+fn payload(tag: &str, len: usize) -> String {
+    let mut text = format!("lws-{tag}-{}-", std::process::id());
+    while text.len() < len {
+        text.push_str(tag);
+    }
+    text.truncate(len);
+    text
+}
+
+#[test]
+#[ignore = "needs the harness change described in the module docs: every node must listen on its own loopback address and share one clipboard port, or the peers cannot be reached at `port_clipboard`"]
+fn a_copy_on_one_node_arrives_on_the_other() {
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+    let text = payload("two-nodes", 64);
+
+    harness.a.copy_to_clipboard(&text);
+    harness
+        .a
+        .wait_for_clipboard(&text, SETTLE)
+        .expect("the node that copied holds its own text");
+    harness
+        .b
+        .wait_for_clipboard(&text, SETTLE)
+        .expect("B applies what A copied");
+    assert!(
+        harness.b.log().contains("clipboard payload applied"),
+        "B must have verified and applied a payload, not merely stored it"
+    );
+}
+
+#[test]
+#[ignore = "needs the harness change described in the module docs: every node must listen on its own loopback address and share one clipboard port, or the peers cannot be reached at `port_clipboard`"]
+fn a_copy_reaches_every_other_member_once() {
+    // AC-28's shape: A copies, B and C each end up with it, and neither of them re-offers it.
+    let _serial = common::serial();
+    let (cluster, ()) = Cluster::start_with("clipboard-fanout", |roots, _, _| {
+        for root in roots {
+            enable_clipboard(root);
+        }
+    });
+    cluster.wait_mesh(Duration::from_secs(40));
+
+    let text = payload("three-nodes", 96);
+    cluster.node(0).copy_to_clipboard(&text);
+    for index in [1usize, 2] {
+        cluster
+            .node(index)
+            .wait_for_clipboard(&text, SETTLE)
+            .unwrap_or_else(|error| panic!("node {index} never got the copy: {error}"));
+    }
+    for index in [1usize, 2] {
+        assert_eq!(
+            cluster.node(index).log().matches("clipboard offer").count(),
+            0,
+            "node {index} applied a peer's payload: it must not mint an offer of its own"
+        );
+    }
+    assert_eq!(
+        cluster.node(0).log().matches("clipboard offer").count(),
+        1,
+        "the node that copied offers exactly once, whatever the member count"
+    );
+}
+
+#[test]
+#[ignore = "needs the harness change described in the module docs: every node must listen on its own loopback address and share one clipboard port, or the peers cannot be reached at `port_clipboard`"]
+fn one_mebibyte_travels_and_one_byte_more_is_refused() {
+    // AC-09: the limit is exactly 1 MiB. The larger copy must produce `CLIPBOARD_TOO_LARGE`
+    // *and* change nothing on the other side.
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+
+    let allowed = payload("mib", 1024 * 1024);
+    harness.a.copy_to_clipboard(&allowed);
+    harness
+        .b
+        .wait_for_clipboard(&allowed, SETTLE)
+        .expect("exactly 1 MiB must travel");
+
+    let refused = payload("over", 1024 * 1024 + 1);
+    harness.a.copy_to_clipboard(&refused);
+    // Give the refused copy every chance to arrive (and to be wrongly applied).
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        harness.b.clipboard_text().as_deref(),
+        Some(allowed.as_str()),
+        "a payload over the limit must not be applied"
+    );
+    assert!(
+        harness.a.log().contains("CLIPBOARD_TOO_LARGE"),
+        "the refusal has to be reported with the documented code"
+    );
+}
+
+#[test]
+#[ignore = "needs the harness change described in the module docs: every node must listen on its own loopback address and share one clipboard port, or the peers cannot be reached at `port_clipboard`"]
+fn a_node_that_did_not_enable_the_clipboard_is_never_offered_anything() {
+    // «явное включение на обеих сторонах»: B does not claim the capability, so A's copy stays
+    // on A and the refusal is `CLIPBOARD_DISABLED`.
+    let _serial = common::serial();
+    let (harness, ()) = Harness::start_with(false, false, |a_root, _b_root| {
+        enable_clipboard(a_root);
+    });
+    harness.wait_linked();
+
+    let text = payload("disabled", 48);
+    harness.a.copy_to_clipboard(&text);
+    harness
+        .a
+        .wait_for_clipboard(&text, SETTLE)
+        .expect("A still holds its own copy");
+    std::thread::sleep(Duration::from_secs(2));
+
+    assert!(
+        harness.a.log().contains("CLIPBOARD_DISABLED"),
+        "A must refuse to offer to a peer that did not claim the capability"
+    );
+    assert_eq!(
+        harness.b.clipboard_text(),
+        None,
+        "a node with the clipboard off must never receive a payload"
+    );
+}
+
+#[test]
+#[ignore = "needs the harness change described in the module docs: every node must listen on its own loopback address and share one clipboard port, or the peers cannot be reached at `port_clipboard`"]
+fn a_marked_secret_is_not_sent() {
+    // AC-15: a copy a password manager marked as a secret never leaves the machine.
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+
+    let secret = payload("secret", 40);
+    harness.a.copy_to_clipboard_marked(&secret, &["kde_secret"]);
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert!(
+        harness.a.log().contains("CLIPBOARD_SECRET"),
+        "the skip has to be reported with the documented code"
+    );
+    assert_eq!(
+        harness.b.clipboard_text(),
+        None,
+        "a secret-marked copy must not reach the peer"
+    );
+
+    // The very same text without the marker does travel, which is what makes the assertion
+    // above about the marker and not about the payload.
+    harness.a.copy_to_clipboard(&secret);
+    harness
+        .b
+        .wait_for_clipboard(&secret, SETTLE)
+        .expect("the unmarked copy travels");
+    assert!(
+        harness.b.log().contains("clipboard payload applied"),
+        "B applies the unmarked copy"
+    );
+}
+
+#[test]
+#[ignore = "needs the harness change described in the module docs: every node must listen on its own loopback address and share one clipboard port, or the peers cannot be reached at `port_clipboard`"]
+fn a_received_copy_is_never_offered_back() {
+    // The echo rule: B applies A's payload and mints no version of its own, so the fan-out
+    // settles instead of bouncing. Counted rather than timed: an offer is logged once per
+    // local copy, so a loop would show up as extra offers on both nodes.
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+
+    let text = payload("echo", 80);
+    harness.a.copy_to_clipboard(&text);
+    harness
+        .b
+        .wait_for_clipboard(&text, SETTLE)
+        .expect("B applies");
+    let offers_on_a = harness.a.log().matches("clipboard offer").count();
+    let offers_on_b = harness.b.log().matches("clipboard offer").count();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        harness.a.log().matches("clipboard offer").count(),
+        offers_on_a,
+        "the version counter must stop moving once the copy has been applied"
+    );
+    assert_eq!(
+        harness.b.log().matches("clipboard offer").count(),
+        offers_on_b,
+        "B must not offer what it received"
+    );
+    assert_eq!(offers_on_b, 0, "B copied nothing locally");
+    assert_eq!(offers_on_a, 1, "A copied once");
+}
+
+#[test]
+#[ignore = "needs the harness change described in the module docs: every node must listen on its own loopback address and share one clipboard port, or the peers cannot be reached at `port_clipboard`"]
+fn a_transition_during_a_mebibyte_transfer_is_not_delayed() {
+    // KVM-042. The clipboard is paced at 64 KiB/s, so a 256 KiB payload occupies its channel
+    // for about four seconds — far longer than a transition may ever take. The transition runs
+    // on the input link, which shares no socket, queue or task with the clipboard.
+    let _serial = common::serial();
+    let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
+        write_clipboard_rate(a_root, 64 * 1024);
+        write_clipboard_rate(b_root, 64 * 1024);
+    });
+    harness.wait_linked();
+
+    let text = payload("kvm042", 256 * 1024);
+    harness.a.copy_to_clipboard(&text);
+    // Wait until the transfer is really underway: the peer logs the offer it is answering.
+    let deadline = std::time::Instant::now() + SETTLE;
+    while !harness.b.log().contains("clipboard offer") && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        harness.b.log().contains("clipboard offer"),
+        "the offer never reached B, so this test measured nothing"
+    );
+
+    let started = std::time::Instant::now();
+    harness.cycle();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a transition took {elapsed:?} while a 4 s clipboard transfer was running: the clipboard \
+         is delaying the input link (KVM-042)"
+    );
+
+    harness
+        .b
+        .wait_for_clipboard(&text, SETTLE)
+        .expect("the paced transfer still completes after the transition");
+}

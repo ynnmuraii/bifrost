@@ -115,3 +115,46 @@ try {
     // 3. Clean up: leave plain text behind, never the marked item.
     powershell("Set-Clipboard -Value 'lws-clipboard-smoke done'");
 }
+
+/// The writer half of the adapter: text this process puts on the clipboard is exactly what
+/// the next reader sees, the change counter moves (which is the only signal the agent's echo
+/// suppression has on Windows), and clearing leaves no text at all.
+///
+/// Ignored for the same reason as the test above: it is the clipboard of whoever runs it.
+#[test]
+#[ignore = "overwrites the clipboard of whoever runs it"]
+fn a_written_text_round_trips_and_clearing_removes_it() {
+    let listener = Clipboard::listen().expect("the listener window");
+
+    // Non-ASCII and non-BMP, so the UTF-16 encoding is exercised for real (a Cyrillic
+    // letter is one code unit, the crab is a surrogate pair).
+    let text = format!(
+        "lws-clipboard-write-{}\u{4F60}\u{597D}\u{1F980}",
+        std::process::id()
+    );
+    let before = listener.sequence();
+    listener
+        .set(&text)
+        .expect("the text is put on the clipboard");
+    let after = listener.sequence();
+    assert!(
+        after != before,
+        "SetClipboardData moves the change counter: {after} == {before}"
+    );
+
+    let snapshot = listener.read().expect("reading what was written");
+    assert!(snapshot.has_text, "CF_UNICODETEXT is present");
+    assert_eq!(snapshot.text, text, "the text round-trips byte for byte");
+    assert!(snapshot.markers.is_empty(), "plain text carries no marker");
+    println!("set: read {:?} back at sequence {after}", snapshot.text);
+
+    // And clearing removes it: no text, and the counter moved again.
+    listener.clear().expect("the clipboard is emptied");
+    let snapshot = listener.read().expect("reading the emptied clipboard");
+    assert!(!snapshot.has_text, "nothing to paste after clear()");
+    assert_eq!(snapshot.text, "");
+    assert!(
+        listener.sequence() != after,
+        "EmptyClipboard moves the change counter too"
+    );
+}

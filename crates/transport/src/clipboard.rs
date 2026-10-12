@@ -479,7 +479,13 @@ pub struct ClipboardConnection {
 impl ClipboardConnection {
     /// Sends one message, stamping the envelope `seq` and `connection_id`.
     pub async fn send(&mut self, message: ClipboardMessage) -> Result<(), TransportError> {
-        send_message(&mut self.stream, &self.connection_id, &mut self.out_seq, message).await
+        send_message(
+            &mut self.stream,
+            &self.connection_id,
+            &mut self.out_seq,
+            message,
+        )
+        .await
     }
 
     /// Receives one message, checking the version, the parent `connection_id`, the strictly
@@ -568,7 +574,13 @@ pub struct ClipboardWriter {
 impl ClipboardWriter {
     /// Sends one message; see [`ClipboardConnection::send`].
     pub async fn send(&mut self, message: ClipboardMessage) -> Result<(), TransportError> {
-        send_message(&mut self.stream, &self.connection_id, &mut self.out_seq, message).await
+        send_message(
+            &mut self.stream,
+            &self.connection_id,
+            &mut self.out_seq,
+            message,
+        )
+        .await
     }
 }
 
@@ -682,7 +694,9 @@ pub async fn dial_clipboard(
     let config = identity::clipboard_client_config(identity, trust)?;
     let connector = TlsConnector::from(Arc::new(config));
     let tcp = TcpStream::connect(address).await?;
-    let stream = connector.connect(identity::server_name(address.ip()), tcp).await?;
+    let stream = connector
+        .connect(identity::server_name(address.ip()), tcp)
+        .await?;
     if stream.get_ref().1.alpn_protocol() != Some(limits::ALPN_CLIPBOARD.as_bytes()) {
         return Err(TransportError::Protocol(
             "the peer did not negotiate lan-workspace/clipboard/1".into(),
@@ -759,7 +773,9 @@ impl ClipboardListener {
     ///
     /// A handshake on another ALPN, an unpinned peer, a `Bind`-less first frame or a frame
     /// that fails validation drops the connection; the loop keeps waiting.
-    pub async fn accept(&mut self) -> Result<(ClipboardConnection, ClipboardMessage), TransportError> {
+    pub async fn accept(
+        &mut self,
+    ) -> Result<(ClipboardConnection, ClipboardMessage), TransportError> {
         loop {
             let (tcp, _address) = self.listener.accept().await?;
             let Ok(stream) = self.acceptor.accept(tcp).await else {
