@@ -729,9 +729,13 @@ impl Harness {
     /// Pairs two fresh roots and runs them.
     ///
     /// `proxied` puts the link through a [`Proxy`]; `dry_motion` starts the source with
-    /// the synthetic edge walk and writes the `[topology]` document it needs.
+    /// the synthetic edge walk and display, and writes the `[topology]` document it needs.
     pub fn start(proxied: bool, dry_motion: bool) -> Harness {
         Harness::start_with(proxied, dry_motion, |_, _| ()).0
+    }
+    /// Starts two dry agents with synthetic displays for topology-sharing tests.
+    pub fn start_with_displays() -> Harness {
+        Harness::start_with_options(false, false, true, |_, _| ()).0
     }
 
     /// The same, with a hook that runs once both roots are paired and the topology is
@@ -743,6 +747,15 @@ impl Harness {
     pub fn start_with<T>(
         proxied: bool,
         dry_motion: bool,
+        before_run: impl FnOnce(&PathBuf, &PathBuf) -> T,
+    ) -> (Harness, T) {
+        Harness::start_with_options(proxied, dry_motion, dry_motion, before_run)
+    }
+
+    fn start_with_options<T>(
+        proxied: bool,
+        dry_motion: bool,
+        dry_displays: bool,
         before_run: impl FnOnce(&PathBuf, &PathBuf) -> T,
     ) -> (Harness, T) {
         let dir = unique_dir("fault-injection");
@@ -792,8 +805,8 @@ impl Harness {
         }
         let attached = before_run(&a_root, &b_root);
 
-        let a = spawn_node(a_root, a_id, dry_motion, "a");
-        let b = spawn_node(b_root, b_id, dry_motion, "b");
+        let a = spawn_node(a_root, a_id, dry_motion, dry_displays, "a");
+        let b = spawn_node(b_root, b_id, dry_motion, dry_displays, "b");
         (Harness { dir, a, b, proxy }, attached)
     }
 
@@ -1245,7 +1258,13 @@ fn peers(root: &Path) -> String {
 }
 
 /// Starts one core with its log beside the root.
-fn spawn_node(root: PathBuf, id: String, dry_motion: bool, label: &str) -> Node {
+fn spawn_node(
+    root: PathBuf,
+    id: String,
+    dry_motion: bool,
+    dry_displays: bool,
+    label: &str,
+) -> Node {
     let log = root.join(format!("{label}.log"));
     let file = std::fs::File::create(&log).expect("log file");
     let err = file.try_clone().expect("log file");
@@ -1260,6 +1279,9 @@ fn spawn_node(root: PathBuf, id: String, dry_motion: bool, label: &str) -> Node 
         .stderr(Stdio::from(err));
     if dry_motion && label == "a" {
         command.arg("--dry-motion");
+    }
+    if dry_displays {
+        command.arg("--dry-displays");
     }
     let child = command.spawn().expect("the core starts");
     let pid = child.id();
@@ -1309,6 +1331,7 @@ impl Cluster {
                 spawn_node(
                     roots[index].clone(),
                     ids[index].clone(),
+                    false,
                     false,
                     ["w", "a", "b"][index],
                 )
@@ -1487,8 +1510,8 @@ impl Unpaired {
         write_config(&b_root, b_port, free_port(), "right", true, false);
         let a_id = peers(&a_root);
         let b_id = peers(&b_root);
-        let a = spawn_node(a_root, a_id.clone(), false, "a");
-        let b = spawn_node(b_root, b_id.clone(), false, "b");
+        let a = spawn_node(a_root, a_id.clone(), false, false, "a");
+        let b = spawn_node(b_root, b_id.clone(), false, false, "b");
         Unpaired {
             dir,
             a,

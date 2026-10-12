@@ -7,7 +7,7 @@
 //! lws-core [--root DIR] [--config-dir DIR] [--data-dir DIR] [--state-dir DIR]
 //!          [--runtime-dir DIR] <command>
 //!
-//!   run      [--dry-inject] [--dry-input-events N] [--agent PATH]
+//!   run      [--dry-inject] [--dry-displays] [--dry-input-events N] [--agent PATH]
 //!            [--listen IP] [--port-input N] [--port-clipboard N]
 //!   pair     (--open [--listen IP:PORT] | --dial IP:PORT)
 //!   peers    [--revoke NODE_ID]
@@ -502,6 +502,7 @@ async fn run_async(
         options.dry_inject,
         options.dry_input_events,
         options.dry_motion,
+        options.dry_displays,
         config.input.emergency_hotkey.clone(),
         backend_kind(&config),
         config.input.require_emergency_hotkey,
@@ -565,6 +566,8 @@ struct RunOptions {
     /// With `--dry-inject`: also walk the synthetic pointer over the right edge, so the
     /// edge-triggered transition can be exercised without a human at the keyboard.
     dry_motion: bool,
+    /// With `--dry-inject`: report one synthetic monitor to exercise topology sharing.
+    dry_displays: bool,
     agent: PathBuf,
     listen: Option<String>,
 }
@@ -574,6 +577,7 @@ impl RunOptions {
         let mut dry_inject = false;
         let mut dry_input_events = 0usize;
         let mut dry_motion = false;
+        let mut dry_displays = false;
         let mut agent = None;
         let mut listen = None;
         let mut index = 0;
@@ -586,6 +590,10 @@ impl RunOptions {
                 }
                 "--dry-motion" => {
                     dry_motion = true;
+                    index += 1;
+                }
+                "--dry-displays" => {
+                    dry_displays = true;
                     index += 1;
                 }
                 "--dry-input-events" => {
@@ -615,6 +623,11 @@ impl RunOptions {
                 other => return Err(Failure::Usage(format!("unknown run option {other:?}"))),
             }
         }
+        if dry_displays && !dry_inject {
+            return Err(Failure::Usage(
+                "--dry-displays requires --dry-inject".to_owned(),
+            ));
+        }
         let agent = match agent {
             Some(agent) => agent,
             None => agent::default_agent_program().map_err(Failure::Run)?,
@@ -623,6 +636,7 @@ impl RunOptions {
             dry_inject,
             dry_input_events,
             dry_motion,
+            dry_displays,
             agent,
             listen,
         })

@@ -207,11 +207,8 @@ fn the_gui_endpoint_answers_and_pushes_the_status() {
     let answer = window.request(gui_frame::Msg::GetTopology(protocol::ipc::GetTopology {}));
     match answer {
         gui_frame::Msg::TopologyDoc(doc) => {
-            // KNOWN GAP (reported): this harness configures no `[topology]` section and the dry
-            // agent reports no displays, so the assembled document is empty and this node's
-            // `TopologyDoc` is the empty shell below. What the contract promises either way is
-            // asserted here — the answer is a document, and every link it names is a member it
-            // also declares — which is the invariant the editor relies on before drawing.
+            // This harness's dry agents report no displays, so nodes can be present without
+            // any drawing geometry. Any links that are present must still name declared nodes.
             for link in &doc.links {
                 for endpoint in [link.from.as_ref(), link.to.as_ref()] {
                     let endpoint = endpoint.expect("a link has both endpoints");
@@ -237,6 +234,50 @@ fn the_gui_endpoint_answers_and_pushes_the_status() {
         pushed.members.len() == 1 || pushed.role == "owner",
         "the pushed status is this node's own: {pushed:?}"
     );
+}
+
+#[test]
+fn linked_cores_share_agent_displays_with_the_gui_without_a_layout() {
+    let _guard = common::serial();
+    let harness = Harness::start_with_displays();
+    harness.wait_linked();
+
+    for node in [&harness.a, &harness.b] {
+        let mut window = Window::open(&gui_endpoint_of(&node.root));
+        let has_both_manifests = |doc: &protocol::ipc::TopologyDoc| {
+            doc.members.len() == 2 && doc.members.iter().all(|member| member.displays.len() == 1)
+        };
+        let startup_doc = window.wait_event(
+            "the AgentReady display queries reached the GUI without a manual request",
+            |event| match event {
+                gui_frame::Msg::TopologyDoc(doc) if has_both_manifests(doc) => Some(doc.clone()),
+                _ => None,
+            },
+        );
+        let response = window.request(gui_frame::Msg::GetTopology(protocol::ipc::GetTopology {}));
+        let doc = match response {
+            gui_frame::Msg::TopologyDoc(doc) if has_both_manifests(&doc) => doc,
+            other => panic!("GetTopology did not return both display manifests: {other:?}"),
+        };
+        assert_eq!(startup_doc.members, doc.members);
+        let ids: Vec<_> = doc
+            .members
+            .iter()
+            .flat_map(|member| member.displays.iter().map(|display| display.id.as_str()))
+            .collect();
+        assert_eq!(ids, ["dry-0", "dry-0"]);
+        let log = std::fs::read_to_string(&node.log).expect("core log");
+        assert!(
+            log.contains("core -> agent") && log.contains("QueryDisplays"),
+            "the core must request the agent's display report on startup:\n{log}"
+        );
+        assert!(
+            doc.members
+                .iter()
+                .all(|member| !member.display_name.is_empty()),
+            "both members must have a name for the GUI: {doc:?}"
+        );
+    }
 }
 
 /// The ownership buttons: `AbandonOwnership` gives it up, `ClaimOwnership` takes it back.
