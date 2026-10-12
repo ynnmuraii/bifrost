@@ -224,7 +224,7 @@ fn chain_once(cluster: &Cluster) {
 fn assert_chain_properties(cluster: &Cluster, owner: &str) {
     let owners = cluster.owners();
     assert!(
-        owners.iter().all(|reported| reported == &owner),
+        owners.iter().all(|reported| reported == owner),
         "the owner must not change along the chain: {owners:?}"
     );
     assert!(

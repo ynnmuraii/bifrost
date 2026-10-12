@@ -1162,8 +1162,8 @@ impl Cluster {
             pair(&roots[first], &roots[second], ports[first], ports[second]);
         }
         let ids: Vec<String> = roots.iter().map(|root| peers(root)).collect();
-        for index in 0..3 {
-            write_line_topology(&roots[index], &ids, index);
+        for (index, root) in roots.iter().enumerate() {
+            write_line_topology(root, &ids, index);
         }
         (dir, roots, ports, ids)
     }
@@ -1259,12 +1259,10 @@ pub fn retarget_trust_peer(root: &Path, peer: &str, address: &str) {
             matching = false;
         } else if let Some(id) = line.strip_prefix("node_id = ") {
             matching = id.trim().trim_matches('"') == peer;
-        } else if line.starts_with("last_address") {
-            if matching {
-                out.push_str(&format!("last_address = \"{address}\"\n"));
-                replaced = true;
-                continue;
-            }
+        } else if matching && line.starts_with("last_address") {
+            out.push_str(&format!("last_address = \"{address}\"\n"));
+            replaced = true;
+            continue;
         }
         out.push_str(line);
         out.push('\n');
