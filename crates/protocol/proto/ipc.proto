@@ -28,6 +28,7 @@ message AgentFrame {
     AgentShutdown shutdown = 19;
     Ping ping = 20;
     ForgetPortalGrants forget_portal_grants = 21; // drop stored restore tokens, re-ask the user
+    StopRepeat stop_repeat = 22; // AC-14: `repeat_guard_ms` silent, stop repeating/let the keys up
 
     // agent -> core
     AgentReady ready = 40;
@@ -78,6 +79,17 @@ message AgentAttach {
                                            // core silence (IPC heartbeat = value / 4, see 03-architecture.md)
   TakeoverDetection takeover_detection = 8; // `[input].takeover_detection`; the agent owns the detector
   uint32 takeover_threshold_px = 9;        // `[input].takeover_threshold_px`: physical movement that ends a lease
+  RepeatMode repeat_mode = 10;             // `[input].repeat_mode`: which engine repeats a held key here
+}
+
+// `[input].repeat_mode`: which side repeats a held key. ADR-006: one engine only — the
+// source never sends OS-generated repeats (`agent`/capture filters them), so this chooses
+// what the receiver does with a held key the source is still holding.
+enum RepeatMode {
+  REPEAT_MODE_UNSPECIFIED = 0;
+  REPEAT_MODE_RECEIVER_NATIVE = 1;   // the OS repeats the held injected key (X11, Wayland)
+  REPEAT_MODE_RECEIVER_SOFTWARE = 2; // the agent repeats it at the OS rate (Windows: an
+                                     // injected key-down does not autorepeat, measured)
 }
 
 // `[input].takeover_detection`: how physical input on the receiver is seen. The agent
@@ -160,6 +172,13 @@ message DisplayInfo {
   uint32 rotation = 10; double scale = 11; bool primary = 12;
 }
 message LocalInputDetected { bytes lease_id = 1; }
+
+// `repeat_guard_ms` (150 ms) passed with no `InputBatch` and no `LeaseRenew`: the receiver
+// must stop repeating now (AC-14, `docs/03-architecture.md` «Autorepeat при обрыве связи»).
+// Software repeat stops its engine; native repeat lets the held keys up, which is the only
+// way to stop an OS/app repeat. The lease itself is not over — a late `LeaseRenew` may
+// follow.
+message StopRepeat { bytes lease_id = 1; }
 enum SessionEventKind {
   SESSION_EVENT_UNSPECIFIED = 0;
   SESSION_EVENT_SUSPEND = 1;

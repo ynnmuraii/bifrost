@@ -502,6 +502,26 @@ impl Backend {
         !self.ready().capabilities.is_empty()
     }
 
+    /// The OS autorepeat timing the software engine follows (KVM-036).
+    ///
+    /// Windows answers from `SystemParametersInfo`; X11 would need `XkbGetControls` and
+    /// reports the documented defaults (500 ms, 33/s) until that is wired — the guard's
+    /// budget is what matters for AC-14 and it does not depend on the rate being exact.
+    pub fn repeat_timing(&self) -> crate::repeat::RepeatTiming {
+        match self {
+            Backend::Dry(_) => crate::repeat::RepeatTiming::default(),
+            #[cfg(windows)]
+            Backend::Win(_) => {
+                let (delay, speed) = platform_win::inject::keyboard_timing();
+                crate::repeat::RepeatTiming::from_windows(delay, speed)
+            }
+            #[cfg(target_os = "linux")]
+            Backend::X11(_) => crate::repeat::RepeatTiming::default(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(_) => crate::repeat::RepeatTiming::default(),
+        }
+    }
+
     /// Starts (or re-arms) capture.
     pub async fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
         match self {

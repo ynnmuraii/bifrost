@@ -26,6 +26,7 @@ use platform_win::inject::Injector;
 
 use crate::backend::{Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
 use crate::takeover::Detector;
+use input_model::RepeatFilter;
 
 /// The Windows input path.
 pub struct Win {
@@ -42,6 +43,9 @@ pub struct Win {
     /// anything is queued (`platform-win`, «Injected-event loop prevention»).
     detector: Option<(Detector, Capture)>,
     plan: Option<TakeoverPlan>,
+    /// Source-side autorepeat filter: the OS repeats a held key for us, and those repeats
+    /// must not reach the wire (`docs/05-protocol.md`: the receiver repeats, not the source).
+    repeats: RepeatFilter,
 }
 
 impl Win {
@@ -67,6 +71,7 @@ impl Win {
             emergency,
             detector: None,
             plan,
+            repeats: RepeatFilter::new(),
         })
     }
 
@@ -103,6 +108,9 @@ impl Win {
         if self.capture.take().is_none() {
             tracing::debug!("EndCapture with no active capture");
         }
+        // The keys held now are released locally; their ups never reach this filter, and a
+        // stale pressed set would eat the next real press.
+        self.repeats.clear();
         self.disarm_detector();
         Ok(self.release_session())
     }
@@ -234,7 +242,15 @@ impl Win {
     pub async fn next_event(&mut self) -> Option<Event> {
         if let Some(capture) = &self.capture {
             match capture.try_recv() {
-                Some(CaptureEvent::Input(event)) => return Some(Event::Input(event)),
+                Some(CaptureEvent::Input(event)) => {
+                    // Windows has no per-event repeat flag: a down for a key already in the
+                    // pressed set is the OS repeating it. Dropped here, at capture.
+                    if self.repeats.is_repeat(&event, false) {
+                        tracing::trace!(?event, "dropping an OS autorepeat");
+                        return None;
+                    }
+                    return Some(Event::Input(event));
+                }
                 Some(CaptureEvent::Emergency) => return Some(Event::Emergency),
                 Some(CaptureEvent::QueueOverflow) => return Some(Event::QueueOverflow),
                 None => {}
@@ -402,6 +418,56 @@ mod tests {
     fn an_unknown_part_keeps_the_safe_default() {
         let combo = parse_emergency_hotkey("Ctrl+Alt+Shift+Hyper");
         assert_eq!(combo, EmergencyCombo::default());
+    }
+
+    /// Does Windows repeat a *held injected* key? (KVM-036 decides the receiver engine on it.)
+    ///
+    /// `docs/03-architecture.md`: «на X11 и Windows он останавливает собственный repeat engine»,
+    /// which assumes the OS repeats a held `SendInput` key. This test answers that with a
+    /// measurement instead of an assumption: an observe-only capture with
+    /// `capture_injected` on (the one place that flag is legitimate — it is not the agent's
+    /// capture path) counts the key-downs the OS itself produces for one injected `F24`
+    /// held down for 1.5 s. `F24` types nothing anywhere.
+    #[tokio::test]
+    #[ignore = "needs an interactive Windows desktop; holds F24 down for 1.5 s"]
+    async fn an_injected_key_does_or_does_not_autorepeat() {
+        let config = CaptureConfig {
+            mode: CaptureKind::Observe,
+            capture_injected: true,
+            ..CaptureConfig::default()
+        };
+        let capture = Capture::start(config).expect("a capture");
+        let mut injector = Injector::new();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let f24 = HidKey::keyboard(0x04); // 'a': a key the injector and the hook both map
+        let status = injector.inject(&[InputEvent::Key {
+            key: f24,
+            state: input_model::KeyState::Down,
+        }]);
+        println!("inject status: {status:?}");
+        let deadline = std::time::Instant::now() + Duration::from_millis(1000);
+        let mut downs = 0u32;
+        while std::time::Instant::now() < deadline {
+            if let Some(CaptureEvent::Input(InputEvent::Key {
+                key,
+                state: input_model::KeyState::Down,
+            })) = capture.try_recv()
+            {
+                if key == f24 {
+                    downs += 1;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        injector.inject(&[InputEvent::Key {
+            key: f24,
+            state: input_model::KeyState::Up,
+        }]);
+        println!("F24 downs the OS produced for one injected down: {downs}");
+        println!("stats: {:?}", capture.stats());
+        drop(capture);
+        assert!(downs >= 1, "even the injected down itself must be seen");
     }
 
     /// The dry half of KVM-035's proof: an event this process injected must not end a lease.

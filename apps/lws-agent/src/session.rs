@@ -118,6 +118,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         &mut backend,
         &ready,
         mode,
+        attach.repeat_mode,
         &mut watchdog,
         started,
     )
@@ -137,6 +138,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     backend: &mut Backend,
     ready: &backend::Ready,
     mode: i32,
+    repeat_mode: i32,
     watchdog: &mut Watchdog,
     started: Instant,
 ) -> anyhow::Result<Stop> {
@@ -148,6 +150,25 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     let mut held_lease: Option<Vec<u8>> = None;
     // Captured events waiting for the next tick, so one tick is one batch.
     let mut batch: Vec<LocalEvent> = Vec::new();
+    // KVM-036: with `ReceiverSoftware` this agent repeats a held key itself, at the OS rate
+    // (Windows cannot do it natively for injected keys — measured); with `ReceiverNative` the
+    // platform repeats it and the guard below releases the keys instead. `None` means the
+    // software engine is not running, which is exactly the native case.
+    let repeat_mode =
+        ipc::RepeatMode::try_from(repeat_mode).unwrap_or(ipc::RepeatMode::ReceiverSoftware);
+    let mut repeat = match repeat_mode {
+        ipc::RepeatMode::ReceiverNative => None,
+        _ => {
+            let timing = backend.repeat_timing();
+            tracing::info!(
+                repeat_mode = repeat_mode.as_str_name(),
+                delay_ms = timing.delay_ms,
+                interval_ms = timing.interval_ms,
+                "software autorepeat engine armed"
+            );
+            Some(crate::repeat::SoftwareRepeat::new(timing))
+        }
+    };
     // `CapturedBatch.at_edge`: set when the backend reports an edge crossing, cleared
     // once core has been told. The batch is sent even when it carries no events,
     // because the crossing itself is the news.
@@ -183,13 +204,30 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 if let Some(stop) = handle_message(
                     link, backend, ready, message, &mut deadline, &mut self_timeout,
-                    &mut held_lease, &mut batch, &mut displays,
+                    &mut held_lease, &mut batch, &mut displays, &mut repeat, now,
                 ).await? {
                     return Ok(stop);
                 }
             }
             event = backend.next_event() => {
                 let now = now_ms(started);
+                // KVM-036: one repeat per interval, injected like any other key event, so it
+                // travels the same ledger and the same cleanup as the original press.
+                if let Some(engine) = repeat.as_mut() {
+                    if let Some(key) = engine.due(now) {
+                        let events = [input_model::InputEvent::Key {
+                            key,
+                            state: input_model::KeyState::Down,
+                        }];
+                        let injected = backend.inject(&events).await;
+                        tracing::debug!(
+                            ?key,
+                            applied = injected.applied,
+                            repeats = engine.repeats(),
+                            "software repeat"
+                        );
+                    }
+                }
                 if let Some(event) = event {
                     handle_backend_event(
                         link,
@@ -275,6 +313,8 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
     held_lease: &mut Option<Vec<u8>>,
     batch: &mut Vec<LocalEvent>,
     displays: &mut crate::displays::DisplaysState,
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    now: u64,
 ) -> anyhow::Result<Option<Stop>> {
     match message {
         Msg::Attach(_) => {
@@ -316,6 +356,11 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Msg::EndCapture(end) => {
+            // The lease is over: a repeat must not outlive it, or a key nobody holds keeps
+            // typing (KVM-036 wires the engine to the lease, not to the process).
+            if let Some(engine) = repeat.as_mut() {
+                engine.resume();
+            }
             *self_timeout = None;
             match backend.end_capture(end.replay_buffered_locally).await {
                 Ok(released) => {
@@ -356,6 +401,11 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                 );
             }
             let injected: Injected = backend.inject(&events).await;
+            // The engine follows what actually went to the OS: the most recent held key is
+            // the one the OS would repeat.
+            if let Some(engine) = repeat.as_mut() {
+                engine.applied(&events, now);
+            }
             batch.clear();
             link.send(Msg::InjectResult(InjectResult {
                 lease_id: inject.lease_id.clone(),
@@ -381,7 +431,39 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             ));
             tracing::debug!(remaining, "deadline armed");
         }
+        Msg::StopRepeat(stop) => {
+            // AC-14 (`docs/03-architecture.md`, «Autorepeat при обрыве связи»): no input and
+            // no renew for `repeat_guard_ms`. Software repeat stops its engine; native repeat
+            // lets the held keys up, because the OS or the application owns that repeat and
+            // releasing is the only way to stop it. The lease itself stays alive: a late
+            // `LeaseRenew` may still arrive.
+            // The branch is the *mode*, not whether a key happened to be repeating: with
+            // software repeat there is no OS repeat to release, and with native repeat there
+            // is nothing else that could stop it.
+            match repeat.as_mut() {
+                Some(engine) => {
+                    let stopped = engine.stop();
+                    tracing::warn!(
+                        key = ?stopped,
+                        repeats = engine.repeats(),
+                        "repeat guard: software repeat stopped"
+                    );
+                }
+                None => {
+                    let released = backend.release_session().await;
+                    tracing::warn!(
+                        keys = released.keys,
+                        buttons = released.buttons,
+                        lease = stop.lease_id.len(),
+                        "repeat guard: held keys released (native repeat)"
+                    );
+                }
+            }
+        }
         Msg::ReleaseSession(release) => {
+            if let Some(engine) = repeat.as_mut() {
+                engine.resume();
+            }
             *deadline = None;
             *self_timeout = None;
             let released = backend.release_session().await;
@@ -605,6 +687,10 @@ mod tests {
         batch: Vec<LocalEvent>,
         at_edge: bool,
         displays: crate::displays::DisplaysState,
+        /// The software repeat engine, or `None` for native repeat (KVM-036).
+        repeat: Option<crate::repeat::SoftwareRepeat>,
+        /// The harness's monotonic clock, advanced by the tests that need one.
+        clock: u64,
     }
 
     impl Harness {
@@ -632,6 +718,12 @@ mod tests {
                 batch: Vec::new(),
                 at_edge: false,
                 displays: crate::displays::DisplaysState::default(),
+                // The harness drives the engine on an injected clock, so a repeat schedule
+                // is asserted exactly instead of waited for (KVM-036).
+                repeat: Some(crate::repeat::SoftwareRepeat::new(
+                    crate::repeat::RepeatTiming::default(),
+                )),
+                clock: 0,
             }
         }
 
@@ -646,6 +738,8 @@ mod tests {
                 &mut self.held,
                 &mut self.batch,
                 &mut self.displays,
+                &mut self.repeat,
+                self.clock,
             )
             .await
             .expect("a valid frame must not fail the handler");
@@ -898,6 +992,48 @@ mod tests {
         );
     }
 
+    /// KVM-036 / AC-14: the guard frame is what stops the software engine, and silence after
+    /// it never produces another repeat.
+    #[tokio::test]
+    async fn the_repeat_guard_stops_the_software_engine() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::Inject(ipc::Inject {
+                lease_id: lease(9),
+                input_batch_seq: 1,
+                events: vec![ipc::LocalEvent {
+                    ev: Some(ipc::local_event::Ev::Key(ipc::HidKey {
+                        usage_page: 7,
+                        usage: 0x04,
+                        down: true,
+                    })),
+                    ..Default::default()
+                }],
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::InjectResult(result) => assert_eq!(result.applied_count, 1),
+            other => panic!("expected an InjectResult, got {other:?}"),
+        }
+        let holding = input_model::HidKey::keyboard(0x04);
+        assert_eq!(
+            harness.repeat.as_ref().expect("software mode").holding(),
+            Some(holding),
+            "an injected key-down takes the repeat slot"
+        );
+
+        harness
+            .send(Msg::StopRepeat(ipc::StopRepeat { lease_id: lease(9) }))
+            .await;
+        let engine = harness.repeat.as_mut().expect("software mode");
+        assert_eq!(engine.holding(), None);
+        assert_eq!(
+            engine.due(u64::MAX / 2),
+            None,
+            "the guard ends the repeat for good"
+        );
+    }
+
     #[tokio::test]
     async fn a_queue_overflow_ends_the_capture_and_is_reported() {
         let mut harness = Harness::new().await;
@@ -952,6 +1088,7 @@ mod tests {
             .send(Msg::Attach(ipc::AgentAttach {
                 takeover_detection: ipc::TakeoverDetection::Auto as i32,
                 takeover_threshold_px: 12,
+                repeat_mode: ipc::RepeatMode::ReceiverSoftware as i32,
                 launch_token: vec![0u8; 32],
                 mode: AgentMode::Normal as i32,
                 emergency_hotkey: HOTKEY.to_owned(),

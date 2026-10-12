@@ -23,6 +23,7 @@ mod backend;
 mod displays;
 mod events;
 mod launch;
+mod repeat;
 mod session;
 mod takeover;
 
