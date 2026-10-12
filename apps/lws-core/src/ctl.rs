@@ -30,12 +30,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::command::{AgentState, PeerRef};
 
-/// The stream a CLI client is served on.
-#[cfg(unix)]
-pub type ClientStream = tokio::net::UnixStream;
-/// See [`ClientStream`].
-#[cfg(windows)]
-pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeServer;
+/// The stream a CLI client is served on: the same local endpoint type the GUI uses.
+pub use ipc::transport::ClientStream;
 
 /// Where the control endpoint lives for a runtime directory.
 ///
@@ -72,30 +68,12 @@ pub fn endpoint(runtime_dir: &std::path::Path) -> Result<Endpoint, String> {
 
 /// The `--root` tag for the control pipe, or `None` for the default directories.
 ///
-/// FNV-1a over the canonical runtime directory: the daemon and the CLI client build it
-/// from the same [`config::Paths`], so they agree without touching the filesystem, and a
-/// pipe name cannot carry the path's `\` itself. The default runtime directory is `None`
-/// on Windows and the core then lives in the state directory (`private_root`), so both
-/// defaults count as "not a `--root`".
+/// The tag itself lives in `ipc::transport` now: the GUI endpoint, the GUI binary and this
+/// channel must derive the same name from the same [`config::Paths`], and one copy of the
+/// hash is what keeps them from drifting apart.
 #[cfg(windows)]
 fn runtime_tag(runtime_dir: &std::path::Path) -> Option<String> {
-    let defaults = config::Config::default_paths().ok()?;
-    let canonical =
-        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let ours = canonical(runtime_dir);
-    let is_default = [defaults.runtime_dir(), Some(defaults.state_dir())]
-        .into_iter()
-        .flatten()
-        .any(|default| canonical(default) == ours);
-    if is_default {
-        return None;
-    }
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in ours.as_os_str().to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    Some(format!("{hash:016x}"))
+    transport::root_tag(runtime_dir)
 }
 
 /// One line of the request protocol.

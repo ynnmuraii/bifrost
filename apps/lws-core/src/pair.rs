@@ -21,7 +21,7 @@ use identity::{PairedPeer, PairingDriver, TrustStore};
 use crate::{Failure, USAGE};
 
 /// How long the dialer waits for the opener to appear.
-const WINDOW: Duration = Duration::from_secs(120);
+pub(crate) const WINDOW: Duration = Duration::from_secs(120);
 
 /// The documented SAS window (`identity::pairing::WINDOW_MS` is 120 s).
 pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
@@ -174,7 +174,14 @@ async fn confirm(
 /// `PairHello.listen_port` — the port the dialer actually listens on, or the documented
 /// default when it sent `0` (`docs/05-protocol.md`: «Адреса для `network.peers` берутся из
 /// сопряжения, поэтому ручной IP вводится один раз на пару»).
-fn peer_address(opener: bool, observed: Option<&str>, listen_port: u16) -> Option<String> {
+///
+/// The GUI's ceremonies use this too (`crate::session::pairing`), so both surfaces record
+/// the same address for the same peer.
+pub(crate) fn peer_address(
+    opener: bool,
+    observed: Option<&str>,
+    listen_port: u16,
+) -> Option<String> {
     let mut address: SocketAddr = observed?.parse().ok()?;
     if opener {
         address.set_port(if listen_port == 0 {

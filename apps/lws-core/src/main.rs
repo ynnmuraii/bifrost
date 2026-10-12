@@ -24,6 +24,7 @@ mod agent;
 mod clipboard;
 mod command;
 mod ctl;
+mod gui;
 mod ids;
 mod job;
 mod layout;
@@ -381,11 +382,19 @@ async fn run_async(
             displays_revision: 0,
         },
     );
+    // The pairing window is served by this node's own link listener, distinguished by ALPN
+    // (`docs/05-protocol.md`: `pair/1` on 47901). The gate is the one switch the transport
+    // reads; the session owns the window behind it.
+    let pairing_gate = transport::PairingGate::closed();
     let manager_config = ManagerConfig {
         identity: Arc::clone(&identity),
         trust: trust.clone(),
         local_hello,
         listen,
+        // The pairing window the listener serves by ALPN (`pair/1` on this same port):
+        // closed until the user opens it, so no unknown peer reaches the listener before
+        // then (`docs/05-protocol.md`, «Сопряжение»).
+        pairing: pairing_gate.clone(),
         peers,
         max_members: config.network.max_members,
         queue_capacity: QUEUE_CAPACITY,
@@ -434,6 +443,17 @@ async fn run_async(
         ctl::endpoint(private_root(paths)).map_err(|error| format!("control endpoint: {error}"))?;
     let server = ctl::Server::bind(&endpoint)
         .map_err(|error| format!("cannot own {}: {error}", endpoint.describe()))?;
+
+    // The GUI's own endpoint, from the same rules (`ipc::transport::gui_endpoint`): it is
+    // bound even with no window open, so `lws-gui` started first finds core when it appears.
+    let gui_endpoint =
+        ipc::transport::gui_endpoint(paths).map_err(|error| format!("GUI endpoint: {error}"))?;
+    let gui_server = crate::gui::Server::bind(&gui_endpoint)
+        .map_err(|error| format!("cannot own {}: {error}", gui_endpoint.describe()))?;
+    tracing::info!(
+        endpoint = gui_endpoint.describe().as_str(),
+        "GUI channel bound"
+    );
     let watchdog = Watchdog::for_core_silence_ms(config.timing.agent_core_silence_ms, 0)
         .map_err(|error| format!("agent_core_silence_ms: {error}"))?;
 
@@ -488,6 +508,13 @@ async fn run_async(
         LayoutStore::new(paths.config_file(), config.clone(), node_id),
         clipboard,
         clipboard_events,
+        gui_server,
+        Arc::clone(&identity),
+        paths.clone(),
+        listen,
+        config.input.emergency_hotkey.clone(),
+        session.capabilities,
+        pairing_gate,
     );
     session.run().await.map_err(|error| error.to_string())
 }
