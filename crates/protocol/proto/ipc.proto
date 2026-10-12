@@ -205,7 +205,10 @@ message AgentError { string code = 1; string detail = 2; } // never contains key
 message ClipboardChanged {
   uint64 origin_version = 1;   // the agent's monotonic counter of its own clipboard changes
   uint32 chunk_index = 2;      // zero-based
-  uint32 chunk_count = 3;      // 1..=32; a payload that fits one frame has count 1
+  uint32 chunk_count = 3;      // 1..=64; a payload that fits one frame has count 1, and 64
+                               // frames of 32 KiB reach 2 MiB — more than the 1 MiB the policy
+                               // refuses, so a copy over the limit is still *reported* and
+                               // refused by core's policy rather than dropped by the agent
   bytes data = 4;              // UTF-8 text, <= 32768 bytes
   uint64 size_bytes = 5;       // the whole payload's size, repeated on every chunk
   repeated string markers = 6; // secret markers the platform reported: exclude_from_monitor |
@@ -215,7 +218,7 @@ message ClipboardChanged {
 message SetClipboardText {
   uint64 origin_version = 1;   // the origin node's version, so a payload applied here is not re-offered
   uint32 chunk_index = 2;      // zero-based
-  uint32 chunk_count = 3;      // 1..=32; 0 releases the selection and forgets the text
+  uint32 chunk_count = 3;      // 1..=64; 0 releases the selection and forgets the text
   bytes data = 4;              // UTF-8 text, <= 32768 bytes
   bytes sha256 = 5;            // of the whole payload; present on the last chunk only
 }
