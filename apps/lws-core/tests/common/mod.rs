@@ -50,7 +50,8 @@ fn agent_exe() -> PathBuf {
     let path = core_exe().with_file_name(name);
     assert!(
         path.is_file(),
-        "{} is missing: run `cargo test --workspace` (or `cargo build -p lws-agent`) first",
+        "{} is missing: `cargo test` does not build the plain agent binary, so run \
+         `cargo build --workspace` (or `cargo build -p lws-agent`) first",
         path.display()
     );
     path
@@ -556,7 +557,8 @@ fn tunnel(
     live: &Arc<Mutex<Vec<TcpStream>>>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(String, JoinHandle<()>), String> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| format!("proxy bind: {error}"))?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|error| format!("proxy bind: {error}"))?;
     let port = listener
         .local_addr()
         .map_err(|error| error.to_string())?
@@ -579,11 +581,11 @@ fn tunnel(
                     if let Ok(clone) = stream.try_clone() {
                         live.lock().expect("proxy").push(clone);
                     }
-                    let (backward, backward_target) = match (upstream.try_clone(), stream.try_clone())
-                    {
-                        (Ok(from_upstream), Ok(to_client)) => (from_upstream, to_client),
-                        _ => continue,
-                    };
+                    let (backward, backward_target) =
+                        match (upstream.try_clone(), stream.try_clone()) {
+                            (Ok(from_upstream), Ok(to_client)) => (from_upstream, to_client),
+                            _ => continue,
+                        };
                     // Both directions, or the link would be half-duplex: the protocol
                     // needs the peer's answers to travel back.
                     let forward_mode = Arc::clone(&mode);
