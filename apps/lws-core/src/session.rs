@@ -194,7 +194,7 @@ pub struct Session {
     emergency_hotkey: String,
     /// This node's declared capabilities: what `Status.capabilities_unavailable` subtracts.
     capabilities: platform_probe::Capabilities,
-    /// The last agent portal report (`PortalPermissionRequired`), for `Status.portal_state`.
+    /// The last agent portal progress report (`PortalPermissionRequired` or restoring).
     portal_state: String,
     /// The receiver's active keyboard layout while a lease is remote (`ActiveLayout`).
     active_layout: String,
@@ -1724,6 +1724,16 @@ impl Session {
                 self.portal_state = "permission_required".to_owned();
                 self.agent_degraded_reason =
                     format!("Ожидание разрешения портала: {interface} ({detail})");
+            }
+            AgentSignal::PortalRestoring { interface, detail } => {
+                tracing::info!(
+                    interface = interface.as_str(),
+                    detail = detail.as_str(),
+                    "portal permission restoring"
+                );
+                self.portal_state = "restoring".to_owned();
+                self.agent_degraded_reason =
+                    format!("Восстановление разрешения портала: {interface} ({detail})");
             }
             AgentSignal::Grant(changed) => self.on_portal_grant(changed).await,
             AgentSignal::Ignored => {}

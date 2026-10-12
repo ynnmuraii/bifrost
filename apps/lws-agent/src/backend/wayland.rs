@@ -107,9 +107,7 @@ impl Wayland {
         session: &SessionInfo,
         emergency_hotkey: &str,
         restore_tokens: &[protocol::ipc::PortalGrant],
-        portal_progress: &tokio::sync::mpsc::UnboundedSender<
-            protocol::ipc::PortalPermissionRequired,
-        >,
+        portal_progress: &tokio::sync::mpsc::UnboundedSender<protocol::ipc::agent_frame::Msg>,
     ) -> Result<(Self, Ready, Vec<Refusal>), Refusal> {
         let mut refusals = Vec::new();
 
@@ -135,10 +133,11 @@ impl Wayland {
         // Injection first: a source needs it too, for the local replay, and a node
         // that cannot inject cannot be part of a lease in either role.
         let inject_grant = grants.get(REMOTE_DESKTOP_INTERFACE, &signature).cloned();
-        let _ = portal_progress.send(protocol::ipc::PortalPermissionRequired {
-            portal_interface: REMOTE_DESKTOP_INTERFACE.to_owned(),
-            purpose: "inject".to_owned(),
-        });
+        let _ = portal_progress.send(crate::backend::portal_progress_message(
+            REMOTE_DESKTOP_INTERFACE,
+            "inject",
+            inject_grant.is_some(),
+        ));
         let injector = WaylandInjector::connect(inject_grant.as_ref())
             .await
             .map_err(|error| fatal(&error))?;
@@ -161,10 +160,11 @@ impl Wayland {
         // Capture: degradable. A denied dialog is reported and names its interface,
         // which is what the GUI needs (scenario S8).
         let capture_grant = grants.get(INPUT_CAPTURE_INTERFACE, &signature).cloned();
-        let _ = portal_progress.send(protocol::ipc::PortalPermissionRequired {
-            portal_interface: INPUT_CAPTURE_INTERFACE.to_owned(),
-            purpose: "capture".to_owned(),
-        });
+        let _ = portal_progress.send(crate::backend::portal_progress_message(
+            INPUT_CAPTURE_INTERFACE,
+            "capture",
+            capture_grant.is_some(),
+        ));
         let mut capture = match WaylandCapture::connect(capture_grant.as_ref()).await {
             Ok(capture) => Some(capture),
             Err(error) => {

@@ -367,8 +367,10 @@ pub enum AgentSignal {
     Captured(Vec<ipc::LocalEvent>),
     /// The agent's display set changed.
     Displays(ipc::DisplaysReport),
-    /// A portal hint for the GUI (`PortalPermissionRequired`).
+    /// A portal dialog is expected because no persisted grant was available.
     Portal { interface: String, detail: String },
+    /// A persisted portal grant is being restored; no dialog is expected.
+    PortalRestoring { interface: String, detail: String },
     /// A portal restore token the agent received or lost; the session stores it.
     Grant(ipc::PortalGrantChanged),
     /// Nothing for the loop beyond the watchdog having seen the frame.
@@ -487,6 +489,10 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
             interface: permission.portal_interface.clone(),
             detail: format!("portal permission required for {}", permission.purpose),
         },
+        Msg::PortalPermissionRestoring(progress) => AgentSignal::PortalRestoring {
+            interface: progress.portal_interface.clone(),
+            detail: format!("restoring portal permission for {}", progress.purpose),
+        },
         // The token itself is a secret: it is stored, never logged, so this signal
         // carries the message rather than a description of it.
         Msg::PortalGrant(changed) => AgentSignal::Grant(changed.clone()),
@@ -512,9 +518,9 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
 ///
 /// This is what `status` shows next to the node: the last `AgentError` the agent
 /// reported (`PORTAL_DENIED`, `CAPTURE_FAILED`, …) and the portal hints
-/// (`PortalPermissionRequired`, `PortalGrantChanged`). The text is derived here, from
-/// the frame alone, so it can be unit-tested; the token in `PortalGrantChanged` is
-/// never part of it.
+/// (`PortalPermissionRequired`, `PortalPermissionRestoring`, `PortalGrantChanged`). The text is derived
+/// here from the frame alone, so it can be unit-tested; the token in `PortalGrantChanged`
+/// is never part of it.
 pub fn agent_note(message: &ipc::agent_frame::Msg) -> Option<String> {
     use ipc::agent_frame::Msg;
 
@@ -532,6 +538,10 @@ pub fn agent_note(message: &ipc::agent_frame::Msg) -> Option<String> {
         Msg::PortalPermission(permission) => Some(shorten(&format!(
             "permission required for {} ({})",
             permission.portal_interface, permission.purpose
+        ))),
+        Msg::PortalPermissionRestoring(progress) => Some(shorten(&format!(
+            "restoring portal grant for {} ({})",
+            progress.portal_interface, progress.purpose
         ))),
         Msg::PortalGrant(changed) => {
             let interface = changed
@@ -698,6 +708,7 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::Pong(_) => "Pong",
         Msg::Error(_) => "AgentError",
         Msg::PortalPermission(_) => "PortalPermissionRequired",
+        Msg::PortalPermissionRestoring(_) => "PortalPermissionRestoring",
         Msg::PortalGrant(_) => "PortalGrantChanged",
         Msg::SetClipboardText(_) => "SetClipboardText",
         Msg::ClipboardChanged(_) => "ClipboardChanged",
@@ -1208,6 +1219,35 @@ mod contract_tests {
     }
 
     #[test]
+    fn portal_startup_progress_distinguishes_permission_from_restore() {
+        let mut context = AgentContext::default();
+        let permission = ipc::agent_frame::Msg::PortalPermission(ipc::PortalPermissionRequired {
+            portal_interface: "org.freedesktop.portal.RemoteDesktop".to_owned(),
+            purpose: "inject".to_owned(),
+        });
+        assert_eq!(
+            agent_signal(&permission, &mut context),
+            AgentSignal::Portal {
+                interface: "org.freedesktop.portal.RemoteDesktop".to_owned(),
+                detail: "portal permission required for inject".to_owned(),
+            }
+        );
+
+        let restoring =
+            ipc::agent_frame::Msg::PortalPermissionRestoring(ipc::PortalPermissionRestoring {
+                portal_interface: "org.freedesktop.portal.InputCapture".to_owned(),
+                purpose: "capture".to_owned(),
+            });
+        assert_eq!(
+            agent_signal(&restoring, &mut context),
+            AgentSignal::PortalRestoring {
+                interface: "org.freedesktop.portal.InputCapture".to_owned(),
+                detail: "restoring portal permission for capture".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn every_wire_message_has_its_own_log_name() {
         let peer = NodeId::new([2; 32]);
         let cases: [(fr::Message, &str); 14] = [
@@ -1383,6 +1423,10 @@ mod contract_tests {
             (
                 Msg::PortalPermission(ipc::PortalPermissionRequired::default()),
                 "PortalPermissionRequired",
+            ),
+            (
+                Msg::PortalPermissionRestoring(ipc::PortalPermissionRestoring::default()),
+                "PortalPermissionRestoring",
             ),
             (
                 Msg::PortalGrant(ipc::PortalGrantChanged::default()),

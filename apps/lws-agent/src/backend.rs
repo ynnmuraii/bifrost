@@ -156,6 +156,27 @@ pub struct Refusal {
     /// Payload-free, actionable text: never a token, a key or clipboard content.
     pub detail: String,
 }
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Selects the startup progress shown for a portal request.
+fn portal_progress_message(
+    portal_interface: &str,
+    purpose: &str,
+    restoring: bool,
+) -> ipc::agent_frame::Msg {
+    let portal_interface = portal_interface.to_owned();
+    let purpose = purpose.to_owned();
+    if restoring {
+        ipc::agent_frame::Msg::PortalPermissionRestoring(ipc::PortalPermissionRestoring {
+            portal_interface,
+            purpose,
+        })
+    } else {
+        ipc::agent_frame::Msg::PortalPermission(ipc::PortalPermissionRequired {
+            portal_interface,
+            purpose,
+        })
+    }
+}
 
 /// The outcome of one `Inject` batch.
 #[derive(Debug, Clone, Default)]
@@ -593,7 +614,7 @@ impl Backend {
         emergency_hotkey: &str,
         restore_tokens: &[ipc::PortalGrant],
         allow_portal_sessions: bool,
-        portal_progress: tokio::sync::mpsc::UnboundedSender<ipc::PortalPermissionRequired>,
+        portal_progress: tokio::sync::mpsc::UnboundedSender<ipc::agent_frame::Msg>,
         takeover_detection: ipc::TakeoverDetection,
         takeover_threshold_px: u32,
     ) -> (Self, Ready, Vec<Refusal>) {
@@ -1203,6 +1224,26 @@ fn describe_session(snapshot: &EnvSnapshot) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_restore_token_announces_restoration_instead_of_a_permission_dialog() {
+        const REMOTE_DESKTOP: &str = "org.freedesktop.portal.RemoteDesktop";
+        const INPUT_CAPTURE: &str = "org.freedesktop.portal.InputCapture";
+        let restoring = portal_progress_message(REMOTE_DESKTOP, "inject", true);
+        assert!(matches!(
+            restoring,
+            ipc::agent_frame::Msg::PortalPermissionRestoring(progress)
+                if progress.portal_interface == REMOTE_DESKTOP
+                    && progress.purpose == "inject"
+        ));
+
+        let permission = portal_progress_message(INPUT_CAPTURE, "capture", false);
+        assert!(matches!(
+            permission,
+            ipc::agent_frame::Msg::PortalPermission(progress)
+                if progress.portal_interface == INPUT_CAPTURE
+                    && progress.purpose == "capture"
+        ));
+    }
 
     #[test]
     fn explicit_dry_clipboard_survives_an_unsupported_session_probe() {

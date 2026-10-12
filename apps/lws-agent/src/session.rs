@@ -143,10 +143,10 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keeps the IPC heartbeat responsive while a portal request awaits user approval.
+/// Keeps the IPC heartbeat responsive while portal sessions are opening or restoring.
 async fn complete_backend_startup<S, F, T>(
     link: &mut AgentLink<S>,
-    progress_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ipc::PortalPermissionRequired>,
+    progress_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     backend: F,
 ) -> anyhow::Result<Option<T>>
 where
@@ -155,7 +155,7 @@ where
 {
     enum Startup<T> {
         Backend(T),
-        Progress(Option<ipc::PortalPermissionRequired>),
+        Progress(Option<Msg>),
         Frame(Result<AgentFrame, ::ipc::IpcError>),
     }
     tokio::pin!(backend);
@@ -168,7 +168,7 @@ where
         match startup {
             Startup::Backend(selected) => return Ok(Some(selected)),
             Startup::Progress(Some(progress)) => {
-                link.send(Msg::PortalPermission(progress)).await?;
+                link.send(progress).await?;
             }
             Startup::Progress(None) => continue,
             Startup::Frame(Ok(AgentFrame {
@@ -1027,10 +1027,10 @@ mod tests {
         let mut core = AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR);
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
         progress_tx
-            .send(ipc::PortalPermissionRequired {
+            .send(Msg::PortalPermission(ipc::PortalPermissionRequired {
                 portal_interface: "org.freedesktop.portal.RemoteDesktop".to_owned(),
                 purpose: "inject".to_owned(),
-            })
+            }))
             .expect("progress receiver is open");
         let (opened, portal_opened) = tokio::sync::oneshot::channel();
         let startup = tokio::spawn(async move {
