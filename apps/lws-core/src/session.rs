@@ -16,7 +16,7 @@
 //! the same scale, which is what makes `ArmDeadline` and the lease watchdog line up
 //! with the agent's own monotonic clock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use geometry::NodeId;
 use input_model::InputEvent;
 use ipc::Watchdog;
 use protocol::ipc::agent_frame::Msg;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use transport::{LinkEvent, LinkManager};
 
 use crate::agent::Supervisor;
@@ -41,6 +41,13 @@ use crate::routing::{self, AgentSignal, Effect};
 const IDLE_TICK: Duration = Duration::from_millis(50);
 /// Backoff before a crashed agent is respawned.
 const RESTART_BACKOFF: Duration = Duration::from_millis(500);
+/// How long a `layout edit`/`layout apply` waits for the coordinator's verdict before its
+/// connection is told the verdict has not arrived (`PENDING_VERDICT`).
+///
+/// The link round trip is milliseconds; two seconds is long enough that only a real partition
+/// or a stopped coordinator can exhaust it, and short enough that the CLI (`ctl`) and the GUI
+/// do not look hung.
+const LAYOUT_VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
@@ -76,6 +83,15 @@ pub struct Session {
     /// The last refusal this node saw or sent, as `(code, detail)`, reported by `layout show`
     /// until a revision moves (KVM-072).
     last_layout_error: Option<(String, String)>,
+    /// The `layout edit`/`layout apply` requests the coordinator has not answered yet, keyed by
+    /// the request id the frame carries (E3.5).
+    ///
+    /// The key is this node's own nonce and not the peer: the answer travels back with that id,
+    /// so two concurrent requests from one node cannot take each other's verdict, and a verdict
+    /// for a request whose connection already gave up is recognised as nobody's.
+    layout_requests: HashMap<u64, LayoutRequest>,
+    /// The next `LayoutEdit.request_nonce`; 0 is reserved for "no request".
+    next_layout_nonce: u64,
     /// Set by `quit` on the control channel.
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
@@ -152,6 +168,8 @@ impl Session {
             applied_wire: None,
             layout_editing_disabled: None,
             last_layout_error: None,
+            layout_requests: HashMap::new(),
+            next_layout_nonce: 0,
             stopping: false,
             agent_restart_due: None,
             agent_lost_reported: false,
@@ -528,6 +546,8 @@ impl Session {
                             from,
                             transport::convert::LayoutMessage::TopologyApplied {
                                 revision: pair.revision,
+                                // A document push, not a request: nothing to correlate.
+                                request_nonce: 0,
                             },
                         )
                         .await;
@@ -542,6 +562,7 @@ impl Session {
                             from,
                             transport::convert::LayoutMessage::TopologyApplied {
                                 revision: current.revision,
+                                request_nonce: 0,
                             },
                         )
                         .await;
@@ -551,6 +572,8 @@ impl Session {
                             from,
                             protocol::wire::ErrorCode::InvalidTopology,
                             &detail,
+                            // A document push is not a request: there is no id to echo.
+                            0,
                         )
                         .await;
                     }
@@ -566,6 +589,7 @@ impl Session {
                         from,
                         protocol::wire::ErrorCode::NoCoordinator,
                         "this node is not the coordinator",
+                        edit.request_nonce,
                     )
                     .await;
                     return;
@@ -600,6 +624,17 @@ impl Session {
                         self.layout_store.observe(&self.layout_state);
                         self.router.set_topology_revision(pair.revision);
                         tracing::info!(peer = %from, revision = pair.revision, "layout edit applied");
+                        // The editor asked by id, so it gets the verdict by id: a successful
+                        // edit is otherwise only visible as a document change, and two
+                        // requests from one node must not take each other's answer.
+                        self.send_layout_to(
+                            from,
+                            transport::convert::LayoutMessage::TopologyApplied {
+                                revision: pair.revision,
+                                request_nonce: edit.request_nonce,
+                            },
+                        )
+                        .await;
                         let document = match toml::from_str::<config::TopologyConfig>(&layout_toml)
                         {
                             Ok(parsed) => match &self.topology {
@@ -629,6 +664,7 @@ impl Session {
                             from,
                             protocol::wire::ErrorCode::LayoutConflict,
                             &format!("expected revision {} is applied", current.revision),
+                            edit.request_nonce,
                         )
                         .await;
                     }
@@ -637,6 +673,7 @@ impl Session {
                             from,
                             protocol::wire::ErrorCode::InvalidTopology,
                             &detail,
+                            edit.request_nonce,
                         )
                         .await;
                     }
@@ -645,6 +682,7 @@ impl Session {
                             from,
                             protocol::wire::ErrorCode::NoCoordinator,
                             "this node is not the coordinator",
+                            edit.request_nonce,
                         )
                         .await;
                     }
@@ -661,16 +699,41 @@ impl Session {
                 self.send_layout_to(from, transport::convert::LayoutMessage::Topology(document))
                     .await;
             }
-            LayoutMessage::Error { code } => {
+            LayoutMessage::Error {
+                code,
+                request_nonce,
+            } => {
                 // The editor's answer: `layout show` reports it until a revision moves.
                 self.last_layout_error = Some((
                     code.as_str_name().to_owned(),
                     format!("the coordinator refused the edit ({})", code.as_str_name()),
                 ));
                 tracing::warn!(peer = %from, code = code.as_str_name(), "layout edit refused");
+                self.deliver_layout_verdict(
+                    request_nonce,
+                    false,
+                    ctl::Response::Error {
+                        code: layout_refusal_code(code),
+                        detail: format!(
+                            "the coordinator refused the edit ({})",
+                            layout_refusal_code(code)
+                        ),
+                    },
+                );
             }
-            LayoutMessage::TopologyApplied { revision } => {
+            LayoutMessage::TopologyApplied {
+                revision,
+                request_nonce,
+            } => {
                 tracing::info!(peer = %from, revision, "the peer applied the layout revision");
+                // With an id this is the coordinator's verdict on an edit of ours; without one
+                // it is a member confirming a document it was sent, which nobody here waits
+                // for (`deliver_layout_verdict` ignores 0).
+                self.deliver_layout_verdict(
+                    request_nonce,
+                    true,
+                    ctl::Response::Status(format!("applied revision={revision}")),
+                );
             }
             LayoutMessage::ActiveLayout(layout) => {
                 // The receiver's keyboard layout, for the GUI («печать идёт на <ПК>, раскладка
@@ -774,17 +837,92 @@ impl Session {
         peer: NodeId,
         code: protocol::wire::ErrorCode,
         detail: &str,
+        request_nonce: u64,
     ) {
         tracing::warn!(peer = %peer, code = code.as_str_name(), detail, "layout refused for a peer");
         // «The last refusal this node saw *or sent*»: a refusal this node emits is as much a
         // fact about the document as one it received, and `layout show` reports it either way.
         self.last_layout_error = Some((code.as_str_name().to_owned(), detail.to_owned()));
-        self.send_layout_to(peer, transport::convert::LayoutMessage::Error { code })
-            .await;
+        self.send_layout_to(
+            peer,
+            transport::convert::LayoutMessage::Error {
+                code,
+                request_nonce,
+            },
+        )
+        .await;
     }
 
-    /// `layout apply`: apply the pending edit, which only the coordinator can do.
-    async fn layout_apply(&mut self) -> ctl::Response {
+    /// Registers one layout request and returns its id together with where its verdict goes.
+    ///
+    /// The id is what the coordinator echoes, so two concurrent requests cannot take each
+    /// other's verdict. Requests whose connection already gave up are dropped first: their
+    /// verdict has nobody to tell.
+    fn hold_layout_request(
+        &mut self,
+        layout_toml: String,
+    ) -> (u64, oneshot::Receiver<ctl::Response>) {
+        self.layout_requests
+            .retain(|_, request| !request.verdict.is_closed());
+        // `.max(1)` keeps 0 out of the wire: it means «this frame is not a request».
+        self.next_layout_nonce = self.next_layout_nonce.wrapping_add(1).max(1);
+        let nonce = self.next_layout_nonce;
+        let (verdict, receiver) = oneshot::channel();
+        self.layout_requests.insert(
+            nonce,
+            LayoutRequest {
+                layout_toml,
+                verdict,
+            },
+        );
+        (nonce, receiver)
+    }
+
+    /// Hands the coordinator's verdict to the connection that asked, if it is still there.
+    ///
+    /// `applied` is the verdict's own kind, reported by the coordinator: an *applied* verdict
+    /// releases the pending slot, and only when the slot still holds the document that was
+    /// applied — a newer edit that arrived while this one was in flight is not thrown away. A
+    /// refusal keeps the edit, which is what ADR-013's «перезагрузить и применить своё» needs.
+    fn deliver_layout_verdict(
+        &mut self,
+        request_nonce: u64,
+        applied: bool,
+        verdict: ctl::Response,
+    ) {
+        if request_nonce == 0 {
+            return;
+        }
+        let Some(request) = self.layout_requests.remove(&request_nonce) else {
+            tracing::debug!(
+                request_nonce,
+                "a layout verdict for a request nobody waits for"
+            );
+            return;
+        };
+        let still_ours = self.layout_state.pending() == Some(request.layout_toml.as_str());
+        if applied && still_ours {
+            // The edit is the document now: the slot has nothing left to keep.
+            self.layout_state.take_pending();
+        } else if !applied && still_ours {
+            // Refused: this is a losing edit, and a loser belongs in `layout.pending.toml`
+            // for the GUI's reload-and-reapply (ADR-013).
+            self.layout_store.write_pending(&request.layout_toml);
+        }
+        if request.verdict.send(verdict).is_err() {
+            tracing::debug!(
+                request_nonce,
+                "the layout requester is gone; the verdict is dropped"
+            );
+        }
+    }
+
+    /// `layout apply`: hand the pending edit to the coordinator's CAS.
+    ///
+    /// On the coordinator the verdict is immediate. A follower sends the edit with the base it
+    /// names and answers with the coordinator's verdict, which is why the reply is a
+    /// [`Handled`]: this node is not the one that decides.
+    async fn layout_apply(&mut self) -> Handled {
         let (base_pair, layout_toml) = match self.layout_state.pending() {
             Some(toml) => (
                 self.layout_state
@@ -793,21 +931,24 @@ impl Session {
                 toml.to_owned(),
             ),
             None => {
-                return ctl::Response::Error {
+                return Handled::Reply(ctl::Response::Error {
                     code: "BAD_REQUEST".to_owned(),
                     detail: "no pending layout edit".to_owned(),
-                }
+                })
             }
         };
         if !self.router.ownership().is_owner() {
-            // The pending edit belongs to the coordinator's CAS: a follower forwards it and
-            // keeps it pending until the send lands.
+            // The pending edit belongs to the coordinator's CAS: a follower forwards it with
+            // the base the slot keeps and answers with the verdict that comes back. The slot
+            // is released by that verdict, not by the send, so a refusal or a lost answer
+            // leaves the edit to reload (ADR-013).
             let Some(owner) = self.router.ownership().owner().copied() else {
-                return ctl::Response::Error {
+                return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "no owner is known; the pending edit waits".to_owned(),
-                };
+                });
             };
+            let (nonce, verdict) = self.hold_layout_request(layout_toml.clone());
             // The base is the pair the edit was *written against*, never the pair this node
             // has applied now: a pending edit waits across a partition while the document
             // moves, and sending `applied` would turn the coordinator's CAS into a no-op that
@@ -820,21 +961,17 @@ impl Session {
                         .map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
                     author_node_id: self.node_id.as_bytes().to_vec(),
                     layout_toml: layout_toml.clone().into_bytes(),
+                    request_nonce: nonce,
                 });
             if !self.send_layout_to(owner, message).await {
-                return ctl::Response::Error {
+                // Nothing was asked, so nobody will answer; the pending edit stays where it is.
+                self.layout_requests.remove(&nonce);
+                return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "the coordinator is unreachable; the pending edit waits".to_owned(),
-                };
+                });
             }
-            // Sent: the coordinator runs the CAS with the base the edit names, and replicates
-            // the new revision back (or refuses it by name).
-            self.layout_state.take_pending();
-            return ctl::Response::Status(format!(
-                "sent to the coordinator ({}), based on revision {}",
-                identity::fingerprint(&owner),
-                base_pair.revision
-            ));
+            return Handled::Deferred(verdict);
         }
         let edit = crate::layout::Edit {
             expected: base_pair,
@@ -844,7 +981,7 @@ impl Session {
         let outcome = self
             .layout_state
             .apply_edit(&edit, self.node_id, true, validate_layout_toml);
-        match outcome {
+        Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
                 self.layout_state.take_pending();
                 self.layout_store.observe(&self.layout_state);
@@ -875,7 +1012,7 @@ impl Session {
                 code: "NO_COORDINATOR".to_owned(),
                 detail: "this node is not the owner".to_owned(),
             },
-        }
+        })
     }
 
     /// `layout show`: the pair, the floor, whether an edit is waiting, and the last refusal.
@@ -912,46 +1049,48 @@ impl Session {
     /// Only the coordinator applies (`docs/03-architecture.md`: «Layout правит любой узел, но
     /// применяет только координатор через CAS по `(revision, author)`»), and the base is the
     /// revision this node has applied — which is why the answer names the current one on a
-    /// conflict instead of guessing what the caller meant.
-    async fn layout_edit(&mut self, path: &str) -> ctl::Response {
+    /// conflict instead of guessing what the caller meant. A follower's answer is the
+    /// coordinator's own verdict: `OK applied revision=N` and `ERR LAYOUT_CONFLICT …` mean the
+    /// same thing on both sides of the link.
+    async fn layout_edit(&mut self, path: &str) -> Handled {
         let is_coordinator = self.router.ownership().is_owner();
         let document_text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
-                return ctl::Response::Error {
+                return Handled::Reply(ctl::Response::Error {
                     code: "BAD_REQUEST".to_owned(),
                     detail: format!("cannot read {path}: {error}"),
-                }
+                })
             }
         };
-        // The document is needed twice on the follower path: inside the frame and, if the
-        // coordinator turns out to be unreachable, in `layout.pending.toml`.
-
-        let edit = crate::layout::Edit {
-            expected: self.layout_state.applied(),
-            editor: self.node_id,
-            layout_toml: document_text.clone(),
-        };
         if let Some(reason) = self.layout_editing_disabled.clone() {
-            self.layout_state.hold_pending(edit.layout_toml.clone());
-            self.layout_store.write_pending(&edit.layout_toml);
-            return ctl::Response::Error {
+            self.layout_state.hold_pending(document_text.clone());
+            self.layout_store.write_pending(&document_text);
+            return Handled::Reply(ctl::Response::Error {
                 code: "NO_COORDINATOR".to_owned(),
                 detail: format!("{reason}; the edit is kept as pending"),
-            };
+            });
         }
         if !is_coordinator {
-            // A follower sends the edit to the coordinator and waits for the answer; only a
-            // partition or a conflict leaves it pending (`docs/05-protocol.md`).
+            // A follower sends the edit to the coordinator and answers with the verdict that
+            // comes back; only a partition keeps it pending (`docs/05-protocol.md`).
             let Some(owner) = self.router.ownership().owner().copied() else {
-                self.layout_state.hold_pending(edit.layout_toml.clone());
-                self.layout_store.write_pending(&edit.layout_toml);
-                return ctl::Response::Error {
+                self.layout_state.hold_pending(document_text.clone());
+                self.layout_store.write_pending(&document_text);
+                return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "no owner is known; the edit is kept as pending".to_owned(),
-                };
+                });
             };
+            // The base is the revision this node has applied *now*: the edit was just written
+            // against it, and the coordinator's CAS compares exactly that pair. The edit
+            // occupies the pending slot until the verdict says it was applied, so a refusal or
+            // a lost answer leaves the user something to reload rather than a silent loss;
+            // `layout.pending.toml` is written only when the edit turns out not to be applied
+            // (here, or on the verdict), so the file keeps meaning «a losing edit».
             let applied = self.layout_state.applied();
+            self.layout_state.hold_pending(document_text.clone());
+            let (nonce, verdict) = self.hold_layout_request(document_text.clone());
             let message =
                 transport::convert::LayoutMessage::LayoutEdit(protocol::wire::LayoutEdit {
                     expected_revision: applied.revision,
@@ -960,27 +1099,28 @@ impl Session {
                         .map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
                     author_node_id: self.node_id.as_bytes().to_vec(),
                     layout_toml: document_text.clone().into_bytes(),
+                    request_nonce: nonce,
                 });
-            if self.manager.handle(&owner).await.is_none() {
-                self.layout_state.hold_pending(document_text.clone());
+            if !self.send_layout_to(owner, message).await {
+                self.layout_requests.remove(&nonce);
                 self.layout_store.write_pending(&document_text);
-                return ctl::Response::Error {
+                return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "the coordinator is unreachable; the edit is kept as pending"
                         .to_owned(),
-                };
+                });
             }
-            self.send_layout_to(owner, message).await;
-            return ctl::Response::Status(format!(
-                "sent to the coordinator ({}), based on revision {}",
-                identity::fingerprint(&owner),
-                self.layout_state.applied().revision
-            ));
+            return Handled::Deferred(verdict);
         }
+        let edit = crate::layout::Edit {
+            expected: self.layout_state.applied(),
+            editor: self.node_id,
+            layout_toml: document_text,
+        };
         let outcome =
             self.layout_state
                 .apply_edit(&edit, self.node_id, is_coordinator, validate_layout_toml);
-        match outcome {
+        Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
                 self.layout_store.observe(&self.layout_state);
                 self.router.set_topology_revision(pair.revision);
@@ -989,11 +1129,9 @@ impl Session {
                     author = identity::fingerprint(&self.node_id).as_str(),
                     "layout applied by the coordinator"
                 );
-                ctl::Response::Status(format!(
-                    "applied revision={} author={}",
-                    pair.revision,
-                    identity::fingerprint(&self.node_id)
-                ))
+                // The same words a follower's verdict uses: the published document is always
+                // authored by the coordinator, so naming it here adds nothing.
+                ctl::Response::Status(format!("applied revision={}", pair.revision))
             }
             crate::layout::EditOutcome::Conflict(current) => {
                 let detail = format!(
@@ -1019,7 +1157,7 @@ impl Session {
                 code: "NO_COORDINATOR".to_owned(),
                 detail: "this node is not the owner".to_owned(),
             },
-        }
+        })
     }
 
     /// One line per FSM transition, and the reason when something was refused.
@@ -1503,35 +1641,62 @@ impl Session {
             }
         };
         let response = self.handle_request(&line).await;
-        let reply = response.render();
-        if let Err(error) = ctl::write_line(&mut stream, &reply).await {
-            tracing::warn!(%error, "cannot answer a control request");
+        match response {
+            Handled::Reply(response) => {
+                let reply = response.render();
+                if let Err(error) = ctl::write_line(&mut stream, &reply).await {
+                    tracing::warn!(%error, "cannot answer a control request");
+                }
+            }
+            Handled::Deferred(verdict) => {
+                // The loop must not block on a peer: the connection is handed to a writer that
+                // waits for the coordinator's verdict and answers either way. A verdict that
+                // never comes is not invented — `PENDING_VERDICT` says so, and the edit stays
+                // pending on this node.
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let reply = match tokio::time::timeout(LAYOUT_VERDICT_TIMEOUT, verdict).await {
+                        Ok(Ok(response)) => response.render(),
+                        // The request was dropped (core is stopping) or the answer never came:
+                        // both mean there is no verdict to report.
+                        Ok(Err(_)) | Err(_) => ctl::Response::Error {
+                            code: "PENDING_VERDICT".to_owned(),
+                            detail: "the coordinator has not answered; the edit is kept as pending"
+                                .to_owned(),
+                        }
+                        .render(),
+                    };
+                    if let Err(error) = ctl::write_line(&mut stream, &reply).await {
+                        tracing::warn!(%error, "cannot answer a deferred control request");
+                    }
+                });
+            }
         }
     }
 
-    async fn handle_request(&mut self, line: &str) -> ctl::Response {
+    async fn handle_request(&mut self, line: &str) -> Handled {
         let request = match ctl::Request::parse(line) {
             Ok(request) => request,
             Err(detail) => {
-                return ctl::Response::Error {
+                return Handled::Reply(ctl::Response::Error {
                     code: "BAD_REQUEST".to_owned(),
                     detail,
-                }
+                })
             }
         };
         tracing::info!(?request, "control request");
         match request {
-            ctl::Request::Ping => ctl::Response::Pong,
-            ctl::Request::Status => ctl::Response::Status(self.status_line().await),
-            ctl::Request::ResetPortals => self.reset_portals().await,
+            ctl::Request::Ping => ctl::Response::Pong.into(),
+            ctl::Request::Status => ctl::Response::Status(self.status_line().await).into(),
+            ctl::Request::ResetPortals => self.reset_portals().await.into(),
             ctl::Request::Quit => {
                 self.stopping = true;
-                ctl::Response::Stopping
+                ctl::Response::Stopping.into()
             }
-            ctl::Request::Switch(peer) => self.switch_to(&peer).await,
-            ctl::Request::Claim => self.claim().await,
-            ctl::Request::Abandon => self.abandon().await,
-            ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()),
+            ctl::Request::Switch(peer) => self.switch_to(&peer).await.into(),
+            ctl::Request::Claim => self.claim().await.into(),
+            ctl::Request::Abandon => self.abandon().await.into(),
+            ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()).into(),
             ctl::Request::LayoutEdit(path) => self.layout_edit(&path).await,
             ctl::Request::LayoutApply => self.layout_apply().await,
             ctl::Request::LayoutDiscard => {
@@ -1541,6 +1706,7 @@ impl Session {
                     "pending={}",
                     if dropped { "discarded" } else { "none" }
                 ))
+                .into()
             }
         }
     }
@@ -1745,12 +1911,53 @@ impl Session {
     }
 }
 
+/// The ctl code of a layout refusal: the contract's enum name without its prefix.
+///
+/// The proto spells it `ERROR_CODE_LAYOUT_CONFLICT`; the CLI, the GUI and the `last_error=`
+/// field of `layout show` all use the code itself, and the coordinator refuses with the same
+/// word, so `ERR LAYOUT_CONFLICT …` reads the same on both sides of the link.
+fn layout_refusal_code(code: protocol::wire::ErrorCode) -> String {
+    code.as_str_name()
+        .strip_prefix("ERROR_CODE_")
+        .unwrap_or_else(|| code.as_str_name())
+        .to_owned()
+}
+
 /// What one turn of the loop produced.
 enum Step {
     Link(Option<LinkEvent>),
     Agent(Result<protocol::ipc::AgentFrame, String>),
     Control(Result<ctl::ClientStream, ipc::IpcError>),
     Tick,
+}
+
+/// What one control request produced.
+///
+/// A `layout edit`/`layout apply` on a follower is not answered by the node that read the
+/// line: only the coordinator's CAS knows the verdict, so the connection is handed the pair of
+/// [`oneshot::Receiver`] and the timeout instead of an invented answer.
+enum Handled {
+    /// The answer is known here and now.
+    Reply(ctl::Response),
+    /// The coordinator was asked; the verdict is on its way.
+    Deferred(oneshot::Receiver<ctl::Response>),
+}
+
+impl From<ctl::Response> for Handled {
+    fn from(response: ctl::Response) -> Self {
+        Handled::Reply(response)
+    }
+}
+
+/// One layout request whose verdict has not arrived.
+struct LayoutRequest {
+    /// The document the request carried.
+    ///
+    /// An applied verdict releases the pending slot only when the slot still holds *this*
+    /// document: a newer edit that arrived while the request was in flight is not thrown away.
+    layout_toml: String,
+    /// Where the connection that asked is waiting.
+    verdict: oneshot::Sender<ctl::Response>,
 }
 
 /// The FSM's timers on the loop's millisecond clock.

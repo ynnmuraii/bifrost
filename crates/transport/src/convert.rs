@@ -177,6 +177,9 @@ pub fn to_envelope(
         } => Payload::Error(wire::ProtocolError {
             related_seq: *related_seq,
             code: code.as_u32() as i32,
+            // The correlation id belongs to the layout arm's `LayoutEdit`; the FSM's errors
+            // have no request to name.
+            request_nonce: 0,
         }),
         fr::Message::Shutdown { reason, .. } => Payload::Shutdown(wire::Shutdown {
             reason: reason.as_u32() as i32,
@@ -324,10 +327,14 @@ pub enum LayoutMessage {
     /// `TopologyRequest{}` — a member asking the coordinator, or the coordinator asking the
     /// author of a higher stored revision.
     TopologyRequest,
-    /// `TopologyApplied{revision}` — a receiver confirming it applied the document.
+    /// `TopologyApplied{revision, request_nonce}` — a receiver confirming it applied the
+    /// document, or the coordinator's verdict on an edit it applied.
     TopologyApplied {
         /// The revision that was applied.
         revision: u64,
+        /// The `LayoutEdit.request_nonce` this confirms, or 0 for a confirmation nobody
+        /// asked for by id (a document pushed by the coordinator).
+        request_nonce: u64,
     },
     /// `ActiveLayout` — the receiver's keyboard layout, for the owner's GUI.
     ActiveLayout(wire::ActiveLayout),
@@ -340,6 +347,9 @@ pub enum LayoutMessage {
     Error {
         /// The wire code, as the contract defines it.
         code: wire::ErrorCode,
+        /// The `LayoutEdit.request_nonce` this refuses, or 0 when the refusal answers a
+        /// document instead of an edit.
+        request_nonce: u64,
     },
 }
 
@@ -372,6 +382,7 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
         Some(Payload::TopologyApplied(applied)) => {
             Ok(Inbound::Layout(LayoutMessage::TopologyApplied {
                 revision: applied.revision,
+                request_nonce: applied.request_nonce,
             }))
         }
         Some(Payload::ActiveLayout(layout)) => {
@@ -381,7 +392,10 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
             // A layout refusal travels on the layout arm; every other `ProtocolError` keeps
             // its place in the focus vocabulary (`focus_router::ErrorCode` models the codes
             // the FSM emits, and these are not among them).
-            Ok(code) if is_layout_code(code) => Ok(Inbound::Layout(LayoutMessage::Error { code })),
+            Ok(code) if is_layout_code(code) => Ok(Inbound::Layout(LayoutMessage::Error {
+                code,
+                request_nonce: error.request_nonce,
+            })),
             _ => from_envelope(envelope).map(Inbound::Focus),
         },
         None => Err(ConvertError::Unsupported("empty payload")),
@@ -404,15 +418,21 @@ pub fn layout_envelope(
         LayoutMessage::Topology(topology) => Payload::Topology(topology.clone()),
         LayoutMessage::LayoutEdit(edit) => Payload::LayoutEdit(edit.clone()),
         LayoutMessage::TopologyRequest => Payload::TopologyRequest(wire::TopologyRequest {}),
-        LayoutMessage::TopologyApplied { revision } => {
-            Payload::TopologyApplied(wire::TopologyApplied {
-                revision: *revision,
-            })
-        }
+        LayoutMessage::TopologyApplied {
+            revision,
+            request_nonce,
+        } => Payload::TopologyApplied(wire::TopologyApplied {
+            revision: *revision,
+            request_nonce: *request_nonce,
+        }),
         LayoutMessage::ActiveLayout(layout) => Payload::ActiveLayout(layout.clone()),
-        LayoutMessage::Error { code } => Payload::Error(wire::ProtocolError {
+        LayoutMessage::Error {
+            code,
+            request_nonce,
+        } => Payload::Error(wire::ProtocolError {
             related_seq: 0,
             code: *code as i32,
+            request_nonce: *request_nonce,
         }),
     };
     wire::Envelope {
