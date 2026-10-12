@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      # The last step attaches archives to a tag, which the read-only default
+      # token of a fresh repository would refuse.
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 is deliberate: its glibc is older than the one in
+        # Ubuntu 24.04, so the binary built here runs both on CachyOS (a
+        # rolling release with an even newer glibc) and on 24.04. Building on
+        # 24.04 would risk binaries an older glibc refuses to load.
+        os: [windows-latest, ubuntu-22.04]
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Not pinned on purpose, same as ci.yml: rust-toolchain.toml is the
+      # source of truth and names the channel "stable", the one this action
+      # installs. The fmt/clippy components and the x86_64 target ci.yml
+      # passes exist there so its later steps can run; a release build needs
+      # neither.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+
+      # Only what a release build needs: build-essential supplies the C
+      # compiler and the archiver that ring (rustls) compiles its C and
+      # assembly parts with. Everything else in the graph is pure Rust, and
+      # the X11/Wayland clients load their libraries at runtime rather than
+      # at link time (see the longer note on the same step in ci.yml), so no
+      # -dev packages are installed. ci.yml also installs binutils, xvfb and
+      # xauth for its symbol check and test run; this workflow runs neither.
+      - name: System dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential
+
+      # `cargo build --release` is deliberately the only build: no
+      # cross-compilation, no extra toolchains, nothing staged through cargo.
+      # The three binaries land in target/release next to each other, which
+      # is the one layout they can start from - lws-gui finds lws-core beside
+      # its own executable, and the core finds lws-agent the same way.
+      - name: Build
+        run: cargo build --release
+
+      # docs/06-development-plan.md, «CI и выпуск»: «Release manifest и архивы
+      # сборок генерируются в CI, а не хранятся вручную: version, OS/arch,
+      # checksums, известные ограничения и manual matrix». SHA256SUMS.txt is
+      # the checksum half of that manifest, and the archive is flat on
+      # purpose: the user unpacks three binaries and three text files into
+      # one directory, which is the layout the GUI needs. The texts are
+      # packaging/README_RU.txt (the in-archive instructions),
+      # licenses/THIRD_PARTY_NOTICES.md (MIT redistributability, ADR-009) and
+      # crates/config/examples-data/config.example.toml - the core requires
+      # config.toml and does not create it (Config::load fails on a missing
+      # file), so a release without the example file cannot start at all.
+      - name: Package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "lan-workspace-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
+          $archive = Join-Path $env:RUNNER_TEMP "$name.zip"
+          $stage = Join-Path $env:RUNNER_TEMP "stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/lws-core.exe $stage
+          Copy-Item target/release/lws-agent.exe $stage
+          Copy-Item target/release/lws-gui.exe $stage
+          Copy-Item packaging/README_RU.txt $stage
+          Copy-Item licenses/THIRD_PARTY_NOTICES.md $stage
+          Copy-Item crates/config/examples-data/config.example.toml $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          # `<hex>  <file>` with two spaces, the sha256sum convention: the
+          # name is the archive's own, so `sha256sum -c SHA256SUMS.txt`
+          # verifies a download without knowing where it came from.
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP "SHA256SUMS.txt") -Value "$hash  $name.zip"
+
+      - name: Package
+        if: runner.os == 'Linux'
+        run: |
+          name="lan-workspace-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          cp target/release/lws-core target/release/lws-agent target/release/lws-gui "$stage/"
+          cp packaging/README_RU.txt licenses/THIRD_PARTY_NOTICES.md "$stage/"
+          cp crates/config/examples-data/config.example.toml "$stage/"
+          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" lws-core lws-agent lws-gui README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml
+          # shasum prints `<hex>  <file>` (two spaces), the same format and
+          # file name as the Windows step writes. The subshell makes <file>
+          # the archive's own name rather than its path, so a user who
+          # unpacked the archive can verify it with `sha256sum -c`.
+          (cd "$RUNNER_TEMP" && shasum -a 256 "$name.tar.gz" > SHA256SUMS.txt)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lan-workspace-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/lan-workspace-*-${{ matrix.platform }}.*
+            ${{ runner.temp }}/SHA256SUMS.txt
+
+      # Only the tag trigger: `push` fires here solely on `v*` tags, so this
+      # condition is exactly "a release is being cut". A workflow_dispatch on
+      # a branch still uploads artifacts to test the packaging, but publishes
+      # nothing.
+      - name: Attach to the release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ runner.temp }}/lan-workspace-*-${{ matrix.platform }}.*
+            ${{ runner.temp }}/SHA256SUMS.txt
