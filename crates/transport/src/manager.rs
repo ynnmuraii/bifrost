@@ -354,18 +354,18 @@ impl LinkManager {
 
     /// Drops every link abruptly, without a `Shutdown`, and stops the dialers with them.
     ///
-    /// A peer cannot tell this apart from a crashed process, which is exactly what the e2e
-    /// timing of `docs/05-protocol.md` (offline after 3 s without `Pong`) is about — and that
-    /// is also why the dialers go: a process that died neither dials nor accepts. A dialer
-    /// that survived here would keep re-dialling the peer it lost, and each of those dials is
-    /// accepted by any survivor that still trusts it, so the pair links again and the dead
-    /// peer never looks dead (the `mesh.rs` kill test is the pinned case). The graceful path
-    /// is [`LinkHandle::close`] on each handle plus letting the manager's loop keep running.
+    /// Each established member is reported to the session as `Down { LocalClosed }`; the
+    /// session owns the user-facing link log and cleanup. The peer still sees a crash, and
+    /// the dialers stop because this is also the local revocation path.
     pub async fn kill_all(&self) {
         let mut inner = self.inner.lock().await;
-        for (_, link) in std::mem::take(&mut inner.links) {
-            link.task.abort();
-        }
+        let peers = std::mem::take(&mut inner.links)
+            .into_iter()
+            .map(|(peer, link)| {
+                link.task.abort();
+                peer
+            })
+            .collect::<Vec<_>>();
         for (_, pending) in std::mem::take(&mut inner.pending) {
             pending.task.abort();
         }
@@ -376,6 +376,16 @@ impl LinkManager {
         inner.dial_waiters.clear();
         for (_, dialer) in std::mem::take(&mut inner.peer_dialers) {
             dialer.abort();
+        }
+        drop(inner);
+        for peer in peers {
+            let _ = self
+                .events_tx
+                .send(LinkEvent::Down {
+                    peer,
+                    reason: LinkDownReason::LocalClosed,
+                })
+                .await;
         }
     }
 

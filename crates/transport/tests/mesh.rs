@@ -772,6 +772,83 @@ async fn a_deliberate_shutdown_is_reported_as_such() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_all_reports_local_close_for_each_member() {
+    let root = temp_root("kill-all-down");
+    let address_a = free_address().await;
+    let address_b = free_address().await;
+    let address_c = free_address().await;
+
+    let identity_a = Arc::new(identity_at(&root, "a"));
+    let identity_b = Arc::new(identity_at(&root, "b"));
+    let identity_c = Arc::new(identity_at(&root, "c"));
+    let (id_a, id_b, id_c) = (
+        identity_a.node_id(),
+        identity_b.node_id(),
+        identity_c.node_id(),
+    );
+
+    let mut a = spawn_node(
+        "a",
+        Arc::clone(&identity_a),
+        address_a,
+        &[(id_b, address_b), (id_c, address_c)],
+        &[],
+        3,
+    )
+    .await;
+    let b = spawn_node(
+        "b",
+        Arc::clone(&identity_b),
+        address_b,
+        &[(id_a, address_a)],
+        &[address_a],
+        3,
+    )
+    .await;
+    let c = spawn_node(
+        "c",
+        Arc::clone(&identity_c),
+        address_c,
+        &[(id_a, address_a)],
+        &[address_a],
+        3,
+    )
+    .await;
+
+    assert!(wait_for_members(&a, 2, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&c, 1, FORM_TIMEOUT).await);
+    settle(&mut a, Duration::from_millis(300)).await;
+
+    a.manager.kill_all().await;
+    assert_eq!(a.manager.member_count().await, 0);
+
+    let mut removed = BTreeSet::new();
+    while removed.len() < 2 {
+        let event = wait_for_event(
+            &mut a.events,
+            |event| matches!(event, LinkEvent::Down { .. }),
+            EVENT_TIMEOUT,
+        )
+        .await
+        .expect("kill_all reports each removed member");
+        match event {
+            LinkEvent::Down { peer, reason } => {
+                assert_eq!(reason, LinkDownReason::LocalClosed);
+                removed.insert(peer);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert_eq!(removed, [id_b, id_c].into_iter().collect());
+
+    a.kill().await;
+    b.kill().await;
+    c.kill().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn the_membership_refusal_can_be_read_back_from_the_wire() {
     // The manager refuses an extra member with `ProtocolError { code: MembershipFull }`;
