@@ -110,7 +110,7 @@ fn pair_from_config(revision: u64, author: &str) -> Pair {
 }
 
 /// The 32 identity bytes of a lower-case hex fingerprint.
-fn node_id_from_hex(text: &str) -> Option<NodeId> {
+pub(crate) fn node_id_from_hex(text: &str) -> Option<NodeId> {
     let text = text.trim();
     if text.len() != 64 {
         return None;

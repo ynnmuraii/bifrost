@@ -16,7 +16,10 @@ use identity::{now_unix_ms, IdentityPaths, NodeIdentity, TrustStore, TrustedPeer
 use protocol::wire;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use transport::{BackoffBounds, LinkDownReason, LinkEvent, LinkLiveness, LinkManager, ManagerConfig};
+use transport::convert::Inbound;
+use transport::{
+    BackoffBounds, LinkDownReason, LinkEvent, LinkLiveness, LinkManager, ManagerConfig,
+};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -476,11 +479,11 @@ async fn a_focus_message_is_delivered_after_the_link_has_been_alive() {
     match received {
         Some(LinkEvent::Message { peer, message }) => {
             assert_eq!(peer, id_a);
-            let Message::InputBatch {
+            let Inbound::Focus(Message::InputBatch {
                 lease_id,
                 input_batch_seq,
                 events,
-            } = &message
+            }) = &message
             else {
                 panic!("the first message must be the batch, got {message:?}");
             };
@@ -508,7 +511,7 @@ async fn a_focus_message_is_delivered_after_the_link_has_been_alive() {
             matches!(
                 event,
                 LinkEvent::Message {
-                    message: Message::OwnerClaim { .. },
+                    message: Inbound::Focus(Message::OwnerClaim { .. }),
                     ..
                 }
             )
@@ -519,6 +522,9 @@ async fn a_focus_message_is_delivered_after_the_link_has_been_alive() {
     match second {
         Some(LinkEvent::Message { peer, message }) => {
             assert_eq!(peer, id_a);
+            let Inbound::Focus(message) = message else {
+                panic!("the second message is a focus message, got {message:?}");
+            };
             assert_eq!(message, claim, "the second message must arrive unchanged");
         }
         Some(other) => panic!("unexpected event {other:?}"),

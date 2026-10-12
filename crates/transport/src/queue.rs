@@ -100,6 +100,8 @@ pub fn outbound_of(message: fr::Message) -> Outbound {
 pub enum Outbound {
     /// Must be delivered: control, or any batch with an edge in it.
     Guaranteed(fr::Message),
+    /// A layout-document message: always guaranteed, never coalesced (KVM-072).
+    Layout(crate::convert::LayoutMessage),
     /// Coalescible pointer motion; may be dropped when the queue is full.
     Motion(Vec<InputEvent>),
 }
@@ -109,7 +111,7 @@ impl Outbound {
     pub fn motion_events(&self) -> Option<&[InputEvent]> {
         match self {
             Outbound::Motion(events) => Some(events),
-            Outbound::Guaranteed(_) => None,
+            Outbound::Guaranteed(_) | Outbound::Layout(_) => None,
         }
     }
 }

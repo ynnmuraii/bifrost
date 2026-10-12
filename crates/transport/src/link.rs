@@ -60,12 +60,12 @@ pub enum LinkEvent {
         /// Its `Hello` gossip.
         hello: PeerInfo,
     },
-    /// One focus/lease message.
+    /// One message from the peer, in the layer that owns it.
     Message {
         /// The peer it came from.
         peer: NodeId,
         /// The message.
-        message: fr::Message,
+        message: crate::convert::Inbound,
     },
     /// The link is gone.
     Down {
@@ -207,7 +207,24 @@ impl LinkHandle {
                 .send(Outbound::Guaranteed(message))
                 .await
                 .map_err(|_| TransportError::LinkClosed),
+            // `outbound_of` never produces this arm; it exists because `Outbound` is shared.
+            Outbound::Layout(message) => self.send_layout(message).await,
         }
+    }
+
+    /// Sends one layout-document message (KVM-072).
+    ///
+    /// Always guaranteed and never coalesced: a document, its CAS and the confirmations around
+    /// them are control traffic, and a dropped `TopologyApplied` would leave the coordinator
+    /// waiting forever.
+    pub async fn send_layout(
+        &self,
+        message: crate::convert::LayoutMessage,
+    ) -> Result<(), TransportError> {
+        self.tx
+            .send(Outbound::Layout(message))
+            .await
+            .map_err(|_| TransportError::LinkClosed)
     }
 
     /// Enqueues pointer motion without waiting; returns whether it was queued.
@@ -263,8 +280,8 @@ pub enum LinkReport {
     Message {
         /// The peer.
         peer: NodeId,
-        /// The message.
-        message: fr::Message,
+        /// The message, in the layer that owns it.
+        message: crate::convert::Inbound,
     },
     /// The link ended.
     Down {
@@ -621,7 +638,7 @@ impl LinkState {
             }
             _ => {}
         }
-        let message = convert::from_envelope(envelope)
+        let message = convert::inbound_from_envelope(envelope)
             .map_err(|error: ConvertError| LinkDownReason::Protocol(error.to_string()))?;
         reports
             .send(LinkReport::Message {
@@ -672,6 +689,10 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
                 write_message(writer, state, message.clone()).await?;
                 index += 1;
             }
+            Outbound::Layout(message) => {
+                write_layout_message(writer, state, message.clone()).await?;
+                index += 1;
+            }
             Outbound::Motion(_) => {
                 // Merge the contiguous motion run that starts here.
                 let mut events = Vec::new();
@@ -689,6 +710,17 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
         }
     }
     Ok(())
+}
+
+/// Writes one layout message: same framing, no lease and no batch display.
+async fn write_layout_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    state: &mut LinkState,
+    message: crate::convert::LayoutMessage,
+) -> Result<(), LinkDownReason> {
+    let envelope = convert::layout_envelope(&message, state.tx_seq, &state.connection_id);
+    state.tx_seq += 1;
+    write_frame(writer, &envelope).await.map_err(reason_from)
 }
 
 async fn write_message<W: AsyncWrite + Unpin>(

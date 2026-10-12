@@ -296,6 +296,103 @@ pub fn from_envelope(envelope: &wire::Envelope) -> Result<fr::Message, ConvertEr
     .map(|message| attach_lease(message, lease_id))
 }
 
+/// A message from a peer, split by layer.
+///
+/// The focus/lease vocabulary is a mirror of `focus_router::Message`, which the FSM owns. The
+/// layout document is not a focus message at all — `Topology`, `LayoutEdit`, `TopologyRequest`,
+/// `TopologyApplied` and `ActiveLayout` never drive a transition — so it travels beside the
+/// mirror instead of being forced into it. Core is the only consumer of both.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inbound {
+    /// A focus/lease message, already in the FSM's vocabulary.
+    Focus(fr::Message),
+    /// A layout-document message, in the wire types core works with.
+    Layout(LayoutMessage),
+}
+
+/// The layout half of the wire: whole-document replication and its CAS.
+///
+/// The payloads are `protocol::wire` types rather than a second mirror: the document is what
+/// is replicated and revalidated as a whole (ADR-013), and a lossy translation layer would be
+/// one more thing to keep in step with the schema.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayoutMessage {
+    /// `Topology{revision, author_node_id, nodes, links}` — the document.
+    Topology(wire::Topology),
+    /// `LayoutEdit{expected_revision, expected_author, author_node_id, layout_toml}`.
+    LayoutEdit(wire::LayoutEdit),
+    /// `TopologyRequest{}` — a member asking the coordinator, or the coordinator asking the
+    /// author of a higher stored revision.
+    TopologyRequest,
+    /// `TopologyApplied{revision}` — a receiver confirming it applied the document.
+    TopologyApplied {
+        /// The revision that was applied.
+        revision: u64,
+    },
+    /// `ActiveLayout` — the receiver's keyboard layout, for the owner's GUI.
+    ActiveLayout(wire::ActiveLayout),
+}
+
+/// Reads one envelope into the layer that owns its payload.
+///
+/// `Hello` stays with the handshake and clipboard stays with its channel, as before; a payload
+/// that belongs to neither layer is an error, exactly as in [`from_envelope`].
+pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, ConvertError> {
+    use wire::envelope::Payload;
+
+    match envelope.payload.as_ref() {
+        Some(Payload::Topology(topology)) => {
+            Ok(Inbound::Layout(LayoutMessage::Topology(topology.clone())))
+        }
+        Some(Payload::LayoutEdit(edit)) => {
+            Ok(Inbound::Layout(LayoutMessage::LayoutEdit(edit.clone())))
+        }
+        Some(Payload::TopologyRequest(_)) => Ok(Inbound::Layout(LayoutMessage::TopologyRequest)),
+        Some(Payload::TopologyApplied(applied)) => {
+            Ok(Inbound::Layout(LayoutMessage::TopologyApplied {
+                revision: applied.revision,
+            }))
+        }
+        Some(Payload::ActiveLayout(layout)) => {
+            Ok(Inbound::Layout(LayoutMessage::ActiveLayout(layout.clone())))
+        }
+        None => Err(ConvertError::Unsupported("empty payload")),
+        Some(_) => from_envelope(envelope).map(Inbound::Focus),
+    }
+}
+
+/// Builds the envelope of a layout message.
+///
+/// No lease id: these messages belong to the connection, not to a lease (`docs/05-protocol.md`
+/// gives every one of them a `connection_id`-scoped meaning).
+pub fn layout_envelope(
+    message: &LayoutMessage,
+    seq: u64,
+    connection_id: &[u8; 16],
+) -> wire::Envelope {
+    use wire::envelope::Payload;
+
+    let payload = match message {
+        LayoutMessage::Topology(topology) => Payload::Topology(topology.clone()),
+        LayoutMessage::LayoutEdit(edit) => Payload::LayoutEdit(edit.clone()),
+        LayoutMessage::TopologyRequest => Payload::TopologyRequest(wire::TopologyRequest {}),
+        LayoutMessage::TopologyApplied { revision } => {
+            Payload::TopologyApplied(wire::TopologyApplied {
+                revision: *revision,
+            })
+        }
+        LayoutMessage::ActiveLayout(layout) => Payload::ActiveLayout(layout.clone()),
+    };
+    wire::Envelope {
+        major: protocol::limits::PROTOCOL_MAJOR,
+        minor: protocol::limits::PROTOCOL_MINOR,
+        connection_id: connection_id.to_vec(),
+        seq,
+        lease_id: Vec::new(),
+        payload: Some(payload),
+    }
+}
+
 /// The lease id of an envelope, when it carries one.
 pub fn lease_id_of(envelope: &wire::Envelope) -> Result<Option<[u8; 16]>, ConvertError> {
     if envelope.lease_id.is_empty() {
@@ -632,6 +729,10 @@ pub struct PeerInfo {
     pub owner_serial: u64,
     /// `Hello.owner_node_id`.
     pub owner: Option<NodeId>,
+    /// `Hello.topology_revision`: the layout revision this node has *stored* (KVM-072).
+    pub topology_revision: u64,
+    /// `Hello.topology_author`: the author applied together with that revision.
+    pub topology_author: Option<NodeId>,
     /// The capability bits `Hello.capabilities`, in the four flags `focus-router` knows.
     ///
     /// The FSM gates a transition on them — «Preparing → …: receiver не поддержан» uses
@@ -662,6 +763,16 @@ impl PeerInfo {
                         .as_slice()
                         .try_into()
                         .map_err(|_| ConvertError::Unsupported("owner_node_id is not 32 bytes"))?,
+                ))
+            },
+            topology_revision: hello.topology_revision,
+            topology_author: if hello.topology_author.is_empty() {
+                None
+            } else {
+                Some(NodeId::new(
+                    hello.topology_author.as_slice().try_into().map_err(|_| {
+                        ConvertError::Unsupported("topology_author is not 32 bytes")
+                    })?,
                 ))
             },
             capabilities: capabilities_from_wire(&hello.capabilities),
