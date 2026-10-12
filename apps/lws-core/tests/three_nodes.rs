@@ -179,39 +179,49 @@ fn an_offline_node_builds_no_transitions() {
     );
 }
 
-/// (2) `AC-22`: the chain walks two leases with an unchanged owner and no relay.
-#[test]
-fn a_chain_walks_two_leases_without_a_relay() {
-    let _serial = common::serial();
-    let cluster = Cluster::start("three-chain");
-    cluster.wait_mesh(Duration::from_secs(40));
-    let owner = cluster.nodes[0].id.clone();
-
-    // Lease one: `w` -> `a`.
+/// One walk of the chain: `w` -> `a`, release, `w` -> `b`, release.
+///
+/// A switch while `Remote` is the *return* edge (`scenarios.rs::s07`), so the second lease
+/// starts from `Local` — which is exactly the shape of the pending-target walk: the
+/// re-target is applied once the first lease is released.
+fn chain_once(cluster: &Cluster) {
     cluster.switch(0, 1).expect("w switches to a");
     cluster
         .node(1)
-        .wait_for("a is Remote", Duration::from_secs(10), |status| {
+        .wait_for("a is Remote", Duration::from_secs(15), |status| {
             status.focus == "Remote"
         })
-        .expect("a must receive");
-    // The chain re-targets *after* the release, exactly like the pending-target walk: a
-    // switch while `Remote` is the return edge (`scenarios.rs::s07`), so the lease to `b`
-    // starts from `Local`.
-    cluster.switch(0, 1).expect("w returns");
+        .expect("a must receive the first lease");
+    cluster.switch(0, 1).expect("w returns from a");
     cluster
         .node(0)
-        .wait_for("w is Local again", Duration::from_secs(10), |s| s.is_idle())
+        .wait_for("w is Local after a", Duration::from_secs(15), |s| {
+            s.is_idle()
+        })
         .expect("the first lease must be released");
-    // Lease two, straight from the owner: `w` -> `b`. `a` is out of the path, and the
-    // middle node sends no input of its own.
     cluster.switch(0, 2).expect("w switches to b");
     cluster
         .node(2)
-        .wait_for("b is Remote", Duration::from_secs(10), |status| {
+        .wait_for("b is Remote", Duration::from_secs(15), |status| {
             status.focus == "Remote"
         })
-        .expect("b must receive");
+        .expect("b must receive the second lease");
+    cluster.switch(0, 2).expect("w returns from b");
+    for index in [0usize, 2] {
+        cluster
+            .node(index)
+            .wait_for(
+                &format!("node {index} is at rest"),
+                Duration::from_secs(15),
+                |status| status.is_idle(),
+            )
+            .expect("both ends must return to Local");
+    }
+}
+
+/// The chain never relays, and the owner never changes: the two properties `AC-22` is
+/// about, checked after any number of walks.
+fn assert_chain_properties(cluster: &Cluster, owner: &str) {
     let owners = cluster.owners();
     assert!(
         owners.iter().all(|reported| reported == &owner),
@@ -232,17 +242,29 @@ fn a_chain_walks_two_leases_without_a_relay() {
             .any(|(_, line)| line.contains("InputBatch")),
         "the owner must be the one sending input"
     );
-    cluster.switch(0, 2).expect("w returns");
-    cluster
-        .node(0)
-        .wait_for("w is at rest", Duration::from_secs(10), |s| s.is_idle())
-        .expect("w must return to Local");
     cluster.assert_idle();
-    report_switches(&cluster, "chain (fast)");
-    println!("chain: two leases, owner unchanged, no relay through the middle node");
 }
 
-/// The 1000-cycle variant of the chain.
+/// (2) `AC-22`, the fast variant: 200 chain walks with an unchanged owner and no relay.
+#[test]
+fn a_chain_walks_two_leases_without_a_relay() {
+    let _serial = common::serial();
+    let cluster = Cluster::start("three-chain");
+    cluster.wait_mesh(Duration::from_secs(40));
+    let owner = cluster.nodes[0].id.clone();
+    let started = Instant::now();
+    for cycle in 0..200 {
+        chain_once(&cluster);
+        if cycle % 50 == 49 {
+            println!("  {}/200 chain cycles ({:?})", cycle + 1, started.elapsed());
+        }
+    }
+    println!("200 chain cycles in {:?}", started.elapsed());
+    assert_chain_properties(&cluster, &owner);
+    report_switches(&cluster, "chain (200)");
+}
+
+/// (2) `AC-22`, the long variant: 1000 chain walks.
 #[test]
 #[ignore = "1000 chain cycles: cargo test -p lws-core --test three_nodes -- --ignored --nocapture --test-threads=1"]
 fn a_thousand_chain_transitions_keep_the_owner() {
@@ -252,30 +274,7 @@ fn a_thousand_chain_transitions_keep_the_owner() {
     let owner = cluster.nodes[0].id.clone();
     let started = Instant::now();
     for cycle in 0..1000 {
-        cluster.switch(0, 1).expect("switch to a");
-        cluster
-            .node(1)
-            .wait_for("a is Remote", Duration::from_secs(15), |s| {
-                s.focus == "Remote"
-            })
-            .expect("a must receive");
-        cluster.switch(0, 1).expect("return from a");
-        cluster
-            .node(0)
-            .wait_for("w is Local", Duration::from_secs(15), |s| s.is_idle())
-            .expect("the first lease must be released");
-        cluster.switch(0, 2).expect("switch to b");
-        cluster
-            .node(2)
-            .wait_for("b is Remote", Duration::from_secs(15), |s| {
-                s.focus == "Remote"
-            })
-            .expect("b must receive");
-        cluster.switch(0, 2).expect("return");
-        cluster
-            .node(0)
-            .wait_for("w is Local", Duration::from_secs(15), |s| s.is_idle())
-            .expect("w must return");
+        chain_once(&cluster);
         if cycle % 100 == 99 {
             println!(
                 "  {}/1000 chain cycles ({:?})",
@@ -285,19 +284,7 @@ fn a_thousand_chain_transitions_keep_the_owner() {
         }
     }
     println!("1000 chain cycles in {:?}", started.elapsed());
-    let owners = cluster.owners();
-    assert!(
-        owners.iter().all(|reported| reported == &owner),
-        "the owner changed along the chain: {owners:?}"
-    );
-    assert!(
-        cluster.nodes[1]
-            .marked("core -> peer")
-            .iter()
-            .all(|(_, line)| !line.contains("InputBatch")),
-        "the middle node relayed input"
-    );
-    cluster.assert_idle();
+    assert_chain_properties(&cluster, &owner);
     report_switches(&cluster, "chain (1000)");
 }
 
