@@ -26,6 +26,7 @@ mod launch;
 mod session;
 mod takeover;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -121,6 +122,9 @@ fn init_logging() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        // Same rule as core: colour is for a terminal, not for the file or pipe the agent
+        // is usually redirected into (its stderr is often core's).
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
