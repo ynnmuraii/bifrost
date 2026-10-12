@@ -421,6 +421,7 @@ async fn run_async(
             displays_revision: 0,
         },
     );
+    let session_hello = local_hello.clone();
     // The pairing window is served by this node's own link listener, distinguished by ALPN
     // (`docs/05-protocol.md`: `pair/1` on 47901). The gate is the one switch the transport
     // reads; the session owns the window behind it.
@@ -532,6 +533,7 @@ async fn run_async(
         supervisor,
         server,
         node_id,
+        session_hello,
         session.backend,
         trust,
         // The layout document and the pointer gain: what edge-triggered transitions

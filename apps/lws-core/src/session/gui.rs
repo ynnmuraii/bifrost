@@ -188,12 +188,16 @@ impl Session {
                 .iter()
                 .map(|node| ipc::MemberTopology {
                     node_id: hex(&node.node_id),
-                    display_name: node_id_of(&node.node_id)
-                        .and_then(|node| self.trust.get(&node))
-                        .map(|record| record.display_name.clone())
-                        .unwrap_or_default(),
-                    online: node.online,
+                    display_name: if node_id_of(&node.node_id) == Some(self.node_id) {
+                        self.display_name.clone()
+                    } else {
+                        node_id_of(&node.node_id)
+                            .and_then(|node| self.trust.get(&node))
+                            .map(|record| record.display_name.clone())
+                            .unwrap_or_default()
+                    },
                     displays: node.displays.iter().map(display_view).collect(),
+                    online: node.online,
                 })
                 .collect(),
             links: document
@@ -254,8 +258,9 @@ impl Session {
                 answer(&out, request_id, Msg::Status(status)).await;
             }
             Msg::GetTopology(_) => {
+                self.query_agent_displays().await;
                 let doc = self.gui_topology_doc();
-                self.gui_revision = Some(doc.revision);
+                self.gui_topology = Some(doc.clone());
                 answer(&out, request_id, Msg::TopologyDoc(doc)).await;
             }
             Msg::ListPendingEdits(_) => {
@@ -407,10 +412,10 @@ impl Session {
             self.gui_status = Some(status.clone());
             self.publish(Msg::Status(status));
         }
-        let revision = self.layout_state.applied().revision;
-        if self.gui_revision != Some(revision) {
-            self.gui_revision = Some(revision);
-            self.publish(Msg::TopologyDoc(self.gui_topology_doc()));
+        let document = self.gui_topology_doc();
+        if self.gui_topology.as_ref() != Some(&document) {
+            self.gui_topology = Some(document.clone());
+            self.publish(Msg::TopologyDoc(document));
         }
     }
 

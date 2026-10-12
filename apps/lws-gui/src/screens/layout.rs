@@ -39,6 +39,17 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
 
     block(ui, "Компьютеры и их экраны", |ui| {
         actions.extend(pickers(vm, ui));
+        for node in vm
+            .editor
+            .nodes
+            .iter()
+            .filter(|node| node.displays.is_empty())
+        {
+            important(
+                ui,
+                &format!("Служба не получила список мониторов от {}", node.label()),
+            );
+        }
         actions.extend(canvas(vm, ui));
         hint(
             ui,

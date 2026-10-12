@@ -1,13 +1,8 @@
 //! The layout half of the wire: `Inbound::Layout` round trips and stays out of the focus mirror.
 //!
-//! `docs/03-architecture.md` gives the layout document its own messages (`Topology`,
-//! `LayoutEdit`, `TopologyRequest`, `TopologyApplied`, `ActiveLayout`) and the refusals that
-//! go with them (`LAYOUT_CONFLICT`, `INVALID_TOPOLOGY`, `NO_COORDINATOR`). None of them drives
-//! a transition, so none of them belongs in `focus_router::Message`; transport delivers them
-//! beside the mirror, and these tests pin that split: every layout payload comes back out of
-//! `inbound_from_envelope` as `Inbound::Layout`, a focus payload still comes back as
-//! `Inbound::Focus`, and a refusal with a *layout* code is a layout message while any other
-//! `ProtocolError` stays with the FSM.
+//! `docs/03-architecture.md` gives topology, membership display manifests and layout edits
+//! their own messages. None drives a transition, so none belongs in `focus_router::Message`;
+//! transport delivers them beside the mirror, and these tests pin that split.
 
 use protocol::wire;
 use transport::convert::{
@@ -85,6 +80,24 @@ fn every_layout_payload_round_trips() {
     let topology = document();
     let cases = [
         LayoutMessage::Topology(topology.clone()),
+        LayoutMessage::DisplaysChanged {
+            revision: 12,
+            displays: vec![wire::Display {
+                id: "eDP-1".to_owned(),
+                logical_bounds: Some(wire::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                }),
+                native_bounds: None,
+                rotation_degrees: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                primary: true,
+                native_known: false,
+            }],
+        },
         LayoutMessage::LayoutEdit(wire::LayoutEdit {
             expected_revision: 3,
             expected_author: node(1),
