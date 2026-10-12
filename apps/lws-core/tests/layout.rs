@@ -303,6 +303,12 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
         refused.contains("LAYOUT_CONFLICT"),
         "the refusal names the contract's code: {refused}"
     );
+    // And the revision to reload: the editor reloads what the coordinator is on, not what it
+    // happens to have (docs/05-protocol.md, the error table).
+    assert!(
+        refused.contains(&format!("revision {winner} applied")),
+        "the refusal names the applied revision: {refused}"
+    );
     wait_refusal(
         &harness,
         "ERROR_CODE_LAYOUT_CONFLICT",
@@ -424,6 +430,10 @@ fn a_stale_edit_is_refused_with_layout_conflict() {
     assert!(
         rejection.contains("ERR LAYOUT_CONFLICT"),
         "the verdict is the contract's own refusal: {rejection}"
+    );
+    assert!(
+        rejection.contains(&format!("revision {follower_before} applied")),
+        "the refusal tells the editor which revision to reload: {rejection}"
     );
     let refused = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_refusal(

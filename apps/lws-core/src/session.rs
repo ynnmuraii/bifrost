@@ -595,7 +595,9 @@ impl Session {
                             from,
                             protocol::wire::ErrorCode::InvalidTopology,
                             &detail,
-                            // A document push is not a request: there is no id to echo.
+                            // A document push is not a request: there is no id or revision to
+                            // name.
+                            0,
                             0,
                         )
                         .await;
@@ -613,6 +615,7 @@ impl Session {
                         protocol::wire::ErrorCode::NoCoordinator,
                         "this node is not the coordinator",
                         edit.request_nonce,
+                        0,
                     )
                     .await;
                     return;
@@ -683,11 +686,15 @@ impl Session {
                         self.publish_layout(document).await;
                     }
                     crate::layout::EditOutcome::Conflict(current) => {
+                        // The editor cannot reload what it cannot name: the refusal carries the
+                        // revision that is applied now (`docs/05-protocol.md`, the error table:
+                        // «отклонить, показать текущую ревизию и перезагрузить документ»).
                         self.send_layout_error(
                             from,
                             protocol::wire::ErrorCode::LayoutConflict,
                             &format!("expected revision {} is applied", current.revision),
                             edit.request_nonce,
+                            current.revision,
                         )
                         .await;
                     }
@@ -697,6 +704,7 @@ impl Session {
                             protocol::wire::ErrorCode::InvalidTopology,
                             &detail,
                             edit.request_nonce,
+                            0,
                         )
                         .await;
                     }
@@ -706,6 +714,7 @@ impl Session {
                             protocol::wire::ErrorCode::NoCoordinator,
                             "this node is not the coordinator",
                             edit.request_nonce,
+                            0,
                         )
                         .await;
                     }
@@ -725,22 +734,18 @@ impl Session {
             LayoutMessage::Error {
                 code,
                 request_nonce,
+                layout_revision,
             } => {
                 // The editor's answer: `layout show` reports it until a revision moves.
-                self.last_layout_error = Some((
-                    code.as_str_name().to_owned(),
-                    format!("the coordinator refused the edit ({})", code.as_str_name()),
-                ));
-                tracing::warn!(peer = %from, code = code.as_str_name(), "layout edit refused");
+                let detail = refusal_detail(code, layout_revision);
+                self.last_layout_error = Some((code.as_str_name().to_owned(), detail.clone()));
+                tracing::warn!(peer = %from, code = code.as_str_name(), detail, "layout edit refused");
                 self.deliver_layout_verdict(
                     request_nonce,
                     false,
                     ctl::Response::Error {
                         code: layout_refusal_code(code),
-                        detail: format!(
-                            "the coordinator refused the edit ({})",
-                            layout_refusal_code(code)
-                        ),
+                        detail,
                     },
                 );
             }
@@ -861,6 +866,7 @@ impl Session {
         code: protocol::wire::ErrorCode,
         detail: &str,
         request_nonce: u64,
+        layout_revision: u64,
     ) {
         tracing::warn!(peer = %peer, code = code.as_str_name(), detail, "layout refused for a peer");
         // «The last refusal this node saw *or sent*»: a refusal this node emits is as much a
@@ -871,6 +877,7 @@ impl Session {
             transport::convert::LayoutMessage::Error {
                 code,
                 request_nonce,
+                layout_revision,
             },
         )
         .await;
@@ -2089,6 +2096,24 @@ fn layout_refusal_code(code: protocol::wire::ErrorCode) -> String {
         .strip_prefix("ERROR_CODE_")
         .unwrap_or_else(|| code.as_str_name())
         .to_owned()
+}
+
+/// The sentence an editor reads when the coordinator refuses its edit.
+///
+/// A `LAYOUT_CONFLICT` that names the revision the coordinator is on is what «показать текущую
+/// ревизию и перезагрузить документ» (`docs/05-protocol.md`, the error table) asks for: the
+/// editor reloads *that* revision and writes its edit against it.
+fn refusal_detail(code: protocol::wire::ErrorCode, layout_revision: u64) -> String {
+    if code == protocol::wire::ErrorCode::LayoutConflict && layout_revision > 0 {
+        return format!(
+            "the coordinator has revision {layout_revision} applied; reload the document and \
+             reapply"
+        );
+    }
+    format!(
+        "the coordinator refused the edit ({})",
+        layout_refusal_code(code)
+    )
 }
 
 /// What one turn of the loop produced.

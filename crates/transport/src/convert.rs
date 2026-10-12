@@ -177,9 +177,10 @@ pub fn to_envelope(
         } => Payload::Error(wire::ProtocolError {
             related_seq: *related_seq,
             code: code.as_u32() as i32,
-            // The correlation id belongs to the layout arm's `LayoutEdit`; the FSM's errors
-            // have no request to name.
+            // The correlation id and the layout revision belong to the layout arm's
+            // `LayoutEdit`; the FSM's errors have no request to name.
             request_nonce: 0,
+            layout_revision: 0,
         }),
         fr::Message::Shutdown { reason, .. } => Payload::Shutdown(wire::Shutdown {
             reason: reason.as_u32() as i32,
@@ -378,6 +379,9 @@ pub enum LayoutMessage {
         /// The `LayoutEdit.request_nonce` this refuses, or 0 when the refusal answers a
         /// document instead of an edit.
         request_nonce: u64,
+        /// The applied layout revision this refuses an edit against (`LAYOUT_CONFLICT` names
+        /// what the editor must reload to), or 0 when there is none to name.
+        layout_revision: u64,
     },
 }
 
@@ -423,6 +427,7 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
             Ok(code) if is_layout_code(code) => Ok(Inbound::Layout(LayoutMessage::Error {
                 code,
                 request_nonce: error.request_nonce,
+                layout_revision: error.layout_revision,
             })),
             _ => from_envelope(envelope).map(Inbound::Focus),
         },
@@ -469,10 +474,12 @@ pub fn layout_envelope(
         LayoutMessage::Error {
             code,
             request_nonce,
+            layout_revision,
         } => Payload::Error(wire::ProtocolError {
             related_seq: 0,
             code: *code as i32,
             request_nonce: *request_nonce,
+            layout_revision: *layout_revision,
         }),
     };
     wire::Envelope {
