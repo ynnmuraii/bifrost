@@ -104,6 +104,7 @@ fn every_layout_payload_round_trips() {
         LayoutMessage::Error {
             code: wire::ErrorCode::LayoutConflict,
             request_nonce: 7,
+            layout_revision: 5,
         },
     ];
     for case in cases {
@@ -124,11 +125,13 @@ fn layout_refusal_codes_are_layout_messages() {
         assert_eq!(
             round_trip(&LayoutMessage::Error {
                 code,
-                request_nonce: 0
+                request_nonce: 0,
+                layout_revision: 0,
             }),
             LayoutMessage::Error {
                 code,
-                request_nonce: 0
+                request_nonce: 0,
+                layout_revision: 0,
             }
         );
     }
@@ -139,6 +142,7 @@ fn layout_refusal_codes_are_layout_messages() {
         &LayoutMessage::Error {
             code: wire::ErrorCode::NotOwner,
             request_nonce: 0,
+            layout_revision: 0,
         },
         1,
         &CONNECTION,

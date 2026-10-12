@@ -256,6 +256,9 @@ message ProtocolError {
   ErrorCode code = 3;
   uint64 request_nonce = 4;   // echoes LayoutEdit.request_nonce when this refuses an edit;
                               // 0 for every other protocol error
+  uint64 layout_revision = 5; // the applied layout revision when this refuses an edit
+                              // (LAYOUT_CONFLICT names what the editor must reload to);
+                              // 0 for every other protocol error
 }
 message Shutdown {
   reserved 1; reserved "reason_code";
