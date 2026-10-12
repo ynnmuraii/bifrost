@@ -102,7 +102,9 @@ pub use config::{
     pairing_server_config, ring_provider, server_config, server_name, trusted_client_config,
     trusted_server_config, LINK_ALPN,
 };
-pub use drive::{accept_one, bind, dial, open_window, PairError, PairedPeer, PairingDriver};
+pub use drive::{
+    accept_one, accept_stream, bind, dial, open_window, PairError, PairedPeer, PairingDriver,
+};
 pub use key::{
     key_file_of, random16, trust_file_at, IdentityError, IdentityLoad, IdentityPaths, NodeIdentity,
 };

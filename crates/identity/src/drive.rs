@@ -382,9 +382,8 @@ pub async fn accept_one(
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let (tcp, address) = listener.accept().await?;
     let accepted = acceptor.accept(tcp).await.map_err(PairError::Io)?;
-    let stream = Stream::Server(Box::new(accepted));
-    let result = opener_ceremony(
-        stream,
+    let result = accept_stream(
+        accepted,
         identity,
         window,
         Some(address.to_string()),
@@ -393,6 +392,30 @@ pub async fn accept_one(
     .await;
     window.finish();
     result
+}
+
+/// Runs the opener's half of the ceremony on an already-handshaked `pair/1` stream.
+///
+/// This is the acceptor side used when the pairing window is served by the shared link
+/// listener (`crates/transport`, ALPN `lan-workspace/pair/1`): the manager admitted the
+/// dialer through its own gate before the handshake, so this function does **not** call
+/// [`PairingWindow::admit`]/[`PairingWindow::finish`] — it only runs the one
+/// [`opener_ceremony`] body on the stream and the window it is handed.
+pub async fn accept_stream(
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    identity: &NodeIdentity,
+    window: &PairingWindow,
+    address: Option<String>,
+    listen_port: u16,
+) -> Result<PairingDriver, PairError> {
+    opener_ceremony(
+        Stream::Server(Box::new(stream)),
+        identity,
+        window,
+        address,
+        listen_port,
+    )
+    .await
 }
 
 /// Dials a window opener and runs the dialer's half of the ceremony.

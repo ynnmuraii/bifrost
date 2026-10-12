@@ -81,6 +81,7 @@ async fn spawn_node(
         queue_capacity: 64,
         liveness: LinkLiveness::default(),
         backoff: BackoffBounds::default(),
+        pairing: Default::default(),
     };
     let (manager, events) = LinkManager::new(config).expect("manager");
     let manager = Arc::new(manager);
@@ -111,6 +112,8 @@ async fn spawn_node(
                 LinkEvent::Down { peer, reason } => {
                     println!("  [{label}] link down with {peer}: {reason:?}")
                 }
+                // The demo opens no pairing window, so this never arrives.
+                LinkEvent::Pairing(_) => {}
             }
         }
     });

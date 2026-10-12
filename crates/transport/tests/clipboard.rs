@@ -132,6 +132,7 @@ async fn spawn_node(
         queue_capacity: 64,
         liveness: LIVENESS,
         backoff: BackoffBounds::default(),
+        pairing: Default::default(),
     };
     let (manager, events) = LinkManager::new(config).expect("manager");
     let manager = Arc::new(manager);

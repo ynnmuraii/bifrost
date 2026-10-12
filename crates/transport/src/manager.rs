@@ -12,19 +12,21 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use focus_router as fr;
 use geometry::NodeId;
 use identity::{peer_node_id, trust::TrustStore, NodeIdentity};
-use protocol::wire;
+use protocol::{limits, wire};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
 use crate::convert::PeerInfo;
 use crate::link::{
     Direction, LinkConfig, LinkDownReason, LinkEvent, LinkHandle, LinkReport, Stream,
 };
+use crate::pairing::{PairingConnection, PairingGate};
 use crate::policy;
 use crate::TransportError;
 
@@ -50,6 +52,33 @@ pub struct ManagerConfig {
     /// The reconnect backoff bounds: `network.reconnect_backoff_ms` from the application's
     /// configuration.
     pub backoff: policy::BackoffBounds,
+    /// The pairing window the listener may serve on `47901` by ALPN (`pair/1`); closed by
+    /// default, so no unknown peer reaches the listener until the application opens it.
+    pub pairing: PairingGate,
+}
+
+/// A monotonic millisecond clock.
+///
+/// `crates/transport` has no clock helper, and the pairing window is bounded in milliseconds
+/// (`docs/05-protocol.md`: «окно сопряжения … на 120 s»), so the manager keeps its own
+/// `Instant` origin — the same idiom `apps/lws-core/src/session.rs` uses. A monotonic origin
+/// means the window never jumps with the wall clock.
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    origin: Instant,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+
+    /// Milliseconds since the origin.
+    fn now_ms(&self) -> u64 {
+        Instant::now().duration_since(self.origin).as_millis() as u64
+    }
 }
 
 /// What the manager keeps per live link.
@@ -100,6 +129,8 @@ pub struct LinkManager {
     messages_rx: Mutex<mpsc::Receiver<ManagerMessage>>,
     events_tx: mpsc::Sender<LinkEvent>,
     inner: Arc<Mutex<Inner>>,
+    /// The monotonic origin the pairing window's millisecond deadline is measured against.
+    clock: Clock,
 }
 
 #[derive(Default)]
@@ -126,6 +157,7 @@ impl LinkManager {
                 messages_rx: Mutex::new(messages_rx),
                 events_tx,
                 inner: Arc::new(Mutex::new(Inner::default())),
+                clock: Clock::new(),
             },
             events_rx,
         ))
@@ -169,9 +201,13 @@ impl LinkManager {
 
     /// Runs until the process ends: listens, dials, dedups, supervises.
     pub async fn run(&self) -> Result<(), TransportError> {
-        let server_config =
-            identity::trusted_server_config(&self.config.identity, &self.config.trust)?;
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        // The two server configs the one listener chooses between, told apart by the ALPN
+        // the ClientHello offers (`docs/05-protocol.md`: `pair/1` shares `47901`).
+        let link_config = Arc::new(identity::trusted_server_config(
+            &self.config.identity,
+            &self.config.trust,
+        )?);
+        let pairing_config = Arc::new(identity::pairing_server_config(&self.config.identity)?);
         let listener = bind_listener(self.config.listen).await?;
         let local_hello = self.config.local_hello.clone();
         let local = self.config.identity.node_id();
@@ -197,12 +233,28 @@ impl LinkManager {
                 accepted = listener.accept() => {
                     let (tcp, address) = accepted?;
                     let messages = self.messages_tx.clone();
+                    let events = self.events_tx.clone();
                     let identity = Arc::clone(&self.config.identity);
-                    let acceptor = acceptor.clone();
+                    let link_config = Arc::clone(&link_config);
+                    let pairing_config = Arc::clone(&pairing_config);
+                    let gate = self.config.pairing.clone();
                     let hello = local_hello.clone();
+                    let clock = self.clock;
                     tokio::spawn(async move {
-                        accept_one(acceptor, tcp, address, identity, hello, messages, settings)
-                            .await;
+                        serve_connection(
+                            tcp,
+                            address,
+                            identity,
+                            link_config,
+                            pairing_config,
+                            gate,
+                            events,
+                            hello,
+                            messages,
+                            settings,
+                            clock,
+                        )
+                        .await;
                     });
                 }
                 message = async { self.messages_rx.lock().await.recv().await } => {
@@ -439,20 +491,79 @@ fn set_exclusive_address_use(socket: &socket2::Socket) -> std::io::Result<()> {
     }
 }
 
-async fn accept_one(
-    acceptor: TlsAcceptor,
+/// Serves one accepted TCP connection: peeks the ClientHello and picks the TLS config by
+/// ALPN (`docs/05-protocol.md`: `pair/1` shares `47901`).
+///
+/// A `pair/1` ClientHello is admitted through the gate and only then handshaked with
+/// [`identity::pairing_server_config`] (unknown peers allowed); `LinkEvent::Pairing` hands
+/// the connection to the application, which runs [`identity::accept_stream`]. With no window
+/// open (or a spent or expired one — [`PairingGate::admit`] decides) the connection is
+/// dropped *before* the handshake: that is the documented refusal, and the client sees the
+/// socket close instead of a `PairHello`.
+///
+/// Everything else — `input/1`, `clipboard/1`, no ALPN — completes the handshake with the
+/// pinned link config and takes the existing [`accept_one`] path, so an unknown peer on
+/// `input/1` is still refused by the pin.
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection(
     tcp: TcpStream,
     address: SocketAddr,
+    identity: Arc<NodeIdentity>,
+    link_config: Arc<rustls::ServerConfig>,
+    pairing_config: Arc<rustls::ServerConfig>,
+    gate: PairingGate,
+    events: mpsc::Sender<LinkEvent>,
+    hello: wire::Hello,
+    messages: mpsc::Sender<ManagerMessage>,
+    settings: LinkSettings,
+    clock: Clock,
+) {
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp);
+    let start = match acceptor.await {
+        Ok(start) => start,
+        Err(_) => return,
+    };
+    let wants_pairing = start
+        .client_hello()
+        .alpn()
+        .is_some_and(|mut alpn| alpn.any(|protocol| protocol == limits::ALPN_PAIR.as_bytes()));
+
+    if wants_pairing {
+        // Resolve the gate before the handshake: an error here is the documented refusal.
+        let window = match gate.admit(clock.now_ms()) {
+            Ok(window) => window,
+            Err(_reason) => return,
+        };
+        let stream = match start.into_stream(pairing_config).await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        let _ = events
+            .send(LinkEvent::Pairing(Box::new(PairingConnection {
+                stream,
+                address,
+                window,
+            })))
+            .await;
+        return;
+    }
+
+    let stream = match start.into_stream(link_config).await {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+    accept_one(stream, identity, hello, messages, settings).await;
+}
+
+/// Runs the pinned link path on an already-handshaked stream: reads the peer `node_id` from
+/// its certificate and spawns the link.
+async fn accept_one(
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
     identity: Arc<NodeIdentity>,
     hello: wire::Hello,
     messages: mpsc::Sender<ManagerMessage>,
     settings: LinkSettings,
 ) {
-    let _ = address;
-    let stream = match acceptor.accept(tcp).await {
-        Ok(stream) => stream,
-        Err(_) => return,
-    };
     let peer = match stream
         .get_ref()
         .1
