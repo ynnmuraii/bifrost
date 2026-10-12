@@ -842,12 +842,27 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
     let identity_b = Arc::new(identity_at(&root, "b"));
     let (id_a, id_b) = (identity_a.node_id(), identity_b.node_id());
 
+    // Only the *smaller* id dials at formation, so the live link is the one it dialled and its
+    // initiator is the smaller of the two. The larger node then dials second, and its initiator
+    // beats the live one — that comparison is what replaces a link. (With both sides dialing at
+    // formation the larger id's link wins on both ends and nothing can beat it, so no
+    // replacement could happen at all.)
+    let dial_a: Vec<SocketAddr> = if id_a < id_b {
+        vec![address_b]
+    } else {
+        Vec::new()
+    };
+    let dial_b: Vec<SocketAddr> = if id_a < id_b {
+        Vec::new()
+    } else {
+        vec![address_a]
+    };
     let mut a = spawn_node(
         "a",
         Arc::clone(&identity_a),
         address_a,
         &[(id_b, address_b)],
-        &[address_b],
+        &dial_a,
         3,
     )
     .await;
@@ -856,7 +871,7 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
         Arc::clone(&identity_b),
         address_b,
         &[(id_a, address_a)],
-        &[address_a],
+        &dial_b,
         3,
     )
     .await;
@@ -866,10 +881,9 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
     while a.events.try_recv().is_ok() {}
     while b.events.try_recv().is_ok() {}
 
-    // `prefer_incoming` keeps the larger initiator, so a second dial from the *other* node wins
-    // against a link this node dialed — and loses against one the peer dialed. Dial second from
-    // the side that wins, and watch that side.
-    let dial_second_from_b = policy::prefer_incoming(&id_a, &id_b);
+    // The second dial comes from the *larger* id, and it is the smaller id that watches: its
+    // live link is the one that gets replaced.
+    let dial_second_from_b = id_b > id_a;
     let (watch_a, second_identity, peer_id, peer_address) = if dial_second_from_b {
         (true, Arc::clone(&identity_b), id_a, address_a)
     } else {
@@ -944,4 +958,131 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
     second_runner.abort();
     drain.abort();
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A second link in the *same* direction must not evict the live one.
+///
+/// The manager keyed its link maps by `(peer, direction)`, and that pair is not unique: a peer
+/// that dials twice is two links in one direction — the late-redial case, and the
+/// simultaneous-dial case when one side's dial arrives after the other's. The newcomer loses
+/// [`policy::prefer_incoming`] (two dials from the same node tie, and a tie goes to the existing
+/// link) and the manager closed it; its `Down` then matched the *live* link's direction and
+/// evicted the live entry from the member list, so the application was told that a link which
+/// was still up had gone down. Links are keyed by the key the manager hands each one now, so a
+/// report can only ever change the state of the link that sent it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_link_in_the_same_direction_cannot_evict_the_live_one() {
+    let root = temp_root("same-direction");
+    let address_a = free_address().await;
+    let address_b = free_address().await;
+    let identity_a = Arc::new(identity_at(&root, "a"));
+    let identity_b = Arc::new(identity_at(&root, "b"));
+    let (id_a, id_b) = (identity_a.node_id(), identity_b.node_id());
+
+    let mut a = spawn_node(
+        "a",
+        Arc::clone(&identity_a),
+        address_a,
+        &[(id_b, address_b)],
+        &[address_b],
+        3,
+    )
+    .await;
+    let mut b = spawn_node(
+        "b",
+        Arc::clone(&identity_b),
+        address_b,
+        &[(id_a, address_a)],
+        &[address_a],
+        3,
+    )
+    .await;
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+    // Formation's own events are not this test's subject.
+    while a.events.try_recv().is_ok() {}
+    while b.events.try_recv().is_ok() {}
+
+    // The link that survives a simultaneous dial is the one the *larger* node id dialled
+    // (`prefer_incoming` keeps the larger initiator), so a second dial from that same node ties
+    // and loses — deterministically, whichever ids the test happened to generate. Dial again
+    // from the larger id and watch the other node: its live link is the one the newcomer's
+    // `Down` must not touch.
+    let (second_identity, watch_b) = if id_a > id_b {
+        (Arc::clone(&identity_a), true)
+    } else {
+        (Arc::clone(&identity_b), false)
+    };
+    let (watched_id, watched_address) = if watch_b {
+        (id_b, address_b)
+    } else {
+        (id_a, address_a)
+    };
+
+    let mut trust = TrustStore::new();
+    trust.trust(TrustedPeer::paired(
+        watched_id,
+        "peer",
+        Some(watched_address.to_string()),
+        now_unix_ms(),
+    ));
+    let second_id = second_identity.node_id();
+    let (second, mut second_events) = LinkManager::new(ManagerConfig {
+        identity: second_identity,
+        trust,
+        local_hello: hello_for(second_id, "second"),
+        listen: free_address().await,
+        peers: vec![watched_address],
+        max_members: 3,
+        queue_capacity: 64,
+        liveness: LIVENESS,
+        backoff: BackoffBounds::default(),
+        pairing: transport::PairingGate::closed(),
+    })
+    .expect("the second manager");
+    let second = Arc::new(second);
+    let second_runner = {
+        let second = Arc::clone(&second);
+        tokio::spawn(async move {
+            let _ = second.run().await;
+        })
+    };
+    // Its own events must be drained or its sends block.
+    let drain = tokio::spawn(async move { while second_events.recv().await.is_some() {} });
+
+    // The newcomer is closed as soon as its `Up` loses, and its `Down` arrives right after —
+    // that is the report that used to be attributed to the live link. The window is short on
+    // purpose: far longer than that round trip, far shorter than the 3 s liveness window, so a
+    // loaded box cannot make the *live* link fail inside it and confuse the two.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let downs: Vec<LinkDownReason> = {
+        let events = if watch_b {
+            &mut b.events
+        } else {
+            &mut a.events
+        };
+        let mut reasons = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let LinkEvent::Down { reason, .. } = event {
+                reasons.push(reason);
+            }
+        }
+        reasons
+    };
+    let watched = if watch_b { &b } else { &a };
+    let still_a_member = wait_for_members(watched, 1, FORM_TIMEOUT).await;
+
+    second_runner.abort();
+    drain.abort();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        downs.is_empty(),
+        "a closed newcomer in the live link's direction must not be reported as its `Down`: \
+         {downs:?}"
+    );
+    assert!(
+        still_a_member,
+        "the live link must stay a member while a same-direction newcomer is refused"
+    );
 }
