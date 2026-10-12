@@ -40,7 +40,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use input_model::{CaptureKind, HidKey, InputEvent, KeyState, MouseButton, Position};
+use input_model::{CaptureKind, HidKey, InputEvent, KeyState, MouseButton, Position, RepeatFilter};
 use platform_probe::SessionInfo;
 use platform_wayland::{
     compositor_signature, portal_versions, Barrier, BarrierID, BarrierPosition, CapturedEvent,
@@ -92,6 +92,9 @@ pub struct Wayland {
     pending: VecDeque<Event>,
     pressed_keys: HashSet<(u16, u16)>,
     pressed_buttons: HashSet<MouseButton>,
+    /// Source-side autorepeat filter (KVM-036): EIS repeats a held key on the compositor's
+    /// own schedule, and those repeats must not reach the wire.
+    repeats: RepeatFilter,
 }
 
 impl Wayland {
@@ -218,6 +221,7 @@ impl Wayland {
             pending,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            repeats: RepeatFilter::new(),
         };
         Ok((wayland, ready, refusals))
     }
@@ -288,6 +292,9 @@ impl Wayland {
         }
         self.buffered.clear();
         self.pending.clear();
+        // The keys held now are released locally; their ups never reach the filter, and a
+        // stale pressed set would eat the next real press (KVM-036).
+        self.repeats.clear();
         self.mode = Mode::Observe;
 
         if let Some(capture) = self.capture.as_mut() {
@@ -520,6 +527,14 @@ impl Wayland {
     async fn map_event(&mut self, event: CapturedEvent) -> Option<Event> {
         match event {
             CapturedEvent::Input(input) => {
+                // EIS carries no per-event repeat flag, so the pressed-set rule decides
+                // (KVM-036): a down for a key already held is the compositor repeating it.
+                // Dropped for every mode, so a buffered replay cannot re-send a repeat
+                // either.
+                if self.repeats.is_repeat(&input, false) {
+                    tracing::trace!(?input, "dropping an OS autorepeat");
+                    return None;
+                }
                 if self.mode == Mode::Remote {
                     Some(Event::Input(input))
                 } else {
