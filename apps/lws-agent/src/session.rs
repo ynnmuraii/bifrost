@@ -706,13 +706,16 @@ async fn send_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
     change: ClipboardChange,
 ) -> anyhow::Result<()> {
     let bytes = change.text.len();
-    if bytes as u64 > clipboard::MAX_BYTES {
-        // 32 chunks of 32 KiB is the framing, so anything larger has no wire form at all:
-        // reported and dropped rather than sent truncated.
+    // The 1 MiB limit is *core's* policy — it is the side that can answer `CLIPBOARD_TOO_LARGE`
+    // and that knows `[clipboard].max_bytes` — so a copy over it is still reported. What the
+    // agent owns is the framing: `MAX_CHUNKS` frames of `CHUNK_BYTES` each, beyond which the
+    // payload has no wire form at all and is dropped rather than sent truncated.
+    let ceiling = clipboard_wire::MAX_CHUNKS as usize * clipboard_wire::CHUNK_BYTES;
+    if bytes > ceiling {
         tracing::warn!(
             bytes,
-            limit = clipboard::MAX_BYTES,
-            "clipboard payload over the 1 MiB protocol limit; not offering it"
+            limit = ceiling,
+            "clipboard payload beyond the IPC framing ceiling; not offering it"
         );
         return Ok(());
     }
@@ -1165,12 +1168,12 @@ mod tests {
             "a refused transfer does not move the version"
         );
 
-        // `chunk_count` outside `1..=32` is refused before anything is buffered.
+        // `chunk_count` outside `1..=64` is refused before anything is buffered.
         harness
             .send(Msg::SetClipboardText(ipc::SetClipboardText {
                 origin_version: 9,
                 chunk_index: 0,
-                chunk_count: 33,
+                chunk_count: crate::clipboard_wire::MAX_CHUNKS + 1,
                 data: b"x".to_vec(),
                 sha256: Vec::new(),
             }))
@@ -1288,11 +1291,16 @@ mod tests {
         }
     }
 
-    /// A payload over the protocol's 1 MiB limit has no wire form, so it is reported and
-    /// dropped rather than sent truncated.
+    /// Two different ceilings, deliberately: a payload over the *policy's* 1 MiB is reported
+    /// anyway (core is the side that answers `CLIPBOARD_TOO_LARGE`, and it knows
+    /// `[clipboard].max_bytes`), while one beyond the *framing* ceiling — `MAX_CHUNKS` frames
+    /// of `CHUNK_BYTES` each — has no wire form at all and is dropped rather than truncated.
     #[tokio::test]
-    async fn a_payload_over_the_limit_is_dropped_instead_of_truncated() {
+    async fn the_policy_limit_is_reported_and_the_framing_ceiling_is_dropped() {
         let mut harness = Harness::new().await;
+
+        // 1 MiB + 1: over the policy, inside the framing. It goes out whole, so core can name
+        // the refusal.
         send_clipboard_change(
             &mut harness.agent,
             &mut harness.clipboard,
@@ -1302,9 +1310,29 @@ mod tests {
             },
         )
         .await
+        .expect("reporting it is not an error");
+        match harness.recv().await {
+            Msg::ClipboardChanged(changed) => {
+                assert_eq!(changed.origin_version, 1);
+                assert_eq!(changed.size_bytes, clipboard::MAX_BYTES + 1);
+                assert_eq!(changed.chunk_count, 33);
+            }
+            other => panic!("expected ClipboardChanged, got {other:?}"),
+        }
+
+        // Beyond the framing ceiling: nothing is numbered, so the next change is version 2.
+        let ceiling = clipboard_wire::MAX_CHUNKS as usize * clipboard_wire::CHUNK_BYTES;
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                text: "x".repeat(ceiling + 1),
+                markers: Vec::new(),
+            },
+        )
+        .await
         .expect("dropping it is not an error");
         harness.quiet().await;
-        // Nothing was numbered, so the next change is still the first version.
         send_clipboard_change(
             &mut harness.agent,
             &mut harness.clipboard,
@@ -1316,7 +1344,7 @@ mod tests {
         .await
         .expect("the frame goes out");
         match harness.recv().await {
-            Msg::ClipboardChanged(changed) => assert_eq!(changed.origin_version, 1),
+            Msg::ClipboardChanged(changed) => assert_eq!(changed.origin_version, 2),
             other => panic!("expected ClipboardChanged, got {other:?}"),
         }
     }

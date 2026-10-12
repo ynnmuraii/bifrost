@@ -261,6 +261,9 @@ impl Node {
     pub fn copy_to_clipboard(&self, text: &str) {
         let dir = self.dry_clipboard_dir();
         std::fs::create_dir_all(&dir).expect("dry clipboard directory");
+        // A plain copy is plain: the markers belong to one copy, so a file left behind by an
+        // earlier `copy_to_clipboard_marked` must not leak into this one.
+        let _ = std::fs::remove_file(dir.join("in.markers"));
         std::fs::write(dir.join("in.txt"), text).expect("dry clipboard in.txt");
     }
 
