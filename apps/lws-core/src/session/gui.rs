@@ -547,12 +547,22 @@ impl Session {
         let identity = Arc::clone(&self.identity);
         let events = self.pairing_events_tx.clone();
         let local_fingerprint = self.local_fingerprint();
+        // What the other computer's prompt and trust record will show for this node.
+        let display_name = self.display_name.clone();
         // The port this node listens on, which the opener records as *this* node's address
         // (`PairHello.listen_port`): the dialer's source port is ephemeral.
         let listen_port = self.listen.port();
         let answer = self.pairing.reserve();
         tokio::spawn(async move {
-            match identity::dial(parsed, &identity, crate::pair::WINDOW, listen_port).await {
+            match identity::dial(
+                parsed,
+                &identity,
+                crate::pair::WINDOW,
+                listen_port,
+                &display_name,
+            )
+            .await
+            {
                 Ok(driver) => {
                     pairing::run(driver, answer, false, local_fingerprint, events).await;
                 }
@@ -579,6 +589,7 @@ impl Session {
         let identity = Arc::clone(&self.identity);
         let events = self.pairing_events_tx.clone();
         let local_fingerprint = self.local_fingerprint();
+        let display_name = self.display_name.clone();
         let listen_port = self.listen.port();
         let window = connection.window.clone();
         let address = connection.address.to_string();
@@ -589,6 +600,7 @@ impl Session {
                 &window,
                 Some(address),
                 listen_port,
+                &display_name,
             )
             .await
             {

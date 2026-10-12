@@ -177,10 +177,9 @@ fn the_gui_endpoint_answers_and_pushes_the_status() {
     assert_eq!(status.members.len(), 1, "one peer is linked: {status:?}");
     assert!(status.members[0].online);
     // `Status.members[].display_name` comes from the trust record, and that record's name is
-    // what the pairing ceremony read from `PairHello` — which `identity::drive` fills with the
-    // constant "lan-workspace" (KNOWN DEFECT, reported: the configured `node.display_name` is
-    // never advertised). The assertion is what the code honestly produces today.
-    assert!(!status.members[0].display_name.is_empty());
+    // what the pairing ceremony read from the peer's `PairHello` — the configured
+    // `node.display_name`, which this harness sets to "receiver" for the other node.
+    assert_eq!(status.members[0].display_name, "receiver");
     assert!(status.connected);
     // The backend is this build's own session decision, so it is asserted by shape and not by
     // a name only one host could produce.
@@ -423,12 +422,10 @@ fn the_pairing_wizard_pairs_two_cores_over_the_gui_endpoint() {
         left.sas_code
     );
     assert_eq!(left.attempt_id, right.attempt_id);
-    // KNOWN DEFECT (reported, not hidden): `identity::drive` hardcodes `PairHello.display_name`
-    // as "lan-workspace" instead of the node's configured name, so every prompt shows that word
-    // for every peer. The assertion is what the code can honestly promise today; the GUI shows
-    // the same string it is given.
-    assert!(!left.peer_name.is_empty());
-    assert_eq!(left.peer_name, right.peer_name);
+    // `Unpaired` names the two nodes "left" and "right" (`common::write_config`), and each
+    // prompt shows the *other* computer's configured name — not a constant.
+    assert_eq!(left.peer_name, "right");
+    assert_eq!(right.peer_name, "left");
     assert_ne!(left.local_fingerprint, left.peer_fingerprint);
 
     // 6. Both users confirm. Neither window can wait for its own answer before the other
@@ -463,15 +460,21 @@ fn the_pairing_wizard_pairs_two_cores_over_the_gui_endpoint() {
     });
     assert_eq!(closed.seconds_remaining, 0);
 
-    for (root, peer_id, what) in [
-        (&two.a.root, &two.b_id, "the opener"),
-        (&two.b.root, &two.a_id, "the dialer"),
+    for (root, peer_id, peer_name, what) in [
+        (&two.a.root, &two.b_id, "right", "the opener"),
+        (&two.b.root, &two.a_id, "left", "the dialer"),
     ] {
         let trust = std::fs::read_to_string(root.join("config/trust.toml")).expect("trust.toml");
         assert!(
             trust.contains(peer_id),
             "{what} must hold {} in trust.toml:\n{trust}",
             peer_id
+        );
+        // The name the record keeps is the peer's configured one, which is what `Status`
+        // lists and what the settings screen names when it offers to revoke.
+        assert!(
+            trust.contains(&format!("display_name = \"{peer_name}\"")),
+            "{what} must record the peer's own name ({peer_name}):\n{trust}"
         );
     }
     // The address each side remembered is the other's listener, which is what a restart needs

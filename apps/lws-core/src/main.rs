@@ -512,6 +512,7 @@ async fn run_async(
         Arc::clone(&identity),
         paths.clone(),
         listen,
+        config.node.display_name.clone(),
         config.input.emergency_hotkey.clone(),
         session.capabilities,
         pairing_gate,

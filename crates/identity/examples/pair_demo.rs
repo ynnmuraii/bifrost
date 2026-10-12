@@ -90,8 +90,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hex(&window.attempt_id()[..4])
     );
 
-    let server = accept_one(&listener, &identity_a, &mut window, 0, 47901);
-    let client = dial(address, &identity_b, Duration::from_secs(120), 47901);
+    let server = accept_one(
+        &listener,
+        &identity_a,
+        &mut window,
+        0,
+        47901,
+        "workstation-a",
+    );
+    let client = dial(
+        address,
+        &identity_b,
+        Duration::from_secs(120),
+        47901,
+        "laptop-b",
+    );
     let (driver_a, driver_b) = tokio::try_join!(server, client)?;
 
     println!("SAS on A: {}", driver_a.sas());
