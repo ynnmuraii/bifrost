@@ -393,6 +393,10 @@ async fn run_async(
         // The portal tokens core ships to the agent: `portal-restore.toml`, which only
         // a Wayland session ever fills (`docs/03-architecture.md`).
         portal::PortalGrants::load(paths.portal_restore_file()),
+        crate::agent::TakeoverSettings {
+            detection: takeover_detection(&config),
+            threshold_px: config.input.takeover_threshold_px,
+        },
     );
     // The layout document is assembled by the session (`Session::rebuild_topology`), which
     // is also where it is rebuilt when the agent reports its displays; doing it here as well
@@ -548,7 +552,15 @@ fn decide_session(config: &config::Config) -> LocalSession {
     };
     match platform_probe::decide(&snapshot, requested) {
         Ok(session) => LocalSession {
-            capabilities: session.capabilities,
+            // `input.takeover_detection = "off"` turns the detector off, and a capability is
+            // a promise about behaviour: without a detector the node must not claim
+            // `RECEIVER_TAKEOVER` (AC-13). `evdev` keeps the native detector on Windows and
+            // X11 and is refused on a portal receiver, which never claims it anyway.
+            capabilities: platform_probe::Capabilities {
+                receiver_takeover: session.capabilities.receiver_takeover
+                    && config.input.takeover_detection != config::TakeoverDetection::Off,
+                ..session.capabilities
+            },
             fsm: focus_router::Capabilities {
                 capture: session.capabilities.capture,
                 inject: session.capabilities.inject,
@@ -567,6 +579,15 @@ fn decide_session(config: &config::Config) -> LocalSession {
                 backend: String::new(),
             }
         }
+    }
+}
+
+/// `[input].takeover_detection` in IPC terms.
+fn takeover_detection(config: &config::Config) -> protocol::ipc::TakeoverDetection {
+    match config.input.takeover_detection {
+        config::TakeoverDetection::Auto => protocol::ipc::TakeoverDetection::Auto,
+        config::TakeoverDetection::Evdev => protocol::ipc::TakeoverDetection::Evdev,
+        config::TakeoverDetection::Off => protocol::ipc::TakeoverDetection::Off,
     }
 }
 

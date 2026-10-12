@@ -51,6 +51,20 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The agent process and its channel.
+/// The receiver-takeover settings the agent needs (KVM-035).
+///
+/// They travel in `AgentAttach` because the agent has no config of its own: core reads
+/// `[input]` and hands over the decision, and the agent still checks its environment
+/// (`takeover_detection = "off"` is honoured here as well, so a stale attach cannot arm a
+/// detector).
+#[derive(Debug, Clone, Copy)]
+pub struct TakeoverSettings {
+    /// `[input].takeover_detection`.
+    pub detection: ipc::TakeoverDetection,
+    /// `[input].takeover_threshold_px`.
+    pub threshold_px: u32,
+}
+
 pub struct Supervisor {
     program: PathBuf,
     /// Directory for the per-launch token file (user-only).
@@ -65,6 +79,8 @@ pub struct Supervisor {
     backend_override: ipc::BackendKind,
     require_emergency_hotkey: bool,
     core_silence_ms: u32,
+    /// `[input].takeover_detection` / `.takeover_threshold_px`, sent in every `AgentAttach`.
+    takeover: TakeoverSettings,
     /// Portal restore tokens, persisted in `portal-restore.toml` and shipped in
     /// `AgentAttach.restore_tokens`; new ones arrive back as `PortalGrantChanged`.
     portal: crate::portal::PortalGrants,
@@ -92,6 +108,7 @@ impl Supervisor {
         require_emergency_hotkey: bool,
         core_silence_ms: u32,
         portal: crate::portal::PortalGrants,
+        takeover: TakeoverSettings,
     ) -> Self {
         Supervisor {
             program,
@@ -105,6 +122,7 @@ impl Supervisor {
             require_emergency_hotkey,
             core_silence_ms,
             portal,
+            takeover,
             launches: 0,
             child: None,
             job: None,
@@ -201,6 +219,8 @@ impl Supervisor {
             self.core_silence_ms,
             self.require_emergency_hotkey,
             self.portal.to_ipc(),
+            self.takeover.detection,
+            self.takeover.threshold_px,
         );
         if let Err(error) = link.attach(attach).await {
             self.stop().await;
@@ -516,6 +536,10 @@ mod launch_tests {
             true,
             300,
             crate::portal::PortalGrants::default(),
+            TakeoverSettings {
+                detection: ipc::TakeoverDetection::Auto,
+                threshold_px: 12,
+            },
         );
         assert_eq!(
             supervisor.state(),

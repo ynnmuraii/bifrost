@@ -159,6 +159,9 @@ pub fn release_keys(
 }
 
 /// `AgentAttach`: the first frame, and the only place the launch token travels.
+// One parameter per `AgentAttach` field: the function is the message, and grouping them
+// would only hide which field a caller forgot.
+#[allow(clippy::too_many_arguments)]
 pub fn attach(
     launch_token: Vec<u8>,
     mode: ipc::AgentMode,
@@ -167,6 +170,8 @@ pub fn attach(
     core_silence_ms: u32,
     require_emergency_hotkey: bool,
     restore_tokens: Vec<ipc::PortalGrant>,
+    takeover_detection: ipc::TakeoverDetection,
+    takeover_threshold_px: u32,
 ) -> ipc::AgentAttach {
     ipc::AgentAttach {
         launch_token,
@@ -178,6 +183,8 @@ pub fn attach(
         restore_tokens,
         require_emergency_hotkey,
         core_silence_ms,
+        takeover_detection: takeover_detection as i32,
+        takeover_threshold_px,
     }
 }
 

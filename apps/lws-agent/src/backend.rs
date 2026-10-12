@@ -52,6 +52,19 @@ pub enum Backend {
     Wayland(Box<wayland::Wayland>),
 }
 
+/// Whether and how this backend watches the machine for physical input while it is a
+/// receiver, and the threshold it watches for (KVM-035).
+///
+/// `None` is `[input].takeover_detection = "off"`: no detector, no `LocalInputDetected`,
+/// and the node must not claim `CAPABILITY_RECEIVER_TAKEOVER` (AC-13). The plan exists
+/// only on a backend that can tell physical input from synthetic input, which on this
+/// build means Windows and X11 — a portal receiver cannot see its own devices (AC-13a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TakeoverPlan {
+    /// `[input].takeover_threshold_px`.
+    pub threshold_px: u32,
+}
+
 /// What the agent reports in `AgentReady` right after the attach.
 #[derive(Debug, Clone)]
 pub struct Ready {
@@ -90,12 +103,22 @@ pub enum Event {
     /// X11 backend reads from the X connection and has no equivalent signal.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     QueueOverflow,
+    /// A human touched this machine while a lease was injecting here: the receiver
+    /// takeover of rule 9 (`docs/03-architecture.md`: «физическое (не XTest/не injected)
+    /// событие при активном inject → `LocalInputDetected`. Agent сам освобождает ledger»).
+    ///
+    /// Raised by [`crate::takeover::Detector`] from an observe-only capture, which is the
+    /// only path that sees the machine's own keyboard and mouse while the agent is a
+    /// receiver (KVM-035). `reason` is for the log; the wire frame carries the lease id.
+    LocalTakeover {
+        /// `key` / `button` / `motion`.
+        reason: &'static str,
+        /// The distance motion accumulated, when the reason is `motion`.
+        distance_px: Option<f64>,
+    },
     /// The capture path failed or lost its session; the agent ends capture and reports
     /// it to core with `code` (`AgentError.code`: `CAPTURE_FAILED`, `PORTAL_DENIED`,
     /// `PORTAL_SESSION_LOST`, `PORTAL_FRONTEND_STUCK`, …).
-    ///
-    /// Receiver takeover (`LocalInputDetected`, rule 9) still has no signal in any
-    /// backend — KVM-035 adds it together with the detector that raises it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Failed {
         /// The `AgentError.code` core should see.
@@ -210,6 +233,62 @@ impl Ready {
     }
 }
 
+/// Decides whether this session runs a receiver-takeover detector, from `[input]` and the
+/// session the probe chose.
+///
+/// `docs/03-architecture.md`, «Takeover на получателе»: the detector exists where the
+/// backend can tell physical input from synthetic input — Windows (low-level hooks drop the
+/// OS injected flag and our `dwExtraInfo` tag) and X11 (raw events from an XTEST slave are
+/// dropped) — and a portal receiver cannot, which is AC-13a's «автоматический takeover не
+/// объявляется». `off` is honoured first, and `evdev` (the opt-in `/dev/input` reader,
+/// KVM-028) is *not implemented in this build*: on a portal receiver that is a refusal with
+/// `CONFIG_TAKEOVER`, and on Windows/X11 the native detector is used and the setting is
+/// reported in the log, because there it answers the same question with fewer privileges.
+fn takeover_plan(
+    session: &SessionInfo,
+    detection: ipc::TakeoverDetection,
+    threshold_px: u32,
+) -> (Option<TakeoverPlan>, Option<Refusal>) {
+    // `Unspecified` (a core that spoke before this field existed) is treated like `Auto`,
+    // which is the documented default of `[input].takeover_detection`.
+    if detection == ipc::TakeoverDetection::Off {
+        tracing::info!(
+            "takeover_detection = \"off\": a receiver lease will not end on local input"
+        );
+        return (None, None);
+    }
+    if !session.capabilities.receiver_takeover {
+        // AC-13a: a portal receiver sees only EIS injection, never its own devices.
+        if detection == ipc::TakeoverDetection::Evdev {
+            return (
+                None,
+                Some(Refusal {
+                    code: "CONFIG_TAKEOVER",
+                    detail: "the opt-in evdev detector is not implemented in this build, and a                              portal receiver cannot see physical input: automatic takeover is off                              for this node (docs/03-architecture.md, AC-13a)"
+                        .to_owned(),
+                }),
+            );
+        }
+        tracing::info!(
+            session = session.backend.name(),
+            "this session cannot see physical input: a receiver lease will not end on local input"
+        );
+        return (None, None);
+    }
+    if detection == ipc::TakeoverDetection::Evdev {
+        tracing::warn!(
+            session = session.backend.name(),
+            "takeover_detection = \"evdev\" asks for the /dev/input reader; on this session the              native detector is used instead (it sees keyboard and pointer events from the              kernel through the platform, without reading the input devices)"
+        );
+    }
+    tracing::info!(
+        session = session.backend.name(),
+        threshold_px,
+        "receiver takeover enabled: physical input above the threshold ends a lease"
+    );
+    (Some(TakeoverPlan { threshold_px }), None)
+}
+
 /// A backend that touches no OS input path.
 ///
 /// Two callers use it: `--dry-inject` (deliberate, so the whole transition can be
@@ -269,6 +348,7 @@ impl Backend {
     /// backend uses them (`AgentAttach.restore_tokens`), so on other platforms the
     /// parameter is accepted and ignored.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn select(
         override_kind: BackendKindArg,
         dry: bool,
@@ -276,6 +356,8 @@ impl Backend {
         dry_motion: bool,
         emergency_hotkey: &str,
         restore_tokens: &[ipc::PortalGrant],
+        takeover_detection: ipc::TakeoverDetection,
+        takeover_threshold_px: u32,
     ) -> (Self, Ready, Vec<Refusal>) {
         // The probe reads D-Bus and X11 before the session is even known, and its
         // zbus path is the *blocking* API, which builds a tokio runtime of its own:
@@ -299,7 +381,18 @@ impl Backend {
         let requested = override_kind.into_backend_override();
         match platform_probe::decide(&snapshot, requested) {
             Ok(session) => {
-                let ready = Ready::from_session(&session, String::new());
+                let mut ready = Ready::from_session(&session, String::new());
+                let (plan, takeover_refusal) =
+                    takeover_plan(&session, takeover_detection, takeover_threshold_px);
+                // The capabilities this agent reports must match what it will actually do:
+                // with no detector there is no takeover, whatever the probe said.
+                if plan.is_none() {
+                    ready.backend.has_receiver_takeover = false;
+                    ready
+                        .capabilities
+                        .retain(|name| name != "RECEIVER_TAKEOVER");
+                }
+                let refusals = takeover_refusal.into_iter().collect::<Vec<_>>();
                 if dry {
                     return (
                         Backend::Dry(Box::new(Dry::new(
@@ -308,15 +401,15 @@ impl Backend {
                             dry_motion,
                         ))),
                         ready,
-                        Vec::new(),
+                        refusals,
                     );
                 }
                 match session.backend {
                     platform_probe::Backend::Windows => {
                         #[cfg(windows)]
                         {
-                            match win::Win::new(&ready, emergency_hotkey) {
-                                Ok(backend) => (Backend::Win(Box::new(backend)), ready, Vec::new()),
+                            match win::Win::new(&ready, emergency_hotkey, plan) {
+                                Ok(backend) => (Backend::Win(Box::new(backend)), ready, refusals),
                                 Err(reason) => refuse(&snapshot, &reason),
                             }
                         }
@@ -331,8 +424,8 @@ impl Backend {
                     platform_probe::Backend::X11 => {
                         #[cfg(target_os = "linux")]
                         {
-                            match x11::X11::new(&ready, emergency_hotkey) {
-                                Ok(backend) => (Backend::X11(Box::new(backend)), ready, Vec::new()),
+                            match x11::X11::new(&ready, emergency_hotkey, plan) {
+                                Ok(backend) => (Backend::X11(Box::new(backend)), ready, refusals),
                                 Err(reason) => refuse(&snapshot, &reason),
                             }
                         }
@@ -354,7 +447,7 @@ impl Backend {
                             )
                             .await
                             {
-                                Ok((backend, ready, refusals)) => {
+                                Ok((backend, ready, _)) => {
                                     (Backend::Wayland(Box::new(backend)), ready, refusals)
                                 }
                                 Err(refusal) => {
