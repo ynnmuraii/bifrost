@@ -16,6 +16,8 @@
 //! ```text
 //! status                 -> OK focus=LOCAL owner=… members=1 agent=ready
 //! switch <peer>          -> OK switched to <peer> | ERR <code> <detail>
+//! claim                  -> OK claimed | ERR CLAIM_REFUSED <code>
+//! abandon                -> OK abandoned
 //! quit                   -> OK stopping
 //! ping                   -> OK pong
 //! ```
@@ -103,6 +105,11 @@ pub enum Request {
     Status,
     /// Ask for a manual transition to a peer.
     Switch(PeerRef),
+    /// Ask this node to own the workspace (`GuiFrame.ClaimOwnership`): the same path as
+    /// the claim hotkey or the GUI button, and the only way a node claims in a test.
+    Claim,
+    /// Give up ownership and stay a follower (`GuiFrame.AbandonOwnership`).
+    Abandon,
     /// Drop every stored portal token, in core and in the agent
     /// (`ForgetPortalGrants`/`ResetPortalGrants`).
     ResetPortals,
@@ -143,6 +150,10 @@ impl Request {
             "reset-portals" => Err("reset-portals takes no argument".to_owned()),
             "switch" if !argument.is_empty() => Ok(Request::Switch(PeerRef::new(argument))),
             "switch" => Err("switch needs a peer id or display name".to_owned()),
+            "claim" if argument.is_empty() => Ok(Request::Claim),
+            "claim" => Err("claim takes no argument".to_owned()),
+            "abandon" if argument.is_empty() => Ok(Request::Abandon),
+            "abandon" => Err("abandon takes no argument".to_owned()),
             other => Err(format!("unknown request {other:?}")),
         }
     }
@@ -155,6 +166,10 @@ pub enum Response {
     Status(String),
     /// The switch was handed to the FSM.
     Switched(PeerRef),
+    /// The claim was handed to the FSM.
+    Claimed,
+    /// Ownership was abandoned.
+    Abandoned,
     /// A refusal: `ERR <code> <detail>`.
     Error { code: String, detail: String },
     /// `OK stopping`.
@@ -169,6 +184,8 @@ impl Response {
         match self {
             Response::Status(line) => format!("OK {line}"),
             Response::Switched(peer) => format!("OK switched to {peer}"),
+            Response::Claimed => "OK claimed".to_owned(),
+            Response::Abandoned => "OK abandoned".to_owned(),
             Response::Error { code, detail } => format!("ERR {code} {detail}"),
             Response::Stopping => "OK stopping".to_owned(),
             Response::Pong => "OK pong".to_owned(),
@@ -195,6 +212,8 @@ impl Response {
             return match rest {
                 "stopping" => Ok(Response::Stopping),
                 "pong" => Ok(Response::Pong),
+                "claimed" => Ok(Response::Claimed),
+                "abandoned" => Ok(Response::Abandoned),
                 other => Ok(Response::Status(other.to_owned())),
             };
         }
@@ -367,6 +386,11 @@ mod tests {
             )))
         );
         assert!(Request::parse("switch").is_err());
+        // The GUI's two ownership buttons, reachable from the CLI so a harness can claim.
+        assert_eq!(Request::parse("claim"), Ok(Request::Claim));
+        assert_eq!(Request::parse("  abandon "), Ok(Request::Abandon));
+        assert!(Request::parse("claim now").is_err());
+        assert!(Request::parse("abandon now").is_err());
         assert!(Request::parse("status extra").is_err());
         assert!(Request::parse("frobnicate").is_err());
     }
@@ -376,6 +400,8 @@ mod tests {
         for reply in [
             Response::Status("focus=LOCAL role=owner".to_owned()),
             Response::Switched(PeerRef::new("laptop")),
+            Response::Claimed,
+            Response::Abandoned,
             Response::Error {
                 code: "NOT_OWNER".to_owned(),
                 detail: "this node is a follower".to_owned(),
