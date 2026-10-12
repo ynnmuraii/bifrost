@@ -174,8 +174,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if !injector.capabilities().has_absolute_injection {
         println!(
-            "WARNING: no absolute region/interface, so nothing will be injected: relative \
-             injection is deliberately not substituted for absolute input"
+            "WARNING: this spike exercises absolute placement only; the agent uses bounded \
+             relative motion when the compositor advertises ei_pointer without an absolute region"
         );
     }
 

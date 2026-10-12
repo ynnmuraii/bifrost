@@ -10,10 +10,9 @@
 //! Two things are deliberately unlike other libei clients here:
 //!
 //! * Absolute pointer input needs a region. The EIS server discards absolute events
-//!   outside its regions *silently*, so this backend validates the position itself and
-//!   reports [`WaylandError::PositionOutOfRegion`] / [`WaylandError::NoAbsoluteRegion`]
-//!   instead of pretending the event was delivered. Relative injection is never
-//!   substituted.
+//!   outside its regions silently, so this backend validates absolute positions instead
+//!   of pretending delivery. Relative motion is supported as an explicit event; the
+//!   agent may use it with its bounded cursor estimate when absolute regions are absent.
 //! * The device must be resumed before anything may be emulated (a freshly advertised
 //!   device is paused). [`WaylandInjector::pump`] keeps that state current, and
 //!   [`WaylandInjector::inject`] refuses to emit on a paused device.
@@ -117,6 +116,8 @@ impl Region {
 pub struct WaylandCapabilities {
     /// Absolute pointer injection is possible: `ei_pointer_absolute` plus a region.
     pub has_absolute_injection: bool,
+    /// Relative pointer injection is possible.
+    pub has_relative_injection: bool,
     /// `ei_keyboard` is available.
     pub has_keyboard: bool,
     /// `ei_button` is available.
@@ -164,6 +165,7 @@ pub struct WaylandInjector {
     device_name: Option<String>,
     device_type: ei::device::DeviceType,
     keyboard: Option<ei::Keyboard>,
+    pointer: Option<ei::Pointer>,
     pointer_absolute: Option<ei::PointerAbsolute>,
     button: Option<ei::Button>,
     scroll: Option<ei::Scroll>,
@@ -298,19 +300,27 @@ impl WaylandInjector {
                 };
                 match event? {
                     EiEvent::SeatAdded(seat_added) => {
+                        tracing::debug!(
+                            seat = ?seat_added.seat.name(),
+                            requested_capabilities = ?seat_capabilities(),
+                            "EIS seat advertised; binding requested capabilities"
+                        );
                         // Answering this is what makes the server advertise a device.
                         seat_added.seat.bind_capabilities(seat_capabilities());
                         connection.flush().map_err(std::io::Error::from)?;
                     }
                     EiEvent::DeviceAdded(added) => {
-                        // `DeviceAdded` is queued when `ei_device.done` arrives, so this
-                        // is the moment a sender has to answer with `ei_device.ready`.
+                        // `DeviceAdded` is queued when `ei_device.done` arrives; its
+                        // interfaces, dimensions, and regions are complete at this point.
+                        log_device("done", &added.device);
                         declare_device_ready(&added.device);
                         device = Some(added.device);
                     }
                     EiEvent::DeviceResumed(resumed) => {
                         // Nothing may be emulated before this serial. Only a resumed
                         // device may start an emulation sequence.
+                        log_device("resumed", &resumed.device);
+                        device = Some(resumed.device.clone());
                         last_serial = resumed.serial;
                         break;
                     }
@@ -339,6 +349,7 @@ impl WaylandInjector {
             device_name: device.name().map(ToOwned::to_owned),
             device_type: device.device_type(),
             keyboard: device.interface::<ei::Keyboard>(),
+            pointer: device.interface::<ei::Pointer>(),
             pointer_absolute: device.interface::<ei::PointerAbsolute>(),
             button: device.interface::<ei::Button>(),
             scroll: device.interface::<ei::Scroll>(),
@@ -360,6 +371,13 @@ impl WaylandInjector {
             started: Instant::now(),
             ei_error: None,
         };
+        tracing::info!(
+            device = ?injector.device_name,
+            device_type = ?injector.device_type,
+            capabilities = ?injector.capabilities(),
+            regions = ?injector.regions,
+            "EIS injection device ready"
+        );
         let _ = injector.connection.flush();
         Ok(injector)
     }
@@ -521,6 +539,7 @@ impl WaylandInjector {
     pub fn capabilities(&self) -> WaylandCapabilities {
         WaylandCapabilities {
             has_absolute_injection: self.pointer_absolute.is_some() && !self.regions.is_empty(),
+            has_relative_injection: self.pointer.is_some(),
             has_keyboard: self.keyboard.is_some(),
             has_buttons: self.button.is_some(),
             has_scroll: self.scroll.is_some(),
@@ -633,14 +652,21 @@ impl WaylandInjector {
     fn handle_event(&mut self, event: EiEvent) {
         match event {
             EiEvent::SeatAdded(seat_added) => {
+                tracing::debug!(
+                    seat = ?seat_added.seat.name(),
+                    requested_capabilities = ?seat_capabilities(),
+                    "EIS seat added"
+                );
                 seat_added.seat.bind_capabilities(seat_capabilities());
                 let _ = self.connection.flush();
             }
             EiEvent::DeviceAdded(added) => {
+                log_device("done", &added.device);
                 declare_device_ready(&added.device);
                 self.adopt_device(&added.device);
             }
             EiEvent::DeviceResumed(resumed) => {
+                log_device("resumed", &resumed.device);
                 self.last_serial = resumed.serial;
                 self.resumed = true;
                 // A resume starts a new emulation sequence; the next inject() starts it.
@@ -664,6 +690,7 @@ impl WaylandInjector {
         self.device_name = device.name().map(ToOwned::to_owned);
         self.device_type = device.device_type();
         self.keyboard = device.interface::<ei::Keyboard>();
+        self.pointer = device.interface::<ei::Pointer>();
         self.pointer_absolute = device.interface::<ei::PointerAbsolute>();
         self.button = device.interface::<ei::Button>();
         self.scroll = device.interface::<ei::Scroll>();
@@ -741,7 +768,17 @@ impl WaylandInjector {
                 }
                 Ok(None)
             }
-            InputEvent::PointerRelative { .. } => Err(WaylandError::RelativePointerUnsupported),
+            InputEvent::PointerRelative { dx, dy } => {
+                let pointer = self
+                    .pointer
+                    .as_ref()
+                    .ok_or(WaylandError::MissingInterface {
+                        interface: "ei_pointer",
+                    })?;
+                pointer.motion_relative(dx as f32, dy as f32);
+                self.commit_frame();
+                Ok(None)
+            }
         }
     }
 
@@ -754,6 +791,25 @@ impl WaylandInjector {
     fn timestamp_us(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
+}
+
+/// Records the completed capability set at `ei_device.done` and `resumed`. In reis,
+/// regions and interface objects are complete before `done` is surfaced.
+fn log_device(stage: &str, device: &event::Device) {
+    tracing::debug!(
+        stage,
+        seat = ?device.seat().name(),
+        name = ?device.name(),
+        device_type = ?device.device_type(),
+        pointer = device.has_capability(DeviceCapability::Pointer),
+        pointer_absolute = device.has_capability(DeviceCapability::PointerAbsolute),
+        button = device.has_capability(DeviceCapability::Button),
+        scroll = device.has_capability(DeviceCapability::Scroll),
+        keyboard = device.has_capability(DeviceCapability::Keyboard),
+        dimensions = ?device.dimensions(),
+        regions = ?device.regions(),
+        "EIS device capabilities"
+    );
 }
 
 /// The capabilities we bind on every seat: the product needs pointer, absolute pointer,

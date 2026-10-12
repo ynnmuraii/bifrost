@@ -28,3 +28,4 @@ futures-util = "0.3"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+tracing = "0.1"

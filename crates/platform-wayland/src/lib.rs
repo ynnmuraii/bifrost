@@ -10,8 +10,8 @@
 //!   us, we integrate relative pointer deltas from an absolute seed, and we `Release`
 //!   input back to the compositor when the peer takes over.
 //! * `inject` — `org.freedesktop.portal.RemoteDesktop`: we receive an EIS file
-//!   descriptor and drive an `ei_pointer_absolute`/`ei_keyboard`/`ei_button`/`ei_scroll`
-//!   sender over it.
+//!   descriptor and drive absolute or relative pointer, keyboard, button, and scroll
+//!   devices over it.
 //!
 //! `compositor`, `grant` and `shortcuts` hold the pure logic: compositor detection and
 //! the portal-version signature, restore-token storage (KVM-017) and the
@@ -78,6 +78,8 @@ mod grant;
 #[cfg(target_os = "linux")]
 mod inject;
 #[cfg(target_os = "linux")]
+mod relative;
+#[cfg(target_os = "linux")]
 mod shortcuts;
 
 pub use clipboard::{availability, Availability, Unavailable};
@@ -90,6 +92,10 @@ pub use compositor::{compositor_signature, portal_interfaces, Compositor, Portal
 pub use grant::{GrantStore, PortalGrant};
 #[cfg(target_os = "linux")]
 pub use inject::{InjectOutcome, InjectSource, Region, WaylandCapabilities, WaylandInjector};
+#[cfg(target_os = "linux")]
+pub use relative::{
+    select_pointer_mode, PointerMode, RelativeBounds, RelativeCursor, RelativeMotion,
+};
 #[cfg(target_os = "linux")]
 pub use shortcuts::EmergencyShortcuts;
 
@@ -240,17 +246,6 @@ pub enum WaylandError {
         /// HID usage id.
         usage: u16,
     },
-    /// Relative pointer injection was requested.
-    ///
-    /// Relative injection is deliberately not part of the input contract
-    /// (`docs/03-architecture.md`: a source integrates deltas and sends an absolute
-    /// [`input_model::Position`]), so the backend refuses the event rather than
-    /// silently substituting `ei_pointer.motion_relative`.
-    #[error(
-        "relative pointer injection is not part of the input contract (a source integrates \
-         deltas into PointerAbsolute); refusing instead of guessing"
-    )]
-    RelativePointerUnsupported,
     /// A persisted grant blob could not be parsed.
     #[error("malformed grant store: {0}")]
     InvalidGrant(String),
