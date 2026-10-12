@@ -983,6 +983,29 @@ fn the_created_config_file_is_reported_once_in_a_session() {
 }
 
 #[test]
+fn connection_after_first_run_reloads_the_created_config_for_settings() {
+    let dir = settings_dir("192.168.31.37");
+    let file = dir.join("config/config.toml");
+    std::fs::remove_file(&file).expect("start without config");
+    let paths = paths_of(&dir);
+    let mut vm = view();
+    vm.config = lws_gui::view_model::LocalConfig::load(&paths);
+    assert!(vm.config.config_was_missing);
+
+    std::fs::write(
+        &file,
+        "config_version = 2\n\n[network]\nlisten_address = \"192.168.31.37\"\n",
+    )
+    .expect("the core writes the first-run config before accepting the GUI");
+    vm.on_connected("endpoint");
+
+    assert_eq!(vm.config.listen_address, "192.168.31.37");
+    assert!(!vm.config.config_was_missing);
+    assert!(vm.settings.first_run_reported);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn a_machine_that_already_had_its_configuration_says_nothing_about_a_first_run() {
     let mut vm = view();
     vm.on_core_started(Ok(own_core(12)));
