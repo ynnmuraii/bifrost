@@ -179,7 +179,9 @@ mod tests {
     #[test]
     fn the_pair_survives_a_reload() {
         let (path, config) = temp_config();
-        let mut store = LayoutStore::new(path.clone(), config);
+        // `self_node` is this node, the same one the reload below names; the pair that comes
+        // back is the one `observe` wrote, so the identity is only here to resolve `"self"`.
+        let mut store = LayoutStore::new(path.clone(), config, node(7));
         let mut layout = store.restored();
         assert_eq!(layout.applied(), Pair::NONE);
 
