@@ -417,6 +417,67 @@ pub fn validate_wire(document: &wire::Topology) -> Result<(), String> {
     Ok(())
 }
 
+/// Builds the wire document of the *live* layout: nodes from the member manifests, links from
+/// the configuration (KVM-072).
+///
+/// `docs/05-protocol.md` gives `Topology.nodes[]` as «members and their displays», and
+/// `config.example.toml` says the same about `[[topology.displays]]`: «снимок для GUI; источник
+/// истины — агент узла». The live document is therefore the source for the nodes — it is
+/// assembled from the agents' `DisplaysReport`s and the peers' `Hello.displays`, exactly what
+/// the wire carries — while the *links* come from the layout configuration, which is what an
+/// edit carries.
+#[must_use]
+pub fn wire_from_live(
+    live: &geometry::Topology,
+    layout: &config::TopologyConfig,
+    revision: u64,
+    author: NodeId,
+    self_node: NodeId,
+) -> wire::Topology {
+    let rect = |rect: geometry::Rect| wire::Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    };
+    let nodes: Vec<wire::NodeDisplays> = live
+        .nodes
+        .iter()
+        .map(|node| wire::NodeDisplays {
+            node_id: node.node.as_bytes().to_vec(),
+            displays: node
+                .displays
+                .iter()
+                .map(|display| wire::Display {
+                    id: display.id.as_str().to_owned(),
+                    logical_bounds: Some(rect(display.logical_bounds)),
+                    native_bounds: display.native_bounds.map(rect),
+                    rotation_degrees: match display.rotation {
+                        geometry::Rotation::Deg0 => 0,
+                        geometry::Rotation::Deg90 => 90,
+                        geometry::Rotation::Deg180 => 180,
+                        geometry::Rotation::Deg270 => 270,
+                    },
+                    scale_x: display.scale.x,
+                    scale_y: display.scale.y,
+                    primary: display.primary,
+                    native_known: display.native_bounds.is_some(),
+                })
+                .collect(),
+            online: node.online,
+        })
+        .collect();
+    let mut document = wire_document(layout, revision, author, self_node);
+    if nodes.is_empty() || nodes.iter().all(|node| node.displays.is_empty()) {
+        // No live manifest at all — a headless runner, an agent that has not reported yet: the
+        // configuration snapshot is what `[[topology.displays]]` exists for, and a document
+        // with no nodes could not be revalidated by anyone.
+        return document;
+    }
+    document.nodes = nodes;
+    document
+}
+
 /// Builds the wire document of a `[topology]` section (KVM-072).
 ///
 /// This is the coordinator's publish step: the applied revision and its author travel with the

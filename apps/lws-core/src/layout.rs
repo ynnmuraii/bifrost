@@ -108,7 +108,19 @@ pub enum TopologyOutcome {
 pub struct Layout {
     applied: Pair,
     max_seen: Pair,
-    pending: Option<String>,
+    pending: Option<Pending>,
+}
+
+/// A divergent local edit and the revision it was written against.
+///
+/// The base is not `self.applied` at the time the edit is finally sent: a pending edit waits
+/// across a partition, and the document moves while it waits. Sending `self.applied` would
+/// turn the CAS into a no-op that always succeeds — the exact failure KVM-072's `LAYOUT_CONFLICT`
+/// exists to prevent (found by the stale-edit integration test).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pending {
+    base: Pair,
+    layout_toml: String,
 }
 
 impl Layout {
@@ -140,7 +152,15 @@ impl Layout {
     /// The divergent local edit kept after a partition, if any.
     #[must_use]
     pub fn pending(&self) -> Option<&str> {
-        self.pending.as_deref()
+        self.pending
+            .as_ref()
+            .map(|pending| pending.layout_toml.as_str())
+    }
+
+    /// The revision the pending edit was written against, when there is one.
+    #[must_use]
+    pub fn pending_base(&self) -> Option<Pair> {
+        self.pending.as_ref().map(|pending| pending.base)
     }
 
     /// The coordinator applies a whole-document edit (CAS on the pair it names).
@@ -223,12 +243,15 @@ impl Layout {
     /// Keeps a divergent local edit: it cannot be applied (a newer author's revision is
     /// applied), so it waits in `layout.pending.toml` for the user's apply or discard.
     pub fn hold_pending(&mut self, layout_toml: String) {
-        self.pending = Some(layout_toml);
+        self.pending = Some(Pending {
+            base: self.applied,
+            layout_toml,
+        });
     }
 
     /// Takes the pending edit (the user applied it, or discarded it).
     pub fn take_pending(&mut self) -> Option<String> {
-        self.pending.take()
+        self.pending.take().map(|pending| pending.layout_toml)
     }
 }
 
