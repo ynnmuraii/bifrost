@@ -896,10 +896,11 @@ mod tests {
 
         /// The same, with a dry session that has a clipboard (`--dry-clipboard-dir`).
         async fn dry(clipboard_dir: Option<PathBuf>) -> Self {
-            // Room for a whole chunked clipboard payload on the wire: the frames are ≤32 KiB
-            // each and a test that writes several of them before reading would otherwise block
-            // on the pipe instead of exercising the handler.
-            let (agent_io, core_io) = duplex(256 * 1024);
+            // Room for a whole chunked clipboard payload on the wire. A test that writes the
+            // frames before reading any of them blocks on the pipe as soon as it is full, so
+            // the pipe has to hold the largest payload any of these tests sends — 1 MiB + 1
+            // is 33 frames of 32 KiB — and not merely one frame.
+            let (agent_io, core_io) = duplex(4 * 1024 * 1024);
             let (backend, ready, _refusals) = Backend::select(
                 BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
                 true,
@@ -1311,14 +1312,30 @@ mod tests {
         )
         .await
         .expect("reporting it is not an error");
-        match harness.recv().await {
-            Msg::ClipboardChanged(changed) => {
+        // All 33 frames, so nothing is left in the pipe to confuse the next step: the whole
+        // copy is reported, in order, with the hash on the last frame only.
+        let mut seen = 0u32;
+        while let Msg::ClipboardChanged(changed) = harness.recv().await {
+            assert_eq!(changed.chunk_count, 33);
+            assert_eq!(changed.chunk_index, seen);
+            if seen == 0 {
                 assert_eq!(changed.origin_version, 1);
                 assert_eq!(changed.size_bytes, clipboard::MAX_BYTES + 1);
-                assert_eq!(changed.chunk_count, 33);
             }
-            other => panic!("expected ClipboardChanged, got {other:?}"),
+            if changed.chunk_index + 1 == changed.chunk_count {
+                assert!(
+                    !changed.sha256.is_empty(),
+                    "the last chunk carries the hash"
+                );
+                break;
+            }
+            assert!(
+                changed.sha256.is_empty(),
+                "only the last chunk carries the hash"
+            );
+            seen += 1;
         }
+        assert_eq!(seen, 32, "33 frames, the last one ending the loop");
 
         // Beyond the framing ceiling: nothing is numbered, so the next change is version 2.
         let ceiling = clipboard_wire::MAX_CHUNKS as usize * clipboard_wire::CHUNK_BYTES;
@@ -1363,7 +1380,9 @@ mod tests {
                 let dir = temp_dir("loop");
                 let in_path = dir.join("in.txt");
                 let out_path = dir.join("out.txt");
-                let (agent_io, core_io) = duplex(256 * 1024);
+                // Wide enough for the chunked payloads this loop writes before anything
+                // reads them (see `Harness::dry`).
+                let (agent_io, core_io) = duplex(4 * 1024 * 1024);
                 let (mut backend, ready, _refusals) = Backend::select(
                     BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
                     true,
