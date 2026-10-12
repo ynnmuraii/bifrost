@@ -126,6 +126,35 @@ async fn spawn_node(
     TestNode { events, runner }
 }
 
+/// Connects to a manager that was just spawned, waiting until its listener is bound.
+///
+/// `spawn_node` returns as soon as `manager.run()` is spawned, and the listener is bound
+/// inside `run()`; `LinkManager` exposes no readiness signal, so the first dial races the
+/// bind and can come back `ECONNREFUSED` (seen on `ubuntu-latest`). Retrying the connect is
+/// the right place for the wait: a refused connect is not a `pair/1` or `input/1` result,
+/// and the manager's own behaviour after the handshake starts is what these tests assert on.
+async fn connect_when_listening(address: SocketAddr) -> TcpStream {
+    /// How long a just-spawned manager may take to bind before the test gives up.
+    const LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
+    const RETRY_DELAY: Duration = Duration::from_millis(20);
+
+    let deadline = Instant::now() + LISTEN_TIMEOUT;
+    loop {
+        match TcpStream::connect(address).await {
+            Ok(stream) => return stream,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                assert!(
+                    Instant::now() < deadline,
+                    "no listener on {address} within {}s: {error}",
+                    LISTEN_TIMEOUT.as_secs()
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => panic!("cannot reach {address}: {error}"),
+        }
+    }
+}
+
 /// Waits for the first event that satisfies `predicate`, ignoring the others.
 async fn wait_for_event(
     events: &mut mpsc::Receiver<LinkEvent>,
@@ -171,7 +200,7 @@ async fn a_pair_dialer_is_handed_to_the_application_while_the_window_is_open() {
 
     let config = identity::pairing_client_config(&b).expect("pairing client config");
     let connector = TlsConnector::from(Arc::new(config));
-    let tcp = TcpStream::connect(address).await.expect("connect");
+    let tcp = connect_when_listening(address).await;
     let local = tcp.local_addr().expect("local address");
     let _stream = connector
         .connect(identity::server_name(address.ip()), tcp)
@@ -207,7 +236,7 @@ async fn a_pair_dialer_is_refused_when_no_window_is_open() {
 
     let config = identity::pairing_client_config(&b).expect("pairing client config");
     let connector = TlsConnector::from(Arc::new(config));
-    let tcp = TcpStream::connect(address).await.expect("connect");
+    let tcp = connect_when_listening(address).await;
     let result = tokio::time::timeout(
         TIMEOUT,
         connector.connect(identity::server_name(address.ip()), tcp),
@@ -248,7 +277,7 @@ async fn an_unknown_peer_on_input_is_still_refused_with_a_window_open() {
     let trust = trust_of(&[(a_id, address)]);
     let config = identity::trusted_client_config(&b, &trust).expect("client config");
     let connector = TlsConnector::from(Arc::new(config));
-    let tcp = TcpStream::connect(address).await.expect("connect");
+    let tcp = connect_when_listening(address).await;
     let result = tokio::time::timeout(
         TIMEOUT,
         connector.connect(identity::server_name(address.ip()), tcp),

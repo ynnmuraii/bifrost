@@ -19,6 +19,11 @@ jobs:
         # transport of crates/ipc, platform-x11, platform-wayland and
         # platform-probe only execute on ubuntu-latest, where their cfg gates
         # select them; on Windows the same commands compile them to no tests.
+        # `apps/lws-gui` is that same shape for a different reason: the window
+        # itself only opens where a human is — never in this workflow — and
+        # everything the crate does headlessly (the view model, the screens
+        # drawn into an offscreen `egui::Context`, and its two-core test) runs
+        # on both runners.
         os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +54,17 @@ jobs:
       # through transitions, and a runner without a session reports
       # `UnsupportedSession`, so the agent advertises no capabilities and every
       # switch is refused. `xauth` comes with `xvfb-run`.
+      #
+      # `apps/lws-gui` adds nothing to this list, and that is why its window is
+      # eframe/egui on the `glow` renderer: glutin opens GLX/EGL through
+      # `libloading`, `x11-dl` opens `libX11` the same way, and `wayland-dlopen`
+      # (pulled by the `winit` entry in `apps/lws-gui/Cargo.toml`) opens
+      # `libwayland-client` — so no X11/Wayland library is a *link-time*
+      # dependency and no `-dev` package or GL driver has to exist here. What the
+      # workflow builds and runs headlessly is the view model, the screens drawn
+      # into an offscreen `egui::Context`, and one test against two real cores;
+      # the offscreen PNGs are an example (`cargo run -p lws-gui --example
+      # shots`), which `cargo test` compiles but never runs.
       - name: System dependencies
         if: runner.os == 'Linux'
         run: |

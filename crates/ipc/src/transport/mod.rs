@@ -65,8 +65,8 @@ pub type ClientConnection = tokio::net::windows::named_pipe::NamedPipeClient;
 /// everything it keeps in one (`apps/lws-core/src/main.rs::private_root`); this mirrors
 /// that choice so the daemon, the GUI and the CLI agree on one name without a lookup.
 ///
-/// Windows-only: the Unix endpoints are built from `XDG_RUNTIME_DIR` directly, so only
-/// [`root_tag`]'s two callers (the Windows `gui_endpoint`/`ctl_endpoint`) use this.
+/// Windows-only: on Unix the two endpoints are paths under the runtime directory, and a
+/// function nothing calls is dead code on a Linux build (`-D warnings`).
 #[cfg(windows)]
 fn endpoint_root(paths: &config::Paths) -> &std::path::Path {
     paths.runtime_dir().unwrap_or_else(|| paths.state_dir())
