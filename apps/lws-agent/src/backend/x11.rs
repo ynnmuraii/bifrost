@@ -117,8 +117,10 @@ impl X11 {
     /// The next clipboard change the *user* made, if the selection informed us of one.
     ///
     /// Non-blocking on purpose: the session polls this from its own tick, and its watchdog and
-    /// deadline live on that tick too.
-    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+    /// deadline live on that tick too. The X work itself already lives on the selection's own
+    /// thread (`platform_x11::clipboard::Clipboard` dispatches commands to it), so the
+    /// runtime thread only waits for that thread's reply.
+    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
         let clipboard = self.clipboard.as_ref()?;
         clipboard.wait(Duration::ZERO)?;
         let snapshot = match clipboard.read() {
@@ -158,7 +160,10 @@ impl X11 {
     /// The adapter has no "release the selection" call in this build (ICCCM release and
     /// `SelectionClear` handling are not wired), so a release puts the empty string on the
     /// selection: the previous payload stops being pastable, which is what the command is for.
-    pub fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+    ///
+    /// Async for the session's sake: the X round-trips ride the selection's own thread, and
+    /// the runtime thread must stay free for the poll tick and the heartbeat.
+    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
         let Some(clipboard) = self.clipboard.as_ref() else {
             return Err("CLIPBOARD_DISABLED: this session has no CLIPBOARD selection".to_owned());
         };
@@ -293,23 +298,33 @@ impl X11 {
     ///
     /// A failure is reported as an empty set: core then falls back to the
     /// `[[topology.displays]]` snapshot instead of losing the node.
-    pub fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
-        match platform_x11::displays::enumerate() {
-            Ok(monitors) => monitors
-                .into_iter()
-                .map(|monitor| crate::displays::RawDisplay {
-                    id: monitor.id,
-                    logical: monitor.logical,
-                    native: Some(monitor.native),
-                    scale: monitor.scale,
-                    primary: monitor.primary,
-                })
-                .collect(),
-            Err(error) => {
+    ///
+    /// The enumeration is a burst of X round-trips on the calling thread, so it runs on a
+    /// blocking thread: the session answers `QueryDisplays` on the same task the heartbeat
+    /// `Pong` rides.
+    pub async fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
+        let enumerated = match tokio::task::spawn_blocking(platform_x11::displays::enumerate).await
+        {
+            Ok(Ok(monitors)) => monitors,
+            Ok(Err(error)) => {
                 tracing::warn!(%error, "cannot enumerate X11 monitors");
-                Vec::new()
+                return Vec::new();
             }
-        }
+            Err(error) => {
+                tracing::warn!(%error, "the monitor enumeration task failed");
+                return Vec::new();
+            }
+        };
+        enumerated
+            .into_iter()
+            .map(|monitor| crate::displays::RawDisplay {
+                id: monitor.id,
+                logical: monitor.logical,
+                native: Some(monitor.native),
+                scale: monitor.scale,
+                primary: monitor.primary,
+            })
+            .collect()
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {

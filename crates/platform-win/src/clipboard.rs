@@ -77,7 +77,7 @@ pub fn classify_names(names: &[&str], history_allowed_zero: bool) -> Vec<Marker>
 }
 
 #[cfg(windows)]
-pub use windows_impl::{Change, Clipboard, ClipboardError};
+pub use windows_impl::{read_clipboard, write_clipboard, Change, Clipboard, ClipboardError};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -195,29 +195,10 @@ mod windows_impl {
             unsafe { GetClipboardSequenceNumber() }
         }
 
-        /// Reads the current text and its secret markers.
-        pub fn read(&self) -> Result<Snapshot, ClipboardError> {
-            read_clipboard()
-        }
-
-        /// Takes ownership of the clipboard and puts `text` on it as `CF_UNICODETEXT`.
-        ///
-        /// `&self` is enough: the write is a sequence of Win32 calls a thread makes on its
-        /// own, and this struct owns no per-write state — the listener's message loop is
-        /// unaffected (`WM_CLIPBOARDUPDATE` is what announces this write to everyone else,
-        /// including this process; recognising it as our own is the caller's job, see
-        /// `Clipboard::sequence`).
-        pub fn set(&self, text: &str) -> Result<(), ClipboardError> {
-            write_clipboard(Some(text))
-        }
-
-        /// Empties the clipboard, giving up the selection.
-        ///
-        /// The result is an open, empty clipboard: `CF_UNICODETEXT` is gone, so a paste
-        /// finds nothing, and the update counter still moves.
-        pub fn clear(&self) -> Result<(), ClipboardError> {
-            write_clipboard(None)
-        }
+        // The read and the write are the module-level [`read_clipboard`] and
+        // [`write_clipboard`]: they are Win32 work with a retry loop, so an async caller
+        // runs them on a blocking thread, and there is no reason to reach them through a
+        // method on the notification listener.
     }
 
     impl Drop for Clipboard {
@@ -342,6 +323,9 @@ mod windows_impl {
     }
 
     /// Reads the clipboard: text, the registered marker formats, and the sequence number.
+    ///
+    /// Blocking by nature — [`open_clipboard`] retries for up to 100 ms while another
+    /// process holds the clipboard — so an async caller runs it on a blocking thread.
     pub fn read_clipboard() -> Result<Snapshot, ClipboardError> {
         let sequence = unsafe { GetClipboardSequenceNumber() };
         open_clipboard()?;
@@ -369,7 +353,12 @@ mod windows_impl {
     }
 
     /// Replaces the clipboard contents with `text`, or empties it for `None`.
-    fn write_clipboard(text: Option<&str>) -> Result<(), ClipboardError> {
+    ///
+    /// Public so an async caller can run it on a blocking thread: `open_clipboard`
+    /// retries for up to 100 ms while another process holds the clipboard, and that
+    /// sleep must never sit on a runtime thread (the agent's poll tick, its IPC frames
+    /// and its watchdog live there).
+    pub fn write_clipboard(text: Option<&str>) -> Result<(), ClipboardError> {
         open_clipboard()?;
         let result = write_open_clipboard(text);
         // SAFETY: the clipboard was opened above, on this thread.

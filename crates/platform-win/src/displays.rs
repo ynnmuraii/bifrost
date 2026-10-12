@@ -241,4 +241,26 @@ mod tests {
             );
         }
     }
+
+    /// The agent answers `QueryDisplays` from a `spawn_blocking` thread: the
+    /// enumeration must describe the same desktop from a thread with no message queue
+    /// of its own. `EnumDisplayMonitors` enumerates the calling thread's desktop, and
+    /// every thread of this process shares one — this test is what proves moving the
+    /// call off the runtime thread changes nothing.
+    #[test]
+    fn a_thread_without_a_message_queue_sees_the_same_monitors() {
+        let here = enumerate().expect("a Windows host always has a monitor");
+        let there =
+            std::thread::spawn(|| enumerate().expect("a Windows host always has a monitor"))
+                .join()
+                .expect("the thread ran");
+        let ids = |monitors: &[Monitor]| -> Vec<String> {
+            monitors.iter().map(|monitor| monitor.id.clone()).collect()
+        };
+        assert_eq!(
+            ids(&here),
+            ids(&there),
+            "the same desktop from any thread: {here:?} vs {there:?}"
+        );
+    }
 }
