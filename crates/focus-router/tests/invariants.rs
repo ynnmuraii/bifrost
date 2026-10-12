@@ -435,8 +435,13 @@ fn invariant_7_a_return_release_waits_for_the_receiver() {
                     LeaseSlot::Source(lease)
                         if lease.awaiting_leave_ack && lease.lease_id == id(1)
                 );
-                let is_leave_ack =
-                    matches!(input, Input::Net { message: Message::LeaveAck { .. }, .. });
+                let is_leave_ack = matches!(
+                    input,
+                    Input::Net {
+                        message: Message::LeaveAck { .. },
+                        ..
+                    }
+                );
                 let is_guard = matches!(input, Input::TimerExpired(Timer::ReleaseGuard));
                 let is_link_down = matches!(input, Input::LinkDown { peer } if peer == PEER);
                 let out = r.handle(now, input);
