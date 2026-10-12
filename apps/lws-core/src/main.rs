@@ -403,6 +403,7 @@ async fn run_async(
             detection: takeover_detection(&config),
             threshold_px: config.input.takeover_threshold_px,
         },
+        repeat_mode(&config),
     );
     // The layout document is assembled by the session (`Session::rebuild_topology`), which
     // is also where it is rebuilt when the agent reports its displays; doing it here as well
@@ -594,6 +595,14 @@ fn takeover_detection(config: &config::Config) -> protocol::ipc::TakeoverDetecti
         config::TakeoverDetection::Auto => protocol::ipc::TakeoverDetection::Auto,
         config::TakeoverDetection::Evdev => protocol::ipc::TakeoverDetection::Evdev,
         config::TakeoverDetection::Off => protocol::ipc::TakeoverDetection::Off,
+    }
+}
+
+/// `[input].repeat_mode` in IPC terms (ADR-006: one engine, chosen here).
+fn repeat_mode(config: &config::Config) -> protocol::ipc::RepeatMode {
+    match config.input.repeat_mode {
+        config::RepeatMode::ReceiverNative => protocol::ipc::RepeatMode::ReceiverNative,
+        config::RepeatMode::ReceiverSoftware => protocol::ipc::RepeatMode::ReceiverSoftware,
     }
 }
 

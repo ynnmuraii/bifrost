@@ -298,8 +298,11 @@ impl SessionInfo {
                 absolute_pointer: true,
                 physical_hid_keys: true,
                 text_clipboard: false,
-                native_repeat: true,
-                software_repeat: false,
+                // Measured: a key injected with `SendInput` and held without an up produces
+                // no further down of its own (lws-agent `repeat` module, KVM-036), so a
+                // Windows receiver must repeat it in software.
+                native_repeat: false,
+                software_repeat: true,
                 receiver_takeover: true,
                 displays_changed: true,
                 emergency_hotkey: true,
@@ -321,8 +324,11 @@ impl SessionInfo {
                 absolute_pointer: true,
                 physical_hid_keys: true,
                 text_clipboard: false,
-                native_repeat: true,
-                software_repeat: false,
+                // Measured: a key injected with `SendInput` and held without an up produces
+                // no further down of its own (lws-agent `repeat` module, KVM-036), so a
+                // Windows receiver must repeat it in software.
+                native_repeat: false,
+                software_repeat: true,
                 receiver_takeover: true,
                 displays_changed: true,
                 // The emergency combo is handled inside the X11 grab (KVM-013).

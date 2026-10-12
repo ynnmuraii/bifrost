@@ -354,7 +354,15 @@ impl Session {
                         handle.close();
                     }
                 }
-                Effect::Notice(notice) => self.log_notice(&notice),
+                Effect::Notice(notice) => {
+                    if let fr::Notice::RepeatGuardElapsed { lease_id } = notice {
+                        // AC-14 and the IPC table of `docs/03-architecture.md`: this is the
+                        // translation step, the agent owns the mechanism (software engine off
+                        // or the held keys up).
+                        self.send_agent_stop_repeat(lease_id).await;
+                    }
+                    self.log_notice(&notice)
+                }
             }
         }
         // Ownership is a persisted counter, not only FSM state: a restart that forgot the
@@ -373,6 +381,21 @@ impl Session {
             remaining_ms,
         });
         tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
+        if let Err(error) = self.agent.send(frame).await {
+            tracing::warn!(%error, "cannot reach the agent");
+            self.on_agent_lost().await;
+        }
+    }
+
+    /// `StopRepeat`: the receiver must stop repeating (`repeat_guard_ms` of silence).
+    async fn send_agent_stop_repeat(&mut self, lease_id: fr::LeaseId) {
+        let frame = Msg::StopRepeat(protocol::ipc::StopRepeat {
+            lease_id: lease_id.to_vec(),
+        });
+        tracing::warn!(
+            frame = routing::agent_frame_name(&frame),
+            "repeat guard elapsed; telling the agent to stop repeating"
+        );
         if let Err(error) = self.agent.send(frame).await {
             tracing::warn!(%error, "cannot reach the agent");
             self.on_agent_lost().await;

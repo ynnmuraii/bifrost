@@ -451,3 +451,47 @@ mod tests {
         }
     }
 }
+
+/// The OS autorepeat settings, as the two indices `SystemParametersInfo` speaks.
+///
+/// `(delay_index, speed_index)`: the delay is 0..=3 (250 ms steps) and the speed 0..=31
+/// (2.5..30 repeats per second). The receiver's software repeat engine is the only thing on
+/// Windows that repeats a held injected key at all — a `SendInput` key-down without an up
+/// produces no further down of its own (measured; see `lws-agent`'s `repeat` module) — so the
+/// rate has to come from here to look like the keyboard the user configured (KVM-036, AC-14).
+///
+/// A failure returns the Windows defaults (1, 31): 500 ms and the fastest rate.
+#[cfg(windows)]
+#[must_use]
+pub fn keyboard_timing() -> (u32, u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+
+    fn query(
+        action: windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_ACTION,
+    ) -> Option<u32> {
+        let mut value: u32 = 0;
+        // SAFETY: `pvParam` points at a live `u32`; both actions are documented as
+        // `uiParam = 0`, an integer output and no update flag.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                action,
+                0,
+                Some(std::ptr::addr_of_mut!(value).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        };
+        ok.ok().map(|()| value)
+    }
+
+    let delay = query(SPI_GETKEYBOARDDELAY);
+    let speed = query(SPI_GETKEYBOARDSPEED);
+    match (delay, speed) {
+        (Some(delay), Some(speed)) if (0..=3).contains(&delay) && (0..=31).contains(&speed) => {
+            (delay, speed)
+        }
+        _ => (1, 31),
+    }
+}

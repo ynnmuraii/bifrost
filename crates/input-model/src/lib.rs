@@ -36,6 +36,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod repeat;
+
+pub use repeat::RepeatFilter;
+
 /// USB HID usage page for a keyboard (spec: "Keyboard/Keypad", page `0x07`).
 pub const HID_PAGE_KEYBOARD: u16 = 0x07;
 

@@ -21,6 +21,7 @@ use platform_x11::inject::X11Injector;
 
 use crate::backend::{Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
 use crate::takeover::Detector;
+use input_model::RepeatFilter;
 
 /// The X11 input path.
 pub struct X11 {
@@ -35,6 +36,9 @@ pub struct X11 {
     /// what makes «physical input» here mean the user's own keyboard and mouse.
     detector: Option<(Detector, X11Capture)>,
     plan: Option<TakeoverPlan>,
+    /// Source-side autorepeat filter. X11's `raw KeyPress` carries `XIKeyRepeat`, but
+    /// `platform_x11::capture` does not expose it, so the pressed-set rule decides here too.
+    repeats: RepeatFilter,
 }
 
 impl X11 {
@@ -64,6 +68,7 @@ impl X11 {
             injector: None,
             detector: None,
             plan,
+            repeats: RepeatFilter::new(),
         })
     }
 
@@ -89,6 +94,7 @@ impl X11 {
             capture.ungrab();
         }
         self.capture = None;
+        self.repeats.clear();
         self.disarm_detector();
         let released = match &mut self.injector {
             Some(injector) => release_counts(injector),
@@ -235,7 +241,13 @@ impl X11 {
         if let Some(capture) = &mut self.capture {
             // A non-blocking poll; the loop's tick provides the wait.
             match capture.next_event(Some(Duration::ZERO)) {
-                Ok(Some(CapturedEvent::Input(event))) => return Some(Event::Input(event)),
+                Ok(Some(CapturedEvent::Input(event))) => {
+                    if self.repeats.is_repeat(&event, false) {
+                        tracing::trace!(?event, "dropping an OS autorepeat");
+                        return None;
+                    }
+                    return Some(Event::Input(event));
+                }
                 Ok(Some(CapturedEvent::Emergency)) => return Some(Event::Emergency),
                 Ok(None) => {}
                 Err(error) => {

@@ -172,6 +172,7 @@ pub fn attach(
     restore_tokens: Vec<ipc::PortalGrant>,
     takeover_detection: ipc::TakeoverDetection,
     takeover_threshold_px: u32,
+    repeat_mode: ipc::RepeatMode,
 ) -> ipc::AgentAttach {
     ipc::AgentAttach {
         launch_token,
@@ -185,6 +186,7 @@ pub fn attach(
         core_silence_ms,
         takeover_detection: takeover_detection as i32,
         takeover_threshold_px,
+        repeat_mode: repeat_mode as i32,
     }
 }
 
@@ -676,6 +678,7 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::Shutdown(_) => "AgentShutdown",
         Msg::Ping(_) => "Ping",
         Msg::ForgetPortalGrants(_) => "ForgetPortalGrants",
+        Msg::StopRepeat(_) => "StopRepeat",
         Msg::Ready(_) => "AgentReady",
         Msg::CaptureReady(_) => "CaptureReady",
         Msg::Captured(_) => "CapturedBatch",

@@ -81,6 +81,8 @@ pub struct Supervisor {
     core_silence_ms: u32,
     /// `[input].takeover_detection` / `.takeover_threshold_px`, sent in every `AgentAttach`.
     takeover: TakeoverSettings,
+    /// `[input].repeat_mode`: which side repeats a held key (KVM-036).
+    repeat_mode: ipc::RepeatMode,
     /// Portal restore tokens, persisted in `portal-restore.toml` and shipped in
     /// `AgentAttach.restore_tokens`; new ones arrive back as `PortalGrantChanged`.
     portal: crate::portal::PortalGrants,
@@ -109,6 +111,7 @@ impl Supervisor {
         core_silence_ms: u32,
         portal: crate::portal::PortalGrants,
         takeover: TakeoverSettings,
+        repeat_mode: ipc::RepeatMode,
     ) -> Self {
         Supervisor {
             program,
@@ -123,6 +126,7 @@ impl Supervisor {
             core_silence_ms,
             portal,
             takeover,
+            repeat_mode,
             launches: 0,
             child: None,
             job: None,
@@ -221,6 +225,7 @@ impl Supervisor {
             self.portal.to_ipc(),
             self.takeover.detection,
             self.takeover.threshold_px,
+            self.repeat_mode,
         );
         if let Err(error) = link.attach(attach).await {
             self.stop().await;
@@ -540,6 +545,7 @@ mod launch_tests {
                 detection: ipc::TakeoverDetection::Auto,
                 threshold_px: 12,
             },
+            ipc::RepeatMode::ReceiverSoftware,
         );
         assert_eq!(
             supervisor.state(),
