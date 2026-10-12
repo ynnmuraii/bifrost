@@ -418,11 +418,21 @@ impl<I: Identifiers> FocusRouter<I> {
                     },
                 });
                 out.push(Output::CancelTimer(Timer::SourceLeaseWatchdog));
+                // The receiver still owes a `LeaveAck`, and the ack can be lost (a link
+                // replaced between the `Leave` and the ack is the case CI hit): the
+                // release is bounded by the same conservative wait the closed-channel
+                // path uses, so a missing ack can never trap the owner in `Releasing`
+                // (`docs/05-protocol.md`: «…либо после закрытия прежнего канала и
+                // консервативного ожидания 600 ms»).
+                out.push(Output::ArmTimer {
+                    timer: Timer::ReleaseGuard,
+                    deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),
+                });
                 if let Some(lease) = self.lease.source_mut() {
                     lease.state = SourceState::Releasing;
                     // The receiver has not released yet: the next transition waits for
-                    // its `LeaveAck` (or the release guard once the channel is gone),
-                    // never for our own capture to come back.
+                    // its `LeaveAck` (or the release guard), never for our own capture to
+                    // come back.
                     lease.awaiting_leave_ack = true;
                 }
             }
@@ -479,6 +489,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
                 out.push(Output::CancelTimer(Timer::ReceiverChallenge));
                 out.push(Output::CancelTimer(Timer::RepeatGuard));
+                out.push(Output::CancelTimer(Timer::ReleaseGuard));
                 self.lease = LeaseSlot::Idle;
                 self.burned.insert(lease_id);
             }
@@ -516,7 +527,7 @@ impl<I: Identifiers> FocusRouter<I> {
 
     fn on_owner_claim(
         &mut self,
-        _now_ms: u64,
+        now_ms: u64,
         from: NodeId,
         serial: u64,
         on_claim: ClaimReason,
@@ -570,12 +581,13 @@ impl<I: Identifiers> FocusRouter<I> {
             }
             return;
         }
-        let _ = self.begin_deposition_for_claim(from, serial, out);
+        let _ = self.begin_deposition_for_claim(now_ms, from, serial, out);
     }
 
     /// A claim strictly newer than our belief: hand off if we own, otherwise record.
     fn begin_deposition_for_claim(
         &mut self,
+        now_ms: u64,
         from: NodeId,
         serial: u64,
         out: &mut Vec<Output>,
@@ -586,7 +598,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 claimant: from,
                 serial,
             });
-            self.release_lease_for_ownership(out);
+            self.release_lease_for_ownership(now_ms, out);
             return true;
         }
         // A follower cannot grant; record the serial and answer only with an older
@@ -646,7 +658,7 @@ impl<I: Identifiers> FocusRouter<I> {
 
     fn begin_deposition(
         &mut self,
-        _now_ms: u64,
+        now_ms: u64,
         serial: u64,
         owner: NodeId,
         notify: Option<NodeId>,
@@ -663,7 +675,7 @@ impl<I: Identifiers> FocusRouter<I> {
             owner,
             notify,
         });
-        self.release_lease_for_ownership(out);
+        self.release_lease_for_ownership(now_ms, out);
     }
 
     fn on_protocol_error(
@@ -713,7 +725,11 @@ impl<I: Identifiers> FocusRouter<I> {
 
     /// The role split of an ownership change: `source → EndCapture`,
     /// `receiver → ReleaseSession`, and nothing is published until the agent answers.
-    fn release_lease_for_ownership(&mut self, out: &mut Vec<Output>) {
+    fn release_lease_for_ownership(&mut self, now_ms: u64, out: &mut Vec<Output>) {
+        // Every entry into `Releasing` arms the same bound, so no release can wait on
+        // a message forever: the receiver's `LeaveAck`, the agent's `Released` — the
+        // guard is the backstop on all of them.
+        let bound = now_ms.saturating_add(self.timing.claim_grant_timeout_ms);
         let depose = matches!(
             self.pending_ownership,
             Some(PendingOwnership::Depose { .. })
@@ -728,7 +744,10 @@ impl<I: Identifiers> FocusRouter<I> {
                 }));
                 out.push(Output::CancelTimer(Timer::PrepareTimeout));
                 out.push(Output::CancelTimer(Timer::SourceLeaseWatchdog));
-                out.push(Output::CancelTimer(Timer::ReleaseGuard));
+                out.push(Output::ArmTimer {
+                    timer: Timer::ReleaseGuard,
+                    deadline_ms: bound,
+                });
                 if depose {
                     // «разослать `Leave{OWNERSHIP_LOST}` по активным получателям»
                     out.push(Output::Send {
@@ -750,6 +769,10 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
                 out.push(Output::CancelTimer(Timer::ReceiverChallenge));
                 out.push(Output::CancelTimer(Timer::RepeatGuard));
+                out.push(Output::ArmTimer {
+                    timer: Timer::ReleaseGuard,
+                    deadline_ms: bound,
+                });
                 if depose {
                     out.push(Output::Send {
                         peer,
@@ -843,6 +866,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
                 out.push(Output::CancelTimer(Timer::ReceiverChallenge));
                 out.push(Output::CancelTimer(Timer::RepeatGuard));
+                out.push(Output::CancelTimer(Timer::ReleaseGuard));
                 self.lease = LeaseSlot::Idle;
                 self.burned.insert(lease_id);
             }
@@ -956,7 +980,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 // owner.
                 let serial = claim.serial;
                 self.pending_ownership = Some(PendingOwnership::SelfGrant { serial });
-                self.release_lease_for_ownership(out);
+                self.release_lease_for_ownership(now_ms, out);
             }
             Timer::ReleaseGuard => match &self.lease {
                 LeaseSlot::Source(lease) if lease.state == SourceState::Releasing => {
@@ -1024,7 +1048,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 out,
             ),
             AgentEvent::LocalInputDetected { lease_id } => {
-                self.on_local_input_detected(lease_id, out);
+                self.on_local_input_detected(now_ms, lease_id, out);
             }
             AgentEvent::DeadlineExpired { lease_id } => {
                 self.on_agent_deadline_expired(lease_id, out);
@@ -1039,7 +1063,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 // transition, and a buffered press is replayed locally («Нельзя «потерять»
                 // нажатие в Preparing»).
                 ErrorCode::CaptureFailed | ErrorCode::UnsupportedSession => match lease_id {
-                    Some(lease_id) => self.cancel_failed_transition(lease_id, code, out),
+                    Some(lease_id) => self.cancel_failed_transition(now_ms, lease_id, code, out),
                     None => out.push(Output::Notice(Notice::Rejected {
                         peer: self.local,
                         code,
@@ -1056,6 +1080,7 @@ impl<I: Identifiers> FocusRouter<I> {
     /// Cancels the lease an agent failure was reported for.
     fn cancel_failed_transition(
         &mut self,
+        now_ms: u64,
         lease_id: LeaseId,
         code: ErrorCode,
         out: &mut Vec<Output>,
@@ -1071,6 +1096,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 }));
                 out.push(Output::CancelTimer(Timer::PrepareTimeout));
                 out.push(Output::CancelTimer(Timer::SourceLeaseWatchdog));
+                out.push(Output::CancelTimer(Timer::ReleaseGuard));
                 self.lease = LeaseSlot::Idle;
                 self.burned.insert(lease_id);
             }
@@ -1080,6 +1106,10 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
                 out.push(Output::CancelTimer(Timer::ReceiverChallenge));
                 out.push(Output::CancelTimer(Timer::RepeatGuard));
+                out.push(Output::ArmTimer {
+                    timer: Timer::ReleaseGuard,
+                    deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),
+                });
                 if let Some(lease) = self.lease.receiver_mut() {
                     lease.state = ReceiverState::Releasing;
                 }
@@ -1338,7 +1368,7 @@ impl<I: Identifiers> FocusRouter<I> {
         }));
     }
 
-    fn on_local_input_detected(&mut self, lease_id: LeaseId, out: &mut Vec<Output>) {
+    fn on_local_input_detected(&mut self, now_ms: u64, lease_id: LeaseId, out: &mut Vec<Output>) {
         let Some(lease) = self.lease.receiver() else {
             return;
         };
@@ -1359,6 +1389,10 @@ impl<I: Identifiers> FocusRouter<I> {
         out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
         out.push(Output::CancelTimer(Timer::ReceiverChallenge));
         out.push(Output::CancelTimer(Timer::RepeatGuard));
+        out.push(Output::ArmTimer {
+            timer: Timer::ReleaseGuard,
+            deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),
+        });
         if let Some(lease) = self.lease.receiver_mut() {
             lease.state = ReceiverState::Releasing;
             lease.pending_leave = Some(LeaveReason::ReceiverLocalInput);
@@ -1443,6 +1477,10 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
                 out.push(Output::CancelTimer(Timer::ReceiverChallenge));
                 out.push(Output::CancelTimer(Timer::RepeatGuard));
+                out.push(Output::ArmTimer {
+                    timer: Timer::ReleaseGuard,
+                    deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),
+                });
                 if let Some(lease) = self.lease.receiver_mut() {
                     lease.state = ReceiverState::Releasing;
                     lease.channel_gone = true;
@@ -1766,7 +1804,7 @@ impl<I: Identifiers> FocusRouter<I> {
 
     fn on_leave(
         &mut self,
-        _now_ms: u64,
+        now_ms: u64,
         from: NodeId,
         lease_id: LeaseId,
         reason: LeaveReason,
@@ -1800,6 +1838,7 @@ impl<I: Identifiers> FocusRouter<I> {
                         peer: from,
                         message: Message::LeaveAck { lease_id },
                     });
+                    out.push(Output::CancelTimer(Timer::ReleaseGuard));
                     self.burned.insert(lease_id);
                     self.lease = LeaseSlot::Idle;
                     return;
@@ -1811,6 +1850,13 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
                 out.push(Output::CancelTimer(Timer::ReceiverChallenge));
                 out.push(Output::CancelTimer(Timer::RepeatGuard));
+                // The agent's `Released` is the expected way out; the guard is the
+                // backstop when even that answer never comes, so `Releasing` is bounded
+                // on every path into it.
+                out.push(Output::ArmTimer {
+                    timer: Timer::ReleaseGuard,
+                    deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),
+                });
                 if let Some(lease) = self.lease.receiver_mut() {
                     lease.state = ReceiverState::Releasing;
                     lease.pending_leave = None;

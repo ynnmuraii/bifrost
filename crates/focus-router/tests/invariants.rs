@@ -416,7 +416,9 @@ fn invariant_7_a_return_release_waits_for_the_receiver() {
             let mut r = remote();
             r.handle(20, switch(SwitchTrigger::Edge)); // the return edge, lease id(1)
             let mut released_by_peer = false;
-            let mut guard_armed = false;
+            // The return edge arms the bound (S36): a release in flight is never
+            // unbounded, whatever happens to the channel or to our own agent.
+            let mut guard_armed = true;
             for (index, op) in steps.into_iter().enumerate() {
                 let now = 21 + index as u64;
                 let input = match op {
@@ -424,8 +426,8 @@ fn invariant_7_a_return_release_waits_for_the_receiver() {
                     1 => Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
                     2 => switch(SwitchTrigger::Edge),
                     3 => net(Message::LeaveAck { lease_id: id(1) }),
-                    // The session only delivers a timer it armed (`S31`), so the
-                    // guard is only ever fed after a link down.
+                    // The session only delivers a timer it armed, which is why the
+                    // guard is fed only while the router still owes one.
                     4 if guard_armed => Input::TimerExpired(Timer::ReleaseGuard),
                     5 => Input::LinkDown { peer: PEER },
                     _ => Input::Local(LocalInput::Resume),
@@ -474,7 +476,12 @@ fn invariant_7_a_return_release_waits_for_the_receiver() {
                     } else if released_by_peer {
                         prop_assert!(r.lease().is_idle(), "the ack must free the slot");
                     } else {
-                        // Our own release, a trigger or peer chatter: still waiting.
+                        // Our own release, a trigger or peer chatter: still waiting —
+                        // and still bounded.
+                        prop_assert!(
+                            guard_armed,
+                            "a release in flight must be bounded by the release guard"
+                        );
                         prop_assert!(
                             matches!(
                                 r.lease(),

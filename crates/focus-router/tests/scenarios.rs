@@ -193,6 +193,61 @@ fn s35_return_edge_waits_for_the_leave_ack_not_for_our_own_release() {
     assert!(r.lease().is_idle());
 }
 
+/// A `LeaveAck` can be lost — a link replaced between the `Leave` and the ack is how CI
+/// hit it — and the owner must still leave `Releasing`: the bound is the documented
+/// conservative wait (`claim_grant_timeout_ms`), not a message that may never arrive.
+#[test]
+fn s36_a_lost_leave_ack_is_bounded_by_the_release_guard() {
+    let mut r = remote();
+    let out = r.handle(20, switch(SwitchTrigger::Edge));
+    assert!(
+        out.contains(&arm(Timer::ReleaseGuard, 620)),
+        "the return edge arms the bound: {out:?}"
+    );
+    // Our own capture is back and the ack never arrives: nothing else happens, and the
+    // release is still waiting (the session delivers the guard only when it is due).
+    r.handle(21, Input::Agent(AgentEvent::Released { lease_id: id(1) }));
+    assert_eq!(r.focus(), FocusState::Releasing);
+    assert_eq!(
+        effects(&r.handle(620, Input::TimerExpired(Timer::ReleaseGuard))),
+        vec![]
+    );
+    assert!(r.lease().is_idle());
+    assert_eq!(r.focus(), FocusState::Local);
+    // The walk continues instead of hanging: the next transition opens a fresh lease.
+    assert_eq!(
+        effects(&r.handle(621, switch(SwitchTrigger::Edge))),
+        vec![begin(CaptureKind::Temporary, id(2), 200)]
+    );
+}
+
+/// A channel replaced while releasing: the ack cannot be re-delivered on the lost one, so
+/// the conservative wait runs from the close — the link coming back is not by itself the
+/// receiver's release (`docs/05-protocol.md`: «…либо после закрытия прежнего канала и
+/// консервативного ожидания 600 ms»).
+#[test]
+fn s37_a_link_replaced_while_releasing_ends_the_release() {
+    let mut r = remote();
+    r.handle(20, switch(SwitchTrigger::Edge));
+    r.handle(21, Input::Agent(AgentEvent::Released { lease_id: id(1) }));
+    let out = r.handle(30, Input::LinkDown { peer: PEER });
+    assert!(
+        out.contains(&arm(Timer::ReleaseGuard, 630)),
+        "the close restarts the bound: {out:?}"
+    );
+    assert_eq!(r.focus(), FocusState::Releasing);
+    // The replacement (a fresh `Hello`) does not release on its own: the receiver's own
+    // lease may still be alive, which is what the conservative wait covers.
+    assert_eq!(effects(&r.handle(40, hello(PEER, LOCAL, 1))), vec![]);
+    assert_eq!(r.focus(), FocusState::Releasing);
+    assert_eq!(
+        effects(&r.handle(630, Input::TimerExpired(Timer::ReleaseGuard))),
+        vec![]
+    );
+    assert!(r.lease().is_idle());
+    assert_eq!(r.focus(), FocusState::Local);
+}
+
 #[test]
 fn s08_leave_ack_returns_local_and_burns_old_id() {
     let mut r = remote();
