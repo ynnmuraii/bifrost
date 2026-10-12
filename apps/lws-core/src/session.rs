@@ -733,9 +733,8 @@ impl Session {
                     return;
                 };
                 let parsed = crate::topology::config_from_wire(&document, self.node_id);
-                let validation = crate::topology::validate_wire(&document).and_then(|()| {
-                    parsed.as_ref().map(|_| ()).map_err(Clone::clone)
-                });
+                let validation = crate::topology::validate_wire(&document)
+                    .and_then(|()| parsed.as_ref().map(|_| ()).map_err(Clone::clone));
                 let outcome = self
                     .layout_state
                     .accept_topology(from, pair, || validation.clone());
@@ -999,12 +998,9 @@ impl Session {
                 author,
                 self.node_id,
             ),
-            None => crate::topology::wire_document(
-                &self.layout,
-                pair.revision,
-                author,
-                self.node_id,
-            ),
+            None => {
+                crate::topology::wire_document(&self.layout, pair.revision, author, self.node_id)
+            }
         };
         self.applied_wire = Some(document.clone());
         document
@@ -1272,15 +1268,12 @@ impl Session {
             layout_toml,
         };
         let mut candidate = None;
-        let outcome = self.layout_state.apply_edit(
-            &edit,
-            self.node_id,
-            true,
-            |text| {
+        let outcome = self
+            .layout_state
+            .apply_edit(&edit, self.node_id, true, |text| {
                 candidate = Some(parse_layout_toml(text)?);
                 Ok(())
-            },
-        );
+            });
         Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
                 self.release_layout_pending();
@@ -1423,8 +1416,7 @@ impl Session {
                 applied_author = ?applied.author.map(|id| identity::fingerprint(&id)),
                 "forwarding layout edit to coordinator"
             );
-            let (nonce, verdict) =
-                self.hold_layout_request(document_text.clone(), expected);
+            let (nonce, verdict) = self.hold_layout_request(document_text.clone(), expected);
             let message =
                 transport::convert::LayoutMessage::LayoutEdit(protocol::wire::LayoutEdit {
                     expected_revision: expected.revision,
@@ -1451,15 +1443,12 @@ impl Session {
             layout_toml: document_text,
         };
         let mut candidate = None;
-        let outcome = self.layout_state.apply_edit(
-            &edit,
-            self.node_id,
-            is_coordinator,
-            |text| {
+        let outcome = self
+            .layout_state
+            .apply_edit(&edit, self.node_id, is_coordinator, |text| {
                 candidate = Some(parse_layout_toml(text)?);
                 Ok(())
-            },
-        );
+            });
         Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
                 let layout = candidate.expect("applied layout was parsed");

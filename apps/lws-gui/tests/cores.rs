@@ -740,12 +740,16 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
     assert_eq!(owner_status.owner_node_id, lab.a_id);
     assert_eq!(follower_status.layout_author, owner_status.layout_author);
 
-    wait_for(&mut owner, "the owner's initial two-display document", |view| {
-        (view.editor.nodes.len() == 2).then_some(())
-    });
-    wait_for(&mut follower, "the follower's initial two-display document", |view| {
-        (view.editor.nodes.len() == 2).then_some(())
-    });
+    wait_for(
+        &mut owner,
+        "the owner's initial two-display document",
+        |view| (view.editor.nodes.len() == 2).then_some(()),
+    );
+    wait_for(
+        &mut follower,
+        "the follower's initial two-display document",
+        |view| (view.editor.nodes.len() == 2).then_some(()),
+    );
     for (name, view) in [("owner", owner.view()), ("follower", follower.view())] {
         assert_eq!(view.editor.revision, 1, "{name} editor: {:?}", view.editor);
         assert!(
@@ -788,14 +792,20 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
             lws_gui::view_model::node_id_bytes(&view.editor.author),
         )
     };
-    assert_eq!(expected_author, lws_gui::view_model::node_id_bytes(&lab.a_id));
+    assert_eq!(
+        expected_author,
+        lws_gui::view_model::node_id_bytes(&lab.a_id)
+    );
 
     owner.view_mut().outcome = None;
     owner.dispatch(request, Instant::now());
     let outcome = wait_for(&mut owner, "the first owner Apply result", |view| {
         view.outcome.clone()
     });
-    assert!(outcome.ok, "the owner applies against restored revision 1: {outcome:?}");
+    assert!(
+        outcome.ok,
+        "the owner applies against restored revision 1: {outcome:?}"
+    );
 
     let owner_status = wait_for(&mut owner, "the owner to apply revision 2", |view| {
         view.status
@@ -810,10 +820,14 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
         "the owner's applied document must contain the first edge: {:?}",
         owner.view().editor
     );
-    let follower_doc = wait_for(&mut follower, "the follower to receive revision 2 and its edge", |view| {
-        (view.editor.revision == 2 && !view.editor.links.is_empty())
-            .then(|| view.editor.clone())
-    });
+    let follower_doc = wait_for(
+        &mut follower,
+        "the follower to receive revision 2 and its edge",
+        |view| {
+            (view.editor.revision == 2 && !view.editor.links.is_empty())
+                .then(|| view.editor.clone())
+        },
+    );
     owner.dispatch(Action::ListPendingEdits, Instant::now());
     wait_for(&mut owner, "the pending-edit read to finish", |view| {
         (!view
@@ -834,12 +848,21 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
     follower.view_mut().outcome = None;
     follower.view_mut().conflict = None;
     follower.dispatch(stale_follower_request, Instant::now());
-    let conflict = wait_for(&mut follower, "the owner to refuse the stale follower edit", |view| {
-        view.conflict.clone()
-    });
+    let conflict = wait_for(
+        &mut follower,
+        "the owner to refuse the stale follower edit",
+        |view| view.conflict.clone(),
+    );
     assert!(!conflict.is_empty());
-    let refusal = follower.view().outcome.as_ref().expect("the refusal is shown");
-    assert!(!refusal.ok, "the stale follower edit is refused: {refusal:?}");
+    let refusal = follower
+        .view()
+        .outcome
+        .as_ref()
+        .expect("the refusal is shown");
+    assert!(
+        !refusal.ok,
+        "the stale follower edit is refused: {refusal:?}"
+    );
     assert_eq!(owner.view().editor.revision, 2);
     assert_eq!(owner.view().editor.links.len(), 1);
     assert_eq!(follower.view().editor.revision, 2);
