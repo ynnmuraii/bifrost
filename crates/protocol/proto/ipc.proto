@@ -250,6 +250,7 @@ message GuiFrame {
     OpResult op_result = 42;
     TopologyDoc topology_doc = 43;   // response to GetTopology and pushed on every applied revision
     PendingEdits pending_edits = 44; // response to ListPendingEdits
+    PairingWindow pairing_window = 45; // pushed when the pairing window opens, changes or closes
   }
 }
 message GetStatus {}
@@ -294,6 +295,17 @@ message MemberStatus {
   string link_state = 5;   // CONNECTING / TLS / HELLO / READY / CLOSING
 }
 message PairingPrompt { bytes attempt_id = 1; string peer_name = 2; string sas_code = 3; string local_fingerprint = 4; string peer_fingerprint = 5; }
+// Pushed when the pairing window opens, when what is left of it changes, and when it
+// closes. The window is served on the node's input/control port by ALPN
+// `lan-workspace/pair/1` (docs/05-protocol.md, «Сопряжение»), so a `StartPairing`
+// answer alone would leave the GUI unable to tell its user what the other computer
+// has to type: `address` is exactly that.
+message PairingWindow {
+  bool open = 1;
+  string address = 2;           // "<ip>:<port>" the other node dials; "" when closed
+  uint32 seconds_remaining = 3; // until the 120 s window closes; 0 when closed
+  bytes attempt_id = 4;         // the id every PairingAnswer of this window names; empty when closed
+}
 message OpResult { bool ok = 1; string error_code = 2; }
 
 // ---------- layout editor model (gui <-> core) ----------
