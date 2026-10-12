@@ -83,8 +83,13 @@ impl Clock {
 
 /// What the manager keeps per live link.
 struct LiveLink {
+    /// What the manager knows this link by (see [`LinkConfig::key`]).
+    ///
+    /// The map is keyed by peer, because the dedup keeps exactly one live link per peer; the
+    /// key is what a report is matched against, and `(peer, direction)` cannot do that job: a
+    /// peer that dials twice is two links in the same direction.
+    key: [u8; 16],
     handle: LinkHandle,
-    direction: Direction,
     initiator: NodeId,
     /// The link's task, so [`LinkManager::kill_all`] can drop it without a `Shutdown`.
     task: tokio::task::JoinHandle<()>,
@@ -111,6 +116,7 @@ struct PendingLink {
 enum ManagerMessage {
     /// A link was spawned; the manager takes ownership of its handle.
     Register {
+        key: [u8; 16],
         peer: NodeId,
         direction: Direction,
         handle: LinkHandle,
@@ -136,13 +142,14 @@ pub struct LinkManager {
 #[derive(Default)]
 struct Inner {
     links: BTreeMap<NodeId, LiveLink>,
-    /// Keyed by peer **and** direction: two nodes that dial each other have two links
-    /// between them at the same time, and both are registered before either `Hello`
-    /// exchange finishes. Keying by the peer alone let the second registration clobber
-    /// the first one's handle — which killed the first link, made the manager drop its
-    /// `Up`, and left the pair split across two different TCP connections instead of the
-    /// one the dedup rule picked.
-    pending: BTreeMap<(NodeId, Direction), PendingLink>,
+    /// Keyed by the link's own key ([`LinkConfig::key`]), which is what makes it unique.
+    ///
+    /// `(peer, direction)` is not: two nodes that dial each other have two links between them
+    /// at the same time *and* different directions, and a peer that dials twice has two links
+    /// in the *same* direction — the late registration then clobbered the earlier one's
+    /// handle, the manager dropped that link's `Up`, and the pair stayed split across two TCP
+    /// connections instead of the one the dedup rule picked.
+    pending: BTreeMap<[u8; 16], PendingLink>,
 }
 
 impl LinkManager {
@@ -268,6 +275,7 @@ impl LinkManager {
     async fn on_message(&self, message: ManagerMessage, local: NodeId) {
         match message {
             ManagerMessage::Register {
+                key,
                 peer,
                 direction,
                 handle,
@@ -275,7 +283,7 @@ impl LinkManager {
             } => {
                 let initiator = if direction.is_outgoing() { local } else { peer };
                 self.inner.lock().await.pending.insert(
-                    (peer, direction),
+                    key,
                     PendingLink {
                         handle,
                         initiator,
@@ -285,34 +293,27 @@ impl LinkManager {
             }
             ManagerMessage::Report(report) => match report {
                 LinkReport::Up {
+                    key,
                     peer,
-                    direction,
                     hello,
                     connection_id,
                     remote,
-                } => {
-                    self.on_up(peer, direction, hello, connection_id, remote)
-                        .await
-                }
+                } => self.on_up(key, peer, hello, connection_id, remote).await,
                 LinkReport::Message { peer, message } => {
                     let _ = self
                         .events_tx
                         .send(LinkEvent::Message { peer, message })
                         .await;
                 }
-                LinkReport::Down {
-                    peer,
-                    direction,
-                    reason,
-                } => {
+                LinkReport::Down { key, peer, reason } => {
                     let removed = {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.remove(&(peer, direction));
-                        // Only the link that went down may leave the member list: with two
-                        // links to one peer, the other direction's `Down` must not evict the
-                        // live one.
+                        inner.pending.remove(&key);
+                        // Only the link that went down may leave the member list: a `Down` is
+                        // matched against the *key* the manager handed that link, so a closed
+                        // newcomer in the same direction as a live link cannot evict it.
                         match inner.links.get(&peer) {
-                            Some(live) if live.direction == direction => {
+                            Some(live) if live.key == key => {
                                 inner.links.remove(&peer);
                                 true
                             }
@@ -329,31 +330,33 @@ impl LinkManager {
 
     async fn on_up(
         &self,
+        key: [u8; 16],
         peer: NodeId,
-        direction: Direction,
         hello: PeerInfo,
         connection_id: [u8; 16],
         remote: std::net::SocketAddr,
     ) {
-        let incoming = self.inner.lock().await.pending.remove(&(peer, direction));
+        let incoming = self.inner.lock().await.pending.remove(&key);
         let Some(pending) = incoming else {
             return;
         };
 
         // Simultaneous dial: both sides compute the same winner from the two identities, so
         // the losing link is closed on both ends without any negotiation.
-        let (existing_initiator, replaced) = {
+        let (existing_key, replaced) = {
             let inner = self.inner.lock().await;
             match inner.links.get(&peer) {
-                Some(existing) => {
+                // A link cannot replace itself: a repeated `Up` for the same key is not a
+                // second link.
+                Some(existing) if existing.key != key => {
                     let keep_incoming =
                         policy::prefer_incoming(&existing.initiator, &pending.initiator);
-                    (Some(existing.initiator), keep_incoming)
+                    (Some(existing.key), keep_incoming)
                 }
-                None => (None, false),
+                _ => (None, false),
             }
         };
-        if existing_initiator.is_some() && !replaced {
+        if existing_key.is_some() && !replaced {
             // The existing link wins; ask the new one to close.
             pending.handle.close();
             return;
@@ -412,8 +415,8 @@ impl LinkManager {
         self.inner.lock().await.links.insert(
             peer,
             LiveLink {
+                key,
                 handle: pending.handle,
-                direction,
                 initiator: pending.initiator,
                 task: pending.task,
             },
@@ -588,7 +591,11 @@ async fn accept_one(
         },
         None => return,
     };
+    let Ok(key) = identity::random16() else {
+        return;
+    };
     start_link(
+        key,
         peer,
         Direction::Incoming,
         Stream::Server(Box::new(stream)),
@@ -644,17 +651,20 @@ async fn dial_loop(
                 .and_then(|certs| certs.first())
                 .and_then(|certificate| peer_node_id(std::slice::from_ref(certificate)).ok());
             if let Some(peer) = peer {
-                start_link(
-                    peer,
-                    Direction::Outgoing,
-                    Stream::Client(Box::new(stream)),
-                    identity.node_id(),
-                    hello.clone(),
-                    messages.clone(),
-                    settings,
-                )
-                .await;
-                attempt = 0;
+                if let Ok(key) = identity::random16() {
+                    start_link(
+                        key,
+                        peer,
+                        Direction::Outgoing,
+                        Stream::Client(Box::new(stream)),
+                        identity.node_id(),
+                        hello.clone(),
+                        messages.clone(),
+                        settings,
+                    )
+                    .await;
+                    attempt = 0;
+                }
             }
         }
         attempt = attempt.saturating_add(1);
@@ -664,6 +674,7 @@ async fn dial_loop(
 
 /// Spawns a link, registers it with the manager and waits for it to end.
 async fn start_link(
+    key: [u8; 16],
     peer: NodeId,
     direction: Direction,
     stream: Stream,
@@ -674,6 +685,7 @@ async fn start_link(
 ) {
     let (reports_tx, mut reports_rx) = mpsc::channel::<LinkReport>(64);
     let Ok(link) = crate::link::spawn(LinkConfig {
+        key,
         peer,
         local,
         direction,
@@ -688,6 +700,7 @@ async fn start_link(
     let handle = link.handle.clone();
     if messages
         .send(ManagerMessage::Register {
+            key,
             peer,
             direction,
             handle,

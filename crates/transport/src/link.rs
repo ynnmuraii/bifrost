@@ -315,10 +315,10 @@ pub struct Link {
 pub enum LinkReport {
     /// Handshake done.
     Up {
+        /// The key the manager gave this link (see [`LinkConfig::key`]).
+        key: [u8; 16],
         /// The peer.
         peer: NodeId,
-        /// Who dialled this link.
-        direction: Direction,
         /// Its gossip.
         hello: PeerInfo,
         /// The negotiated `connection_id` (see [`LinkEvent::Up`]).
@@ -335,11 +335,11 @@ pub enum LinkReport {
     },
     /// The link ended.
     Down {
+        /// The key the manager gave this link (see [`LinkConfig::key`]), so this report can
+        /// only remove the link that sent it — not a live link in the same direction.
+        key: [u8; 16],
         /// The peer.
         peer: NodeId,
-        /// Who dialled *this* link, so the manager tells a `Down` from one of two
-        /// simultaneous links to the same peer apart.
-        direction: Direction,
         /// Why.
         reason: LinkDownReason,
     },
@@ -353,6 +353,13 @@ pub struct LinkConfig {
     pub local: NodeId,
     /// Who dialled.
     pub direction: Direction,
+    /// What the manager knows this link by.
+    ///
+    /// Unique per spawned link, and echoed in every [`LinkReport`], so a report can only ever
+    /// change the state of the link that sent it. `(peer, direction)` cannot do that: a peer
+    /// that dials twice is two links in one direction, and the late one used to overwrite the
+    /// earlier one's bookkeeping.
+    pub key: [u8; 16],
     /// The `Hello` we send.
     pub local_hello: wire::Hello,
     /// The established TLS stream.
@@ -380,6 +387,7 @@ pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
 
 async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
     let LinkConfig {
+        key,
         peer,
         direction,
         local_hello,
@@ -395,8 +403,8 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
             Err(error) => {
                 report_down(
                     &reports,
+                    key,
                     peer,
-                    direction,
                     LinkDownReason::Protocol(error.to_string()),
                 )
                 .await;
@@ -425,7 +433,7 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
     let (frames_tx, mut frames_rx) = mpsc::channel::<Result<wire::Envelope, TransportError>>(8);
     let reader_task = tokio::spawn(read_loop(reader, frames_tx));
 
-    let mut state = LinkState::new(peer, direction, connection_id);
+    let mut state = LinkState::new(peer, connection_id, key);
     state.remote = remote;
 
     // The dialer speaks first: its `Hello` is the first frame of its direction (`seq = 1`).
@@ -437,7 +445,7 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
             Ok(()) => {}
             Err(reason) => {
                 reader_task.abort();
-                report_down(&reports, peer, direction, reason).await;
+                report_down(&reports, key, peer, reason).await;
                 return;
             }
         }
@@ -509,13 +517,14 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
     };
 
     reader_task.abort();
-    report_down(&reports, peer, direction, reason).await;
+    report_down(&reports, key, peer, reason).await;
 }
 
 /// The coordinator's mutable state.
 struct LinkState {
     peer: NodeId,
-    direction: Direction,
+    /// The key the manager gave this link (see [`LinkConfig::key`]).
+    key: [u8; 16],
     tx_seq: u64,
     connection_id: [u8; 16],
     announced: bool,
@@ -534,10 +543,10 @@ struct LinkState {
 }
 
 impl LinkState {
-    fn new(peer: NodeId, direction: Direction, connection_id: [u8; 16]) -> Self {
+    fn new(peer: NodeId, connection_id: [u8; 16], key: [u8; 16]) -> Self {
         Self {
             peer,
-            direction,
+            key,
             tx_seq: 1,
             connection_id,
             announced: false,
@@ -664,8 +673,8 @@ impl LinkState {
             }
             return reports
                 .send(LinkReport::Up {
+                    key: self.key,
                     peer: self.peer,
-                    direction: self.direction,
                     hello: info,
                     connection_id: self.connection_id,
                     remote: self.remote.expect("a connected socket has a peer address"),
@@ -832,15 +841,9 @@ fn reason_from(error: TransportError) -> LinkDownReason {
 
 async fn report_down(
     reports: &mpsc::Sender<LinkReport>,
+    key: [u8; 16],
     peer: NodeId,
-    direction: Direction,
     reason: LinkDownReason,
 ) {
-    let _ = reports
-        .send(LinkReport::Down {
-            peer,
-            direction,
-            reason,
-        })
-        .await;
+    let _ = reports.send(LinkReport::Down { key, peer, reason }).await;
 }
