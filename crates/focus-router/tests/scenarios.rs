@@ -146,10 +146,7 @@ fn s35_return_edge_waits_for_the_leave_ack_not_for_our_own_release() {
     // The agent restored the local capture at once — that is not the receiver's
     // release, so the lease stays in the slot and nothing may open a new one.
     assert_eq!(
-        effects(&r.handle(
-            21,
-            Input::Agent(AgentEvent::Released { lease_id: id(1) })
-        )),
+        effects(&r.handle(21, Input::Agent(AgentEvent::Released { lease_id: id(1) }))),
         vec![]
     );
     assert_eq!(
@@ -184,10 +181,7 @@ fn s35_return_edge_waits_for_the_leave_ack_not_for_our_own_release() {
     // `LeaveAck` falls back to the conservative `claim_grant_timeout_ms` wait.
     let mut r = remote();
     r.handle(20, switch(SwitchTrigger::Edge));
-    r.handle(
-        21,
-        Input::Agent(AgentEvent::Released { lease_id: id(1) }),
-    );
+    r.handle(21, Input::Agent(AgentEvent::Released { lease_id: id(1) }));
     let out = r.handle(22, Input::LinkDown { peer: PEER });
     assert_eq!(effects(&out), vec![]);
     assert!(out.contains(&arm(Timer::ReleaseGuard, 622)));
