@@ -15,3 +15,21 @@ geometry = { path = "../geometry" }
 protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+[target.'cfg(windows)'.dependencies]
+# `first_run` names this host's interfaces to pick a `listen_address`:
+# `GetAdaptersAddresses` gives the friendly names the virtual-adapter filter reads
+# (`vEthernet (Default Switch)`, `VirtualBox Host-Only Network`) together with
+# `OperStatus`; `WinSock` supplies the `sockaddr` the returned addresses come in and
+# `Ndis` the `IF_OPER_STATUS` values.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# `getifaddrs` is the platform half of the same enumeration on Unix (names plus the
+# `IFF_UP` flag); the crate is already in the graph through `x11rb`.
+libc = "0.2"
