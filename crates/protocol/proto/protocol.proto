@@ -305,7 +305,15 @@ message ActiveLayout {
   uint64 layout_revision = 2;  // monotonic counter of the receiver's own layout changes
 }
 
-message ClipboardGrant { bytes channel_id = 1; bytes binding_token = 2; uint32 ttl_ms = 3; }
+message ClipboardGrant {
+  bytes channel_id = 1;
+  bytes binding_token = 2;
+  uint32 ttl_ms = 3;
+  uint32 clipboard_port = 4;   // the port the granting node's clipboard listener is bound to;
+                               // 0 = the default 47902. `network.port_clipboard` is configurable,
+                               // so the dialer may not assume the default: it connects to the
+                               // address the input link comes from, at this port.
+}
 message ClipboardBind {
   bytes parent_connection_id = 1;
   bytes channel_id = 2;

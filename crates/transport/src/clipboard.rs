@@ -48,6 +48,10 @@ pub enum ClipboardMessage {
         binding_token: [u8; 32],
         /// Lifetime of the grant in milliseconds.
         ttl_ms: u32,
+        /// The port this node's clipboard listener is bound to; `0` means the default
+        /// 47902. `network.port_clipboard` is configurable, so the dialer may not assume
+        /// the default: it dials the address the input link comes from, at this port.
+        clipboard_port: u32,
     },
     /// `ClipboardBind`: the clipboard channel's first frame.
     Bind {
@@ -120,10 +124,12 @@ impl ClipboardMessage {
                 channel_id,
                 binding_token,
                 ttl_ms,
+                clipboard_port,
             } => Payload::ClipboardGrant(wire::ClipboardGrant {
                 channel_id: channel_id.to_vec(),
                 binding_token: binding_token.to_vec(),
                 ttl_ms: *ttl_ms,
+                clipboard_port: *clipboard_port,
             }),
             ClipboardMessage::Bind {
                 parent_connection_id,
@@ -340,6 +346,7 @@ fn classify(envelope: &wire::Envelope) -> Result<ClipboardMessage, DecodeError> 
             channel_id: arr16(&grant.channel_id).map_err(violation)?,
             binding_token: arr32(&grant.binding_token).map_err(violation)?,
             ttl_ms: grant.ttl_ms,
+            clipboard_port: grant.clipboard_port,
         }),
         Some(Payload::ClipboardBind(bind)) => Ok(ClipboardMessage::Bind {
             parent_connection_id: arr16(&bind.parent_connection_id).map_err(violation)?,
