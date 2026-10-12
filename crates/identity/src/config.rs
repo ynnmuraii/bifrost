@@ -229,11 +229,7 @@ mod tests {
         let accept = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.expect("accept");
             let stream = acceptor.accept(tcp).await.expect("handshake");
-            stream
-                .get_ref()
-                .1
-                .alpn_protocol()
-                .map(<[u8]>::to_vec)
+            stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
         });
 
         let connector = TlsConnector::from(Arc::new(
@@ -291,9 +287,7 @@ mod tests {
             clipboard_client_config(&client, &client_trust).expect("client config"),
         ));
         let tcp = TcpStream::connect(address).await.expect("connect");
-        let client_result = connector
-            .connect(server_name(address.ip()), tcp)
-            .await;
+        let client_result = connector.connect(server_name(address.ip()), tcp).await;
 
         let server_result = accept.await.expect("accept task");
         assert!(

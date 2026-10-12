@@ -189,6 +189,9 @@ struct LocalAssembly {
     payload: Vec<u8>,
 }
 
+/// What one `ClipboardChanged` chunk contributed: nothing yet, or the whole copy.
+type AssembledCopy = Result<Option<(Vec<u8>, Vec<cb::Marker>)>, cb::ClipboardError>;
+
 impl Clipboard {
     /// Builds the endpoint and its runtime: the listener on `47902` and the dial list.
     pub async fn start(
@@ -273,10 +276,7 @@ impl Clipboard {
     ///
     /// `Ok(None)` means more chunks are expected; `Ok(Some(..))` is the last one, with the
     /// payload and the markers the platform reported for the whole copy.
-    fn take_chunk(
-        &mut self,
-        message: &ipc::ClipboardChanged,
-    ) -> Result<Option<(Vec<u8>, Vec<cb::Marker>)>, cb::ClipboardError> {
+    fn take_chunk(&mut self, message: &ipc::ClipboardChanged) -> AssembledCopy {
         let count = message.chunk_count;
         if count == 0 || count as usize > cb::MAX_CHUNKS || message.chunk_index >= count {
             self.local = None;
