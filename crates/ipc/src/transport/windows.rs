@@ -393,6 +393,16 @@ impl GuiListener {
     /// The kernel already checked the DACL at connect time, so the
     /// [`PeerCheck`] hook sees [`CredentialSource::PipeDacl`] credentials and the
     /// default [`crate::peer::SameUser`] accepts them.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe: core's session loop polls it as one branch of a
+    /// `select!` next to its ticks and agent frames, so it is cancelled most times a client
+    /// shows up. The instance that is waiting for the client is taken out of `pending`
+    /// *before* the wait and [`PendingInstance`] puts it back if the wait is cancelled —
+    /// without that the instance is dropped with a live client on it, and the client reads a
+    /// closed pipe instead of its answer («core closed the control channel without an
+    /// answer» watched as `lws-core status` failing a few times in two hundred).
     pub async fn accept(&mut self, check: &dyn PeerCheck) -> Result<NamedPipeServer, IpcError> {
         let server = std::mem::replace(
             &mut self.pending,
@@ -401,16 +411,59 @@ impl GuiListener {
             self.security
                 .create(&self.name, &self.options.with_first_instance(false))?,
         );
-        server
-            .connect()
-            .await
-            .map_err(|source| IpcError::io("connecting a GUI pipe client", source))?;
+        let instance = PendingInstance {
+            server: Some(server),
+            pending: &mut self.pending,
+        };
+        let connected = instance.server().connect().await;
+        // The wait is over, whichever way it went: the caller owns the instance from here.
+        let server = instance.take();
+        connected.map_err(|source| IpcError::io("connecting a GUI pipe client", source))?;
 
         let credentials = PeerCredentials::pipe_dacl();
         check
             .check(&credentials)
             .map_err(|rejected| crate::error::rejected_on(&self.name, rejected))?;
         Ok(server)
+    }
+}
+
+/// Puts the instance that is waiting for a client back into the listener if the wait is
+/// cancelled, and hands it to the caller when the wait finishes.
+///
+/// A [`NamedPipeServer`] that a client has connected to is the client's only way to be
+/// served: dropping it closes the connection under that client. `PendingInstance` exists so a
+/// cancelled [`GuiListener::accept`] cannot do that (`mem::replace` takes the instance out of
+/// the listener before the `await`, which is exactly the window a `select!` cancels in).
+struct PendingInstance<'a> {
+    server: Option<NamedPipeServer>,
+    pending: &'a mut NamedPipeServer,
+}
+
+impl PendingInstance<'_> {
+    /// The instance that is waiting for its client.
+    fn server(&self) -> &NamedPipeServer {
+        self.server
+            .as_ref()
+            .expect("the instance is owned until `take`")
+    }
+
+    /// Ends the wait, whichever way it went: the caller owns the instance.
+    fn take(mut self) -> NamedPipeServer {
+        self.server
+            .take()
+            .expect("the instance is owned until `take`")
+    }
+}
+
+impl Drop for PendingInstance<'_> {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            // Cancelled: the client is still connected to this instance, so it goes back to
+            // the listener for the next `accept`. The fresh instance that replaced it in
+            // `pending` has no client and is dropped.
+            *self.pending = server;
+        }
     }
 }
 
@@ -459,4 +512,74 @@ pub async fn agent_pair() -> Result<(NamedPipeServer, NamedPipeClient), IpcError
         .map_err(|source| IpcError::io("connecting the agent pipe", source))?;
 
     Ok((server, client))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::peer::SameUser;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+
+    /// A pipe name no other test or process uses.
+    fn test_endpoint() -> Endpoint {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Endpoint::pipe(format!(
+            "{PIPE_PATH_PREFIX}{PIPE_NAME_PREFIX}test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// A cancelled `accept` must not lose the client that connected while it waited.
+    ///
+    /// Core's session loop polls `accept` as one branch of a `select!` beside its ticks and
+    /// agent frames, so a client that shows up right then is cancelled on almost every
+    /// request. Before [`PendingInstance`] the instance waiting for that client was dropped
+    /// with the connection on it, and `lws-core status` reported «core closed the control
+    /// channel without an answer» for a few calls in two hundred — even though core served
+    /// every *other* one, which is what made it look like the answer had been lost rather
+    /// than the connection.
+    #[tokio::test]
+    async fn a_cancelled_accept_keeps_the_client_it_waited_for() {
+        let endpoint = test_endpoint();
+        let mut listener = listen(&endpoint).expect("a listener");
+
+        // Start an `accept`: it takes the instance out of the listener and waits for a client.
+        let same_user = SameUser::current();
+        let mut accept = Box::pin(listener.accept(&same_user));
+        tokio::select! {
+            result = &mut accept => panic!("no client is connected yet: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        // A client connects while that `accept` is waiting — and the `accept` is then dropped,
+        // which is what core's `select!` does when its tick or an agent frame wins the race.
+        let client = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { connect(&endpoint).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(accept);
+
+        // The client is still there, so the next accept serves it.
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            listener.accept(&SameUser::current()),
+        )
+        .await
+        .expect("the client connected before the cancel must still be accepted")
+        .expect("accept");
+        let mut client = client.await.expect("client task").expect("connect");
+
+        // And the connection is usable, not just present.
+        client.write_all(b"ping\n").await.expect("write");
+        client.flush().await.expect("flush");
+        let mut line = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .await
+            .expect("read");
+        assert_eq!(line, "ping\n");
+    }
 }

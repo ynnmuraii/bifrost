@@ -797,7 +797,14 @@ impl Session {
     async fn on_control(&mut self, mut stream: ctl::ClientStream) {
         let line = match ctl::read_line(&mut stream).await {
             Ok(Some(line)) => line,
-            Ok(None) => return,
+            Ok(None) => {
+                // A client that connected and closed without a line. Core used to drop such
+                // connections without saying anything, which hid a cancelled `accept` for a
+                // while (`ipc::transport::GuiListener::accept`); the warning is how the next
+                // reader of the log sees it.
+                tracing::warn!("a control client closed without sending a request");
+                return;
+            }
             Err(error) => {
                 tracing::warn!(%error, "cannot read a control request");
                 return;
