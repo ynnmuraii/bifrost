@@ -800,8 +800,9 @@ impl Harness {
         let (a_id, b_id) = peer_ids(&a_root, &b_root);
         if dry_motion {
             // The link document needs the peer's id, which only exists after pairing.
-            write_topology(&a_root, &b_id);
-            write_topology(&b_root, &a_id);
+            // Each node describes the same shared boundary from its own side.
+            write_topology(&a_root, &b_id, "right", "left");
+            write_topology(&b_root, &a_id, "left", "right");
         }
         let attached = before_run(&a_root, &b_root);
 
@@ -1066,9 +1067,9 @@ pub fn append_config(root: &Path, fragment: &str) {
 
 /// The `[topology]` document `--dry-motion` walks across.
 ///
-/// One 1920×1080 display per node and a bidirectional link from the source's right edge
-/// to the peer's left edge — the shape `docs/work/e3-smoke-transcript.md` proved.
-fn write_topology(root: &Path, peer: &str) {
+/// One 1920×1080 display per node; each side describes the same bidirectional boundary
+/// in its own direction — the shape `docs/work/e3-smoke-transcript.md` proved.
+fn write_topology(root: &Path, peer: &str, from_edge: &str, to_edge: &str) {
     let path = root.join("config/config.toml");
     let mut document = std::fs::read_to_string(&path).expect("configuration");
     document.push_str(&format!(
@@ -1098,14 +1099,14 @@ fn write_topology(root: &Path, peer: &str) {
          [topology.links.from]\n\
          node = \"self\"\n\
          display = \"dry-0\"\n\
-         edge = \"right\"\n\
+         edge = \"{from_edge}\"\n\
          start = 0.0\n\
          end = 1080.0\n\
          \n\
          [topology.links.to]\n\
          node = \"peer:{peer}\"\n\
          display = \"dry-0\"\n\
-         edge = \"left\"\n\
+         edge = \"{to_edge}\"\n\
          start = 0.0\n\
          end = 1080.0\n"
     ));
