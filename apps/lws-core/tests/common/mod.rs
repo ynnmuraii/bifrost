@@ -56,24 +56,6 @@ fn agent_exe() -> PathBuf {
     path
 }
 
-/// Removes ANSI CSI sequences (the `ESC[…m` colour codes) from a log.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(current) = chars.next() {
-        if current == '\u{1b}' {
-            for code in chars.by_ref() {
-                if code == 'm' {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(current);
-    }
-    out
-}
-
 /// Milliseconds since the Unix epoch, from the harness's own clock.
 pub fn now_millis() -> i64 {
     SystemTime::now()
@@ -243,14 +225,14 @@ impl Node {
         }
     }
 
-    /// The whole log so far, with colour sequences removed.
+    /// The whole log so far.
     ///
-    /// `tracing`'s fmt layer colours its output whenever the environment looks like a
-    /// terminal, and on a Linux runner it does that even for a redirected file, so the
-    /// bytes the harness parses carry `ESC[…m` around every field. The timestamps and the
-    /// field names are what matter here.
+    /// Plain text by construction: core and the agent colour their logs only when stderr
+    /// is a terminal (`with_ansi(std::io::stderr().is_terminal())`), and this harness
+    /// always redirects them into a file. The harness used to strip `ESC[…m` here; that
+    /// is gone, so a colour regression fails the log assertions instead of being hidden.
     pub fn log(&self) -> String {
-        strip_ansi(&std::fs::read_to_string(&self.log).unwrap_or_default())
+        std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
     /// Every `focus focus="…"` transition with its wall-clock millisecond.
@@ -484,15 +466,19 @@ impl Drop for Node {
 
 /// The link between the two nodes, with a switch for the fault tests.
 ///
-/// One direction is enough: the dialer records the address it typed, so pointing *A* at
-/// the proxy routes the whole link through it, while B's record of A is the documented
-/// port and its dial simply fails (harmless, and the same asymmetry `pair` documents).
+/// **Both** directions go through it. Every node dials every trusted peer, so a single
+/// tunnel would leave a second, direct link for the dedup rule to choose between — and
+/// which one survives depends on the node ids of that run. One listener per side, one
+/// shared switch, and the fault always lands in the middle of the surviving link.
 pub struct Proxy {
-    pub addr: String,
+    /// The address A has to record for B.
+    pub toward_b: String,
+    /// The address B has to record for A.
+    pub toward_a: String,
     mode: Arc<Mutex<Mode>>,
     live: Arc<Mutex<Vec<TcpStream>>>,
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,66 +491,20 @@ enum Mode {
 }
 
 impl Proxy {
-    /// Listens on a free port and forwards to `target` until told otherwise.
-    pub fn start(target: u16) -> Result<Proxy, String> {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").map_err(|error| format!("proxy bind: {error}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|error| error.to_string())?
-            .port();
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| error.to_string())?;
+    /// Two tunnels: the first lands on A, the second on B.
+    pub fn start(a_port: u16, b_port: u16) -> Result<Proxy, String> {
         let mode = Arc::new(Mutex::new(Mode::Forward));
-        let live = Arc::new(Mutex::new(Vec::new()));
+        let live: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let thread = {
-            let mode = Arc::clone(&mode);
-            let live = Arc::clone(&live);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let Ok(upstream) = TcpStream::connect(("127.0.0.1", target)) else {
-                                continue;
-                            };
-                            let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
-                            let _ = upstream.set_read_timeout(Some(Duration::from_millis(20)));
-                            if let Ok(clone) = stream.try_clone() {
-                                live.lock().expect("proxy").push(clone);
-                            }
-                            let (backward, backward_target) =
-                                match (upstream.try_clone(), stream.try_clone()) {
-                                    (Ok(from_upstream), Ok(to_client)) => {
-                                        (from_upstream, to_client)
-                                    }
-                                    _ => continue,
-                                };
-                            // Both directions, or the link would be half-duplex: the
-                            // protocol needs the peer's answers to travel back.
-                            let forward_mode = Arc::clone(&mode);
-                            std::thread::spawn(move || bridge(stream, upstream, forward_mode));
-                            let backward_mode = Arc::clone(&mode);
-                            std::thread::spawn(move || {
-                                bridge(backward, backward_target, backward_mode)
-                            });
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })
-        };
+        let (toward_a, first) = tunnel(a_port, &mode, &live, &stop)?;
+        let (toward_b, second) = tunnel(b_port, &mode, &live, &stop)?;
         Ok(Proxy {
-            addr: format!("127.0.0.1:{port}"),
+            toward_b,
+            toward_a,
             mode,
             live,
             stop,
-            thread: Some(thread),
+            threads: vec![first, second],
         })
     }
 
@@ -603,10 +543,62 @@ impl Drop for Proxy {
         for stream in self.live.lock().expect("proxy").drain(..) {
             let _ = stream.shutdown(Shutdown::Both);
         }
-        if let Some(thread) = self.thread.take() {
+        for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
     }
+}
+
+/// One tunnel: accepts, dials `target`, and bridges both directions.
+fn tunnel(
+    target: u16,
+    mode: &Arc<Mutex<Mode>>,
+    live: &Arc<Mutex<Vec<TcpStream>>>,
+    stop: &Arc<AtomicBool>,
+) -> Result<(String, JoinHandle<()>), String> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| format!("proxy bind: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let mode = Arc::clone(mode);
+    let live = Arc::clone(live);
+    let stop = Arc::clone(stop);
+    let thread = std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let Ok(upstream) = TcpStream::connect(("127.0.0.1", target)) else {
+                        continue;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+                    let _ = upstream.set_read_timeout(Some(Duration::from_millis(20)));
+                    if let Ok(clone) = stream.try_clone() {
+                        live.lock().expect("proxy").push(clone);
+                    }
+                    let (backward, backward_target) = match (upstream.try_clone(), stream.try_clone())
+                    {
+                        (Ok(from_upstream), Ok(to_client)) => (from_upstream, to_client),
+                        _ => continue,
+                    };
+                    // Both directions, or the link would be half-duplex: the protocol
+                    // needs the peer's answers to travel back.
+                    let forward_mode = Arc::clone(&mode);
+                    std::thread::spawn(move || bridge(stream, upstream, forward_mode));
+                    let backward_mode = Arc::clone(&mode);
+                    std::thread::spawn(move || bridge(backward, backward_target, backward_mode));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Ok((format!("127.0.0.1:{port}"), thread))
 }
 
 /// One direction of a proxied connection.
@@ -679,16 +671,18 @@ impl Harness {
         write_config(&a_root, a_port, "source", true, dry_motion);
         write_config(&b_root, b_port, "receiver", false, dry_motion);
 
+        // Pairing happens on the real ports: it is the ceremony that writes the records.
+        pair(&a_root, &b_root, a_port, b_port);
         let proxy = if proxied {
-            Some(Proxy::start(b_port).expect("proxy"))
+            let proxy = Proxy::start(a_port, b_port).expect("proxy");
+            // Both records move behind the proxy. Leaving one direct would let the dedup
+            // rule keep a link the fault tests cannot reach.
+            retarget_trust(&a_root, &proxy.toward_b);
+            retarget_trust(&b_root, &proxy.toward_a);
+            Some(proxy)
         } else {
             None
         };
-        let dial = proxy
-            .as_ref()
-            .map(|proxy| proxy.addr.clone())
-            .unwrap_or_else(|| format!("127.0.0.1:{b_port}"));
-        pair(&a_root, &b_root, b_port, &dial);
         let (a_id, b_id) = peer_ids(&a_root, &b_root);
         if dry_motion {
             // The link document needs the peer's id, which only exists after pairing.
@@ -926,7 +920,9 @@ fn write_topology(root: &Path, peer: &str) {
 }
 
 /// Runs the pairing ceremony, answering `y` on both sides.
-fn pair(a_root: &Path, b_root: &Path, listen: u16, dial: &str) {
+fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
+    let listen = b_port;
+    let dial = format!("127.0.0.1:{b_port}");
     let mut opener = Command::new(core_exe())
         .arg("--root")
         .arg(b_root)
@@ -946,7 +942,7 @@ fn pair(a_root: &Path, b_root: &Path, listen: u16, dial: &str) {
     let mut dialer = Command::new(core_exe())
         .arg("--root")
         .arg(a_root)
-        .args(["pair", "--dial", dial])
+        .args(["pair", "--dial", &dial])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -972,6 +968,40 @@ fn pair(a_root: &Path, b_root: &Path, listen: u16, dial: &str) {
         String::from_utf8_lossy(&dialer_out.stderr),
         String::from_utf8_lossy(&opener_out.stderr)
     );
+
+    // `PairHello.listen_port` is what makes both records usable: the dialer records the
+    // address it typed, and the opener records the dialer's IP with the port the dialer
+    // *listens* on instead of the documented 47901. Before that field existed, B's record
+    // named a port A does not listen on and B could never dial back.
+    let a_trust = std::fs::read_to_string(a_root.join("config/trust.toml")).expect("trust");
+    let b_trust = std::fs::read_to_string(b_root.join("config/trust.toml")).expect("trust");
+    assert!(
+        a_trust.contains(&format!("127.0.0.1:{b_port}")),
+        "A must record B's real port:\n{a_trust}"
+    );
+    assert!(
+        b_trust.contains(&format!("127.0.0.1:{a_port}")),
+        "B must record A's real port, which only `PairHello.listen_port` can tell it:\n{b_trust}"
+    );
+}
+
+/// Points one node's trust entry at `address`, the way a proxy in the middle requires.
+fn retarget_trust(root: &Path, address: &str) {
+    let path = root.join("config/trust.toml");
+    let text = std::fs::read_to_string(&path).expect("trust store");
+    let mut out = String::with_capacity(text.len());
+    let mut replaced = false;
+    for line in text.lines() {
+        if line.starts_with("last_address") {
+            out.push_str(&format!("last_address = \"{address}\"\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    assert!(replaced, "the trust store must carry an address:\n{text}");
+    std::fs::write(&path, out).expect("trust store");
 }
 
 /// The own and peer node ids, from `peers`.

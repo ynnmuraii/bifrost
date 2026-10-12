@@ -206,6 +206,11 @@ pub struct PairingDriver {
     peer_display_name: String,
     sas: SasCode,
     address: Option<String>,
+    /// This node's own `network.port_input`, advertised in `PairHello.listen_port` so the
+    /// opener can record a dialer that does not listen on the documented 47901.
+    listen_port: u16,
+    /// The raw `PairHello.listen_port` the peer sent (0 = it listens on the default).
+    peer_listen_port: u16,
 }
 
 impl PairingDriver {
@@ -243,6 +248,15 @@ impl PairingDriver {
     /// The address this ceremony used, for `TRUSTED_PEER.last_address`.
     pub fn address(&self) -> Option<&str> {
         self.address.as_deref()
+    }
+
+    /// The port the peer says it listens on (`PairHello.listen_port`).
+    ///
+    /// `0` means the peer left it at the documented default, and the caller turns that
+    /// into [`protocol::PORT_INPUT_CONTROL`] when it builds the address. The opener needs
+    /// this because it only ever sees the dialer's *source* port, which is ephemeral.
+    pub const fn peer_listen_port(&self) -> u16 {
+        self.peer_listen_port
     }
 
     /// Approves locally and finishes with the peer's decision.
@@ -314,6 +328,7 @@ impl PairingDriver {
                         node_id: node_id.as_bytes().to_vec(),
                         display_name,
                         supports_sas,
+                        listen_port: u32::from(self.listen_port),
                     }));
                     self.stream.write_frame(&envelope).await?;
                 }
@@ -360,6 +375,7 @@ pub async fn accept_one(
     identity: &NodeIdentity,
     window: &mut PairingWindow,
     now_ms: u64,
+    listen_port: u16,
 ) -> Result<PairingDriver, PairError> {
     window.admit(now_ms).map_err(PairError::Rejected)?;
     let config = pairing_server_config(identity)?;
@@ -367,7 +383,7 @@ pub async fn accept_one(
     let (tcp, address) = listener.accept().await?;
     let accepted = acceptor.accept(tcp).await.map_err(PairError::Io)?;
     let stream = Stream::Server(Box::new(accepted));
-    let result = opener_ceremony(stream, identity, window, Some(address.to_string())).await;
+    let result = opener_ceremony(stream, identity, window, Some(address.to_string()), listen_port).await;
     window.finish();
     result
 }
@@ -377,6 +393,7 @@ pub async fn dial(
     address: SocketAddr,
     identity: &NodeIdentity,
     window: Duration,
+    listen_port: u16,
 ) -> Result<PairingDriver, PairError> {
     let config = pairing_client_config(identity)?;
     let connector = TlsConnector::from(Arc::new(config));
@@ -386,7 +403,7 @@ pub async fn dial(
         .await
         .map_err(PairError::Io)?;
     let stream = Stream::Client(Box::new(connected));
-    let ceremony = dialer_ceremony(stream, identity, Some(address.to_string()));
+    let ceremony = dialer_ceremony(stream, identity, Some(address.to_string()), listen_port);
     tokio::time::timeout(window, ceremony)
         .await
         .map_err(|_| PairError::Timeout)?
@@ -397,6 +414,7 @@ async fn opener_ceremony(
     identity: &NodeIdentity,
     window: &PairingWindow,
     address: Option<String>,
+    listen_port: u16,
 ) -> Result<PairingDriver, PairError> {
     let attempt_id: AttemptId = *window.attempt_id();
     let mut fsm = PairingFsm::window_opener(identity.node_id(), "lan-workspace", attempt_id);
@@ -410,29 +428,39 @@ async fn opener_ceremony(
     let sas = SasCode::from_exporter_bytes(stream.export_attempt_material(&attempt_id)?);
 
     let outputs = fsm.handle(PairingInput::HandshakeEstablished { peer_node_id });
-    run_outputs(&mut stream, &mut fsm, outputs).await?;
+    run_outputs(&mut stream, &mut fsm, outputs, listen_port).await?;
     // The opener generated the attempt id, so it can compute the code immediately; the
     // ceremony waits for the dialer's hello before Comparing.
     fsm.handle(PairingInput::AttemptMaterial { sas });
 
-    // The dialer's PairHello.
+    // The dialer's PairHello. Its `listen_port` is the only honest address part the opener
+    // can learn: what it sees on the socket is the dialer's ephemeral source port.
     let envelope = stream.read_frame().await?;
-    let (remote_attempt_id, remote_node_id, display_name, supports_sas) = hello_of(&envelope)?;
+    let remote = hello_of(&envelope)?;
     let outputs = fsm.handle(PairingInput::RemoteHello {
-        attempt_id: remote_attempt_id,
-        node_id: remote_node_id,
-        display_name,
-        supports_sas,
+        attempt_id: remote.attempt_id,
+        node_id: remote.node_id,
+        display_name: remote.display_name,
+        supports_sas: remote.supports_sas,
     });
-    run_outputs(&mut stream, &mut fsm, outputs).await?;
+    run_outputs(&mut stream, &mut fsm, outputs, listen_port).await?;
 
-    finish_driver(stream, fsm, peer_node_id, sas, address)
+    finish_driver(
+        stream,
+        fsm,
+        peer_node_id,
+        sas,
+        address,
+        listen_port,
+        remote.listen_port,
+    )
 }
 
 async fn dialer_ceremony(
     mut stream: Stream,
     identity: &NodeIdentity,
     address: Option<String>,
+    listen_port: u16,
 ) -> Result<PairingDriver, PairError> {
     let mut fsm = PairingFsm::dialer(identity.node_id(), "lan-workspace");
     fsm.handle(PairingInput::DialStarted { now_ms: 0 });
@@ -442,30 +470,41 @@ async fn dialer_ceremony(
 
     let peer_node_id = presented_node_id(&stream)?;
     let outputs = fsm.handle(PairingInput::HandshakeEstablished { peer_node_id });
-    run_outputs(&mut stream, &mut fsm, outputs).await?;
+    run_outputs(&mut stream, &mut fsm, outputs, listen_port).await?;
 
     // The opener's PairHello carries the attempt id, so the code can only be computed now.
     let envelope = stream.read_frame().await?;
-    let (attempt_id, remote_node_id, display_name, supports_sas) = hello_of(&envelope)?;
-    let sas = SasCode::from_exporter_bytes(stream.export_attempt_material(&attempt_id)?);
+    let remote = hello_of(&envelope)?;
+    let sas = SasCode::from_exporter_bytes(stream.export_attempt_material(&remote.attempt_id)?);
     fsm.handle(PairingInput::AttemptMaterial { sas });
     let outputs = fsm.handle(PairingInput::RemoteHello {
-        attempt_id,
-        node_id: remote_node_id,
-        display_name,
-        supports_sas,
+        attempt_id: remote.attempt_id,
+        node_id: remote.node_id,
+        display_name: remote.display_name,
+        supports_sas: remote.supports_sas,
     });
-    run_outputs(&mut stream, &mut fsm, outputs).await?;
+    run_outputs(&mut stream, &mut fsm, outputs, listen_port).await?;
 
-    finish_driver(stream, fsm, peer_node_id, sas, address)
+    finish_driver(
+        stream,
+        fsm,
+        peer_node_id,
+        sas,
+        address,
+        listen_port,
+        remote.listen_port,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_driver(
     stream: Stream,
     fsm: PairingFsm,
     peer_node_id: NodeId,
     sas: SasCode,
     address: Option<String>,
+    listen_port: u16,
+    peer_listen_port: u16,
 ) -> Result<PairingDriver, PairError> {
     if fsm.state() != PairingState::Comparing {
         return Err(match fsm.rejection() {
@@ -484,6 +523,8 @@ fn finish_driver(
         peer_display_name,
         sas,
         address,
+        listen_port,
+        peer_listen_port,
     })
 }
 
@@ -502,6 +543,7 @@ async fn run_outputs(
     stream: &mut Stream,
     fsm: &mut PairingFsm,
     outputs: Vec<PairingOutput>,
+    listen_port: u16,
 ) -> Result<(), PairError> {
     for output in outputs {
         match output {
@@ -516,6 +558,7 @@ async fn run_outputs(
                         node_id: node_id.as_bytes().to_vec(),
                         display_name,
                         supports_sas,
+                        listen_port: u32::from(listen_port),
                     }),
                 );
                 stream.write_frame(&envelope).await?;
@@ -551,7 +594,17 @@ fn envelope_of(fsm: &PairingFsm, payload: pairing_envelope::Payload) -> PairingE
     }
 }
 
-fn hello_of(envelope: &PairingEnvelope) -> Result<(AttemptId, NodeId, String, bool), PairError> {
+/// The `PairHello` fields this implementation acts on.
+struct RemoteHello {
+    attempt_id: AttemptId,
+    node_id: NodeId,
+    display_name: String,
+    supports_sas: bool,
+    /// Raw `PairHello.listen_port`; `0` means the documented default.
+    listen_port: u16,
+}
+
+fn hello_of(envelope: &PairingEnvelope) -> Result<RemoteHello, PairError> {
     match &envelope.payload {
         Some(pairing_envelope::Payload::Hello(hello)) => {
             let attempt_id: AttemptId = envelope
@@ -559,12 +612,16 @@ fn hello_of(envelope: &PairingEnvelope) -> Result<(AttemptId, NodeId, String, bo
                 .as_slice()
                 .try_into()
                 .map_err(|_| PairError::Protocol("attempt_id must be 16 bytes".into()))?;
-            Ok((
+            // A peer built by an older draft sends nothing, which protobuf reads as 0 —
+            // exactly the documented default.
+            let listen_port = u16::try_from(hello.listen_port).unwrap_or(protocol::PORT_INPUT_CONTROL);
+            Ok(RemoteHello {
                 attempt_id,
-                node_id_from_bytes(&hello.node_id)?,
-                hello.display_name.clone(),
-                hello.supports_sas,
-            ))
+                node_id: node_id_from_bytes(&hello.node_id)?,
+                display_name: hello.display_name.clone(),
+                supports_sas: hello.supports_sas,
+                listen_port,
+            })
         }
         _ => Err(PairError::Protocol(
             "expected PairHello on the pairing channel".into(),

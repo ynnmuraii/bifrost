@@ -339,6 +339,7 @@ message PairHello {
   string display_name = 2;
   reserved 3; reserved "desired_role"; // roles are per-lease in v0.3
   bool supports_sas = 4;       // 6-digit comparison code from TLS exporter
+  uint32 listen_port = 5;      // input/control port the sender listens on; 0 = default 47901
 }
 message PairDecision {
   bool approved = 1;           // only after local user decision

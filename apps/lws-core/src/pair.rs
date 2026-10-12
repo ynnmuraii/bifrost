@@ -66,6 +66,14 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
         ));
     }
 
+    // The port this node listens on. `PairHello` advertises it so the *opener* can record
+    // an address for a dialer that does not use the documented default: the opener only
+    // sees the dialer's ephemeral source port. A missing or invalid configuration is not
+    // fatal here — `pair` reads this one setting and nothing else from it.
+    let listen_port = config::Config::load(paths.config_file())
+        .map(|config| config.network.port_input)
+        .unwrap_or(protocol::PORT_INPUT_CONTROL);
+
     let identity_paths = identity::IdentityPaths {
         data_dir: paths.data_dir().to_path_buf(),
         key_file: paths.identity_file(),
@@ -101,6 +109,7 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
                 &identity,
                 &mut window,
                 identity::now_unix_ms() as u64,
+                listen_port,
             )
             .await
             .map_err(|error| Failure::Run(error.to_string()))?
@@ -109,7 +118,7 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
                 .expect("checked above")
                 .parse()
                 .map_err(|error| Failure::Run(format!("--dial: {error}")))?;
-            identity::dial(address, &identity, WINDOW)
+            identity::dial(address, &identity, WINDOW, listen_port)
                 .await
                 .map_err(|error| Failure::Run(error.to_string()))?
         };
@@ -131,7 +140,7 @@ async fn confirm(
     print!("codes match? [y/N] ");
     std::io::stdout().flush().ok();
 
-    let address = peer_address(opener, driver.address());
+    let address = peer_address(opener, driver.address(), driver.peer_listen_port());
     let approved = ask().await?;
     if !approved {
         driver
@@ -160,15 +169,19 @@ async fn confirm(
 /// The address to remember for the peer.
 ///
 /// The dialer typed the opener's address, so the address it observed *is* the peer's input
-/// endpoint and its port is real. The opener only sees the dialer's *source* address, whose
-/// port is ephemeral, and `PairHello` carries no address at all (`docs/protocol.proto`:
-/// `node_id`, `display_name`, `supports_sas`), so the only address it can record honestly is
-/// the dialer's IP with the documented input port (`docs/05-protocol.md`: «Адреса для
-/// `network.peers` берутся из сопряжения, поэтому ручной IP вводится один раз на пару»).
-fn peer_address(opener: bool, observed: Option<&str>) -> Option<String> {
+/// endpoint and its port is real. The opener only ever sees the dialer's *source* address,
+/// whose port is ephemeral, so it takes the IP from the socket and the port from
+/// `PairHello.listen_port` — the port the dialer actually listens on, or the documented
+/// default when it sent `0` (`docs/05-protocol.md`: «Адреса для `network.peers` берутся из
+/// сопряжения, поэтому ручной IP вводится один раз на пару»).
+fn peer_address(opener: bool, observed: Option<&str>, listen_port: u16) -> Option<String> {
     let mut address: SocketAddr = observed?.parse().ok()?;
     if opener {
-        address.set_port(protocol::PORT_INPUT_CONTROL);
+        address.set_port(if listen_port == 0 {
+            protocol::PORT_INPUT_CONTROL
+        } else {
+            listen_port
+        });
     }
     Some(address.to_string())
 }
@@ -195,20 +208,27 @@ mod tests {
     fn the_opener_records_the_documented_port_and_the_dialer_keeps_the_typed_one() {
         // The dialer typed the opener's address: that port is the peer's input port.
         assert_eq!(
-            peer_address(false, Some("192.168.1.11:47931")),
+            peer_address(false, Some("192.168.1.11:47931"), 0),
             Some("192.168.1.11:47931".to_owned())
         );
 
-        // The opener saw an ephemeral source port, and `PairHello` has no address field,
-        // so it records the documented input port instead of an unusable one.
+        // The opener saw an ephemeral source port; `0` means the dialer listens on the
+        // documented default.
         assert_eq!(
-            peer_address(true, Some("192.168.1.11:56175")),
+            peer_address(true, Some("192.168.1.11:56175"), 0),
             Some(format!("192.168.1.11:{}", protocol::PORT_INPUT_CONTROL))
         );
 
-        assert_eq!(peer_address(true, None), None);
+        // A dialer that listens elsewhere says so in `PairHello`, and the opener records
+        // that port instead of a dead one.
         assert_eq!(
-            peer_address(false, Some("not an address")),
+            peer_address(true, Some("192.168.1.11:56175"), 47931),
+            Some("192.168.1.11:47931".to_owned())
+        );
+
+        assert_eq!(peer_address(true, None, 47931), None);
+        assert_eq!(
+            peer_address(false, Some("not an address"), 47931),
             None,
             "an unparsable address is not stored"
         );
