@@ -430,6 +430,7 @@ impl Session {
                 window_closed,
                 address,
                 status,
+                reply,
             } => {
                 if let Some(window) = window_closed {
                     self.publish(Msg::PairingWindow(ipc::PairingWindow {
@@ -439,7 +440,7 @@ impl Session {
                         attempt_id: window.attempt_id.to_vec(),
                     }));
                 }
-                match outcome {
+                let verdict: pairing::Verdict = match outcome {
                     pairing::Outcome::Paired(peer) => {
                         // The same write the CLI's ceremony does: one `TrustedPeer`, atomically,
                         // with the address this side learned (`pairing::peer_address`).
@@ -450,19 +451,31 @@ impl Session {
                         );
                         self.trust.trust(record);
                         self.pairing_error = None;
-                        if let Err(error) = self.trust.save(&self.paths.trust_file()) {
-                            tracing::warn!(%error, "cannot write the trust record");
-                            self.pairing_error = Some("TRUST_WRITE".to_owned());
+                        // The verdict is sent only after this: a window told "paired" can rely
+                        // on the record being readable, and a write that failed is reported
+                        // instead of being hidden behind a success.
+                        match self.trust.save(&self.paths.trust_file()) {
+                            Ok(_) => Ok(()),
+                            Err(error) => {
+                                tracing::warn!(%error, "cannot write the trust record");
+                                self.pairing_error = Some("TRUST_WRITE".to_owned());
+                                Err(("TRUST_WRITE".to_owned(), error.to_string()))
+                            }
                         }
                     }
                     pairing::Outcome::Rejected => {
                         self.pairing_error = None;
                         tracing::info!("pairing rejected; nothing was written");
+                        Ok(())
                     }
                     pairing::Outcome::Failed(detail) => {
                         tracing::warn!(detail = detail.as_str(), "pairing failed");
                         self.pairing_error = Some("PAIRING_FAILED".to_owned());
+                        Err(("PAIRING_FAILED".to_owned(), detail))
                     }
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(verdict);
                 }
                 self.refusal = Some(status);
                 self.publish_gui_state().await;

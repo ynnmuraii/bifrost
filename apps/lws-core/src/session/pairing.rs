@@ -350,8 +350,10 @@ impl Pairing {
 
     /// Folds one report from a ceremony task into the loop's state.
     ///
-    /// Resolving the waiting replies here is what keeps "the other side confirmed" and "the
-    /// caller was told" one event instead of two timers.
+    /// The dialer's own reply (`PairWith`) is resolved here, the moment the prompt exists —
+    /// that is the answer `PairWith` promises. The ceremony's verdict is **not**: it is handed
+    /// to the caller in [`PublishedEvent::Finished`], because a window told "paired" must be
+    /// able to rely on the `TRUSTED_PEER` record being on disk, and only the caller writes it.
     pub fn on_event(&mut self, event: Event, now_ms: u64) -> Option<PublishedEvent> {
         match event {
             Event::DialFailed { code, detail } => {
@@ -394,30 +396,21 @@ impl Pairing {
                     Some(window) if window.attempt_id == attempt_id => self.close(),
                     _ => None,
                 };
-                let failure = match &outcome {
-                    Outcome::Paired(_) | Outcome::Rejected => None,
-                    Outcome::Failed(detail) => Some(detail.clone()),
-                };
                 let status = match &outcome {
                     Outcome::Paired(peer) => format!("paired with {}", peer.display_name),
                     Outcome::Rejected => "pairing rejected".to_owned(),
                     Outcome::Failed(detail) => format!("pairing failed: {detail}"),
                 };
                 let address = ceremony.as_ref().and_then(|c| c.address.clone());
-                if let Some(ceremony) = ceremony {
-                    if let Some(reply) = ceremony.reply {
-                        let answer = match &failure {
-                            None => Ok(()),
-                            Some(detail) => Err(("PAIRING_FAILED".to_owned(), detail.clone())),
-                        };
-                        let _ = reply.send(answer);
-                    }
-                }
+                // Who waits for the verdict, if anybody: the caller resolves it *after* it
+                // made the outcome durable (see the method's own comment).
+                let reply = ceremony.and_then(|ceremony| ceremony.reply);
                 Some(PublishedEvent::Finished {
                     outcome,
                     window_closed,
                     address,
                     status,
+                    reply,
                 })
             }
         }
@@ -439,6 +432,11 @@ pub enum PublishedEvent {
         address: Option<String>,
         /// One line for `Status`/`status` and the log.
         status: String,
+        /// Whoever is waiting for the verdict (`PairingAnswer`, the CLI's `pair-answer`).
+        ///
+        /// The loop resolves it after persisting the outcome, so an `Ok` here means the
+        /// `TRUSTED_PEER` record is on disk, not that it is about to be written.
+        reply: Option<oneshot::Sender<Verdict>>,
     },
 }
 
