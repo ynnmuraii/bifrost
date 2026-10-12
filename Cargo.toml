@@ -14,3 +14,7 @@ unsafe_op_in_unsafe_fn = "deny"
 all = "warn"
 
 [workspace.dependencies]
+# `SO_EXCLUSIVEADDRUSE` on Windows (see transport::manager::bind_listener) is not exposed by
+# tokio's `TcpSocket`; socket2 is the smallest crate that sets listener flags portably.
+socket2 = { version = "0.6", features = ["all"] }
+windows-sys = { version = "0.61", default-features = false }
