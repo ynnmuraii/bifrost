@@ -792,11 +792,13 @@ dependencies = [
  "platform-probe",
  "protocol",
  "serde",
+ "socket2",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "transport",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

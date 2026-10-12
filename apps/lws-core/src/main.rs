@@ -24,6 +24,7 @@ mod agent;
 mod command;
 mod ctl;
 mod ids;
+mod job;
 mod ownership_store;
 mod pair;
 mod portal;

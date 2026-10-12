@@ -70,6 +70,9 @@ pub struct Supervisor {
     portal: crate::portal::PortalGrants,
     launches: u64,
     child: Option<tokio::process::Child>,
+    /// The kill-on-close job the current child lives in (see [`crate::job`]); dropping it
+    /// kills the agent, which is what core wants whenever it owns no agent any more.
+    job: Option<crate::job::KillOnCoreExit>,
     link: Option<AgentLink<AgentStream>>,
     state: AgentState,
 }
@@ -104,6 +107,7 @@ impl Supervisor {
             portal,
             launches: 0,
             child: None,
+            job: None,
             link: None,
             state: AgentState::Starting,
         }
@@ -152,6 +156,20 @@ impl Supervisor {
         let child = command
             .spawn()
             .map_err(|error| format!("cannot spawn {}: {error}", self.program.display()))?;
+        // The agent must not be able to outlive core (see `crate::job`): it is attached to a
+        // job that the kernel kills when core's handle closes. Failing to attach is not fatal
+        // — the agent's own watchdog stays the release path — but it is worth a warning.
+        self.job = match crate::job::KillOnCoreExit::attach(&child) {
+            Ok(job) => Some(job),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the agent is not in a kill-on-close job; its own watchdog is the only \
+                     release path if core is killed"
+                );
+                None
+            }
+        };
         self.child = Some(child);
         self.state = match mode {
             AgentMode::Recovery => AgentState::Recovery,
@@ -238,6 +256,9 @@ impl Supervisor {
         if let Some(mut child) = self.child.take() {
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         }
+        // Dropping the job is the belt to `start_kill`'s braces: whatever the child did with
+        // the kill, the kernel takes it out with the job.
+        self.job = None;
         if matches!(self.state, AgentState::Ready | AgentState::Starting) {
             self.state = AgentState::Lost;
         }
