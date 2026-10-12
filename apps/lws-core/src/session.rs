@@ -70,6 +70,9 @@ pub struct Session {
     /// editing is disabled until that resolves (`docs/05-protocol.md`: «Координатор
     /// недостижим: редактирование layout отключено»).
     layout_editing_disabled: Option<String>,
+    /// The last refusal this node saw or sent, as `(code, detail)`, reported by `layout show`
+    /// until a revision moves (KVM-072).
+    last_layout_error: Option<(String, String)>,
     /// Set by `quit` on the control channel.
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
@@ -145,6 +148,7 @@ impl Session {
             layout_store,
             topology_wire: None,
             layout_editing_disabled: None,
+            last_layout_error: None,
             stopping: false,
             agent_restart_due: None,
             agent_lost_reported: false,
@@ -461,6 +465,8 @@ impl Session {
                 );
                 match outcome {
                     crate::layout::TopologyOutcome::Applied(pair) => {
+                        self.layout_editing_disabled = None;
+                        self.last_layout_error = None;
                         self.topology_wire = Some(document.clone());
                         self.layout_store.observe(&self.layout_state);
                         self.router.set_topology_revision(pair.revision);
@@ -489,7 +495,12 @@ impl Session {
                         .await;
                     }
                     crate::layout::TopologyOutcome::Invalid(detail) => {
-                        self.send_error_to(from, "INVALID_TOPOLOGY", &detail).await;
+                        self.send_layout_error(
+                            from,
+                            protocol::wire::ErrorCode::InvalidTopology,
+                            &detail,
+                        )
+                        .await;
                     }
                     crate::layout::TopologyOutcome::NotAuthor => {
                         tracing::warn!(peer = %from, "a topology was relayed by someone who is not its author");
@@ -499,8 +510,12 @@ impl Session {
             LayoutMessage::LayoutEdit(edit) => {
                 // Only the coordinator applies, and it answers the editor either way.
                 if !self.router.ownership().is_owner() {
-                    self.send_error_to(from, "NO_COORDINATOR", "this node is not the coordinator")
-                        .await;
+                    self.send_layout_error(
+                        from,
+                        protocol::wire::ErrorCode::NoCoordinator,
+                        "this node is not the coordinator",
+                    )
+                    .await;
                     return;
                 }
                 let base = match <[u8; 32]>::try_from(edit.expected_author.as_slice()) {
@@ -528,6 +543,8 @@ impl Session {
                 );
                 match outcome {
                     crate::layout::EditOutcome::Applied(pair) => {
+                        self.layout_editing_disabled = None;
+                        self.last_layout_error = None;
                         self.layout_store.observe(&self.layout_state);
                         self.router.set_topology_revision(pair.revision);
                         tracing::info!(peer = %from, revision = pair.revision, "layout edit applied");
@@ -547,20 +564,25 @@ impl Session {
                         self.publish_layout(document).await;
                     }
                     crate::layout::EditOutcome::Conflict(current) => {
-                        self.send_error_to(
+                        self.send_layout_error(
                             from,
-                            "LAYOUT_CONFLICT",
+                            protocol::wire::ErrorCode::LayoutConflict,
                             &format!("expected revision {} is applied", current.revision),
                         )
                         .await;
                     }
                     crate::layout::EditOutcome::Invalid(detail) => {
-                        self.send_error_to(from, "INVALID_TOPOLOGY", &detail).await;
+                        self.send_layout_error(
+                            from,
+                            protocol::wire::ErrorCode::InvalidTopology,
+                            &detail,
+                        )
+                        .await;
                     }
                     crate::layout::EditOutcome::NotCoordinator => {
-                        self.send_error_to(
+                        self.send_layout_error(
                             from,
-                            "NO_COORDINATOR",
+                            protocol::wire::ErrorCode::NoCoordinator,
                             "this node is not the coordinator",
                         )
                         .await;
@@ -588,6 +610,14 @@ impl Session {
                     applied.author.unwrap_or(self.node_id).as_bytes().to_vec();
                 self.send_layout_to(from, transport::convert::LayoutMessage::Topology(document))
                     .await;
+            }
+            LayoutMessage::Error { code } => {
+                // The editor's answer: `layout show` reports it until a revision moves.
+                self.last_layout_error = Some((
+                    code.as_str_name().to_owned(),
+                    format!("the coordinator refused the edit ({})", code.as_str_name()),
+                ));
+                tracing::warn!(peer = %from, code = code.as_str_name(), "layout edit refused");
             }
             LayoutMessage::TopologyApplied { revision } => {
                 tracing::info!(peer = %from, revision, "the peer applied the layout revision");
@@ -646,29 +676,45 @@ impl Session {
         }
     }
 
-    /// One layout message to one peer.
-    async fn send_layout_to(&mut self, peer: NodeId, message: transport::convert::LayoutMessage) {
+    /// One layout message to one peer; `false` when there is no usable link.
+    ///
+    /// The answer is what tells a follower that the coordinator is unreachable: a partition
+    /// looks exactly like a send that never lands, and that is when an edit is kept as
+    /// pending instead of being lost.
+    async fn send_layout_to(
+        &mut self,
+        peer: NodeId,
+        message: transport::convert::LayoutMessage,
+    ) -> bool {
         match self.manager.handle(&peer).await {
-            Some(handle) => {
-                if let Err(error) = handle.send_layout(message).await {
+            Some(handle) => match handle.send_layout(message).await {
+                Ok(()) => true,
+                Err(error) => {
                     tracing::warn!(peer = %peer, %error, "cannot send a layout message");
+                    false
                 }
+            },
+            None => {
+                tracing::warn!(peer = %peer, "no link for a layout message");
+                false
             }
-            None => tracing::warn!(peer = %peer, "no link for a layout message"),
         }
     }
 
-    /// One `Error` frame to a peer.
-    async fn send_error_to(&mut self, peer: NodeId, code: &str, detail: &str) {
-        tracing::warn!(peer = %peer, code, detail, "layout refused for a peer");
-        self.send_to(
-            peer,
-            fr::Message::ProtocolError {
-                code: fr::ErrorCode::TopologyChanged,
-                related_seq: 0,
-            },
-        )
-        .await;
+    /// One layout refusal to a peer: a `ProtocolError` with the code the contract names.
+    ///
+    /// It travels on the layout arm (`LayoutMessage::Error`), so the editor sees
+    /// `LAYOUT_CONFLICT` / `INVALID_TOPOLOGY` / `NO_COORDINATOR` rather than a generic
+    /// protocol error, and the focus mirror stays what it is.
+    async fn send_layout_error(
+        &mut self,
+        peer: NodeId,
+        code: protocol::wire::ErrorCode,
+        detail: &str,
+    ) {
+        tracing::warn!(peer = %peer, code = code.as_str_name(), detail, "layout refused for a peer");
+        self.send_layout_to(peer, transport::convert::LayoutMessage::Error { code })
+            .await;
     }
 
     /// `layout apply`: apply the pending edit, which only the coordinator can do.
@@ -928,6 +974,34 @@ impl Session {
                             peer_pair.revision
                         ));
                     }
+                }
+                if self.layout_state.applied().is_newer_than(peer_pair)
+                    && self.layout_state.applied().author == Some(self.node_id)
+                {
+                    // This node published what is applied, so the peer is behind: replicate,
+                    // which is how a member that was in the other partition half catches up
+                    // without asking (KVM-072).
+                    let applied = self.layout_state.applied();
+                    let mut document = self.topology_wire.clone().unwrap_or_else(|| {
+                        crate::topology::wire_document(
+                            &self.layout,
+                            applied.revision,
+                            self.node_id,
+                            self.node_id,
+                        )
+                    });
+                    document.revision = applied.revision;
+                    document.author_node_id = self.node_id.as_bytes().to_vec();
+                    tracing::info!(
+                        peer = %peer,
+                        revision = applied.revision,
+                        "replicating the applied layout to a rejoining peer"
+                    );
+                    self.send_layout_to(
+                        peer,
+                        transport::convert::LayoutMessage::Topology(document),
+                    )
+                    .await;
                 }
                 let ownership = self.router.ownership();
                 if ownership.is_owner() {
