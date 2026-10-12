@@ -138,6 +138,9 @@ pub mod synth;
 
 #[cfg(windows)]
 pub mod capture;
+// Clipboard text and its secret markers: `AddClipboardFormatListener`, `CF_UNICODETEXT`
+// and the three documented formats (KVM-041/KVM-043).
+pub mod clipboard;
 #[cfg(windows)]
 pub mod displays;
 #[cfg(windows)]
