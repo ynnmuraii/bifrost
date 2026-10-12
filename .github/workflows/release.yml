@@ -101,7 +101,7 @@ jobs:
           name="lan-workspace-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
           stage="$RUNNER_TEMP/stage"
           mkdir -p "$stage"
-          cp target/release/lws-core target/release/lws-agent target/release/lws-gui "$stage/"
+          install -m 0755 target/release/lws-core target/release/lws-agent target/release/lws-gui "$stage/"
           cp packaging/README_RU.txt licenses/THIRD_PARTY_NOTICES.md "$stage/"
           cp crates/config/examples-data/config.example.toml "$stage/"
           tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" lws-core lws-agent lws-gui README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml
