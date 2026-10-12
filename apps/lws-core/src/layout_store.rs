@@ -62,14 +62,45 @@ impl LayoutStore {
     /// owns the in-memory copy ([`crate::layout::Layout::hold_pending`]), this only survives a
     /// restart.
     pub fn write_pending(&self, layout_toml: &str) {
-        let path = self
-            .path
-            .parent()
-            .map(|dir| dir.join(config::paths::LAYOUT_PENDING_FILE))
-            .unwrap_or_else(|| PathBuf::from(config::paths::LAYOUT_PENDING_FILE));
+        let path = self.pending_path();
         if let Err(error) = config::save::save_atomic(&path, layout_toml) {
             tracing::warn!(%error, "cannot write the pending layout edit");
         }
+    }
+
+    /// Removes `layout.pending.toml` — the other half of [`Self::write_pending`].
+    ///
+    /// The file and the in-memory slot are one fact, so the file is written when an edit enters
+    /// the slot ([`crate::layout::Layout::hold_pending`]) and removed when the slot clears: a
+    /// silent `layout.pending.toml` left behind would tell the next reader (the GUI, a human)
+    /// that an unapplied edit exists when the node holds none.
+    ///
+    /// `remove_file` is the atomic delete on both platforms — unlike a write there is no
+    /// half-written state to protect against — and a file that is already gone is the normal
+    /// case, not a failure.
+    pub fn clear_pending(&self) {
+        let path = self.pending_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::debug!(path = %path.display(), "the pending layout edit was removed");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "cannot remove the pending layout edit"
+                );
+            }
+        }
+    }
+
+    /// Where `layout.pending.toml` lives: next to the configuration file it belongs to.
+    fn pending_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|dir| dir.join(config::paths::LAYOUT_PENDING_FILE))
+            .unwrap_or_else(|| PathBuf::from(config::paths::LAYOUT_PENDING_FILE))
     }
 
     /// Writes the pair back when it changed.
@@ -173,6 +204,33 @@ mod tests {
             Some(id),
             "reading is lenient about case; writing is not"
         );
+    }
+
+    /// The pending file appears with the edit and goes away with the slot, so
+    /// «a `layout.pending.toml` is here» always means «this node holds an unapplied edit».
+    /// (The file is not read back yet; the pairing is what keeps it from lying in the
+    /// meantime.)
+    #[test]
+    fn the_pending_file_follows_the_slot() {
+        let (path, config) = temp_config();
+        let store = LayoutStore::new(path, config, node(7));
+        let pending = store.pending_path();
+
+        // Nothing pending: removing nothing is the normal case, not an error.
+        store.clear_pending();
+        assert!(!pending.exists(), "{pending:?} must not exist yet");
+
+        store.write_pending("links = []");
+        assert_eq!(
+            std::fs::read_to_string(&pending).expect("the pending edit is written"),
+            "links = []"
+        );
+
+        store.clear_pending();
+        assert!(!pending.exists(), "the file went with the slot");
+        // And it stays gone: a second clear is what every release path may call.
+        store.clear_pending();
+        assert!(!pending.exists());
     }
 
     /// A stored pair survives a restart: the file is what the next core reads.

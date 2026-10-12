@@ -126,6 +126,12 @@ pub struct Session {
     /// *noticed* before there is any transition: «OBSERVE: Local: watch edges, no
     /// suppression», so core arms the observation itself for the node that owns input.
     observe_armed: bool,
+    /// The clipboard endpoint, when `[clipboard].enabled`: the policy, the offers and the
+    /// handle to the runtime that listens on `47902` (ADR-008). `None` keeps every clipboard
+    /// path closed, which is the default.
+    clipboard: Option<crate::clipboard::Clipboard>,
+    /// Events from the clipboard runtime: a bound channel, a message, or a lost channel.
+    clipboard_events: mpsc::Receiver<crate::clipboard::Inbound>,
 }
 
 impl Session {
@@ -145,6 +151,8 @@ impl Session {
         pointer_gain: f64,
         ownership_store: OwnershipStore,
         layout_store: crate::layout_store::LayoutStore,
+        clipboard: Option<crate::clipboard::Clipboard>,
+        clipboard_events: mpsc::Receiver<crate::clipboard::Inbound>,
     ) -> Self {
         let layout_state = layout_store.restored();
         let mut session = Session {
@@ -182,6 +190,8 @@ impl Session {
             remote_node: None,
             pending_target: None,
             observe_armed: false,
+            clipboard,
+            clipboard_events,
         };
         session.rebuild_topology();
         session
@@ -253,10 +263,14 @@ impl Session {
             let now = self.now_ms();
             let deadline = self.instant_of(self.next_deadline(now));
             let attached = self.agent.is_attached();
+            // The clipboard runtime owns the sender of `clipboard_events`; with the clipboard
+            // off there is no runtime, and the arm must not fire on a closed channel.
+            let clipboard_enabled = self.clipboard.is_some();
             let step = {
                 tokio::select! {
                     event = self.link_events.recv() => Step::Link(event),
                     frame = self.agent.recv(), if attached => Step::Agent(frame),
+                    event = self.clipboard_events.recv(), if clipboard_enabled => Step::Clipboard(event),
                     client = self.ctl.accept() => Step::Control(client),
                     () = tokio::time::sleep_until(deadline) => Step::Tick,
                 }
@@ -277,7 +291,16 @@ impl Session {
                 Step::Control(Err(error)) => {
                     tracing::warn!(%error, "control channel error");
                 }
-                Step::Tick => self.arm_observation().await,
+                Step::Clipboard(Some(event)) => self.on_clipboard(event).await,
+                Step::Clipboard(None) => {
+                    // The runtime never closes its channel while core runs; if it did, every
+                    // clipboard feature would silently stop, so say so.
+                    tracing::warn!("the clipboard channel stopped");
+                }
+                Step::Tick => {
+                    self.arm_observation().await;
+                    self.clipboard_on_focus().await;
+                }
             }
         }
     }
@@ -878,12 +901,31 @@ impl Session {
         (nonce, receiver)
     }
 
+    /// Puts an edit in the pending slot, and the same document in `layout.pending.toml`.
+    ///
+    /// One fact, two places: an edit is written when it enters the slot and the file is removed
+    /// when the slot clears (see [`Self::release_layout_pending`]), so «a
+    /// `layout.pending.toml` is here» always means «this node holds an edit the coordinator has
+    /// not applied».
+    fn hold_layout_pending(&mut self, layout_toml: &str) {
+        self.layout_state.hold_pending(layout_toml.to_owned());
+        self.layout_store.write_pending(layout_toml);
+    }
+
+    /// Empties the pending slot and removes `layout.pending.toml`; `true` when there was one.
+    fn release_layout_pending(&mut self) -> bool {
+        let dropped = self.layout_state.take_pending().is_some();
+        self.layout_store.clear_pending();
+        dropped
+    }
+
     /// Hands the coordinator's verdict to the connection that asked, if it is still there.
     ///
     /// `applied` is the verdict's own kind, reported by the coordinator: an *applied* verdict
     /// releases the pending slot, and only when the slot still holds the document that was
     /// applied — a newer edit that arrived while this one was in flight is not thrown away. A
-    /// refusal keeps the edit, which is what ADR-013's «перезагрузить и применить своё» needs.
+    /// refusal keeps the edit (in the slot and in `layout.pending.toml`), which is what
+    /// ADR-013's «перезагрузить и применить своё» needs.
     fn deliver_layout_verdict(
         &mut self,
         request_nonce: u64,
@@ -900,14 +942,9 @@ impl Session {
             );
             return;
         };
-        let still_ours = self.layout_state.pending() == Some(request.layout_toml.as_str());
-        if applied && still_ours {
+        if applied && self.layout_state.pending() == Some(request.layout_toml.as_str()) {
             // The edit is the document now: the slot has nothing left to keep.
-            self.layout_state.take_pending();
-        } else if !applied && still_ours {
-            // Refused: this is a losing edit, and a loser belongs in `layout.pending.toml`
-            // for the GUI's reload-and-reapply (ADR-013).
-            self.layout_store.write_pending(&request.layout_toml);
+            self.release_layout_pending();
         }
         if request.verdict.send(verdict).is_err() {
             tracing::debug!(
@@ -983,7 +1020,7 @@ impl Session {
             .apply_edit(&edit, self.node_id, true, validate_layout_toml);
         Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
-                self.layout_state.take_pending();
+                self.release_layout_pending();
                 self.layout_store.observe(&self.layout_state);
                 self.router.set_topology_revision(pair.revision);
                 ctl::Response::Status(format!("applied revision={}", pair.revision))
@@ -1064,8 +1101,7 @@ impl Session {
             }
         };
         if let Some(reason) = self.layout_editing_disabled.clone() {
-            self.layout_state.hold_pending(document_text.clone());
-            self.layout_store.write_pending(&document_text);
+            self.hold_layout_pending(&document_text);
             return Handled::Reply(ctl::Response::Error {
                 code: "NO_COORDINATOR".to_owned(),
                 detail: format!("{reason}; the edit is kept as pending"),
@@ -1075,8 +1111,7 @@ impl Session {
             // A follower sends the edit to the coordinator and answers with the verdict that
             // comes back; only a partition keeps it pending (`docs/05-protocol.md`).
             let Some(owner) = self.router.ownership().owner().copied() else {
-                self.layout_state.hold_pending(document_text.clone());
-                self.layout_store.write_pending(&document_text);
+                self.hold_layout_pending(&document_text);
                 return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "no owner is known; the edit is kept as pending".to_owned(),
@@ -1085,11 +1120,9 @@ impl Session {
             // The base is the revision this node has applied *now*: the edit was just written
             // against it, and the coordinator's CAS compares exactly that pair. The edit
             // occupies the pending slot until the verdict says it was applied, so a refusal or
-            // a lost answer leaves the user something to reload rather than a silent loss;
-            // `layout.pending.toml` is written only when the edit turns out not to be applied
-            // (here, or on the verdict), so the file keeps meaning «a losing edit».
+            // a lost answer leaves the edit — slot and file — for the user's reload.
             let applied = self.layout_state.applied();
-            self.layout_state.hold_pending(document_text.clone());
+            self.hold_layout_pending(&document_text);
             let (nonce, verdict) = self.hold_layout_request(document_text.clone());
             let message =
                 transport::convert::LayoutMessage::LayoutEdit(protocol::wire::LayoutEdit {
@@ -1103,7 +1136,6 @@ impl Session {
                 });
             if !self.send_layout_to(owner, message).await {
                 self.layout_requests.remove(&nonce);
-                self.layout_store.write_pending(&document_text);
                 return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "the coordinator is unreachable; the edit is kept as pending"
@@ -1179,7 +1211,11 @@ impl Session {
 
     async fn on_link_event(&mut self, event: LinkEvent) {
         match event {
-            LinkEvent::Up { peer, hello } => {
+            LinkEvent::Up {
+                peer,
+                hello,
+                connection_id,
+            } => {
                 tracing::info!(
                     peer = %peer,
                     name = hello.display_name.as_str(),
@@ -1187,6 +1223,11 @@ impl Session {
                     receiver_ready = hello.capabilities.receiver_ready(),
                     "link up"
                 );
+                // The clipboard channel of this pair is bound to this connection id as its
+                // parent: the grant carries it, the bind echoes it, and closing the input link
+                // closes the channel (ADR-008, «Clipboard канал»).
+                self.on_clipboard_link_up(peer, connection_id, hello.text_clipboard)
+                    .await;
                 self.feed(fr::Input::Hello {
                     peer,
                     hello: fr::PeerHello {
@@ -1291,10 +1332,127 @@ impl Session {
                 transport::convert::Inbound::Layout(message) => {
                     self.on_layout(peer, message).await;
                 }
+                transport::convert::Inbound::Clipboard {
+                    message,
+                    connection_id,
+                } => {
+                    // A grant is the only clipboard message the input link carries, and it has
+                    // to arrive before the channel it authorises can exist.
+                    tracing::info!(peer = %peer, "clipboard grant");
+                    let out = match self.clipboard.as_mut() {
+                        Some(clipboard) => clipboard.on_grant(peer, connection_id, &message),
+                        None => Vec::new(),
+                    };
+                    self.apply_clipboard(out).await;
+                }
             },
             LinkEvent::Down { peer, reason } => {
                 tracing::warn!(peer = %peer, ?reason, "link down");
+                if let Some(clipboard) = self.clipboard.as_mut() {
+                    clipboard.on_link_down(peer).await;
+                }
                 self.feed(fr::Input::LinkDown { peer }).await;
+            }
+        }
+    }
+
+    /// `[clipboard].transfer = "on_focus_enter"`: while this node is the receiver of an active
+    /// lease, ask the peer for the offer it made while focus was elsewhere.
+    async fn clipboard_on_focus(&mut self) {
+        let receiving = matches!(
+            self.router.lease().receiver(),
+            Some(lease) if lease.state == fr::ReceiverState::Active
+        );
+        if !receiving {
+            return;
+        }
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            clipboard.on_focus().await;
+        }
+    }
+
+    /// Tells the clipboard endpoint that a member's input link came up.
+    async fn on_clipboard_link_up(
+        &mut self,
+        peer: NodeId,
+        connection_id: [u8; 16],
+        text_clipboard: bool,
+    ) {
+        let out = match self.clipboard.as_mut() {
+            Some(clipboard) => {
+                clipboard
+                    .on_link_up(peer, connection_id, text_clipboard)
+                    .await
+            }
+            None => Vec::new(),
+        };
+        self.apply_clipboard(out).await;
+    }
+
+    /// One event from the clipboard runtime.
+    async fn on_clipboard(&mut self, event: crate::clipboard::Inbound) {
+        let out = match self.clipboard.as_mut() {
+            Some(clipboard) => match event {
+                crate::clipboard::Inbound::Bound { peer, channel_id } => {
+                    tracing::info!(peer = %peer, "clipboard channel bound");
+                    clipboard.on_bound(peer, channel_id).await
+                }
+                crate::clipboard::Inbound::Message { peer, message } => {
+                    clipboard.on_peer_message(peer, message).await
+                }
+                crate::clipboard::Inbound::Down { peer } => {
+                    clipboard.on_channel_down(peer).await;
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        self.apply_clipboard(out).await;
+    }
+
+    /// Performs what the clipboard endpoint decided.
+    async fn apply_clipboard(&mut self, out: Vec<crate::clipboard::Out>) {
+        for action in out {
+            match action {
+                crate::clipboard::Out::Grant { peer, message } => {
+                    // The grant travels on the input link: the channel it authorises does not
+                    // exist until the peer has it.
+                    match self.manager.handle(&peer).await {
+                        Some(handle) => {
+                            tracing::info!(peer = %peer, "core -> peer");
+                            if let Err(error) = handle.send_clipboard(message).await {
+                                tracing::warn!(peer = %peer, %error, "clipboard grant failed");
+                            }
+                        }
+                        None => tracing::warn!(peer = %peer, "no input link for a clipboard grant"),
+                    }
+                }
+                crate::clipboard::Out::Dial {
+                    peer,
+                    parent,
+                    channel_id,
+                    token,
+                } => {
+                    if let Some(clipboard) = self.clipboard.as_ref() {
+                        clipboard.dial(peer, parent, channel_id, token).await;
+                    }
+                }
+                crate::clipboard::Out::Agent(frame) => {
+                    tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
+                    if let Err(error) = self.agent.send(frame).await {
+                        tracing::warn!(%error, "cannot reach the agent");
+                        self.on_agent_lost().await;
+                    }
+                }
+                crate::clipboard::Out::Cancel {
+                    peer,
+                    offer_id,
+                    reason,
+                } => {
+                    if let Some(clipboard) = self.clipboard.as_ref() {
+                        clipboard.cancel(peer, offer_id, reason).await;
+                    }
+                }
             }
         }
     }
@@ -1310,6 +1468,16 @@ impl Session {
         // from the frame and never contains a token (`routing::agent_note`).
         if let Some(note) = routing::agent_note(&message) {
             self.refusal = Some(note);
+        }
+        if let Msg::ClipboardChanged(changed) = &message {
+            // The clipboard never drives the focus FSM: a copy is core's own business, so it is
+            // handled here and does not reach `routing::agent_signal`.
+            let out = match self.clipboard.as_mut() {
+                Some(clipboard) => clipboard.on_agent_frame(changed).await,
+                None => Vec::new(),
+            };
+            self.apply_clipboard(out).await;
+            return Ok(());
         }
         match routing::agent_signal(&message, &mut self.context) {
             AgentSignal::Fsm(event) => {
@@ -1700,7 +1868,7 @@ impl Session {
             ctl::Request::LayoutEdit(path) => self.layout_edit(&path).await,
             ctl::Request::LayoutApply => self.layout_apply().await,
             ctl::Request::LayoutDiscard => {
-                let dropped = self.layout_state.take_pending().is_some();
+                let dropped = self.release_layout_pending();
                 tracing::info!(dropped, "pending layout edit discarded");
                 ctl::Response::Status(format!(
                     "pending={}",
@@ -1928,6 +2096,8 @@ enum Step {
     Link(Option<LinkEvent>),
     Agent(Result<protocol::ipc::AgentFrame, String>),
     Control(Result<ctl::ClientStream, ipc::IpcError>),
+    /// One event from the clipboard runtime: a bound channel, a message, or a lost channel.
+    Clipboard(Option<crate::clipboard::Inbound>),
     Tick,
 }
 
