@@ -69,16 +69,10 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-      # Windows runners have a session; Linux ones need Xvfb (above). The fault
-      # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
-      # matter: it spawns two cores and waits for real transitions.
-      - name: Test
-        if: runner.os == 'Windows'
-        run: cargo test --workspace
-
-      - name: Test
-        if: runner.os == 'Linux'
-        run: xvfb-run -a cargo test --workspace
+      # The two symbol checks come before `Test` on purpose: they need nothing
+      # but the binaries `Build` just produced, and GitHub skips every later step
+      # once one fails. While the test suite is red the agent invariant would
+      # otherwise never be checked at all.
 
       # docs/03-architecture.md, rule 1: «Нет сетевых сокетов. В Windows-сборке не
       # линкуется winsock; на Linux — проверка в CI по списку символов.»
@@ -128,3 +122,49 @@ jobs:
             echo "If a new symbol is legitimate for a local transport, add it to the list in this step and say why."
             exit 1
           fi
+
+      # `LWS_KEEP_ROOTS=1` stops the harness from deleting its per-test root
+      # (`unique_dir`), and the roots are then uploaded as an artifact below: a
+      # flaky two-core or three-node test is diagnosed from the cores' own logs
+      # and configs, not from a rerun. The harness has no base-dir variable of its
+      # own — it calls `std::env::temp_dir()` — so the location is chosen through
+      # TMPDIR (Linux) and TMP/TEMP (Windows), which is exactly how
+      # `std::env::temp_dir()` resolves. The directory is created first: `xvfb-run`
+      # runs `mktemp -d` in TMPDIR and would fail if it did not exist.
+      - name: Prepare diagnostics root
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\lws-roots" | Out-Null
+
+      - name: Prepare diagnostics root
+        if: runner.os == 'Linux'
+        run: mkdir -p "$RUNNER_TEMP/lws-roots"
+
+      # Windows runners have a session; Linux ones need Xvfb (above). The fault
+      # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
+      # matter: it spawns two cores and waits for real transitions.
+      - name: Test
+        if: runner.os == 'Windows'
+        env:
+          LWS_KEEP_ROOTS: "1"
+          TMP: ${{ runner.temp }}\lws-roots
+          TEMP: ${{ runner.temp }}\lws-roots
+        run: cargo test --workspace
+
+      - name: Test
+        if: runner.os == 'Linux'
+        env:
+          LWS_KEEP_ROOTS: "1"
+          TMPDIR: ${{ runner.temp }}/lws-roots
+        run: xvfb-run -a cargo test --workspace
+
+      # The kept roots are the point of `LWS_KEEP_ROOTS` above: one directory per
+      # harness (`lws-<label>-<pid>-<n>`) with each core's log, config and state.
+      # Only on failure, so a green run uploads nothing.
+      - name: Upload harness roots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lws-roots-${{ runner.os }}
+          path: ${{ runner.temp }}/lws-roots
+          if-no-files-found: ignore
