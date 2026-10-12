@@ -38,11 +38,6 @@ fn field(line: &str, name: &str) -> String {
         .to_owned()
 }
 
-/// The coordinator's current revision.
-fn coordinator_revision(harness: &Harness) -> u64 {
-    revision(&harness.a.ctl("layout show").expect("layout show"))
-}
-
 /// Waits until both nodes report the *same* document, i.e. the same `(revision, author)` pair.
 ///
 /// Comparing pairs inside the predicate is what keeps this race-free: the coordinator may move
@@ -163,12 +158,13 @@ fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
     let applied = wait_layout(&harness.a, "the coordinator applies the edit", |line| {
         revision(line) == start + 1
     });
+    // `wait_layout`'s own predicate already fixed the revision; the author is the part the
+    // predicate cannot see.
     let author = field(&applied, "author");
     assert_eq!(
         author, harness.a.id,
         "the published revision is authored by the coordinator"
     );
-    assert!(revision(&applied) >= start + 1);
 
     let follower = wait_layout(&harness.b, "the follower adopts the revision", |line| {
         revision(line) == start + 1
@@ -191,10 +187,14 @@ fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
 ///
 /// `docs/03-architecture.md`: «после партиции координатор забирает победившую ревизию у её
 /// автора и публикует её как max_seen+1 под своим авторством». The coordinator's own edit wins
-/// by the CAS; the follower's divergent one waits in `layout.pending.toml` and is applied by
-/// `layout apply` once the link is back, which is what «resolved» means here.
+/// by the CAS; the follower's divergent one lies in `layout.pending.toml` with the base it was
+/// written against (revision 1). After the heal that base is stale, so the coordinator refuses
+/// the pending edit by name instead of applying it on top of the winner — ADR-013 leaves the
+/// way out to the user («перезагрузить и применить своё»), which is the reload walk at the end
+/// of this test: the stale entry goes, and the edit is written against the base that is
+/// current now.
 #[test]
-fn a_partition_leaves_the_loser_pending_and_apply_resolves_it() {
+fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
     let _guard = common::serial();
     let mut harness = Harness::start(true, true);
     harness.wait_linked();
@@ -256,20 +256,54 @@ fn a_partition_leaves_the_loser_pending_and_apply_resolves_it() {
         "yes",
         "the loser's edit is still pending"
     );
+    let winner = revision(&healed);
+    assert_eq!(winner, loser_start + 1, "the winner is the coordinator's edit");
 
-    // `layout apply` sends it to the coordinator, which applies it as the next revision.
-    let sent = harness
-        .b
-        .ctl("layout apply")
-        .expect("apply forwards the edit");
+    // `layout apply` sends the pending edit with the base *it* names (revision 1), not with the
+    // revision this node has applied by now (2). The coordinator's CAS therefore refuses it by
+    // name, and the pair stays exactly where the rejoin left it: the winning edit is not
+    // silently reverted by the loser's stale document.
+    let sent = harness.b.ctl("layout apply").expect("apply forwards the edit");
     assert!(sent.contains("sent to the coordinator"), "{sent}");
-    let (done, _) = wait_same_document(&harness, "the follower sees the applied revision");
+    wait_refusal(
+        &harness,
+        "ERROR_CODE_LAYOUT_CONFLICT",
+        "the stale pending edit is refused",
+    );
+    let held = harness.b.ctl("layout show").expect("layout show");
     assert_eq!(
-        field(&done, "pending"),
-        "no",
-        "apply resolved the pending edit"
+        revision(&held),
+        winner,
+        "a refused edit does not move the revision"
+    );
+    assert_eq!(
+        field(&held, "author"),
+        harness.a.id,
+        "the winner still owns the document"
+    );
+
+    // The reload: the stale entry goes, and the edit is written against the revision that is
+    // applied now — the base the CAS accepts.
+    harness
+        .b
+        .ctl("layout discard")
+        .expect("the stale entry is discarded");
+    let reply = harness
+        .b
+        .ctl(&format!(
+            "layout edit {}",
+            edit_file(&harness, "b.toml", "eDP-B")
+        ))
+        .expect("the reloaded edit is sent");
+    assert!(reply.contains("sent to the coordinator"), "{reply}");
+    let (done, _) = wait_same_document(&harness, "the reloaded edit is applied");
+    assert_eq!(
+        revision(&done),
+        winner + 1,
+        "the reloaded edit lands above the winner"
     );
     assert_eq!(field(&done, "author"), harness.a.id);
+    assert_eq!(field(&done, "pending"), "no");
     harness.a.stop();
     harness.b.stop();
 }
@@ -308,7 +342,6 @@ fn a_stale_edit_is_refused_with_layout_conflict() {
         edit_file(&harness, "b.toml", "eDP-B")
     ));
     proxy.forward();
-    let base = revision(&harness.a.ctl("layout show").expect("layout show"));
     wait_same_document(&harness, "the follower adopts the coordinator's revision");
 
     // The pending edit is stale for a simpler reason: the coordinator applied *its* edit while
