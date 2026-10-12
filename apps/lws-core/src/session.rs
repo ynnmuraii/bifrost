@@ -826,7 +826,7 @@ impl Session {
             return ctl::Response::Status(format!(
                 "sent to the coordinator ({}), based on revision {}",
                 identity::fingerprint(&owner),
-                applied.revision
+                self.layout_state.applied().revision
             ));
         }
         let edit = crate::layout::Edit {
@@ -960,7 +960,7 @@ impl Session {
             return ctl::Response::Status(format!(
                 "sent to the coordinator ({}), based on revision {}",
                 identity::fingerprint(&owner),
-                applied.revision
+                self.layout_state.applied().revision
             ));
         }
         let outcome =
