@@ -673,6 +673,37 @@ async fn an_abrupt_kill_is_reported_as_a_liveness_timeout() {
         "a dead socket must not take longer than the liveness timeout to show up"
     );
 
+    // And nothing puts the dead peer back: a dialer that survived the kill kept dialling the
+    // survivor, the survivor accepted it, and the pair linked again — a dead peer that never
+    // looked dead, which is exactly what this test saw on Windows (`Down{LocalClosed}` + `Up`
+    // and then fifteen silent seconds, because the replacement link was perfectly healthy).
+    // `kill_all` takes the dialers with the links now, the way a crash does.
+    let resurrected = {
+        let window = Instant::now() + Duration::from_millis(2_000);
+        let mut resurrected = false;
+        while let Ok(event) = tokio::time::timeout(
+            window.saturating_duration_since(Instant::now()),
+            b.events.recv(),
+        )
+        .await
+        {
+            match event {
+                Some(LinkEvent::Up { peer, .. }) if peer == id_a => resurrected = true,
+                Some(LinkEvent::Down {
+                    peer,
+                    reason: LinkDownReason::LocalClosed,
+                }) if peer == id_a => resurrected = true,
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        resurrected
+    };
+    assert!(
+        !resurrected,
+        "the killed peer must not be linked again by its own dial loop"
+    );
+
     // The member list no longer contains the dead peer. This is a second, separately bounded
     // wait: the link's `Down` report and the manager's member bookkeeping are different steps,
     // and a loaded machine stretches both.
@@ -837,18 +868,27 @@ async fn a_silent_peer_is_retried_instead_of_parking_the_dialer() {
     );
 }
 
-/// A link that replaces a live one must be reported as a replacement, not swapped in silence.
+/// A healthy link is never replaced by a late redial.
 ///
-/// Both sides dial at formation and [`policy::prefer_incoming`] keeps one of the two; the
-/// loser's dialer redials after its link ends, and when that redial *wins* the comparison it
-/// replaces the link the application is using. That replacement used to be silent — the manager
-/// closed the old link and sent only the new `Up` — so the application kept reading a link that
-/// was already gone. In a three-node CI run an in-flight `LeaveAck` died with it and the leaving
-/// node sat in `Releasing` with nothing left to read. The replaced link is now reported
-/// `Down { LocalClosed }`, which is what that reason documents, before the new `Up`.
+/// This is what CI kept hitting: two nodes linked, a lease `Remote`, and then both ends logged
+/// `link down reason=LocalClosed` + `link up` in the same millisecond — the established link
+/// replaced, the session torn down. The cause was that [`policy::prefer_incoming`] decided
+/// *every* `Up` that met a live link, not only the simultaneous dial it exists for: a dial
+/// that completes after formation settled — a staggered start, a loser's redial loop, a
+/// reconnect that overlapped the old link's last moments — carries the larger initiator, and
+/// that alone used to be enough to replace a healthy link.
+///
+/// The setup below is that shape, deterministically: only the *smaller* id dials at formation,
+/// so the mesh settles on its link, and a second manager — still the larger, still trusted —
+/// dials the smaller node's address long afterwards. Its initiator beats the live one in
+/// `prefer_incoming`; before the fix that comparison replaced the link. Now the dial is late by
+/// [`policy::formation_overlap`], so it is refused: no `Down`, no `Up`, no member loss — and
+/// the live link keeps carrying traffic. (The only replacement left is a dial that was already
+/// forming when the live link came up, which is what the doc's «одновременный взаимный дозвон»
+/// means and what `prefer_incoming` still decides.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
-    let root = temp_root("replacement");
+async fn a_healthy_link_is_never_replaced_by_a_late_redial() {
+    let root = temp_root("late-redial");
     let address_a = free_address().await;
     let address_b = free_address().await;
     let identity_a = Arc::new(identity_at(&root, "a"));
@@ -856,10 +896,8 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
     let (id_a, id_b) = (identity_a.node_id(), identity_b.node_id());
 
     // Only the *smaller* id dials at formation, so the live link is the one it dialled and its
-    // initiator is the smaller of the two. The larger node then dials second, and its initiator
-    // beats the live one — that comparison is what replaces a link. (With both sides dialing at
-    // formation the larger id's link wins on both ends and nothing can beat it, so no
-    // replacement could happen at all.)
+    // initiator is the smaller of the two — the state every settled mesh is in, and the state a
+    // late dial from the larger id used to overturn.
     let dial_a: Vec<SocketAddr> = if id_a < id_b {
         vec![address_b]
     } else {
@@ -895,15 +933,13 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
     settle(&mut a, Duration::from_millis(600)).await;
     settle(&mut b, Duration::from_millis(600)).await;
 
-    // The second dial comes from the *larger* id, and it is the smaller id that watches: its
-    // live link is the one that gets replaced.
-    let dial_second_from_b = id_b > id_a;
-    let (watch_a, second_identity, peer_id, peer_address) = if dial_second_from_b {
-        (true, Arc::clone(&identity_b), id_a, address_a)
+    // The late dial comes from the *larger* id, and it is the smaller id that watches: its live
+    // link is the one the late dial used to replace.
+    let (watch_a, second_identity, peer_id, peer_address, watched_peer_id) = if id_b > id_a {
+        (true, Arc::clone(&identity_b), id_a, address_a, id_b)
     } else {
-        (false, Arc::clone(&identity_a), id_b, address_b)
+        (false, Arc::clone(&identity_a), id_b, address_b, id_a)
     };
-
     let mut trust = TrustStore::new();
     trust.trust(TrustedPeer::paired(
         peer_id,
@@ -932,45 +968,203 @@ async fn a_link_that_replaces_a_live_one_is_reported_as_a_replacement() {
             let _ = second.run().await;
         })
     };
-    // Its own events must be drained or its sends block.
-    let drain = tokio::spawn(async move { while second_events.recv().await.is_some() {} });
+    // Its own events must be drained or its sends block. Every `Up` the second manager sees is a
+    // late dial the watched node refused: it holds no link of its own to that peer, so each dial
+    // comes up, dies, and is retried — the churn that must stay invisible to the watched node.
+    let late_dials = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&late_dials);
+    let drain = tokio::spawn(async move {
+        while let Some(event) = second_events.recv().await {
+            if matches!(event, LinkEvent::Up { .. }) {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    // Wait until the refusal path has run a few times, or a quiet machine proves nothing: the
+    // watched node has to stay silent *while* those refusals are happening.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    while late_dials.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        late_dials.load(Ordering::SeqCst) >= 3,
+        "the late dialer must keep being retried by its own loop (it has no link to that peer \
+         on its own side), so the watched node really is refusing repeatedly"
+    );
 
     let events = if watch_a {
         &mut a.events
     } else {
         &mut b.events
     };
-    let replacement = wait_for_event(
-        events,
-        |event| {
-            matches!(
-                event,
-                LinkEvent::Down {
-                    reason: LinkDownReason::LocalClosed,
-                    ..
-                }
-            )
-        },
-        EVENT_TIMEOUT,
-    )
-    .await;
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(format!("{event:?}"));
+    }
     assert!(
-        replacement.is_some(),
-        "the replaced link must be reported down, not swapped in silence"
+        seen.is_empty(),
+        "a late redial must leave the live link's owner in silence, not replace it: {seen:?}"
     );
-    let up = wait_for_event(
-        events,
-        |event| matches!(event, LinkEvent::Up { .. }),
-        EVENT_TIMEOUT,
-    )
-    .await;
-    assert!(
-        up.is_some(),
-        "the replacement must come up after the report"
+    let watched = if watch_a { &a } else { &b };
+    assert_eq!(
+        watched.manager.member_count().await,
+        1,
+        "the refused dial must not cost the live link its member"
     );
 
+    let handle = watched
+        .manager
+        .handle(&watched_peer_id)
+        .await
+        .expect("a handle over the live link");
+    handle
+        .send(Message::InputBatch {
+            lease_id: [7u8; 16],
+            input_batch_seq: 1,
+            events: vec![input_model::InputEvent::Button {
+                button: input_model::MouseButton::Left,
+                state: input_model::KeyState::Up,
+            }],
+        })
+        .await
+        .expect("the batch is queued on the live link");
+    let peer_events = if watch_a {
+        &mut b.events
+    } else {
+        &mut a.events
+    };
+    let received = wait_for_event(
+        peer_events,
+        |event| matches!(event, LinkEvent::Message { .. }),
+        EVENT_TIMEOUT,
+    )
+    .await;
+    assert!(
+        received.is_some(),
+        "the live link must still deliver after the refused redial"
+    );
+
+    second.kill_all().await;
     second_runner.abort();
     drain.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A dialer to an already-linked peer stays idle until that link goes down.
+///
+/// The loser of a dial used to keep dialling: its link lost the dedup, the manager closed it,
+/// and the dialer read that as "the peer went away" — redial every backoff, a full TLS handshake
+/// each time, all of it refused at the `Up` by the very manager that keeps the live link. A
+/// dialer now takes its turn from the manager, and the manager only hands it over when the peer
+/// has no link left. The proxy counts the connections the losing side actually makes: after
+/// formation that count must not move, and after the live link is closed it must move again —
+/// the idleness is a wait, not a wedge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dialer_to_a_linked_peer_stays_idle() {
+    let root = temp_root("idle-dialer");
+    let via_proxy_address = free_address().await;
+    let direct_address = free_address().await;
+    let proxy_address = free_address().await;
+
+    let identity_first = Arc::new(identity_at(&root, "first"));
+    let identity_second = Arc::new(identity_at(&root, "second"));
+    // The survivor of a simultaneous dial is the link with the larger initiator, so the node
+    // that dials *through the proxy* must be the one with the smaller id — those are the
+    // connections being counted. The ids are random, so the roles are assigned to fit.
+    let (proxy_identity, direct_identity) = if identity_first.node_id() < identity_second.node_id()
+    {
+        (Arc::clone(&identity_first), Arc::clone(&identity_second))
+    } else {
+        (Arc::clone(&identity_second), Arc::clone(&identity_first))
+    };
+    let (id_via_proxy, id_direct) = (proxy_identity.node_id(), direct_identity.node_id());
+
+    // The proxy: plain TCP in front of the direct node's real listener, so the pinned handshake
+    // and the `Hello` travel through it unchanged — it only forwards and counts.
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&connections);
+    let backend = direct_address;
+    let proxy = tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(proxy_address)
+            .await
+            .expect("bind the proxy");
+        while let Ok((mut client, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut upstream) = tokio::net::TcpStream::connect(backend).await {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                }
+            });
+        }
+    });
+
+    // The smaller id dials through the proxy (and loses), the larger dials directly (and wins).
+    let mut via_proxy = spawn_node(
+        "via-proxy",
+        proxy_identity,
+        via_proxy_address,
+        &[(id_direct, direct_address)],
+        &[proxy_address],
+        3,
+    )
+    .await;
+    let mut direct = spawn_node(
+        "direct",
+        direct_identity,
+        direct_address,
+        &[(id_via_proxy, via_proxy_address)],
+        &[via_proxy_address],
+        3,
+    )
+    .await;
+    assert!(wait_for_members(&via_proxy, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&direct, 1, FORM_TIMEOUT).await);
+    settle(&mut via_proxy, Duration::from_millis(300)).await;
+    settle(&mut direct, Duration::from_millis(300)).await;
+
+    // Formation's losing dial may still be in flight when the member count is right, so wait for
+    // the counter to hold still before measuring. A dialer that loops is not slowed by this: it
+    // moves the counter well inside the quiet bound below.
+    let quiet = Duration::from_millis(1_200);
+    let settle_deadline = Instant::now() + FORM_TIMEOUT;
+    let mut last_change = Instant::now();
+    let mut settled_at = connections.load(Ordering::SeqCst);
+    while last_change.elapsed() < quiet && Instant::now() < settle_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = connections.load(Ordering::SeqCst);
+        if now != settled_at {
+            settled_at = now;
+            last_change = Instant::now();
+        }
+    }
+
+    // Several backoffs' worth of silence: the losing dialer used to handshake through the proxy
+    // every ~500 ms for the life of the mesh.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        settled_at,
+        "a dialer whose peer is linked must not dial again until that link goes down"
+    );
+
+    // The heal: stop the live endpoint's link and dialers, leaving its listener up. That
+    // isolates the waiting dialer's Down notification from a competing reconnect on this side.
+    direct.manager.kill_all().await;
+    let reconnect_deadline = Instant::now() + FORM_TIMEOUT;
+    while connections.load(Ordering::SeqCst) == settled_at && Instant::now() < reconnect_deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        connections.load(Ordering::SeqCst) > settled_at,
+        "after the link is gone the dialer must dial again — the permit is a wait, not a wedge"
+    );
+    assert!(wait_for_members(&via_proxy, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&direct, 1, FORM_TIMEOUT).await);
+
+    via_proxy.kill().await;
+    direct.kill().await;
+    proxy.abort();
     let _ = std::fs::remove_dir_all(&root);
 }
 

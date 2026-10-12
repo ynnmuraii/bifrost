@@ -73,12 +73,37 @@ pub fn winning_dialer(a: &NodeId, b: &NodeId) -> NodeId {
 /// Whether a newly accepted/dialled link should replace the existing one to `peer`.
 ///
 /// Returns `true` when the *incoming* link is the one whose initiator is the winning
-/// dialer. `existing_initiator` and `incoming_initiator` are the `initiator_node_id`s of the
-/// two links (one of them is always us or the peer).
+/// dialer. `existing_initiator` and `incoming_initiator` are the `initiator_node_id`s of
+/// the two links (one of them is always us or the peer).
+///
+/// This decides **simultaneous formation only** (`docs/05-protocol.md`, «одновременный
+/// взаимный дозвон разрешается детерминированно»): two dials that were in flight at the
+/// same time, so both sides must pick the same connection without negotiating. It is never
+/// the authority for replacing an established link — see [`formation_overlap`], which is
+/// what scopes this rule to the race it exists for.
 pub fn prefer_incoming(existing_initiator: &NodeId, incoming_initiator: &NodeId) -> bool {
     // The winner is the larger of the two initiators; ties cannot happen for two distinct
     // links to the same peer (one is us, the other is the peer).
     incoming_initiator > existing_initiator
+}
+
+/// Whether a link reporting `Up` was still forming when the live link came up.
+///
+/// `existing_up_at_ns` is when the live link finished forming, `incoming_registered_at_ns`
+/// when the newcomer was spawned — both on the manager's monotonic nanosecond clock. `true`
+/// means the newcomer was registered *before* the live link was up, so the two dials
+/// overlapped in time: the simultaneous-dial race, where [`prefer_incoming`] decides
+/// deterministically. Nanosecond precision avoids treating a redial in the same millisecond
+/// as a formation race.
+///
+/// `false` means the newcomer dialled after the live link was already established. That is a
+/// late redial — a staggered start, a reconnect that overlapped the old link's last moments,
+/// or a dial loop that outlived its link — and it must be refused, not deduplicated: a redial
+/// that arrives while a healthy link exists never replaces it, because the replacement tears
+/// down the session the established link is carrying. `docs/05-protocol.md` scopes the
+/// dedup rule to «одновременный» dialling for exactly this reason.
+pub fn formation_overlap(existing_up_at_ns: u128, incoming_registered_at_ns: u128) -> bool {
+    incoming_registered_at_ns <= existing_up_at_ns
 }
 
 /// Membership gate: `docs/05-protocol.md`: «Достигнут предел членов (`N_max = 4`,
@@ -170,6 +195,38 @@ pub fn next_liveness_wakeup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The simultaneous-dial rule, pinned as the pure decision it is: the link initiated by
+    /// the larger `node_id` wins, on both ends, with no negotiation. The tie goes to the
+    /// existing link, which is the two-dials-from-one-node case (`a peer that dials twice`).
+    #[test]
+    fn the_larger_initiator_wins_a_simultaneous_dial() {
+        let smaller = NodeId::new([7u8; 32]);
+        let larger = NodeId::new([9u8; 32]);
+        assert_eq!(winning_dialer(&smaller, &larger), larger);
+        assert_eq!(winning_dialer(&larger, &smaller), larger);
+        assert!(prefer_incoming(&smaller, &larger));
+        assert!(!prefer_incoming(&larger, &smaller));
+        // Two dials from the same node tie, and the existing link keeps its place.
+        assert!(!prefer_incoming(&larger, &larger));
+    }
+
+    /// The dedup decision is scoped to dials that overlapped in time.
+    ///
+    /// A newcomer registered while the live link was still forming is the simultaneous race
+    /// [`prefer_incoming`] exists for; a newcomer registered after the live link was already
+    /// up is a late redial and never decides anything — it is refused. The boundary is the
+    /// instant the live link came up, inclusive.
+    #[test]
+    fn only_a_formation_race_may_decide_the_dedup() {
+        // Newcomer registered one nanosecond before the live link came up: the dials
+        // overlapped, so the winner is decided by the initiators.
+        assert!(formation_overlap(1_000, 999));
+        // Registered at the same instant.
+        assert!(formation_overlap(1_000, 1_000));
+        // Registered after: the live link was formed, so the newcomer is late.
+        assert!(!formation_overlap(1_000, 1_001));
+    }
 
     /// The documented deadline, pinned where no scheduler can move it.
     ///

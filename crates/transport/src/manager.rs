@@ -19,7 +19,7 @@ use geometry::NodeId;
 use identity::{peer_node_id, trust::TrustStore, NodeIdentity};
 use protocol::{limits, wire};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
 use crate::convert::PeerInfo;
@@ -79,6 +79,11 @@ impl Clock {
     fn now_ms(&self) -> u64 {
         Instant::now().duration_since(self.origin).as_millis() as u64
     }
+
+    /// Nanoseconds since the origin, for formation ordering finer than the pairing clock.
+    fn now_ns(&self) -> u128 {
+        Instant::now().duration_since(self.origin).as_nanos()
+    }
 }
 
 /// What the manager keeps per live link.
@@ -91,6 +96,12 @@ struct LiveLink {
     key: [u8; 16],
     handle: LinkHandle,
     initiator: NodeId,
+    /// When this link finished forming, on the manager's monotonic clock.
+    ///
+    /// A newcomer that registered before this instant dialled while this link was still
+    /// forming — the simultaneous race [`policy::prefer_incoming`] exists for. A newcomer
+    /// registered after it is a late redial and is refused instead.
+    up_at_ns: u128,
     /// The link's task, so [`LinkManager::kill_all`] can drop it without a `Shutdown`.
     task: tokio::task::JoinHandle<()>,
 }
@@ -110,6 +121,13 @@ struct PendingLink {
     handle: LinkHandle,
     initiator: NodeId,
     task: tokio::task::JoinHandle<()>,
+    /// The peer this link is for, so a report can be matched without the live map's key.
+    peer: NodeId,
+    /// When the manager registered it, on its monotonic clock.
+    ///
+    /// Compared against a live link's [`LiveLink::up_at_ns`] to tell a simultaneous dial (the
+    /// newcomer was already forming) from a late redial (it started afterwards).
+    registered_at_ns: u128,
 }
 
 /// Messages from the accept/dial tasks into the manager loop.
@@ -124,6 +142,24 @@ enum ManagerMessage {
     },
     /// A link's own report.
     Report(LinkReport),
+    /// A dialer asks for its turn to dial `peer`: granted once no link to that peer is left.
+    ///
+    /// The dialer learns a peer's identity from the first handshake with it, so this is the
+    /// only way it can know not to dial while that peer is already linked — the link may have
+    /// been dialled by the peer, or by a link this dialer's own attempt lost.
+    DialPermit {
+        peer: NodeId,
+        reply: oneshot::Sender<DialTurn>,
+    },
+}
+
+/// What a granted dial permit tells the waiting dialer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialTurn {
+    /// The peer had no link at all: dial, and keep the reconnect backoff where it is.
+    Free,
+    /// The peer had a link that went away: a fresh start, retry promptly.
+    Waited,
 }
 
 /// The mesh of links around this node.
@@ -150,6 +186,42 @@ struct Inner {
     /// handle, the manager dropped that link's `Up`, and the pair stayed split across two TCP
     /// connections instead of the one the dedup rule picked.
     pending: BTreeMap<[u8; 16], PendingLink>,
+    /// The dialers [`LinkManager::run`] spawned, so [`LinkManager::kill_all`] can stop them.
+    ///
+    /// A crash takes the dialers with it: a dialer that outlives its links keeps re-dialling a
+    /// peer that is gone, and every one of those dials is accepted by a survivor that still
+    /// trusts it — the dead peer never looks dead.
+    dialers: Vec<tokio::task::JoinHandle<()>>,
+    /// Dial permits not yet granted, per peer: the dialers waiting for that peer's link to go.
+    ///
+    /// This is what makes a dialer idle while its peer is linked. Without it, a dialer whose
+    /// link lost the dedup looped forever: redial, get refused at `Up`, redial again — a TLS
+    /// handshake every backoff, for the life of the mesh.
+    dial_waiters: BTreeMap<NodeId, Vec<oneshot::Sender<DialTurn>>>,
+}
+
+impl Inner {
+    /// Whether a link to `peer` exists, live or still forming.
+    fn has_link_to(&self, peer: &NodeId) -> bool {
+        self.links.contains_key(peer) || self.pending.values().any(|pending| pending.peer == *peer)
+    }
+
+    /// Grants every permit waiting on `peer` once no link to it remains.
+    ///
+    /// The check is the manager's state *at this instant*, so any transition that touches
+    /// `peer` may call it — including the one that replaces a live link, where a live link
+    /// exists again by the time the old one's removal is noticed.
+    fn release_dial_waiters(&mut self, peer: NodeId) {
+        if self.has_link_to(&peer) {
+            return;
+        }
+        let Some(waiting) = self.dial_waiters.remove(&peer) else {
+            return;
+        };
+        for reply in waiting {
+            let _ = reply.send(DialTurn::Waited);
+        }
+    }
 }
 
 impl LinkManager {
@@ -190,12 +262,15 @@ impl LinkManager {
         self.inner.lock().await.links.len()
     }
 
-    /// Drops every link abruptly, without a `Shutdown`.
+    /// Drops every link abruptly, without a `Shutdown`, and stops the dialers with them.
     ///
     /// A peer cannot tell this apart from a crashed process, which is exactly what the e2e
-    /// timing of `docs/05-protocol.md` (offline after 3 s without `Pong`) is about. The
-    /// graceful path is [`LinkHandle::close`] on each handle plus letting the manager's loop
-    /// keep running.
+    /// timing of `docs/05-protocol.md` (offline after 3 s without `Pong`) is about — and that
+    /// is also why the dialers go: a process that died neither dials nor accepts. A dialer
+    /// that survived here would keep re-dialling the peer it lost, and each of those dials is
+    /// accepted by any survivor that still trusts it, so the pair links again and the dead
+    /// peer never looks dead (the `mesh.rs` kill test is the pinned case). The graceful path
+    /// is [`LinkHandle::close`] on each handle plus letting the manager's loop keep running.
     pub async fn kill_all(&self) {
         let mut inner = self.inner.lock().await;
         for (_, link) in std::mem::take(&mut inner.links) {
@@ -204,6 +279,11 @@ impl LinkManager {
         for (_, pending) in std::mem::take(&mut inner.pending) {
             pending.task.abort();
         }
+        for dialer in std::mem::take(&mut inner.dialers) {
+            dialer.abort();
+        }
+        // The waiters would otherwise hold their dialers' senders until the manager is gone.
+        inner.dial_waiters.clear();
     }
 
     /// Runs until the process ends: listens, dials, dedups, supervises.
@@ -225,15 +305,17 @@ impl LinkManager {
             liveness: self.config.liveness,
             backoff: self.config.backoff,
         };
+        let mut dialers = Vec::with_capacity(self.config.peers.len());
         for address in self.config.peers.clone() {
             let messages = self.messages_tx.clone();
             let identity = Arc::clone(&self.config.identity);
             let trust = self.config.trust.clone();
             let hello = local_hello.clone();
-            tokio::spawn(async move {
+            dialers.push(tokio::spawn(async move {
                 dial_loop(address, identity, trust, hello, messages, settings).await;
-            });
+            }));
         }
+        self.inner.lock().await.dialers = dialers;
 
         loop {
             tokio::select! {
@@ -282,14 +364,25 @@ impl LinkManager {
                 task,
             } => {
                 let initiator = if direction.is_outgoing() { local } else { peer };
+                let registered_at_ns = self.clock.now_ns();
                 self.inner.lock().await.pending.insert(
                     key,
                     PendingLink {
+                        peer,
                         handle,
                         initiator,
                         task,
+                        registered_at_ns,
                     },
                 );
+            }
+            ManagerMessage::DialPermit { peer, reply } => {
+                let mut inner = self.inner.lock().await;
+                if inner.has_link_to(&peer) {
+                    inner.dial_waiters.entry(peer).or_default().push(reply);
+                } else {
+                    let _ = reply.send(DialTurn::Free);
+                }
             }
             ManagerMessage::Report(report) => match report {
                 LinkReport::Up {
@@ -312,13 +405,17 @@ impl LinkManager {
                         // Only the link that went down may leave the member list: a `Down` is
                         // matched against the *key* the manager handed that link, so a closed
                         // newcomer in the same direction as a live link cannot evict it.
-                        match inner.links.get(&peer) {
+                        let removed = match inner.links.get(&peer) {
                             Some(live) if live.key == key => {
                                 inner.links.remove(&peer);
                                 true
                             }
                             _ => false,
-                        }
+                        };
+                        // Whichever link went away, a dialer waiting for this peer may have
+                        // its turn now — the check inside only grants when nothing is left.
+                        inner.release_dial_waiters(peer);
+                        removed
                     };
                     if removed || reason == LinkDownReason::MembershipFull {
                         let _ = self.events_tx.send(LinkEvent::Down { peer, reason }).await;
@@ -342,15 +439,25 @@ impl LinkManager {
         };
 
         // Simultaneous dial: both sides compute the same winner from the two identities, so
-        // the losing link is closed on both ends without any negotiation.
+        // the losing link is closed on both ends without any negotiation. The rule only
+        // decides dials that *overlapped* (`docs/05-protocol.md`, «одновременный взаимный
+        // дозвон»): a link that registered after the live link was already up is a late redial
+        // — a staggered start, a reconnect that overlapped an old link's last moments, a dial
+        // loop that outlived its link — and a late redial is refused, never deduplicated.
+        // Replacing a live, healthy link tears down the session it carries: the mesh used to
+        // do exactly that under load, both ends logging `Down{LocalClosed}` + `Up` while a
+        // lease was Remote. The closed newcomer is not a member loss, so no `Down` is
+        // reported for it — the live link keeps its place in silence.
         let (existing_key, replaced) = {
             let inner = self.inner.lock().await;
             match inner.links.get(&peer) {
                 // A link cannot replace itself: a repeated `Up` for the same key is not a
                 // second link.
                 Some(existing) if existing.key != key => {
-                    let keep_incoming =
-                        policy::prefer_incoming(&existing.initiator, &pending.initiator);
+                    let simultaneous =
+                        policy::formation_overlap(existing.up_at_ns, pending.registered_at_ns);
+                    let keep_incoming = simultaneous
+                        && policy::prefer_incoming(&existing.initiator, &pending.initiator);
                     (Some(existing.key), keep_incoming)
                 }
                 _ => (None, false),
@@ -412,12 +519,14 @@ impl LinkManager {
             }
         }
 
+        let up_at_ns = self.clock.now_ns();
         self.inner.lock().await.links.insert(
             peer,
             LiveLink {
                 key,
                 handle: pending.handle,
                 initiator: pending.initiator,
+                up_at_ns,
                 task: pending.task,
             },
         );
@@ -633,8 +742,28 @@ async fn dial_loop(
     // peer to answer a `Ping` («офлайн через 3 s без `Pong`»): a handshake that cannot finish
     // inside it belongs to an unreachable peer, not a slow one.
     let dial_timeout = Duration::from_millis(settings.liveness.offline_ms);
+    // Who answers at `address`; unknown until the first handshake reveals the certificate, and
+    // until then there is no peer whose link this dialer would have to wait for.
+    let mut peer: Option<NodeId> = None;
     let mut attempt = 0u32;
     loop {
+        // One dial per peer, at most one link per peer: once the peer is known, dialing is the
+        // *manager's* turn to give. While the peer has a link — dialled by it, or by a link
+        // this loop's own attempt lost — a dial would only build a connection the manager
+        // refuses at its `Up`; a dialer that looped anyway burned a handshake every backoff for
+        // the life of the mesh. When the link goes, the manager hands the turn over and this
+        // loop heals it.
+        if let Some(known) = peer {
+            match request_dial_permit(&messages, known).await {
+                // The peer was linked and stopped being: reconnect promptly, not on the
+                // backoff a long-unreachable peer would demand.
+                Some(DialTurn::Waited) => attempt = 0,
+                // Nothing linked at all: the backoff keeps growing towards its ceiling.
+                Some(DialTurn::Free) => {}
+                // The manager stopped listening; there is nothing left to dial for.
+                None => return,
+            }
+        }
         let connected = tokio::time::timeout(dial_timeout, async {
             let tcp = TcpStream::connect(address).await.ok()?;
             connector
@@ -646,18 +775,19 @@ async fn dial_loop(
         .ok()
         .flatten();
         if let Some(stream) = connected {
-            let peer = stream
+            let dialed = stream
                 .get_ref()
                 .1
                 .peer_certificates()
                 .and_then(|certs| certs.first())
                 .and_then(|certificate| peer_node_id(std::slice::from_ref(certificate)).ok());
-            if let Some(peer) = peer {
+            if let Some(dialed) = dialed {
+                peer = Some(dialed);
                 if let Ok(key) = identity::random16() {
                     start_link(
                         LinkSpawn {
                             key,
-                            peer,
+                            peer: dialed,
                             direction: Direction::Outgoing,
                         },
                         Stream::Client(Box::new(stream)),
@@ -674,6 +804,22 @@ async fn dial_loop(
         attempt = attempt.saturating_add(1);
         tokio::time::sleep(policy::reconnect_delay(attempt, settings.backoff)).await;
     }
+}
+
+/// Asks the manager for the turn to dial `peer`, resolving once no link to it is left.
+///
+/// `None` means the manager stopped listening — its channel is gone, so this dialer has nobody
+/// left to report a link to and may as well stop.
+async fn request_dial_permit(
+    messages: &mpsc::Sender<ManagerMessage>,
+    peer: NodeId,
+) -> Option<DialTurn> {
+    let (reply, granted) = oneshot::channel();
+    messages
+        .send(ManagerMessage::DialPermit { peer, reply })
+        .await
+        .ok()?;
+    granted.await.ok()
 }
 
 /// What one spawned link is: which peer, which way it was dialled, and the key the manager
