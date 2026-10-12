@@ -32,6 +32,7 @@ mod routing;
 mod session;
 mod topology;
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -250,6 +251,11 @@ fn init_logging(paths: &Paths) {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        // Colour only what a human reads. `tracing` colours by default, and a *redirected*
+        // stderr is not a terminal: a log file or a pipe would otherwise carry `ESC[…m`
+        // around every field, which breaks anything that parses it (the fault-injection
+        // harness did) and wastes bytes in the planned file sink (`[log] max_file_mb`).
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
