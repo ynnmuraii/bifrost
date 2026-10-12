@@ -20,8 +20,8 @@ use crate::TITLE;
 /// The window's own header: the name, the screen tabs and the state of the link.
 ///
 /// The link line lives here rather than on one screen because it is the one fact that is
-/// true on all four (the build spec's «Статус» block: «Ядро не запущено» / «Связь с ядром
-/// установлена» / «Ядро не отвечает»).
+/// true on all four (the build spec's «Статус» block, in the words of someone who did not
+/// install anything: «Служба не запущена» / «Служба работает» / «Служба не отвечает»).
 pub fn header(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     ui.horizontal_wrapped(|ui| {

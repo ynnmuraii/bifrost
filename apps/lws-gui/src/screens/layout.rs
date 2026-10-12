@@ -25,7 +25,7 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     if !vm.editor.has_document() {
         block(ui, "Раскладка", |ui| {
-            ui.label("Ядро ещё не прислало раскладку");
+            ui.label("Служба ещё не прислала раскладку");
             if ui.button("Запросить раскладку").clicked() {
                 actions.push(Action::Refresh);
             }
@@ -57,7 +57,7 @@ fn state_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     block(ui, "Раскладка", |ui| {
         ui.label(format!(
-            "Применено: ревизия {} от {}",
+            "Применено: ревизия {}, автор — {}",
             vm.editor.revision,
             author_text(&vm.editor.author)
         ));
@@ -105,7 +105,7 @@ fn pending_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
             for edit in &vm.pending_edits {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!(
-                        "Основа: ревизия {} от {}",
+                        "Основа: ревизия {}, автор — {}",
                         edit.base_revision,
                         author_text(&edit.base_author)
                     ));
@@ -150,7 +150,7 @@ fn pickers(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
         });
         hint(
             ui,
-            "Ядро не сообщило, какой из компьютеров этот; выберите его сами",
+            "Служба не сообщила, какой из компьютеров этот; выберите его сами",
         );
         return actions;
     }
@@ -200,6 +200,8 @@ fn canvas(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
         )
     };
     let this = vm.self_node().map(str::to_owned);
+    let linked = vm.linked_span();
+    let link_color = ui.visuals().selection.bg_fill;
     for node in &vm.editor.nodes {
         let mine = this.as_deref() == Some(node.node_id.as_str());
         for display in &node.displays {
@@ -235,7 +237,13 @@ fn canvas(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
                     egui::StrokeKind::Inside,
                 );
             }
-            let label = format!("{} — {}", node.label(), display.id);
+            // Which side of the screen is which computer: the owner reads «этот компьютер»
+            // once, on the machine they are sitting at.
+            let label = if mine {
+                format!("Этот компьютер — {}", node.label())
+            } else {
+                node.label()
+            };
             painter.text(
                 rect.min + egui::vec2(6.0, 4.0),
                 egui::Align2::LEFT_TOP,
@@ -243,6 +251,42 @@ fn canvas(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
                 egui::FontId::proportional(13.0),
                 ui.visuals().text_color(),
             );
+            // The stretch of edge the link crosses, drawn on the edge it crosses: this is the
+            // «Применить» document's own `start..end`, so the picture is the document.
+            if let Some((my_display, my_edge, their_display, their_edge, end)) = &linked {
+                let wanted =
+                    (mine && my_display == &display.id) || (!mine && their_display == &display.id);
+                if wanted {
+                    let edge = if mine { *my_edge } else { *their_edge };
+                    // On the edge itself, not through the middle of the rectangle: the line
+                    // *is* the stretch of screen border input crosses at.
+                    let (a, b) = match edge {
+                        config::Edge::Left | config::Edge::Right => {
+                            let x = if edge == config::Edge::Left {
+                                rect.min.x
+                            } else {
+                                rect.max.x
+                            };
+                            (
+                                egui::pos2(x, place(display.x, display.y).y),
+                                egui::pos2(x, place(display.x, display.y + *end).y),
+                            )
+                        }
+                        config::Edge::Top | config::Edge::Bottom => {
+                            let y = if edge == config::Edge::Top {
+                                rect.min.y
+                            } else {
+                                rect.max.y
+                            };
+                            (
+                                egui::pos2(place(display.x, display.y).x, y),
+                                egui::pos2(place(display.x + *end, display.y).x, y),
+                            )
+                        }
+                    };
+                    painter.line_segment([a, b], egui::Stroke::new(4.0, link_color));
+                }
+            }
             let size_label = if display.native_known {
                 format!("{}×{}", display.w.round(), display.h.round())
             } else {
@@ -336,7 +380,7 @@ fn side_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
             if !vm.editor.editable {
                 hint(ui, "Кнопка станет доступна, когда появится координатор");
             } else if !vm.connection.is_connected() {
-                hint(ui, "Нужна связь с ядром");
+                hint(ui, "Нужна связь со службой");
             }
         });
     });

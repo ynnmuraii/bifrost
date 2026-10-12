@@ -11,7 +11,7 @@
 //!
 //! What it covers, in the order the owner meets them:
 //!
-//! * the status screen of a working pair: «Связь с ядром установлена», both computers in the
+//! * the status screen of a working pair: «Служба работает», both computers in the
 //!   status and in the layout document, this computer owning input;
 //! * the pairing wizard: the address core pushes, the same six digits on both screens, both
 //!   users confirming, the two `trust.toml` records the ceremony exists for — and the honest
@@ -563,18 +563,18 @@ fn the_status_screen_holds_the_linked_workspace() {
     // The client thread connects on its own, and a fresh link asks for `Status` **and**
     // `TopologyDoc` (§4 of the build spec): nothing here sends a request to get them.
     wait_for(&mut window, "the window to reach the core", |view| {
-        (view.connection_label() == "Связь с ядром установлена").then_some(())
+        (view.connection_label() == "Служба работает").then_some(())
     });
 
     // «Подключиться снова» is one of the two buttons that need no request of their own: it
     // goes through the client half, which drops the link and dials again.
-    let before = count_lines(window.view(), "Связь с ядром установлена");
+    let before = count_lines(window.view(), "Служба работает");
     assert!(
         window.client().connect_again(),
         "the client thread is alive"
     );
     wait_for(&mut window, "the client to dial the core again", |view| {
-        (count_lines(view, "Связь с ядром установлена") > before).then_some(())
+        (count_lines(view, "Служба работает") > before).then_some(())
     });
 
     let status = wait_for(&mut window, "a Status naming the other computer", |view| {
@@ -633,10 +633,10 @@ fn the_pairing_wizard_pairs_two_cores_through_the_view_model() {
 
     // Both windows are on their own core before the wizard starts.
     wait_for(&mut left, "the left window to reach its core", |view| {
-        (view.connection_label() == "Связь с ядром установлена").then_some(())
+        (view.connection_label() == "Служба работает").then_some(())
     });
     wait_for(&mut right, "the right window to reach its core", |view| {
-        (view.connection_label() == "Связь с ядром установлена").then_some(())
+        (view.connection_label() == "Служба работает").then_some(())
     });
 
     // 1. «Открыть окно сопряжения» on the left computer. The address is core's own — the

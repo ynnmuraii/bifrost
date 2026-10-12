@@ -27,7 +27,7 @@ fn clipboard_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     block(ui, "Общий буфер обмена", |ui| {
         let Some(status) = &vm.status else {
-            ui.label("Нет данных от ядра");
+            ui.label("Нет данных от службы");
             return;
         };
         let mut enabled = status.clipboard_enabled;
@@ -58,7 +58,7 @@ fn keys_block(vm: &ViewModel, ui: &mut egui::Ui) {
             .as_ref()
             .map(|status| status.emergency_hotkey.clone())
             .filter(|key| !key.is_empty())
-            .unwrap_or_else(|| "не сообщена ядром".to_owned());
+            .unwrap_or_else(|| "не сообщена службой".to_owned());
         ui.label(format!("Аварийная клавиша: {emergency}"));
         ui.label(format!("Клавиша переключения: {}", vm.config.switch_hotkey));
         ui.label(format!(
@@ -87,7 +87,7 @@ fn portal_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<Actio
         }
         if ui
             .add_enabled(connected, egui::Button::new("Забыть разрешения порталов"))
-            .on_hover_text("Ядро попросит разрешения заново")
+            .on_hover_text("Служба попросит разрешения заново")
             .clicked()
         {
             actions.push(Action::ResetPortalGrants);
@@ -162,7 +162,7 @@ fn diagnostics_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<
     block(ui, "Диагностика", |ui| {
         if ui
             .add_enabled(connected, egui::Button::new("Сохранить диагностику"))
-            .on_hover_text("Ядро запишет отчёт без ключей и содержимого буфера обмена")
+            .on_hover_text("Служба запишет отчёт без ключей и содержимого буфера обмена")
             .clicked()
         {
             // An empty path asks the core to choose one: it knows its own directories.
@@ -180,7 +180,7 @@ fn diagnostics_block(vm: &ViewModel, ui: &mut egui::Ui, connected: bool) -> Vec<
                 };
                 ui.colored_label(color, outcome.line());
             }
-            None => hint(ui, "Отчёт попадёт в каталог состояния ядра"),
+            None => hint(ui, "Отчёт попадёт в каталог состояния службы"),
         }
         ui.label(format!(
             "Каталог состояния: {}",

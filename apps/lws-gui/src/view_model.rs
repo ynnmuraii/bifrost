@@ -11,7 +11,7 @@
 //! The UI never blocks on the network (`docs/03-architecture.md`: «GUI не участвует в
 //! горячем пути»). Every request is fire-and-forget with a `request_id`; the answer comes
 //! back as a frame and is folded by [`ViewModel::apply`], and a request that stays
-//! unanswered for [`REQUEST_TIMEOUT`] is what makes the header say «Ядро не отвечает».
+//! unanswered for [`REQUEST_TIMEOUT`] is what makes the header say «Служба не отвечает».
 //! The async half is [`GuiClient`], which owns one connection task on its own thread and
 //! talks to the UI over an unbounded channel the app drains with `try_recv`.
 //!
@@ -36,7 +36,7 @@ use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
 
-/// How long a request may stay unanswered before the window says «Ядро не отвечает».
+/// How long a request may stay unanswered before the window says «Служба не отвечает».
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How many lines of the shared log the window keeps in front of the user.
@@ -585,7 +585,7 @@ impl ViewModel {
         let mut view = ViewModel {
             endpoint,
             connection: Connection::Disconnected {
-                why: "ядро ещё не отвечало".to_owned(),
+                why: "служба ещё не отвечала".to_owned(),
             },
             core: None,
             config,
@@ -612,12 +612,12 @@ impl ViewModel {
     pub fn on_connected(&mut self, endpoint: &str) {
         self.connection = Connection::Connected;
         self.silent = false;
-        self.push_log(format!("Связь с ядром установлена ({endpoint})"));
+        self.push_log(format!("Служба работает ({endpoint})"));
     }
 
     /// The link is gone; the last `Status` stays on screen.
     pub fn on_disconnected(&mut self, why: String) {
-        self.push_log(format!("Связь с ядром потеряна: {}", short_error(&why)));
+        self.push_log(format!("Связь со службой потеряна: {}", short_error(&why)));
         self.connection = Connection::Disconnected { why };
         self.inflight.clear();
         self.silent = false;
@@ -646,7 +646,7 @@ impl ViewModel {
     pub fn on_not_sent(&mut self, id: u64) {
         let request = self.take_inflight(id);
         let name = request.map_or("запрос", Request::label);
-        self.push_log(format!("Ядро не запущено: {name} не отправлено"));
+        self.push_log(format!("Служба не запущена: {name} не отправлено"));
     }
 
     /// Ages the deadlines; called once per frame.
@@ -662,7 +662,7 @@ impl ViewModel {
         match started {
             Ok(core) => {
                 self.push_log(format!(
-                    "Ядро запущено: {} (pid {})",
+                    "Служба запущена: {} (pid {})",
                     core.program.display(),
                     core.pid
                         .map_or_else(|| "не сообщён".to_owned(), |pid| pid.to_string())
@@ -670,9 +670,12 @@ impl ViewModel {
                 self.core = Some(core);
             }
             Err(why) => {
-                self.push_log(format!("Не удалось запустить ядро: {}", short_error(&why)));
+                self.push_log(format!(
+                    "Не удалось запустить службу: {}",
+                    short_error(&why)
+                ));
                 self.outcome = Some(Outcome::failed(format!(
-                    "не удалось запустить ядро ({})",
+                    "не удалось запустить службу ({})",
                     short_error(&why)
                 )));
             }
@@ -684,7 +687,7 @@ impl ViewModel {
     /// Folds one `GuiFrame` — a response or an event — into the state.
     pub fn apply(&mut self, frame: GuiFrame) {
         let Some(msg) = frame.msg else {
-            self.push_log("Ядро прислало пустой кадр");
+            self.push_log("Служба прислала пустой кадр");
             return;
         };
         // Any frame is proof that the core is there, whatever it says.
@@ -724,7 +727,7 @@ impl ViewModel {
             // The pushed half of the contract never arrives here; a GUI that gets one of its
             // own requests back is talking to something that is not a core.
             other => self.push_log(format!(
-                "Ядро прислало неожиданный кадр ({})",
+                "Служба прислала неожиданный кадр ({})",
                 message_name(&other)
             )),
         }
@@ -790,6 +793,10 @@ impl ViewModel {
         self.editor.nodes = nodes;
         self.editor.self_choice = None;
         self.editor.other_choice = None;
+        // The applied document places both computers at their own origins, which draws one on
+        // top of the other. The window's own arrangement is the pair at the chosen edge, so
+        // the preview equals what «Применить» would send from the first frame on.
+        self.place_other(self.editor.side);
         self.push_log(format!(
             "Раскладка получена: ревизия {} от {}, участников {}",
             doc.revision,
@@ -870,21 +877,22 @@ impl ViewModel {
                 .map(|prompt| prompt.peer_name.clone())
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "Компьютер".to_owned());
-            return format!("{name} сопряжён. Связь появится после перезапуска ядра");
+            return format!("{name} сопряжён. Связь появится после перезапуска службы");
         }
         success_text(request)
     }
 
     // ------------------------------------------------------------ derived text
 
-    /// The header's status line.
+    /// The header's status line, in the words of someone who did not install anything: the
+    /// thing that must be running is «служба», not «ядро».
     pub fn connection_label(&self) -> &'static str {
         if self.silent {
-            "Ядро не отвечает"
+            "Служба не отвечает"
         } else if self.connection.is_connected() {
-            "Связь с ядром установлена"
+            "Служба работает"
         } else {
-            "Ядро не запущено"
+            "Служба не запущена"
         }
     }
 
@@ -896,10 +904,11 @@ impl ViewModel {
         }
     }
 
-    /// «Куда идёт ввод» (an NFR of `docs/03-architecture.md`).
+    /// «Куда идёт ввод» (an NFR of `docs/03-architecture.md`) — the headline the status
+    /// screen shows first and largest, because it is the one thing the window exists for.
     pub fn focus_line(&self) -> String {
         let Some(status) = &self.status else {
-            return "Нет данных от ядра".to_owned();
+            return "Нет данных от службы".to_owned();
         };
         match status.focus.as_str() {
             "LOCAL" => "Ввод здесь".to_owned(),
@@ -910,15 +919,19 @@ impl ViewModel {
                 } else {
                     status.active_peer.clone()
                 };
-                if status.active_layout.is_empty() {
-                    format!("Ввод идёт на {peer}")
-                } else {
-                    format!("Ввод идёт на {peer}, раскладка {}", status.active_layout)
-                }
+                format!("Ввод на {peer}")
             }
             "BLOCKED" => "Ввод остановлен из-за ошибки".to_owned(),
-            other => format!("Ввод: ядро сообщило неизвестное состояние ({other})"),
+            other => format!("Ввод: служба сообщила неизвестное состояние ({other})"),
         }
+    }
+
+    /// The small line under [`ViewModel::focus_line`]: the one fact that does not fit the
+    /// headline, which is the keyboard layout in use on the other computer.
+    pub fn focus_detail(&self) -> Option<String> {
+        let status = self.status.as_ref()?;
+        (status.focus == "REMOTE" && !status.active_layout.is_empty())
+            .then(|| format!("раскладка {}", status.active_layout))
     }
 
     /// Whether the link to the other computer is up.
@@ -926,40 +939,68 @@ impl ViewModel {
         match &self.status {
             Some(status) if status.connected => "Есть связь",
             Some(_) => "Нет связи",
-            None => "Нет данных от ядра",
+            None => "Нет данных от службы",
         }
     }
 
-    /// One line per member, or the sentence that says there are none.
+    /// One line per **other** computer, or the sentence that says there are none.
+    ///
+    /// This computer is not a peer of itself: listing it here read as a third machine and the
+    /// owner asked why. Who controls the keyboard is said in plain words, «владелец» being
+    /// the core's word and not the owner's.
     pub fn member_lines(&self) -> Vec<String> {
         let Some(status) = &self.status else {
-            return vec!["Нет данных от ядра".to_owned()];
+            return vec!["Нет данных от службы".to_owned()];
         };
-        if status.members.is_empty() {
-            return vec!["Пока никого: откройте окно сопряжения".to_owned()];
-        }
-        status
+        let this = self.self_node().map(str::to_owned);
+        let others: Vec<&protocol::ipc::MemberStatus> = status
             .members
             .iter()
+            .filter(|member| !self.is_this_computer(member, this.as_deref()))
+            .collect();
+        if others.is_empty() {
+            return vec!["Пока никого: откройте окно сопряжения".to_owned()];
+        }
+        others
+            .into_iter()
             .map(|member| {
                 let name = if member.display_name.is_empty() {
                     format!("компьютер {}", short_id(&member.node_id))
                 } else {
                     member.display_name.clone()
                 };
-                let role = if member.is_owner {
-                    "владелец"
-                } else {
-                    "не владелец"
-                };
                 let state = if member.online {
-                    "подключён"
+                    "в сети"
                 } else {
-                    "не на связи"
+                    "не в сети"
                 };
-                format!("{name} — {state}, {role}")
+                let keyboard = if member.is_owner {
+                    "управляет клавиатурой"
+                } else {
+                    "не управляет клавиатурой"
+                };
+                format!("{name} — {state}, {keyboard}")
             })
             .collect()
+    }
+
+    /// Whether one member of `Status` is this computer, as far as the window can tell.
+    ///
+    /// [`ViewModel::self_node`] answers from the *document* (a node id it can place), which is
+    /// what naming a topology endpoint needs. A list of the **other** computers needs less:
+    /// `Status.is_owner` says the owner is this node, so the owner's id is this computer's id
+    /// even before any document arrived. Without either, the question stays open and the core's
+    /// own list is shown unedited rather than guessed at.
+    fn is_this_computer(&self, member: &protocol::ipc::MemberStatus, this: Option<&str>) -> bool {
+        if let Some(this) = this {
+            return member.node_id == this;
+        }
+        let Some(status) = &self.status else {
+            return false;
+        };
+        status.is_owner
+            && !status.owner_node_id.is_empty()
+            && member.node_id == status.owner_node_id
     }
 
     /// The backend in the words the owner reads.
@@ -996,7 +1037,7 @@ impl ViewModel {
     /// Who owns input, as the two lines the block shows.
     pub fn owner_lines(&self) -> (String, String) {
         let Some(status) = &self.status else {
-            return ("нет данных от ядра".to_owned(), String::new());
+            return ("нет данных от службы".to_owned(), String::new());
         };
         // The serial is the one number in this block and the build spec asks for it small;
         // it is shown whoever owns input, because it is what a support question is about.
@@ -1033,7 +1074,7 @@ impl ViewModel {
     /// The «Ограничения и деградации» block (KVM-056): never invented, only `Status`.
     pub fn limits(&self) -> Vec<String> {
         let Some(status) = &self.status else {
-            return vec!["Нет данных от ядра".to_owned()];
+            return vec!["Нет данных от службы".to_owned()];
         };
         let mut lines = Vec::new();
         for code in &status.capabilities_unavailable {
@@ -1060,9 +1101,12 @@ impl ViewModel {
             _ => {}
         }
         if status.backend == "platform-wayland" {
+            // Only what Wayland as a platform means. The rest of what it costs — the
+            // missing takeover, the emergency hotkey — arrives as the capability codes
+            // above, if the core could not provide them: on Wayland where they *are*
+            // provided (a desktop that supports them), this line must not claim otherwise.
             lines.push(
-                "Wayland: перехват ввода возможен только через порталы; автоматического завершения сеанса по краю экрана нет"
-                    .to_owned(),
+                "Wayland: перехват ввода возможен только через порталы рабочего стола".to_owned(),
             );
         }
         if !status.last_error_code.is_empty() {
@@ -1144,6 +1188,40 @@ impl ViewModel {
             .iter()
             .map(|node| node.node_id.as_str())
             .find(|node_id| *node_id != this)
+    }
+
+    /// The stretch of edge the link between this computer and the other one uses, as
+    /// `(my display, my edge, their display, their edge, end)` in logical units, with
+    /// `start` always `0.0` — the same span [`ViewModel::pair_link`] writes into the
+    /// document, so the picture cannot disagree with what «Применить» sends.
+    pub fn linked_span(&self) -> Option<(String, config::Edge, String, config::Edge, f64)> {
+        let (this, other) = (self.self_node()?, self.other_node()?);
+        let mine = self
+            .editor
+            .nodes
+            .iter()
+            .find(|node| node.node_id == this)?
+            .main_display()?;
+        let theirs = self
+            .editor
+            .nodes
+            .iter()
+            .find(|node| node.node_id == other)?
+            .main_display()?;
+        let (my_edge, their_edge) = self.editor.side.edges();
+        let (my_extent, their_extent) = if self.editor.side.horizontal() {
+            (mine.h, theirs.h)
+        } else {
+            (mine.w, theirs.w)
+        };
+        let end = edge_span(my_extent, their_extent);
+        Some((
+            mine.id.clone(),
+            my_edge,
+            theirs.id.clone(),
+            their_edge,
+            if end > 0.0 { end } else { 1.0 },
+        ))
     }
 
     /// The edited document as `[topology]` TOML — what `UpdateTopology` carries.
@@ -1294,7 +1372,7 @@ impl ViewModel {
             Action::ClosePairingWindow => {
                 self.pairing.window = None;
                 self.pairing.prompt = None;
-                self.push_log("Окно сопряжения закрыто в окне (ядро закроет его по таймауту)");
+                self.push_log("Окно сопряжения закрыто в окне (служба закроет его по таймауту)");
             }
             Action::SetSide(side) => {
                 self.editor.side = *side;
@@ -1368,23 +1446,48 @@ impl ViewModel {
     }
 
     /// Moves one display by a delta in its own node's logical units.
+    ///
+    /// The peer's block has one position — next to the edge the radio names — so a drag is a
+    /// gesture that *chooses* that edge: the display follows the pointer, the nearest side to
+    /// where it ended up becomes the side, and the block snaps onto it. Nothing the user can
+    /// drag can leave the two computers overlapping, which is what makes the preview and
+    /// «Применить» the same picture.
     fn move_display(&mut self, node_id: &str, display_id: &str, dx: f64, dy: f64) {
-        let Some(node) = self
+        let Some(moved) = self
             .editor
             .nodes
             .iter_mut()
             .find(|node| node.node_id == node_id)
+            .and_then(|node| {
+                node.displays
+                    .iter_mut()
+                    .find(|display| display.id == display_id)
+            })
         else {
             return;
         };
-        let Some(display) = node
-            .displays
-            .iter_mut()
-            .find(|display| display.id == display_id)
+        moved.shift(dx, dy);
+        let Some(other_bounds) = self
+            .editor
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .and_then(EditorNode::bounds)
         else {
             return;
         };
-        display.shift(dx, dy);
+        let Some(mine) = self
+            .self_node()
+            .and_then(|this| self.editor.nodes.iter().find(|node| node.node_id == this))
+            .and_then(EditorNode::bounds)
+        else {
+            return;
+        };
+        let side = nearest_side(mine, other_bounds);
+        if side != self.editor.side {
+            self.editor.side = side;
+        }
+        self.place_other(side);
     }
 }
 
@@ -1746,7 +1849,7 @@ impl GuiClient {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = event_tx.send(GuiEvent::Disconnected {
-                            why: format!("не удалось запустить обмен с ядром: {error}"),
+                            why: format!("не удалось запустить обмен со службой: {error}"),
                         });
                         return;
                     }
@@ -1920,7 +2023,7 @@ where
                 // A core is already answering here, so «Запустить» has nothing to do; saying
                 // so beats starting a second daemon.
                 let _ = events.send(GuiEvent::CoreStarted {
-                    started: Err("ядро уже запущено и отвечает".to_owned()),
+                    started: Err("служба уже запущена и отвечает".to_owned()),
                 });
             }
         }
@@ -2146,6 +2249,29 @@ fn edge_span(mine: f64, theirs: f64) -> f64 {
         span
     } else {
         0.0
+    }
+}
+
+/// Which side of `mine` the block `theirs` was dragged to.
+///
+/// The centres are compared, so a block dragged past a corner snaps to the edge it is
+/// *nearest* to and not to whichever direction an `if`-chain tests first — which is what makes
+/// a diagonal drag feel predictable.
+fn nearest_side(mine: (f64, f64, f64, f64), theirs: (f64, f64, f64, f64)) -> Side {
+    let (dx, dy) = (
+        (theirs.0 + theirs.2) - (mine.0 + mine.2),
+        (theirs.1 + theirs.3) - (mine.1 + mine.3),
+    );
+    if dx.abs() >= dy.abs() {
+        if dx < 0.0 {
+            Side::Left
+        } else {
+            Side::Right
+        }
+    } else if dy < 0.0 {
+        Side::Top
+    } else {
+        Side::Bottom
     }
 }
 
