@@ -87,15 +87,20 @@ fn every_layout_payload_round_trips() {
             expected_author: node(1),
             author_node_id: node(2),
             layout_toml: b"[[topology.links]]".to_vec(),
+            request_nonce: 7,
         }),
         LayoutMessage::TopologyRequest,
-        LayoutMessage::TopologyApplied { revision: 9 },
+        LayoutMessage::TopologyApplied {
+            revision: 9,
+            request_nonce: 7,
+        },
         LayoutMessage::ActiveLayout(wire::ActiveLayout {
             layout_id: "us".to_owned(),
             layout_revision: 2,
         }),
         LayoutMessage::Error {
             code: wire::ErrorCode::LayoutConflict,
+            request_nonce: 7,
         },
     ];
     for case in cases {
@@ -114,8 +119,14 @@ fn layout_refusal_codes_are_layout_messages() {
     ] {
         assert!(is_layout_code(code), "{code:?} is a layout code");
         assert_eq!(
-            round_trip(&LayoutMessage::Error { code }),
-            LayoutMessage::Error { code }
+            round_trip(&LayoutMessage::Error {
+                code,
+                request_nonce: 0
+            }),
+            LayoutMessage::Error {
+                code,
+                request_nonce: 0
+            }
         );
     }
     assert!(!is_layout_code(wire::ErrorCode::NotOwner));
@@ -124,6 +135,7 @@ fn layout_refusal_codes_are_layout_messages() {
     let envelope = layout_envelope(
         &LayoutMessage::Error {
             code: wire::ErrorCode::NotOwner,
+            request_nonce: 0,
         },
         1,
         &CONNECTION,

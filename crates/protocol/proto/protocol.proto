@@ -181,7 +181,11 @@ message DisplaysChanged {                // a member's own display set changed
   uint64 displays_revision = 1;
   repeated Display displays = 2;
 }
-message TopologyApplied { uint64 revision = 1; }
+message TopologyApplied {
+  uint64 revision = 1;
+  uint64 request_nonce = 2;   // echoes LayoutEdit.request_nonce when this is the verdict of an
+                              // edit; 0 when it only confirms a received document
+}
 
 message Position {
   string display_id = 1;
@@ -250,6 +254,8 @@ message ProtocolError {
   reserved 1; // string code in earlier drafts; name reused with enum type
   uint64 related_seq = 2;
   ErrorCode code = 3;
+  uint64 request_nonce = 4;   // echoes LayoutEdit.request_nonce when this refuses an edit;
+                              // 0 for every other protocol error
 }
 message Shutdown {
   reserved 1; reserved "reason_code";
@@ -281,6 +287,8 @@ message LayoutEdit {          // sent by the editing member to the coordinator
   bytes expected_author = 2;  // 32 bytes; the applied (revision, author) pair
   bytes author_node_id = 3;   // informational: who edited in the GUI
   bytes layout_toml = 4;      // full document; validated by the coordinator
+  uint64 request_nonce = 5;   // editor's own request id; the verdict echoes it, so two
+                              // concurrent edits from one node cannot take each other's answer
 }
 message TopologyRequest {} // member -> coordinator for the current revision, or coordinator -> the author of a higher stored revision (partition rejoin)
 message Ping { uint64 nonce = 1; }

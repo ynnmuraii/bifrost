@@ -150,9 +150,12 @@ fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
         .b
         .ctl(&format!("layout edit {path}"))
         .expect("the follower sends the edit");
-    assert!(
-        reply.contains("sent to the coordinator"),
-        "a follower forwards the edit instead of applying it: {reply}"
+    // The follower's answer *is* the coordinator's verdict: the CAS ran one hop away, and a
+    // bare «sent to the coordinator» would leave the editor guessing whether it landed.
+    assert_eq!(
+        reply,
+        format!("OK applied revision={}", start + 1),
+        "a follower's edit answers with the coordinator's verdict"
     );
 
     let applied = wait_layout(&harness.a, "the coordinator applies the edit", |line| {
@@ -257,19 +260,30 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
         "the loser's edit is still pending"
     );
     let winner = revision(&healed);
-    assert_eq!(winner, loser_start + 1, "the winner is the coordinator's edit");
+    assert_eq!(
+        winner,
+        loser_start + 1,
+        "the winner is the coordinator's edit"
+    );
 
     // `layout apply` sends the pending edit with the base *it* names (revision 1), not with the
     // revision this node has applied by now (2). The coordinator's CAS therefore refuses it by
     // name, and the pair stays exactly where the rejoin left it: the winning edit is not
     // silently reverted by the loser's stale document.
-    let sent = harness.b.ctl("layout apply").expect("apply forwards the edit");
-    assert!(sent.contains("sent to the coordinator"), "{sent}");
+    let refused = harness
+        .b
+        .ctl("layout apply")
+        .expect_err("the stale base must be refused, not applied");
+    assert!(
+        refused.contains("LAYOUT_CONFLICT"),
+        "the refusal names the contract's code: {refused}"
+    );
     wait_refusal(
         &harness,
         "ERROR_CODE_LAYOUT_CONFLICT",
         "the stale pending edit is refused",
     );
+    // Refused, but not lost: ADR-013 keeps the edit aside for the user's reload.
     let held = harness.b.ctl("layout show").expect("layout show");
     assert_eq!(
         revision(&held),
@@ -281,13 +295,19 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
         harness.a.id,
         "the winner still owns the document"
     );
+    assert_eq!(
+        field(&held, "pending"),
+        "yes",
+        "the refused edit is still there to reload"
+    );
 
     // The reload: the stale entry goes, and the edit is written against the revision that is
     // applied now — the base the CAS accepts.
-    harness
+    let discarded = harness
         .b
         .ctl("layout discard")
         .expect("the stale entry is discarded");
+    assert!(discarded.contains("pending=discarded"), "{discarded}");
     let reply = harness
         .b
         .ctl(&format!(
@@ -295,7 +315,11 @@ fn a_partition_leaves_the_loser_pending_and_a_reload_resolves_it() {
             edit_file(&harness, "b.toml", "eDP-B")
         ))
         .expect("the reloaded edit is sent");
-    assert!(reply.contains("sent to the coordinator"), "{reply}");
+    assert_eq!(
+        reply,
+        format!("OK applied revision={}", winner + 1),
+        "the reloaded edit answers with the coordinator's verdict"
+    );
     let (done, _) = wait_same_document(&harness, "the reloaded edit is applied");
     assert_eq!(
         revision(&done),
@@ -351,9 +375,17 @@ fn a_stale_edit_is_refused_with_layout_conflict() {
     // based on the revision it had when the link came back.
     let follower_before = revision(&harness.b.ctl("layout show").expect("layout show"));
 
-    // The pending edit is still based on revision 1: the CAS refuses it by name.
-    let sent = harness.b.ctl("layout apply").expect("the edit is sent");
-    assert!(sent.contains("sent to the coordinator"), "{sent}");
+    // The pending edit is still based on revision 1: the coordinator's CAS refuses it by name,
+    // and the editor reads that refusal from its own connection — the same words the
+    // coordinator would have answered with, had it been the node that was asked.
+    let rejection = harness
+        .b
+        .ctl("layout apply")
+        .expect_err("the stale base must be refused, not applied");
+    assert!(
+        rejection.contains("ERR LAYOUT_CONFLICT"),
+        "the verdict is the contract's own refusal: {rejection}"
+    );
     let refused = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_refusal(
             &harness,
