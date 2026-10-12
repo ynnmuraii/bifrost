@@ -59,6 +59,10 @@ pub struct Session {
     trust: identity::TrustStore,
     /// Persists the ownership pair across restarts (`config.toml`).
     ownership_store: OwnershipStore,
+    /// The layout document's revision discipline (KVM-072): CAS, floor, pending.
+    layout_state: crate::layout::Layout,
+    /// Persists the layout pair into `[topology]`.
+    layout_store: crate::layout_store::LayoutStore,
     /// Set by `quit` on the control channel.
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
@@ -111,7 +115,9 @@ impl Session {
         layout: config::TopologyConfig,
         pointer_gain: f64,
         ownership_store: OwnershipStore,
+        layout_store: crate::layout_store::LayoutStore,
     ) -> Self {
+        let layout_state = layout_store.restored();
         let mut session = Session {
             router,
             manager,
@@ -128,6 +134,8 @@ impl Session {
             backend,
             trust,
             ownership_store,
+            layout_state,
+            layout_store,
             stopping: false,
             agent_restart_due: None,
             agent_lost_reported: false,
@@ -414,6 +422,141 @@ impl Session {
             None => {
                 tracing::warn!(peer = %peer, message = name, "no link to the peer");
             }
+        }
+    }
+
+    /// `layout apply`: apply the pending edit, which only the coordinator can do.
+    async fn layout_apply(&mut self) -> ctl::Response {
+        let Some(layout_toml) = self.layout_state.pending().map(str::to_owned) else {
+            return ctl::Response::Error {
+                code: "BAD_REQUEST".to_owned(),
+                detail: "no pending layout edit".to_owned(),
+            };
+        };
+        if !self.router.ownership().is_owner() {
+            return ctl::Response::Error {
+                code: "NO_COORDINATOR".to_owned(),
+                detail: "this node is not the owner; the pending edit waits".to_owned(),
+            };
+        }
+        let edit = crate::layout::Edit {
+            expected: self.layout_state.applied(),
+            editor: self.node_id,
+            layout_toml,
+        };
+        let outcome = self
+            .layout_state
+            .apply_edit(&edit, self.node_id, true, validate_layout_toml);
+        match outcome {
+            crate::layout::EditOutcome::Applied(pair) => {
+                self.layout_state.take_pending();
+                self.layout_store.observe(&self.layout_state);
+                self.router.set_topology_revision(pair.revision);
+                ctl::Response::Status(format!("applied revision={}", pair.revision))
+            }
+            crate::layout::EditOutcome::Conflict(current) => ctl::Response::Error {
+                code: "LAYOUT_CONFLICT".to_owned(),
+                detail: format!("the pending edit is based on revision {}", current.revision),
+            },
+            crate::layout::EditOutcome::Invalid(detail) => ctl::Response::Error {
+                code: "INVALID_TOPOLOGY".to_owned(),
+                detail,
+            },
+            crate::layout::EditOutcome::NotCoordinator => ctl::Response::Error {
+                code: "NO_COORDINATOR".to_owned(),
+                detail: "this node is not the owner".to_owned(),
+            },
+        }
+    }
+
+    /// `layout show`: the pair, the floor and whether an edit is waiting.
+    fn layout_line(&self) -> String {
+        let hex = |pair: crate::layout::Pair| {
+            pair.author
+                .map_or_else(|| "-".to_owned(), |id| identity::fingerprint(&id))
+        };
+        let applied = self.layout_state.applied();
+        let floor = self.layout_state.max_seen();
+        format!(
+            "revision={} author={} max_seen={} max_seen_author={} pending={}",
+            applied.revision,
+            hex(applied),
+            floor.revision,
+            hex(floor),
+            if self.layout_state.pending().is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+        )
+    }
+
+    /// `layout edit <file>`: the whole-document CAS of KVM-072.
+    ///
+    /// Only the coordinator applies (`docs/03-architecture.md`: «Layout правит любой узел, но
+    /// применяет только координатор через CAS по `(revision, author)`»), and the base is the
+    /// revision this node has applied — which is why the answer names the current one on a
+    /// conflict instead of guessing what the caller meant.
+    async fn layout_edit(&mut self, path: &str) -> ctl::Response {
+        let is_coordinator = self.router.ownership().is_owner();
+        let layout_toml = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                return ctl::Response::Error {
+                    code: "BAD_REQUEST".to_owned(),
+                    detail: format!("cannot read {path}: {error}"),
+                }
+            }
+        };
+        let edit = crate::layout::Edit {
+            expected: self.layout_state.applied(),
+            editor: self.node_id,
+            layout_toml,
+        };
+        if !is_coordinator {
+            // A follower cannot apply (the coordinator owns the CAS), and after a partition
+            // the coordinator may be unreachable for a while: the edit waits in
+            // `layout.pending.toml` until this node coordinates, or the user discards it.
+            self.layout_state.hold_pending(edit.layout_toml.clone());
+            self.layout_store.write_pending(&edit.layout_toml);
+            return ctl::Response::Error {
+                code: "NO_COORDINATOR".to_owned(),
+                detail: "this node is not the owner; the edit is kept as pending".to_owned(),
+            };
+        }
+        let outcome =
+            self.layout_state
+                .apply_edit(&edit, self.node_id, is_coordinator, validate_layout_toml);
+        match outcome {
+            crate::layout::EditOutcome::Applied(pair) => {
+                self.layout_store.observe(&self.layout_state);
+                self.router.set_topology_revision(pair.revision);
+                tracing::info!(
+                    revision = pair.revision,
+                    author = identity::fingerprint(&self.node_id).as_str(),
+                    "layout applied by the coordinator"
+                );
+                ctl::Response::Status(format!(
+                    "applied revision={} author={}",
+                    pair.revision,
+                    identity::fingerprint(&self.node_id)
+                ))
+            }
+            crate::layout::EditOutcome::Conflict(current) => ctl::Response::Error {
+                code: "LAYOUT_CONFLICT".to_owned(),
+                detail: format!(
+                    "the edit is based on revision {} but {} is applied",
+                    edit.expected.revision, current.revision
+                ),
+            },
+            crate::layout::EditOutcome::Invalid(detail) => ctl::Response::Error {
+                code: "INVALID_TOPOLOGY".to_owned(),
+                detail,
+            },
+            crate::layout::EditOutcome::NotCoordinator => ctl::Response::Error {
+                code: "NO_COORDINATOR".to_owned(),
+                detail: "this node is not the owner".to_owned(),
+            },
         }
     }
 
@@ -860,6 +1003,17 @@ impl Session {
                 ctl::Response::Stopping
             }
             ctl::Request::Switch(peer) => self.switch_to(&peer).await,
+            ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()),
+            ctl::Request::LayoutEdit(path) => self.layout_edit(&path).await,
+            ctl::Request::LayoutApply => self.layout_apply().await,
+            ctl::Request::LayoutDiscard => {
+                let dropped = self.layout_state.take_pending().is_some();
+                tracing::info!(dropped, "pending layout edit discarded");
+                ctl::Response::Status(format!(
+                    "pending={}",
+                    if dropped { "discarded" } else { "none" }
+                ))
+            }
         }
     }
 
@@ -1064,6 +1218,21 @@ impl Timers {
         }
         due
     }
+}
+
+/// Revalidates an edited layout document (KVM-072: the coordinator validates the whole
+/// document; ADR-013 rejected merging rows for exactly that reason).
+///
+/// The document is the `[topology]` shape, so it parses as the same struct the configuration
+/// uses; a document with neither displays nor links is refused, because an empty layout would
+/// silently disable every transition.
+fn validate_layout_toml(layout_toml: &str) -> Result<(), String> {
+    let parsed: config::TopologyConfig =
+        toml::from_str(layout_toml).map_err(|error| format!("layout_toml: {error}"))?;
+    if parsed.displays.is_empty() && parsed.links.is_empty() {
+        return Err("layout_toml: a document with neither displays nor links".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

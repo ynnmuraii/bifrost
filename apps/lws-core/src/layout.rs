@@ -61,6 +61,7 @@ impl Pair {
 
     /// Whether this pair is newer than `other` (the lexical order of the pair).
     #[must_use]
+    #[allow(dead_code)] // used by `accept_topology`, which the transport half still has to reach
     pub fn is_newer_than(self, other: Self) -> bool {
         self > other
     }
@@ -91,7 +92,12 @@ pub enum EditOutcome {
 }
 
 /// What happened to an incoming `Topology`.
+///
+/// `focus_router::Message` carries no `Topology`/`LayoutEdit`/`TopologyRequest` variant yet, so
+/// nothing on the wire reaches these paths: the rules are implemented and tested, and the
+/// transport half of KVM-072 is what wires them up.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum TopologyOutcome {
     /// Applied: the document is now this pair.
     Applied(Pair),
@@ -143,12 +149,6 @@ impl Layout {
         self.pending.as_deref()
     }
 
-    /// Whether this node may edit at all: only a coordinator (owner) applies.
-    #[must_use]
-    pub const fn coordinator_is(&self, is_coordinator: bool) -> bool {
-        is_coordinator
-    }
-
     /// The coordinator applies a whole-document edit (CAS on the pair it names).
     ///
     /// `validate` revalidates the whole document, because the invariants are global: a valid
@@ -159,8 +159,12 @@ impl Layout {
         &mut self,
         edit: &Edit,
         coordinator: NodeId,
+        is_coordinator: bool,
         validate: impl FnOnce(&str) -> Result<(), String>,
     ) -> EditOutcome {
+        if !is_coordinator {
+            return EditOutcome::NotCoordinator;
+        }
         if edit.expected != self.applied {
             return EditOutcome::Conflict(self.applied);
         }
@@ -176,6 +180,10 @@ impl Layout {
     }
 
     /// A `Topology` frame arrived from `from`.
+    ///
+    /// Not reachable from the network yet: the FSM's message enum has no `Topology` variant
+    /// (see [`TopologyOutcome`]).
+    #[allow(dead_code)]
     ///
     /// Accepted only when `from` is the document's author, the document is newer than the
     /// applied one, and it revalidates. `max_seen` rises even when the document is not newer
@@ -203,6 +211,10 @@ impl Layout {
 
     /// The rejoin: the coordinator republishes the winning document under its own authorship.
     ///
+    /// Not reachable from the network yet: it belongs to the `TopologyRequest` half of the
+    /// rejoin sequence, which the transport still has to carry.
+    #[allow(dead_code)]
+    ///
     /// Returns the pair the coordinator should publish, or `None` when this node is not the
     /// coordinator. The caller sends the document; this only fixes the identity it must carry,
     /// which is `max_seen + 1` — never `max_seen` itself, or two coordinators that both saw
@@ -223,13 +235,6 @@ impl Layout {
     /// Takes the pending edit (the user applied it, or discarded it).
     pub fn take_pending(&mut self) -> Option<String> {
         self.pending.take()
-    }
-
-    /// Whether an edit the local user made can be applied right now: the coordinator applies,
-    /// and only onto the revision it currently has.
-    #[must_use]
-    pub fn edit_base(&self) -> Pair {
-        self.applied
     }
 }
 
@@ -270,11 +275,27 @@ mod tests {
         let outcome = layout.apply_edit(
             &edit(Pair::new(3, coordinator), "links = []"),
             coordinator,
+            true,
             |_| Ok(()),
         );
         assert_eq!(outcome, EditOutcome::Applied(Pair::new(4, coordinator)));
         assert_eq!(layout.applied(), Pair::new(4, coordinator));
         assert_eq!(layout.max_seen(), Pair::new(4, coordinator));
+    }
+
+    /// A follower does not apply anything: `NO_COORDINATOR`.
+    #[test]
+    fn a_follower_never_applies() {
+        let coordinator = node(1);
+        let mut layout = Layout::restore(Pair::new(2, coordinator), Pair::new(2, coordinator));
+        let outcome = layout.apply_edit(
+            &edit(Pair::new(2, coordinator), "links = []"),
+            coordinator,
+            false,
+            |_| Ok(()),
+        );
+        assert_eq!(outcome, EditOutcome::NotCoordinator);
+        assert_eq!(layout.applied(), Pair::new(2, coordinator));
     }
 
     /// A stale base is `LAYOUT_CONFLICT` and changes nothing.
@@ -285,6 +306,7 @@ mod tests {
         let outcome = layout.apply_edit(
             &edit(Pair::new(3, coordinator), "links = []"),
             coordinator,
+            true,
             |_| Ok(()),
         );
         assert_eq!(outcome, EditOutcome::Conflict(Pair::new(4, coordinator)));
@@ -303,6 +325,7 @@ mod tests {
         let outcome = layout.apply_edit(
             &edit(Pair::new(2, coordinator), "broken"),
             coordinator,
+            true,
             |_| Err("link 0 has no target".to_owned()),
         );
         assert_eq!(
@@ -437,14 +460,19 @@ mod tests {
                 0 => {
                     // A clean edit from the coordinator.
                     let edit = edit(applied_before, "links = []");
-                    let outcome = layout.apply_edit(&edit, coordinator, |_| Ok(()));
+                    let outcome = layout.apply_edit(&edit, coordinator, true, |_| Ok(()));
                     assert_eq!(outcome, EditOutcome::Applied(layout.applied()));
                 }
                 1 => {
                     // A stale edit: refused, nothing moves.
                     let stale = Pair::new(applied_before.revision.saturating_sub(1), coordinator);
                     assert!(matches!(
-                        layout.apply_edit(&edit(stale, "links = []"), coordinator, |_| Ok(())),
+                        layout.apply_edit(
+                            &edit(stale, "links = []"),
+                            coordinator,
+                            true,
+                            |_| Ok(())
+                        ),
                         EditOutcome::Conflict(_) | EditOutcome::Applied(_)
                     ));
                 }
