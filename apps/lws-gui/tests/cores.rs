@@ -13,6 +13,8 @@
 //!
 //! * the status screen of a working pair: «Служба работает», both computers in the
 //!   status and in the layout document, this computer owning input;
+//! * the owner's first layout Apply after restoring revision 1: the link reaches both windows,
+//!   listing pending edits leaves it applied, and a stale follower edit is refused;
 //! * the pairing wizard: the address core pushes, the same six digits on both screens, both
 //!   users confirming, both `trust.toml` records are written and the live link appears in each
 //!   window without restarting either core;
@@ -155,9 +157,15 @@ impl Core {
         let child = Command::new(program("lws-core"))
             .arg("--root")
             .arg(&root)
-            .args(["run", "--dry-inject", "--dry-input-events", "4", "--agent"])
+            .args([
+                "run",
+                "--dry-inject",
+                "--dry-input-events",
+                "4",
+                "--dry-displays",
+                "--agent",
+            ])
             .arg(program("lws-agent"))
-            .stdin(Stdio::null())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -218,15 +226,20 @@ impl Lab {
     /// Two cores that are already paired, the way a working pair looks: the left computer
     /// claims on startup and owns input, the right one may own but does not claim.
     fn linked(label: &str) -> Lab {
-        Lab::start(label, true)
+        Lab::start(label, true, false)
+    }
+
+    /// The coordinator restored revision 1; the follower starts with no applied document.
+    fn restored_owner_layout(label: &str) -> Lab {
+        Lab::start(label, true, true)
     }
 
     /// Two cores with no trust at all — what the pairing wizard starts from.
     fn unpaired(label: &str) -> Lab {
-        Lab::start(label, false)
+        Lab::start(label, false, false)
     }
 
-    fn start(label: &str, pair_first: bool) -> Lab {
+    fn start(label: &str, pair_first: bool, owner_only_layout: bool) -> Lab {
         let dir = unique_dir(label);
         let a_root = dir.join("a");
         let b_root = dir.join("b");
@@ -246,9 +259,13 @@ impl Lab {
         let a_id = node_id(&a_root);
         let b_id = node_id(&b_root);
         if pair_first {
-            // Both computers in the document the editor draws; the peer's id only exists now.
-            write_topology(&a_root, &b_id);
-            write_topology(&b_root, &a_id);
+            if owner_only_layout {
+                write_topology(&a_root, &b_id, false);
+                write_topology_revision(&b_root, &a_id, false, 0, "", 0, "");
+            } else {
+                write_topology(&a_root, &b_id, true);
+                write_topology(&b_root, &a_id, true);
+            }
         }
         Lab {
             dir,
@@ -306,18 +323,30 @@ fn write_config(root: &Path, port: u16, clipboard_port: u16, name: &str, claim_o
     std::fs::write(root.join("config/config.toml"), document).expect("configuration");
 }
 
-/// The `[topology]` document of the two-computer workspace: one display each, and a
-/// bidirectional link from this computer's right edge to the peer's left edge.
-fn write_topology(root: &Path, peer: &str) {
+/// A revision-one workspace with one display per computer and an optional shared edge.
+fn write_topology(root: &Path, peer: &str, with_link: bool) {
+    write_topology_revision(root, peer, with_link, 1, "self", 1, "self");
+}
+
+/// A workspace snapshot whose applied pair is explicit; revision zero still seeds both displays.
+fn write_topology_revision(
+    root: &Path,
+    peer: &str,
+    with_link: bool,
+    revision: u64,
+    author: &str,
+    max_seen_revision: u64,
+    max_seen_author: &str,
+) {
     let path = root.join("config/config.toml");
     let mut document = std::fs::read_to_string(&path).expect("configuration");
     document.push_str(&format!(
         "\n\
          [topology]\n\
-         revision = 1\n\
-         author = \"self\"\n\
-         max_seen_revision = 1\n\
-         max_seen_author = \"self\"\n\
+         revision = {revision}\n\
+         author = \"{author}\"\n\
+         max_seen_revision = {max_seen_revision}\n\
+         max_seen_author = \"{max_seen_author}\"\n\
          \n\
          [[topology.displays]]\n\
          node = \"self\"\n\
@@ -329,26 +358,30 @@ fn write_topology(root: &Path, peer: &str) {
          node = \"peer:{peer}\"\n\
          id = \"dry-0\"\n\
          logical = [0.0, 0.0, 1920.0, 1080.0]\n\
-         primary = true\n\
-         \n\
-         [[topology.links]]\n\
-         id = \"right-to-left\"\n\
-         bidirectional = true\n\
-         \n\
-         [topology.links.from]\n\
-         node = \"self\"\n\
-         display = \"dry-0\"\n\
-         edge = \"right\"\n\
-         start = 0.0\n\
-         end = 1080.0\n\
-         \n\
-         [topology.links.to]\n\
-         node = \"peer:{peer}\"\n\
-         display = \"dry-0\"\n\
-         edge = \"left\"\n\
-         start = 0.0\n\
-         end = 1080.0\n"
+         primary = true\n"
     ));
+    if with_link {
+        document.push_str(&format!(
+            "\n\
+             [[topology.links]]\n\
+             id = \"right-to-left\"\n\
+             bidirectional = true\n\
+             \n\
+             [topology.links.from]\n\
+             node = \"self\"\n\
+             display = \"dry-0\"\n\
+             edge = \"right\"\n\
+             start = 0.0\n\
+             end = 1080.0\n\
+             \n\
+             [topology.links.to]\n\
+             node = \"peer:{peer}\"\n\
+             display = \"dry-0\"\n\
+             edge = \"left\"\n\
+             start = 0.0\n\
+             end = 1080.0\n"
+        ));
+    }
     std::fs::write(&path, document).expect("topology document");
 }
 
@@ -677,6 +710,142 @@ fn the_status_screen_holds_the_linked_workspace() {
         nodes.iter().all(|node| !node.displays.is_empty()),
         "every member of the document has a display: {nodes:?}"
     );
+}
+
+/// The owner's restored revision is the CAS base for the first edit from the layout screen.
+#[test]
+fn the_first_owner_layout_apply_reaches_both_windows() {
+    let _serial = serial();
+    let lab = Lab::restored_owner_layout("layout-first-apply");
+    let mut owner = bridge_for(lab.a_root());
+    let mut follower = bridge_for(lab.b_root());
+
+    let owner_status = wait_for(&mut owner, "the owner to restore revision 1", |view| {
+        view.status
+            .as_ref()
+            .filter(|status| status.connected && status.is_owner && status.layout_revision == 1)
+            .cloned()
+    });
+    let follower_status = wait_for(&mut follower, "the follower to adopt revision 1", |view| {
+        view.status
+            .as_ref()
+            .filter(|status| {
+                status.connected
+                    && !status.is_owner
+                    && status.owner_node_id == lab.a_id
+                    && status.layout_revision == 1
+            })
+            .cloned()
+    });
+    assert_eq!(owner_status.owner_node_id, lab.a_id);
+    assert_eq!(follower_status.layout_author, owner_status.layout_author);
+
+    wait_for(&mut owner, "the owner's initial two-display document", |view| {
+        (view.editor.nodes.len() == 2).then_some(())
+    });
+    wait_for(&mut follower, "the follower's initial two-display document", |view| {
+        (view.editor.nodes.len() == 2).then_some(())
+    });
+    for (name, view) in [("owner", owner.view()), ("follower", follower.view())] {
+        assert_eq!(view.editor.revision, 1, "{name} editor: {:?}", view.editor);
+        assert!(
+            view.editor.links.is_empty(),
+            "{name} starts with no edge: {:?}",
+            view.editor.links
+        );
+    }
+
+    let stale_follower_request = {
+        let view = follower.view();
+        Action::UpdateTopology {
+            layout_toml: view.layout_toml().into_bytes(),
+            expected_revision: view.editor.revision,
+            expected_author: lws_gui::view_model::node_id_bytes(&view.editor.author),
+        }
+    };
+
+    // This is the same request the layout screen dispatches: serialize its editor and CAS
+    // against the revision/author shown in that editor.
+    let (request, expected_author) = {
+        let view = owner.view();
+        let layout_toml = view.layout_toml();
+        let parsed: config::TopologyConfig =
+            toml::from_str(&layout_toml).expect("the layout editor emits a topology document");
+        assert_eq!(
+            parsed.links.len(),
+            1,
+            "first Apply creates the GUI edge; self={:?}, other={:?}, displays={:?}",
+            view.self_node(),
+            view.other_node(),
+            parsed.displays
+        );
+        (
+            Action::UpdateTopology {
+                layout_toml: layout_toml.into_bytes(),
+                expected_revision: view.editor.revision,
+                expected_author: lws_gui::view_model::node_id_bytes(&view.editor.author),
+            },
+            lws_gui::view_model::node_id_bytes(&view.editor.author),
+        )
+    };
+    assert_eq!(expected_author, lws_gui::view_model::node_id_bytes(&lab.a_id));
+
+    owner.view_mut().outcome = None;
+    owner.dispatch(request, Instant::now());
+    let outcome = wait_for(&mut owner, "the first owner Apply result", |view| {
+        view.outcome.clone()
+    });
+    assert!(outcome.ok, "the owner applies against restored revision 1: {outcome:?}");
+
+    let owner_status = wait_for(&mut owner, "the owner to apply revision 2", |view| {
+        view.status
+            .as_ref()
+            .filter(|status| status.layout_revision == 2)
+            .cloned()
+    });
+    assert_eq!(owner_status.layout_author, follower_status.layout_author);
+    assert_eq!(
+        owner.view().editor.links.len(),
+        1,
+        "the owner's applied document must contain the first edge: {:?}",
+        owner.view().editor
+    );
+    let follower_doc = wait_for(&mut follower, "the follower to receive revision 2 and its edge", |view| {
+        (view.editor.revision == 2 && !view.editor.links.is_empty())
+            .then(|| view.editor.clone())
+    });
+    owner.dispatch(Action::ListPendingEdits, Instant::now());
+    wait_for(&mut owner, "the pending-edit read to finish", |view| {
+        (!view
+            .inflight
+            .iter()
+            .any(|request| request.request == lws_gui::view_model::Request::ListPendingEdits))
+        .then_some(())
+    });
+    assert!(owner.view().pending_edits.is_empty());
+    assert_eq!(owner.view().editor.revision, 2);
+    assert_eq!(owner.view().editor.links.len(), 1);
+    for root in [lab.a_root(), lab.b_root()] {
+        let saved = config::Config::load(root.join("config/config.toml"))
+            .expect("the applied document remains valid configuration");
+        assert_eq!(saved.topology.revision, 2);
+        assert_eq!(saved.topology.links.len(), 1);
+    }
+    follower.view_mut().outcome = None;
+    follower.view_mut().conflict = None;
+    follower.dispatch(stale_follower_request, Instant::now());
+    let conflict = wait_for(&mut follower, "the owner to refuse the stale follower edit", |view| {
+        view.conflict.clone()
+    });
+    assert!(!conflict.is_empty());
+    let refusal = follower.view().outcome.as_ref().expect("the refusal is shown");
+    assert!(!refusal.ok, "the stale follower edit is refused: {refusal:?}");
+    assert_eq!(owner.view().editor.revision, 2);
+    assert_eq!(owner.view().editor.links.len(), 1);
+    assert_eq!(follower.view().editor.revision, 2);
+    assert_eq!(follower.view().editor.links.len(), 1);
+    assert_eq!(follower_doc.links.len(), 1, "{follower_doc:?}");
+    assert_eq!(follower_doc.revision, owner.view().editor.revision);
 }
 
 /// The pairing wizard, driven through the view model, between two unpaired cores.

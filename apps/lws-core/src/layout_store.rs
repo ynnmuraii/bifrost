@@ -1,10 +1,9 @@
-//! Persists the layout pair into `[topology]` of `config.toml` (KVM-072).
+//! Persists the applied topology document and revision floor in `[topology]` of `config.toml`.
 //!
 //! `docs/06-development-plan.md`, KVM-072: «персистятся `max_seen_revision`/`max_seen_author`,
 //! ревизия назад не идёт». The file is the same one the rest of the configuration lives in, so
-//! the store keeps the loaded [`config::Config`] and rewrites it whole — exactly the shape
-//! [`crate::ownership_store`] uses for the ownership pair, and for the same reason: a partial
-//! write would drop settings nobody asked to change.
+//! the store keeps the loaded [`config::Config`] and rewrites it whole, preserving unrelated
+//! settings while replacing the topology section.
 //!
 //! The authors are stored as the lower-case hex fingerprint (`identity::fingerprint`), which is
 //! what the schema asks for and what a human can compare; [`node_id_from_hex`] is the way back,
@@ -103,16 +102,17 @@ impl LayoutStore {
             .unwrap_or_else(|| PathBuf::from(config::paths::LAYOUT_PENDING_FILE))
     }
 
-    /// Writes the pair back when it changed.
+    /// Writes the applied document and revision pair back when the pair changes.
     ///
     /// A failure is logged and left for the next change to retry: a configuration write must
     /// not stop the session, and the pair is still correct in memory.
-    pub fn observe(&mut self, layout: &Layout) {
+    pub fn observe(&mut self, layout: &Layout, topology: &config::TopologyConfig) {
         let applied = layout.applied();
         let max_seen = layout.max_seen();
         if (applied, max_seen) == self.saved {
             return;
         }
+        self.config.topology = topology.clone();
         self.config.topology.revision = applied.revision;
         self.config.topology.author = applied
             .author
@@ -254,7 +254,7 @@ mod tests {
             |_| Ok(()),
         );
         assert!(matches!(outcome, crate::layout::EditOutcome::Applied(_)));
-        store.observe(&layout);
+        store.observe(&layout, &config::TopologyConfig::default());
 
         let reloaded = config::Config::load(&path).expect("the file still parses");
         let restored = LayoutStore::new(path, reloaded, node(7)).restored();
