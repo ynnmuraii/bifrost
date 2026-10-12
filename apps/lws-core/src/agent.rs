@@ -29,10 +29,10 @@
 //! connection is checked with `SO_PEERCRED`.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::ipc::transport::{self, Endpoint};
-use ::ipc::{AgentLink, IpcError};
+use ::ipc::{AgentLink, IpcError, Watchdog};
 use protocol::ipc::{self, agent_frame::Msg, AgentMode};
 
 use crate::command::AgentState;
@@ -49,6 +49,149 @@ pub type AgentStream = tokio::net::windows::named_pipe::NamedPipeServer;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a `RECOVERY` release exchange may take before core gives up on it.
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Core's heartbeat state for the agent channel (rule 11), with the startup grace the
+/// documents imply.
+///
+/// # The clock and the grace
+///
+/// Rule 11 is a steady-state contract — «core шлёт агенту `Ping` каждые
+/// `core_silence_ms / 4` … агент отвечает `Pong`» — and rule 6 scopes the release it
+/// protects to `REMOTE`: «Core молчит в REMOTE дольше `core_silence_ms` … → agent
+/// выполняет release и Local». A *starting* agent is neither: it holds no capture (the
+/// backend is selected only after the attach, and capture needs a `BeginCapture`, which
+/// can only follow `AgentReady`), and its spawn is already bounded by
+/// [`LAUNCH_TIMEOUT`]. So the silence clock starts at the agent's **first frame** after a
+/// launch — `AgentReady`, in practice, but any frame proves the process answers — and a
+/// launch that produces no frame within the launch timeout is judged lost instead of
+/// being waited for forever.
+///
+/// This is the CI-38220074904 failure on `windows-latest`: a loaded runner spends over
+/// the 300 ms limit on spawn + connect + attach + the backend probe + `AgentReady`, and
+/// the clock that ran from the *previous* launch's end declared every fresh agent lost
+/// before it could answer — five launches in a row, the node `Blocked` most of the run.
+/// With the grace a slow start costs its own launch timeout, not a restart loop.
+///
+/// The clock is this type's own: the supervisor outlives one session and marks every
+/// launch, including the two starts a `RECOVERY` restart performs inside
+/// [`Supervisor::restart_recovery`].
+#[derive(Debug)]
+pub struct AgentHeartbeat {
+    /// Rule 11's periods: `Ping` every `core_silence_ms / 4`, silence limit `core_silence_ms`.
+    watchdog: Watchdog,
+    /// The epoch of this type's monotonic clock.
+    started: Instant,
+    /// When the current launch began, in `now_ms`; `None` before the first one.
+    launched_at: Option<u64>,
+    /// Whether a frame has arrived since [`AgentHeartbeat::launched`].
+    live: bool,
+    /// How long a launch may take to produce its first frame ([`LAUNCH_TIMEOUT`]).
+    launch_timeout_ms: u64,
+}
+
+impl AgentHeartbeat {
+    /// The heartbeat for the `core_silence_ms` carried in every `AgentAttach`.
+    ///
+    /// The value is validated by the config schema (200..=500); a value that still
+    /// arrives out of range falls back to the default, exactly as the agent does with
+    /// the same attach field.
+    pub fn new(core_silence_ms: u32) -> Self {
+        Self::with_launch_timeout(core_silence_ms, LAUNCH_TIMEOUT.as_millis() as u64)
+    }
+
+    /// The same, with the launch-timeout bound as a parameter: the grace is part of the
+    /// policy, so it is testable without waiting five seconds.
+    pub fn with_launch_timeout(core_silence_ms: u32, launch_timeout_ms: u64) -> Self {
+        let watchdog = Watchdog::for_core_silence_ms(core_silence_ms, 0).unwrap_or_else(|error| {
+            tracing::warn!(%error, "core_silence_ms outside 200..=500; using the default");
+            Watchdog::for_core_silence_ms(::ipc::DEFAULT_CORE_SILENCE_MS, 0)
+                .expect("the default core_silence_ms is in range")
+        });
+        AgentHeartbeat {
+            watchdog,
+            started: Instant::now(),
+            launched_at: None,
+            live: false,
+            launch_timeout_ms,
+        }
+    }
+
+    /// Milliseconds on this type's own monotonic clock.
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// A launch began: the silence clock is held until the first frame, and a launch
+    /// that never produces one is judged after [`LAUNCH_TIMEOUT`].
+    pub fn launched(&mut self) {
+        let now = self.now_ms();
+        self.launched_at = Some(now);
+        self.live = false;
+        // The channel is new: the heartbeat period restarts with the launch, so a slow
+        // start does not also owe a ping for the time it took.
+        self.watchdog = Watchdog::for_core_silence_ms(self.watchdog.silence_limit_ms() as u32, now)
+            .expect("the limit was validated at construction");
+    }
+
+    /// Any frame from the agent: the process is alive, and the silence clock runs from
+    /// here («нет ни одного кадра, включая IPC `Ping`»).
+    pub fn on_frame(&mut self) {
+        let now = self.now_ms();
+        self.live = true;
+        self.watchdog.on_frame(now);
+    }
+
+    /// Whether it is time to send the heartbeat `Ping` (rule 11).
+    pub fn heartbeat_due(&self) -> bool {
+        self.watchdog.heartbeat_due(self.now_ms())
+    }
+
+    /// Record that the heartbeat `Ping` was sent.
+    pub fn on_heartbeat(&mut self) {
+        let now = self.now_ms();
+        self.watchdog.on_heartbeat(now);
+    }
+
+    /// Milliseconds until the next heartbeat is due (0 when it already is).
+    pub fn next_heartbeat_in_ms(&self) -> u64 {
+        self.watchdog.next_heartbeat_in_ms(self.now_ms())
+    }
+
+    /// Whether the agent must be considered lost.
+    ///
+    /// Before the first frame of a launch only the launch timeout counts: the agent is
+    /// starting, and there is nothing to release. Afterwards rule 6's silence limit is
+    /// the watchdog's own.
+    pub fn silence_exceeded(&self) -> bool {
+        match (self.launched_at, self.live) {
+            (Some(launched), false) => {
+                self.now_ms().saturating_sub(launched) >= self.launch_timeout_ms
+            }
+            _ => self.watchdog.silence_exceeded(self.now_ms()),
+        }
+    }
+
+    /// How long the agent has not been heard from, for the loss log.
+    ///
+    /// During the grace this is the age of the launch, which is what the operator needs
+    /// to see: the agent never became ready, as opposed to going quiet.
+    pub fn silence_ms(&self) -> u64 {
+        match (self.launched_at, self.live) {
+            (Some(launched), false) => self.now_ms().saturating_sub(launched),
+            _ => self.watchdog.silence_ms(self.now_ms()),
+        }
+    }
+
+    /// Milliseconds until the next liveness decision is due, for the loop's deadline.
+    pub fn next_silence_check_in_ms(&self) -> u64 {
+        match (self.launched_at, self.live) {
+            (Some(launched), false) => self
+                .launch_timeout_ms
+                .saturating_sub(self.now_ms().saturating_sub(launched)),
+            _ => self.watchdog.remaining_ms(self.now_ms()),
+        }
+    }
+}
 
 /// The agent process and its channel.
 /// The receiver-takeover settings the agent needs (KVM-035).
@@ -88,6 +231,9 @@ pub struct Supervisor {
     /// Portal restore tokens, persisted in `portal-restore.toml` and shipped in
     /// `AgentAttach.restore_tokens`; new ones arrive back as `PortalGrantChanged`.
     portal: crate::portal::PortalGrants,
+    /// Rule 11's heartbeat, with the startup grace; the supervisor marks every launch
+    /// and every received frame, so the state survives a session's watchdog questions.
+    heartbeat: AgentHeartbeat,
     launches: u64,
     child: Option<tokio::process::Child>,
     /// The kill-on-close job the current child lives in (see [`crate::job`]); dropping it
@@ -131,6 +277,7 @@ impl Supervisor {
             portal,
             takeover,
             repeat_mode,
+            heartbeat: AgentHeartbeat::new(core_silence_ms),
             launches: 0,
             child: None,
             job: None,
@@ -153,6 +300,9 @@ impl Supervisor {
     /// Spawns one agent, waits for it to connect and sends the `AgentAttach`.
     pub async fn start(&mut self, mode: AgentMode) -> Result<(), String> {
         self.stop().await;
+        // The launch is where the silence clock resets (see [`AgentHeartbeat`]): the
+        // frames of the *previous* channel prove nothing about this one.
+        self.heartbeat.launched();
         self.launches += 1;
         let endpoint = launch_endpoint(&self.runtime_dir, self.launches)?;
         let mut listener = transport::listen(&endpoint).map_err(|error| error.to_string())?;
@@ -277,11 +427,49 @@ impl Supervisor {
     }
 
     /// Receives one frame, or reports why the channel ended.
+    ///
+    /// Every received frame is liveness (rule 6: «нет ни одного кадра, включая IPC
+    /// `Ping`»), so the heartbeat hears about it here — including the frames a
+    /// `RECOVERY` restart consumes through this same method.
     pub async fn recv(&mut self) -> Result<ipc::AgentFrame, String> {
         match self.link.as_mut() {
-            Some(link) => link.recv().await.map_err(|error| error.to_string()),
+            Some(link) => {
+                let frame = link.recv().await.map_err(|error| error.to_string())?;
+                self.heartbeat.on_frame();
+                Ok(frame)
+            }
             None => Err("no agent is attached".to_owned()),
         }
+    }
+
+    /// Whether the heartbeat `Ping` (rule 11) is due on the current channel.
+    pub fn heartbeat_due(&self) -> bool {
+        self.heartbeat.heartbeat_due()
+    }
+
+    /// Records that the heartbeat `Ping` was sent.
+    pub fn on_heartbeat(&mut self) {
+        self.heartbeat.on_heartbeat();
+    }
+
+    /// Whether the agent must be considered lost (the grace and rule 6's limit).
+    pub fn silence_exceeded(&self) -> bool {
+        self.heartbeat.silence_exceeded()
+    }
+
+    /// How long the agent has not been heard from, for the loss log.
+    pub fn silence_ms(&self) -> u64 {
+        self.heartbeat.silence_ms()
+    }
+
+    /// Milliseconds until the heartbeat `Ping` is due.
+    pub fn next_heartbeat_in_ms(&self) -> u64 {
+        self.heartbeat.next_heartbeat_in_ms()
+    }
+
+    /// Milliseconds until the next liveness decision, for the loop's deadline.
+    pub fn next_silence_check_in_ms(&self) -> u64 {
+        self.heartbeat.next_silence_check_in_ms()
     }
 
     /// Whether the child process has exited (the channel may not have noticed yet).
@@ -583,5 +771,129 @@ mod launch_tests {
 
         let _ = std::fs::remove_dir_all(&runtime);
         let _ = std::fs::remove_dir_all(&private);
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    /// The grace, in the shape the CI failure had: a launch whose first frame arrives
+    /// after more than the whole silence limit must not be judged silent.
+    #[test]
+    fn the_silence_clock_does_not_run_before_the_agents_first_frame() {
+        // 200 ms is the documented minimum, so the heartbeat is 50 ms and the grace is
+        // clearly longer than the limit it protects.
+        let mut heartbeat = AgentHeartbeat::with_launch_timeout(200, 400);
+        heartbeat.launched();
+
+        // The agent is starting: the silence clock is held even well past the limit.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !heartbeat.silence_exceeded(),
+            "a starting agent is not a silent one (300 ms > the 200 ms limit)"
+        );
+        assert_eq!(
+            heartbeat.silence_ms(),
+            300,
+            "the log shows the launch's age"
+        );
+
+        // Its first frame starts the clock: silence is measured from here, not from the
+        // launch or from the previous channel.
+        heartbeat.on_frame();
+        assert_eq!(
+            heartbeat.silence_ms(),
+            0,
+            "the clock starts at the first frame"
+        );
+    }
+
+    #[test]
+    fn the_first_frame_starts_the_silence_clock() {
+        let mut heartbeat = AgentHeartbeat::with_launch_timeout(200, 5_000);
+        heartbeat.launched();
+        // A start that outlasts the limit twice over: the old clock called this "the agent
+        // stopped answering"; it is only startup.
+        std::thread::sleep(Duration::from_millis(400));
+        heartbeat.on_frame();
+        assert!(
+            !heartbeat.silence_exceeded(),
+            "the clock starts at the frame"
+        );
+
+        // Rule 6 applies from the first frame onwards: silent past the limit is lost.
+        std::thread::sleep(Duration::from_millis(260));
+        assert!(
+            heartbeat.silence_exceeded(),
+            "260 ms of silence is past the 200 ms limit"
+        );
+
+        // Any later frame resets it, exactly as the sans-IO watchdog's contract says.
+        heartbeat.on_frame();
+        assert_eq!(heartbeat.silence_ms(), 0, "any frame resets the silence");
+        assert!(!heartbeat.silence_exceeded());
+    }
+
+    #[test]
+    fn a_launch_that_never_answers_is_lost_at_the_launch_timeout() {
+        let mut heartbeat = AgentHeartbeat::with_launch_timeout(200, 150);
+        heartbeat.launched();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !heartbeat.silence_exceeded(),
+            "inside the launch timeout the agent is still starting"
+        );
+        assert_eq!(
+            heartbeat.next_silence_check_in_ms(),
+            100,
+            "the bound is near"
+        );
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            heartbeat.silence_exceeded(),
+            "a launch that never produces a frame is lost at the launch timeout"
+        );
+        assert_eq!(
+            heartbeat.next_silence_check_in_ms(),
+            0,
+            "the decision is due now"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_period_restarts_with_every_launch() {
+        let mut heartbeat = AgentHeartbeat::with_launch_timeout(200, 5_000);
+        heartbeat.launched();
+        // Rule 11: one heartbeat every `core_silence_ms / 4`.
+        assert!(!heartbeat.heartbeat_due(), "a fresh channel owes no ping");
+        assert!(heartbeat.next_heartbeat_in_ms() <= 50);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(heartbeat.heartbeat_due(), "50 ms later the ping is due");
+        heartbeat.on_heartbeat();
+        assert!(!heartbeat.heartbeat_due(), "and not again immediately");
+
+        // A second launch owes no ping for the time the first one took either.
+        std::thread::sleep(Duration::from_millis(60));
+        heartbeat.launched();
+        assert!(!heartbeat.heartbeat_due());
+        assert!(!heartbeat.silence_exceeded());
+    }
+
+    #[test]
+    fn the_grace_covers_every_start_a_restart_performs() {
+        let mut heartbeat = AgentHeartbeat::with_launch_timeout(200, 400);
+        // The RECOVERY restart: its own start, its frame, then the NORMAL start.
+        heartbeat.launched();
+        std::thread::sleep(Duration::from_millis(100));
+        heartbeat.on_frame();
+        heartbeat.launched();
+        assert!(
+            !heartbeat.silence_exceeded(),
+            "the fresh NORMAL launch gets the grace again"
+        );
+        heartbeat.on_frame();
+        assert_eq!(heartbeat.silence_ms(), 0);
     }
 }

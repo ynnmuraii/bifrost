@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 use focus_router as fr;
 use geometry::NodeId;
 use input_model::InputEvent;
-use ipc::Watchdog;
 use protocol::ipc::agent_frame::Msg;
 use tokio::sync::{mpsc, oneshot};
 use transport::{LinkEvent, LinkManager};
@@ -63,7 +62,6 @@ pub struct Session {
     ctl: ctl::Server,
     timers: Timers,
     context: routing::AgentContext,
-    watchdog: Watchdog,
     started: Instant,
     ping_nonce: u64,
     node_id: NodeId,
@@ -187,7 +185,6 @@ impl Session {
         link_events: mpsc::Receiver<LinkEvent>,
         agent: Supervisor,
         ctl: ctl::Server,
-        watchdog: Watchdog,
         node_id: NodeId,
         backend: String,
         trust: identity::TrustStore,
@@ -219,7 +216,6 @@ impl Session {
             timers: Timers::default(),
             refusal: None,
             context: routing::AgentContext::default(),
-            watchdog,
             started: Instant::now(),
             ping_nonce: 0,
             node_id,
@@ -398,6 +394,19 @@ impl Session {
                     self.expire_pairing_window();
                 }
             }
+            // The liveness decision comes *after* the turn's work: whatever the agent
+            // sent during this turn was processed by the step above, and a loop that
+            // woke late (a starved worker on a loaded machine) must not condemn an
+            // agent whose answer is already sitting in the link's buffer.
+            if self.agent.is_attached()
+                && (self.agent.child_exited() || self.agent.silence_exceeded())
+            {
+                tracing::warn!(
+                    silence_ms = self.agent.silence_ms(),
+                    "the agent stopped answering"
+                );
+                self.on_agent_lost().await;
+            }
             // Once per turn, and only what changed: the GUI's `Status` and, on a new revision,
             // the document its editor works on.
             self.publish_gui_state().await;
@@ -415,7 +424,7 @@ impl Session {
 
         if self.agent.is_attached() {
             // Rule 11: `Ping` every `core_silence_ms / 4`, on its own clock.
-            if self.watchdog.heartbeat_due(now) {
+            if self.agent.heartbeat_due() {
                 self.ping_nonce = self.ping_nonce.wrapping_add(1);
                 let ping = Msg::Ping(protocol::ipc::Ping {
                     nonce: self.ping_nonce,
@@ -424,15 +433,8 @@ impl Session {
                     tracing::warn!(%error, "cannot ping the agent");
                     self.on_agent_lost().await;
                 } else {
-                    self.watchdog.on_heartbeat(now);
+                    self.agent.on_heartbeat();
                 }
-            }
-            if self.agent.child_exited() || self.watchdog.silence_exceeded(now) {
-                tracing::warn!(
-                    silence_ms = self.watchdog.silence_ms(now),
-                    "the agent stopped answering"
-                );
-                self.on_agent_lost().await;
             }
         } else if let Some(due) = self.agent_restart_due {
             if Instant::now() >= due {
@@ -449,8 +451,12 @@ impl Session {
             deadline = deadline.min(timer_deadline);
         }
         if self.agent.is_attached() {
-            let heartbeat = now_ms.saturating_add(self.watchdog.next_heartbeat_in_ms(now_ms));
+            // Rule 11's ping period, and the moment rule 6's limit (or the launch
+            // timeout of a starting agent) makes the next liveness decision due.
+            let heartbeat = now_ms.saturating_add(self.agent.next_heartbeat_in_ms());
             deadline = deadline.min(heartbeat);
+            let silence = now_ms.saturating_add(self.agent.next_silence_check_in_ms());
+            deadline = deadline.min(silence);
         }
         if let Some(due) = self.agent_restart_due {
             let millis = due.saturating_duration_since(Instant::now()).as_millis() as u64;
@@ -1593,8 +1599,8 @@ impl Session {
     }
 
     async fn on_agent_frame(&mut self, frame: protocol::ipc::AgentFrame) -> anyhow::Result<()> {
-        let now = self.now_ms();
-        self.watchdog.on_frame(now);
+        // The frame is liveness wherever it was received: `Supervisor::recv` already
+        // marked it on the heartbeat, so nothing to do here but handle it.
         let Some(message) = frame.msg else {
             return Ok(());
         };
@@ -1632,7 +1638,6 @@ impl Session {
                     self.agent.mark_ready();
                     self.agent_lost_reported = false;
                     self.agent_restart_due = None;
-                    self.watchdog.on_frame(now);
                     // A new session starts with a clean slate; the previous crash's
                     // error is not this session's state.
                     self.refusal = None;
@@ -1921,15 +1926,11 @@ impl Session {
         );
         match self.agent.restart_recovery(&keys, &buttons).await {
             Ok(_) => {
-                self.agent_lost_reported = false;
                 // The fresh `NORMAL` agent reports `AgentReady`, which clears
-                // `Blocked` and finishes the recovery (S4). Its channel is new, so the
-                // heartbeat starts from now.
-                self.watchdog = Watchdog::for_core_silence_ms(
-                    self.watchdog.silence_limit_ms() as u32,
-                    self.now_ms(),
-                )
-                .unwrap_or(self.watchdog);
+                // `Blocked` and finishes the recovery (S4). Its channel is new, and the
+                // supervisor marked the launch, so the heartbeat's clock starts at that
+                // agent's first frame rather than at the instant the restart finished.
+                self.agent_lost_reported = false;
             }
             Err(error) => {
                 tracing::error!(%error, "agent restart failed; retrying");
