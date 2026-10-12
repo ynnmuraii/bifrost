@@ -166,3 +166,59 @@ pub fn next_liveness_wakeup(
     let offline_due = last_pong_ms.saturating_add(liveness.offline_ms);
     ping_due.min(offline_due).max(now_ms)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The documented deadline, pinned where no scheduler can move it.
+    ///
+    /// «офлайн через 3 s без `Pong`» is a statement about the link's *own* monotonic clock, and
+    /// this is that statement as an assertion: one millisecond before the window is out the
+    /// link is still alive (and pinging), at the window it is offline. The integration test in
+    /// `tests/mesh.rs` measures the same thing through a real socket, so it can only bound the
+    /// *report* generously — the product's deadline is exact here.
+    #[test]
+    fn the_offline_action_flips_exactly_at_the_documented_window() {
+        let liveness = LinkLiveness::default();
+        assert_eq!(liveness.ping_ms, 1_000, "documented ping cadence");
+        assert_eq!(liveness.offline_ms, 3_000, "documented offline window");
+
+        // A `Pong` a moment ago: alive, and no ping is due yet.
+        assert_eq!(
+            liveness_action(2_999, 0, Some(2_999), liveness),
+            LivenessAction::Idle
+        );
+        // The same instant, but the last ping is a full period old: the link wants to ping.
+        assert_eq!(
+            liveness_action(2_999, 0, Some(1_000), liveness),
+            LivenessAction::Ping
+        );
+        // The window is out: offline, whatever the ping bookkeeping says.
+        assert_eq!(
+            liveness_action(3_000, 0, Some(2_999), liveness),
+            LivenessAction::Offline
+        );
+        assert_eq!(
+            liveness_action(9_999, 0, None, liveness),
+            LivenessAction::Offline
+        );
+    }
+
+    /// The wakeup lands on the earlier of the next ping and the offline deadline, and never in
+    /// the past: the caller sleeps for `wakeup - now`, and a past instant would mean a busy
+    /// loop or a check that never happens.
+    #[test]
+    fn the_wakeup_is_the_earlier_of_the_next_ping_and_the_deadline() {
+        let liveness = LinkLiveness::default();
+
+        // The next ping comes first.
+        assert_eq!(next_liveness_wakeup(1_000, 0, Some(1_000), liveness), 2_000);
+        // Both are due at the same instant.
+        assert_eq!(next_liveness_wakeup(2_900, 0, Some(2_000), liveness), 3_000);
+        // The deadline has passed: the caller is told to check now, not in the past.
+        assert_eq!(next_liveness_wakeup(3_500, 0, Some(3_000), liveness), 3_500);
+        // No ping sent yet: ping now (the first `Ping` is not delayed by a period).
+        assert_eq!(next_liveness_wakeup(500, 0, None, liveness), 500);
+    }
+}
