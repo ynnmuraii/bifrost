@@ -51,6 +51,10 @@
 
 #![forbid(unsafe_code)]
 
+// The clipboard's `INCR` bookkeeping is pure, so it builds and tests on any host; the
+// selection adapter below it is Linux-only (KVM-041).
+pub mod clipboard;
+
 #[cfg(target_os = "linux")]
 pub mod capture;
 #[cfg(target_os = "linux")]
