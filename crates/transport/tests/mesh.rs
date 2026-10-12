@@ -26,7 +26,6 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Generous bounds: the tests wait for events, never for a fixed sleep.
 const FORM_TIMEOUT: Duration = Duration::from_secs(20);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
-const OFFLINE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The cadence every node in these tests runs with: the documented `1 s` / `3 s` that the
 /// application passes in from `workspace.link_ping_ms` / `workspace.link_timeout_ms`.
@@ -34,6 +33,29 @@ const LIVENESS: LinkLiveness = LinkLiveness {
     ping_ms: 1_000,
     offline_ms: 3_000,
 };
+
+/// What the test allows on top of [`LIVENESS`]'s window before it calls a report late.
+///
+/// The link decides on its *own* monotonic clock (`policy::liveness_action` compares
+/// milliseconds since the last `Pong`), so a descheduled link task declares the peer dead the
+/// instant it is scheduled again: the delay belongs to the machine, not to the product. The
+/// product's deadline is therefore pinned where no scheduler can move it — `policy`'s own unit
+/// tests assert the action flips at exactly `offline_ms` — and this integration bound only has
+/// to be generous enough that a starved process still answers. Measured: the socket-death path
+/// reports in well under a second on an idle machine, and a box running two full workspace
+/// suites at once stretched it past the old fixed 8 s, which is how this bound was found.
+const SCHEDULING_ALLOWANCE_MS: u64 = 12_000;
+
+/// The slowest honest report a starved process may give: the documented offline window plus the
+/// allowance above.
+const OFFLINE_TIMEOUT: Duration =
+    Duration::from_millis(LIVENESS.offline_ms + SCHEDULING_ALLOWANCE_MS);
+
+/// How long the member bookkeeping may lag the link's `Down` report.
+///
+/// A second, separately bounded wait: removing the member is the manager's step after the
+/// link's report, so it may not take longer than the report itself was allowed.
+const MEMBER_DROP_TIMEOUT: Duration = OFFLINE_TIMEOUT;
 
 struct TestNode {
     name: &'static str,
@@ -43,9 +65,18 @@ struct TestNode {
 }
 
 impl TestNode {
-    /// Takes the node down the way a crash would: no `Shutdown`, sockets dropped.
+    /// Takes the node down the way a crash would: no `Shutdown`, the listener and every link
+    /// gone with the process.
+    ///
+    /// [`LinkManager::kill_all`] alone is *not* a crash: the manager's own task keeps the
+    /// listener, so a surviving peer's redial is accepted, the pair is linked again, and the
+    /// dead peer never looks dead. That is how this suite failed under load — the test saw an
+    /// `Up` (the reconnect) and waited for a `Down` that a linked peer does not produce.
+    /// Aborting the runner closes the listener, so the redial is refused and the survivor has
+    /// only the socket death and the liveness clock to go on, which is the subject here.
     async fn kill(&self) {
         self.manager.kill_all().await;
+        self.runner.abort();
     }
 }
 
@@ -575,30 +606,46 @@ async fn an_abrupt_kill_is_reported_as_a_liveness_timeout() {
     // A crash: no `Shutdown`, sockets dropped. B can only notice through the socket dying or
     // through the liveness clock («офлайн через 3 s без Pong»). The simultaneous-dial dedup
     // may still surface a `LocalClosed` for the redundant link, so those are ignored while
-    // the detection is collected.
+    // the detection is collected — and every event is kept for the message below, because
+    // "nothing was reported" and "something else was reported" are different failures.
     a.kill().await;
     let started = Instant::now();
     let deadline = Instant::now() + OFFLINE_TIMEOUT;
     let mut detected: Option<LinkDownReason> = None;
     let mut graceful = false;
+    let mut seen: Vec<String> = Vec::new();
     while detected.is_none() && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let event = wait_for_event(
-            &mut b.events,
-            |event| matches!(event, LinkEvent::Down { peer, .. } if *peer == id_a),
-            remaining,
-        )
-        .await;
-        match event {
-            Some(LinkEvent::Down { reason, .. }) => match reason {
-                LinkDownReason::Timeout | LinkDownReason::Io(_) => detected = Some(reason),
-                LinkDownReason::PeerShutdown => graceful = true,
-                _ => {}
-            },
-            _ => break,
+        match tokio::time::timeout(remaining, b.events.recv()).await {
+            // Nothing at all in the window: the manager's own channel closed.
+            Ok(None) => break,
+            // The window is out.
+            Err(_) => break,
+            Ok(Some(event)) => {
+                match &event {
+                    LinkEvent::Down { peer, reason } if *peer == id_a => match reason {
+                        LinkDownReason::Timeout | LinkDownReason::Io(_) => {
+                            detected = Some(reason.clone());
+                        }
+                        LinkDownReason::PeerShutdown => graceful = true,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                seen.push(format!("{event:?}"));
+            }
         }
     }
 
+    // The waited-out time is the evidence for the bounds below, printed whichever way the run
+    // went: on an idle machine the socket death reports in well under a second, a loaded one
+    // stretches it, and the product's own deadline is not what moved (the `policy` tests pin
+    // that at exactly `offline_ms`).
+    println!(
+        "b waited {:?} for the dead peer (liveness window {:?}); detected {detected:?}, graceful {graceful}, events {seen:?}",
+        started.elapsed(),
+        Duration::from_millis(LIVENESS.offline_ms)
+    );
     assert!(
         detected.is_some(),
         "b must notice the dead peer through the socket or the liveness clock"
@@ -612,12 +659,18 @@ async fn an_abrupt_kill_is_reported_as_a_liveness_timeout() {
         "a dead socket must not take longer than the liveness timeout to show up"
     );
 
-    // The member list no longer contains the dead peer.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The member list no longer contains the dead peer. This is a second, separately bounded
+    // wait: the link's `Down` report and the manager's member bookkeeping are different steps,
+    // and a loaded machine stretches both.
+    let deadline = Instant::now() + MEMBER_DROP_TIMEOUT;
     while b.manager.member_count().await != 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(b.manager.member_count().await, 0);
+    assert_eq!(
+        b.manager.member_count().await,
+        0,
+        "the dead peer must leave the member list within {MEMBER_DROP_TIMEOUT:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
