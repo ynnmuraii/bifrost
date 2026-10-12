@@ -70,6 +70,18 @@ fn wait_same_document(harness: &Harness, what: &str) -> (String, String) {
     panic!("{what} did not happen; last: {last}");
 }
 
+/// The last few lines of a node's log that mention the layout.
+fn tail(node: &Node) -> String {
+    node.log()
+        .lines()
+        .filter(|line| line.contains("layout") || line.contains("topology"))
+        .rev()
+        .take(8)
+        .map(|line| line.chars().take(200).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Waits until *either* node reports this refusal code.
 ///
 /// Which one is the coordinator after a partition depends on the ownership pair (the larger
@@ -309,11 +321,20 @@ fn a_stale_edit_is_refused_with_layout_conflict() {
     // The pending edit is still based on revision 1: the CAS refuses it by name.
     let sent = harness.b.ctl("layout apply").expect("the edit is sent");
     assert!(sent.contains("sent to the coordinator"), "{sent}");
-    let refused = wait_refusal(
-        &harness,
-        "ERROR_CODE_LAYOUT_CONFLICT",
-        "the stale edit is refused by name",
-    );
+    let refused = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_refusal(
+            &harness,
+            "ERROR_CODE_LAYOUT_CONFLICT",
+            "the stale edit is refused by name",
+        )
+    })) {
+        Ok(line) => line,
+        Err(_) => panic!(
+            "the stale edit is refused by name did not happen.\nA log:\n{}\nB log:\n{}",
+            tail(&harness.a),
+            tail(&harness.b)
+        ),
+    };
     assert!(
         revision(&refused) >= follower_before,
         "the revision never goes back"
