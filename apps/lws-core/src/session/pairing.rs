@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use identity::{PairedPeer, PairingDriver};
 use tokio::sync::{mpsc, oneshot};
@@ -24,6 +25,13 @@ use tokio::sync::{mpsc, oneshot};
 /// The `attempt_id` of one ceremony: random bytes16 from the window opener, the exporter
 /// context of the code both users compare.
 pub type AttemptId = [u8; 16];
+
+/// How long a ceremony may wait for the other side once the local user has answered.
+///
+/// The window is 120 s (`docs/05-protocol.md`: «окно 120 s»), and past it the ceremony is over
+/// whatever the peer does. Without this a peer that approves locally and then vanishes would
+/// leave the task — and the caller whose answer waits on it — waiting on a socket forever.
+const DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why an operation could not even start: the code the GUI acts on and the sentence a human
 /// reads.
@@ -67,6 +75,14 @@ pub enum Event {
     Started {
         /// Which ceremony.
         attempt_id: AttemptId,
+    },
+    /// The dial never reached a ceremony (a refused connection, a TLS failure, a timeout):
+    /// whoever asked for the dial is told instead of being left waiting.
+    DialFailed {
+        /// The code the caller acts on.
+        code: String,
+        /// The sentence a human reads.
+        detail: String,
     },
     /// The code is known and the user must decide.
     Prompt(Box<Prompt>),
@@ -118,6 +134,8 @@ pub struct Pairing {
     ceremonies: HashMap<AttemptId, Ceremony>,
     /// A dial that has not produced a prompt yet (`PairWith`).
     dial: Option<oneshot::Sender<Verdict>>,
+    /// Who is waiting for the next prompt (the control channel's `pair-prompt`).
+    waiting: Vec<oneshot::Sender<Prompt>>,
     /// Answer channels for ceremonies whose `attempt_id` is not known yet (a dialer learns it
     /// from the opener's first `PairHello`), in the order they were reserved.
     reserved: Vec<oneshot::Sender<bool>>,
@@ -137,6 +155,7 @@ impl Pairing {
             window: None,
             ceremonies: HashMap::new(),
             dial: None,
+            waiting: Vec::new(),
             reserved: Vec::new(),
         }
     }
@@ -298,6 +317,16 @@ impl Pairing {
         Ok(receiver)
     }
 
+    /// Waits for the next prompt (the control channel's `pair-prompt`).
+    ///
+    /// The GUI is told through `PairingPrompt`; this is for the one caller that has no event
+    /// stream of its own, and it is resolved by the same [`Event::Prompt`].
+    pub fn wait_for_prompt(&mut self) -> oneshot::Receiver<Prompt> {
+        let (sender, receiver) = oneshot::channel();
+        self.waiting.push(sender);
+        receiver
+    }
+
     /// A dial has started: the reply waits for the driver (or the failure).
     pub fn dial_started(&mut self) -> oneshot::Receiver<Verdict> {
         let (sender, receiver) = oneshot::channel();
@@ -310,8 +339,10 @@ impl Pairing {
         receiver
     }
 
-    /// The dial could not even start (an address that is not `ip:port`).
+    /// The dial did not reach a ceremony: an address that is not `ip:port`, a peer that
+    /// refused the connection, a TLS failure. The reserved answer channel goes with it.
     pub fn dial_failed(&mut self, code: &str, detail: String) {
+        self.reserved.pop();
         if let Some(dial) = self.dial.take() {
             let _ = dial.send(Err((code.to_owned(), detail)));
         }
@@ -323,6 +354,10 @@ impl Pairing {
     /// caller was told" one event instead of two timers.
     pub fn on_event(&mut self, event: Event, now_ms: u64) -> Option<PublishedEvent> {
         match event {
+            Event::DialFailed { code, detail } => {
+                self.dial_failed(&code, detail);
+                None
+            }
             Event::Started { attempt_id } => {
                 // The dialer's `attempt_id` comes from the opener's first `PairHello`, so the
                 // window's own admission limit is the opener's business; here the reserved
@@ -336,6 +371,10 @@ impl Pairing {
                 let prompt = *prompt;
                 if let Some(ceremony) = self.ceremonies.get_mut(&prompt.attempt_id) {
                     ceremony.address = prompt.address.clone();
+                }
+                // A waiter whose receiver is gone has nobody to tell; `send` consumes it.
+                for waiter in std::mem::take(&mut self.waiting) {
+                    let _ = waiter.send(prompt.clone());
                 }
                 if let Some(dial) = self.dial.take() {
                     let _ = dial.send(Ok(()));
@@ -449,14 +488,16 @@ pub async fn run(
     // ceremony must not hold a TLS connection open for its own sake.
     let approve = answer.await.unwrap_or(false);
     let outcome = if approve {
-        match driver.approve().await {
-            Ok(peer) => Outcome::Paired(Box::new(peer)),
-            Err(error) => Outcome::Failed(error.to_string()),
+        match tokio::time::timeout(DECISION_TIMEOUT, driver.approve()).await {
+            Ok(Ok(peer)) => Outcome::Paired(Box::new(peer)),
+            Ok(Err(error)) => Outcome::Failed(error.to_string()),
+            Err(_) => Outcome::Failed("the other computer did not confirm in time".to_owned()),
         }
     } else {
-        match driver.reject().await {
-            Ok(()) => Outcome::Rejected,
-            Err(error) => Outcome::Failed(error.to_string()),
+        match tokio::time::timeout(DECISION_TIMEOUT, driver.reject()).await {
+            Ok(Ok(())) => Outcome::Rejected,
+            Ok(Err(error)) => Outcome::Failed(error.to_string()),
+            Err(_) => Outcome::Failed("the other computer did not answer in time".to_owned()),
         }
     };
     let _ = events

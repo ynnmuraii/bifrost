@@ -49,6 +49,16 @@ pub type ClientStream = tokio::net::UnixStream;
 #[cfg(windows)]
 pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeServer;
 
+/// The stream a local client *connects* with: what [`connect`] hands back.
+///
+/// One name for the other end of [`ClientStream`], so a client (`lws-core status`, `lws-gui`,
+/// a test that drives `GuiFrame`) is written once for both platforms.
+#[cfg(unix)]
+pub type ClientConnection = tokio::net::UnixStream;
+/// See [`ClientConnection`].
+#[cfg(windows)]
+pub type ClientConnection = tokio::net::windows::named_pipe::NamedPipeClient;
+
 /// The directory a per-user endpoint name is derived from.
 ///
 /// Windows has no runtime directory, so `lws-core` falls back to the state directory for

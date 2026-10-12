@@ -9,6 +9,15 @@
 //! Both sides must answer, because the ceremony is mutual: `approve` sends the local
 //! decision and waits for the peer's, and only a `Committed` outcome is written to
 //! `trust.toml`. A rejection writes nothing.
+//!
+//! # With a core already running
+//!
+//! The peer's `pair/1` connection arrives on *core's* link listener (`docs/05-protocol.md`:
+//! pairing shares `47901`, told apart by ALPN), so a window can only be served by the process
+//! that owns that listener. `pair --open` therefore asks the running core over its control
+//! channel (`pair-open`/`pair-prompt`/`pair-answer`) and only binds a listener of its own when
+//! no core holds the port — the `--listen` address defaults to the configured
+//! `network.listen_address:port_input` for exactly that case.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -70,9 +79,24 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
     // an address for a dialer that does not use the documented default: the opener only
     // sees the dialer's ephemeral source port. A missing or invalid configuration is not
     // fatal here — `pair` reads this one setting and nothing else from it.
-    let listen_port = config::Config::load(paths.config_file())
+    // The port this node listens on, and the address a window opens on when this CLI has to
+    // serve one itself: `network.listen_address` + `network.port_input`, which is where the
+    // peer dials (`docs/05-protocol.md`). A missing or invalid configuration is not fatal
+    // here — this command reads these two settings and nothing else from it.
+    let configured = config::Config::load(paths.config_file()).ok();
+    let listen_port = configured
+        .as_ref()
         .map(|config| config.network.port_input)
         .unwrap_or(protocol::PORT_INPUT_CONTROL);
+    let default_listen = configured.as_ref().map_or_else(
+        || format!("127.0.0.1:{listen_port}"),
+        |config| {
+            format!(
+                "{}:{}",
+                config.network.listen_address, config.network.port_input
+            )
+        },
+    );
 
     let identity_paths = identity::IdentityPaths {
         data_dir: paths.data_dir().to_path_buf(),
@@ -90,8 +114,17 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
 
     runtime.block_on(async move {
         let driver = if open {
+            // A core that is already running owns `pair/1`: open the window through it.
+            let through_core = if listen.is_none() {
+                window_on_running_core(paths).await?
+            } else {
+                None
+            };
+            if let Some(outcome) = through_core {
+                return outcome;
+            }
             let address: SocketAddr = listen
-                .unwrap_or_else(|| "127.0.0.1:47911".to_owned())
+                .unwrap_or(default_listen)
                 .parse()
                 .map_err(|error| Failure::Run(format!("--listen: {error}")))?;
             let mut window = identity::open_window(identity::now_unix_ms() as u64)
@@ -124,6 +157,101 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
         };
         confirm(driver, &mut trust, &trust_path, open).await
     })
+}
+
+/// Opens the window on a core that is already running, if there is one.
+///
+/// `None` means "no core is listening": the caller then serves the window itself. `Some(())`
+/// means the window was served here, through the core, and the command is finished.
+async fn window_on_running_core(paths: &Paths) -> Result<Option<Result<(), Failure>>, Failure> {
+    let endpoint = crate::ctl::endpoint(crate::private_root(paths))
+        .map_err(|error| Failure::Run(format!("control endpoint: {error}")))?;
+    // `ping` is the documented liveness probe of the control channel and touches nothing
+    // else; a refused connection means no core holds this configuration directory.
+    if crate::ctl::request(&endpoint, "ping").await.is_err() {
+        return Ok(None);
+    }
+    let opened = ask_core(&endpoint, "pair-open 120", WINDOW)
+        .await
+        .map_err(Failure::Run)?;
+    let fields = Fields::parse(&opened);
+    println!(
+        "ядро уже запущено: окно открыто через него.\nадрес для второго компьютера: {}",
+        fields.get("address").unwrap_or("?")
+    );
+    println!(
+        "ожидание подключения второго компьютера ({} с)…",
+        fields.get("seconds").unwrap_or("120")
+    );
+
+    let prompt = ask_core(&endpoint, "pair-prompt", WINDOW + Duration::from_secs(10))
+        .await
+        .map_err(Failure::Run)?;
+    let fields = Fields::parse(&prompt);
+    println!("SAS: {}", fields.get("sas").unwrap_or("?"));
+    println!("peer: {}", fields.get("peer").unwrap_or("?"));
+    println!("compare the six digits with the other machine, then answer y/n");
+    print!("codes match? [y/N] ");
+    std::io::stdout().flush().ok();
+
+    let approved = ask().await?;
+    let Some(attempt) = fields.get("attempt") else {
+        return Err(Failure::Run(
+            "the core did not name the ceremony's attempt id".to_owned(),
+        ));
+    };
+    let answer = format!(
+        "pair-answer {attempt} {}",
+        if approved { "approve" } else { "reject" }
+    );
+    let outcome = ask_core(&endpoint, &answer, WINDOW + Duration::from_secs(10))
+        .await
+        .map_err(Failure::Run)?;
+    println!("{outcome}");
+    Ok(Some(Ok(())))
+}
+
+/// One control request with a deadline, because the deferred pairing verbs answer when the
+/// ceremony gets there and never before.
+async fn ask_core(
+    endpoint: &ipc::transport::Endpoint,
+    line: &str,
+    within: Duration,
+) -> Result<String, String> {
+    match tokio::time::timeout(within, crate::ctl::request(endpoint, line)).await {
+        Ok(Ok(reply)) => {
+            if let Some(rest) = reply.strip_prefix("ERR ") {
+                Err(rest.to_owned())
+            } else {
+                Ok(reply.trim_start_matches("OK ").to_owned())
+            }
+        }
+        Ok(Err(error)) => Err(format!("{error}")),
+        Err(_) => Err(format!(
+            "the core did not answer {line:?} within {within:?}"
+        )),
+    }
+}
+
+/// The `key=value` fields of a control reply.
+struct Fields(Vec<(String, String)>);
+
+impl Fields {
+    fn parse(line: &str) -> Self {
+        Fields(
+            line.split_whitespace()
+                .filter_map(|field| field.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+        )
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 /// Shows the SAS, asks, and commits only a mutual approval.
