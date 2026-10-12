@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod convert;
 pub mod link;
 pub mod manager;
+pub mod pairing;
 pub mod policy;
 pub mod queue;
 
@@ -17,6 +18,7 @@ pub use link::{
     LinkReport, Stream,
 };
 pub use manager::{LinkManager, ManagerConfig};
+pub use pairing::{PairingConnection, PairingGate};
 pub use policy::{
     admit_member, liveness_action, next_liveness_wakeup, prefer_incoming, reconnect_delay,
     winning_dialer, BackoffBounds, LinkLiveness, LivenessAction, MembershipFull,

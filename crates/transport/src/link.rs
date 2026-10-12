@@ -52,8 +52,17 @@ pub enum LinkDownReason {
 }
 
 /// What the application sees from a link.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The [`LinkEvent::Pairing`] variant owns a TLS stream, which is neither `Clone` nor
+/// `PartialEq`, so this enum deliberately does not derive either.
+#[derive(Debug)]
 pub enum LinkEvent {
+    /// An accepted `pair/1` connection the application must run the ceremony on
+    /// (`docs/05-protocol.md`: `pair/1` shares `47901`, so the listener tells it apart by
+    /// ALPN). The manager has already admitted the dialer through
+    /// [`crate::PairingGate::admit`]; the application runs [`identity::accept_stream`] on
+    /// the stream and calls [`crate::PairingGate::finish`] once the ceremony concludes.
+    Pairing(Box<crate::pairing::PairingConnection>),
     /// TLS and the `Hello` exchange finished.
     Up {
         /// The peer.
