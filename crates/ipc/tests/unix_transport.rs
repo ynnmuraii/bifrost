@@ -211,10 +211,13 @@ async fn a_cancelled_accept_keeps_the_client_that_connects_while_it_waits() {
 
     let socket = TempSocket::new("cancel");
     let mut listener = transport::listen(&socket.endpoint).expect("listening");
+    // Bound outside the braces: the future borrows it, so a temporary would be dropped
+    // while borrowed.
+    let check = SameUser::current();
 
     // The cancel window: one poll with nothing pending, then drop the future.
     {
-        let mut pending = std::pin::pin!(listener.accept(&SameUser::current()));
+        let mut pending = std::pin::pin!(listener.accept(&check));
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
         assert!(
@@ -231,7 +234,7 @@ async fn a_cancelled_accept_keeps_the_client_that_connects_while_it_waits() {
             .expect("connecting to the GUI socket")
     });
     let mut accepted = listener
-        .accept(&SameUser::current())
+        .accept(&check)
         .await
         .expect("accepting the queued client");
     let mut client = client.await.expect("the client task");
