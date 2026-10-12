@@ -438,11 +438,15 @@ impl GuiListener {
             pending: &mut self.pending,
         };
         if let Err(source) = instance.server().connect().await {
-            // The wait ended without a client core can serve: the client that queued on this
-            // instance left (Windows reports `ERROR_NO_DATA`), or the wait itself failed. Such
-            // an instance cannot be waited on again — keeping it would leave the channel
-            // stuck on a dead pipe and every later client refused — so it goes, and a fresh
-            // one takes its place.
+            // The wait failed (a closed instance, an invalid handle): an instance whose
+            // `ConnectNamedPipe` errored cannot be waited on again — keeping it would leave the
+            // channel stuck on a dead pipe with every later client refused — so it goes, and a
+            // fresh one takes its place.
+            //
+            // A client that queued on the instance and left is *not* this case: Windows reports
+            // `ERROR_NO_DATA` and mio maps it to a successful connect, so the instance is handed
+            // on and the caller's first read or write on the gone client fails, which is where
+            // it is dropped.
             instance.discard();
             self.pending = Some(
                 self.security
