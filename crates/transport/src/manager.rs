@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use focus_router as fr;
 use geometry::NodeId;
@@ -601,16 +601,29 @@ async fn dial_loop(
         Err(_) => return,
     };
     let connector = TlsConnector::from(Arc::new(client_config));
+    // How long one dial may take.
+    //
+    // `TcpStream::connect` and the TLS handshake have no deadline of their own, and a peer that
+    // accepts the connection and then says nothing — a blackholed route, a suspended core, a
+    // half-open path — parks the dialer for ever; with it the whole reconnect schedule stops,
+    // and the node never dials that peer again while it lives. That is how a partition failed to
+    // heal on the two-CPU CI runner: both ends logged `link down reason=Timeout` and then no
+    // `link up` for the rest of the test. The window is the one the protocol already gives a
+    // peer to answer a `Ping` («офлайн через 3 s без `Pong`»): a handshake that cannot finish
+    // inside it belongs to an unreachable peer, not a slow one.
+    let dial_timeout = Duration::from_millis(settings.liveness.offline_ms);
     let mut attempt = 0u32;
     loop {
-        let connected = async {
+        let connected = tokio::time::timeout(dial_timeout, async {
             let tcp = TcpStream::connect(address).await.ok()?;
             connector
                 .connect(identity::server_name(address.ip()), tcp)
                 .await
                 .ok()
-        }
-        .await;
+        })
+        .await
+        .ok()
+        .flatten();
         if let Some(stream) = connected {
             let peer = stream
                 .get_ref()

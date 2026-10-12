@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -740,4 +740,85 @@ fn the_membership_refusal_can_be_read_back_from_the_wire() {
     );
     // An undefined number is still rejected, so the check did not become "anything goes".
     assert!(transport::convert::error_code_from_i32(23_000).is_err());
+}
+
+/// A dial must end: a peer that accepts the connection and then says nothing must be retried.
+///
+/// `TcpStream::connect` and the TLS handshake have no deadline of their own, so a blackholed
+/// route (or a suspended core, or a half-open path) used to park the dialer for ever — and with
+/// it the whole reconnect schedule: the node never dialed that peer again while it lived, so a
+/// partition never healed. The layout suite's heal waits were the messenger for it on the
+/// two-CPU CI runner («the follower adopts the coordinator's revision did not happen»); this
+/// test is the mechanism, with no proxy or core in the way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_peer_is_retried_instead_of_parking_the_dialer() {
+    // The peer: accepts, holds the connection, never answers. The dialer's handshake waits for
+    // a `ServerHello` that never comes, which is what a blackholed route looks like.
+    let blackhole = tokio::net::TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .expect("a blackhole listener");
+    let address = blackhole.local_addr().expect("its address");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let held: Arc<std::sync::Mutex<Vec<tokio::net::TcpStream>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let counter = Arc::clone(&attempts);
+    let keep = Arc::clone(&held);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = blackhole.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // Holding the stream is the point: closing it would end the handshake and let the
+            // dial fail fast instead of hanging.
+            keep.lock().expect("held streams").push(stream);
+        }
+    });
+
+    let root = temp_root("silent-peer");
+    let identity = Arc::new(identity_at(&root, "dialer"));
+    let id = identity.node_id();
+    let silent = identity_at(&root, "silent").node_id();
+    let mut trust = TrustStore::new();
+    trust.trust(TrustedPeer::paired(
+        silent,
+        "silent",
+        Some(address.to_string()),
+        now_unix_ms(),
+    ));
+    let (manager, _events) = LinkManager::new(ManagerConfig {
+        identity,
+        trust,
+        local_hello: hello_for(id, "dialer"),
+        listen: "127.0.0.1:0".parse().expect("a listen address"),
+        peers: vec![address],
+        max_members: 3,
+        queue_capacity: 64,
+        liveness: LIVENESS,
+        backoff: BackoffBounds::default(),
+        pairing: transport::PairingGate::closed(),
+    })
+    .expect("manager");
+    let manager = Arc::new(manager);
+    let runner = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = manager.run().await;
+        })
+    };
+
+    // One attempt may last `LIVENESS.offline_ms` (the dial deadline in `dial_loop`) and a retry
+    // adds the first backoff step; three deadlines plus two seconds is far past a second
+    // attempt, and a dialer that parks on the first one never gets there.
+    let bound = Duration::from_millis(LIVENESS.offline_ms * 3 + 2_000);
+    let deadline = Instant::now() + bound;
+    while attempts.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let seen = attempts.load(Ordering::SeqCst);
+    runner.abort();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        seen >= 2,
+        "a silent peer parked the dialer: {seen} attempt(s) in {bound:?} — with no deadline on \
+         `TcpStream::connect` plus the TLS handshake the reconnect schedule never runs again"
+    );
 }
