@@ -311,6 +311,34 @@ pub enum Inbound {
     Focus(fr::Message),
     /// A layout-document message, in the wire types core works with.
     Layout(LayoutMessage),
+    /// A clipboard message that arrived on the input link.
+    ///
+    /// `docs/05-protocol.md` («Clipboard канал»): the peer that holds content hands every member
+    /// a `ClipboardGrant` *before* the channel it authorises exists, so the grant is the one
+    /// clipboard message that travels on the input link. Every later clipboard message belongs
+    /// to the channel itself. `connection_id` is the envelope's, which is the parent the bind
+    /// echoes back.
+    Clipboard {
+        /// The message.
+        message: crate::clipboard::ClipboardMessage,
+        /// The parent connection the channel will be bound to.
+        connection_id: [u8; 16],
+    },
+}
+
+/// Whether a payload belongs to the clipboard channel's vocabulary.
+fn is_clipboard(payload: &wire::envelope::Payload) -> bool {
+    use wire::envelope::Payload;
+    matches!(
+        payload,
+        Payload::ClipboardGrant(_)
+            | Payload::ClipboardBind(_)
+            | Payload::ClipboardOffer(_)
+            | Payload::ClipboardRequest(_)
+            | Payload::ClipboardData(_)
+            | Payload::ClipboardComplete(_)
+            | Payload::ClipboardCancel(_)
+    )
 }
 
 /// The layout half of the wire: whole-document replication and its CAS.
@@ -398,6 +426,18 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
             })),
             _ => from_envelope(envelope).map(Inbound::Focus),
         },
+        Some(payload) if is_clipboard(payload) => {
+            let message = crate::clipboard::ClipboardMessage::from_envelope(envelope)?;
+            let connection_id: [u8; 16] = envelope
+                .connection_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| ConvertError::Unsupported("connection_id is not 16 bytes"))?;
+            Ok(Inbound::Clipboard {
+                message,
+                connection_id,
+            })
+        }
         None => Err(ConvertError::Unsupported("empty payload")),
         Some(_) => from_envelope(envelope).map(Inbound::Focus),
     }
@@ -791,6 +831,12 @@ pub struct PeerInfo {
     /// `Capabilities::receiver_ready()` and a source needs `source_ready()` — so an
     /// application that fed `Input::Hello` without them could never enter `Remote`.
     pub capabilities: fr::Capabilities,
+    /// `CAPABILITY_TEXT_CLIPBOARD`.
+    ///
+    /// Deliberately *not* part of [`fr::Capabilities`]: the focus FSM has no opinion on the
+    /// clipboard, but the clipboard channel does — ADR-008 makes it opt-in on both sides, so a
+    /// node whose peer did not claim this bit never offers it anything.
+    pub text_clipboard: bool,
 }
 
 impl PeerInfo {
@@ -828,6 +874,9 @@ impl PeerInfo {
                 ))
             },
             capabilities: capabilities_from_wire(&hello.capabilities),
+            text_clipboard: hello
+                .capabilities
+                .contains(&(wire::Capability::TextClipboard as i32)),
         })
     }
 }

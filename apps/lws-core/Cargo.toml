@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+clipboard = { path = "../../crates/clipboard" }
 config = { path = "../../crates/config" }
 focus-router = { path = "../../crates/focus-router" }
 geometry = { path = "../../crates/geometry" }

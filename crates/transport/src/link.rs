@@ -59,6 +59,10 @@ pub enum LinkEvent {
         peer: NodeId,
         /// Its `Hello` gossip.
         hello: PeerInfo,
+        /// The negotiated `connection_id`: the dialer's random 16 bytes, which the acceptor
+        /// adopts. Every `Envelope` of this link carries it, and a clipboard channel is bound
+        /// to it as its parent (`docs/05-protocol.md`, «Clipboard канал»).
+        connection_id: [u8; 16],
     },
     /// One message from the peer, in the layer that owns it.
     Message {
@@ -209,6 +213,8 @@ impl LinkHandle {
                 .map_err(|_| TransportError::LinkClosed),
             // `outbound_of` never produces this arm; it exists because `Outbound` is shared.
             Outbound::Layout(message) => self.send_layout(message).await,
+            // The same: a clipboard message is queued through `send_clipboard`, never here.
+            Outbound::Clipboard(message) => self.send_clipboard(message).await,
         }
     }
 
@@ -223,6 +229,21 @@ impl LinkHandle {
     ) -> Result<(), TransportError> {
         self.tx
             .send(Outbound::Layout(message))
+            .await
+            .map_err(|_| TransportError::LinkClosed)
+    }
+
+    /// Sends one clipboard message on this link.
+    ///
+    /// The grant is the only clipboard message the input link carries, and it has to reach the
+    /// peer *before* the channel it authorises exists (`docs/05-protocol.md`, «Clipboard канал»);
+    /// every later clipboard message travels on that channel instead.
+    pub async fn send_clipboard(
+        &self,
+        message: crate::clipboard::ClipboardMessage,
+    ) -> Result<(), TransportError> {
+        self.tx
+            .send(Outbound::Clipboard(message))
             .await
             .map_err(|_| TransportError::LinkClosed)
     }
@@ -275,6 +296,8 @@ pub enum LinkReport {
         direction: Direction,
         /// Its gossip.
         hello: PeerInfo,
+        /// The negotiated `connection_id` (see [`LinkEvent::Up`]).
+        connection_id: [u8; 16],
     },
     /// A focus/lease message.
     Message {
@@ -610,6 +633,7 @@ impl LinkState {
                     peer: self.peer,
                     direction: self.direction,
                     hello: info,
+                    connection_id: self.connection_id,
                 })
                 .await
                 .map_err(|_| LinkDownReason::LocalClosed);
@@ -693,6 +717,10 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
                 write_layout_message(writer, state, message.clone()).await?;
                 index += 1;
             }
+            Outbound::Clipboard(message) => {
+                write_clipboard_message(writer, state, message.clone()).await?;
+                index += 1;
+            }
             Outbound::Motion(_) => {
                 // Merge the contiguous motion run that starts here.
                 let mut events = Vec::new();
@@ -710,6 +738,19 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
         }
     }
     Ok(())
+}
+
+/// Writes one clipboard message: same framing, no lease (it belongs to the connection).
+async fn write_clipboard_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    state: &mut LinkState,
+    message: crate::clipboard::ClipboardMessage,
+) -> Result<(), LinkDownReason> {
+    let envelope = message
+        .to_envelope(state.tx_seq, &state.connection_id)
+        .map_err(|error| LinkDownReason::Protocol(error.to_string()))?;
+    state.tx_seq += 1;
+    write_frame(writer, &envelope).await.map_err(reason_from)
 }
 
 /// Writes one layout message: same framing, no lease and no batch display.

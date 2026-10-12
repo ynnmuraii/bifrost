@@ -246,6 +246,60 @@ impl Node {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Where the dry agent mirrors its clipboard (`--dry-clipboard-dir`).
+    ///
+    /// Core owns the directory beside the launch token, so it moves with the rest of the
+    /// node's private state: `run/` on Linux, `state/` on Windows (`config::Paths`, which
+    /// `--root` fills in).
+    pub fn dry_clipboard_dir(&self) -> PathBuf {
+        let private = if cfg!(windows) { "state" } else { "run" };
+        self.root.join(private).join("clipboard-dry")
+    }
+
+    /// Writes text into the dry clipboard's `in.txt`, which the agent reads as a **local user
+    /// copy** — the hook the clipboard suite drives the OS layer with, since the runner has no
+    /// clipboard of its own.
+    pub fn copy_to_clipboard(&self, text: &str) {
+        let dir = self.dry_clipboard_dir();
+        std::fs::create_dir_all(&dir).expect("dry clipboard directory");
+        std::fs::write(dir.join("in.txt"), text).expect("dry clipboard in.txt");
+    }
+
+    /// What the dry clipboard currently holds (`out.txt`), once the agent has written it.
+    pub fn clipboard_text(&self) -> Option<String> {
+        std::fs::read_to_string(self.dry_clipboard_dir().join("out.txt")).ok()
+    }
+
+    /// A local copy a password manager would have marked: `in.txt` plus the marker names the
+    /// platform adapter reports (`AC-15`).
+    pub fn copy_to_clipboard_marked(&self, text: &str, markers: &[&str]) {
+        let dir = self.dry_clipboard_dir();
+        std::fs::create_dir_all(&dir).expect("dry clipboard directory");
+        // The markers go first: the agent reads the pair when `in.txt` changes.
+        std::fs::write(dir.join("in.markers"), markers.join(",")).expect("dry clipboard markers");
+        std::fs::write(dir.join("in.txt"), text).expect("dry clipboard in.txt");
+    }
+
+    /// Waits until the dry clipboard holds exactly `expected`.
+    pub fn wait_for_clipboard(&self, expected: &str, timeout: Duration) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Some(text) = self.clipboard_text() {
+                if text == expected {
+                    return Ok(text);
+                }
+                last = text;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err(format!(
+            "the dry clipboard never held {} bytes of the expected text; last seen: {} bytes",
+            expected.len(),
+            last.len()
+        ))
+    }
+
     /// Every `focus focus="…"` transition with its wall-clock millisecond.
     pub fn focus_events(&self) -> Vec<(i64, String)> {
         self.log()
@@ -675,16 +729,46 @@ impl Harness {
     /// `proxied` puts the link through a [`Proxy`]; `dry_motion` starts the source with
     /// the synthetic edge walk and writes the `[topology]` document it needs.
     pub fn start(proxied: bool, dry_motion: bool) -> Harness {
+        Harness::start_with(proxied, dry_motion, |_, _| ()).0
+    }
+
+    /// The same, with a hook that runs once both roots are paired and the topology is
+    /// written, but before either core starts.
+    ///
+    /// That window is what a scenario needing a different `config.toml` uses: the clipboard
+    /// suite turns `[clipboard]` on there, and nothing that is already running has read the
+    /// file yet.
+    pub fn start_with<T>(
+        proxied: bool,
+        dry_motion: bool,
+        before_run: impl FnOnce(&PathBuf, &PathBuf) -> T,
+    ) -> (Harness, T) {
         let dir = unique_dir("fault-injection");
         let a_root = dir.join("a");
         let b_root = dir.join("b");
         let a_port = free_port();
         let b_port = free_port();
+        let a_clipboard_port = free_port();
+        let b_clipboard_port = free_port();
         for root in [&a_root, &b_root] {
             std::fs::create_dir_all(root.join("config")).expect("config directory");
         }
-        write_config(&a_root, a_port, "source", true, dry_motion);
-        write_config(&b_root, b_port, "receiver", false, dry_motion);
+        write_config(
+            &a_root,
+            a_port,
+            a_clipboard_port,
+            "source",
+            true,
+            dry_motion,
+        );
+        write_config(
+            &b_root,
+            b_port,
+            b_clipboard_port,
+            "receiver",
+            false,
+            dry_motion,
+        );
 
         // Pairing happens on the real ports: it is the ceremony that writes the records.
         pair(&a_root, &b_root, a_port, b_port);
@@ -704,10 +788,11 @@ impl Harness {
             write_topology(&a_root, &b_id);
             write_topology(&b_root, &a_id);
         }
+        let attached = before_run(&a_root, &b_root);
 
         let a = spawn_node(a_root, a_id, dry_motion, "a");
         let b = spawn_node(b_root, b_id, dry_motion, "b");
-        Harness { dir, a, b, proxy }
+        (Harness { dir, a, b, proxy }, attached)
     }
 
     /// Waits until both nodes see each other, both agents are ready, and the source owns
@@ -880,15 +965,34 @@ pub fn free_port() -> u16 {
 }
 
 /// The base configuration, with the topology section left out.
-fn write_config(root: &Path, port: u16, name: &str, can_own: bool, _dry_motion: bool) {
+fn write_config(
+    root: &Path,
+    port: u16,
+    clipboard_port: u16,
+    name: &str,
+    can_own: bool,
+    _dry_motion: bool,
+) {
     // The two-node harness couples them: the source owns and claims, the receiver does
     // neither. `write_config_sides` is for the cluster, where every node may own but only
     // one claims on startup.
-    write_config_sides(root, port, name, can_own, can_own);
+    write_config_sides(root, port, clipboard_port, name, can_own, can_own);
 }
 
 /// The base configuration with `can_own` and `claim_on_startup` chosen separately.
-fn write_config_sides(root: &Path, port: u16, name: &str, can_own: bool, claim_on_startup: bool) {
+///
+/// `port_clipboard` is a port of its own and *not* `port + 1`: two nodes whose input ports
+/// happen to be adjacent (`free_port` hands out whatever the OS has) would otherwise collide,
+/// one of them would fail to bind its clipboard listener, and the suite would fail for a
+/// reason that has nothing to do with the clipboard.
+fn write_config_sides(
+    root: &Path,
+    port: u16,
+    clipboard_port: u16,
+    name: &str,
+    can_own: bool,
+    claim_on_startup: bool,
+) {
     let document = format!(
         "config_version = 2\n\
          \n\
@@ -900,7 +1004,7 @@ fn write_config_sides(root: &Path, port: u16, name: &str, can_own: bool, claim_o
          [network]\n\
          listen_address = \"127.0.0.1\"\n\
          port_input = {port}\n\
-         port_clipboard = {}\n\
+         port_clipboard = {clipboard_port}\n\
          max_members = 3\n\
          \n\
          [input]\n\
@@ -908,9 +1012,41 @@ fn write_config_sides(root: &Path, port: u16, name: &str, can_own: bool, claim_o
          \n\
          [log]\n\
          level = \"info\"\n",
-        port + 1,
     );
     std::fs::write(root.join("config/config.toml"), document).expect("configuration");
+}
+
+/// Turns `[clipboard]` on in a node's `config.toml` before it starts.
+///
+/// ADR-008 makes the clipboard opt-in, and off by default, so the suite that needs the second
+/// channel turns it on explicitly instead of making every other test carry the setting.
+pub fn enable_clipboard(root: &Path) {
+    append_config(
+        root,
+        "\n[clipboard]\nenabled = true\nskip_secret_marked = true\n",
+    );
+}
+
+/// The same, with an explicit per-channel rate.
+///
+/// `KVM-042` needs a transfer that is slow enough to measure against: at the default 256 KiB/s
+/// a 1 MiB payload takes four seconds, and the test that measures a transition against it wants
+/// the clipboard busy for longer than that.
+pub fn write_clipboard_rate(root: &Path, rate_bytes_per_s: u64) {
+    append_config(
+        root,
+        &format!(
+            "\n[clipboard]\nenabled = true\nskip_secret_marked = true\nrate_bytes_per_s = {rate_bytes_per_s}\n"
+        ),
+    );
+}
+
+/// Appends a TOML fragment to a node's configuration.
+pub fn append_config(root: &Path, fragment: &str) {
+    let path = root.join("config/config.toml");
+    let mut document = std::fs::read_to_string(&path).expect("configuration");
+    document.push_str(fragment);
+    std::fs::write(&path, document).expect("configuration");
 }
 
 /// The `[topology]` document `--dry-motion` walks across.
@@ -1151,9 +1287,17 @@ impl Cluster {
             let root = dir.join(name);
             std::fs::create_dir_all(root.join("config")).expect("config directory");
             let port = free_port();
+            let clipboard_port = free_port();
             // `AC-21`: «владение можно заявить с любого узла» — every node in the cluster
             // may own; only `w` claims on startup, the other two follow until asked.
-            write_config_sides(&root, port, &format!("node-{name}"), true, index == 0);
+            write_config_sides(
+                &root,
+                port,
+                clipboard_port,
+                &format!("node-{name}"),
+                true,
+                index == 0,
+            );
             roots.push(root);
             ports.push(port);
         }

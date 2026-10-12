@@ -26,6 +26,9 @@ fn round_trip(message: &LayoutMessage) -> LayoutMessage {
     match inbound_from_envelope(&envelope).expect("a layout payload must convert") {
         Inbound::Layout(message) => message,
         Inbound::Focus(other) => panic!("expected a layout message, got {other:?}"),
+        Inbound::Clipboard { message, .. } => {
+            panic!("expected a layout message, got a clipboard one: {message:?}")
+        }
     }
 }
 

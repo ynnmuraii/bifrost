@@ -21,6 +21,7 @@
 //! the only process that listens on the network.
 
 mod agent;
+mod clipboard;
 mod command;
 mod ctl;
 mod ids;
@@ -326,6 +327,7 @@ async fn run_async(
         NodeIdentity::load_or_create(&identity_paths).map_err(|error| error.to_string())?;
     tracing::info!(load = ?load, "identity loaded");
     let trust = load_trust(paths).map_err(failure_message)?;
+    let identity = Arc::new(identity);
     let node_id = identity.node_id();
 
     let listen: SocketAddr = options
@@ -343,6 +345,34 @@ async fn run_async(
     peers.sort();
     peers.dedup();
 
+    // `[clipboard]`: the second channel (ADR-008) exists only when the setting is on. It has a
+    // listener of its own on `network.port_clipboard` and a dial list of its own, because
+    // `KVM-042` («объём clipboard не блокирует key-up») is exactly about the two channels not
+    // sharing a socket, a queue or a task.
+    let (clipboard, clipboard_events) = if config.clipboard.enabled {
+        let clipboard_listen = SocketAddr::new(listen.ip(), config.network.port_clipboard);
+        let clipboard_peers: Vec<SocketAddr> = peers
+            .iter()
+            .map(|address| SocketAddr::new(address.ip(), config.network.port_clipboard))
+            .collect();
+        let (endpoint, events) = clipboard::Clipboard::start(
+            node_id,
+            clipboard::Settings::from_config(&config.clipboard),
+            Arc::clone(&identity),
+            trust.clone(),
+            clipboard_listen,
+            clipboard_peers,
+            QUEUE_CAPACITY,
+        )
+        .await?;
+        (Some(endpoint), events)
+    } else {
+        // Nothing listens and nothing dials, and the `select!` arm is disabled by the
+        // `clipboard.is_some()` guard, so this receiver never fires.
+        let (_unused, events) = tokio::sync::mpsc::channel(1);
+        (None, events)
+    };
+
     let local_hello = routing::hello(
         node_id,
         config.node.display_name.as_str(),
@@ -357,7 +387,7 @@ async fn run_async(
         },
     );
     let manager_config = ManagerConfig {
-        identity: Arc::new(identity),
+        identity: Arc::clone(&identity),
         trust: trust.clone(),
         local_hello,
         listen,
@@ -461,6 +491,8 @@ async fn run_async(
         // counter it learned instead of claiming serial 1 again (`ownership_store`).
         OwnershipStore::new(paths.config_file(), config.clone()),
         LayoutStore::new(paths.config_file(), config.clone(), node_id),
+        clipboard,
+        clipboard_events,
     );
     session.run().await.map_err(|error| error.to_string())
 }
@@ -594,6 +626,15 @@ fn decide_session(config: &config::Config) -> LocalSession {
             capabilities: platform_probe::Capabilities {
                 receiver_takeover: session.capabilities.receiver_takeover
                     && config.input.takeover_detection != config::TakeoverDetection::Off,
+                // ADR-008: `CAPABILITY_TEXT_CLIPBOARD` is claimed only when the clipboard is
+                // enabled *and* this session has an adapter the build can drive. Windows and
+                // X11 own the selection directly; the Wayland path is the clipboard portal,
+                // which is not implemented here, so a Wayland node does not claim it.
+                text_clipboard: config.clipboard.enabled
+                    && matches!(
+                        session.session_kind,
+                        platform_probe::SessionKind::Windows | platform_probe::SessionKind::X11
+                    ),
                 ..session.capabilities
             },
             fsm: focus_router::Capabilities {

@@ -101,6 +101,37 @@ pub fn trusted_server_config(
     server_config(identity, TrustPolicy::Pinned(trust.pinned()), &LINK_ALPN)
 }
 
+/// Client config for the **clipboard channel only**: ALPN
+/// `protocol::limits::ALPN_CLIPBOARD`, pinned to the active trust records.
+///
+/// The clipboard channel is its own TLS session on port `47902`
+/// (`docs/05-protocol.md`), so its handshake negotiates only
+/// `lan-workspace/clipboard/1`. A peer with no active trust record is refused during the
+/// handshake, before any `ClipboardBind` is read; a peer that answered on another channel
+/// cannot reach this one.
+pub fn clipboard_client_config(
+    identity: &NodeIdentity,
+    trust: &TrustStore,
+) -> Result<ClientConfig, IdentityError> {
+    client_config(
+        identity,
+        TrustPolicy::Pinned(trust.pinned()),
+        &[protocol::limits::ALPN_CLIPBOARD],
+    )
+}
+
+/// Server config for the **clipboard channel only**. See [`clipboard_client_config`].
+pub fn clipboard_server_config(
+    identity: &NodeIdentity,
+    trust: &TrustStore,
+) -> Result<ServerConfig, IdentityError> {
+    server_config(
+        identity,
+        TrustPolicy::Pinned(trust.pinned()),
+        &[protocol::limits::ALPN_CLIPBOARD],
+    )
+}
+
 /// Client config for the pairing channel: the server is unknown by definition, and the
 /// SAS code is what authenticates it.
 pub fn pairing_client_config(identity: &NodeIdentity) -> Result<ClientConfig, IdentityError> {
@@ -141,5 +172,149 @@ fn check_policy_alpn(policy: &TrustPolicy, alpn: &[&str]) -> Result<(), Identity
                 .into(),
         )),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::key::IdentityPaths;
+    use crate::trust::TrustedPeer;
+
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lws-identity-config-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        dir
+    }
+
+    fn identity_at(root: &std::path::Path, name: &str) -> NodeIdentity {
+        NodeIdentity::load_or_create(&IdentityPaths::rooted_at(root.join(name)))
+            .expect("identity")
+            .0
+    }
+
+    /// A pinned trust store for the two identities that have just met.
+    fn paired(a: &NodeIdentity, b: &NodeIdentity) -> (TrustStore, TrustStore) {
+        let mut a_trust = TrustStore::new();
+        a_trust.trust(TrustedPeer::paired(b.node_id(), "peer", None, 0));
+        let mut b_trust = TrustStore::new();
+        b_trust.trust(TrustedPeer::paired(a.node_id(), "peer", None, 0));
+        (a_trust, b_trust)
+    }
+
+    /// The clipboard channel's handshake negotiates `lan-workspace/clipboard/1` on both
+    /// sides: the two builders offer that ALPN and nothing else, and rustls selects it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clipboard_handshake_negotiates_the_clipboard_alpn() {
+        let root = temp_dir("clipboard-alpn");
+        let server = identity_at(&root, "server");
+        let client = identity_at(&root, "client");
+        let (server_trust, client_trust) = paired(&server, &client);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let acceptor = TlsAcceptor::from(Arc::new(
+            clipboard_server_config(&server, &server_trust).expect("server config"),
+        ));
+
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let stream = acceptor.accept(tcp).await.expect("handshake");
+            stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .map(<[u8]>::to_vec)
+        });
+
+        let connector = TlsConnector::from(Arc::new(
+            clipboard_client_config(&client, &client_trust).expect("client config"),
+        ));
+        let tcp = TcpStream::connect(address).await.expect("connect");
+        let stream = connector
+            .connect(server_name(address.ip()), tcp)
+            .await
+            .expect("handshake");
+        let client_alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        let server_alpn = accept.await.expect("accept task");
+
+        assert_eq!(
+            client_alpn.as_deref(),
+            Some(protocol::limits::ALPN_CLIPBOARD.as_bytes()),
+            "the dialer must negotiate the clipboard ALPN"
+        );
+        assert_eq!(
+            server_alpn.as_deref(),
+            Some(protocol::limits::ALPN_CLIPBOARD.as_bytes()),
+            "the acceptor must negotiate the clipboard ALPN"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An input-only server refuses a client that offers only the clipboard ALPN: rustls
+    /// sends `no_application_protocol` when the server has ALPN configured and nothing
+    /// overlaps, so a clipboard session cannot masquerade as an input link.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_input_only_server_refuses_a_clipboard_only_client() {
+        let root = temp_dir("clipboard-vs-input");
+        let server = identity_at(&root, "server");
+        let client = identity_at(&root, "client");
+        let (server_trust, client_trust) = paired(&server, &client);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let acceptor = TlsAcceptor::from(Arc::new(
+            server_config(
+                &server,
+                TrustPolicy::Pinned(server_trust.pinned()),
+                &[protocol::limits::ALPN_INPUT],
+            )
+            .expect("input-only server config"),
+        ));
+
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            acceptor.accept(tcp).await.map(|_| ())
+        });
+
+        let connector = TlsConnector::from(Arc::new(
+            clipboard_client_config(&client, &client_trust).expect("client config"),
+        ));
+        let tcp = TcpStream::connect(address).await.expect("connect");
+        let client_result = connector
+            .connect(server_name(address.ip()), tcp)
+            .await;
+
+        let server_result = accept.await.expect("accept task");
+        assert!(
+            server_result.is_err(),
+            "an input-only server must refuse a clipboard-only client"
+        );
+        // The client may observe the refusal as a handshake error, or the handshake may
+        // finish just before the server's `no_application_protocol` alert arrives; in that
+        // case the proof of refusal is a stream that never delivers data.
+        if let Ok(mut stream) = client_result {
+            use tokio::io::AsyncReadExt;
+            let mut byte = [0u8; 1];
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut byte))
+                    .await;
+            assert!(
+                matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+                "a refused clipboard client must not be able to exchange data"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
