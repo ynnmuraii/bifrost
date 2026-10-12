@@ -157,6 +157,924 @@ pub fn kde_hint_is_secret(value: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// The targets this adapter advertises from `TARGETS`, in the order it answers them.
+///
+/// ICCCM section 2.6.2 requires `TIMESTAMP` (so a requestor can discover the acquisition
+/// time and reject stale requests) and `TARGETS` itself; `UTF8_STRING` is what modern
+/// clients paste as, and `TEXT` is the polymorphic fallback. These are names, not atoms:
+/// interning them needs a connection, this list does not.
+pub const SELECTION_TARGET_NAMES: [&str; 4] = ["TIMESTAMP", "TARGETS", "UTF8_STRING", "TEXT"];
+
+/// The chunk size this node writes per property for its own `INCR` transfers.
+///
+/// ICCCM section 2.7.2 says each chunk "should be less than the maximum-request-size in
+/// the connection handshake", so the requestor's maximum is the natural chunk; a zero would
+/// make the transfer spin forever, so it is floored at one byte.
+pub fn incr_chunk_size(max_request_size: usize) -> usize {
+    max_request_size.max(1)
+}
+
+/// Decodes a clipboard payload as UTF-8, or `None` when it is not text.
+///
+/// Text-only is ADR-008's contract. A payload that is not valid UTF-8 is *not text*, so the
+/// adapter reports `has_text = false` rather than lossily rewriting what another client
+/// published: half of a JPEG is not a string, and a monitoring channel must never be handed
+/// a plausible-looking mutation of a secret's bytes.
+pub fn decode_text_payload(bytes: &[u8]) -> Option<String> {
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+/// The X11 `CLIPBOARD` adapter: ownership, change observation and the `INCR` wire dance.
+///
+/// The machine above owns the *arithmetic* of an `INCR` transfer; this owns the X plumbing
+/// around it. One background thread keeps a single connection pumping, so a
+/// `SelectionRequest` from another client (a paste of our own selection) is served while the
+/// caller does something else, and `wait`/`read`/`set` are messages to that thread. The
+/// public API is `&self` because the thread holds the mutable state.
+#[cfg(target_os = "linux")]
+mod x11_impl {
+    use std::fmt;
+    use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use clipboard::Marker;
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xfixes::{self, ConnectionExt as _, SelectionEventMask};
+    use x11rb::protocol::xproto::{
+        self, Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux,
+        EventMask, PropMode, Property, SelectionNotifyEvent, SelectionRequestEvent, Timestamp,
+        Window, WindowClass,
+    };
+    use x11rb::protocol::Event;
+    use x11rb::rust_connection::RustConnection;
+
+    use super::{
+        decode_text_payload, incr_chunk_size, kde_hint_is_secret, needs_incr, Owner, Requestor,
+        DEFAULT_MAX_REQUEST_SIZE, KDE_PASSWORD_HINT, SELECTION_TARGET_NAMES,
+    };
+
+    /// How long one `read` step waits for the X reply it needs.
+    const READ_TIMEOUT: Duration = Duration::from_secs(10);
+    /// How long the pump blocks on the connection before checking for a command again.
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    /// The atom value `None`.
+    const NONE_ATOM: Atom = 0;
+    /// The X protocol's `CurrentTime`.
+    const CURRENT_TIME: Timestamp = 0;
+
+    /// What one clipboard read found.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Snapshot {
+        /// The selection text, decoded from UTF-8.
+        pub text: String,
+        /// Every secret marker the item carried.
+        pub markers: Vec<Marker>,
+        /// Whether the selection held text at all: an image-only selection is not an error,
+        /// it is simply nothing this adapter can offer.
+        pub has_text: bool,
+    }
+
+    impl Snapshot {
+        /// The content description `clipboard::policy` decides on.
+        pub fn content(&self) -> clipboard::Content {
+            clipboard::Content {
+                bytes: self.text.len() as u64,
+                markers: self.markers.clone(),
+            }
+        }
+    }
+
+    /// Why an adapter operation failed.
+    #[derive(Debug)]
+    pub enum ClipboardError {
+        /// Opening the display named by `$DISPLAY` failed.
+        Connect(x11rb::errors::ConnectError),
+        /// The X connection broke, or a request could not be written to it.
+        Connection(x11rb::errors::ConnectionError),
+        /// The server answered a request with an X protocol error.
+        Reply(x11rb::errors::ReplyError),
+        /// The other side did not answer in time.
+        Timeout,
+        /// The server lacks something this adapter requires.
+        Unsupported(String),
+        /// The adapter reached a state it cannot continue from.
+        Internal(String),
+    }
+
+    impl fmt::Display for ClipboardError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                ClipboardError::Connect(err) => write!(f, "cannot connect to the X display: {err}"),
+                ClipboardError::Connection(err) => write!(f, "X connection error: {err}"),
+                ClipboardError::Reply(err) => write!(f, "X request failed: {err}"),
+                ClipboardError::Timeout => {
+                    f.write_str("the selection owner did not answer in time")
+                }
+                ClipboardError::Unsupported(what) => write!(f, "unsupported X server: {what}"),
+                ClipboardError::Internal(what) => write!(f, "clipboard adapter error: {what}"),
+            }
+        }
+    }
+
+    impl std::error::Error for ClipboardError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                ClipboardError::Connect(err) => Some(err),
+                ClipboardError::Connection(err) => Some(err),
+                ClipboardError::Reply(err) => Some(err),
+                ClipboardError::Timeout
+                | ClipboardError::Unsupported(_)
+                | ClipboardError::Internal(_) => None,
+            }
+        }
+    }
+
+    impl From<x11rb::errors::ConnectError> for ClipboardError {
+        fn from(err: x11rb::errors::ConnectError) -> Self {
+            ClipboardError::Connect(err)
+        }
+    }
+
+    impl From<x11rb::errors::ConnectionError> for ClipboardError {
+        fn from(err: x11rb::errors::ConnectionError) -> Self {
+            ClipboardError::Connection(err)
+        }
+    }
+
+    impl From<x11rb::errors::ReplyError> for ClipboardError {
+        fn from(err: x11rb::errors::ReplyError) -> Self {
+            ClipboardError::Reply(err)
+        }
+    }
+
+    /// A change to the CLIPBOARD selection's owner was seen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Change;
+
+    /// The reply channel of one command.
+    type ReadReply = Sender<Result<Snapshot, ClipboardError>>;
+    type SetReply = Sender<Result<(), ClipboardError>>;
+
+    /// What the caller sends the background thread.
+    enum Command {
+        Read(ReadReply),
+        Set(String, SetReply),
+        Shutdown,
+    }
+
+    /// The atoms one adapter works with, interned once at connect.
+    #[derive(Debug, Clone, Copy)]
+    struct Atoms {
+        clipboard: Atom,
+        timestamp: Atom,
+        targets: Atom,
+        utf8_string: Atom,
+        text: Atom,
+        incr: Atom,
+        kde_hint: Atom,
+        /// Where a text reply is asked for.
+        read_property: Atom,
+        /// Where the KDE hint reply is asked for.
+        hint_property: Atom,
+        /// A scratch property used to read the server clock.
+        time_property: Atom,
+    }
+
+    /// An `INCR` transfer we are streaming to one requestor.
+    struct ActiveOwner {
+        requestor: Window,
+        property: Atom,
+        target: Atom,
+        payload: Vec<u8>,
+        owner: Owner,
+    }
+
+    /// The thread's mutable state.
+    struct State {
+        /// The text we last published; `Some` exactly while we own CLIPBOARD.
+        owned: Option<String>,
+        /// The time we acquired ownership, answered as `TIMESTAMP`.
+        ownership_time: Timestamp,
+        /// The `INCR` transfer currently in flight, if any.
+        active: Option<ActiveOwner>,
+    }
+
+    /// The CLIPBOARD selection owner + observer for one X connection.
+    pub struct Clipboard {
+        commands: Sender<Command>,
+        changes: Receiver<Change>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Clipboard {
+        /// Opens `$DISPLAY`, creates an unmapped window and attaches to the CLIPBOARD
+        /// selection's change notifications.
+        pub fn connect() -> Result<Self, ClipboardError> {
+            let (conn, screen_num) = x11rb::connect(None)?;
+            let root = conn.setup().roots[screen_num].root;
+
+            let window = conn.generate_id().map_err(|err| {
+                ClipboardError::Internal(format!("the server has no window id to give: {err}"))
+            })?;
+            conn.create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            )?;
+
+            let version = conn
+                .xfixes_query_version(5, 0)
+                .map_err(map_extension_error)?
+                .reply()?;
+            if version.major_version < 5 {
+                return Err(ClipboardError::Unsupported(format!(
+                    "XFixes 5 is required to observe selection changes, the server offers {}.{}",
+                    version.major_version, version.minor_version
+                )));
+            }
+
+            let atoms = Atoms {
+                clipboard: intern(&conn, "CLIPBOARD")?,
+                timestamp: intern(&conn, SELECTION_TARGET_NAMES[0])?,
+                targets: intern(&conn, SELECTION_TARGET_NAMES[1])?,
+                utf8_string: intern(&conn, SELECTION_TARGET_NAMES[2])?,
+                text: intern(&conn, SELECTION_TARGET_NAMES[3])?,
+                incr: intern(&conn, "INCR")?,
+                kde_hint: intern(&conn, KDE_PASSWORD_HINT)?,
+                read_property: intern(&conn, "LWS_CLIPBOARD_SELECTION")?,
+                hint_property: intern(&conn, "LWS_CLIPBOARD_KDE_HINT")?,
+                time_property: intern(&conn, "LWS_CLIPBOARD_TIME")?,
+            };
+
+            conn.xfixes_select_selection_input(
+                window,
+                atoms.clipboard,
+                SelectionEventMask::SET_SELECTION_OWNER,
+            )?;
+            // Flush before returning: the subscription must be live before the caller can
+            // observe anything, or a change right after `connect` is lost.
+            conn.flush()?;
+
+            let (command_tx, command_rx) = mpsc::channel();
+            let (change_tx, change_rx) = mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name("lws-x11-clipboard".to_owned())
+                .spawn(move || run(conn, window, atoms, change_tx, command_rx))
+                .map_err(|err| {
+                    ClipboardError::Internal(format!("cannot start the clipboard thread: {err}"))
+                })?;
+
+            Ok(Clipboard {
+                commands: command_tx,
+                changes: change_rx,
+                thread: Some(thread),
+            })
+        }
+
+        /// Blocks up to `timeout` for the next CLIPBOARD owner change.
+        ///
+        /// A served `SelectionRequest` is *not* reported: the thread handles those without
+        /// the caller noticing, which is what lets a paste happen while the caller is idle.
+        pub fn wait(&self, timeout: Duration) -> Option<Change> {
+            self.changes.recv_timeout(timeout).ok()
+        }
+
+        /// Reads the CURRENT CLIPBOARD owner's text, including a real `INCR` transfer, and
+        /// classifies the KDE secret hint.
+        pub fn read(&self) -> Result<Snapshot, ClipboardError> {
+            let (tx, rx) = mpsc::channel();
+            self.send(Command::Read(tx))?;
+            rx.recv().map_err(|_| gone())?
+        }
+
+        /// Takes CLIPBOARD ownership and serves `TARGETS` / `TIMESTAMP` / `UTF8_STRING` /
+        /// `TEXT` for `text`, using the `INCR` dance for large payloads.
+        pub fn set(&self, text: &str) -> Result<(), ClipboardError> {
+            let (tx, rx) = mpsc::channel();
+            self.send(Command::Set(text.to_owned(), tx))?;
+            rx.recv().map_err(|_| gone())?
+        }
+
+        fn send(&self, command: Command) -> Result<(), ClipboardError> {
+            self.commands.send(command).map_err(|_| gone())
+        }
+    }
+
+    impl Drop for Clipboard {
+        fn drop(&mut self) {
+            // Tell the thread to release the selection and end. It never blocks for long:
+            // the pump wakes on a 20 ms tick even when the connection stays quiet.
+            let _ = self.commands.send(Command::Shutdown);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn gone() -> ClipboardError {
+        ClipboardError::Internal("the clipboard thread is gone".to_owned())
+    }
+
+    fn map_extension_error(err: x11rb::errors::ConnectionError) -> ClipboardError {
+        match err {
+            x11rb::errors::ConnectionError::UnsupportedExtension => {
+                ClipboardError::Unsupported("this server has no XFixes extension".to_owned())
+            }
+            other => ClipboardError::Connection(other),
+        }
+    }
+
+    fn intern(conn: &RustConnection, name: &str) -> Result<Atom, ClipboardError> {
+        Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+    }
+
+    /// The thread: pump the connection, answer requests, execute commands.
+    fn run(
+        mut conn: RustConnection,
+        window: Window,
+        atoms: Atoms,
+        changes: Sender<Change>,
+        commands: Receiver<Command>,
+    ) {
+        let mut state = State {
+            owned: None,
+            ownership_time: 0,
+            active: None,
+        };
+        loop {
+            // Serve everything already queued first: a paste must not wait for the command
+            // channel, and a change must reach `wait` promptly.
+            let mut live = true;
+            loop {
+                match conn.poll_for_event() {
+                    Ok(Some(event)) => {
+                        if handle_event(&mut conn, window, &atoms, &mut state, &changes, event)
+                            .is_err()
+                        {
+                            live = false;
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        live = false;
+                        break;
+                    }
+                }
+            }
+            if !live {
+                break;
+            }
+
+            match commands.try_recv() {
+                Ok(Command::Read(reply)) => {
+                    let result = read_selection(&mut conn, window, &atoms, &mut state, &changes);
+                    let _ = reply.send(result);
+                }
+                Ok(Command::Set(text, reply)) => {
+                    let result =
+                        take_ownership(&mut conn, window, &atoms, &mut state, &changes, text);
+                    let _ = reply.send(result);
+                }
+                Ok(Command::Shutdown) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+
+            if wait_readable(&conn, POLL_INTERVAL).is_err() {
+                break;
+            }
+        }
+
+        // Release the selection and destroy the window that owned it; the server then frees
+        // both and XFixes tells every other client the selection is unowned.
+        let _ = conn.set_selection_owner(AtomEnum::NONE, atoms.clipboard, CURRENT_TIME);
+        let _ = conn.destroy_window(window);
+        let _ = conn.flush();
+    }
+
+    fn handle_event(
+        conn: &mut RustConnection,
+        window: Window,
+        atoms: &Atoms,
+        state: &mut State,
+        changes: &Sender<Change>,
+        event: Event,
+    ) -> Result<(), ClipboardError> {
+        match event {
+            Event::XfixesSelectionNotify(event) => {
+                if event.subtype == xfixes::SelectionEvent::SET_SELECTION_OWNER
+                    && event.selection == atoms.clipboard
+                {
+                    let _ = changes.send(Change);
+                }
+            }
+            Event::SelectionRequest(request) => serve_request(conn, window, atoms, state, request)?,
+            Event::SelectionClear(event) => {
+                if event.selection == atoms.clipboard && event.owner == window {
+                    state.owned = None;
+                }
+            }
+            // An `INCR` acknowledgement arrives on the *requestor's* window, which is why
+            // the transfer is matched by (window, atom) and not by `window == ours`.
+            Event::PropertyNotify(event) if event.state == Property::DELETE => {
+                advance_transfer(conn, state, event.window, event.atom)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Answers one `SelectionRequest` (ICCCM section 2.2).
+    fn serve_request(
+        conn: &mut RustConnection,
+        window: Window,
+        atoms: &Atoms,
+        state: &mut State,
+        request: SelectionRequestEvent,
+    ) -> Result<(), ClipboardError> {
+        if request.owner != window || request.selection != atoms.clipboard {
+            return Ok(());
+        }
+        // ICCCM 2.2: "all properties used to reply to SelectionRequest events must be
+        // placed on the requestor window", not on ours.
+        let target_window = request.requestor;
+        // An obsolete requestor sends property None; ICCCM says to use the target atom as
+        // the property name then.
+        let property = if request.property == NONE_ATOM {
+            request.target
+        } else {
+            request.property
+        };
+
+        if request.target == atoms.targets {
+            let mut data = Vec::with_capacity(SELECTION_TARGET_NAMES.len() * 4);
+            for atom in [
+                atoms.timestamp,
+                atoms.targets,
+                atoms.utf8_string,
+                atoms.text,
+            ] {
+                data.extend_from_slice(&atom.to_ne_bytes());
+            }
+            change_property(
+                conn,
+                target_window,
+                property,
+                AtomEnum::ATOM.into(),
+                32,
+                &data,
+            )?;
+            return notify(conn, atoms, request, property);
+        }
+
+        if request.target == atoms.timestamp {
+            change_property(
+                conn,
+                target_window,
+                property,
+                AtomEnum::INTEGER.into(),
+                32,
+                &state.ownership_time.to_ne_bytes(),
+            )?;
+            return notify(conn, atoms, request, property);
+        }
+
+        if request.target == atoms.utf8_string || request.target == atoms.text {
+            let text = state.owned.clone().unwrap_or_default();
+            let payload = text.as_bytes();
+            if needs_incr(payload.len(), DEFAULT_MAX_REQUEST_SIZE) {
+                let total = payload.len() as u32;
+                change_property(
+                    conn,
+                    target_window,
+                    property,
+                    atoms.incr,
+                    32,
+                    &total.to_ne_bytes(),
+                )?;
+                // The chunks live on the requestor's window; PropertyChangeMask there is
+                // how the owner learns the requestor consumed each one (ICCCM 2.2 / 2.7.2).
+                conn.change_window_attributes(
+                    target_window,
+                    &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+                )?;
+                let owner = Owner::start(payload.len(), incr_chunk_size(DEFAULT_MAX_REQUEST_SIZE))
+                    .map_err(|err| {
+                        ClipboardError::Internal(format!("cannot start an INCR transfer: {err:?}"))
+                    })?;
+                state.active = Some(ActiveOwner {
+                    requestor: target_window,
+                    property,
+                    target: request.target,
+                    payload: payload.to_vec(),
+                    owner,
+                });
+            } else {
+                change_property(conn, target_window, property, request.target, 8, payload)?;
+            }
+            return notify(conn, atoms, request, property);
+        }
+
+        // TARGETS, TIMESTAMP and the two text targets are all this node serves; everything
+        // else is refused with property None (ICCCM section 2.2).
+        notify(conn, atoms, request, NONE_ATOM)
+    }
+
+    /// Writes the next `INCR` chunk after the requestor deleted the property.
+    fn advance_transfer(
+        conn: &mut RustConnection,
+        state: &mut State,
+        window: Window,
+        atom: Atom,
+    ) -> Result<(), ClipboardError> {
+        let Some(mut active) = state.active.take() else {
+            return Ok(());
+        };
+        if active.requestor != window || active.property != atom {
+            state.active = Some(active);
+            return Ok(());
+        }
+        let slice = active.owner.next_slice();
+        let chunk = active.payload[slice.clone()].to_vec();
+        change_property(
+            conn,
+            active.requestor,
+            active.property,
+            active.target,
+            8,
+            &chunk,
+        )?;
+        // An empty slice is the documented zero-length end marker: the transfer is over.
+        if !slice.is_empty() {
+            state.active = Some(active);
+        }
+        Ok(())
+    }
+
+    /// Sends the `SelectionNotify` that acknowledges a `SelectionRequest`.
+    fn notify(
+        conn: &mut RustConnection,
+        atoms: &Atoms,
+        request: SelectionRequestEvent,
+        property: Atom,
+    ) -> Result<(), ClipboardError> {
+        let event = SelectionNotifyEvent {
+            response_type: xproto::SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: request.time,
+            requestor: request.requestor,
+            selection: atoms.clipboard,
+            target: request.target,
+            property,
+        };
+        conn.send_event(false, request.requestor, EventMask::NO_EVENT, event)?;
+        conn.flush()?;
+        Ok(())
+    }
+
+    /// Writes a property with the mode and element count the X server needs.
+    fn change_property(
+        conn: &mut RustConnection,
+        window: Window,
+        property: Atom,
+        type_: Atom,
+        format: u8,
+        data: &[u8],
+    ) -> Result<(), ClipboardError> {
+        let elements = match format {
+            32 => data.len() / 4,
+            16 => data.len() / 2,
+            _ => data.len(),
+        };
+        conn.change_property(
+            PropMode::REPLACE,
+            window,
+            property,
+            type_,
+            format,
+            elements as u32,
+            data,
+        )?;
+        conn.flush()?;
+        Ok(())
+    }
+
+    /// Takes CLIPBOARD and remembers `text`.
+    fn take_ownership(
+        conn: &mut RustConnection,
+        window: Window,
+        atoms: &Atoms,
+        state: &mut State,
+        changes: &Sender<Change>,
+        text: String,
+    ) -> Result<(), ClipboardError> {
+        let time = server_time(conn, window, atoms, state, changes)?;
+        conn.set_selection_owner(window, atoms.clipboard, time)?;
+        conn.flush()?;
+        // ICCCM 2.1: `SetSelectionOwner` can merely *appear* to succeed, so confirm it.
+        let owner = conn.get_selection_owner(atoms.clipboard)?.reply()?.owner;
+        if owner != window {
+            return Err(ClipboardError::Internal(
+                "the server did not hand us CLIPBOARD ownership".to_owned(),
+            ));
+        }
+        state.owned = Some(text);
+        state.ownership_time = time;
+        state.active = None;
+        Ok(())
+    }
+
+    /// Reads the current server time.
+    ///
+    /// ICCCM section 2.1: a zero-length append to a property reports the server clock in
+    /// the matching `PropertyNotify`; it is the standard way to learn a timestamp for an
+    /// action no event triggered, and the timestamp `TIMESTAMP` must answer.
+    fn server_time(
+        conn: &mut RustConnection,
+        window: Window,
+        atoms: &Atoms,
+        state: &mut State,
+        changes: &Sender<Change>,
+    ) -> Result<Timestamp, ClipboardError> {
+        conn.change_property(
+            PropMode::APPEND,
+            window,
+            atoms.time_property,
+            AtomEnum::STRING,
+            8,
+            0,
+            &[],
+        )?;
+        conn.flush()?;
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let event = pump_until(conn, window, atoms, state, changes, deadline, |event| {
+            matches!(
+                event,
+                Event::PropertyNotify(property)
+                    if property.window == window && property.atom == atoms.time_property
+            )
+        })?;
+        match event {
+            Event::PropertyNotify(property) => Ok(property.time),
+            _ => Err(ClipboardError::Internal(
+                "the server clock reply was not a property notification".to_owned(),
+            )),
+        }
+    }
+
+    /// Reads the current owner's `target`, including an `INCR` transfer; `None` when the
+    /// owner cannot convert it.
+    fn read_selection(
+        conn: &mut RustConnection,
+        window: Window,
+        atoms: &Atoms,
+        state: &mut State,
+        changes: &Sender<Change>,
+    ) -> Result<Snapshot, ClipboardError> {
+        // Reading our own published text needs no round trip: asking ourselves would make the
+        // requestor and the owner the same client, which the protocol does not describe. The
+        // server's owner is authoritative here, so this is also correct before our own
+        // `SelectionClear` has been processed.
+        let owner = conn.get_selection_owner(atoms.clipboard)?.reply()?.owner;
+        if owner == window {
+            return Ok(Snapshot {
+                text: state.owned.clone().unwrap_or_default(),
+                markers: Vec::new(),
+                has_text: true,
+            });
+        }
+
+        let bytes = match read_target(
+            conn,
+            window,
+            atoms,
+            state,
+            changes,
+            atoms.utf8_string,
+            atoms.read_property,
+        )? {
+            Some(bytes) => Some(bytes),
+            None => read_target(
+                conn,
+                window,
+                atoms,
+                state,
+                changes,
+                atoms.text,
+                atoms.read_property,
+            )?,
+        };
+
+        let mut markers = Vec::new();
+        // The KDE hint is an ordinary target: the owner answers with the hint's value, or
+        // refuses it (property None), in which case there is nothing to classify.
+        if let Some(value) = read_target(
+            conn,
+            window,
+            atoms,
+            state,
+            changes,
+            atoms.kde_hint,
+            atoms.hint_property,
+        )? {
+            if kde_hint_is_secret(&value) {
+                markers.push(Marker::KdeSecret);
+            }
+        }
+
+        match bytes.and_then(|bytes| decode_text_payload(&bytes)) {
+            Some(text) => Ok(Snapshot {
+                text,
+                markers,
+                has_text: true,
+            }),
+            None => Ok(Snapshot {
+                text: String::new(),
+                markers,
+                has_text: false,
+            }),
+        }
+    }
+
+    /// `ConvertSelection` for one target and reads the reply, `INCR` included.
+    fn read_target(
+        conn: &mut RustConnection,
+        window: Window,
+        atoms: &Atoms,
+        state: &mut State,
+        changes: &Sender<Change>,
+        target: Atom,
+        property: Atom,
+    ) -> Result<Option<Vec<u8>>, ClipboardError> {
+        conn.convert_selection(window, atoms.clipboard, target, property, CURRENT_TIME)?;
+        conn.flush()?;
+
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let event = pump_until(conn, window, atoms, state, changes, deadline, |event| {
+            matches!(
+                event,
+                Event::SelectionNotify(notify)
+                    if notify.requestor == window
+                        && notify.selection == atoms.clipboard
+                        && notify.target == target
+            )
+        })?;
+        let notify = match event {
+            Event::SelectionNotify(notify) => notify,
+            _ => {
+                return Err(ClipboardError::Internal(
+                    "unexpected event while reading".to_owned(),
+                ))
+            }
+        };
+        if notify.property == NONE_ATOM {
+            return Ok(None);
+        }
+
+        // Deleting the reply property is also what starts an `INCR` transfer: the owner
+        // begins writing chunks only once it sees this deletion (ICCCM 2.7.2).
+        let (type_, announced) = get_property_all(conn, window, notify.property, true)?;
+        if type_ != atoms.incr {
+            return Ok(Some(announced));
+        }
+
+        // ICCCM says the INCR property holds a 32-bit lower bound on the payload, but the
+        // real terminator is the zero-length property, and owners exist (xclip) that publish
+        // a zero-length INCR property with no bound at all. An absent or empty bound is
+        // therefore accounted as "unknown" and only caught by the end marker.
+        let total = match announced_total(&announced) {
+            Some(total) if total > 0 => total,
+            _ => u32::MAX as usize,
+        };
+        let mut requestor = Requestor::start(total).map_err(|err| {
+            ClipboardError::Internal(format!("cannot start the INCR requestor: {err:?}"))
+        })?;
+
+        let mut payload = Vec::new();
+        loop {
+            let deadline = Instant::now() + READ_TIMEOUT;
+            pump_until(conn, window, atoms, state, changes, deadline, |event| {
+                matches!(
+                    event,
+                    Event::PropertyNotify(property)
+                        if property.window == window
+                            && property.atom == notify.property
+                            && property.state == Property::NEW_VALUE
+                )
+            })?;
+            let (_, chunk) = get_property_all(conn, window, notify.property, true)?;
+            if chunk.is_empty() {
+                break;
+            }
+            requestor.accept(chunk.len()).map_err(|err| {
+                ClipboardError::Internal(format!("the owner sent a malformed INCR stream: {err:?}"))
+            })?;
+            payload.extend_from_slice(&chunk);
+            if requestor.is_finished() {
+                break;
+            }
+        }
+        Ok(Some(payload))
+    }
+
+    /// Reads a whole property and, when asked, deletes it.
+    ///
+    /// A zero-length first read reports only the size, so a chunk larger than a single
+    /// request still comes back in one piece.
+    fn get_property_all(
+        conn: &mut RustConnection,
+        window: Window,
+        property: Atom,
+        delete: bool,
+    ) -> Result<(Atom, Vec<u8>), ClipboardError> {
+        let probe = conn
+            .get_property(false, window, property, AtomEnum::ANY, 0, 0)?
+            .reply()?;
+        let bytes_after = probe.bytes_after as usize;
+        if bytes_after == 0 {
+            if delete {
+                conn.delete_property(window, property)?;
+                conn.flush()?;
+            }
+            return Ok((probe.type_, Vec::new()));
+        }
+        let units = bytes_after.div_ceil(4) as u32;
+        let reply = conn
+            .get_property(delete, window, property, AtomEnum::ANY, 0, units)?
+            .reply()?;
+        Ok((reply.type_, reply.value))
+    }
+
+    /// Loops the connection until `matches` accepts an event or the deadline passes.
+    ///
+    /// Every other event is handed to `handle_event`, so a paste of our own selection is
+    /// still served while we are waiting on someone else.
+    fn pump_until<F>(
+        conn: &mut RustConnection,
+        window: Window,
+        atoms: &Atoms,
+        state: &mut State,
+        changes: &Sender<Change>,
+        deadline: Instant,
+        matches: F,
+    ) -> Result<Event, ClipboardError>
+    where
+        F: Fn(&Event) -> bool,
+    {
+        loop {
+            if let Some(event) = conn.poll_for_event()? {
+                if matches(&event) {
+                    return Ok(event);
+                }
+                handle_event(conn, window, atoms, state, changes, event)?;
+                continue;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ClipboardError::Timeout);
+            }
+            wait_readable(conn, (deadline - now).min(POLL_INTERVAL))?;
+        }
+    }
+
+    /// Blocks until the X connection is readable or `timeout` elapses.
+    ///
+    /// The fd is polled rather than `wait_for_event`-ing, exactly like `capture.rs`, so the
+    /// thread can also notice a command without an extra wake-up fd.
+    fn wait_readable(conn: &RustConnection, timeout: Duration) -> Result<(), ClipboardError> {
+        let timespec = rustix::event::Timespec {
+            tv_sec: timeout.as_secs() as rustix::event::Secs,
+            tv_nsec: u64::from(timeout.subsec_nanos()) as rustix::event::Nsecs,
+        };
+        let mut fds = [rustix::event::PollFd::new(
+            conn.stream(),
+            rustix::event::PollFlags::IN,
+        )];
+        rustix::event::poll(&mut fds, Some(&timespec)).map_err(|err| {
+            ClipboardError::Internal(format!("polling the X connection failed: {err}"))
+        })?;
+        Ok(())
+    }
+
+    /// The 32-bit word an `INCR` property starts with, when it has one.
+    fn announced_total(property: &[u8]) -> Option<usize> {
+        let word: [u8; 4] = property.get(..4)?.try_into().ok()?;
+        Some(u32::from_ne_bytes(word) as usize)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use x11_impl::{Change, Clipboard, ClipboardError, Snapshot};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +1182,42 @@ mod tests {
         assert!(!kde_hint_is_secret(b"normal"));
         // Not UTF-8: never a secret, and never a panic.
         assert!(!kde_hint_is_secret(&[0xff, 0xfe]));
+    }
+
+    #[test]
+    fn the_advertised_targets_are_the_required_ones_in_order() {
+        // TIMESTAMP and TARGETS are ICCCM-required; the two text targets are what a paste
+        // asks for. The adapter interns exactly these names.
+        assert_eq!(
+            SELECTION_TARGET_NAMES,
+            ["TIMESTAMP", "TARGETS", "UTF8_STRING", "TEXT"]
+        );
+    }
+
+    #[test]
+    fn the_incr_chunk_size_is_the_requestors_maximum_and_never_zero() {
+        assert_eq!(
+            incr_chunk_size(DEFAULT_MAX_REQUEST_SIZE),
+            DEFAULT_MAX_REQUEST_SIZE
+        );
+        assert_eq!(
+            incr_chunk_size(0),
+            1,
+            "a zero-byte chunk would never make progress"
+        );
+    }
+
+    #[test]
+    fn a_payload_decodes_as_text_only_when_it_is_utf8() {
+        assert_eq!(
+            decode_text_payload("héllo".as_bytes()),
+            Some("héllo".to_owned())
+        );
+        assert_eq!(decode_text_payload(b""), Some(String::new()));
+        assert_eq!(
+            decode_text_payload(&[0xff, 0xfe, 0x00]),
+            None,
+            "binary is not text"
+        );
     }
 }

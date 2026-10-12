@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 input-model = { path = "../input-model" }
+# The marker vocabulary the adapter translates X11's secret hint into; the crate is pure, so
+# it is fine on every host (KVM-041).
+clipboard = { path = "../clipboard" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.14", features = ["xtest", "xinput", "randr", "xfixes"] }
