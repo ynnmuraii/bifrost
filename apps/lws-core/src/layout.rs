@@ -61,7 +61,6 @@ impl Pair {
 
     /// Whether this pair is newer than `other` (the lexical order of the pair).
     #[must_use]
-    #[allow(dead_code)] // used by `accept_topology`, which the transport half still has to reach
     pub fn is_newer_than(self, other: Self) -> bool {
         self > other
     }
@@ -92,12 +91,7 @@ pub enum EditOutcome {
 }
 
 /// What happened to an incoming `Topology`.
-///
-/// `focus_router::Message` carries no `Topology`/`LayoutEdit`/`TopologyRequest` variant yet, so
-/// nothing on the wire reaches these paths: the rules are implemented and tested, and the
-/// transport half of KVM-072 is what wires them up.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum TopologyOutcome {
     /// Applied: the document is now this pair.
     Applied(Pair),
