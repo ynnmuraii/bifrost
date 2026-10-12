@@ -14,8 +14,8 @@
 //! * the status screen of a working pair: «Служба работает», both computers in the
 //!   status and in the layout document, this computer owning input;
 //! * the pairing wizard: the address core pushes, the same six digits on both screens, both
-//!   users confirming, the two `trust.toml` records the ceremony exists for — and the honest
-//!   statement that the two cores are paired and **not** linked until they restart;
+//!   users confirming, both `trust.toml` records are written and the live link appears in each
+//!   window without restarting either core;
 //! * «Взять управление» on the follower, watched on its own status screen.
 //!
 //! Every wait is event-driven with a deadline and a message naming what was seen, never a
@@ -783,26 +783,20 @@ fn the_pairing_wizard_pairs_two_cores_through_the_view_model() {
         );
     }
 
-    // What is **not** true afterwards, and the window must not pretend otherwise: nothing
-    // restarts the cores, and a link is only dialled from the peers read at startup, so the
-    // two are paired and still not linked. Both cores say so on their own control channels,
-    // and the window's last `Status` carries no member either.
+    // The trust records and live link both appear without restarting either core.
+    let live = |view: &ViewModel| {
+        view.status
+            .as_ref()
+            .filter(|status| status.connected && status.members.len() == 1)
+            .cloned()
+    };
+    let left_status = wait_for(&mut left, "the left window's live link", live);
+    let right_status = wait_for(&mut right, "the right window's live link", live);
+    assert_eq!(left_status.members[0].display_name, "right");
+    assert_eq!(right_status.members[0].display_name, "left");
     for (root, side) in [(lab.a_root(), "left"), (lab.b_root(), "right")] {
-        assert_eq!(
-            links(root),
-            0,
-            "the {side} core must hold no link until it restarts"
-        );
+        assert_eq!(links(root), 1, "the {side} core links without a restart");
     }
-    let status = left
-        .view()
-        .status
-        .as_ref()
-        .expect("the window received a Status");
-    assert!(
-        !status.connected && status.members.is_empty(),
-        "the window must show no member yet: {status:?}"
-    );
 }
 
 /// «Взять управление» on the follower, watched on its own status screen.

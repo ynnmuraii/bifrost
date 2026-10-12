@@ -406,10 +406,7 @@ fn a_successful_pairing_promises_what_actually_happens() {
     ));
     let outcome = vm.outcome.as_ref().expect("the result is shown");
     assert!(outcome.ok);
-    assert_eq!(
-        outcome.line(),
-        "Готово: linux-box сопряжён. Связь появится после перезапуска службы"
-    );
+    assert_eq!(outcome.line(), "Готово: linux-box сопряжён");
 }
 
 #[test]

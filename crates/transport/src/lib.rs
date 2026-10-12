@@ -48,4 +48,7 @@ pub enum TransportError {
     /// Identity/key store failure.
     #[error("identity error: {0}")]
     Identity(#[from] identity::IdentityError),
+    /// A pairing record has no usable socket address.
+    #[error("invalid peer address: {0}")]
+    InvalidPeerAddress(String),
 }

@@ -58,12 +58,9 @@ impl Window {
         }
     }
 
-    /// One frame, or a panic if the core is silent past the deadline.
-    ///
-    /// `recv` has no timeout of its own: a window that waits forever on a silent core is
-    /// exactly the failure this suite has to report, not hang on.
-    fn recv(&mut self, what: &str) -> GuiFrame {
-        let left = DEADLINE;
+    /// One frame, or a panic if the core is silent before `deadline`.
+    fn recv_until(&mut self, what: &str, deadline: Instant) -> GuiFrame {
+        let left = deadline.saturating_duration_since(Instant::now());
         match self
             .runtime
             .block_on(async { tokio::time::timeout(left, self.link.recv()).await })
@@ -72,6 +69,11 @@ impl Window {
             Ok(Err(error)) => panic!("{what}: the GUI link failed: {error}"),
             Err(_) => panic!("{what}: no frame within {left:?}"),
         }
+    }
+
+    /// One frame, or a panic if the core is silent past the usual deadline.
+    fn recv(&mut self, what: &str) -> GuiFrame {
+        self.recv_until(what, Instant::now() + DEADLINE)
     }
 
     /// Sends one request and returns its `request_id` without waiting for the answer.
@@ -116,13 +118,26 @@ impl Window {
 
     /// Waits for a pushed event of one kind.
     fn wait_event<T>(&mut self, what: &str, of: impl Fn(&gui_frame::Msg) -> Option<T>) -> T {
+        self.wait_event_until(what, Instant::now() + DEADLINE, of)
+    }
+
+    /// Waits until one absolute deadline, so paired nodes share the same 10-second window.
+    fn wait_event_until<T>(
+        &mut self,
+        what: &str,
+        deadline: Instant,
+        of: impl Fn(&gui_frame::Msg) -> Option<T>,
+    ) -> T {
         let mut seen = Vec::new();
         loop {
             if let Some(index) = self.events.iter().position(|event| of(event).is_some()) {
                 let event = self.events.remove(index);
                 return of(&event).expect("checked by position");
             }
-            let frame = self.recv(&format!("{what} did not arrive; events seen: {seen:?}"));
+            let frame = self.recv_until(
+                &format!("{what} did not arrive; events seen: {seen:?}"),
+                deadline,
+            );
             assert_eq!(
                 frame.request_id, 0,
                 "{}: an event answers nothing, but this frame carries a request id",
@@ -353,7 +368,7 @@ fn the_wizard_opens_a_window_and_pushes_the_address_to_type() {
 /// does the same — its requests are fire-and-forget (`docs/03-architecture.md`, «GUI ↔ core»),
 /// and two computers cannot wait for each other's click.
 #[test]
-fn the_pairing_wizard_pairs_two_cores_over_the_gui_endpoint() {
+fn the_pairing_wizard_links_two_cores_without_restarting_them() {
     let _guard = common::serial();
     let two = Unpaired::start("gui-pairing");
     two.wait_ready();
@@ -430,6 +445,7 @@ fn the_pairing_wizard_pairs_two_cores_over_the_gui_endpoint() {
 
     // 6. Both users confirm. Neither window can wait for its own answer before the other
     //    confirms, so both answers go out first, exactly as two windows on two computers do.
+    let link_deadline = Instant::now() + Duration::from_secs(10);
     let left_id = opener.send(gui_frame::Msg::PairingAnswer(
         protocol::ipc::PairingAnswer {
             attempt_id: left.attempt_id.clone(),
@@ -452,6 +468,30 @@ fn the_pairing_wizard_pairs_two_cores_over_the_gui_endpoint() {
         gui_frame::Msg::OpResult(result) => assert!(result.ok, "the dialer's answer: {result:?}"),
         other => panic!("PairingAnswer answered {other:?}"),
     }
+    let left_status =
+        opener.wait_event_until(
+            "the opener's live link",
+            link_deadline,
+            |event| match event {
+                gui_frame::Msg::Status(status) if status.connected && status.members.len() == 1 => {
+                    Some(status.clone())
+                }
+                _ => None,
+            },
+        );
+    let right_status =
+        dialer.wait_event_until(
+            "the dialer's live link",
+            link_deadline,
+            |event| match event {
+                gui_frame::Msg::Status(status) if status.connected && status.members.len() == 1 => {
+                    Some(status.clone())
+                }
+                _ => None,
+            },
+        );
+    assert_eq!(left_status.members[0].display_name, "right");
+    assert_eq!(right_status.members[0].display_name, "left");
 
     // 7. The window closes on its own, and both sides hold the peer they paired with.
     let closed = opener.wait_event("PairingWindow{closed}", |event| match event {
