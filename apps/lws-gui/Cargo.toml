@@ -39,6 +39,10 @@ toml = "1"
 # glutin are (so `build-essential` stays the only system dependency). winit is never named in
 # this crate's code; the entry exists for its features.
 winit = "0.30.13"
+# `CREATE_NO_WINDOW`, so the service this window starts has no console to flash: the value is
+# the one Windows documents, and taking it from the same crate the core does keeps it that way.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # An integration test is a crate of its own: it sees `lws-gui` and these, and not the window's
