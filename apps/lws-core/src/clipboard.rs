@@ -258,7 +258,9 @@ impl Clipboard {
     /// matching hash and valid UTF-8.
     pub async fn on_agent_frame(&mut self, message: &ipc::ClipboardChanged) -> Vec<Out> {
         let (payload, markers) = match self.take_chunk(message) {
-            Ok(assembled) => assembled,
+            Ok(Some(assembled)) => assembled,
+            // Not the last chunk yet: nothing is decided, and nothing is offered.
+            Ok(None) => return Vec::new(),
             Err(error) => {
                 tracing::warn!(?error, "clipboard chunks from the agent refused");
                 return Vec::new();
@@ -267,11 +269,14 @@ impl Clipboard {
         self.on_local_copy(payload, markers).await
     }
 
-    /// Assembles one chunk; `Ok((payload, markers))` on the last one.
+    /// Assembles one chunk.
+    ///
+    /// `Ok(None)` means more chunks are expected; `Ok(Some(..))` is the last one, with the
+    /// payload and the markers the platform reported for the whole copy.
     fn take_chunk(
         &mut self,
         message: &ipc::ClipboardChanged,
-    ) -> Result<(Vec<u8>, Vec<cb::Marker>), cb::ClipboardError> {
+    ) -> Result<Option<(Vec<u8>, Vec<cb::Marker>)>, cb::ClipboardError> {
         let count = message.chunk_count;
         if count == 0 || count as usize > cb::MAX_CHUNKS || message.chunk_index >= count {
             self.local = None;
@@ -302,7 +307,7 @@ impl Clipboard {
         assembly.payload.extend_from_slice(&message.data);
         assembly.next += 1;
         if assembly.next < count {
-            return Err(cb::ClipboardError::Invalid);
+            return Ok(None);
         }
         let assembly = self.local.take().expect("checked above");
         if assembly.payload.len() as u64 != assembly.size
@@ -310,7 +315,7 @@ impl Clipboard {
         {
             return Err(cb::ClipboardError::HashMismatch);
         }
-        Ok((assembly.payload, assembly.markers))
+        Ok(Some((assembly.payload, assembly.markers)))
     }
 
     /// A local copy: the only path that mints a version, and the only one that offers.
@@ -968,9 +973,12 @@ impl Handle {
 
     /// The dialer: opens the channel a grant authorised, and only to the peer it names.
     ///
-    /// The address a member answers on is looked up among the configured peers; the pin in the
-    /// certificate is what picks the right one, so an address that turns out to belong to
-    /// somebody else is dropped and the next is tried.
+    /// The address a member answers on is looked up among the configured peers, and the pin in
+    /// the certificate only says it is *a* trusted peer — not that it is the one that granted
+    /// the channel. The two are told apart by what follows the bind: the node that issued the
+    /// grant answers it with the offer it was holding, while a node that never did closes the
+    /// connection (its own `Grants` refuses the token). Each candidate address therefore gets a
+    /// short window to produce that first frame, and the next one is tried otherwise.
     async fn dial(
         &self,
         peer: NodeId,
@@ -990,16 +998,35 @@ impl Handle {
                 token,
             )
             .await;
-            let Ok(connection) = result else {
+            let Ok(mut connection) = result else {
+                continue;
+            };
+            let first = tokio::time::timeout(BIND_ANSWER_TIMEOUT, connection.recv()).await;
+            let Ok(Ok(first)) = first else {
+                // Silent or closed: this address did not issue the grant.
+                connection.close().await;
                 continue;
             };
             self.serve(peer, channel_id, connection, queue_capacity)
+                .await;
+            let _ = self
+                .events
+                .send(Inbound::Message {
+                    peer,
+                    message: first,
+                })
                 .await;
             return;
         }
         tracing::warn!(peer = %peer, "no clipboard address answered the bind");
     }
 }
+
+/// How long a dialed address has to answer a bind with the offer the grant implies.
+///
+/// The answer is one round trip on a LAN link the peer is already running. It is paid only when
+/// a wrong address was tried first, which is why a second is generous rather than tight.
+const BIND_ANSWER_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Writes one channel's queue; the reader is a separate task so a blocked read never stalls a
 /// send (`KVM-042`).

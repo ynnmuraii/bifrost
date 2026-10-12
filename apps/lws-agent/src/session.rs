@@ -29,9 +29,18 @@ use protocol::ipc::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::backend::{self, Backend, Event, Injected};
+use crate::backend::{self, Backend, ClipboardChange, Event, Injected};
+use crate::clipboard_wire;
 use crate::launch;
 use crate::{Args, FRAME_MAJOR, FRAME_MINOR};
+
+/// How often the session asks the backend whether the local clipboard changed.
+///
+/// The backend poll never blocks, so this interval is the only pacing there is: 20 ms is short
+/// enough that a copy reaches core well inside the input path's own budget (the prepare window
+/// is 200 ms) and long enough that the clipboard's notification queue, its `stat` and its
+/// framing are not serviced on the 5 ms input tick.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(20);
 
 /// How the loop ended.
 enum Stop {
@@ -84,6 +93,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         args.dry_inject,
         args.dry_input_events,
         args.dry_motion,
+        args.dry_clipboard_dir.clone(),
         attach.emergency_hotkey.as_str(),
         attach.restore_tokens.as_slice(),
         ipc::TakeoverDetection::try_from(attach.takeover_detection)
@@ -176,6 +186,11 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     let mut released_after_silence = false;
     // The node's own display set and its revision (`Hello.displays_revision`).
     let mut displays = crate::displays::DisplaysState::default();
+    // The clipboard: the versions this node speaks, and the transfer it is assembling.
+    let mut clipboard = ClipboardState::new();
+    let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
+    // A slow tick must not queue up: the clipboard is polled, not scheduled.
+    clipboard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -204,9 +219,18 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 if let Some(stop) = handle_message(
                     link, backend, ready, message, &mut deadline, &mut self_timeout,
-                    &mut held_lease, &mut batch, &mut displays, &mut repeat, now,
+                    &mut held_lease, &mut batch, &mut displays, &mut repeat,
+                    &mut clipboard, now,
                 ).await? {
                     return Ok(stop);
+                }
+            }
+            // ADR-008, agent side: a local copy is *polled*, never waited for, so the
+            // deadline and the core-silence watchdog below keep running on their own tick
+            // while this branch asks the platform whether the user copied something.
+            _ = clipboard_tick.tick() => {
+                if let Some(change) = backend.clipboard_change() {
+                    send_clipboard_change(link, &mut clipboard, change).await?;
                 }
             }
             event = backend.next_event() => {
@@ -314,6 +338,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
     batch: &mut Vec<LocalEvent>,
     displays: &mut crate::displays::DisplaysState,
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    clipboard: &mut ClipboardState,
     now: u64,
 ) -> anyhow::Result<Option<Stop>> {
     match message {
@@ -524,6 +549,12 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         Msg::ForgetPortalGrants(_) => {
             backend.forget_portal_grants().await;
         }
+        // ADR-008: the local selection is this agent's to own, and core hands over a payload
+        // a peer sent (or the release of one). It is applied only once every chunk arrived and
+        // the whole payload passed its sha256 and the UTF-8 check.
+        Msg::SetClipboardText(set) => {
+            handle_set_clipboard(link, backend, clipboard, set).await?;
+        }
         Msg::Shutdown(_) => {
             tracing::info!("shutdown requested by core");
             release_everything(backend).await;
@@ -540,6 +571,164 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     Ok(None)
+}
+
+/// The agent's clipboard state: the versions it speaks, and the transfer it is assembling.
+///
+/// ADR-008 asks for origin/version/hash so that an echo cannot become a loop. Core owns the
+/// fan-out and its own echo history; this is the agent's half of the rule, one hop earlier:
+/// what core sent is applied with core's `origin_version` remembered, and the *next* change
+/// this node reports is numbered strictly above it.
+struct ClipboardState {
+    /// The `origin_version` the next `ClipboardChanged` carries.
+    own_version: u64,
+    /// The `origin_version` core last asked this node to apply.
+    applied_version: u64,
+    /// The inbound transfer being assembled, if any. Only one at a time, per channel.
+    inbound: Option<clipboard_wire::Inbound>,
+}
+
+impl ClipboardState {
+    fn new() -> Self {
+        ClipboardState {
+            own_version: 0,
+            applied_version: 0,
+            inbound: None,
+        }
+    }
+
+    /// Records a version this node applied, so a later local change is numbered above it.
+    fn applied(&mut self, origin_version: u64) {
+        self.applied_version = origin_version;
+        self.own_version = self.own_version.max(origin_version);
+    }
+
+    /// The version for the next change this node reports: strictly greater than every version
+    /// applied here, so core can never mistake it for the payload it just sent.
+    fn next_version(&mut self) -> u64 {
+        self.own_version = self.own_version.max(self.applied_version) + 1;
+        self.own_version
+    }
+}
+
+/// Applies one `SetClipboardText` frame from core.
+///
+/// The chunks are assembled by `origin_version`, and the selection is set only after the last
+/// chunk's `sha256` covers the whole payload *and* the bytes are valid UTF-8
+/// (`docs/05-protocol.md`: «проверка sha256 и UTF-8 до установки selection»). Every refusal is
+/// an `AgentError` with a `CLIPBOARD_*` code, and a refusal never touches the selection:
+/// unverified text is never applied. `chunk_count == 0` releases the selection and forgets the
+/// text.
+async fn handle_set_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentLink<S>,
+    backend: &mut Backend,
+    state: &mut ClipboardState,
+    set: &ipc::SetClipboardText,
+) -> anyhow::Result<()> {
+    if !backend.clipboard_available() {
+        // ADR-008: the clipboard is opt-in on both sides and separate from the KVM, so a node
+        // that cannot own a selection says so instead of dropping the frame silently.
+        state.inbound = None;
+        send_error(
+            link,
+            "CLIPBOARD_DISABLED",
+            "this session has no local clipboard (the clipboard is a separate, opt-in feature)",
+        )
+        .await?;
+        return Ok(());
+    }
+    if set.chunk_count == 0 {
+        state.inbound = None;
+        match backend.set_clipboard(None) {
+            Ok(()) => {
+                state.applied(set.origin_version);
+                tracing::info!(version = set.origin_version, "clipboard released by core");
+            }
+            Err(detail) => send_error(link, "CLIPBOARD_APPLY_FAILED", &detail).await?,
+        }
+        return Ok(());
+    }
+
+    // "Keyed by origin_version": a frame for another version opens a new transfer and drops
+    // whatever was half-assembled for the old one. A frame for the *same* version that
+    // disagrees about anything else is the protocol error `push` reports.
+    let opens = state
+        .inbound
+        .as_ref()
+        .map(clipboard_wire::Inbound::origin_version)
+        != Some(set.origin_version);
+    if opens {
+        match clipboard_wire::Inbound::start(set) {
+            Ok(inbound) => state.inbound = Some(inbound),
+            Err(error) => {
+                state.inbound = None;
+                send_error(link, error.code(), error.detail()).await?;
+                return Ok(());
+            }
+        }
+    }
+    let inbound = state.inbound.as_mut().expect("opened or kept above");
+    match inbound.push(set) {
+        Err(error) => {
+            state.inbound = None;
+            send_error(link, error.code(), error.detail()).await?;
+        }
+        Ok(clipboard_wire::Progress::NeedMore) => {}
+        Ok(clipboard_wire::Progress::Ready) => {
+            let inbound = state.inbound.take().expect("checked above");
+            match inbound.finish(set) {
+                Err(error) => send_error(link, error.code(), error.detail()).await?,
+                Ok(text) => match backend.set_clipboard(Some(&text)) {
+                    Ok(()) => {
+                        tracing::info!(
+                            version = set.origin_version,
+                            bytes = text.len(),
+                            "clipboard applied from core"
+                        );
+                        state.applied(set.origin_version);
+                    }
+                    Err(detail) => send_error(link, "CLIPBOARD_APPLY_FAILED", &detail).await?,
+                },
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reports one local clipboard change to core, in frames that fit an IPC frame.
+///
+/// `size_bytes` and the markers travel on every chunk and the `sha256` on the last one, which
+/// is what core's assembly verifies before it offers anything to a peer. The text is never
+/// logged — only its size, the chunk count and how many markers came with it.
+async fn send_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentLink<S>,
+    state: &mut ClipboardState,
+    change: ClipboardChange,
+) -> anyhow::Result<()> {
+    let bytes = change.text.len();
+    if bytes as u64 > clipboard::MAX_BYTES {
+        // 32 chunks of 32 KiB is the framing, so anything larger has no wire form at all:
+        // reported and dropped rather than sent truncated.
+        tracing::warn!(
+            bytes,
+            limit = clipboard::MAX_BYTES,
+            "clipboard payload over the 1 MiB protocol limit; not offering it"
+        );
+        return Ok(());
+    }
+    let version = state.next_version();
+    let frames = clipboard_wire::frames(&change.text, version, &change.markers);
+    tracing::info!(
+        version,
+        bytes,
+        chunks = frames.len(),
+        markers = change.markers.len(),
+        "offering a local clipboard change"
+    );
+    for frame in frames {
+        link.send(Msg::ClipboardChanged(frame)).await?;
+    }
+    Ok(())
 }
 
 /// Handles one backend event.
@@ -667,6 +856,8 @@ fn monotonic_us() -> u64 {
 mod tests {
     use super::*;
     use crate::backend::BackendKindArg;
+    use clipboard::Marker;
+    use std::path::PathBuf;
     use tokio::io::duplex;
 
     const HOTKEY: &str = "Ctrl+Alt+Shift+F12";
@@ -689,18 +880,26 @@ mod tests {
         displays: crate::displays::DisplaysState,
         /// The software repeat engine, or `None` for native repeat (KVM-036).
         repeat: Option<crate::repeat::SoftwareRepeat>,
+        /// The clipboard versions and the transfer being assembled (KVM-041).
+        clipboard: ClipboardState,
         /// The harness's monotonic clock, advanced by the tests that need one.
         clock: u64,
     }
 
     impl Harness {
         async fn new() -> Self {
+            Harness::dry(None).await
+        }
+
+        /// The same, with a dry session that has a clipboard (`--dry-clipboard-dir`).
+        async fn dry(clipboard_dir: Option<PathBuf>) -> Self {
             let (agent_io, core_io) = duplex(8 * 1024);
             let (backend, ready, _refusals) = Backend::select(
                 BackendKindArg(::protocol::ipc::BackendKind::Auto as i32),
                 true,
                 0,
                 false,
+                clipboard_dir,
                 HOTKEY,
                 &[],
                 ::protocol::ipc::TakeoverDetection::Auto,
@@ -723,6 +922,7 @@ mod tests {
                 repeat: Some(crate::repeat::SoftwareRepeat::new(
                     crate::repeat::RepeatTiming::default(),
                 )),
+                clipboard: ClipboardState::new(),
                 clock: 0,
             }
         }
@@ -739,6 +939,7 @@ mod tests {
                 &mut self.batch,
                 &mut self.displays,
                 &mut self.repeat,
+                &mut self.clipboard,
                 self.clock,
             )
             .await
@@ -765,6 +966,355 @@ mod tests {
             )
             .await
             .expect("a backend event must not fail the handler");
+        }
+
+        /// Asserts that the handler answered nothing at all.
+        async fn quiet(&mut self) {
+            match tokio::time::timeout(Duration::from_millis(50), self.core.recv()).await {
+                Err(_) => {}
+                Ok(Ok(frame)) => panic!("expected no frame, got {:?}", frame.msg),
+                Ok(Err(error)) => panic!("the link ended instead of staying quiet: {error}"),
+            }
+        }
+    }
+
+    static CLIPBOARD_DIRS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// A private directory under the system temp root, for the dry clipboard's two files.
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lws-agent-clipboard-{}-{}-{label}",
+            std::process::id(),
+            CLIPBOARD_DIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temporary directory must be creatable");
+        dir
+    }
+
+    /// One whole payload in one frame, as core sends it.
+    fn set_text(version: u64, text: &str) -> Msg {
+        Msg::SetClipboardText(ipc::SetClipboardText {
+            origin_version: version,
+            chunk_index: 0,
+            chunk_count: 1,
+            data: text.as_bytes().to_vec(),
+            sha256: clipboard::sha256(text.as_bytes()),
+        })
+    }
+
+    /// Waits out the dry hook's own pacing (`in.txt` is looked at ~20 times a second).
+    async fn clipboard_tick() {
+        tokio::time::sleep(crate::backend::DRY_CLIPBOARD_POLL + Duration::from_millis(10)).await;
+    }
+
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).expect("the dry clipboard file must be readable")
+    }
+
+    /// A dry session with a clipboard: what core applies lands on the selection, the payload
+    /// itself is not reported back as a local copy, and the next user copy is — numbered above
+    /// the version core used (ADR-008's echo rule at the agent's edge).
+    #[tokio::test]
+    async fn a_payload_from_core_is_applied_and_its_own_echo_is_not_a_local_change() {
+        let dir = temp_dir("apply");
+        let in_path = dir.join("in.txt");
+        let out_path = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        assert!(harness.backend.clipboard_available());
+        assert!(
+            harness
+                .ready
+                .capabilities
+                .iter()
+                .any(|name| name == "TEXT_CLIPBOARD"),
+            "a dry session with a clipboard advertises the capability: {:?}",
+            harness.ready.capabilities
+        );
+        assert_eq!(read(&out_path), "", "a fresh selection is empty");
+
+        harness.send(set_text(41, "from core")).await;
+        harness.quiet().await;
+        assert_eq!(read(&out_path), "from core", "the selection holds it");
+        assert_eq!(harness.clipboard.applied_version, 41);
+
+        // The outside world reports the item this node caused: "it is what you put there".
+        std::fs::write(&in_path, "from core").expect("in.txt is writable");
+        clipboard_tick().await;
+        assert!(
+            harness.backend.clipboard_change().is_none(),
+            "the payload core applied is not a local change"
+        );
+        assert_eq!(harness.clipboard.applied_version, 41);
+
+        // A copy the user makes, on the other hand, is exactly what core has to hear about.
+        std::fs::write(&in_path, "copied by the user").expect("in.txt is writable");
+        clipboard_tick().await;
+        let change = harness
+            .backend
+            .clipboard_change()
+            .expect("a local copy surfaces");
+        assert_eq!(change.text, "copied by the user");
+        assert!(change.markers.is_empty(), "dry mode reports no marker");
+        assert_eq!(read(&out_path), "copied by the user");
+
+        send_clipboard_change(&mut harness.agent, &mut harness.clipboard, change)
+            .await
+            .expect("the frame goes out");
+        match harness.recv().await {
+            Msg::ClipboardChanged(changed) => {
+                assert_eq!(changed.data, b"copied by the user");
+                assert_eq!(changed.chunk_index, 0);
+                assert_eq!(changed.chunk_count, 1);
+                assert_eq!(changed.size_bytes, 17);
+                assert_eq!(changed.markers, Vec::<String>::new());
+                assert_eq!(changed.sha256, clipboard::sha256(b"copied by the user"));
+                assert_eq!(
+                    changed.origin_version, 42,
+                    "strictly greater than the 41 core applied"
+                );
+            }
+            other => panic!("expected ClipboardChanged, got {other:?}"),
+        }
+    }
+
+    /// A release (`chunk_count == 0`) forgets the text, and a local change after it is still
+    /// numbered above the version of the release.
+    #[tokio::test]
+    async fn a_release_empties_the_selection_and_does_not_undo_the_version_order() {
+        let dir = temp_dir("release");
+        let out_path = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        harness.send(set_text(5, "held")).await;
+        harness.quiet().await;
+        assert_eq!(read(&out_path), "held");
+
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 6,
+                chunk_index: 0,
+                chunk_count: 0,
+                data: Vec::new(),
+                sha256: Vec::new(),
+            }))
+            .await;
+        harness.quiet().await;
+        assert_eq!(read(&out_path), "", "the selection is released");
+        assert_eq!(harness.clipboard.applied_version, 6);
+
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                text: "local".to_owned(),
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .expect("the frame goes out");
+        match harness.recv().await {
+            Msg::ClipboardChanged(changed) => assert_eq!(changed.origin_version, 7),
+            other => panic!("expected ClipboardChanged, got {other:?}"),
+        }
+    }
+
+    /// An out-of-sequence chunk and a payload whose hash does not cover it are both refused
+    /// with a `CLIPBOARD_*` code, and neither touches the selection.
+    #[tokio::test]
+    async fn an_unverified_transfer_is_refused_and_never_applied() {
+        let dir = temp_dir("verify");
+        let out_path = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+
+        // Index 1 as the first chunk of a two-chunk transfer: out of order.
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 7,
+                chunk_index: 1,
+                chunk_count: 2,
+                data: b"def".to_vec(),
+                sha256: clipboard::sha256(b"abcdef"),
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_INVALID"),
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+        assert_eq!(read(&out_path), "", "nothing out of order is applied");
+
+        // The right shape, the wrong hash.
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 8,
+                chunk_index: 0,
+                chunk_count: 1,
+                data: "секрет".as_bytes().to_vec(),
+                sha256: clipboard::sha256(b"another payload"),
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_HASH_MISMATCH"),
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+        assert_eq!(read(&out_path), "", "unverified text is never applied");
+        assert_eq!(
+            harness.clipboard.applied_version, 0,
+            "a refused transfer does not move the version"
+        );
+
+        // `chunk_count` outside `1..=32` is refused before anything is buffered.
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 9,
+                chunk_index: 0,
+                chunk_count: 33,
+                data: b"x".to_vec(),
+                sha256: Vec::new(),
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_INVALID"),
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+
+        // And a valid two-chunk payload still goes through after all that.
+        let payload = "abcdef".as_bytes().to_vec();
+        let hash = clipboard::sha256(&payload);
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 10,
+                chunk_index: 0,
+                chunk_count: 2,
+                data: b"abc".to_vec(),
+                sha256: Vec::new(),
+            }))
+            .await;
+        harness.quiet().await;
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 10,
+                chunk_index: 1,
+                chunk_count: 2,
+                data: b"def".to_vec(),
+                sha256: hash,
+            }))
+            .await;
+        harness.quiet().await;
+        assert_eq!(read(&out_path), "abcdef");
+        assert_eq!(harness.clipboard.applied_version, 10);
+    }
+
+    /// A session with no clipboard at all answers `CLIPBOARD_DISABLED`, never polls, and
+    /// advertises nothing (ADR-008: opt-in on both sides).
+    #[tokio::test]
+    async fn without_a_clipboard_the_frame_is_refused_with_clipboard_disabled() {
+        let mut harness = Harness::new().await;
+        assert!(!harness.backend.clipboard_available());
+        assert!(
+            !harness
+                .ready
+                .capabilities
+                .iter()
+                .any(|name| name == "TEXT_CLIPBOARD"),
+            "no clipboard, no capability: {:?}",
+            harness.ready.capabilities
+        );
+        assert!(harness.backend.clipboard_change().is_none());
+        assert!(harness.backend.set_clipboard(Some("x")).is_err());
+
+        harness.send(set_text(1, "x")).await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_DISABLED"),
+            other => panic!("expected an AgentError, got {other:?}"),
+        }
+    }
+
+    /// Markers travel with every chunk of a multi-chunk payload and the hash only with the
+    /// last one — the shape core's own assembly checks.
+    #[tokio::test]
+    async fn a_large_change_is_chunked_with_the_markers_on_every_frame() {
+        let mut harness = Harness::new().await;
+        let text = "x".repeat(70 * 1024);
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                text: text.clone(),
+                markers: vec![Marker::KdeSecret, Marker::ExcludeFromMonitor],
+            },
+        )
+        .await
+        .expect("the frames go out");
+
+        let mut collected = String::new();
+        for index in 0..3u32 {
+            match harness.recv().await {
+                Msg::ClipboardChanged(changed) => {
+                    assert_eq!(changed.chunk_index, index);
+                    assert_eq!(changed.chunk_count, 3, "70 KiB is three 32 KiB frames");
+                    assert_eq!(changed.size_bytes, 70 * 1024);
+                    assert_eq!(changed.markers, vec!["kde_secret", "exclude_from_monitor"]);
+                    assert_eq!(changed.origin_version, 1);
+                    if index < 2 {
+                        assert!(changed.sha256.is_empty(), "no hash before the last chunk");
+                    } else {
+                        assert_eq!(changed.sha256, clipboard::sha256(text.as_bytes()));
+                    }
+                    collected.push_str(&String::from_utf8(changed.data).expect("UTF-8 text"));
+                }
+                other => panic!("expected ClipboardChanged, got {other:?}"),
+            }
+        }
+        assert_eq!(collected, text);
+        harness.quiet().await;
+
+        // The second change is numbered after the first, so core can order them.
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                text: "second".to_owned(),
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .expect("the frame goes out");
+        match harness.recv().await {
+            Msg::ClipboardChanged(changed) => assert_eq!(changed.origin_version, 2),
+            other => panic!("expected ClipboardChanged, got {other:?}"),
+        }
+    }
+
+    /// A payload over the protocol's 1 MiB limit has no wire form, so it is reported and
+    /// dropped rather than sent truncated.
+    #[tokio::test]
+    async fn a_payload_over_the_limit_is_dropped_instead_of_truncated() {
+        let mut harness = Harness::new().await;
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                text: "x".repeat(clipboard::MAX_BYTES as usize + 1),
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .expect("dropping it is not an error");
+        harness.quiet().await;
+        // Nothing was numbered, so the next change is still the first version.
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                text: "small".to_owned(),
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .expect("the frame goes out");
+        match harness.recv().await {
+            Msg::ClipboardChanged(changed) => assert_eq!(changed.origin_version, 1),
+            other => panic!("expected ClipboardChanged, got {other:?}"),
         }
     }
 

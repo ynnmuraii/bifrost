@@ -7,6 +7,10 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+# The clipboard vocabulary and limits (`Marker`, `MAX_BYTES`, `sha256`) — pure, no OS:
+# the agent owns the local selection, and this crate is what decides what may be applied
+# (ADR-008). The per-platform halves are behind `platform-win`/`platform-x11`.
+clipboard = { path = "../../crates/clipboard" }
 input-model = { path = "../../crates/input-model" }
 ipc = { path = "../../crates/ipc" }
 platform-probe = { path = "../../crates/platform-probe" }

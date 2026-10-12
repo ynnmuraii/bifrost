@@ -21,9 +21,12 @@
 //! documents require of a backend that cannot honour the session; a half-wired
 //! portal session would look like a defect instead.
 
+use clipboard::Marker;
 use input_model::{CaptureKind, HidKey, InputEvent, MouseButton, Position};
 use platform_probe::{BackendOverride, EnvSnapshot, SessionInfo};
 use protocol::ipc;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -76,6 +79,19 @@ pub struct Ready {
     pub session_kind: String,
     /// The structured detail `AgentReady.backend` carries.
     pub backend: ipc::BackendInfo,
+}
+
+/// A local clipboard change the user made (KVM-041/043, ADR-008).
+///
+/// Nothing here is logged: sizes and marker names only, never the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardChange {
+    /// The text now on the local CLIPBOARD selection.
+    pub text: String,
+    /// The secret markers the platform reported for it. The decision whether it may leave
+    /// the machine belongs to `clipboard::policy` on core's side of the link; the agent only
+    /// reports what it saw.
+    pub markers: Vec<clipboard::Marker>,
 }
 
 /// One thing the backend produced while capturing.
@@ -203,6 +219,16 @@ impl Ready {
         }
     }
 
+    /// `CAPABILITY_TEXT_CLIPBOARD`, advertised exactly when the backend can own and read the
+    /// local CLIPBOARD selection (ADR-008: the clipboard is what the *platform* can do, so the
+    /// capability is the adapter's answer, not the probe's).
+    pub(crate) fn set_text_clipboard(&mut self, available: bool) {
+        self.capabilities.retain(|name| name != "TEXT_CLIPBOARD");
+        if available {
+            self.capabilities.push("TEXT_CLIPBOARD".to_owned());
+        }
+    }
+
     /// The same report with no capability claimed, for a session this build cannot
     /// drive.
     fn degraded(reason: &str, platform: &str, session_kind: &str) -> Self {
@@ -307,10 +333,181 @@ pub struct Dry {
     /// `Local`, and core's edge trigger is what notices it.
     motion: std::collections::VecDeque<Option<InputEvent>>,
     capturing: bool,
+    /// The clipboard, when `--dry-clipboard-dir` named one. `None` is a dry agent with no
+    /// clipboard at all, which is what it reports.
+    clipboard: Option<DryClipboard>,
+}
+
+/// The `--dry-clipboard-dir` hook: a clipboard made of files.
+///
+/// `in.txt` is the outside world copying something — a local user copy, which is the only
+/// thing that may surface as a change — while `out.txt` mirrors what this node's selection
+/// holds, so a smoke can see what the agent applied without a desktop. `set_clipboard` writes
+/// `out.txt` and never touches `in.txt`, which is what keeps "the user copied this" (a change
+/// to `in.txt`) apart from "core sent this" (a change to `out.txt`) on one filesystem.
+///
+/// `in.markers`, read only when `in.txt` changes, is how a smoke expresses the copy a password
+/// manager would mark (`AC-15`): the five names the IPC carries, separated by commas, spaces or
+/// newlines, and an absent or empty file means "plain text". Anything else in it is ignored.
+///
+/// # Echo suppression
+///
+/// `in.txt` is only ever written by whoever is driving the smoke, so the way the outside world
+/// reports "the selection now holds what you put there" (the OS notification this node caused)
+/// is by writing that same text into `in.txt`. The text this backend last applied from core is
+/// remembered in `applied`, and one matching observation is swallowed — which is the same rule
+/// Windows implements with `GetClipboardSequenceNumber` and X11 with a comparison of the
+/// observed text to the applied one. One observation, not all of them: a second identical write
+/// with no intervening change is a user copy this hook cannot tell apart from a retry, and
+/// reporting it is the safe direction (core's own echo history drops it downstream).
+#[derive(Debug)]
+struct DryClipboard {
+    in_path: PathBuf,
+    markers_path: PathBuf,
+    out_path: PathBuf,
+    /// The text this node's selection holds.
+    text: String,
+    /// The cheap identity of `in.txt` (`(mtime, length)`, or `None` when it is absent) as of
+    /// the last look — what makes the poll a `stat` rather than a read.
+    observed: Option<(Option<SystemTime>, u64)>,
+    /// When `in.txt` was last looked at, so a 5 ms loop tick does not turn into 200 stats a
+    /// second.
+    last_poll: Option<Instant>,
+    /// The payload this backend last applied from core.
+    applied: Option<String>,
+}
+
+/// How often the dry hook is allowed to look at `in.txt`.
+///
+/// `pub(crate)` so the session's tests can wait it out instead of guessing.
+pub(crate) const DRY_CLIPBOARD_POLL: Duration = Duration::from_millis(50);
+
+/// The cheap identity of a file: its modification time and length, or `None` when it is not
+/// there. Enough to notice a copy without reading the payload every tick.
+fn file_stamp(path: &std::path::Path) -> Option<(Option<SystemTime>, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.modified().ok(), meta.len()))
+}
+
+/// The markers `<dir>/in.markers` names, in the order it names them.
+///
+/// The tokens are separated by anything whitespace, a comma or a semicolon; a name outside the
+/// five the IPC carries is ignored (and logged at debug), and a file that is absent, unreadable
+/// or empty means "no markers" — the same tolerance core's own marker decoding has for the wire.
+fn read_markers(path: &std::path::Path) -> Vec<Marker> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut markers: Vec<Marker> = Vec::new();
+    for token in text.split([',', ';', ' ', '\t', '\r', '\n']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match crate::clipboard_wire::marker_from_name(token) {
+            Some(marker) if !markers.contains(&marker) => markers.push(marker),
+            Some(_) => {}
+            None => tracing::debug!(
+                name = token,
+                "ignoring an unknown marker name in in.markers"
+            ),
+        }
+    }
+    markers
+}
+
+impl DryClipboard {
+    /// The hook for one directory, which is created when it is not there.
+    ///
+    /// Whatever `in.txt` holds at this moment is the selection as of now: it is *not* a change,
+    /// so it is captured as the baseline instead of being reported.
+    fn new(dir: PathBuf) -> Self {
+        let in_path = dir.join("in.txt");
+        let markers_path = dir.join("in.markers");
+        let out_path = dir.join("out.txt");
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                %error,
+                dir = dir.display().to_string(),
+                "cannot create the dry clipboard directory"
+            );
+        }
+        let observed = file_stamp(&in_path);
+        let text = std::fs::read_to_string(&in_path).unwrap_or_default();
+        let clipboard = DryClipboard {
+            in_path,
+            markers_path,
+            out_path,
+            text,
+            observed,
+            last_poll: None,
+            applied: None,
+        };
+        clipboard.write_out();
+        tracing::info!(
+            dir = dir.display().to_string(),
+            bytes = clipboard.text.len(),
+            "dry clipboard armed: in.txt is a local copy, out.txt is the selection"
+        );
+        clipboard
+    }
+
+    /// Mirrors the selection into `out.txt`. Never logs the text, only its size.
+    fn write_out(&self) {
+        if let Err(error) = std::fs::write(&self.out_path, &self.text) {
+            tracing::warn!(
+                %error,
+                path = self.out_path.display().to_string(),
+                "cannot write the dry clipboard's out.txt"
+            );
+        }
+    }
+
+    /// Looks for a copy the user made, at most every [`DRY_CLIPBOARD_POLL`].
+    fn poll(&mut self) -> Option<ClipboardChange> {
+        if let Some(last) = self.last_poll {
+            if last.elapsed() < DRY_CLIPBOARD_POLL {
+                return None;
+            }
+        }
+        self.last_poll = Some(Instant::now());
+        let current = file_stamp(&self.in_path);
+        if current == self.observed {
+            return None;
+        }
+        self.observed = current;
+        // A selection that disappeared is not a copy; keep what the node holds.
+        current?;
+        let Ok(text) = std::fs::read_to_string(&self.in_path) else {
+            tracing::warn!(
+                path = self.in_path.display().to_string(),
+                "cannot read the dry clipboard's in.txt; ignoring the change"
+            );
+            return None;
+        };
+        self.text = text.clone();
+        if self.applied.as_deref() == Some(text.as_str()) {
+            // The payload this node itself applied, showing up as a notification.
+            self.applied = None;
+            self.write_out();
+            tracing::debug!(
+                bytes = text.len(),
+                "dry clipboard: swallowing its own payload"
+            );
+            return None;
+        }
+        // The markers belong to this copy, not to the file: they are read when `in.txt` changes
+        // and only for a change that is reported (an echo carries the applied payload, whose
+        // markers core already knows).
+        let markers = read_markers(&self.markers_path);
+        self.write_out();
+        Some(ClipboardChange { text, markers })
+    }
 }
 
 impl Dry {
-    fn new(ready: Ready, synthetic: usize, motion: bool) -> Self {
+    fn new(ready: Ready, synthetic: usize, motion: bool, clipboard_dir: Option<PathBuf>) -> Self {
         let mut scheduled = Vec::new();
         // Alternating down/up of HID usage 0x04: visibly synthetic, payload-free and
         // never text. It exists to exercise the batch path without a human at the
@@ -325,6 +522,9 @@ impl Dry {
                 },
             });
         }
+        let clipboard = clipboard_dir.map(DryClipboard::new);
+        let mut ready = ready;
+        ready.set_text_clipboard(clipboard.is_some());
         Dry {
             ready,
             scheduled,
@@ -334,7 +534,48 @@ impl Dry {
                 std::collections::VecDeque::new()
             },
             capturing: false,
+            clipboard,
         }
+    }
+
+    /// Whether this dry agent has a clipboard at all (`--dry-clipboard-dir`).
+    fn clipboard_available(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// A copy the user made, per [`DryClipboard::poll`].
+    fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+        self.clipboard.as_mut().and_then(DryClipboard::poll)
+    }
+
+    /// Owns the selection: `Some` puts `text` on it, `None` releases it and forgets the text.
+    ///
+    /// Only `out.txt` is written — `in.txt` (and `in.markers`) belong to the outside world, and
+    /// that is exactly what makes "core applied this" and "the user copied this" two different
+    /// observations of the same directory.
+    fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return Err("CLIPBOARD_DISABLED: this dry agent has no --dry-clipboard-dir".to_owned());
+        };
+        match text {
+            Some(text) => {
+                clipboard.text = text.to_owned();
+                clipboard.applied = Some(text.to_owned());
+            }
+            None => {
+                clipboard.text.clear();
+                // The selection is gone, so the payload is not "ours" any more: a later copy
+                // of the same text is a real local copy.
+                clipboard.applied = None;
+            }
+        }
+        clipboard.write_out();
+        tracing::info!(
+            bytes = clipboard.text.len(),
+            released = text.is_none(),
+            "dry clipboard: selection set"
+        );
+        Ok(())
     }
 }
 
@@ -354,6 +595,7 @@ impl Backend {
         dry: bool,
         synthetic_events: usize,
         dry_motion: bool,
+        dry_clipboard_dir: Option<PathBuf>,
         emergency_hotkey: &str,
         restore_tokens: &[ipc::PortalGrant],
         takeover_detection: ipc::TakeoverDetection,
@@ -394,22 +636,26 @@ impl Backend {
                 }
                 let refusals = takeover_refusal.into_iter().collect::<Vec<_>>();
                 if dry {
-                    return (
-                        Backend::Dry(Box::new(Dry::new(
-                            ready.clone(),
-                            synthetic_events,
-                            dry_motion,
-                        ))),
-                        ready,
-                        refusals,
+                    let backend = Dry::new(
+                        ready.clone(),
+                        synthetic_events,
+                        dry_motion,
+                        dry_clipboard_dir,
                     );
+                    // The adapter is what knows whether it has a clipboard at all, so the
+                    // report comes back from it rather than from the probe.
+                    let ready = backend.ready.clone();
+                    return (Backend::Dry(Box::new(backend)), ready, refusals);
                 }
                 match session.backend {
                     platform_probe::Backend::Windows => {
                         #[cfg(windows)]
                         {
                             match win::Win::new(&ready, emergency_hotkey, plan) {
-                                Ok(backend) => (Backend::Win(Box::new(backend)), ready, refusals),
+                                Ok(backend) => {
+                                    let ready = backend.ready();
+                                    (Backend::Win(Box::new(backend)), ready, refusals)
+                                }
                                 Err(reason) => refuse(&snapshot, &reason),
                             }
                         }
@@ -425,7 +671,10 @@ impl Backend {
                         #[cfg(target_os = "linux")]
                         {
                             match x11::X11::new(&ready, emergency_hotkey, plan) {
-                                Ok(backend) => (Backend::X11(Box::new(backend)), ready, refusals),
+                                Ok(backend) => {
+                                    let ready = backend.ready();
+                                    (Backend::X11(Box::new(backend)), ready, refusals)
+                                }
                                 Err(reason) => refuse(&snapshot, &reason),
                             }
                         }
@@ -467,6 +716,64 @@ impl Backend {
                 }
             }
             Err(unsupported) => refuse(&snapshot, &unsupported.to_string()),
+        }
+    }
+
+    /// Whether this backend can own and read the local CLIPBOARD selection.
+    ///
+    /// The answer is the adapter's, not the probe's: a backend whose notification window or
+    /// X connection could not be established reports `false` here and therefore advertises no
+    /// `TEXT_CLIPBOARD` (ADR-008 — the capability is a promise about what this node will do).
+    pub fn clipboard_available(&self) -> bool {
+        match self {
+            Backend::Dry(dry) => dry.clipboard_available(),
+            #[cfg(windows)]
+            Backend::Win(backend) => backend.clipboard_available(),
+            #[cfg(target_os = "linux")]
+            Backend::X11(backend) => backend.clipboard_available(),
+            // The portal clipboard is not implemented in this build (KVM-041), and a session
+            // that says otherwise would be lying to core.
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(_) => false,
+        }
+    }
+
+    /// Polls for a clipboard change the *user* made.
+    ///
+    /// Returns as soon as the platform has nothing to say: the session calls this from its own
+    /// tick, so a blocking wait here would stall the deadline and the core-silence watchdog.
+    /// A payload this agent itself applied from core (`set_clipboard`) is never reported —
+    /// ADR-008's echo rule at the agent's edge, which each backend implements with the
+    /// mechanism its platform offers (see `clipboard_change` in `backend/win.rs`,
+    /// `backend/x11.rs` and [`DryClipboard`]).
+    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+        match self {
+            Backend::Dry(dry) => dry.clipboard_change(),
+            #[cfg(windows)]
+            Backend::Win(backend) => backend.clipboard_change(),
+            #[cfg(target_os = "linux")]
+            Backend::X11(backend) => backend.clipboard_change(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(_) => None,
+        }
+    }
+
+    /// Owns the local selection and puts `text` on it; `None` releases it and forgets the
+    /// text.
+    ///
+    /// The error text is for the `AgentError.detail` of the frame core gets, never a payload.
+    pub fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+        match self {
+            Backend::Dry(dry) => dry.set_clipboard(text),
+            #[cfg(windows)]
+            Backend::Win(backend) => backend.set_clipboard(text),
+            #[cfg(target_os = "linux")]
+            Backend::X11(backend) => backend.set_clipboard(text),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(_) => Err(
+                "CLIPBOARD_DISABLED: the portal clipboard is not implemented in this build"
+                    .to_owned(),
+            ),
         }
     }
 
@@ -737,7 +1044,7 @@ fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready, Vec<Refusal>
     );
     let ready = Ready::degraded(reason, &platform, &session_kind);
     (
-        Backend::Dry(Box::new(Dry::new(ready.clone(), 0, false))),
+        Backend::Dry(Box::new(Dry::new(ready.clone(), 0, false, None))),
         ready,
         Vec::new(),
     )
@@ -861,6 +1168,214 @@ fn describe_session(snapshot: &EnvSnapshot) -> (String, String) {
 mod tests {
     use super::*;
 
+    /// A private directory under the system temp root, for the dry clipboard's files.
+    fn temp_dir(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lws-agent-dry-{}-{}-{label}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temporary directory must be creatable");
+        dir
+    }
+
+    /// A dry backend with a clipboard in `dir`, as `--dry-inject --dry-clipboard-dir <dir>`.
+    fn dry_with_clipboard(dir: &std::path::Path) -> Dry {
+        Dry::new(
+            Ready::degraded("test", "platform-test", "windows"),
+            0,
+            false,
+            Some(dir.to_path_buf()),
+        )
+    }
+
+    /// Waits out [`DRY_CLIPBOARD_POLL`] so the next poll looks at `in.txt`.
+    fn wait_for_poll() {
+        std::thread::sleep(DRY_CLIPBOARD_POLL + Duration::from_millis(10));
+    }
+
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).expect("the dry clipboard file must be readable")
+    }
+
+    fn write(path: &std::path::Path, text: &str) {
+        std::fs::write(path, text).expect("the dry clipboard file must be writable");
+    }
+
+    /// The dry hook: `out.txt` mirrors the selection, a payload applied from core is never
+    /// reported as a local change, and a copy the user makes always is.
+    #[test]
+    fn the_dry_clipboard_mirrors_the_selection_and_swallows_its_own_payload() {
+        let dir = temp_dir("echo");
+        let in_path = dir.join("in.txt");
+        let out_path = dir.join("out.txt");
+        let mut dry = dry_with_clipboard(&dir);
+        assert!(
+            dry.clipboard_available(),
+            "--dry-clipboard-dir arms the clipboard"
+        );
+        assert!(
+            dry.ready
+                .capabilities
+                .iter()
+                .any(|name| name == "TEXT_CLIPBOARD"),
+            "and it is advertised: {:?}",
+            dry.ready.capabilities
+        );
+        assert!(dry.clipboard_change().is_none(), "nothing copied yet");
+        assert_eq!(read(&out_path), "", "the selection starts empty");
+
+        dry.set_clipboard(Some("привет"))
+            .expect("the selection is taken");
+        assert_eq!(read(&out_path), "привет", "out.txt mirrors the selection");
+        assert!(
+            !in_path.exists(),
+            "applying from core must not write in.txt: that file is the user's"
+        );
+
+        // The outside world reporting the item this node caused — what a platform sends as the
+        // notification for our own `set` — is not a local change.
+        write(&in_path, "привет");
+        wait_for_poll();
+        assert!(
+            dry.clipboard_change().is_none(),
+            "the payload this node applied is not a local copy"
+        );
+
+        // A real copy is, and it carries no marker when `in.markers` says nothing.
+        write(&in_path, "copied by the user");
+        wait_for_poll();
+        let change = dry.clipboard_change().expect("a local copy");
+        assert_eq!(change.text, "copied by the user");
+        assert!(change.markers.is_empty());
+        assert_eq!(read(&out_path), "copied by the user");
+
+        // Releasing forgets the text: the selection is empty, and `in.txt` is untouched.
+        dry.set_clipboard(None).expect("the selection is released");
+        assert_eq!(read(&out_path), "");
+        assert_eq!(read(&in_path), "copied by the user");
+        assert_eq!(dry.clipboard_change(), None);
+
+        // Two polls have to wait for the hook's own pacing: the second one within the interval
+        // learns nothing new.
+        write(&in_path, "another copy");
+        let immediate = dry.clipboard_change();
+        wait_for_poll();
+        let later = dry.clipboard_change();
+        assert!(
+            later.is_some(),
+            "the change is seen once the interval passed (immediate: {immediate:?})"
+        );
+    }
+
+    /// `in.markers` is what makes `AC-15` testable without a password manager: the names are
+    /// the ones the IPC carries, and nothing else in the file is guessed at.
+    #[test]
+    fn the_marker_file_names_the_markers_of_a_copy() {
+        let dir = temp_dir("markers");
+        let in_path = dir.join("in.txt");
+        let markers_path = dir.join("in.markers");
+        let mut dry = dry_with_clipboard(&dir);
+
+        write(&in_path, "secret");
+        write(&markers_path, "kde_secret\n");
+        wait_for_poll();
+        let change = dry.clipboard_change().expect("a marked copy");
+        assert_eq!(change.text, "secret");
+        assert_eq!(change.markers, vec![Marker::KdeSecret]);
+
+        // Separators may be commas, spaces or newlines, an unknown name is ignored, and a
+        // repeated one is not reported twice.
+        write(&in_path, "another secret");
+        write(
+            &markers_path,
+            "exclude_from_monitor, no_history  viewer_ignore\nportal_secret\nnot_a_marker\nno_history\n",
+        );
+        wait_for_poll();
+        let change = dry.clipboard_change().expect("a marked copy");
+        assert_eq!(
+            change.markers,
+            vec![
+                Marker::ExcludeFromMonitor,
+                Marker::NoHistory,
+                Marker::ViewerIgnore,
+                Marker::PortalSecret
+            ]
+        );
+
+        // An empty file means plain text, and a later copy with no markers at all is plain too.
+        write(&in_path, "plain again");
+        write(&markers_path, "");
+        wait_for_poll();
+        assert!(dry.clipboard_change().expect("a copy").markers.is_empty());
+        std::fs::remove_file(&markers_path).expect("the marker file goes away");
+        write(&in_path, "plain once more");
+        wait_for_poll();
+        assert!(dry.clipboard_change().expect("a copy").markers.is_empty());
+
+        // Rewriting the marker file alone is not a copy: only `in.txt` starts one.
+        write(&markers_path, "kde_secret");
+        wait_for_poll();
+        assert!(
+            dry.clipboard_change().is_none(),
+            "markers without a new in.txt are not a change"
+        );
+    }
+
+    /// The dry backend without a directory keeps today's behaviour: no clipboard, no
+    /// capability, and a refusal instead of a silent no-op.
+    #[test]
+    fn a_dry_session_without_a_directory_has_no_clipboard() {
+        let mut dry = Dry::new(
+            Ready::degraded("test", "platform-test", "windows"),
+            0,
+            false,
+            None,
+        );
+        assert!(!dry.clipboard_available());
+        assert!(dry.clipboard_change().is_none());
+        assert!(dry.set_clipboard(Some("x")).is_err());
+        assert!(dry.set_clipboard(None).is_err());
+        assert!(
+            !dry.ready
+                .capabilities
+                .iter()
+                .any(|name| name == "TEXT_CLIPBOARD"),
+            "no clipboard, no capability: {:?}",
+            dry.ready.capabilities
+        );
+    }
+
+    /// The probe's own clipboard bit is never trusted: the capability is added and removed by
+    /// the adapter's answer.
+    #[test]
+    fn the_text_clipboard_capability_follows_the_adapter() {
+        let mut ready = Ready::degraded("test", "platform-test", "windows");
+        ready.capabilities.push("CAPTURE".to_owned());
+        ready.set_text_clipboard(true);
+        assert!(ready.capabilities.contains(&"TEXT_CLIPBOARD".to_owned()));
+        // The probe may already have claimed it; the adapter's answer is what stands.
+        ready.set_text_clipboard(true);
+        assert_eq!(
+            ready
+                .capabilities
+                .iter()
+                .filter(|name| *name == "TEXT_CLIPBOARD")
+                .count(),
+            1,
+            "the capability is never duplicated: {:?}",
+            ready.capabilities
+        );
+        ready.set_text_clipboard(false);
+        assert!(!ready.capabilities.contains(&"TEXT_CLIPBOARD".to_owned()));
+        assert!(
+            ready.capabilities.contains(&"CAPTURE".to_owned()),
+            "no other capability is touched"
+        );
+    }
+
     #[test]
     fn capture_kinds_match_the_proto_numbers() {
         assert_eq!(capture_kind_from_i32(1), Ok(CaptureKind::Observe));
@@ -876,7 +1391,7 @@ mod tests {
     #[tokio::test]
     async fn the_synthetic_aid_only_fires_once_capture_is_remote() {
         let ready = Ready::degraded("test", "platform-test", "windows");
-        let mut backend = Backend::Dry(Box::new(Dry::new(ready, 3, false)));
+        let mut backend = Backend::Dry(Box::new(Dry::new(ready, 3, false, None)));
 
         // `TEMPORARY` is the window in which core is not yet a remote source and drops
         // captured input, so the aid must not be spent there: it is documented as «after

@@ -24,7 +24,7 @@ use platform_win::capture::{Capture, CaptureConfig, CaptureError, CaptureEvent};
 use platform_win::event::EmergencyCombo;
 use platform_win::inject::Injector;
 
-use crate::backend::{Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
+use crate::backend::{ClipboardChange, Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
 use crate::takeover::Detector;
 use input_model::RepeatFilter;
 
@@ -46,6 +46,22 @@ pub struct Win {
     /// Source-side autorepeat filter: the OS repeats a held key for us, and those repeats
     /// must not reach the wire (`docs/05-protocol.md`: the receiver repeats, not the source).
     repeats: RepeatFilter,
+    /// The local clipboard: the notification window of `platform_win::clipboard` plus the
+    /// change counter. `None` when the window could not be created, in which case this
+    /// backend has no clipboard and says so.
+    ///
+    /// # Echo suppression (KVM-041)
+    ///
+    /// A set of the clipboard moves `GetClipboardSequenceNumber`, and the notification the
+    /// OS delivers for that set is indistinguishable from a user's copy *except* by the
+    /// counter. So the value right after this backend's own `SetClipboardData` is remembered
+    /// in `applied_sequence`, and the read that carries it is swallowed: exactly the payload
+    /// this node applied from core, never someone else's copy. (Core has its own echo history
+    /// on `(origin_node_id, origin_version)`; this is the same rule one hop earlier, at the
+    /// OS edge, where only the platform's signal exists.)
+    clipboard: Option<platform_win::clipboard::Clipboard>,
+    /// `GetClipboardSequenceNumber` right after this backend's own write.
+    applied_sequence: Option<u32>,
 }
 
 impl Win {
@@ -64,19 +80,105 @@ impl Win {
             shift = emergency.shift,
             "emergency combination armed in the capture hook"
         );
+        // The listener is a message-only window on its own thread; a failure here costs the
+        // clipboard and nothing else, so it is reported in the capability rather than
+        // refused (ADR-008: the clipboard is a separate feature from the KVM).
+        let clipboard = match platform_win::clipboard::Clipboard::listen() {
+            Ok(clipboard) => Some(clipboard),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the clipboard listener window could not be created: this session will not \
+                     do the clipboard"
+                );
+                None
+            }
+        };
+        let mut ready = ready.clone();
+        ready.set_text_clipboard(clipboard.is_some());
         Ok(Win {
-            ready: ready.clone(),
+            ready,
             capture: None,
             injector: Injector::new(),
             emergency,
             detector: None,
             plan,
             repeats: RepeatFilter::new(),
+            clipboard,
+            applied_sequence: None,
         })
     }
 
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    /// Whether this backend's clipboard listener is up.
+    pub fn clipboard_available(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// The next clipboard change the *user* made, if the listener queued one.
+    ///
+    /// Non-blocking on purpose: the session polls this from its own tick, and its watchdog and
+    /// deadline live on that tick too.
+    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+        let clipboard = self.clipboard.as_ref()?;
+        clipboard.wait(Duration::ZERO)?;
+        let snapshot = match clipboard.read() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "the clipboard could not be read; ignoring the change");
+                return None;
+            }
+        };
+        if Some(snapshot.sequence) == self.applied_sequence {
+            // Our own write, arriving as a notification. The next one to be noticed carries a
+            // larger counter, so a stale value here can never swallow a later change.
+            self.applied_sequence = None;
+            tracing::debug!(
+                sequence = snapshot.sequence,
+                bytes = snapshot.text.len(),
+                "swallowing the clipboard update this node applied"
+            );
+            return None;
+        }
+        if !snapshot.has_text {
+            // An image-only or empty item: nothing this agent can offer.
+            tracing::debug!(sequence = snapshot.sequence, "the clipboard holds no text");
+            return None;
+        }
+        tracing::info!(
+            sequence = snapshot.sequence,
+            bytes = snapshot.text.len(),
+            markers = snapshot.markers.len(),
+            "local clipboard change"
+        );
+        Some(ClipboardChange {
+            text: snapshot.text,
+            markers: snapshot.markers,
+        })
+    }
+
+    /// Owns the local selection: `Some` puts `text` on it, `None` empties it.
+    pub fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Err("CLIPBOARD_DISABLED: this session has no clipboard listener".to_owned());
+        };
+        match text {
+            Some(text) => clipboard.set(text),
+            None => clipboard.clear(),
+        }
+        .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: the clipboard was not taken: {error}"))?;
+        // The counter after our own write is what the notification will carry.
+        self.applied_sequence = Some(clipboard.sequence());
+        tracing::info!(
+            bytes = text.map(str::len).unwrap_or(0),
+            released = text.is_none(),
+            sequence = self.applied_sequence,
+            "clipboard set"
+        );
+        Ok(())
     }
 
     pub fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {

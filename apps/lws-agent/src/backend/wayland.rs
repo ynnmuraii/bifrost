@@ -49,7 +49,7 @@ use platform_wayland::{
 };
 
 use crate::backend::wayland_barriers::{self, BarrierSegment, Zone};
-use crate::backend::{Event, Injected, Ready, Refusal, Released, POLL_TICK};
+use crate::backend::{ClipboardChange, Event, Injected, Ready, Refusal, Released, POLL_TICK};
 
 /// Which role the agent currently plays on this desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +229,28 @@ impl Wayland {
     /// The capability report sent right after the attach.
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    /// Whether this backend can own and read the local CLIPBOARD selection.
+    ///
+    /// It cannot, and it does not pretend to: `crates/platform-wayland/src/clipboard.rs` has no
+    /// portal clipboard in this build (the `Clipboard` interface of `RemoteDesktop` is not
+    /// wired), so `TEXT_CLIPBOARD` is not advertised (`refine_ready` strips it) and core never
+    /// hands this node a payload. ADR-008 wants the feature to be *off* on a node that cannot
+    /// honour it, not half-wired.
+    pub fn clipboard_available(&self) -> bool {
+        false
+    }
+
+    /// Never: a Wayland session has no local selection this agent can watch.
+    pub fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+        None
+    }
+
+    /// Refused with `CLIPBOARD_DISABLED`: the portal clipboard is not implemented in this
+    /// build, and core is entitled to an answer rather than silence.
+    pub fn set_clipboard(&mut self, _text: Option<&str>) -> Result<(), String> {
+        Err("CLIPBOARD_DISABLED: the portal clipboard is not implemented in this build".to_owned())
     }
 
     /// Starts (or re-arms) capture for the requested kind.

@@ -20,6 +20,7 @@
 //! keyboard (see `docs/work/e2-slice-procedure.md`).
 
 mod backend;
+mod clipboard_wire;
 mod displays;
 mod events;
 mod launch;
@@ -55,6 +56,11 @@ struct Args {
     /// `[[topology.displays]]` snapshot, which is exactly what core falls back to when
     /// the agent reports nothing.
     dry_motion: bool,
+    /// Test aid: a clipboard made of two files, so the whole clipboard path can be driven
+    /// without a desktop. `<dir>/in.txt` is the outside world copying something (a local
+    /// user copy), `<dir>/out.txt` is what this node's selection holds afterwards. Without
+    /// it a dry agent has no clipboard at all and says so.
+    dry_clipboard_dir: Option<PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -62,15 +68,16 @@ lws-agent — LAN Workspace input agent (spawned by lws-core)
 
 USAGE:
     lws-agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
-              [--dry-input-events <n>] [--help]
+              [--dry-input-events <n>] [--dry-motion] [--dry-clipboard-dir <path>] [--help]
 
 OPTIONS:
-    --ipc-endpoint <spec>   local IPC endpoint core created for this launch
-    --token-file <path>     file with the 32-byte launch token (deleted on read)
-    --dry-inject            no capture hooks and no injection; log Inject instead
-    --dry-input-events <n>  with --dry-inject: emit n synthetic key edges (smoke aid)
-    --dry-motion            with --dry-inject: walk the pointer over the right edge and back
-    --help                  print this help
+    --ipc-endpoint <spec>    local IPC endpoint core created for this launch
+    --token-file <path>      file with the 32-byte launch token (deleted on read)
+    --dry-inject             no capture hooks and no injection; log Inject instead
+    --dry-input-events <n>   with --dry-inject: emit n synthetic key edges (smoke aid)
+    --dry-motion             with --dry-inject: walk the pointer over the right edge and back
+    --dry-clipboard-dir <p>  with --dry-inject: a clipboard of in.txt/out.txt under <p>
+    --help                   print this help
 ";
 
 fn parse_args() -> Result<Args, String> {
@@ -79,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dry_inject = false;
     let mut dry_input_events = 0usize;
     let mut dry_motion = false;
+    let mut dry_clipboard_dir = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -97,6 +105,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--dry-inject" => dry_inject = true,
             "--dry-motion" => dry_motion = true,
+            "--dry-clipboard-dir" => {
+                dry_clipboard_dir = Some(PathBuf::from(
+                    args.next().ok_or("--dry-clipboard-dir needs a value")?,
+                ));
+            }
             "--dry-input-events" => {
                 let value = args.next().ok_or("--dry-input-events needs a value")?;
                 dry_input_events = value
@@ -107,12 +120,18 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
+    if dry_clipboard_dir.is_some() && !dry_inject {
+        // Reporting the mistake beats starting a real session that silently ignores it.
+        return Err(format!("--dry-clipboard-dir needs --dry-inject\n\n{USAGE}"));
+    }
+
     Ok(Args {
         ipc_endpoint: ipc_endpoint.ok_or("--ipc-endpoint is required")?,
         token_file: token_file.ok_or("--token-file is required")?,
         dry_inject,
         dry_input_events,
         dry_motion,
+        dry_clipboard_dir,
     })
 }
 
