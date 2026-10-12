@@ -892,10 +892,12 @@ mod heartbeat_tests {
             !heartbeat.silence_exceeded(),
             "inside the launch timeout the agent is still starting"
         );
-        assert_eq!(
-            heartbeat.next_silence_check_in_ms(),
-            100,
-            "the bound is near"
+        // Sleep can overshoot by several milliseconds; assert the deadline's state, not
+        // the exact remainder implied by the requested 50 ms sleep.
+        let remaining = heartbeat.next_silence_check_in_ms();
+        assert!(
+            (1..150).contains(&remaining),
+            "the launch deadline is still ahead and has advanced: remaining={remaining} ms"
         );
 
         std::thread::sleep(Duration::from_millis(150));
