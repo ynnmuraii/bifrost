@@ -364,6 +364,18 @@ impl LinkManager {
                 existing.handle.close();
                 existing.task.abort();
             }
+            // …and the application is told, because that link may be carrying its frames right
+            // now. A silent replacement lost an in-flight `LeaveAck` in a three-node run: the
+            // peer came back mid-transition with no `Down` before it, and the leaving node sat
+            // in `Releasing` with nothing left to read. `LocalClosed` is the reason for exactly
+            // this case — «the local side closed it … or a link that replaced this one».
+            let _ = self
+                .events_tx
+                .send(LinkEvent::Down {
+                    peer,
+                    reason: LinkDownReason::LocalClosed,
+                })
+                .await;
         }
 
         // Membership: «пятый член получает `MEMBERSHIP_FULL`».
