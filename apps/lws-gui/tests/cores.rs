@@ -150,21 +150,20 @@ struct Core {
 
 impl Core {
     /// Starts the daemon with its own log beside its own root.
-    fn start(root: PathBuf, label: &str) -> Core {
+    fn start(root: PathBuf, label: &str, report_displays: bool) -> Core {
         let log = root.join(format!("{label}.log"));
         let out = std::fs::File::create(&log).expect("log file");
         let err = out.try_clone().expect("log file");
-        let child = Command::new(program("lws-core"))
+        let mut command = Command::new(program("lws-core"));
+        command
             .arg("--root")
             .arg(&root)
-            .args([
-                "run",
-                "--dry-inject",
-                "--dry-input-events",
-                "4",
-                "--dry-displays",
-                "--agent",
-            ])
+            .args(["run", "--dry-inject", "--dry-input-events", "4"]);
+        if report_displays {
+            command.arg("--dry-displays");
+        }
+        let child = command
+            .args(["--agent"])
             .arg(program("lws-agent"))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
@@ -226,20 +225,24 @@ impl Lab {
     /// Two cores that are already paired, the way a working pair looks: the left computer
     /// claims on startup and owns input, the right one may own but does not claim.
     fn linked(label: &str) -> Lab {
-        Lab::start(label, true, false)
+        Lab::start(label, true, false, true)
+    }
+    /// A linked pair whose dry agents report no displays, exercising the configured fallback.
+    fn linked_without_agent_displays(label: &str) -> Lab {
+        Lab::start(label, true, false, false)
     }
 
     /// The coordinator restored revision 1; the follower starts with no applied document.
     fn restored_owner_layout(label: &str) -> Lab {
-        Lab::start(label, true, true)
+        Lab::start(label, true, true, true)
     }
 
     /// Two cores with no trust at all — what the pairing wizard starts from.
     fn unpaired(label: &str) -> Lab {
-        Lab::start(label, false, false)
+        Lab::start(label, false, false, true)
     }
 
-    fn start(label: &str, pair_first: bool, owner_only_layout: bool) -> Lab {
+    fn start(label: &str, pair_first: bool, owner_only_layout: bool, report_displays: bool) -> Lab {
         let dir = unique_dir(label);
         let a_root = dir.join("a");
         let b_root = dir.join("b");
@@ -269,8 +272,8 @@ impl Lab {
         }
         Lab {
             dir,
-            a: Core::start(a_root, "a"),
-            b: Core::start(b_root, "b"),
+            a: Core::start(a_root, "a", report_displays),
+            b: Core::start(b_root, "b", report_displays),
             a_id,
             b_id,
         }
@@ -642,7 +645,7 @@ fn missing_session(status: &protocol::ipc::Status) -> Option<&'static str> {
 #[test]
 fn the_status_screen_holds_the_linked_workspace() {
     let _serial = serial();
-    let lab = Lab::linked("status");
+    let lab = Lab::linked_without_agent_displays("status");
     // Make the empty dry-agent report happen before the GUI connects, so this exercises the
     // snapshot fallback rather than depending on which startup message wins the race.
     lab.a.wait_for_empty_report_rebuild();

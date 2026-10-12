@@ -841,10 +841,10 @@ mod heartbeat_tests {
             !heartbeat.silence_exceeded(),
             "a starting agent is not a silent one (300 ms > the 200 ms limit)"
         );
-        assert_eq!(
-            heartbeat.silence_ms(),
-            300,
-            "the log shows the launch's age"
+        let launch_age = heartbeat.silence_ms();
+        assert!(
+            launch_age >= 300,
+            "the log shows at least the requested launch age: {launch_age} ms"
         );
 
         // Its first frame starts the clock: silence is measured from here, not from the
