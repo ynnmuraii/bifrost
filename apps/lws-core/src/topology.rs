@@ -583,6 +583,96 @@ pub fn wire_document(
     }
 }
 
+/// The editable `[topology]` view of a wire document, retaining its graph for later rebuilds.
+///
+/// Node/display manifests are carried on the wire rather than in the configuration schema.
+/// They become display snapshots here; the receiver's next live rebuild still uses its agents.
+pub fn config_from_wire(
+    document: &wire::Topology,
+    self_node: NodeId,
+) -> Result<config::TopologyConfig, String> {
+    let author: [u8; 32] = document
+        .author_node_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| "topology author is not 32 bytes".to_owned())?;
+    let node_reference = |bytes: &[u8]| -> Result<String, String> {
+        let node: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "topology node id is not 32 bytes".to_owned())?;
+        if node == *self_node.as_bytes() {
+            Ok("self".to_owned())
+        } else {
+            Ok(format!(
+                "peer:{}",
+                node.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            ))
+        }
+    };
+    let endpoint = |endpoint: &wire::Endpoint| -> Result<config::EndpointConfig, String> {
+        let edge = match wire::Edge::try_from(endpoint.edge)
+            .map_err(|_| "topology link has an unknown edge".to_owned())?
+        {
+            wire::Edge::Left => config::Edge::Left,
+            wire::Edge::Right => config::Edge::Right,
+            wire::Edge::Top => config::Edge::Top,
+            wire::Edge::Bottom => config::Edge::Bottom,
+            wire::Edge::Unspecified => {
+                return Err("topology link has an unspecified edge".to_owned());
+            }
+        };
+        Ok(config::EndpointConfig {
+            node: node_reference(&endpoint.node_id)?,
+            display: endpoint.display_id.clone(),
+            edge,
+            start: endpoint.segment_start,
+            end: endpoint.segment_end,
+        })
+    };
+    let author_hex = author
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut layout = config::TopologyConfig {
+        revision: document.revision,
+        author: author_hex.clone(),
+        max_seen_revision: document.revision,
+        max_seen_author: author_hex,
+        ..config::TopologyConfig::default()
+    };
+    for node in &document.nodes {
+        let reference = node_reference(&node.node_id)?;
+        for display in &node.displays {
+            let Some(bounds) = &display.logical_bounds else {
+                continue;
+            };
+            layout.displays.push(config::DisplayConfig {
+                node: reference.clone(),
+                id: display.id.clone(),
+                logical: [bounds.x, bounds.y, bounds.width, bounds.height],
+                primary: display.primary,
+            });
+        }
+    }
+    for (index, link) in document.links.iter().enumerate() {
+        let from = link
+            .source_endpoint
+            .as_ref()
+            .ok_or_else(|| "topology link has no source endpoint".to_owned())?;
+        let to = link
+            .target_endpoint
+            .as_ref()
+            .ok_or_else(|| "topology link has no target endpoint".to_owned())?;
+        layout.links.push(config::LinkConfig {
+            id: format!("link-{index}"),
+            from: endpoint(from)?,
+            to: endpoint(to)?,
+            bidirectional: true,
+        });
+    }
+    Ok(layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -732,7 +732,10 @@ impl Session {
                     tracing::warn!(peer = %from, "topology without a readable author id");
                     return;
                 };
-                let validation = crate::topology::validate_wire(&document);
+                let parsed = crate::topology::config_from_wire(&document, self.node_id);
+                let validation = crate::topology::validate_wire(&document).and_then(|()| {
+                    parsed.as_ref().map(|_| ()).map_err(Clone::clone)
+                });
                 let outcome = self
                     .layout_state
                     .accept_topology(from, pair, || validation.clone());
@@ -746,25 +749,8 @@ impl Session {
                     crate::layout::TopologyOutcome::Applied(pair) => {
                         self.layout_editing_disabled = None;
                         self.last_layout_error = None;
-                        self.applied_wire = Some(match &self.topology {
-                            // Fold the live manifests in: the revision is the document the
-                            // author published, its node list is what the agents report.
-                            Some(live) => crate::topology::wire_from_live(
-                                live,
-                                &self.layout,
-                                document.revision,
-                                document
-                                    .author_node_id
-                                    .as_slice()
-                                    .try_into()
-                                    .map(NodeId::new)
-                                    .unwrap_or(self.node_id),
-                                self.node_id,
-                            ),
-                            None => document.clone(),
-                        });
-                        self.layout_store.observe(&self.layout_state);
-                        self.router.set_topology_revision(pair.revision);
+                        let layout = parsed.expect("accepted topology was converted");
+                        self.install_applied_layout(layout, pair);
                         // The coordinator asked for it (rejoin) or published it; either way the
                         // answer is the confirmation `docs/05-protocol.md` names.
                         self.send_layout_to(
@@ -779,7 +765,7 @@ impl Session {
                         if self.router.ownership().is_owner() {
                             // The coordinator takes the winning revision and republishes it
                             // under itself as `max_seen + 1`, keeping its own edit aside.
-                            self.republish_layout(document).await;
+                            self.republish_layout().await;
                         }
                     }
                     crate::layout::TopologyOutcome::NotNewer(current) => {
@@ -797,8 +783,6 @@ impl Session {
                             from,
                             protocol::wire::ErrorCode::InvalidTopology,
                             &detail,
-                            // A document push is not a request: there is no id or revision to
-                            // name.
                             0,
                             0,
                         )
@@ -810,8 +794,23 @@ impl Session {
                 }
             }
             LayoutMessage::LayoutEdit(edit) => {
-                // Only the coordinator applies, and it answers the editor either way.
+                let base = match <[u8; 32]>::try_from(edit.expected_author.as_slice()) {
+                    Ok(bytes) => {
+                        crate::layout::Pair::new(edit.expected_revision, NodeId::new(bytes))
+                    }
+                    Err(_) => crate::layout::Pair::NONE,
+                };
+                let applied = self.layout_state.applied();
                 if !self.router.ownership().is_owner() {
+                    tracing::warn!(
+                        peer = %from,
+                        expected_revision = base.revision,
+                        expected_author = ?base.author.map(|id| identity::fingerprint(&id)),
+                        applied_revision = applied.revision,
+                        applied_author = ?applied.author.map(|id| identity::fingerprint(&id)),
+                        owner = ?self.router.ownership().owner(),
+                        "layout edit refused"
+                    );
                     self.send_layout_error(
                         from,
                         protocol::wire::ErrorCode::NoCoordinator,
@@ -822,12 +821,6 @@ impl Session {
                     .await;
                     return;
                 }
-                let base = match <[u8; 32]>::try_from(edit.expected_author.as_slice()) {
-                    Ok(bytes) => {
-                        crate::layout::Pair::new(edit.expected_revision, NodeId::new(bytes))
-                    }
-                    Err(_) => crate::layout::Pair::NONE,
-                };
                 let editor = NodeId::new(
                     edit.author_node_id
                         .clone()
@@ -835,6 +828,7 @@ impl Session {
                         .unwrap_or(*from.as_bytes()),
                 );
                 let layout_toml = String::from_utf8_lossy(&edit.layout_toml).into_owned();
+                let mut candidate = None;
                 let outcome = self.layout_state.apply_edit(
                     &crate::layout::Edit {
                         expected: base,
@@ -843,18 +837,18 @@ impl Session {
                     },
                     self.node_id,
                     true,
-                    validate_layout_toml,
+                    |text| {
+                        candidate = Some(parse_layout_toml(text)?);
+                        Ok(())
+                    },
                 );
                 match outcome {
                     crate::layout::EditOutcome::Applied(pair) => {
                         self.layout_editing_disabled = None;
                         self.last_layout_error = None;
-                        self.layout_store.observe(&self.layout_state);
-                        self.router.set_topology_revision(pair.revision);
+                        let layout = candidate.expect("applied layout was parsed");
+                        let document = self.install_applied_layout(layout, pair);
                         tracing::info!(peer = %from, revision = pair.revision, "layout edit applied");
-                        // The editor asked by id, so it gets the verdict by id: a successful
-                        // edit is otherwise only visible as a document change, and two
-                        // requests from one node must not take each other's answer.
                         self.send_layout_to(
                             from,
                             transport::convert::LayoutMessage::TopologyApplied {
@@ -863,34 +857,17 @@ impl Session {
                             },
                         )
                         .await;
-                        let document = match toml::from_str::<config::TopologyConfig>(&layout_toml)
-                        {
-                            Ok(parsed) => match &self.topology {
-                                Some(live) => crate::topology::wire_from_live(
-                                    live,
-                                    &parsed,
-                                    pair.revision,
-                                    self.node_id,
-                                    self.node_id,
-                                ),
-                                None => crate::topology::wire_document(
-                                    &parsed,
-                                    pair.revision,
-                                    self.node_id,
-                                    self.node_id,
-                                ),
-                            },
-                            Err(error) => {
-                                tracing::warn!(%error, "applied layout cannot be republished");
-                                return;
-                            }
-                        };
                         self.publish_layout(document).await;
                     }
                     crate::layout::EditOutcome::Conflict(current) => {
-                        // The editor cannot reload what it cannot name: the refusal carries the
-                        // revision that is applied now (`docs/05-protocol.md`, the error table:
-                        // «отклонить, показать текущую ревизию и перезагрузить документ»).
+                        tracing::warn!(
+                            peer = %from,
+                            expected_revision = base.revision,
+                            expected_author = ?base.author.map(|id| identity::fingerprint(&id)),
+                            applied_revision = current.revision,
+                            applied_author = ?current.author.map(|id| identity::fingerprint(&id)),
+                            "layout edit refused"
+                        );
                         self.send_layout_error(
                             from,
                             protocol::wire::ErrorCode::LayoutConflict,
@@ -938,10 +915,26 @@ impl Session {
                 request_nonce,
                 layout_revision,
             } => {
-                // The editor's answer: `layout show` reports it until a revision moves.
+                let expected = self
+                    .layout_requests
+                    .get(&request_nonce)
+                    .map(|request| request.expected);
+                let applied = self.layout_state.applied();
                 let detail = refusal_detail(code, layout_revision);
                 self.last_layout_error = Some((code.as_str_name().to_owned(), detail.clone()));
-                tracing::warn!(peer = %from, code = code.as_str_name(), detail, "layout edit refused");
+                tracing::warn!(
+                    peer = %from,
+                    code = code.as_str_name(),
+                    expected_revision = ?expected.map(|pair| pair.revision),
+                    expected_author = ?expected
+                        .and_then(|pair| pair.author)
+                        .map(|id| identity::fingerprint(&id)),
+                    local_applied_revision = applied.revision,
+                    local_applied_author = ?applied.author.map(|id| identity::fingerprint(&id)),
+                    coordinator_applied_revision = layout_revision,
+                    detail,
+                    "layout edit refused"
+                );
                 self.deliver_layout_verdict(
                     request_nonce,
                     false,
@@ -979,22 +972,57 @@ impl Session {
         }
     }
 
+    /// Makes the accepted document the configuration source for routing, GUI, and persistence.
+    fn install_applied_layout(
+        &mut self,
+        mut layout: config::TopologyConfig,
+        pair: crate::layout::Pair,
+    ) -> protocol::wire::Topology {
+        let author = pair.author.unwrap_or(self.node_id);
+        let max_seen = self.layout_state.max_seen();
+        layout.revision = pair.revision;
+        layout.author = identity::fingerprint(&author);
+        layout.max_seen_revision = max_seen.revision;
+        layout.max_seen_author = max_seen
+            .author
+            .map_or_else(String::new, |id| identity::fingerprint(&id));
+        self.layout = layout;
+        self.layout_store.observe(&self.layout_state, &self.layout);
+        self.router.set_topology_revision(pair.revision);
+        self.rebuild_topology();
+
+        let document = match &self.topology {
+            Some(live) => crate::topology::wire_from_live(
+                live,
+                &self.layout,
+                pair.revision,
+                author,
+                self.node_id,
+            ),
+            None => crate::topology::wire_document(
+                &self.layout,
+                pair.revision,
+                author,
+                self.node_id,
+            ),
+        };
+        self.applied_wire = Some(document.clone());
+        document
+    }
+
     /// Republishes a document the coordinator has just adopted as `max_seen + 1` under itself.
     ///
     /// A divergent local edit stays pending: it was based on the revision this document
     /// supersedes, so applying it would silently revert the other side's work.
-    async fn republish_layout(&mut self, document: protocol::wire::Topology) {
+    async fn republish_layout(&mut self) {
         if self.layout_state.pending().is_some() {
             tracing::warn!(
                 "a pending layout edit stays aside while the winning revision is republished"
             );
         }
         let published = self.layout_state.republish(self.node_id);
-        self.layout_store.observe(&self.layout_state);
-        self.router.set_topology_revision(published.revision);
-        let mut wire = document;
-        wire.revision = published.revision;
-        wire.author_node_id = self.node_id.as_bytes().to_vec();
+        let layout = self.layout.clone();
+        let wire = self.install_applied_layout(layout, published);
         tracing::info!(
             revision = published.revision,
             "republishing the winning layout"
@@ -1094,6 +1122,7 @@ impl Session {
     fn hold_layout_request(
         &mut self,
         layout_toml: String,
+        expected: crate::layout::Pair,
     ) -> (u64, oneshot::Receiver<ctl::Response>) {
         self.layout_requests
             .retain(|_, request| !request.verdict.is_closed());
@@ -1105,6 +1134,7 @@ impl Session {
             nonce,
             LayoutRequest {
                 layout_toml,
+                expected,
                 verdict,
             },
         );
@@ -1189,13 +1219,29 @@ impl Session {
             // the base the slot keeps and answers with the verdict that comes back. The slot
             // is released by that verdict, not by the send, so a refusal or a lost answer
             // leaves the edit to reload (ADR-013).
+            let applied = self.layout_state.applied();
             let Some(owner) = self.router.ownership().owner().copied() else {
+                tracing::warn!(
+                    expected_revision = base_pair.revision,
+                    expected_author = ?base_pair.author.map(|id| identity::fingerprint(&id)),
+                    applied_revision = applied.revision,
+                    applied_author = ?applied.author.map(|id| identity::fingerprint(&id)),
+                    "layout edit refused"
+                );
                 return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "no owner is known; the pending edit waits".to_owned(),
                 });
             };
-            let (nonce, verdict) = self.hold_layout_request(layout_toml.clone());
+            tracing::info!(
+                owner = %owner,
+                expected_revision = base_pair.revision,
+                expected_author = ?base_pair.author.map(|id| identity::fingerprint(&id)),
+                applied_revision = applied.revision,
+                applied_author = ?applied.author.map(|id| identity::fingerprint(&id)),
+                "forwarding layout edit to coordinator"
+            );
+            let (nonce, verdict) = self.hold_layout_request(layout_toml.clone(), base_pair);
             // The base is the pair the edit was *written against*, never the pair this node
             // has applied now: a pending edit waits across a partition while the document
             // moves, and sending `applied` would turn the coordinator's CAS into a no-op that
@@ -1225,17 +1271,32 @@ impl Session {
             editor: self.node_id,
             layout_toml,
         };
-        let outcome = self
-            .layout_state
-            .apply_edit(&edit, self.node_id, true, validate_layout_toml);
+        let mut candidate = None;
+        let outcome = self.layout_state.apply_edit(
+            &edit,
+            self.node_id,
+            true,
+            |text| {
+                candidate = Some(parse_layout_toml(text)?);
+                Ok(())
+            },
+        );
         Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
                 self.release_layout_pending();
-                self.layout_store.observe(&self.layout_state);
-                self.router.set_topology_revision(pair.revision);
+                let layout = candidate.expect("applied pending layout was parsed");
+                let document = self.install_applied_layout(layout, pair);
+                self.publish_layout(document).await;
                 ctl::Response::Status(format!("applied revision={}", pair.revision))
             }
             crate::layout::EditOutcome::Conflict(current) => {
+                tracing::warn!(
+                    expected_revision = edit.expected.revision,
+                    expected_author = ?edit.expected.author.map(|id| identity::fingerprint(&id)),
+                    applied_revision = current.revision,
+                    applied_author = ?current.author.map(|id| identity::fingerprint(&id)),
+                    "layout edit refused"
+                );
                 let detail = format!(
                     "the pending edit is based on revision {} but {} is applied",
                     edit.expected.revision, current.revision
@@ -1336,8 +1397,16 @@ impl Session {
         if !is_coordinator {
             // A follower sends the edit to the coordinator and answers with the verdict that
             // comes back; only a partition keeps it pending (`docs/05-protocol.md`).
+            let applied = self.layout_state.applied();
             let Some(owner) = self.router.ownership().owner().copied() else {
                 self.hold_layout_pending(&document_text);
+                tracing::warn!(
+                    expected_revision = expected.revision,
+                    expected_author = ?expected.author.map(|id| identity::fingerprint(&id)),
+                    applied_revision = applied.revision,
+                    applied_author = ?applied.author.map(|id| identity::fingerprint(&id)),
+                    "layout edit refused"
+                );
                 return Handled::Reply(ctl::Response::Error {
                     code: "NO_COORDINATOR".to_owned(),
                     detail: "no owner is known; the edit is kept as pending".to_owned(),
@@ -1346,7 +1415,16 @@ impl Session {
             // The edit occupies the pending slot until the verdict says it was applied, so a
             // refusal or a lost answer leaves the edit — slot and file — for the user's reload.
             self.hold_layout_pending(&document_text);
-            let (nonce, verdict) = self.hold_layout_request(document_text.clone());
+            tracing::info!(
+                owner = %owner,
+                expected_revision = expected.revision,
+                expected_author = ?expected.author.map(|id| identity::fingerprint(&id)),
+                applied_revision = applied.revision,
+                applied_author = ?applied.author.map(|id| identity::fingerprint(&id)),
+                "forwarding layout edit to coordinator"
+            );
+            let (nonce, verdict) =
+                self.hold_layout_request(document_text.clone(), expected);
             let message =
                 transport::convert::LayoutMessage::LayoutEdit(protocol::wire::LayoutEdit {
                     expected_revision: expected.revision,
@@ -1372,23 +1450,36 @@ impl Session {
             editor: self.node_id,
             layout_toml: document_text,
         };
-        let outcome =
-            self.layout_state
-                .apply_edit(&edit, self.node_id, is_coordinator, validate_layout_toml);
+        let mut candidate = None;
+        let outcome = self.layout_state.apply_edit(
+            &edit,
+            self.node_id,
+            is_coordinator,
+            |text| {
+                candidate = Some(parse_layout_toml(text)?);
+                Ok(())
+            },
+        );
         Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
-                self.layout_store.observe(&self.layout_state);
-                self.router.set_topology_revision(pair.revision);
+                let layout = candidate.expect("applied layout was parsed");
+                let document = self.install_applied_layout(layout, pair);
+                self.publish_layout(document).await;
                 tracing::info!(
                     revision = pair.revision,
                     author = identity::fingerprint(&self.node_id).as_str(),
                     "layout applied by the coordinator"
                 );
-                // The same words a follower's verdict uses: the published document is always
-                // authored by the coordinator, so naming it here adds nothing.
                 ctl::Response::Status(format!("applied revision={}", pair.revision))
             }
             crate::layout::EditOutcome::Conflict(current) => {
+                tracing::warn!(
+                    expected_revision = edit.expected.revision,
+                    expected_author = ?edit.expected.author.map(|id| identity::fingerprint(&id)),
+                    applied_revision = current.revision,
+                    applied_author = ?current.author.map(|id| identity::fingerprint(&id)),
+                    "layout edit refused"
+                );
                 let detail = format!(
                     "the edit is based on revision {} but {} is applied",
                     edit.expected.revision, current.revision
@@ -2582,6 +2673,8 @@ struct LayoutRequest {
     /// An applied verdict releases the pending slot only when the slot still holds *this*
     /// document: a newer edit that arrived while the request was in flight is not thrown away.
     layout_toml: String,
+    /// The applied pair the editor based the document on.
+    expected: crate::layout::Pair,
     /// Where the connection that asked is waiting.
     verdict: oneshot::Sender<ctl::Response>,
 }
@@ -2632,13 +2725,13 @@ impl Timers {
 /// The document is the `[topology]` shape, so it parses as the same struct the configuration
 /// uses; a document with neither displays nor links is refused, because an empty layout would
 /// silently disable every transition.
-fn validate_layout_toml(layout_toml: &str) -> Result<(), String> {
+fn parse_layout_toml(layout_toml: &str) -> Result<config::TopologyConfig, String> {
     let parsed: config::TopologyConfig =
         toml::from_str(layout_toml).map_err(|error| format!("layout_toml: {error}"))?;
     if parsed.displays.is_empty() && parsed.links.is_empty() {
         return Err("layout_toml: a document with neither displays nor links".to_owned());
     }
-    Ok(())
+    Ok(parsed)
 }
 
 #[cfg(test)]
