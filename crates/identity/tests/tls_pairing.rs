@@ -295,11 +295,19 @@ async fn two_independent_sessions_do_not_agree_on_a_code() {
         let opener_identity = Arc::clone(&a);
         let opener = tokio::spawn(async move {
             let mut window = open_window(round * 1_000).expect("window");
-            accept_one(&listener, &opener_identity, &mut window, round * 1_000, 47901)
-                .await
-                .expect("opener")
+            accept_one(
+                &listener,
+                &opener_identity,
+                &mut window,
+                round * 1_000,
+                47901,
+            )
+            .await
+            .expect("opener")
         });
-        let dialer = dial(address, &b, DIAL_TIMEOUT, 47901).await.expect("dialer");
+        let dialer = dial(address, &b, DIAL_TIMEOUT, 47901)
+            .await
+            .expect("dialer");
         let opener = opener.await.expect("task");
         assert_eq!(
             opener.sas(),
