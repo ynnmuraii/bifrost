@@ -46,7 +46,6 @@ use std::time::Duration;
 use config::Paths;
 use focus_router::FocusRouter;
 use identity::{IdentityPaths, NodeIdentity, TrustStore};
-use ipc::Watchdog;
 use platform_probe::BackendOverride;
 use protocol::ipc::{AgentMode, BackendKind};
 use transport::{BackoffBounds, LinkLiveness, LinkManager, ManagerConfig};
@@ -318,7 +317,25 @@ fn run(args: &Args) -> Result<(), Failure> {
     let options = RunOptions::parse(&args.rest)?;
     let paths = &args.paths;
 
+    // AC-16: the first run must not die on a missing `config.toml`. The owner of the
+    // machine is not a developer, so the daemon writes a valid file itself — the
+    // schema defaults plus this host's own LAN address — and only the case the
+    // writer refuses (an unwritable directory) leaves the load error below standing.
+    let wrote = match config::first_run::ensure_config(paths) {
+        Ok(wrote) => wrote,
+        Err(reason) => {
+            tracing::warn!(%reason, "cannot write a first-run config.toml");
+            false
+        }
+    };
     let config = config::Config::load(paths.config_file())?;
+    if wrote {
+        tracing::info!(
+            path = %paths.config_file().display(),
+            listen_address = %config.network.listen_address,
+            "wrote the first-run configuration"
+        );
+    }
     // The probe runs *before* the runtime exists. On Linux `read_snapshot` reaches the
     // portals through zbus's blocking client, which drives its own runtime: called from
     // inside this one it panics («Cannot start a runtime from within a runtime») and core
@@ -476,9 +493,6 @@ async fn run_async(
         endpoint = gui_endpoint.describe().as_str(),
         "GUI channel bound"
     );
-    let watchdog = Watchdog::for_core_silence_ms(config.timing.agent_core_silence_ms, 0)
-        .map_err(|error| format!("agent_core_silence_ms: {error}"))?;
-
     let mut supervisor = Supervisor::new(
         options.agent.clone(),
         private_root(paths).to_path_buf(),
@@ -517,7 +531,6 @@ async fn run_async(
         link_events,
         supervisor,
         server,
-        watchdog,
         node_id,
         session.backend,
         trust,

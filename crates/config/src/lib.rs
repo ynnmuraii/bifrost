@@ -1,4 +1,9 @@
-#![forbid(unsafe_code)]
+// The crate is unsafe-free except for the platform-enumeration half of
+// `first_run`, which must call Win32 (`GetAdaptersAddresses`) and `getifaddrs` to
+// learn this host's interfaces. As in `identity`, the `#[allow(unsafe_code)]` is
+// granted on exactly those modules and every unsafe block carries its own SAFETY
+// comment; a `forbid` cannot be relaxed by an inner attribute, hence `deny` here.
+#![deny(unsafe_code)]
 //! Typed loader, validator and writer for `config.toml` (`config_version = 2`).
 //!
 //! # What is here
@@ -13,6 +18,9 @@
 //!   carries its `CONFIG_*` code ([`ErrorCode`]).
 //! * [`save_atomic`] — temp file, `fsync`, rename, `.bak`, as required by
 //!   «Правила записи».
+//! * [`first_run`] — the `config.toml` the first `lws-core run` writes when there
+//!   is none, and the LAN-address chooser `lws-gui` drives from its settings
+//!   screen.
 //! * [`paths::Paths`] / [`default_paths`] — the per-OS locations of «Файлы и
 //!   пути».
 //! * [`hotkey`] — the `Ctrl+Alt+Shift+F12` parser the hotkey rules need.
@@ -39,9 +47,13 @@
 //! * `[[topology.displays]]` is a GUI snapshot, so it is not converted into
 //!   [`geometry::Display`] values; see [`topology`].
 //! * Directory permissions (0700 / owner-only ACL) belong to the platform setup
-//!   layer; this crate makes no platform calls.
+//!   layer; this crate makes no platform calls — with the one exception of
+//!   `first_run`, which enumerates interfaces (Win32 `GetAdaptersAddresses` /
+//!   Unix `getifaddrs`) to choose a `listen_address`, and creates the
+//!   configuration directory itself, `0700` on Unix.
 
 pub mod error;
+pub mod first_run;
 pub mod hotkey;
 pub mod paths;
 pub mod save;
@@ -49,6 +61,7 @@ pub mod schema;
 pub mod topology;
 
 pub use error::{ConfigError, ErrorCode};
+pub use first_run::{choose, ensure_config, lan_addresses, set_listen_address, Candidate};
 pub use hotkey::{Hotkey, HotkeyError, Modifier};
 pub use paths::{default_paths, Paths};
 pub use save::save_atomic;

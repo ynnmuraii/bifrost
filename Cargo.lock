@@ -761,9 +761,11 @@ name = "config"
 version = "0.0.0"
 dependencies = [
  "geometry",
+ "libc",
  "protocol",
  "serde",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
