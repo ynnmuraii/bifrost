@@ -71,6 +71,28 @@ pub fn node_id_hex(node_id: &NodeId) -> String {
     text
 }
 
+/// The hex form of a 16-byte id (`attempt_id`, `edit_id`), for a control line.
+pub fn hex16(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write;
+    let mut text = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// The 16 bytes a [`hex16`] string names; `None` when it is not one.
+pub fn hex16_decode(text: &str) -> Option<[u8; 16]> {
+    if text.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
 /// What the agent is doing, as the `status` line reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -107,6 +129,19 @@ mod tests {
             store.trust(TrustedPeer::paired(NodeId::new(*id), *name, None, 0));
         }
         store
+    }
+
+    #[test]
+    fn a_sixteen_byte_id_round_trips_through_hex() {
+        let id = [0xab; 16];
+        let text = hex16(&id);
+        assert_eq!(text.len(), 32);
+        assert_eq!(hex16_decode(&text), Some(id));
+        // A control line must not accept a truncated or non-hex id: the ceremony it names
+        // would be somebody else's.
+        assert_eq!(hex16_decode(""), None);
+        assert_eq!(hex16_decode(&text[..31]), None);
+        assert_eq!(hex16_decode(&format!("{}zz", &text[..30])), None);
     }
 
     #[test]

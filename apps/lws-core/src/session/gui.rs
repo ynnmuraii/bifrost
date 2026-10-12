@@ -93,7 +93,7 @@ impl Session {
             } else {
                 "follower".to_owned()
             },
-            focus: focus.as_str().to_owned(),
+            focus: focus_word(focus.as_str()).to_owned(),
             active_peer,
             connected: self.manager.member_count().await > 0,
             clipboard_enabled: self
@@ -158,7 +158,23 @@ impl Session {
     /// exactly the document the peers hold.
     pub(crate) fn gui_topology_doc(&self) -> ipc::TopologyDoc {
         let applied = self.layout_state.applied();
-        let document = self.applied_wire.clone().unwrap_or_default();
+        let document = match self.applied_wire.clone() {
+            Some(document) => document,
+            // Before the first revision is published — a fresh workspace, a node that has just
+            // started — the editor gets what this node actually knows: the assembled live
+            // document (agent displays, configured links) instead of an empty shell it could
+            // not edit.
+            None => match &self.topology {
+                Some(live) => crate::topology::wire_from_live(
+                    live,
+                    &self.layout,
+                    applied.revision,
+                    applied.author.unwrap_or(self.node_id),
+                    self.node_id,
+                ),
+                None => protocol::wire::Topology::default(),
+            },
+        };
         ipc::TopologyDoc {
             revision: applied.revision,
             author_node_id: applied
@@ -324,7 +340,13 @@ impl Session {
                 } else {
                     start.window_s
                 };
-                let result = self.open_pairing_window(window_s);
+                let result = match self.open_pairing_window(window_s) {
+                    Ok(_) => ok(),
+                    Err((code, _detail)) => ipc::OpResult {
+                        ok: false,
+                        error_code: code,
+                    },
+                };
                 answer(&out, request_id, Msg::OpResult(result)).await;
             }
             Msg::PairWith(dial) => {
@@ -449,7 +471,13 @@ impl Session {
     }
 
     /// Opens the pairing window and tells every GUI what the other node has to type.
-    pub(crate) fn open_pairing_window(&mut self, window_s: u32) -> ipc::OpResult {
+    ///
+    /// The control channel's `pair-open` calls this too: one window, one implementation, and
+    /// both surfaces get the same address and `attempt_id`.
+    pub(super) fn open_pairing_window(
+        &mut self,
+        window_s: u32,
+    ) -> Result<pairing::Window, pairing::Refusal> {
         let now = self.now_ms();
         match self.pairing.open(now, window_s, self.listen) {
             Ok(window) => {
@@ -462,11 +490,11 @@ impl Session {
                 let remaining = window.remaining_s(now);
                 self.publish(Msg::PairingWindow(ipc::PairingWindow {
                     open: true,
-                    address: window.address,
+                    address: window.address.clone(),
                     seconds_remaining: remaining,
                     attempt_id: window.attempt_id.to_vec(),
                 }));
-                ok()
+                Ok(window)
             }
             Err((code, detail)) => {
                 tracing::warn!(
@@ -475,10 +503,7 @@ impl Session {
                     "pairing window"
                 );
                 self.pairing_error = Some(code.clone());
-                ipc::OpResult {
-                    ok: false,
-                    error_code: code,
-                }
+                Err((code, detail))
             }
         }
     }
@@ -497,7 +522,7 @@ impl Session {
     }
 
     /// `PairWith`: dial the address the user typed and run the dialer's half.
-    fn spawn_pair_dial(&mut self, address: String) {
+    pub(super) fn spawn_pair_dial(&mut self, address: String) {
         let parsed: std::net::SocketAddr = match address.parse() {
             Ok(address) => address,
             Err(error) => {
@@ -519,10 +544,12 @@ impl Session {
                     pairing::run(driver, answer, false, local_fingerprint, events).await;
                 }
                 Err(error) => {
+                    // No ceremony exists yet, so this is the dial's own failure: the loop
+                    // resolves the `PairWith` reply with it.
                     let _ = events
-                        .send(pairing::Event::Finished {
-                            attempt_id: [0u8; 16],
-                            outcome: pairing::Outcome::Failed(error.to_string()),
+                        .send(pairing::Event::DialFailed {
+                            code: "PAIR_FAILED".to_owned(),
+                            detail: error.to_string(),
                         })
                         .await;
                 }
@@ -766,6 +793,25 @@ async fn answer(out: &mpsc::Sender<Outgoing>, request_id: u64, message: Msg) {
         Ok(Ok(())) => {}
         Ok(Err(_)) => tracing::debug!("a GUI connection went away before its answer"),
         Err(_) => tracing::warn!("a GUI did not take its answer; dropping it"),
+    }
+}
+
+/// The focus state in the words `docs/ipc.proto` fixes for `Status.focus` («LOCAL / PREPARING
+/// / REMOTE / BLOCKED»).
+///
+/// The FSM's own `as_str` is the log's spelling (`Local`), and the control line has always
+/// printed that; the GUI's contract is the uppercase enum, so the translation lives here
+/// instead of changing the words a log reader is used to.
+fn focus_word(state: &str) -> &'static str {
+    match state {
+        "Local" => "LOCAL",
+        "Preparing" => "PREPARING",
+        "Remote" => "REMOTE",
+        "Releasing" => "RELEASING",
+        "Blocked" => "BLOCKED",
+        // A state this build does not know is not invented: the empty string is the contract's
+        // "nothing to say", and the GUI shows no claim rather than a wrong one.
+        _ => "",
     }
 }
 

@@ -1390,6 +1390,88 @@ impl Drop for Cluster {
     }
 }
 
+/// The documented path roots of a `--root DIR` core.
+///
+/// Mirrors `apps/lws-core/src/main.rs::resolve_paths`: `config/`, `data/`, `state/` and
+/// `run/` under the root. The GUI's endpoint is derived from these
+/// (`ipc::transport::gui_endpoint`), which is the same call the daemon and `lws-gui` make.
+pub fn paths_under(root: &Path) -> config::Paths {
+    config::Paths::new(
+        root.join("config"),
+        root.join("data"),
+        root.join("state"),
+        Some(root.join("run")),
+    )
+}
+
+/// The GUI endpoint of a core started with `--root DIR`.
+pub fn gui_endpoint_of(root: &Path) -> ipc::transport::Endpoint {
+    ipc::transport::gui_endpoint(&paths_under(root)).expect("the GUI endpoint of a --root core")
+}
+
+/// Two cores that are **not** paired with each other.
+///
+/// Every other harness pairs first, because the scenarios are about input. The pairing
+/// ceremony itself — the one the GUI's wizard drives — must not be done for it, so this
+/// starts two bare cores with no trust records and no `[[network.peers]]`.
+pub struct Unpaired {
+    /// The directory both roots live in.
+    pub dir: PathBuf,
+    /// This node opens the pairing window.
+    pub a: Node,
+    /// This node dials it.
+    pub b: Node,
+    /// Each node's node id, as the CLI prints it (64 hex).
+    pub a_id: String,
+    /// See [`Unpaired::a_id`].
+    pub b_id: String,
+    /// The port A listens on (`network.port_input`), which its pairing window answers on.
+    pub a_port: u16,
+    /// See [`Unpaired::a_port`].
+    pub b_port: u16,
+}
+
+impl Unpaired {
+    /// Starts the two cores, each with its own `--root`.
+    pub fn start(label: &str) -> Unpaired {
+        let dir = unique_dir(label);
+        let a_root = dir.join("a");
+        let b_root = dir.join("b");
+        for root in [&a_root, &b_root] {
+            std::fs::create_dir_all(root.join("config")).expect("config directory");
+        }
+        // Paired with nobody, so the identity has to be created before the id can be read:
+        // `peers` loads-or-creates it, which is what the harness does for the paired cases too.
+        let a_port = free_port();
+        let b_port = free_port();
+        write_config(&a_root, a_port, free_port(), "left", true, false);
+        write_config(&b_root, b_port, free_port(), "right", true, false);
+        let a_id = peers(&a_root);
+        let b_id = peers(&b_root);
+        let a = spawn_node(a_root, a_id.clone(), false, "a");
+        let b = spawn_node(b_root, b_id.clone(), false, "b");
+        Unpaired {
+            dir,
+            a,
+            b,
+            a_id,
+            b_id,
+            a_port,
+            b_port,
+        }
+    }
+
+    /// Waits until both cores answer on their control channel.
+    pub fn wait_ready(&self) {
+        for node in [&self.a, &self.b] {
+            node.wait_for("the core to come up", Duration::from_secs(20), |status| {
+                status.agent == "ready"
+            })
+            .expect("the core must answer `status`");
+        }
+    }
+}
+
 /// Points one node's trust record for `peer` at `address`.
 ///
 /// The two-node `retarget_trust` above replaces the single `last_address`; with three nodes

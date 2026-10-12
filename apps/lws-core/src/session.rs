@@ -2013,6 +2013,40 @@ impl Session {
             ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()).into(),
             ctl::Request::LayoutEdit(path) => self.layout_edit(&path).await,
             ctl::Request::LayoutApply => self.layout_apply().await,
+            ctl::Request::PairOpen(seconds) => {
+                let window_s = seconds.unwrap_or(120);
+                match self.open_pairing_window(window_s) {
+                    Ok(window) => ctl::Response::Status(format!(
+                        "address={} attempt={} seconds={}",
+                        window.address,
+                        crate::command::hex16(&window.attempt_id),
+                        window.seconds
+                    )),
+                    Err((code, detail)) => ctl::Response::Error { code, detail },
+                }
+                .into()
+            }
+            ctl::Request::PairPrompt => {
+                Handled::Deferred(prompt_of(self.pairing.wait_for_prompt()))
+            }
+            ctl::Request::PairAnswer { attempt, approve } => {
+                match crate::command::hex16_decode(&attempt) {
+                    Some(attempt) => match self.pairing.answer(&attempt, approve) {
+                        Ok(verdict) => Handled::Deferred(verdict_of(verdict)),
+                        Err((code, detail)) => ctl::Response::Error { code, detail }.into(),
+                    },
+                    None => ctl::Response::Error {
+                        code: "BAD_REQUEST".to_owned(),
+                        detail: "the attempt id is 32 hex characters".to_owned(),
+                    }
+                    .into(),
+                }
+            }
+            ctl::Request::PairWith(address) => {
+                let wait = self.pairing.dial_started();
+                self.spawn_pair_dial(address);
+                Handled::Deferred(verdict_of(wait))
+            }
             ctl::Request::LayoutDiscard => {
                 let dropped = self.release_layout_pending();
                 tracing::info!(dropped, "pending layout edit discarded");
@@ -2273,6 +2307,50 @@ enum Step {
 
 /// What one control request produced.
 ///
+/// A reply that arrives when a pairing ceremony reaches the step it names.
+///
+/// The `pair-*` verbs cannot answer at once — the window is opened here and the peer drives it
+/// from its own node — so the caller is handed a channel and the loop's `Deferred` writer
+/// answers it whenever the ceremony gets there (and gives up on it at
+/// [`LAYOUT_VERDICT_TIMEOUT`], like every other deferred answer).
+fn verdict_of(verdict: oneshot::Receiver<pairing::Verdict>) -> oneshot::Receiver<ctl::Response> {
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let response = match verdict.await {
+            Ok(Ok(())) => ctl::Response::Status("paired".to_owned()),
+            Ok(Err((code, detail))) => ctl::Response::Error { code, detail },
+            Err(_) => ctl::Response::Error {
+                code: "PAIRING_GONE".to_owned(),
+                detail: "the ceremony ended before it could answer".to_owned(),
+            },
+        };
+        let _ = sender.send(response);
+    });
+    receiver
+}
+
+/// The `pair-prompt` reply: the six digits, and everything needed to answer them.
+fn prompt_of(prompt: oneshot::Receiver<pairing::Prompt>) -> oneshot::Receiver<ctl::Response> {
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let response = match prompt.await {
+            Ok(prompt) => ctl::Response::Status(format!(
+                "sas={} peer={} attempt={} address={}",
+                prompt.sas_code,
+                prompt.peer_name,
+                crate::command::hex16(&prompt.attempt_id),
+                prompt.address.unwrap_or_default()
+            )),
+            Err(_) => ctl::Response::Error {
+                code: "PAIRING_GONE".to_owned(),
+                detail: "the window closed before a peer appeared".to_owned(),
+            },
+        };
+        let _ = sender.send(response);
+    });
+    receiver
+}
+
 /// A `layout edit`/`layout apply` on a follower is not answered by the node that read the
 /// line: only the coordinator's CAS knows the verdict, so the connection is handed the pair of
 /// [`oneshot::Receiver`] and the timeout instead of an invented answer.

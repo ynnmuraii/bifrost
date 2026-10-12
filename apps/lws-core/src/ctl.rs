@@ -20,9 +20,22 @@
 //! abandon                -> OK abandoned
 //! quit                   -> OK stopping
 //! ping                   -> OK pong
+//! pair-open [seconds]    -> OK address=<ip:port> attempt=<32-hex> seconds=<n>
+//! pair-prompt            -> OK sas=482913 peer=<name> attempt=<32-hex> address=<ip:port>
+//! pair-answer <hex> yes  -> OK paired <name> | ERR <code> <detail>
+//! pair-answer <hex> no   -> OK rejected
+//! pair-with <address>    -> OK dialing
 //! ```
 //!
-//! `<peer>` is a 64-hex node id or a paired peer's display name.
+//! `<peer>` is a 64-hex node id or a paired peer's display name. `pair-prompt` and
+//! `pair-answer` are answered when the ceremony reaches that point — the window is opened by
+//! `pair-open` and the peer drives it from its own node, so the CLI cannot know when — which is
+//! why they block on their own connection instead of returning `OK` at once. `pair-with` is the
+//! dialer's half of the same ceremony, for a node whose core is already running.
+//!
+//! `pair --open` with a core already running uses these verbs instead of binding its own
+//! listener: the window belongs to the running core, because that is the process that owns the
+//! link listener `pair/1` is served on (`docs/05-protocol.md`, «Сопряжение»).
 
 use ipc::peer::SameUser;
 use ipc::transport::{self, Endpoint, GuiListener};
@@ -103,6 +116,20 @@ pub enum Request {
     LayoutApply,
     /// `layout discard`: drop the pending edit.
     LayoutDiscard,
+    /// `pair-open [seconds]`: open the pairing window on the running core
+    /// (`GuiFrame.StartPairing`), sized by the optional argument.
+    PairOpen(Option<u32>),
+    /// `pair-prompt`: wait for the next ceremony's six digits.
+    PairPrompt,
+    /// `pair-answer <attempt-hex> approve|reject`: the user's decision.
+    PairAnswer {
+        /// The `attempt_id` the prompt named, as 32 hex characters.
+        attempt: String,
+        /// `true` for approve, `false` for reject.
+        approve: bool,
+    },
+    /// `pair-with <address>`: dial a peer that opened its window (`GuiFrame.PairWith`).
+    PairWith(String),
 }
 
 impl Request {
@@ -128,6 +155,33 @@ impl Request {
             "reset-portals" => Err("reset-portals takes no argument".to_owned()),
             "switch" if !argument.is_empty() => Ok(Request::Switch(PeerRef::new(argument))),
             "switch" => Err("switch needs a peer id or display name".to_owned()),
+            "pair-open" if argument.is_empty() => Ok(Request::PairOpen(None)),
+            "pair-open" => match argument.parse::<u32>() {
+                Ok(seconds) => Ok(Request::PairOpen(Some(seconds))),
+                Err(_) => Err(format!(
+                    "pair-open takes an optional number of seconds, not {argument:?}"
+                )),
+            },
+            "pair-prompt" if argument.is_empty() => Ok(Request::PairPrompt),
+            "pair-prompt" => Err("pair-prompt takes no argument".to_owned()),
+            "pair-answer" => match argument.split_once(char::is_whitespace) {
+                Some((attempt, answer)) => match answer.trim() {
+                    "approve" | "yes" | "y" => Ok(Request::PairAnswer {
+                        attempt: attempt.to_owned(),
+                        approve: true,
+                    }),
+                    "reject" | "no" | "n" => Ok(Request::PairAnswer {
+                        attempt: attempt.to_owned(),
+                        approve: false,
+                    }),
+                    other => Err(format!(
+                        "pair-answer takes approve or reject, not {other:?}"
+                    )),
+                },
+                None => Err("pair-answer needs an attempt id and approve|reject".to_owned()),
+            },
+            "pair-with" if !argument.is_empty() => Ok(Request::PairWith(argument.to_owned())),
+            "pair-with" => Err("pair-with needs an address".to_owned()),
             "claim" if argument.is_empty() => Ok(Request::Claim),
             "claim" => Err("claim takes no argument".to_owned()),
             "abandon" if argument.is_empty() => Ok(Request::Abandon),
@@ -351,6 +405,36 @@ mod tests {
     #[test]
     fn requests_round_trip_through_one_line() {
         assert_eq!(Request::parse("status"), Ok(Request::Status));
+        // The pairing verbs the CLI uses once a core is running.
+        assert_eq!(Request::parse("pair-open"), Ok(Request::PairOpen(None)));
+        assert_eq!(
+            Request::parse("pair-open 30"),
+            Ok(Request::PairOpen(Some(30)))
+        );
+        assert!(Request::parse("pair-open soon").is_err());
+        assert_eq!(Request::parse("pair-prompt"), Ok(Request::PairPrompt));
+        assert!(Request::parse("pair-prompt now").is_err());
+        assert_eq!(
+            Request::parse("pair-answer 00112233445566778899aabbccddeeff approve"),
+            Ok(Request::PairAnswer {
+                attempt: "00112233445566778899aabbccddeeff".to_owned(),
+                approve: true,
+            })
+        );
+        assert_eq!(
+            Request::parse("pair-answer 00112233445566778899aabbccddeeff n"),
+            Ok(Request::PairAnswer {
+                attempt: "00112233445566778899aabbccddeeff".to_owned(),
+                approve: false,
+            })
+        );
+        assert!(Request::parse("pair-answer").is_err());
+        assert!(Request::parse("pair-answer a maybe").is_err());
+        assert_eq!(
+            Request::parse("pair-with 192.168.1.10:47901"),
+            Ok(Request::PairWith("192.168.1.10:47901".to_owned()))
+        );
+        assert!(Request::parse("pair-with").is_err());
         assert_eq!(Request::parse("reset-portals"), Ok(Request::ResetPortals));
         assert!(Request::parse("reset-portals now").is_err());
         assert_eq!(Request::parse("  ping  "), Ok(Request::Ping));
