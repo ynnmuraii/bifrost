@@ -2197,6 +2197,14 @@ pub fn launch_core(launch: &Launch) -> Result<StartedCore, String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // The service is a console program and this window is not: without this it would open a
+    // console window of its own, which is the black slab a person would then have to keep
+    // alive. Its logs go to `[log]`'s directory (`crates/logging`), not to that console.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     match command.spawn() {
         Ok(child) => Ok(StartedCore {
             program,
