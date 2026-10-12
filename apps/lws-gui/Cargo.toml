@@ -1,0 +1,56 @@
+[package]
+name = "lws-gui"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+config = { path = "../../crates/config" }
+# `default-features = false` + `glow`: the smallest dependency set that still draws a window.
+# glow (OpenGL) loads its libraries at runtime and needs no -dev packages on Linux, which is
+# what the CI runners provide; wgpu would add a whole shader/backend stack for one status
+# window. The feature list is what makes the one binary run on Windows, X11 and Wayland:
+# `x11`/`wayland` reach winit through egui-winit/glutin, `accesskit` is the screen reader,
+# `links` opens the URLs in the docs, `default_fonts` is the embedded font (the UI is
+# Russian, so no system font may be assumed).
+eframe = { version = "0.36.2", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "links",
+    "wayland",
+    "web_screen_reader",
+    "x11",
+] }
+ipc = { path = "../../crates/ipc" }
+protocol = { path = "../../crates/protocol" }
+serde = { version = "1", features = ["derive"] }
+# The async half of the GUI: one connection task on a dedicated thread, fed by a channel.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+# The editor writes its document as TOML in the `[topology]` schema.
+toml = "1"
+# `winit/default`, as the build spec asks when eframe's own feature list does not pull it:
+# eframe's `x11`/`wayland` enable winit's `x11` and `wayland` features but not the rest of
+# `default`, and `wayland-dlopen` is the one that matters for the Linux build — without it
+# `wayland-backend` links `libwayland-client` at build time and the CI runner would need
+# `libwayland-dev`, while with it the library is loaded at runtime exactly as x11-dl and
+# glutin are (so `build-essential` stays the only system dependency). winit is never named in
+# this crate's code; the entry exists for its features.
+winit = "0.30.13"
+
+[dev-dependencies]
+# An integration test is a crate of its own: it sees `lws-gui` and these, and not the window's
+# own dependencies. The fixtures are `GuiFrame`s, so the tests read `protocol` directly, and
+# the editor's serialiser is checked against the `config` schema it has to satisfy.
+config = { path = "../../crates/config" }
+protocol = { path = "../../crates/protocol" }
+toml = "1"
+# Offscreen rendering for `examples/shots.rs`, the screenshot pipeline of the build spec.
+# It is a dev-dependency, never a plain test: `cargo test -p lws-gui` must pass on a host
+# with no display and no GPU, and examples are built but not run by `cargo test`.
+egui_kittest = { version = "0.36.2", features = ["snapshot", "wgpu"] }
+
+[lints]
+workspace = true
