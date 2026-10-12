@@ -19,13 +19,22 @@ use input_model::{CaptureKind, HidKey, InputEvent, MouseButton};
 use platform_x11::capture::{CapturedEvent, X11Capture};
 use platform_x11::inject::X11Injector;
 
-use crate::backend::{Event, Injected, Ready, Released, POLL_TICK};
+use crate::backend::{Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
+use crate::takeover::Detector;
 
 /// The X11 input path.
 pub struct X11 {
     ready: Ready,
     capture: Option<X11Capture>,
     injector: Option<X11Injector>,
+    /// The receiver-takeover detector, when `[input].takeover_detection` armed it.
+    ///
+    /// A second, observe-only `X11Capture` (no grab): XI2 raw events reach us while this
+    /// node injects, and the ones whose `deviceid`/`sourceid` is an XTEST slave are dropped
+    /// by `platform_x11::capture::is_own_injection` before the detector sees them — which is
+    /// what makes «physical input» here mean the user's own keyboard and mouse.
+    detector: Option<(Detector, X11Capture)>,
+    plan: Option<TakeoverPlan>,
 }
 
 impl X11 {
@@ -36,7 +45,11 @@ impl X11 {
     /// fixed F12 keycode (`platform_x11::EMERGENCY_F12_X11_KEYCODE`) and never took
     /// the combination as a parameter, so a configuration that names another key is
     /// reported instead of being pretended to work.
-    pub fn new(ready: &Ready, emergency_hotkey: &str) -> Result<Self, String> {
+    pub fn new(
+        ready: &Ready,
+        emergency_hotkey: &str,
+        plan: Option<TakeoverPlan>,
+    ) -> Result<Self, String> {
         let configured = emergency_hotkey.trim();
         if !configured.is_empty() && !configured.eq_ignore_ascii_case("Ctrl+Alt+Shift+F12") {
             tracing::warn!(
@@ -49,6 +62,8 @@ impl X11 {
             ready: ready.clone(),
             capture: None,
             injector: None,
+            detector: None,
+            plan,
         })
     }
 
@@ -74,6 +89,7 @@ impl X11 {
             capture.ungrab();
         }
         self.capture = None;
+        self.disarm_detector();
         let released = match &mut self.injector {
             Some(injector) => release_counts(injector),
             None => Released::default(),
@@ -81,8 +97,41 @@ impl X11 {
         Ok(released)
     }
 
+    /// Prepares injection — and arms the receiver-takeover detector (KVM-035).
     pub fn prepare_inject(&mut self) -> Result<(), String> {
-        self.injector_mut().map(|_| ())
+        self.injector_mut().map(|_| ())?;
+        if let Some(plan) = self.plan {
+            if self.detector.is_none() {
+                match X11Capture::new(CaptureKind::Observe) {
+                    Ok(capture) => {
+                        tracing::info!(
+                            threshold_px = plan.threshold_px,
+                            "receiver takeover detector armed (observe-only XI2 capture)"
+                        );
+                        self.detector = Some((Detector::new(plan.threshold_px), capture));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "cannot arm the receiver takeover detector; a land on this \
+                             machine will not end the lease"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops watching for physical input: the lease that made it meaningful is over.
+    fn disarm_detector(&mut self) {
+        if let Some((detector, capture)) = self.detector.take() {
+            tracing::info!(
+                triggers = detector.triggers(),
+                filtered_injected = capture.injected_events_filtered(),
+                "receiver takeover detector disarmed"
+            );
+        }
     }
 
     pub fn inject(&mut self, events: &[InputEvent]) -> Injected {
@@ -104,6 +153,8 @@ impl X11 {
     }
 
     pub fn release_session(&mut self) -> Released {
+        // `ReleaseSession` ends the receiver side of a lease as surely as `EndCapture`.
+        self.disarm_detector();
         match &mut self.injector {
             Some(injector) => release_counts(injector),
             None => Released::default(),
@@ -153,6 +204,34 @@ impl X11 {
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
+        if let Some((detector, capture)) = &mut self.detector {
+            match capture.next_event(Some(Duration::ZERO)) {
+                Ok(Some(CapturedEvent::Input(event))) => {
+                    if let Some(trigger) = detector.observe(&event) {
+                        let distance_px = match trigger {
+                            crate::takeover::Trigger::Motion { distance_px } => Some(distance_px),
+                            _ => None,
+                        };
+                        tracing::warn!(
+                            reason = trigger.reason(),
+                            distance_px = ?distance_px,
+                            "physical input on the receiver; ending the lease"
+                        );
+                        return Some(Event::LocalTakeover {
+                            reason: trigger.reason(),
+                            distance_px,
+                        });
+                    }
+                }
+                // Rule 4: the emergency combination works on a receiver too.
+                Ok(Some(CapturedEvent::Emergency)) => return Some(Event::Emergency),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "the receiver takeover detector stopped; disarming");
+                    self.detector = None;
+                }
+            }
+        }
         if let Some(capture) = &mut self.capture {
             // A non-blocking poll; the loop's tick provides the wait.
             match capture.next_event(Some(Duration::ZERO)) {

@@ -24,7 +24,8 @@ use platform_win::capture::{Capture, CaptureConfig, CaptureError, CaptureEvent};
 use platform_win::event::EmergencyCombo;
 use platform_win::inject::Injector;
 
-use crate::backend::{Event, Injected, Ready, Released, POLL_TICK};
+use crate::backend::{Event, Injected, Ready, Released, TakeoverPlan, POLL_TICK};
+use crate::takeover::Detector;
 
 /// The Windows input path.
 pub struct Win {
@@ -32,12 +33,25 @@ pub struct Win {
     capture: Option<Capture>,
     injector: Injector,
     emergency: EmergencyCombo,
+    /// The receiver-takeover detector, when `[input].takeover_detection` armed it.
+    ///
+    /// It is a *second*, observe-only capture: while this node is a receiver its own
+    /// keyboard and mouse still work, and the low-level hooks are the only user-mode place
+    /// that sees them without suppressing them. Injected events never reach the detector —
+    /// the hook drops `LLKHF_INJECTED`/`LLMHF_INJECTED` and our `dwExtraInfo` tag before
+    /// anything is queued (`platform-win`, «Injected-event loop prevention»).
+    detector: Option<(Detector, Capture)>,
+    plan: Option<TakeoverPlan>,
 }
 
 impl Win {
     /// Builds the Windows backend. Always succeeds; capture hooks are installed on
     /// the first `BeginCapture`, so an agent that never captures never suppresses.
-    pub fn new(ready: &Ready, emergency_hotkey: &str) -> Result<Self, String> {
+    pub fn new(
+        ready: &Ready,
+        emergency_hotkey: &str,
+        plan: Option<TakeoverPlan>,
+    ) -> Result<Self, String> {
         let emergency = parse_emergency_hotkey(emergency_hotkey);
         tracing::info!(
             vk = emergency.vk,
@@ -51,6 +65,8 @@ impl Win {
             capture: None,
             injector: Injector::new(),
             emergency,
+            detector: None,
+            plan,
         })
     }
 
@@ -87,10 +103,55 @@ impl Win {
         if self.capture.take().is_none() {
             tracing::debug!("EndCapture with no active capture");
         }
+        self.disarm_detector();
         Ok(self.release_session())
     }
 
+    /// Stops watching for physical input: the lease that made it meaningful is over.
+    fn disarm_detector(&mut self) {
+        if let Some((detector, capture)) = self.detector.take() {
+            tracing::info!(
+                triggers = detector.triggers(),
+                injected_seen = capture.stats().injected_seen,
+                "receiver takeover detector disarmed"
+            );
+        }
+    }
+
+    /// Prepares injection — and arms the receiver-takeover detector.
+    ///
+    /// `PrepareInject` is the moment a lease makes this node the receiver
+    /// (`docs/05-protocol.md`), which is exactly when «physical input on the receiver ends
+    /// the lease» starts to mean something (rule 9). The detector is an observe-only
+    /// capture: no suppression, no forwarding, one trigger.
     pub fn prepare_inject(&mut self) -> Result<(), String> {
+        if let Some(plan) = self.plan {
+            if self.detector.is_none() {
+                let config = CaptureConfig {
+                    mode: CaptureKind::Observe,
+                    emergency: self.emergency,
+                    ..CaptureConfig::default()
+                };
+                match Capture::start(config) {
+                    Ok(capture) => {
+                        tracing::info!(
+                            threshold_px = plan.threshold_px,
+                            "receiver takeover detector armed (observe-only hooks)"
+                        );
+                        self.detector = Some((Detector::new(plan.threshold_px), capture));
+                    }
+                    Err(error) => {
+                        // Not fatal: the lease still works, the user just keeps the local
+                        // pointer until core or the emergency key ends it.
+                        tracing::warn!(
+                            %error,
+                            "cannot arm the receiver takeover detector; a land on this \
+                             machine will not end the lease"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -110,6 +171,8 @@ impl Win {
     }
 
     pub fn release_session(&mut self) -> Released {
+        // `ReleaseSession` ends the receiver side of a lease as surely as `EndCapture`.
+        self.disarm_detector();
         let keys_before = self.injector.ledger().key_count();
         let buttons_before = self.injector.ledger().button_count();
         let status = self.injector.release_all();
@@ -177,13 +240,59 @@ impl Win {
                 None => {}
             }
         }
+        if let Some((detector, capture)) = &mut self.detector {
+            match capture.try_recv() {
+                // Physical input on the receiver: the detector decides whether this one
+                // crossed the threshold. Its events are never forwarded — this node is
+                // injecting here, not capturing for someone else.
+                Some(CaptureEvent::Input(event)) => {
+                    if let Some(trigger) = detector.observe(&event) {
+                        tracing::warn!(
+                            reason = trigger.reason(),
+                            distance_px = ?distance_of(trigger),
+                            "physical input on the receiver; ending the lease"
+                        );
+                        return Some(Event::LocalTakeover {
+                            reason: trigger.reason(),
+                            distance_px: distance_of(trigger),
+                        });
+                    }
+                }
+                // The emergency combination works on a receiver too (rule 4): this capture
+                // is the only place it can be seen while the source capture is not running.
+                Some(CaptureEvent::Emergency) => return Some(Event::Emergency),
+                Some(CaptureEvent::QueueOverflow) => {
+                    // The detector's queue is a counter, not a stream: a dropped batch can
+                    // miss a takeover, but ending the session over it would be worse.
+                    tracing::debug!("receiver takeover detector queue overflowed");
+                }
+                None => {}
+            }
+        }
         tokio::time::sleep(POLL_TICK).await;
         None
+    }
+
+    /// The detector's own view of injected events, for the KVM-035 test.
+    #[cfg(test)]
+    fn injected_seen(&self) -> u64 {
+        self.detector
+            .as_ref()
+            .map(|(_, capture)| capture.stats().injected_seen)
+            .unwrap_or(0)
     }
 }
 
 fn capture_error(error: &CaptureError) -> String {
     format!("{error}")
+}
+
+/// The distance of a motion trigger, for the log and the event.
+fn distance_of(trigger: crate::takeover::Trigger) -> Option<f64> {
+    match trigger {
+        crate::takeover::Trigger::Motion { distance_px } => Some(distance_px),
+        crate::takeover::Trigger::Key | crate::takeover::Trigger::Button => None,
+    }
 }
 
 /// `input.emergency_hotkey` → the hook's virtual-key combination.
@@ -293,5 +402,74 @@ mod tests {
     fn an_unknown_part_keeps_the_safe_default() {
         let combo = parse_emergency_hotkey("Ctrl+Alt+Shift+Hyper");
         assert_eq!(combo, EmergencyCombo::default());
+    }
+
+    /// The dry half of KVM-035's proof: an event this process injected must not end a lease.
+    ///
+    /// The detector runs exactly as it does on a receiver — an observe-only low-level hook —
+    /// and the injection is the production one, which stamps every record with
+    /// [`platform_win::INJECT_TAG`]. The assertion that matters is the pair: the hook *saw*
+    /// the injected event and dropped it (`injected_seen` grew, so the test is not passing
+    /// because nothing arrived), and no `LocalTakeover` was raised. Without the injected
+    /// filtering in `platform-win` this test fails on its first poll.
+    ///
+    /// It injects one Shift tap (harmless anywhere) and therefore needs an interactive
+    /// Windows desktop, which is why it is `#[ignore]`d:
+    ///
+    /// ```text
+    /// cargo test -p lws-agent an_injected_event_does_not_take_over -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs an interactive Windows desktop; injects one Shift tap"]
+    async fn an_injected_event_does_not_take_over() {
+        let ready = Ready {
+            capabilities: Vec::new(),
+            platform: "platform-win".to_owned(),
+            session_kind: "windows".to_owned(),
+            backend: ::protocol::ipc::BackendInfo::default(),
+        };
+        let mut win = Win::new(
+            &ready,
+            "Ctrl+Alt+Shift+F12",
+            Some(TakeoverPlan { threshold_px: 12 }),
+        )
+        .expect("the Windows backend");
+        win.prepare_inject().expect("arming the detector");
+        // The hook thread installs asynchronously; give it a moment before injecting.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let shift = HidKey::keyboard(0xE1);
+        let injected = win.inject(&[
+            InputEvent::Key {
+                key: shift,
+                state: input_model::KeyState::Down,
+            },
+            InputEvent::Key {
+                key: shift,
+                state: input_model::KeyState::Up,
+            },
+        ]);
+        assert!(
+            injected.os_error.is_empty(),
+            "the injection must go out: {injected:?}"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if let Some(event) = win.next_event().await {
+                panic!(
+                    "an injected event raised {event:?}: the takeover detector must ignore \\
+                        our own injections"
+                );
+            }
+        }
+
+        let seen = win.injected_seen();
+        win.end_capture().expect("disarming the detector");
+        assert!(
+            seen > 0,
+            "the hook saw no injected event at all: the test proves nothing"
+        );
+        println!("injected events seen and dropped: {seen}");
     }
 }

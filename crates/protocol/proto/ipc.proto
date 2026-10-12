@@ -76,6 +76,18 @@ message AgentAttach {
   bool require_emergency_hotkey = 6;       // source refuses Remote when the portal lacks it
   uint32 core_silence_ms = 7;              // 200..500, default 300; agent ends capture after this much
                                            // core silence (IPC heartbeat = value / 4, see 03-architecture.md)
+  TakeoverDetection takeover_detection = 8; // `[input].takeover_detection`; the agent owns the detector
+  uint32 takeover_threshold_px = 9;        // `[input].takeover_threshold_px`: physical movement that ends a lease
+}
+
+// `[input].takeover_detection`: how physical input on the receiver is seen. The agent
+// evaluates the environment-owned part (an `evdev` detector needs Linux and the `input`
+// group), which is why the loader accepts every value.
+enum TakeoverDetection {
+  TAKEOVER_DETECTION_UNSPECIFIED = 0;
+  TAKEOVER_DETECTION_AUTO = 1;  // native detector of the session: Windows hooks / X11 raw events
+  TAKEOVER_DETECTION_EVDEV = 2; // opt-in /dev/input reader (Wayland receivers; KVM-028)
+  TAKEOVER_DETECTION_OFF = 3;   // never end a lease on local input
 }
 
 enum CaptureKind {

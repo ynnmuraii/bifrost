@@ -86,6 +86,9 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         args.dry_motion,
         attach.emergency_hotkey.as_str(),
         attach.restore_tokens.as_slice(),
+        ipc::TakeoverDetection::try_from(attach.takeover_detection)
+            .unwrap_or(ipc::TakeoverDetection::Unspecified),
+        attach.takeover_threshold_px,
     )
     .await;
     if args.dry_inject {
@@ -500,6 +503,25 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
             }))
             .await?;
         }
+        Event::LocalTakeover {
+            reason,
+            distance_px,
+        } => {
+            // Rule 9 (KVM-035): «физическое … событие при активном inject →
+            // `LocalInputDetected`. Agent сам освобождает ledger». The order matters: this
+            // machine's keys and buttons are released *before* core hears about it, so the
+            // user who just reached for the keyboard finds it working.
+            tracing::warn!(
+                reason,
+                distance_px = ?distance_px,
+                "physical input on the receiver: releasing the lease locally"
+            );
+            release_everything(backend).await;
+            link.send(Msg::LocalInput(ipc::LocalInputDetected {
+                lease_id: held_lease.take().unwrap_or_default(),
+            }))
+            .await?;
+        }
         Event::QueueOverflow => {
             // Rule 2: the agent ends capture itself and reports the overflow.
             tracing::error!("capture queue overflow; ending capture");
@@ -595,6 +617,8 @@ mod tests {
                 false,
                 HOTKEY,
                 &[],
+                ::protocol::ipc::TakeoverDetection::Auto,
+                12,
             )
             .await;
             Self {
@@ -846,6 +870,34 @@ mod tests {
         );
     }
 
+    /// Rule 9 (KVM-035): the receiver hands its ledger back *before* core hears about the
+    /// takeover, and the frame names the lease that was injecting here.
+    #[tokio::test]
+    async fn a_receiver_takeover_releases_first_and_reports_the_lease() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::PrepareInject(ipc::PrepareInject {
+                lease_id: lease(7),
+            }))
+            .await;
+        harness.recv().await;
+
+        harness
+            .event(Event::LocalTakeover {
+                reason: "key",
+                distance_px: None,
+            })
+            .await;
+        match harness.recv().await {
+            Msg::LocalInput(detected) => assert_eq!(detected.lease_id, lease(7)),
+            other => panic!("expected LocalInputDetected, got {other:?}"),
+        }
+        assert!(
+            harness.held.is_none(),
+            "the ledger is released before core is told (rule 9)"
+        );
+    }
+
     #[tokio::test]
     async fn a_queue_overflow_ends_the_capture_and_is_reported() {
         let mut harness = Harness::new().await;
@@ -898,6 +950,8 @@ mod tests {
         let mut harness = Harness::new().await;
         harness
             .send(Msg::Attach(ipc::AgentAttach {
+                takeover_detection: ipc::TakeoverDetection::Auto as i32,
+                takeover_threshold_px: 12,
                 launch_token: vec![0u8; 32],
                 mode: AgentMode::Normal as i32,
                 emergency_hotkey: HOTKEY.to_owned(),

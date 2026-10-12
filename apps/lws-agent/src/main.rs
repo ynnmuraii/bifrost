@@ -24,6 +24,7 @@ mod displays;
 mod events;
 mod launch;
 mod session;
+mod takeover;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
