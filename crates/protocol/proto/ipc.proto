@@ -29,6 +29,7 @@ message AgentFrame {
     Ping ping = 20;
     ForgetPortalGrants forget_portal_grants = 21; // drop stored restore tokens, re-ask the user
     StopRepeat stop_repeat = 22; // AC-14: `repeat_guard_ms` silent, stop repeating/let the keys up
+    SetClipboardText set_clipboard_text = 23; // core -> agent: own the local CLIPBOARD and put this text on it
 
     // agent -> core
     AgentReady ready = 40;
@@ -45,6 +46,7 @@ message AgentFrame {
     AgentError error = 51;
     PortalPermissionRequired portal_permission = 52; // GUI hint: portal dialog is on screen
     PortalGrantChanged portal_grant = 53;            // fresh restore token to persist
+    ClipboardChanged clipboard_changed = 54;         // the local clipboard changed; core offers it to the peers
   }
 }
 
@@ -192,6 +194,31 @@ message PortalPermissionRequired { string portal_interface = 1; string purpose =
 message PortalGrantChanged { PortalGrant grant = 1; bool revoked = 2; }
 // code: PORTAL_DENIED, PORTAL_UNAVAILABLE, PORTAL_SESSION_LOST, PORTAL_FRONTEND_STUCK, QUEUE_OVERFLOW, ...
 message AgentError { string code = 1; string detail = 2; } // never contains key/clipboard payload
+
+// ---------- clipboard over local IPC ----------
+// ADR-008 keeps clipboard content off the input path; between core and the agent it still has to
+// travel, and an AgentFrame is at most 64 KiB, so both directions carry the payload in chunks of
+// <= 32768 bytes (a 1 MiB payload is 32 chunks). The agent owns the OS selection and never opens
+// a socket; core owns the network and never touches the selection. Neither message is logged, and
+// neither carries an `offer_id`: the origin/version pair (ADR-008's echo suppression) is enough
+// because the two ends of the IPC channel are one node.
+message ClipboardChanged {
+  uint64 origin_version = 1;   // the agent's monotonic counter of its own clipboard changes
+  uint32 chunk_index = 2;      // zero-based
+  uint32 chunk_count = 3;      // 1..=32; a payload that fits one frame has count 1
+  bytes data = 4;              // UTF-8 text, <= 32768 bytes
+  uint64 size_bytes = 5;       // the whole payload's size, repeated on every chunk
+  repeated string markers = 6; // secret markers the platform reported: exclude_from_monitor |
+                               // no_history | viewer_ignore | kde_secret | portal_secret
+  bytes sha256 = 7;            // of the whole payload; present on the last chunk only
+}
+message SetClipboardText {
+  uint64 origin_version = 1;   // the origin node's version, so a payload applied here is not re-offered
+  uint32 chunk_index = 2;      // zero-based
+  uint32 chunk_count = 3;      // 1..=32; 0 releases the selection and forgets the text
+  bytes data = 4;              // UTF-8 text, <= 32768 bytes
+  bytes sha256 = 5;            // of the whole payload; present on the last chunk only
+}
 
 // ---------- gui <-> core ----------
 message GuiFrame {
