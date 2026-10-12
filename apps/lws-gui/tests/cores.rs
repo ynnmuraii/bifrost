@@ -142,6 +142,7 @@ fn free_ports(count: usize) -> Vec<u16> {
 /// One running `lws-core run`, with the dry agent, killed when the test is done with it.
 struct Core {
     root: PathBuf,
+    log: PathBuf,
     child: Child,
 }
 
@@ -161,7 +162,34 @@ impl Core {
             .stderr(Stdio::from(err))
             .spawn()
             .expect("lws-core starts");
-        Core { root, child }
+        Core { root, log, child }
+    }
+
+    /// Waits until an empty agent report has already driven a topology rebuild.
+    fn wait_for_empty_report_rebuild(&self) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let log = std::fs::read_to_string(&self.log).expect("core log");
+            if let Some(report) = log.find("agent display report displays=0") {
+                let after_report = &log[report..];
+                let assembled = after_report.find("layout document assembled");
+                let unusable = after_report.find("layout document unusable");
+                if assembled.is_some() || unusable.is_some() {
+                    assert!(
+                        assembled.is_some_and(|assembled| {
+                            unusable.is_none_or(|unusable| assembled < unusable)
+                        }),
+                        "an empty display report discarded the configured topology:\n{after_report}"
+                    );
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the core did not report/rebuild its empty display set:\n{log}"
+            );
+            std::thread::sleep(FRAME);
+        }
     }
 
     /// Kills the daemon and reaps it. Idempotent, so `Drop` may run after a caller stopped it.
@@ -582,6 +610,10 @@ fn missing_session(status: &protocol::ipc::Status) -> Option<&'static str> {
 fn the_status_screen_holds_the_linked_workspace() {
     let _serial = serial();
     let lab = Lab::linked("status");
+    // Make the empty dry-agent report happen before the GUI connects, so this exercises the
+    // snapshot fallback rather than depending on which startup message wins the race.
+    lab.a.wait_for_empty_report_rebuild();
+    lab.b.wait_for_empty_report_rebuild();
     let mut window = bridge_for(lab.a_root());
 
     // The client thread connects on its own, and a fresh link asks for `Status` **and**

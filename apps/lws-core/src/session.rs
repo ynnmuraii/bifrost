@@ -144,9 +144,8 @@ pub struct Session {
     layout: config::TopologyConfig,
     /// `input.pointer_gain`, applied to captured deltas while a source lease is remote.
     pointer_gain: f64,
-    /// The agent's last display report; it replaces the snapshot for this node.
+    /// The last non-empty agent display report; empty reports never replace it.
     agent_displays: Vec<protocol::ipc::DisplayInfo>,
-    agent_displays_received: bool,
     /// The last captured local position: the input of an edge crossing in `Local`.
     local_pointer: Option<geometry::Position>,
     /// While a source lease is remote: the virtual position on the peer's display.
@@ -275,7 +274,6 @@ impl Session {
             layout,
             pointer_gain,
             agent_displays: Vec::new(),
-            agent_displays_received: false,
             local_hello,
             peer_displays: BTreeMap::new(),
             local_pointer: None,
@@ -308,14 +306,14 @@ impl Session {
         session
     }
 
-    /// Assembles the layout from local and peer manifests, retaining configured display
-    /// snapshots until a member's live report arrives.
+    /// Assembles the layout using the configured snapshot until a non-empty live report
+    /// arrives for a member.
     fn rebuild_topology(&mut self) {
         let snapshot = crate::topology::snapshot_displays(&self.layout, self.node_id.as_bytes());
-        let displays = if self.agent_displays_received {
-            self.agent_displays.clone()
-        } else {
+        let displays = if self.agent_displays.is_empty() {
             snapshot
+        } else {
+            self.agent_displays.clone()
         };
         let mut peers: BTreeMap<_, _> =
             crate::topology::snapshot_peers(&self.layout, self.node_id.as_bytes())
@@ -723,6 +721,9 @@ impl Session {
                     revision,
                     "peer display report"
                 );
+                if displays.is_empty() {
+                    return;
+                }
                 self.peer_displays.insert(from, (revision, displays));
                 self.rebuild_topology();
             }
@@ -1456,11 +1457,9 @@ impl Session {
                     receiver_ready = hello.capabilities.receiver_ready(),
                     "link up"
                 );
-                if hello.displays_revision > 0 {
+                if hello.displays_revision > 0 && !hello.displays.is_empty() {
                     self.peer_displays
                         .insert(peer, (hello.displays_revision, hello.displays.clone()));
-                } else {
-                    self.peer_displays.remove(&peer);
                 }
                 self.rebuild_topology();
                 // The clipboard channel of this pair is bound to this connection id as its
@@ -1785,6 +1784,10 @@ impl Session {
                     .iter()
                     .filter_map(crate::topology::display_to_wire)
                     .collect();
+                if displays.is_empty() {
+                    self.rebuild_topology();
+                    return Ok(());
+                }
                 let revision = if report.local_revision > self.local_hello.displays_revision {
                     report.local_revision
                 } else if displays != self.local_hello.displays {
@@ -1793,7 +1796,6 @@ impl Session {
                     self.local_hello.displays_revision
                 };
                 self.agent_displays = report.displays;
-                self.agent_displays_received = true;
                 self.local_hello.displays_revision = revision;
                 self.local_hello.displays = displays.clone();
                 self.manager
