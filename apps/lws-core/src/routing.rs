@@ -493,6 +493,10 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
             code: error_code(&error.code),
         }),
         Msg::Pong(_) => AgentSignal::Ignored,
+        // The clipboard IPC never drives the focus FSM: `ClipboardChanged` is offered to the
+        // peers on the clipboard channel and `SetClipboardText` is addressed to the agent, so
+        // both are the session loop's business and arrive here only to be classified.
+        Msg::ClipboardChanged(_) | Msg::SetClipboardText(_) => AgentSignal::Ignored,
         // Core → agent frames arriving from the agent are a protocol error; the
         // loop's watchdog still counted the frame as liveness.
         _ => AgentSignal::Fsm(fr::AgentEvent::Error {
@@ -693,6 +697,8 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::Error(_) => "AgentError",
         Msg::PortalPermission(_) => "PortalPermissionRequired",
         Msg::PortalGrant(_) => "PortalGrantChanged",
+        Msg::SetClipboardText(_) => "SetClipboardText",
+        Msg::ClipboardChanged(_) => "ClipboardChanged",
     }
 }
 
