@@ -776,6 +776,9 @@ impl Session {
         detail: &str,
     ) {
         tracing::warn!(peer = %peer, code = code.as_str_name(), detail, "layout refused for a peer");
+        // «The last refusal this node saw *or sent*»: a refusal this node emits is as much a
+        // fact about the document as one it received, and `layout show` reports it either way.
+        self.last_layout_error = Some((code.as_str_name().to_owned(), detail.to_owned()));
         self.send_layout_to(peer, transport::convert::LayoutMessage::Error { code })
             .await;
     }
@@ -805,11 +808,14 @@ impl Session {
                     detail: "no owner is known; the pending edit waits".to_owned(),
                 };
             };
-            let applied = self.layout_state.applied();
+            // The base is the pair the edit was *written against*, never the pair this node
+            // has applied now: a pending edit waits across a partition while the document
+            // moves, and sending `applied` would turn the coordinator's CAS into a no-op that
+            // always succeeds — silently reverting the side that won the rejoin (ADR-013).
             let message =
                 transport::convert::LayoutMessage::LayoutEdit(protocol::wire::LayoutEdit {
-                    expected_revision: applied.revision,
-                    expected_author: applied
+                    expected_revision: base_pair.revision,
+                    expected_author: base_pair
                         .author
                         .map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
                     author_node_id: self.node_id.as_bytes().to_vec(),
@@ -821,12 +827,13 @@ impl Session {
                     detail: "the coordinator is unreachable; the pending edit waits".to_owned(),
                 };
             }
-            // Sent: the coordinator applies it and replicates the new revision back.
+            // Sent: the coordinator runs the CAS with the base the edit names, and replicates
+            // the new revision back (or refuses it by name).
             self.layout_state.take_pending();
             return ctl::Response::Status(format!(
                 "sent to the coordinator ({}), based on revision {}",
                 identity::fingerprint(&owner),
-                self.layout_state.applied().revision
+                base_pair.revision
             ));
         }
         let edit = crate::layout::Edit {
@@ -871,7 +878,7 @@ impl Session {
         }
     }
 
-    /// `layout show`: the pair, the floor and whether an edit is waiting.
+    /// `layout show`: the pair, the floor, whether an edit is waiting, and the last refusal.
     fn layout_line(&self) -> String {
         let hex = |pair: crate::layout::Pair| {
             pair.author
@@ -879,7 +886,7 @@ impl Session {
         };
         let applied = self.layout_state.applied();
         let floor = self.layout_state.max_seen();
-        format!(
+        let mut line = format!(
             "revision={} author={} max_seen={} max_seen_author={} pending={}",
             applied.revision,
             hex(applied),
@@ -890,7 +897,14 @@ impl Session {
             } else {
                 "no"
             },
-        )
+        );
+        // The refusal is appended only when there is one, exactly as `status` does with its
+        // `refusal=`: it is what the GUI shows after `LAYOUT_CONFLICT` («layout изменён на
+        // другом узле»), and it stays until a revision moves.
+        if let Some((code, _detail)) = &self.last_layout_error {
+            line.push_str(&format!(" last_error={code}"));
+        }
+        line
     }
 
     /// `layout edit <file>`: the whole-document CAS of KVM-072.
