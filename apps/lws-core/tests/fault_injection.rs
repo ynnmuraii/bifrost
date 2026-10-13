@@ -257,11 +257,18 @@ fn the_owner_re_arms_its_observation_after_returning_to_local() {
     let _serial = common::serial();
     let harness = Harness::start(false, false);
     harness.wait_linked();
+    // `wait_linked` returns when the status says owner; the observation is armed a moment
+    // later (the claim itself takes the grant window, and the arm follows it), so wait for
+    // the arm rather than reading the count in the same breath as the ownership change.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.a.observe_arms() < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the owning source must observe the local pointer once the workspace is its own"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let armed_before = harness.a.observe_arms();
-    assert!(
-        armed_before >= 1,
-        "the owning source must observe the local pointer once the workspace is its own"
-    );
 
     // Two full there-and-back cycles: each return to `Local` must re-arm exactly once.
     harness.cycle();
