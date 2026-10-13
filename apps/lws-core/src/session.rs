@@ -2654,25 +2654,20 @@ impl Session {
     /// display: its dominant axis and sign are the edge, and `input.edge_hysteresis_px` is
     /// the band. Without this a pointer that came home sitting on the edge resolved a fresh
     /// crossing on the next sample — the `Local`/`Remote` oscillation at the boundary.
-    fn arm_return_guard(&mut self, step: geometry::Point) {
-        let (Some(topology), Some(position)) =
-            (self.topology.as_ref(), self.local_pointer.as_ref())
+    fn arm_return_guard(&mut self, step: geometry::Point, entry: &geometry::Position) {
+        // The step's sign is the direction the pointer came home *in*, which is the inward
+        // direction on this side; the entry point is where it came home.
+        let armed_at = if step.x.abs() >= step.y.abs() {
+            entry.x
+        } else {
+            entry.y
+        };
+        let Some(guard) =
+            crate::topology::ReturnGuard::after_return(step, armed_at, self.edge_hysteresis_px)
         else {
             return;
         };
-        let Some(display) = topology.display(&self.node_id, &position.display_id) else {
-            return;
-        };
-        let size = display.logical_size();
-        let Some(guard) = crate::topology::ReturnGuard::after_return(
-            step,
-            size.width,
-            size.height,
-            self.edge_hysteresis_px,
-        ) else {
-            return;
-        };
-        self.local_pointer = Some(guard.entry(position));
+        self.local_pointer = Some(guard.entry(entry));
         self.edge_guard = Some(guard);
         tracing::debug!(
             axis = ?guard.axis(),
@@ -2755,7 +2750,7 @@ impl Session {
             // Disarm the edge the pointer came home through until it leaves the band: a
             // pointer that came home sitting on the edge would otherwise resolve a fresh
             // crossing on the next sample (see `arm_return_guard`).
-            self.arm_return_guard(step);
+            self.arm_return_guard(step, &entry_position);
         } else {
             // A link that leads further on: the lease has to be released first, so the
             // target is remembered and walked once the FSM is Local again.

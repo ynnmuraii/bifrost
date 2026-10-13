@@ -561,44 +561,39 @@ pub enum Axis {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReturnGuard {
     axis: Axis,
-    /// `+1.0` for the right/bottom edge, `-1.0` for the left/top one.
-    outward: f64,
-    /// The edge's coordinate on `axis`: the display's width or height, or `0.0`.
-    edge: f64,
+    /// The direction the pointer came home *in*, along `axis`: `+1.0` or `-1.0`.
+    ///
+    /// The peer's edge maps to this side's edge, so the direction the captured motion had
+    /// when it crossed is also the direction that carries the pointer *inward* here.
+    inward: f64,
+    /// The coordinate the pointer came home at: the transition's own entry point.
+    armed_at: f64,
     hysteresis: f64,
 }
 
 impl ReturnGuard {
-    /// The guard a return through `step` arms, or `None` for a step with no axis.
+    /// The guard a return through `step` arms at `armed_at`, or `None` without an axis.
     ///
-    /// `step` is the captured delta that crossed the edge, in the *local* node's frame:
-    /// its dominant axis is the edge and its sign says which side of the display it left by.
+    /// `step` is the captured delta that resolved the return and `armed_at` the coordinate
+    /// of the transition's target position on its axis — the point the pointer came home
+    /// at, in the local node's frame.
     #[must_use]
     pub fn after_return(
         step: geometry::Point,
-        width: f64,
-        height: f64,
+        armed_at: f64,
         hysteresis: f64,
     ) -> Option<ReturnGuard> {
-        let (axis, outward, edge) = if step.x.abs() >= step.y.abs() && step.x != 0.0 {
-            (
-                Axis::X,
-                step.x.signum(),
-                if step.x > 0.0 { width } else { 0.0 },
-            )
+        let (axis, inward) = if step.x.abs() >= step.y.abs() && step.x != 0.0 {
+            (Axis::X, step.x.signum())
         } else if step.y != 0.0 {
-            (
-                Axis::Y,
-                step.y.signum(),
-                if step.y > 0.0 { height } else { 0.0 },
-            )
+            (Axis::Y, step.y.signum())
         } else {
             return None;
         };
         Some(ReturnGuard {
             axis,
-            outward,
-            edge,
+            inward,
+            armed_at,
             hysteresis,
         })
     }
@@ -610,14 +605,14 @@ impl ReturnGuard {
             Axis::X => position.x,
             Axis::Y => position.y,
         };
-        (self.edge - coordinate) * self.outward <= self.hysteresis
+        (coordinate - self.armed_at) * self.inward < self.hysteresis
     }
 
-    /// Where the pointer is placed when it comes home: the edge inset by the band.
+    /// Where the pointer is placed when it comes home: the entry point, the band further in.
     #[must_use]
     pub fn entry(&self, position: &geometry::Position) -> geometry::Position {
         let mut entry = position.clone();
-        let inset = self.edge - self.outward * self.hysteresis;
+        let inset = self.armed_at + self.inward * self.hysteresis;
         match self.axis {
             Axis::X => entry.x = inset,
             Axis::Y => entry.y = inset,
@@ -1408,54 +1403,48 @@ mod tests {
     /// `input.edge_hysteresis_px` is the band that stops it.
     #[test]
     fn a_return_disarms_the_edge_until_the_pointer_leaves_the_band() {
-        let (width, height) = (1080.0_f64, 1920.0_f64);
-        let guard = ReturnGuard::after_return(geometry::Point::new(100.0, 0.0), width, height, 8.0)
+        // The live shape: the pointer crossed back over the right edge of a 1080-wide
+        // display with a leftward step, and the transition put it home at x=1078.
+        let guard = ReturnGuard::after_return(geometry::Point::new(-32.0, 0.0), 1078.0, 8.0)
             .expect("a horizontal return arms the guard");
-        let home = guard.entry(&geometry::Position::new("eDP-1", width - 1.0, 540.0));
-        assert_eq!(home.x, width - 8.0, "the entry point is inside the band");
-        for x in [home.x, home.x + 1.0, width - 1.0, width] {
+        for x in [1080.0, 1079.0, 1078.0, 1071.0] {
             let sample = geometry::Position::new("eDP-1", x, 540.0);
             assert!(guard.holds(&sample), "a push at {x} is inside the band");
         }
-        let clear = geometry::Position::new("eDP-1", home.x - 10.0, 540.0);
+        let clear = geometry::Position::new("eDP-1", 1070.0, 540.0);
         assert!(
             !guard.holds(&clear),
-            "ten pixels inward is clear of the band"
+            "eight pixels inward is clear of the band"
         );
+        let entry = guard.entry(&geometry::Position::new("eDP-1", 1078.0, 540.0));
+        assert_eq!(entry.x, 1070.0, "the estimate is placed inside the band");
         assert_eq!(guard.axis(), Axis::X);
         assert_eq!(guard.hysteresis(), 8.0);
     }
 
-    /// The band is the same on the other three edges.
+    /// What matters on the other edges is the direction the pointer came home in: that is
+    /// the inward direction on this side, whatever the document calls the edge.
     #[test]
     fn every_edge_arms_its_own_band() {
-        let (width, height) = (1080.0_f64, 1920.0_f64);
-        for (step, x, y, inside) in [
-            (geometry::Point::new(-100.0, 0.0), 8.0, 540.0, 18.0),
-            (geometry::Point::new(0.0, -100.0), 540.0, 8.0, 18.0),
-            (
-                geometry::Point::new(0.0, 100.0),
-                540.0,
-                height - 8.0,
-                height - 18.0,
-            ),
-        ] {
-            let guard = ReturnGuard::after_return(step, width, height, 8.0)
-                .expect("a return with an axis arms the guard");
-            let home = guard.entry(&geometry::Position::new("eDP-1", width / 2.0, height / 2.0));
-            let held = geometry::Position::new(
-                "eDP-1",
-                if home.x == width / 2.0 { x } else { home.x },
-                if home.y == height / 2.0 { y } else { home.y },
-            );
-            assert!(guard.holds(&held), "{step:?} is still inside its band");
-            let clear = geometry::Position::new(
-                "eDP-1",
-                if held.x == x { inside } else { held.x },
-                if held.y == y { inside } else { held.y },
-            );
-            assert!(!guard.holds(&clear), "{step:?} is clear of its band");
-        }
+        // Up through the bottom edge: inward is -y, the pointer is home at y=1918.
+        let guard = ReturnGuard::after_return(geometry::Point::new(0.0, -100.0), 1918.0, 8.0)
+            .expect("a vertical return arms the guard");
+        assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 1918.0)));
+        assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 1911.0)));
+        assert!(!guard.holds(&geometry::Position::new("eDP-1", 540.0, 1910.0)));
+        // Down through the top edge: inward is +y, the pointer is home at y=2.
+        let guard = ReturnGuard::after_return(geometry::Point::new(0.0, 100.0), 2.0, 8.0)
+            .expect("a vertical return arms the guard");
+        assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 0.0)));
+        assert!(!guard.holds(&geometry::Position::new("eDP-1", 540.0, 10.0)));
+        assert_eq!(
+            guard.entry(&geometry::Position::new("eDP-1", 540.0, 2.0)).y,
+            10.0
+        );
+        assert_eq!(
+            ReturnGuard::after_return(geometry::Point::new(0.0, 0.0), 2.0, 8.0),
+            None
+        );
     }
 
     /// A coarse return step must cross the entry edge exactly like a fine one.
