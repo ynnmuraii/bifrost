@@ -139,6 +139,7 @@ fn author_of(documents: &Documents<'_>) -> Option<NodeId> {
 /// edge needs the display-local form, and this is that conversion: find the display whose
 /// rectangle contains the point. A point outside every display (a gap between monitors,
 /// which the documents allow) has no local position and cannot open a transition.
+
 pub fn position_on(
     topology: &Topology,
     node: &NodeId,
@@ -153,6 +154,40 @@ pub fn position_on(
         .find(|display| display.logical_bounds.contains(point))?;
     Some(geometry::Position::new(
         display.id.clone(),
+        x - display.logical_bounds.x,
+        y - display.logical_bounds.y,
+    ))
+}
+
+/// Maps a captured point to its display-local coordinates, keeping an overshoot on the
+/// last display only when it has left the node's overall display bounds.
+///
+/// Some cursor injection APIs report a requested position beyond the physical desktop
+/// while the actual cursor is clamped to its edge. Continue that sample on the last
+/// display so edge detection can observe it, but do not reinterpret an internal monitor
+/// gap as an edge crossing.
+pub fn position_on_or_last_display(
+    topology: &Topology,
+    node: &NodeId,
+    x: f64,
+    y: f64,
+    last: Option<&geometry::Position>,
+) -> Option<geometry::Position> {
+    if let Some(position) = position_on(topology, node, x, y) {
+        return Some(position);
+    }
+
+    let member = topology.node(node)?;
+    if member
+        .bounds()
+        .is_some_and(|bounds| bounds.contains(geometry::Point::new(x, y)))
+    {
+        return None;
+    }
+    let last = last?;
+    let display = member.display(&last.display_id)?;
+    Some(geometry::Position::new(
+        last.display_id.clone(),
         x - display.logical_bounds.x,
         y - display.logical_bounds.y,
     ))
@@ -746,6 +781,53 @@ mod tests {
 
         // A point in the gap between monitors belongs to no display.
         assert!(position_on(&document, &NodeId::new(local_id()), -2000.0, 512.0).is_none());
+    }
+
+    #[test]
+    fn a_pointer_sample_beyond_the_desktop_edge_can_resolve_a_link() {
+        let config = topology_config();
+        let local = [
+            info(
+                "eDP-1",
+                [0.0, 0.0, 1080.0, 1920.0],
+                [0, 0, 1080, 1920],
+                true,
+            ),
+            info(
+                "left",
+                [-1280.0, 0.0, 1280.0, 1024.0],
+                [0, 0, 1280, 1024],
+                false,
+            ),
+        ];
+        let peers = vec![(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
+        let document = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("the linked displays form a valid document");
+        let node = NodeId::new(local_id());
+        let last = position_on(&document, &node, 1079.0, 959.0).unwrap();
+
+        // SendInput can report its requested point even though Windows clamps the actual
+        // cursor to x=1079 on this 1080-wide virtual desktop.
+        let current = position_on_or_last_display(&document, &node, 1087.0, 959.0, Some(&last))
+            .expect("the overshoot continues on the last display");
+        assert_eq!(current, geometry::Position::new("eDP-1", 1087.0, 959.0));
+        let motion = geometry::Point::new(current.x - last.x, current.y - last.y);
+        let transition =
+            geometry::resolve_motion(&document, &node, &current, motion).expect("right edge link");
+        assert_eq!(transition.target.node, NodeId::new(peer_id()));
+
+        assert!(
+            position_on_or_last_display(&document, &node, -100.0, 1500.0, Some(&last)).is_none()
+        );
+        assert!(position_on_or_last_display(&document, &node, 1087.0, 959.0, None).is_none());
     }
 
     #[test]
