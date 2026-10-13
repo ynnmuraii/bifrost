@@ -471,32 +471,29 @@ impl Win {
             }
         }
         if let Some(capture) = &self.capture {
-            match capture.try_recv() {
-                Some(CaptureEvent::Input(event)) => {
-                    // Windows has no per-event repeat flag: a down for a key already in the
-                    // pressed set is the OS repeating it. Dropped here, at capture.
-                    if self.repeats.is_repeat(&event, false) {
-                        tracing::trace!(?event, "dropping an OS autorepeat");
-                        return None;
-                    }
-                    if self.source_motion.is_none() {
-                        // No accumulator and no baseline: the event cannot be normalised, so
-                        // it is dropped *visibly* (audit F11) instead of returning a bare
-                        // `None`, which was indistinguishable from "no event this tick".
-                        self.note_motion_without_baseline();
-                        return None;
-                    }
-                    let motion = self.source_motion.as_mut().expect("checked just above");
-                    if let InputEvent::PointerAbsolute(native) = event {
-                        if let Some(scale) = monitor_scale(&self.source_monitors, native) {
-                            motion.scale = scale;
-                        }
-                    }
-                    return motion.normalize(capture.mode(), event).map(Event::Input);
+            let mode = capture.mode();
+            // One drain, repeats skipped (batch-3 audit F13): returning as soon as one repeat
+            // was seen made the session's `select!` call this again immediately, so a held key
+            // — which the OS repeats at its own rate — spun the poll loop at full CPU instead
+            // of its tick.
+            if let Some(event) = drain_capture(|| capture.try_recv(), &mut self.repeats) {
+                let Event::Input(event) = event else {
+                    return Some(event);
+                };
+                if self.source_motion.is_none() {
+                    // No accumulator and no baseline: the event cannot be normalised, so it is
+                    // dropped *visibly* (audit F11) instead of returning a bare `None`, which
+                    // was indistinguishable from "no event this tick".
+                    self.note_motion_without_baseline();
+                    return None;
                 }
-                Some(CaptureEvent::Emergency) => return Some(Event::Emergency),
-                Some(CaptureEvent::QueueOverflow) => return Some(Event::QueueOverflow),
-                None => {}
+                let motion = self.source_motion.as_mut().expect("checked just above");
+                if let InputEvent::PointerAbsolute(native) = event {
+                    if let Some(scale) = monitor_scale(&self.source_monitors, native) {
+                        motion.scale = scale;
+                    }
+                }
+                return motion.normalize(mode, event).map(Event::Input);
             }
         }
         if let Some((detector, capture)) = &mut self.detector {
@@ -592,6 +589,35 @@ impl Win {
         }
         self.last_capture_report = Some(now);
         self.last_capture_stats = stats;
+    }
+}
+
+/// The next captured event, skipping the OS autorepeats (batch-3 audit, F13).
+///
+/// `next` is the capture queue's non-blocking read. A repeat does **not** end the call: the
+/// session's `select!` calls `next_event` again the moment it returns, so returning on a repeat
+/// spun the poll loop at full CPU for as long as a key was held (the OS repeats it at its own
+/// rate, and every repeat was dropped here). The drain runs until it has a real event or the
+/// queue is empty — then the caller reaches its tick's sleep.
+///
+/// `platform_says_repeat` is false: Windows has no per-event repeat flag, so the pressed set in
+/// [`RepeatFilter`] is the whole detection rule.
+fn drain_capture(
+    mut next: impl FnMut() -> Option<CaptureEvent>,
+    repeats: &mut RepeatFilter,
+) -> Option<Event> {
+    loop {
+        match next()? {
+            CaptureEvent::Input(event) => {
+                if repeats.is_repeat(&event, false) {
+                    tracing::trace!(?event, "dropping an OS autorepeat");
+                    continue;
+                }
+                return Some(Event::Input(event));
+            }
+            CaptureEvent::Emergency => return Some(Event::Emergency),
+            CaptureEvent::QueueOverflow => return Some(Event::QueueOverflow),
+        }
     }
 }
 
@@ -826,6 +852,75 @@ mod tests {
         println!("stats: {:?}", capture.stats());
         drop(capture);
         assert!(downs >= 1, "even the injected down itself must be seen");
+    }
+
+    /// Batch-3 audit (F13): a queued run of OS autorepeats must not end the drain.
+    ///
+    /// Every repeat used to be one `next_event` call, and the session's `select!` called it
+    /// again at once, so a held key spun the poll loop. One call now consumes the whole run and
+    /// returns the first event that is not a repeat.
+    #[test]
+    fn a_run_of_os_repeats_is_drained_in_one_call() {
+        let down = || {
+            CaptureEvent::Input(InputEvent::Key {
+                key: HidKey::keyboard(0x04),
+                state: input_model::KeyState::Down,
+            })
+        };
+        let up = CaptureEvent::Input(InputEvent::Key {
+            key: HidKey::keyboard(0x04),
+            state: input_model::KeyState::Up,
+        });
+        let mut repeats = RepeatFilter::new();
+        // The press itself is a real event (its own call); it is what puts the key in the
+        // pressed set, which is the whole repeat-detection rule on Windows.
+        let mut press: std::collections::VecDeque<CaptureEvent> = vec![down()].into();
+        assert!(matches!(
+            drain_capture(|| press.pop_front(), &mut repeats),
+            Some(Event::Input(_))
+        ));
+        // Then the OS repeats the key, and the up that ends the hold.
+        let mut queue: std::collections::VecDeque<CaptureEvent> = vec![down(), down(), up].into();
+        let mut reads = 0usize;
+        let drained = drain_capture(
+            || {
+                reads += 1;
+                queue.pop_front()
+            },
+            &mut repeats,
+        );
+        assert_eq!(
+            reads, 3,
+            "one call drained the two repeats and the key-up that followed them"
+        );
+        assert!(
+            matches!(
+                drained,
+                Some(Event::Input(InputEvent::Key {
+                    state: input_model::KeyState::Up,
+                    ..
+                }))
+            ),
+            "the first non-repeat event is the one that is returned"
+        );
+        assert!(queue.is_empty(), "nothing is left behind for the next call");
+
+        // A queue of nothing but repeats drains to `None` in one call, so the caller reaches
+        // its sleep instead of spinning on the same repeats (the up above cleared the pressed
+        // set, so this case seeds its own press).
+        let mut pressed = RepeatFilter::new();
+        let mut seed: std::collections::VecDeque<CaptureEvent> = vec![down()].into();
+        assert!(drain_capture(|| seed.pop_front(), &mut pressed).is_some());
+        let mut only_repeats: std::collections::VecDeque<CaptureEvent> =
+            vec![down(), down()].into();
+        assert!(
+            drain_capture(|| only_repeats.pop_front(), &mut pressed).is_none(),
+            "repeats alone yield no event"
+        );
+        assert!(
+            only_repeats.is_empty(),
+            "and they are consumed, not re-read"
+        );
     }
 
     /// Audit F11: a capture that is re-armed on the `Some(capture)` branch has to get its

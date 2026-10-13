@@ -360,16 +360,16 @@ impl X11 {
             }
         }
         if let Some(capture) = &mut self.capture {
-            // A non-blocking poll; the loop's tick provides the wait.
-            match capture.next_event(Some(Duration::ZERO)) {
-                Ok(Some(CapturedEvent::Input(event))) => {
-                    if self.repeats.is_repeat(&event, false) {
-                        tracing::trace!(?event, "dropping an OS autorepeat");
-                        return None;
-                    }
-                    return Some(Event::Input(event));
-                }
-                Ok(Some(CapturedEvent::Emergency)) => return Some(Event::Emergency),
+            // A non-blocking poll; the loop's tick provides the wait. The drain skips the OS
+            // autorepeats without ending the call (batch-3 audit F13): returning as soon as one
+            // was seen made the session's `select!` call this again immediately, so a held key
+            // — which the X server repeats on its own schedule — spun the poll loop at full CPU
+            // instead of its tick.
+            match drain_capture(
+                || capture.next_event(Some(Duration::ZERO)),
+                &mut self.repeats,
+            ) {
+                Ok(Some(event)) => return Some(event),
                 Ok(None) => {}
                 Err(error) => {
                     return Some(Event::Failed {
@@ -392,6 +392,36 @@ impl X11 {
     }
 }
 
+/// The next captured event, skipping the OS autorepeats (batch-3 audit, F13).
+///
+/// `next` is the non-blocking XI2 read, which reports an error of its own. A repeat does **not**
+/// end the call: the session's `select!` calls `next_event` again the moment it returns, so
+/// returning on a repeat spun the poll loop for as long as a key was held. The drain runs until
+/// it has a real event or the queue is empty — then the caller reaches its tick's sleep.
+///
+/// `platform_says_repeat` is false here: `platform_x11::capture` does not expose XI2's
+/// `XIKeyRepeat` yet, so the pressed set in [`RepeatFilter`] is the detection rule.
+fn drain_capture(
+    mut next: impl FnMut() -> Result<Option<CapturedEvent>, platform_x11::X11Error>,
+    repeats: &mut RepeatFilter,
+) -> Result<Option<Event>, platform_x11::X11Error> {
+    loop {
+        let Some(event) = next()? else {
+            return Ok(None);
+        };
+        match event {
+            CapturedEvent::Input(event) => {
+                if repeats.is_repeat(&event, false) {
+                    tracing::trace!(?event, "dropping an OS autorepeat");
+                    continue;
+                }
+                return Ok(Some(Event::Input(event)));
+            }
+            CapturedEvent::Emergency => return Ok(Some(Event::Emergency)),
+        }
+    }
+}
+
 /// Releases everything the injector still holds, counting what actually went up.
 fn release_counts(injector: &mut X11Injector) -> Released {
     let keys_before = injector.pressed_keys().len();
@@ -400,5 +430,83 @@ fn release_counts(injector: &mut X11Injector) -> Released {
     Released {
         keys: keys_before.saturating_sub(injector.pressed_keys().len()) as u32,
         buttons: buttons_before.saturating_sub(injector.pressed_buttons().len()) as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Batch-3 audit (F13): a queued run of X-server autorepeats must not end the drain.
+    ///
+    /// Every repeat used to be one `next_event` call, and the session's `select!` called it
+    /// again at once, so a held key spun the poll loop. One call now consumes the whole run and
+    /// returns the first event that is not a repeat.
+    #[test]
+    fn a_run_of_x_server_repeats_is_drained_in_one_call() {
+        let down = || {
+            CapturedEvent::Input(InputEvent::Key {
+                key: HidKey::keyboard(0x04),
+                state: input_model::KeyState::Down,
+            })
+        };
+        let up = CapturedEvent::Input(InputEvent::Key {
+            key: HidKey::keyboard(0x04),
+            state: input_model::KeyState::Up,
+        });
+        let mut repeats = RepeatFilter::new();
+        // The press itself is a real event, and it is what puts the key in the pressed set.
+        let mut press: std::collections::VecDeque<CapturedEvent> = vec![down()].into();
+        assert!(matches!(
+            drain_capture(|| Ok(press.pop_front()), &mut repeats),
+            Ok(Some(Event::Input(_)))
+        ));
+        // Then the server repeats the key, and the up that ends the hold.
+        let mut queue: std::collections::VecDeque<CapturedEvent> = vec![down(), down(), up].into();
+        let mut reads = 0usize;
+        let drained = drain_capture(
+            || {
+                reads += 1;
+                Ok(queue.pop_front())
+            },
+            &mut repeats,
+        );
+        assert_eq!(
+            reads, 3,
+            "one call drained the two repeats and the key-up that followed them"
+        );
+        assert!(
+            matches!(
+                drained,
+                Ok(Some(Event::Input(InputEvent::Key {
+                    state: input_model::KeyState::Up,
+                    ..
+                })))
+            ),
+            "the first non-repeat event is the one that is returned"
+        );
+        assert!(queue.is_empty(), "nothing is left behind for the next call");
+
+        // A queue of nothing but repeats drains to `None` in one call, so the caller reaches its
+        // sleep instead of spinning on the same repeats.
+        let mut pressed = RepeatFilter::new();
+        let mut seed: std::collections::VecDeque<CapturedEvent> = vec![down()].into();
+        assert!(matches!(
+            drain_capture(|| Ok(seed.pop_front()), &mut pressed),
+            Ok(Some(Event::Input(_)))
+        ));
+        let mut only_repeats: std::collections::VecDeque<CapturedEvent> =
+            vec![down(), down()].into();
+        assert!(
+            matches!(
+                drain_capture(|| Ok(only_repeats.pop_front()), &mut pressed),
+                Ok(None)
+            ),
+            "repeats alone yield no event"
+        );
+        assert!(
+            only_repeats.is_empty(),
+            "and they are consumed, not re-read"
+        );
     }
 }
