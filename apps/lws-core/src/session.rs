@@ -290,6 +290,10 @@ pub struct Session {
     /// The assembled layout document. `None` means edge-triggered transitions are
     /// disabled: a document that breaks «Правила целостности» is never half-applied.
     topology: Option<geometry::Topology>,
+    /// The configured links the last rebuild left out because an endpoint display is not in
+    /// any member's manifest. They are not an error: the link comes back on the next rebuild
+    /// once the monitor is reported. Only the GUI and the log read this.
+    inactive_links: Vec<crate::topology::InactiveLink>,
     /// `[topology]` from `config.toml`: the links and the display snapshot the document
     /// is assembled from.
     layout: config::TopologyConfig,
@@ -443,6 +447,7 @@ impl Session {
             portal_failure: false,
             agent_lost_reported: false,
             topology: None,
+            inactive_links: Vec::new(),
             layout,
             pointer_gain,
             agent_displays: Vec::new(),
@@ -511,14 +516,30 @@ impl Session {
             peer_displays: &peers,
         };
         match crate::topology::build(&documents) {
-            Ok(document) => {
+            Ok(built) => {
+                let document = built.topology;
                 self.router.set_topology_revision(document.revision);
                 tracing::info!(
                     revision = document.revision,
                     links = document.links.len(),
+                    inactive_links = built.inactive.len(),
                     nodes = document.nodes.len(),
                     "layout document assembled"
                 );
+                for link in &built.inactive {
+                    for missing in &link.missing {
+                        // Once per rebuild, never per sample: `rebuild_topology` runs on a
+                        // display report or a topology change, so one monitor that is off
+                        // produces one line here, not one per pointer event.
+                        tracing::warn!(
+                            link = %link.id,
+                            side = ?missing.side,
+                            node = %missing.node,
+                            display = %missing.display,
+                            "layout link inactive: its endpoint display is not reported"
+                        );
+                    }
+                }
                 if self.applied_wire.is_some() {
                     let applied = self.layout_state.applied();
                     self.applied_wire = Some(crate::topology::wire_from_live(
@@ -530,6 +551,7 @@ impl Session {
                     ));
                 }
                 self.topology = Some(document);
+                self.inactive_links = built.inactive;
             }
             Err(error) => {
                 tracing::error!(
@@ -537,6 +559,7 @@ impl Session {
                     "layout document unusable; edge-triggered transitions are disabled"
                 );
                 self.topology = None;
+                self.inactive_links = Vec::new();
             }
         }
     }
@@ -3689,7 +3712,8 @@ bidirectional = true
             local_displays: &local,
             peer_displays: &peers,
         })
-        .expect("configured link");
+        .expect("configured link")
+        .topology;
         let activation = protocol::ipc::PortalActivation {
             position: Some(protocol::ipc::PointerAbs {
                 display_id: String::new(),

@@ -1224,6 +1224,28 @@ impl ViewModel {
         }
     }
 
+    /// The links the core marked inactive because one of their displays is not in the live
+    /// manifests, as plain lines for the GUI. Empty when every link is usable.
+    ///
+    /// The link is not lost: it becomes active again on its own once the monitor is reported.
+    pub fn inactive_link_lines(&self) -> Vec<String> {
+        self.editor
+            .links
+            .iter()
+            .filter(|link| !link.active)
+            .map(|link| {
+                if link.inactive_reason.is_empty() {
+                    format!("Связь {} неактивна: экран не найден", link.id)
+                } else {
+                    format!(
+                        "Связь {} неактивна: экран «{}» не найден",
+                        link.id, link.inactive_reason
+                    )
+                }
+            })
+            .collect()
+    }
+
     /// One line per **other** computer, or the sentence that says there are none.
     ///
     /// This computer is not a peer of itself: listing it here read as a third machine and the

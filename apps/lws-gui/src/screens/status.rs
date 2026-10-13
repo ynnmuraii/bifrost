@@ -174,6 +174,9 @@ fn link_block(vm: &ViewModel, ui: &mut egui::Ui) {
         for line in vm.member_lines() {
             bullet(ui, &line);
         }
+        for line in vm.inactive_link_lines() {
+            important(ui, &line);
+        }
         if let Some(delay) = vm.delay_line() {
             ui.label(delay);
         }

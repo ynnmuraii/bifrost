@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use focus_router as fr;
 
-use geometry::{Display, DisplayId, NodeDisplays, NodeId, Rect, Rotation, Scale, Topology};
+use geometry::{
+    Display, DisplayId, EndpointSide, LinkId, NodeDisplays, NodeId, Rect, Rotation, Scale, Topology,
+};
 use protocol::ipc;
 use protocol::wire;
 
@@ -41,13 +43,55 @@ pub struct Documents<'a> {
     pub peer_displays: &'a [(NodeId, Vec<wire::Display>)],
 }
 
+/// A link the live document had to leave out because one of its endpoint displays is not
+/// in any member's manifest right now.
+///
+/// The display is not a *structural* defect: a monitor that is switched off, asleep, or
+/// renumbered disappears from `EnumDisplayMonitors`, and the link cannot be resolved until
+/// it comes back. The link stays in the authored document and becomes active again on the
+/// next rebuild once the display is reported — only the resolver's copy is missing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InactiveLink {
+    /// The authored link id ([`geometry::TransitionLink::id`]).
+    pub id: LinkId,
+    /// The endpoints whose display is currently unknown.
+    pub missing: Vec<MissingDisplay>,
+}
+
+/// One endpoint of an inactive link: the display the manifests do not describe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingDisplay {
+    /// Which end of the link.
+    pub side: EndpointSide,
+    /// The node the display was expected on.
+    pub node: NodeId,
+    /// The missing display id.
+    pub display: DisplayId,
+}
+
+/// The assembled live document plus the links it left out.
+///
+/// [`build`] returns this instead of a bare [`Topology`] so the caller can log every inactive
+/// link and carry the state to the GUI; the resolver only ever sees [`Built::topology`], which
+/// contains the links whose endpoints are present.
+#[derive(Debug)]
+pub struct Built {
+    /// The document `geometry` resolves against: only links whose endpoints are present.
+    pub topology: Topology,
+    /// The configured links left out of `topology`, in document order.
+    pub inactive: Vec<InactiveLink>,
+}
+
 /// The assembled document, or why it cannot be used.
 #[derive(Debug)]
 pub enum BuildError {
     /// The links themselves are malformed (a `"self"`/`"peer:<hex>"` reference that does
     /// not parse, a segment with `start >= end`): [`config::TopologyConfig`] refuses them.
     Links(config::ConfigError),
-    /// The document assembled, but breaks the integrity rules of «Доменная модель».
+    /// The document breaks a *structural* integrity rule of «Доменная модель»: a duplicate
+    /// node or link id, a link whose endpoints are on one node, an unknown node, a bad segment
+    /// or an overlapping/ambiguous pair of links. A link whose endpoint display is simply not
+    /// reported right now is *not* here — it becomes [`Built::inactive`].
     Invalid(Vec<geometry::TopologyError>),
 }
 
@@ -77,7 +121,14 @@ impl std::error::Error for BuildError {}
 /// `revision` is the applied revision from `[topology]`, and the author is the node that
 /// authored it (`[topology].author`, resolved as a node id) — the pair core publishes in
 /// `Hello.topology_revision`/`topology_author` and checks in `EnterPrepare`.
-pub fn build(documents: &Documents<'_>) -> Result<Topology, BuildError> {
+///
+/// A link whose endpoint display is not in the manifests is left out of
+/// [`Built::topology`] and reported in [`Built::inactive`] instead of failing the whole
+/// document: one monitor that is off, asleep or renumbered must not disable every edge on
+/// the displays that *are* present. `geometry::validate_topology` still reports that link as
+/// [`geometry::TopologyError::UnknownDisplay`] — this function decides which errors are soft
+/// for the *live* document, and leaves every structural rule fatal.
+pub fn build(documents: &Documents<'_>) -> Result<Built, BuildError> {
     let links = documents
         .topology
         .to_transition_links(&documents.local_node_id)
@@ -113,8 +164,62 @@ pub fn build(documents: &Documents<'_>) -> Result<Topology, BuildError> {
     );
 
     match geometry::validate_topology(&topology) {
-        Ok(()) => Ok(topology),
-        Err(errors) => Err(BuildError::Invalid(errors.errors().to_vec())),
+        Ok(()) => Ok(Built {
+            topology,
+            inactive: Vec::new(),
+        }),
+        Err(errors) => {
+            // `UnknownDisplay` is the only soft error: it names a link that cannot resolve
+            // because the monitor is not reported, which says nothing about the rest of the
+            // document. Every other violation (an unknown node, a duplicate, a bad or
+            // overlapping segment) is structural and stays fatal.
+            let mut missing: BTreeMap<usize, Vec<MissingDisplay>> = BTreeMap::new();
+            let mut fatal = Vec::new();
+            for error in errors.into_errors() {
+                match error {
+                    geometry::TopologyError::UnknownDisplay {
+                        link,
+                        side,
+                        node,
+                        display,
+                    } => missing.entry(link).or_default().push(MissingDisplay {
+                        side,
+                        node,
+                        display,
+                    }),
+                    other => fatal.push(other),
+                }
+            }
+            if !fatal.is_empty() {
+                return Err(BuildError::Invalid(fatal));
+            }
+
+            let inactive: Vec<InactiveLink> = missing
+                .iter()
+                .map(|(index, missing)| InactiveLink {
+                    id: topology.links[*index].id.clone(),
+                    missing: missing.clone(),
+                })
+                .collect();
+            let kept = topology
+                .links
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !missing.contains_key(index))
+                .map(|(_, link)| link)
+                .collect();
+            let filtered = Topology::new(topology.revision, topology.author, topology.nodes, kept);
+
+            // Removing links can only settle the soft errors; revalidate anyway so a link
+            // removal that somehow exposed a structural defect is still refused, not shipped.
+            match geometry::validate_topology(&filtered) {
+                Ok(()) => Ok(Built {
+                    topology: filtered,
+                    inactive,
+                }),
+                Err(errors) => Err(BuildError::Invalid(errors.into_errors())),
+            }
+        }
     }
 }
 
@@ -863,7 +968,8 @@ mod tests {
             local_displays: &local,
             peer_displays: &peers,
         })
-        .expect("valid topology");
+        .expect("valid topology")
+        .topology;
         // The portal reports the last logical pixel on the right barrier.
         let mut activation = ipc::PortalActivation {
             position: Some(ipc::PointerAbs {
@@ -953,7 +1059,8 @@ mod tests {
             local_displays: &displays,
             peer_displays: &[],
         })
-        .expect("two displays and no links");
+        .expect("two displays and no links")
+        .topology;
 
         // Inside the primary: display-local means subtracting its origin.
         let local = position_on(&document, &NodeId::new(local_id()), 1919.0, 540.0).unwrap();
@@ -996,7 +1103,8 @@ mod tests {
             local_displays: &local,
             peer_displays: &peers,
         })
-        .expect("the linked displays form a valid document");
+        .expect("the linked displays form a valid document")
+        .topology;
         let node = NodeId::new(local_id());
         let last = position_on(&document, &node, 1079.0, 959.0).unwrap();
 
@@ -1037,7 +1145,8 @@ mod tests {
             local_displays: &local,
             peer_displays: &[],
         })
-        .unwrap();
+        .unwrap()
+        .topology;
         let node = NodeId::new(local_id());
         let last = geometry::Position::new("primary", 1919.0, 540.0);
         let current = capture_position(&document, &node, 1931.0, 546.0, Some(&last), true)
@@ -1068,7 +1177,8 @@ mod tests {
             local_displays: &local,
             peer_displays: &peers,
         })
-        .unwrap();
+        .unwrap()
+        .topology;
         let peer = NodeId::new(peer_id());
         let mut position = geometry::Position::new("DP-1", 2.0, 540.0);
         let mut source_position = geometry::Position::new("eDP-1", 1919.0, 540.0);
@@ -1247,7 +1357,8 @@ bidirectional = true
             local_displays: &self_displays,
             peer_displays: &peers,
         })
-        .expect("the snapshot alone is a complete document");
+        .expect("the snapshot alone is a complete document")
+        .topology;
 
         // A step from just inside the right edge leaves the node.
         let position = geometry::Position::new("dry-0", 1910.0, 540.0);
@@ -1468,7 +1579,8 @@ bidirectional = true
             local_displays: &local,
             peer_displays: &peers,
         })
-        .expect("a complete document validates");
+        .expect("a complete document validates")
+        .topology;
 
         assert_eq!(document.revision, 3);
         assert_eq!(document.author, NodeId::new(local_id()), "author = self");
@@ -1504,33 +1616,192 @@ bidirectional = true
         assert_eq!(transition.target.display.as_str(), "DP-1");
     }
 
+    /// Two links, one per half of a local display's right edge and of the peer's left edge.
+    ///
+    /// The second link names `DISPLAY1` on this node, so a caller that omits that display
+    /// from its manifest exercises exactly the "monitor is off/asleep" case.
+    fn two_link_config() -> config::TopologyConfig {
+        let mut config = topology_config();
+        config.links[0].from.end = 540.0;
+        config.links[0].to.end = 540.0;
+        config.links.push(config::LinkConfig {
+            id: "b-right-to-a-left".to_owned(),
+            from: config::EndpointConfig {
+                node: "self".to_owned(),
+                display: "DISPLAY1".to_owned(),
+                edge: config::Edge::Right,
+                start: 540.0,
+                end: 1080.0,
+            },
+            to: config::EndpointConfig {
+                node: config::peer_reference(&peer_id()),
+                display: "DP-1".to_owned(),
+                edge: config::Edge::Left,
+                start: 540.0,
+                end: 1080.0,
+            },
+            bidirectional: true,
+        });
+        config
+    }
+
     #[test]
-    fn a_link_to_a_node_without_displays_is_rejected() {
-        let config = topology_config();
+    fn a_link_to_a_display_nobody_reports_is_inactive_not_fatal() {
+        let config = two_link_config();
         let local = [info(
             "eDP-1",
             [0.0, 0.0, 1920.0, 1080.0],
             [0, 0, 1920, 1080],
             true,
         )];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
+
+        let built = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("one missing display must not disable the whole document");
+
+        assert_eq!(
+            built.topology.links.len(),
+            1,
+            "only the resolvable link reaches the resolver"
+        );
+        assert_eq!(
+            built.topology.links[0].id,
+            geometry::LinkId::new("a-right-to-b-left")
+        );
+        assert_eq!(built.inactive.len(), 1);
+        assert_eq!(
+            built.inactive[0].id,
+            geometry::LinkId::new("b-right-to-a-left")
+        );
+        assert_eq!(built.inactive[0].missing.len(), 1);
+        assert_eq!(
+            built.inactive[0].missing[0].side,
+            geometry::EndpointSide::Source
+        );
+        assert_eq!(built.inactive[0].missing[0].display.as_str(), "DISPLAY1");
+        assert_eq!(built.inactive[0].missing[0].node, NodeId::new(local_id()));
+
+        // The surviving link still resolves on this node: eDP-1's right edge is an exit.
+        let transition = geometry::resolve_motion(
+            &built.topology,
+            &NodeId::new(local_id()),
+            &geometry::Position::new("eDP-1", 1919.0, 300.0),
+            geometry::Point::new(4.0, 0.0),
+        )
+        .expect("the active link still resolves");
+        assert_eq!(transition.target.node, NodeId::new(peer_id()));
+    }
+
+    #[test]
+    fn the_link_returns_when_the_display_is_reported_again() {
+        let config = two_link_config();
+        let local = [
+            info(
+                "eDP-1",
+                [0.0, 0.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                true,
+            ),
+            info(
+                "DISPLAY1",
+                [4000.0, 3000.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                false,
+            ),
+        ];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
+
+        let built = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("both displays are present");
+
+        assert_eq!(built.topology.links.len(), 2);
+        assert!(built.inactive.is_empty());
+    }
+
+    #[test]
+    fn overlapping_links_stay_fatal_even_with_every_display_present() {
+        let mut config = two_link_config();
+        // The second link now leaves over the whole of eDP-1's right edge, which the first
+        // one already covers: an overlap, not a missing display.
+        config.links[1].from.display = "eDP-1".to_owned();
+        config.links[1].from.start = 0.0;
+        config.links[1].from.end = 1080.0;
+        let local = [
+            info(
+                "eDP-1",
+                [0.0, 0.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                true,
+            ),
+            info(
+                "DISPLAY1",
+                [4000.0, 3000.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                false,
+            ),
+        ];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
         let error = build(&Documents {
             local_node_id: local_id(),
             topology: &config,
             local_displays: &local,
-            peer_displays: &[(NodeId::new(peer_id()), Vec::new())],
+            peer_displays: &peers,
         })
-        .expect_err("a link endpoint with no display cannot resolve");
+        .expect_err("overlapping segments are structural");
+        match error {
+            BuildError::Invalid(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, geometry::TopologyError::SegmentOverlap { .. })),
+                "{errors:?}"
+            ),
+            other => panic!("expected a document error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_link_to_a_node_that_is_not_a_peer_stays_fatal() {
+        let config = topology_config();
+        // No peer manifest declares the node the link names: that is a structural error, not
+        // a display that happens to be off.
+        let error = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &[info(
+                "eDP-1",
+                [0.0, 0.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                true,
+            )],
+            peer_displays: &[],
+        })
+        .expect_err("an unknown node is structural");
         assert!(
             matches!(
                 &error,
                 BuildError::Invalid(errors)
-                    if errors.iter().any(|error| matches!(
-                        error,
-                        geometry::TopologyError::UnknownDisplay {
-                            side: geometry::EndpointSide::Target,
-                            ..
-                        }
-                    ))
+                    if errors
+                        .iter()
+                        .any(|error| matches!(error, geometry::TopologyError::UnknownNode { .. }))
             ),
             "{error}"
         );
@@ -1544,7 +1815,8 @@ bidirectional = true
             local_displays: &[],
             peer_displays: &[(NodeId::new([2; 32]), Vec::new())],
         })
-        .expect("empty display manifests still form a document");
+        .expect("empty display manifests still form a document")
+        .topology;
 
         assert_eq!(topology.nodes.len(), 2);
         assert!(topology.nodes.iter().all(|node| node.displays.is_empty()));
@@ -1702,7 +1974,8 @@ logical = [0, 0, 800, 600]
             local_displays: &snapshot,
             peer_displays: &[],
         })
-        .expect("a document with no links is valid");
+        .expect("a document with no links is valid")
+        .topology;
         assert!(document.links.is_empty());
     }
 }

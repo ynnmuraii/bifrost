@@ -352,6 +352,12 @@ message LinkView {
   EndpointView from = 2;
   EndpointView to = 3;
   bool bidirectional = 4;
+  // false while an endpoint display is not in the live manifests (a monitor that is off,
+  // asleep or renumbered). The link is kept in the document and becomes active again on the
+  // next report; the resolver simply does not use it yet.
+  bool active = 5;
+  // The missing display id when `active` is false; "" otherwise. GUI text only.
+  string inactive_reason = 6;
 }
 message EndpointView {
   string node_id = 1;

@@ -59,6 +59,18 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     });
 
     actions.extend(side_block(vm, ui));
+    let inactive = vm.inactive_link_lines();
+    if !inactive.is_empty() {
+        block(ui, "Неактивные связи", |ui| {
+            for line in &inactive {
+                important(ui, line);
+            }
+            hint(
+                ui,
+                "Связь станет активной, когда её экран снова появится в системе",
+            );
+        });
+    }
     preview(vm, ui);
     actions
 }
