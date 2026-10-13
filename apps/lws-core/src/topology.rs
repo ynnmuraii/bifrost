@@ -158,6 +158,69 @@ pub fn position_on(
     ))
 }
 
+/// Resolves a compositor activation through the same topology geometry as pointer samples.
+pub fn portal_transition(
+    topology: &Topology,
+    node: &NodeId,
+    activation: &ipc::PortalActivation,
+) -> Option<(geometry::Position, geometry::Transition)> {
+    let pointer = activation.position.as_ref()?;
+    if !pointer.x.is_finite() || !pointer.y.is_finite() {
+        return None;
+    }
+    let edge = match ipc::PortalEdge::try_from(activation.edge).ok()? {
+        ipc::PortalEdge::Left => geometry::Edge::Left,
+        ipc::PortalEdge::Right => geometry::Edge::Right,
+        ipc::PortalEdge::Top => geometry::Edge::Top,
+        ipc::PortalEdge::Bottom => geometry::Edge::Bottom,
+        ipc::PortalEdge::Unspecified => return None,
+    };
+    // Activated can report the exclusive right/bottom boundary or its last pixel.
+    // Only the named barrier's boundary qualifies; never infer a link from proximity
+    // to a different edge, nor from a previously observed pointer.
+    let display = topology.node(node)?.displays.iter().find(|display| {
+        let b = display.logical_bounds;
+        match edge {
+            geometry::Edge::Left => {
+                (pointer.x - b.x).abs() <= 1.0 && pointer.y >= b.y && pointer.y < b.y + b.height
+            }
+            geometry::Edge::Right => {
+                (pointer.x - b.x - b.width).abs() <= 1.0
+                    && pointer.y >= b.y
+                    && pointer.y < b.y + b.height
+            }
+            geometry::Edge::Top => {
+                (pointer.y - b.y).abs() <= 1.0 && pointer.x >= b.x && pointer.x < b.x + b.width
+            }
+            geometry::Edge::Bottom => {
+                (pointer.y - b.y - b.height).abs() <= 1.0
+                    && pointer.x >= b.x
+                    && pointer.x < b.x + b.width
+            }
+        }
+    })?;
+    let b = display.logical_bounds;
+    let (x, y) = match edge {
+        geometry::Edge::Left => (b.x + b.width.min(1.0) / 2.0, pointer.y),
+        geometry::Edge::Right => (b.x + b.width - b.width.min(1.0) / 2.0, pointer.y),
+        geometry::Edge::Top => (pointer.x, b.y + b.height.min(1.0) / 2.0),
+        geometry::Edge::Bottom => (pointer.x, b.y + b.height - b.height.min(1.0) / 2.0),
+    };
+    let basis = position_on(topology, node, x, y)?;
+    let position = geometry::Position::new(basis.display_id, pointer.x - b.x, pointer.y - b.y);
+    let motion = match edge {
+        geometry::Edge::Left => geometry::Point::new(-position.x - 1.0, 0.0),
+        geometry::Edge::Right => geometry::Point::new(b.width - position.x + 1.0, 0.0),
+        geometry::Edge::Top => geometry::Point::new(0.0, -position.y - 1.0),
+        geometry::Edge::Bottom => geometry::Point::new(0.0, b.height - position.y + 1.0),
+    };
+    let transition = geometry::resolve_motion(topology, node, &position, motion)?;
+    if transition.source.edge != edge {
+        return None;
+    }
+    Some((position, transition))
+}
+
 /// Maps a captured source-node point to display-local coordinates.
 ///
 /// Local observation follows physical displays and ignores internal gaps. Remote
@@ -747,6 +810,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn portal_activation_maps_the_configured_zone_edge_without_a_previous_sample() {
+        let config = topology_config();
+        let local = [info(
+            "eDP-1",
+            [-1920.0, -200.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
+        let document = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("valid topology");
+        // The portal reports the last logical pixel on the right barrier.
+        let mut activation = ipc::PortalActivation {
+            position: Some(ipc::PointerAbs {
+                display_id: String::new(),
+                x: -1.0,
+                y: 340.0,
+            }),
+            edge: ipc::PortalEdge::Right as i32,
+        };
+        let (source, transition) =
+            portal_transition(&document, &NodeId::new(local_id()), &activation)
+                .expect("activation is an outward crossing, even without prior motion");
+        assert_eq!(source.display_id.as_str(), "eDP-1");
+        assert_eq!((source.x, source.y), (1919.0, 540.0));
+        assert_eq!(transition.target.node, NodeId::new(peer_id()));
+        assert_eq!(
+            (transition.target_position.x, transition.target_position.y),
+            (2.0, 540.0)
+        );
+        activation.position.as_mut().unwrap().x = 0.0;
+        assert!(
+            portal_transition(&document, &NodeId::new(local_id()), &activation).is_some(),
+            "an exact outer boundary belongs to its portal zone"
+        );
+        activation.edge = ipc::PortalEdge::Top as i32;
+        assert!(
+            portal_transition(&document, &NodeId::new(local_id()), &activation).is_none(),
+            "a different barrier cannot trigger the right-edge link"
+        );
+        activation.edge = ipc::PortalEdge::Unspecified as i32;
+        assert!(portal_transition(&document, &NodeId::new(local_id()), &activation).is_none());
+        activation.position = None;
+        assert!(portal_transition(&document, &NodeId::new(local_id()), &activation).is_none());
+    }
+
+    #[test]
     fn a_forwarded_batch_carries_the_target_display_position() {
         use input_model::{InputEvent, KeyState, MouseButton, Position};
 
@@ -932,6 +1050,7 @@ mod tests {
                 })
                 .collect(),
             at_edge: false,
+            activation: None,
         };
         for (event, (expected_x, expected_y)) in
             captured.events.iter().zip([(14.0, 546.0), (26.0, 552.0)])

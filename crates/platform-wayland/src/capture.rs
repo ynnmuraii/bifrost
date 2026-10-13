@@ -464,24 +464,24 @@ impl WaylandCapture {
                 } => {
                     self.active = true;
                     self.activation_id = Some(activation_id);
-                    if cursor.is_some() {
-                        self.cursor = cursor;
-                    }
+                    seed_activation_cursor(&mut self.cursor, cursor);
                     return Some(CapturedEvent::Activated {
                         activation_id,
-                        cursor: cursor.or(self.cursor),
+                        cursor,
                         barrier_id,
                     });
                 }
                 Step::Deactivated => {
                     self.active = false;
                     self.activation_id = None;
+                    self.cursor = None;
                     return Some(CapturedEvent::Deactivated);
                 }
                 Step::Disabled => {
                     self.active = false;
                     self.enabled = false;
                     self.activation_id = None;
+                    self.cursor = None;
                     return Some(CapturedEvent::Deactivated);
                 }
                 Step::ZonesChanged(zone_set) => {
@@ -507,22 +507,22 @@ impl WaylandCapture {
 
     /// Returns input to the compositor after the peer is done with it.
     ///
-    /// `cursor` is where the local cursor should continue; callers usually nudge it
-    /// just past the barrier that was crossed.
-    pub async fn release(&mut self, cursor: Position) -> Result<(), WaylandError> {
+    /// `cursor` is the local continuation position. `None` leaves placement to the
+    /// compositor when activation did not provide a position.
+    pub async fn release(&mut self, cursor: Option<Position>) -> Result<(), WaylandError> {
         let activation_id = self.activation_id.ok_or(WaylandError::CaptureNotActive)?;
         self.input_capture
             .release(
                 &self.session,
                 ReleaseOptions::default()
                     .set_activation_id(activation_id)
-                    .set_cursor_position((cursor.x, cursor.y)),
+                    .set_cursor_position(cursor.map(|cursor| (cursor.x, cursor.y))),
             )
             .await
             .map_err(|error| map_portal_error(INPUT_CAPTURE_INTERFACE, error))?;
         self.active = false;
         self.activation_id = None;
-        self.cursor = Some(cursor);
+        self.cursor = None;
         Ok(())
     }
 
@@ -722,15 +722,12 @@ impl WaylandCapture {
             }
             EiEvent::PointerMotion(motion) => {
                 self.motion.relative += 1;
-                let Some(cursor) = self.cursor else {
+                let Some(cursor) =
+                    integrate_motion(&mut self.cursor, f64::from(motion.dx), f64::from(motion.dy))
+                else {
                     self.dropped_unseeded_motion += 1;
                     return None;
                 };
-                let cursor = Position::new(
-                    cursor.x + f64::from(motion.dx),
-                    cursor.y + f64::from(motion.dy),
-                );
-                self.cursor = Some(cursor);
                 Some(CapturedEvent::Input(InputEvent::PointerAbsolute(cursor)))
             }
             EiEvent::PointerMotionAbsolute(motion) => {
@@ -797,6 +794,17 @@ impl WaylandCapture {
     }
 }
 
+fn seed_activation_cursor(cursor: &mut Option<Position>, activation: Option<Position>) {
+    *cursor = activation;
+}
+
+fn integrate_motion(cursor: &mut Option<Position>, dx: f64, dy: f64) -> Option<Position> {
+    let previous = (*cursor)?;
+    let position = Position::new(previous.x + dx, previous.y + dy);
+    *cursor = Some(position);
+    Some(position)
+}
+
 /// Clamps a 120th-of-a-detent count into `i32`.
 pub(crate) fn clamp_h120(units: f64) -> i32 {
     units.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
@@ -838,5 +846,26 @@ mod tests {
         ] {
             assert_eq!(clamp_h120(input), expected);
         }
+    }
+}
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn deltas_require_current_activation_seed_and_accumulate() {
+        let mut cursor = None;
+        assert_eq!(integrate_motion(&mut cursor, 3.0, -2.0), None);
+        seed_activation_cursor(&mut cursor, Some(Position::new(120.0, 210.0)));
+        assert_eq!(
+            integrate_motion(&mut cursor, 3.0, -2.0),
+            Some(Position::new(123.0, 208.0))
+        );
+        assert_eq!(
+            integrate_motion(&mut cursor, -5.0, 4.0),
+            Some(Position::new(118.0, 212.0))
+        );
+        seed_activation_cursor(&mut cursor, None);
+        assert_eq!(integrate_motion(&mut cursor, 1.0, 1.0), None);
     }
 }

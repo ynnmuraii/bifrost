@@ -24,10 +24,8 @@
 //! * Events captured while a transition is being prepared are buffered; cancelling
 //!   the transition replays them locally through the inject session, so «нельзя
 //!   «потерять» нажатие в Preparing» holds on Wayland too.
-//! * A `ZonesChanged` signal re-arms the barriers. On GNOME 46 that needs the capture
-//!   session to be recreated (`SetPointerBarriers` is refused while the session is
-//!   enabled, and `Disable` cannot be undone — XDP-gnome #126), and recreating it
-//!   means a new portal dialog; the code does it and logs the cost.
+//! * A `ZonesChanged` signal attempts to re-arm barriers. Enabled barriers are retained;
+//!   a refused re-arm is reported without recreating the session or opening a new dialog.
 //! * `ZonesChanged` is *not* turned into `DisplaysChanged`: display enumeration is
 //!   KVM-040 and `QueryDisplays` is answered with an explicit refusal by the session
 //!   loop.
@@ -71,11 +69,33 @@ struct Activation {
     barrier_id: Option<u32>,
 }
 
+fn portal_activation(
+    cursor: Option<Position>,
+    barrier_id: Option<u32>,
+    barriers: &[BarrierSegment],
+) -> protocol::ipc::PortalActivation {
+    use protocol::ipc::{PointerAbs, PortalActivation, PortalEdge};
+    let edge = match barrier_id.and_then(|id| wayland_barriers::locate(barriers, id)) {
+        Some((_, wayland_barriers::Edge::Left)) => PortalEdge::Left,
+        Some((_, wayland_barriers::Edge::Right)) => PortalEdge::Right,
+        Some((_, wayland_barriers::Edge::Top)) => PortalEdge::Top,
+        Some((_, wayland_barriers::Edge::Bottom)) => PortalEdge::Bottom,
+        None => PortalEdge::Unspecified,
+    };
+    PortalActivation {
+        position: cursor.map(|position| PointerAbs {
+            display_id: String::new(),
+            x: position.x,
+            y: position.y,
+        }),
+        edge: edge as i32,
+    }
+}
+
 /// The Wayland input path.
 pub struct Wayland {
     ready: Ready,
-    /// `None` while no capture session exists (never connected, or dropped because it
-    /// had to be recreated).
+    /// `None` while no usable capture session exists (never connected or closed).
     capture: Option<WaylandCapture>,
     injector: WaylandInjector,
     /// `None` when this compositor has no `GlobalShortcuts` portal (GNOME 46).
@@ -84,6 +104,8 @@ pub struct Wayland {
     /// `docs/03-architecture.md` has *core* own `portal-restore.toml`.
     grants: GrantStore,
     mode: Mode,
+    /// Receiver injection owns its ledger until ReleaseSession.
+    receiving: bool,
     activation: Option<Activation>,
     /// The barriers currently registered, so an activation id can be traced back.
     barriers: Vec<BarrierSegment>,
@@ -238,6 +260,7 @@ impl Wayland {
             shortcuts,
             grants,
             mode: Mode::Observe,
+            receiving: false,
             activation: None,
             barriers,
             relative_cursor: None,
@@ -336,6 +359,13 @@ impl Wayland {
             }
             tracing::info!(events = replayed, "replayed the cancelled edge locally");
         }
+        // Source cancellation replay must not leave synthetic downs held, even
+        // before BeginCapture. A receiver's unrelated injection lease stays intact.
+        let released = if self.receiving {
+            Released::default()
+        } else {
+            self.release_session()
+        };
         self.buffered.clear();
         self.pending.clear();
         // The keys held now are released locally; their ups never reach the filter, and a
@@ -345,21 +375,21 @@ impl Wayland {
 
         if let Some(capture) = self.capture.as_mut() {
             if capture.is_active() {
-                let cursor = capture
-                    .cursor()
-                    .or_else(|| self.activation.and_then(|activation| activation.cursor))
-                    .unwrap_or(Position::new(0.0, 0.0));
+                // Return to the local activation position, not the remote integrated cursor.
+                let cursor = self.activation.and_then(|activation| activation.cursor);
                 if let Err(error) = capture.release(cursor).await {
                     tracing::warn!(%error, "releasing the Wayland capture failed");
+                    if let Err(close_error) = capture.close().await {
+                        tracing::warn!(%close_error, "closing failed Wayland capture session");
+                    }
+                    self.capture = None;
                     self.activation = None;
                     return Err(format!("Release of the capture session failed: {error}"));
                 }
             }
         }
         self.activation = None;
-        // `Release` returns input to the compositor; keys and buttons this agent
-        // emulated are released here so nothing stays logically pressed.
-        Ok(self.release_session())
+        Ok(released)
     }
 
     /// The portal zones as displays (KVM-040).
@@ -400,6 +430,7 @@ impl Wayland {
     pub async fn prepare_inject(&mut self) -> Result<(), String> {
         self.injector.pump().await;
         self.relative_cursor = None;
+        self.receiving = true;
         Ok(())
     }
     fn initialize_relative_cursor(&mut self) {
@@ -508,6 +539,7 @@ impl Wayland {
     /// Releases everything this session emulated, which is what a receiver must do when
     /// it loses the lease.
     pub fn release_session(&mut self) -> Released {
+        self.receiving = false;
         let outcome = self.injector.release_all();
         let released = Released {
             keys: self.pressed_keys.len() as u32,
@@ -676,7 +708,10 @@ impl Wayland {
                 }
                 // The activation *is* the edge crossing on Wayland; core needs it to
                 // start the transition.
-                Some(Event::AtEdge { barrier_id })
+                Some(Event::AtEdge {
+                    barrier_id,
+                    activation: portal_activation(cursor, barrier_id, &self.barriers),
+                })
             }
             CapturedEvent::Deactivated => {
                 self.activation = None;
@@ -946,5 +981,41 @@ fn fatal(error: &WaylandError) -> Refusal {
             "platform-wayland is not usable on this session: {}",
             error_chain(error)
         ),
+    }
+}
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    #[test]
+    fn activation_uses_only_actual_cursor_and_accepted_barrier() {
+        let barriers = wayland_barriers::derive(&[Zone::new(0, 0, 100, 100)]);
+        for barrier in &barriers {
+            let activation =
+                portal_activation(Some(Position::new(12.0, 34.0)), Some(barrier.id), &barriers);
+            assert_eq!(
+                activation.position,
+                Some(protocol::ipc::PointerAbs {
+                    display_id: String::new(),
+                    x: 12.0,
+                    y: 34.0
+                })
+            );
+            let expected = match barrier.edge {
+                wayland_barriers::Edge::Left => protocol::ipc::PortalEdge::Left,
+                wayland_barriers::Edge::Right => protocol::ipc::PortalEdge::Right,
+                wayland_barriers::Edge::Top => protocol::ipc::PortalEdge::Top,
+                wayland_barriers::Edge::Bottom => protocol::ipc::PortalEdge::Bottom,
+            };
+            assert_eq!(activation.edge, expected as i32);
+        }
+        for id in [None, Some(u32::MAX)] {
+            let activation = portal_activation(None, id, &barriers);
+            assert_eq!(activation.position, None);
+            assert_eq!(
+                activation.edge,
+                protocol::ipc::PortalEdge::Unspecified as i32
+            );
+        }
     }
 }

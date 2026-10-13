@@ -235,6 +235,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     // once core has been told. The batch is sent even when it carries no events,
     // because the crossing itself is the news.
     let mut at_edge = false;
+    let mut activation = None;
     let mut last_inject_log = None;
     let mut last_capture_batch_log = None;
     let mut released_after_silence = false;
@@ -322,6 +323,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                         &mut held_lease,
                         &mut batch,
                         &mut at_edge,
+                        &mut activation,
                     )
                     .await?;
                 }
@@ -347,6 +349,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             link,
             &mut batch,
             &mut at_edge,
+            &mut activation,
             &mut last_capture_batch_log,
             now_ms(started),
         )
@@ -478,15 +481,20 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Msg::EndCapture(end) => {
-            // The lease is over: a repeat must not outlive it, or a key nobody holds keeps
-            // typing (KVM-036 wires the engine to the lease, not to the process).
-            if let Some(engine) = repeat.as_mut() {
-                engine.resume();
+            // An empty lease rejects only a portal activation on a receiver;
+            // its injection lease and repeat engine must continue unchanged.
+            let capture_only = end.lease_id.is_empty();
+            if !capture_only {
+                if let Some(engine) = repeat.as_mut() {
+                    engine.resume();
+                }
+                *self_timeout = None;
             }
-            *self_timeout = None;
             match backend.end_capture(end.replay_buffered_locally).await {
                 Ok(released) => {
-                    *held_lease = None;
+                    if !capture_only {
+                        *held_lease = None;
+                    }
                     link.send(Msg::Released(Released {
                         lease_id: end.lease_id.clone(),
                         keys_released: released.keys,
@@ -865,6 +873,7 @@ async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
     link: &mut AgentLink<S>,
     batch: &mut Vec<LocalEvent>,
     at_edge: &mut bool,
+    activation: &mut Option<ipc::PortalActivation>,
     last_log: &mut Option<u64>,
     now: u64,
 ) -> anyhow::Result<()> {
@@ -904,6 +913,7 @@ async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
     link.send(Msg::Captured(CapturedBatch {
         events,
         at_edge: edge,
+        activation: activation.take(),
     }))
     .await?;
     Ok(())
@@ -918,17 +928,34 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
     held_lease: &mut Option<Vec<u8>>,
     batch: &mut Vec<LocalEvent>,
     at_edge: &mut bool,
+    pending_activation: &mut Option<ipc::PortalActivation>,
 ) -> anyhow::Result<()> {
     match event {
         Event::Input(input) => match crate::events::to_local_event(&input, monotonic_us()) {
             Some(event) => batch.push(event),
             None => tracing::trace!("event has no wire form and was dropped"),
         },
-        Event::AtEdge { barrier_id } => {
+        Event::AtEdge {
+            barrier_id,
+            activation,
+        } => {
             // `docs/05-protocol.md`: the source's `CapturedBatch` with `at_edge` is what
             // opens a transition. On a Wayland source this is the only edge signal
             // there is, because the compositor diverts the pointer at the barrier.
             *at_edge = true;
+            // Seed before any subsequent integrated remote motion, even if the
+            // preparing buffer is later cleared by BeginCapture.
+            if let Some(position) = activation.position.as_ref() {
+                if let Some(seed) = crate::events::to_local_event(
+                    &input_model::InputEvent::PointerAbsolute(input_model::Position::new(
+                        position.x, position.y,
+                    )),
+                    monotonic_us(),
+                ) {
+                    batch.push(seed);
+                }
+            }
+            *pending_activation = Some(activation);
             tracing::info!(barrier_id, "the pointer reached the edge; telling core");
         }
         Event::PortalGrant(grant) => {
@@ -1108,6 +1135,57 @@ mod tests {
 
     const HOTKEY: &str = "Ctrl+Alt+Shift+F12";
     #[tokio::test]
+    async fn activation_metadata_and_seed_precede_remote_motion_on_wire() {
+        let mut harness = Harness::new().await;
+        let activation = ipc::PortalActivation {
+            position: Some(ipc::PointerAbs {
+                display_id: String::new(),
+                x: 120.0,
+                y: 210.0,
+            }),
+            edge: ipc::PortalEdge::Right as i32,
+        };
+        harness
+            .event(Event::AtEdge {
+                barrier_id: Some(7),
+                activation: activation.clone(),
+            })
+            .await;
+        harness
+            .event(Event::Input(input_model::InputEvent::PointerAbsolute(
+                input_model::Position::new(123.0, 208.0),
+            )))
+            .await;
+        let mut last_log = None;
+        flush_captured(
+            &mut harness.agent,
+            &mut harness.batch,
+            &mut harness.at_edge,
+            &mut harness.activation,
+            &mut last_log,
+            0,
+        )
+        .await
+        .unwrap();
+        let Msg::Captured(batch) = harness.recv().await else {
+            panic!("expected captured batch")
+        };
+        assert!(batch.at_edge);
+        assert_eq!(batch.activation, Some(activation));
+        let positions: Vec<_> = batch
+            .events
+            .iter()
+            .filter_map(|event| match &event.ev {
+                Some(ipc::local_event::Ev::Pointer(position)) => Some((position.x, position.y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(positions, [(120.0, 210.0), (123.0, 208.0)]);
+        assert!(harness.activation.is_none());
+        assert!(!harness.at_edge);
+    }
+
+    #[tokio::test]
     async fn backend_startup_answers_pings_while_portal_permission_is_pending() {
         let (agent_io, core_io) = duplex(4096);
         let mut agent = AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR);
@@ -1159,6 +1237,7 @@ mod tests {
         held: Option<Vec<u8>>,
         batch: Vec<LocalEvent>,
         at_edge: bool,
+        activation: Option<ipc::PortalActivation>,
         displays: crate::displays::DisplaysState,
         /// The software repeat engine, or `None` for native repeat (KVM-036).
         repeat: Option<crate::repeat::SoftwareRepeat>,
@@ -1206,6 +1285,7 @@ mod tests {
                 held: None,
                 batch: Vec::new(),
                 at_edge: false,
+                activation: None,
                 displays: crate::displays::DisplaysState::default(),
                 // The harness drives the engine on an injected clock, so a repeat schedule
                 // is asserted exactly instead of waited for (KVM-036).
@@ -1256,6 +1336,7 @@ mod tests {
                 &mut self.held,
                 &mut self.batch,
                 &mut self.at_edge,
+                &mut self.activation,
             )
             .await
             .expect("a backend event must not fail the handler");
@@ -1306,6 +1387,7 @@ mod tests {
             &mut harness.agent,
             &mut harness.batch,
             &mut harness.at_edge,
+            &mut harness.activation,
             &mut last_log,
             0,
         )
@@ -1342,6 +1424,7 @@ mod tests {
             &mut harness.agent,
             &mut harness.batch,
             &mut harness.at_edge,
+            &mut harness.activation,
             &mut last_log,
             1_000,
         )
@@ -2066,6 +2149,56 @@ mod tests {
             harness.held.is_none(),
             "local control is restored first (rule 3)"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_lease_capture_release_preserves_receiver_state() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::PrepareInject(ipc::PrepareInject {
+                lease_id: lease(7),
+            }))
+            .await;
+        harness.recv().await;
+        harness
+            .send(Msg::Inject(ipc::Inject {
+                lease_id: lease(7),
+                input_batch_seq: 1,
+                events: vec![ipc::LocalEvent {
+                    ev: Some(ipc::local_event::Ev::Key(ipc::HidKey {
+                        usage_page: 7,
+                        usage: 0x04,
+                        down: true,
+                    })),
+                    ..Default::default()
+                }],
+            }))
+            .await;
+        harness.recv().await;
+        let timeout = (Instant::now() + Duration::from_secs(1), lease(7));
+        harness.self_timeout = Some(timeout.clone());
+        harness.deadline = Some(timeout.clone());
+        harness
+            .send(Msg::EndCapture(ipc::EndCapture {
+                lease_id: Vec::new(),
+                replay_buffered_locally: true,
+            }))
+            .await;
+        let Msg::Released(released) = harness.recv().await else {
+            panic!("expected Released")
+        };
+        assert!(released.lease_id.is_empty());
+        assert_eq!(released.keys_released, 0);
+        assert_eq!(released.buttons_released, 0);
+        assert_eq!(harness.held, Some(lease(7)));
+        assert_eq!(harness.self_timeout, Some(timeout.clone()));
+        assert_eq!(harness.deadline, Some(timeout));
+        assert_eq!(
+            harness.repeat.as_ref().unwrap().holding(),
+            Some(input_model::HidKey::keyboard(0x04))
+        );
+        // Dry injection has no native ledger. The assertions above exercise the real
+        // session-owned receiver state; native EIS pressed-state needs a compositor.
     }
 
     /// Rule 9 (KVM-035): the receiver hands its ledger back *before* core hears about the

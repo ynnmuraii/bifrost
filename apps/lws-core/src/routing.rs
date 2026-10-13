@@ -365,7 +365,7 @@ pub enum AgentSignal {
     /// has to know which display the step happened on to resolve it against the layout
     /// document. `input_model::InputEvent` carries no display id, so the wire event is
     /// what travels here and the session converts it for the `InputBatch` it forwards.
-    Captured(Vec<ipc::LocalEvent>),
+    Captured(ipc::CapturedBatch),
     /// The agent's display set changed.
     Displays(ipc::DisplaysReport),
     /// A portal dialog is expected because no persisted grant was available.
@@ -449,7 +449,7 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
             Some(lease_id) => AgentSignal::Fsm(fr::AgentEvent::CaptureReady { lease_id }),
             None => AgentSignal::Ignored,
         },
-        Msg::Captured(batch) => AgentSignal::Captured(batch.events.clone()),
+        Msg::Captured(batch) => AgentSignal::Captured(batch.clone()),
         Msg::Released(released) => match lease_id(&released.lease_id) {
             // `ReleaseKeys` answers with an empty lease id: it is a RECOVERY ack and
             // never drives the FSM (the counts are logged by the caller).
@@ -1038,11 +1038,13 @@ mod tests {
                 })),
             }],
             at_edge: true,
+            activation: None,
         });
         match agent_signal(&batch, &mut context) {
             // The wire form is kept on purpose: the display id is what the edge trigger
             // needs and `input_model::InputEvent` has no room for it.
             AgentSignal::Captured(events) => {
+                let events = events.events;
                 assert_eq!(events.len(), 1);
                 match events[0].ev.as_ref() {
                     Some(ipc::local_event::Ev::Key(key)) => {
@@ -1080,10 +1082,11 @@ mod tests {
                 })),
             }],
             at_edge: false,
+            activation: None,
         });
         let mut context = AgentContext::default();
         match agent_signal(&batch, &mut context) {
-            AgentSignal::Captured(events) => match events[0].ev.as_ref() {
+            AgentSignal::Captured(batch) => match batch.events[0].ev.as_ref() {
                 Some(ipc::local_event::Ev::Pointer(pointer)) => {
                     assert_eq!(pointer.display_id, "edid:7a3f");
                     assert_eq!((pointer.x, pointer.y), (1919.0, 540.0));
@@ -1091,6 +1094,30 @@ mod tests {
                 other => panic!("expected a pointer event, got {other:?}"),
             },
             other => panic!("expected captured events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn portal_edge_activation_survives_routing_without_input_events() {
+        let batch = ipc::CapturedBatch {
+            at_edge: true,
+            activation: Some(ipc::PortalActivation {
+                position: Some(ipc::PointerAbs {
+                    display_id: String::new(),
+                    x: -1280.0,
+                    y: 512.0,
+                }),
+                edge: ipc::PortalEdge::Left as i32,
+            }),
+            events: Vec::new(),
+        };
+        let signal = agent_signal(
+            &ipc::agent_frame::Msg::Captured(batch.clone()),
+            &mut AgentContext::default(),
+        );
+        match signal {
+            AgentSignal::Captured(captured) => assert_eq!(captured, batch),
+            other => panic!("expected captured activation, got {other:?}"),
         }
     }
 
