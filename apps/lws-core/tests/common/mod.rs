@@ -369,6 +369,18 @@ impl Node {
             .collect()
     }
 
+    /// Fires the emergency combination on this node's dry agent, with no desktop.
+    ///
+    /// The dry agent watches the path `LWS_DRY_EMERGENCY_FILE` names and reports
+    /// `EmergencyFired` once when the marker appears. A real agent gets the emergency from
+    /// its capture hook, which a dry session does not have.
+    pub fn trigger_emergency(&self) {
+        let dir = self.root.join("run");
+        std::fs::create_dir_all(&dir).expect("run directory");
+        std::fs::write(dir.join("emergency-dry"), b"emergency")
+            .expect("write the emergency marker");
+    }
+
     /// The PID of the agent this core spawned.
     pub fn agent_pid(&self) -> Result<u32, String> {
         #[cfg(unix)]
@@ -1299,6 +1311,12 @@ fn spawn_node(
     if dry_displays {
         command.arg("--dry-displays");
     }
+    // The dry emergency aid: the agent inherits this path and reports `EmergencyFired`
+    // once when the file appears (`Node::trigger_emergency`). Harmless until it does.
+    command.env(
+        "LWS_DRY_EMERGENCY_FILE",
+        root.join("run").join("emergency-dry"),
+    );
     let child = command.spawn().expect("the core starts");
     let pid = child.id();
     Node {

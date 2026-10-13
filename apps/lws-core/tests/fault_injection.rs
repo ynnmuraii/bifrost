@@ -280,6 +280,62 @@ fn the_owner_re_arms_its_observation_after_returning_to_local() {
     }
 }
 
+/// The owner's observation follows the agent's capture, it does not latch. The emergency
+/// combination pressed while the node is already `Local` tears that capture down on the
+/// agent with no FSM transition (core's `on_emergency` is a no-op on an idle slot, so no
+/// `EndCapture` is ever emitted); core has to notice the capture is gone and arm a fresh
+/// observation. A latched `observe_armed` leaves the pointer unwatched, so the edge the
+/// dry walk crosses afterwards never starts a transition until core is restarted.
+#[test]
+fn the_emergency_while_local_re_arms_the_observation_without_a_restart() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, true);
+    harness.wait_linked();
+
+    // The emergency must land while core is `Local` and the observation is already armed;
+    // firing it before that would only test startup.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while harness.a.observe_arms() < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the owner never armed its observation"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let armed_before = harness.a.observe_arms();
+    assert_eq!(
+        harness.a.status().expect("status").focus,
+        "Local",
+        "the emergency must land while input is local"
+    );
+
+    harness.a.trigger_emergency();
+
+    // The capture is gone; core must arm a fresh observation on its next tick. This is the
+    // regression: on the latched build the count never moves.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while harness.a.observe_arms() <= armed_before {
+        assert!(
+            Instant::now() < deadline,
+            "the emergency left the observation latched: still {armed_before} arm(s), no \
+             re-arm without a restart"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // And the re-armed observation must actually notice the pointer: the dry walk crosses
+    // the right edge, a `Local -> Preparing -> Remote` with no restart in between.
+    harness
+        .a
+        .wait_for(
+            "the crossing after the emergency",
+            Duration::from_secs(30),
+            |status| status.focus == "Remote",
+        )
+        .expect("the pointer must cross the edge once the observation is re-armed");
+}
+
 /// `AC-02`, blackhole: the link stays up at the socket level and says nothing.
 #[test]
 fn a_blackholed_link_returns_both_sides_to_local() {
