@@ -12,6 +12,9 @@
 //!   the documents turn into "close the channel, release everything".
 //! * [`watchdog`] — [`watchdog::Watchdog`], sans-IO: `Ping` every
 //!   `core_silence_ms / 4` and the `core_silence_ms` silence limit of rule 6.
+//! * [`clock`] — [`clock::Clock`] and [`clock::SuspendDetector`]: the monotonic clock
+//!   the watchdog is fed from, the wall clock beside it, and the divergence that tells
+//!   a resume from a stall.
 //! * [`peer`] — [`peer::PeerCheck`] and [`peer::SameUser`]: who may connect.
 //! * [`agent`] — the launch token, the frame `major` check and the `RECOVERY`
 //!   allow-list of rule 7.
@@ -73,6 +76,7 @@
 //! ```
 
 pub mod agent;
+pub mod clock;
 pub mod error;
 pub mod framed;
 pub mod link;

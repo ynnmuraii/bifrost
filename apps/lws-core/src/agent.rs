@@ -141,6 +141,23 @@ impl AgentHeartbeat {
         self.watchdog.on_frame(now);
     }
 
+    /// The machine was suspended: re-arm the silence clock.
+    ///
+    /// `CLOCK_MONOTONIC` is frozen while the machine sleeps, but the resume can still be
+    /// read as silence — the process is not serviced for a while afterwards — and nothing
+    /// the agent did caused it. A live channel stays live and its silence clock runs from
+    /// now; a launch still in flight gets its grace back. The heartbeat period is left
+    /// alone: the monotonic clock resumes, so the next `Ping` is due on its own schedule
+    /// (within `core_silence_ms / 4`).
+    pub fn on_resume(&mut self) {
+        let now = self.now_ms();
+        if self.live {
+            self.watchdog.on_frame(now);
+        } else if self.launched_at.is_some() {
+            self.launched_at = Some(now);
+        }
+    }
+
     /// Whether it is time to send the heartbeat `Ping` (rule 11).
     pub fn heartbeat_due(&self) -> bool {
         self.watchdog.heartbeat_due(self.now_ms())
@@ -494,6 +511,12 @@ impl Supervisor {
     /// Records that the heartbeat `Ping` was sent.
     pub fn on_heartbeat(&mut self) {
         self.heartbeat.on_heartbeat();
+    }
+
+    /// The machine was suspended: re-arm the heartbeat's silence clock, so the freeze is
+    /// not read as the agent's silence (see [`AgentHeartbeat::on_resume`]).
+    pub fn on_resume(&mut self) {
+        self.heartbeat.on_resume();
     }
 
     /// Whether the agent must be considered lost (the grace and rule 6's limit).
@@ -969,6 +992,28 @@ mod heartbeat_tests {
             0,
             "the decision is due now"
         );
+    }
+
+    #[test]
+    fn a_suspend_does_not_read_as_the_agents_silence() {
+        let mut heartbeat = AgentHeartbeat::with_launch_timeout(200, 5_000);
+        heartbeat.launched();
+        heartbeat.on_frame();
+        // The machine sleeps: the process is not serviced, so the monotonic clock alone
+        // would show the whole sleep as silence.
+        std::thread::sleep(Duration::from_millis(260));
+        assert!(
+            heartbeat.silence_exceeded(),
+            "without a resume, 260 ms of no frames is silence (the 200 ms limit)"
+        );
+        // The resume is what `Session::observe_clock` reports, and it re-arms the clock.
+        heartbeat.on_resume();
+        assert_eq!(
+            heartbeat.silence_ms(),
+            0,
+            "the freeze is not the agent's silence"
+        );
+        assert!(!heartbeat.silence_exceeded());
     }
 
     #[test]
