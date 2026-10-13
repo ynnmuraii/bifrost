@@ -186,11 +186,9 @@ pub enum WaylandError {
         /// The value we could not classify.
         xdg_current_desktop: String,
     },
-    /// No absolute pointer region: absolute injection is impossible and we refuse to
-    /// silently fall back to relative injection.
+    /// No absolute pointer region is available for absolute injection.
     #[error(
-        "the EIS server advertised no absolute pointer region, so absolute injection is \
-         not possible (relative injection is not substituted)"
+        "the EIS server advertised no absolute pointer region; absolute motion is unavailable"
     )]
     NoAbsoluteRegion,
     /// The requested point is outside every region the EIS server accepts.
@@ -226,6 +224,9 @@ pub enum WaylandError {
     /// The EIS server advertised no device after we bound seat capabilities.
     #[error("the EIS server advertised no device after seat capabilities were bound")]
     NoEiDevice,
+    /// No EIS device can inject absolute or relative pointer motion.
+    #[error("the EIS server advertised no pointer injection device")]
+    NoPointerDevice,
     /// The EIS device does not implement the interface an event needs.
     #[error("the EIS device has no {interface} interface, so this event cannot be injected")]
     MissingInterface {

@@ -45,6 +45,8 @@ const REMOTE_DESKTOP_V2: u32 = 2;
 const HANDSHAKE_NAME: &str = "lan-workspace";
 /// How long to wait for the EIS server to resume the device we asked for.
 const DEVICE_RESUME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Collects companion devices arriving shortly after the first device resumes.
+const DEVICE_DISCOVERY_QUIET: Duration = Duration::from_millis(50);
 /// From this `ei_device` version on, a sender must answer `ei_device.done` with
 /// `ei_device.ready`, otherwise the EIS server may never send `ei_device.resumed` and
 /// nothing may be emulated.
@@ -153,15 +155,72 @@ impl InjectOutcome {
     }
 }
 
-/// An EIS sender connected to a compositor.
-///
-/// Call [`WaylandInjector::disconnect`] before dropping: it releases the pressed-input
-/// ledger and closes the portal session.
+/// Per-device protocol state needed to maintain independent EIS serials and frames.
+struct SenderDevice {
+    device: event::Device,
+    last_serial: u32,
+    sequence: u32,
+    emulating: bool,
+    resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DeviceOffer {
+    absolute_with_region: bool,
+    relative_pointer: bool,
+    keyboard: bool,
+    button: bool,
+    scroll: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeviceSelection {
+    absolute: Option<usize>,
+    relative: Option<usize>,
+    pointer: Option<usize>,
+    keyboard: Option<usize>,
+    button: Option<usize>,
+    scroll: Option<usize>,
+}
+
+fn select_devices(offers: &[DeviceOffer]) -> DeviceSelection {
+    let absolute = offers.iter().position(|offer| offer.absolute_with_region);
+    let relative = offers.iter().position(|offer| offer.relative_pointer);
+    let pointer = absolute.or(relative);
+    let keyboard = offers.iter().position(|offer| offer.keyboard);
+    let button = pointer
+        .filter(|index| offers[*index].button)
+        .or_else(|| offers.iter().position(|offer| offer.button));
+    let scroll = pointer
+        .filter(|index| offers[*index].scroll)
+        .or_else(|| offers.iter().position(|offer| offer.scroll));
+    DeviceSelection {
+        absolute,
+        relative,
+        pointer,
+        keyboard,
+        button,
+        scroll,
+    }
+}
+fn route_event(selection: DeviceSelection, event: InputEvent) -> Option<usize> {
+    match event {
+        InputEvent::PointerAbsolute(_) => selection.absolute,
+        InputEvent::PointerRelative { .. } => selection.relative,
+        InputEvent::Key { .. } => selection.keyboard,
+        InputEvent::Button { .. } => selection.button,
+        InputEvent::Scroll { .. } => selection.scroll,
+    }
+}
+
+/// EIS sender that merges independently advertised interfaces from one seat.
 pub struct WaylandInjector {
     session: Option<Session<RemoteDesktop>>,
     connection: event::Connection,
     events: EiStream,
-    device: event::Device,
+    devices: Vec<SenderDevice>,
+    selection: DeviceSelection,
+    active_device: Option<usize>,
     device_name: Option<String>,
     device_type: ei::device::DeviceType,
     keyboard: Option<ei::Keyboard>,
@@ -175,10 +234,6 @@ pub struct WaylandInjector {
     compositor: Option<Compositor>,
     versions: PortalVersions,
     restore_token: Option<String>,
-    last_serial: u32,
-    sequence: u32,
-    emulating: bool,
-    resumed: bool,
     pressed_keys: BTreeSet<u16>,
     pressed_buttons: BTreeSet<u16>,
     scroll_remainder: (i32, i32),
@@ -290,12 +345,20 @@ impl WaylandInjector {
         let (connection, mut events) = context
             .handshake_tokio(HANDSHAKE_NAME, ei::handshake::ContextType::Sender)
             .await?;
-        let mut last_serial = connection.serial();
-        let mut device: Option<event::Device> = None;
+        let mut devices = Vec::new();
 
         let handshake = tokio::time::timeout(DEVICE_RESUME_TIMEOUT, async {
+            let mut any_resumed = false;
             loop {
-                let Some(event) = events.next().await else {
+                let event = if any_resumed {
+                    match tokio::time::timeout(DEVICE_DISCOVERY_QUIET, events.next()).await {
+                        Ok(event) => event,
+                        Err(_) => break,
+                    }
+                } else {
+                    events.next().await
+                };
+                let Some(event) = event else {
                     return Err(WaylandError::EiDisconnected);
                 };
                 match event? {
@@ -305,30 +368,59 @@ impl WaylandInjector {
                             requested_capabilities = ?seat_capabilities(),
                             "EIS seat advertised; binding requested capabilities"
                         );
-                        // Answering this is what makes the server advertise a device.
                         seat_added.seat.bind_capabilities(seat_capabilities());
                         connection.flush().map_err(std::io::Error::from)?;
                     }
                     EiEvent::DeviceAdded(added) => {
-                        // `DeviceAdded` is queued when `ei_device.done` arrives; its
-                        // interfaces, dimensions, and regions are complete at this point.
                         log_device("done", &added.device);
                         declare_device_ready(&added.device);
-                        device = Some(added.device);
+                        if !devices
+                            .iter()
+                            .any(|state: &SenderDevice| state.device == added.device)
+                        {
+                            devices.push(SenderDevice {
+                                device: added.device,
+                                last_serial: connection.serial(),
+                                sequence: 0,
+                                emulating: false,
+                                resumed: false,
+                            });
+                        }
                     }
                     EiEvent::DeviceResumed(resumed) => {
-                        // Nothing may be emulated before this serial. Only a resumed
-                        // device may start an emulation sequence.
                         log_device("resumed", &resumed.device);
-                        device = Some(resumed.device.clone());
-                        last_serial = resumed.serial;
-                        break;
+                        let Some(device) = devices
+                            .iter_mut()
+                            .find(|state| state.device == resumed.device)
+                        else {
+                            continue;
+                        };
+                        device.last_serial = resumed.serial;
+                        device.resumed = true;
+                        any_resumed = true;
+                    }
+                    EiEvent::DevicePaused(paused) => {
+                        if let Some(device) = devices
+                            .iter_mut()
+                            .find(|state| state.device == paused.device)
+                        {
+                            device.resumed = false;
+                        }
+                        any_resumed = devices.iter().any(|device| device.resumed);
+                    }
+                    EiEvent::DeviceRemoved(removed) => {
+                        devices.retain(|state| state.device != removed.device);
+                        any_resumed = devices.iter().any(|device| device.resumed);
                     }
                     EiEvent::Disconnected(_) => return Err(WaylandError::EiDisconnected),
                     _ => {}
                 }
             }
-            Ok(())
+            if any_resumed {
+                Ok(())
+            } else {
+                Err(WaylandError::NoEiDevice)
+            }
         })
         .await;
         match handshake {
@@ -340,30 +432,26 @@ impl WaylandInjector {
                 });
             }
         }
-
-        let device = device.ok_or(WaylandError::NoEiDevice)?;
-        let injector = Self {
+        let mut injector = Self {
             session: portal_session,
             connection,
             events: Box::pin(events),
-            device_name: device.name().map(ToOwned::to_owned),
-            device_type: device.device_type(),
-            keyboard: device.interface::<ei::Keyboard>(),
-            pointer: device.interface::<ei::Pointer>(),
-            pointer_absolute: device.interface::<ei::PointerAbsolute>(),
-            button: device.interface::<ei::Button>(),
-            scroll: device.interface::<ei::Scroll>(),
-            regions: device.regions().iter().map(Region::from_ei).collect(),
-            dimensions: device.dimensions(),
-            device,
+            devices,
+            selection: DeviceSelection::default(),
+            active_device: None,
+            device_name: None,
+            device_type: ei::device::DeviceType::Virtual,
+            keyboard: None,
+            pointer: None,
+            pointer_absolute: None,
+            button: None,
+            scroll: None,
+            regions: Vec::new(),
+            dimensions: None,
             source,
             compositor,
             versions,
             restore_token,
-            last_serial,
-            sequence: 0,
-            emulating: false,
-            resumed: true,
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
             scroll_remainder: (0, 0),
@@ -371,13 +459,8 @@ impl WaylandInjector {
             started: Instant::now(),
             ei_error: None,
         };
-        tracing::info!(
-            device = ?injector.device_name,
-            device_type = ?injector.device_type,
-            capabilities = ?injector.capabilities(),
-            regions = ?injector.regions,
-            "EIS injection device ready"
-        );
+        injector.refresh_selection();
+        injector.log_selection();
         let _ = injector.connection.flush();
         Ok(injector)
     }
@@ -416,19 +499,15 @@ impl WaylandInjector {
     /// the counted events did not reach the compositor.
     pub fn inject(&mut self, events: &[InputEvent]) -> InjectOutcome {
         let mut outcome = InjectOutcome::ok();
-        if !self.resumed {
-            outcome.os_error = Some(WaylandError::DevicePaused);
-            return outcome;
-        }
-        if !self.emulating {
-            // A new sequence number per emulation run; it must strictly increase.
-            self.sequence = self.sequence.wrapping_add(1);
-            self.device
-                .device()
-                .start_emulating(self.last_serial, self.sequence);
-            self.emulating = true;
-        }
         for event in events {
+            let index = self.device_for_event(*event);
+            self.active_device = index;
+            if let Some(index) = index {
+                if !self.ensure_emulating(index) {
+                    outcome.os_error = Some(WaylandError::DevicePaused);
+                    break;
+                }
+            }
             match self.apply(*event) {
                 Ok(actual) => {
                     outcome.applied_count += 1;
@@ -453,33 +532,36 @@ impl WaylandInjector {
     /// A paused device is neutral by protocol, so the ledger is simply dropped then.
     pub fn release_all(&mut self) -> InjectOutcome {
         let mut outcome = InjectOutcome::ok();
-        let keyboard = self.keyboard.clone();
-        let button = self.button.clone();
-        if self.emulating {
-            let keys: Vec<u16> = self.pressed_keys.iter().copied().collect();
-            for code in keys {
-                if let Some(keyboard) = keyboard.as_ref() {
-                    keyboard.key(u32::from(code), ei::keyboard::KeyState::Released);
+        for (index, codes, keyboard) in [
+            (self.selection.keyboard, self.pressed_keys.clone(), true),
+            (self.selection.button, self.pressed_buttons.clone(), false),
+        ] {
+            if let Some(index) = index {
+                if self.devices[index].emulating {
+                    self.active_device = Some(index);
+                    for code in codes {
+                        if keyboard {
+                            if let Some(interface) = self.keyboard.as_ref() {
+                                interface.key(u32::from(code), ei::keyboard::KeyState::Released);
+                            }
+                            self.pressed_keys.remove(&code);
+                        } else {
+                            if let Some(interface) = self.button.as_ref() {
+                                interface
+                                    .button(u32::from(code), ei::button::ButtonState::Released);
+                            }
+                            self.pressed_buttons.remove(&code);
+                        }
+                        self.commit_frame();
+                        outcome.applied_count += 1;
+                    }
                 }
-                self.pressed_keys.remove(&code);
-                self.commit_frame();
-                outcome.applied_count += 1;
             }
-            let buttons: Vec<u16> = self.pressed_buttons.iter().copied().collect();
-            for code in buttons {
-                if let Some(button) = button.as_ref() {
-                    button.button(u32::from(code), ei::button::ButtonState::Released);
-                }
-                self.pressed_buttons.remove(&code);
-                self.commit_frame();
-                outcome.applied_count += 1;
-            }
-            if let Err(error) = self.connection.flush() {
-                outcome.os_error = Some(WaylandError::Io(error.into()));
-            }
-        } else {
-            self.pressed_keys.clear();
-            self.pressed_buttons.clear();
+        }
+        self.pressed_keys.clear();
+        self.pressed_buttons.clear();
+        if let Err(error) = self.connection.flush() {
+            outcome.os_error = Some(WaylandError::Io(error.into()));
         }
         self.scroll_remainder = (0, 0);
         outcome
@@ -492,9 +574,12 @@ impl WaylandInjector {
     /// socket is closed when this value is dropped.
     pub async fn disconnect(&mut self) -> Result<(), WaylandError> {
         let release = self.release_all();
-        if self.emulating {
-            self.device.device().stop_emulating(self.last_serial);
-            self.emulating = false;
+        for device in &mut self.devices {
+            if device.emulating {
+                device.device.device().stop_emulating(device.last_serial);
+                device.emulating = false;
+            }
+            device.resumed = false;
         }
         let _ = self.connection.flush();
         // Best effort write barrier; the callback is never awaited because the
@@ -503,7 +588,6 @@ impl WaylandInjector {
         let _ = self.connection.flush();
         self.connection.connection().disconnect();
         let _ = self.connection.flush();
-        self.resumed = false;
         if let Some(session) = self.session.take() {
             session
                 .close()
@@ -538,11 +622,11 @@ impl WaylandInjector {
     #[must_use]
     pub fn capabilities(&self) -> WaylandCapabilities {
         WaylandCapabilities {
-            has_absolute_injection: self.pointer_absolute.is_some() && !self.regions.is_empty(),
-            has_relative_injection: self.pointer.is_some(),
-            has_keyboard: self.keyboard.is_some(),
-            has_buttons: self.button.is_some(),
-            has_scroll: self.scroll.is_some(),
+            has_absolute_injection: self.selection.absolute.is_some(),
+            has_relative_injection: self.selection.relative.is_some(),
+            has_keyboard: self.selection.keyboard.is_some(),
+            has_buttons: self.selection.button.is_some(),
+            has_scroll: self.selection.scroll.is_some(),
         }
     }
 
@@ -570,16 +654,20 @@ impl WaylandInjector {
         self.device_type
     }
 
-    /// The last serial the EIS server sent us.
+    /// The last serial on the selected pointer device, or another selected device.
     #[must_use]
     pub fn last_serial(&self) -> u32 {
-        self.last_serial
+        self.selection
+            .pointer
+            .or(self.selection.keyboard)
+            .and_then(|index| self.devices.get(index))
+            .map_or(0, |device| device.last_serial)
     }
 
-    /// Whether the device is resumed, i.e. whether input may be emulated.
+    /// Whether a selected EIS device is resumed.
     #[must_use]
     pub fn is_resumed(&self) -> bool {
-        self.resumed
+        self.devices.iter().any(|device| device.resumed)
     }
 
     /// The last absolute position that was successfully injected.
@@ -663,40 +751,139 @@ impl WaylandInjector {
             EiEvent::DeviceAdded(added) => {
                 log_device("done", &added.device);
                 declare_device_ready(&added.device);
-                self.adopt_device(&added.device);
+                if !self
+                    .devices
+                    .iter()
+                    .any(|state| state.device == added.device)
+                {
+                    self.devices.push(SenderDevice {
+                        device: added.device,
+                        last_serial: self.connection.serial(),
+                        sequence: 0,
+                        emulating: false,
+                        resumed: false,
+                    });
+                }
+                self.refresh_selection();
+                self.log_selection();
             }
             EiEvent::DeviceResumed(resumed) => {
                 log_device("resumed", &resumed.device);
-                self.last_serial = resumed.serial;
-                self.resumed = true;
-                // A resume starts a new emulation sequence; the next inject() starts it.
-                self.emulating = false;
+                if let Some(state) = self.devices.iter_mut().find(|s| s.device == resumed.device) {
+                    state.last_serial = resumed.serial;
+                    state.resumed = true;
+                    state.emulating = false;
+                }
             }
-            EiEvent::DevicePaused(_) | EiEvent::DeviceRemoved(_) | EiEvent::Disconnected(_) => {
-                // Pausing resets the device's logical state: the server releases keys and
-                // buttons, so our ledger must not claim them any more.
-                self.resumed = false;
-                self.emulating = false;
+            EiEvent::DevicePaused(paused) => {
+                if let Some(state) = self.devices.iter_mut().find(|s| s.device == paused.device) {
+                    state.resumed = false;
+                    state.emulating = false;
+                }
                 self.pressed_keys.clear();
                 self.pressed_buttons.clear();
                 self.scroll_remainder = (0, 0);
+            }
+            EiEvent::DeviceRemoved(removed) => {
+                self.devices.retain(|s| s.device != removed.device);
+                self.refresh_selection();
+                self.log_selection();
+                self.pressed_keys.clear();
+                self.pressed_buttons.clear();
+                self.scroll_remainder = (0, 0);
+            }
+            EiEvent::Disconnected(_) => {
+                for state in &mut self.devices {
+                    state.resumed = false;
+                    state.emulating = false;
+                }
             }
             _ => {}
         }
     }
 
-    /// Re-reads the interfaces and regions of a (possibly replaced) device.
-    fn adopt_device(&mut self, device: &event::Device) {
-        self.device_name = device.name().map(ToOwned::to_owned);
-        self.device_type = device.device_type();
-        self.keyboard = device.interface::<ei::Keyboard>();
-        self.pointer = device.interface::<ei::Pointer>();
-        self.pointer_absolute = device.interface::<ei::PointerAbsolute>();
-        self.button = device.interface::<ei::Button>();
-        self.scroll = device.interface::<ei::Scroll>();
-        self.regions = device.regions().iter().map(Region::from_ei).collect();
-        self.dimensions = device.dimensions();
-        self.device = device.clone();
+    fn refresh_selection(&mut self) {
+        let offers: Vec<_> = self
+            .devices
+            .iter()
+            .map(|state| DeviceOffer {
+                absolute_with_region: state.device.interface::<ei::PointerAbsolute>().is_some()
+                    && !state.device.regions().is_empty(),
+                relative_pointer: state.device.interface::<ei::Pointer>().is_some(),
+                keyboard: state.device.interface::<ei::Keyboard>().is_some(),
+                button: state.device.interface::<ei::Button>().is_some(),
+                scroll: state.device.interface::<ei::Scroll>().is_some(),
+            })
+            .collect();
+        self.selection = select_devices(&offers);
+        let selection = self.selection;
+        let metadata_device = selection.pointer.or(selection.keyboard);
+        self.device_name = metadata_device
+            .and_then(|index| self.devices[index].device.name().map(ToOwned::to_owned));
+        self.device_type = metadata_device
+            .map(|index| self.devices[index].device.device_type())
+            .unwrap_or(ei::device::DeviceType::Virtual);
+        self.pointer_absolute = selection
+            .absolute
+            .and_then(|i| self.devices[i].device.interface::<ei::PointerAbsolute>());
+        self.pointer = selection
+            .relative
+            .and_then(|i| self.devices[i].device.interface::<ei::Pointer>());
+        self.keyboard = selection
+            .keyboard
+            .and_then(|i| self.devices[i].device.interface::<ei::Keyboard>());
+        self.button = selection
+            .button
+            .and_then(|i| self.devices[i].device.interface::<ei::Button>());
+        self.scroll = selection
+            .scroll
+            .and_then(|i| self.devices[i].device.interface::<ei::Scroll>());
+        self.regions = selection
+            .absolute
+            .map(|i| {
+                self.devices[i]
+                    .device
+                    .regions()
+                    .iter()
+                    .map(Region::from_ei)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.dimensions = metadata_device.and_then(|i| self.devices[i].device.dimensions());
+    }
+
+    fn log_selection(&self) {
+        let selected_name =
+            |index: Option<usize>| index.and_then(|index| self.devices[index].device.name());
+        tracing::info!(
+            pointer = ?selected_name(self.selection.pointer),
+            absolute_pointer = ?selected_name(self.selection.absolute),
+            relative_pointer = ?selected_name(self.selection.relative),
+            keyboard = ?selected_name(self.selection.keyboard),
+            buttons = ?selected_name(self.selection.button),
+            scroll = ?selected_name(self.selection.scroll),
+            "EIS injection devices selected"
+        );
+    }
+
+    fn device_for_event(&self, event: InputEvent) -> Option<usize> {
+        route_event(self.selection, event)
+    }
+
+    fn ensure_emulating(&mut self, index: usize) -> bool {
+        let state = &mut self.devices[index];
+        if !state.resumed {
+            return false;
+        }
+        if !state.emulating {
+            state.sequence = state.sequence.wrapping_add(1);
+            state
+                .device
+                .device()
+                .start_emulating(state.last_serial, state.sequence);
+            state.emulating = true;
+        }
+        true
     }
 
     fn apply(&mut self, event: InputEvent) -> Result<Option<Position>, WaylandError> {
@@ -783,11 +970,14 @@ impl WaylandInjector {
     }
 
     fn commit_frame(&mut self) {
-        self.device
-            .device()
-            .frame(self.last_serial, self.timestamp_us());
+        if let Some(index) = self.active_device {
+            let timestamp = self.timestamp_us();
+            let state = &self.devices[index];
+            if state.emulating {
+                state.device.device().frame(state.last_serial, timestamp);
+            }
+        }
     }
-
     fn timestamp_us(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
@@ -869,8 +1059,106 @@ fn button_state(state: KeyState) -> ei::button::ButtonState {
 
 #[cfg(test)]
 mod tests {
-    use super::split_detents;
 
+    use super::{route_event, select_devices, split_detents, DeviceOffer, DeviceSelection};
+    use input_model::{HidKey, InputEvent, KeyState, MouseButton, Position};
+
+    #[test]
+    fn selects_absolute_pointer_over_relative_and_keeps_keyboard() {
+        let selection = select_devices(&[
+            DeviceOffer {
+                absolute_with_region: true,
+                button: true,
+                scroll: true,
+                ..DeviceOffer::default()
+            },
+            DeviceOffer {
+                relative_pointer: true,
+                keyboard: true,
+                button: true,
+                scroll: true,
+                ..DeviceOffer::default()
+            },
+        ]);
+        assert_eq!(selection.pointer, Some(0));
+        assert_eq!(selection.absolute, Some(0));
+        assert_eq!(selection.relative, Some(1));
+        assert_eq!(selection.keyboard, Some(1));
+        assert_eq!(selection.button, Some(0));
+        assert_eq!(selection.scroll, Some(0));
+    }
+
+    #[test]
+    fn relative_pointer_is_fallback_and_keyboard_only_is_degraded() {
+        let relative = select_devices(&[
+            DeviceOffer {
+                relative_pointer: true,
+                ..DeviceOffer::default()
+            },
+            DeviceOffer {
+                keyboard: true,
+                ..DeviceOffer::default()
+            },
+        ]);
+        assert_eq!(relative.pointer, Some(0));
+        assert_eq!(relative.absolute, None);
+        assert_eq!(relative.keyboard, Some(1));
+
+        let keyboard_only = select_devices(&[DeviceOffer {
+            keyboard: true,
+            ..DeviceOffer::default()
+        }]);
+        assert_eq!(keyboard_only.pointer, None);
+        assert_eq!(keyboard_only.keyboard, Some(0));
+        let key = InputEvent::Key {
+            key: HidKey { page: 7, usage: 4 },
+            state: KeyState::Down,
+        };
+        assert_eq!(route_event(keyboard_only, key), Some(0));
+        assert_eq!(
+            route_event(
+                keyboard_only,
+                InputEvent::PointerAbsolute(Position::new(0.0, 0.0))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn routes_each_event_to_its_selected_device() {
+        let selection = DeviceSelection {
+            absolute: Some(0),
+            relative: Some(1),
+            pointer: Some(0),
+            keyboard: Some(2),
+            button: Some(0),
+            scroll: Some(1),
+        };
+        for (event, expected) in [
+            (
+                InputEvent::PointerAbsolute(Position::new(1.0, 2.0)),
+                Some(0),
+            ),
+            (InputEvent::PointerRelative { dx: 1, dy: 2 }, Some(1)),
+            (
+                InputEvent::Key {
+                    key: HidKey { page: 7, usage: 4 },
+                    state: KeyState::Down,
+                },
+                Some(2),
+            ),
+            (
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: KeyState::Down,
+                },
+                Some(0),
+            ),
+            (InputEvent::Scroll { h120: 0, v120: 120 }, Some(1)),
+        ] {
+            assert_eq!(route_event(selection, event), expected);
+        }
+    }
     #[test]
     fn detents_truncate_toward_zero_and_keep_signed_remainders() {
         for (input, steps, leftover) in [

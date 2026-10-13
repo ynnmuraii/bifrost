@@ -141,9 +141,16 @@ impl Wayland {
             "inject",
             inject_grant.is_some(),
         ));
-        let injector = WaylandInjector::connect(inject_grant.as_ref())
+        let mut injector = WaylandInjector::connect(inject_grant.as_ref())
             .await
             .map_err(|error| fatal(&error))?;
+        let injection_capabilities = injector.capabilities();
+        if !injection_capabilities.has_absolute_injection
+            && !injection_capabilities.has_relative_injection
+        {
+            let _ = injector.disconnect().await;
+            return Err(fatal(&WaylandError::NoPointerDevice));
+        }
         // The emergency hotkey is registered for the whole run (KVM-018); its absence
         // is the documented reason a GNOME 46 node cannot be a source.
         let shortcuts = match EmergencyShortcuts::register(emergency_hotkey).await {
@@ -869,7 +876,8 @@ fn refine_ready(
     refusals: &[Refusal],
 ) -> Ready {
     let mut ready = Ready::from_session(session, String::new());
-    let absolute = injector.capabilities().has_absolute_injection;
+    let capabilities = injector.capabilities();
+    let absolute = capabilities.has_absolute_injection;
     ready.capabilities.retain(|name| match name.as_str() {
         "CAPTURE" => has_capture,
         "ABSOLUTE_POINTER" => absolute,
@@ -888,12 +896,15 @@ fn refine_ready(
     ready.backend.has_absolute_injection = absolute;
     ready.backend.has_emergency_hotkey = has_hotkey;
     ready.backend.has_receiver_takeover = false;
-    ready.backend.degraded_reason = refusals
+    let mut degraded: Vec<&str> = refusals
         .iter()
         .map(|refusal| refusal.detail.as_str())
         .filter(|detail| !detail.is_empty())
-        .collect::<Vec<&str>>()
-        .join("; ");
+        .collect();
+    if !capabilities.has_keyboard {
+        degraded.push("EIS keyboard device unavailable; keyboard injection is disabled");
+    }
+    ready.backend.degraded_reason = degraded.join("; ");
     ready
 }
 
@@ -904,6 +915,7 @@ fn portal_code(error: &WaylandError) -> &'static str {
         WaylandError::Portal(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
             "PORTAL_DENIED"
         }
+        WaylandError::NoPointerDevice | WaylandError::NoEiDevice => "CAPTURE_FAILED",
         WaylandError::PortalUnavailable { .. }
         | WaylandError::PortalTooOld { .. }
         | WaylandError::HotkeyUnavailable { .. }
@@ -911,7 +923,7 @@ fn portal_code(error: &WaylandError) -> &'static str {
         | WaylandError::NoAbsoluteRegion => "PORTAL_UNAVAILABLE",
         WaylandError::BarriersWhileEnabled => "PORTAL_FRONTEND_STUCK",
         WaylandError::EiDisconnected | WaylandError::EiSocketUnavailable => "PORTAL_SESSION_LOST",
-        _ => "CAPTURE_FAILED",
+        _ => "PORTAL_UNAVAILABLE",
     }
 }
 
