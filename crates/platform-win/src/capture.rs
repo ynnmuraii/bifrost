@@ -135,10 +135,20 @@ pub struct CaptureStats {
     pub captured: u64,
     /// Events dropped because the queue was full or the consumer was gone.
     pub dropped: u64,
-    /// Keyboard events whose scancode has no HID usage in the table.
+    /// Keyboard events whose scancode has no HID usage in the table, including scan code 0.
     pub unmapped_keys: u64,
     /// Events the OS flagged as injected (ours or another injector's).
     pub injected_seen: u64,
+    /// Valid keyboard-hook messages seen.
+    pub keyboard_hook_events: u64,
+    /// Keyboard-hook messages the OS flagged as injected.
+    pub keyboard_injected_seen: u64,
+    /// Keyboard-hook messages rejected by the injected-event filter.
+    pub keyboard_filtered: u64,
+    /// Keyboard-hook messages mapped from scancode to HID usage.
+    pub keyboard_mapped: u64,
+    /// Keyboard-hook messages swallowed while local input was suppressed.
+    pub keyboard_suppressed: u64,
     /// `WM_MOUSEMOVE` events seen by the low-level hook.
     pub hook_mouse_moves: u64,
     /// Relative motion events delivered by Raw Input.
@@ -158,6 +168,10 @@ pub struct CaptureStats {
     /// Times a low-level hook callback ran (keyboard + mouse). Zero means the
     /// hooks never fired, which on an idle machine is the normal result.
     pub hook_calls: u64,
+    /// Whether this capture accepts externally injected hook events.
+    pub capture_injected: bool,
+    /// Active hook mode.
+    pub mode: CaptureKind,
 }
 
 /// Why capture could not be started.
@@ -219,6 +233,11 @@ struct Shared {
     raw_input_ok: AtomicBool,
     hook_calls: AtomicU64,
     capture_injected: AtomicBool,
+    keyboard_hook_events: AtomicU64,
+    keyboard_injected_seen: AtomicU64,
+    keyboard_filtered: AtomicU64,
+    keyboard_mapped: AtomicU64,
+    keyboard_suppressed: AtomicU64,
 }
 
 /// The process-wide handle the hook callbacks use.
@@ -253,6 +272,11 @@ impl Capture {
             emergency_fired: AtomicBool::new(false),
             modifiers: AtomicU32::new(0),
             combo: config.emergency,
+            keyboard_hook_events: AtomicU64::new(0),
+            keyboard_injected_seen: AtomicU64::new(0),
+            keyboard_filtered: AtomicU64::new(0),
+            keyboard_mapped: AtomicU64::new(0),
+            keyboard_suppressed: AtomicU64::new(0),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             unmapped_keys: AtomicU64::new(0),
@@ -361,6 +385,13 @@ impl Capture {
     pub fn stats(&self) -> CaptureStats {
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
         CaptureStats {
+            keyboard_hook_events: load(&self.shared.keyboard_hook_events),
+            keyboard_injected_seen: load(&self.shared.keyboard_injected_seen),
+            keyboard_filtered: load(&self.shared.keyboard_filtered),
+            keyboard_mapped: load(&self.shared.keyboard_mapped),
+            keyboard_suppressed: load(&self.shared.keyboard_suppressed),
+            capture_injected: self.shared.capture_injected.load(Ordering::Relaxed),
+            mode: capture_kind(&self.shared),
             captured: load(&self.shared.captured),
             dropped: load(&self.shared.dropped),
             unmapped_keys: load(&self.shared.unmapped_keys),
@@ -665,6 +696,7 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
     if !down && message != WM_KEYUP && message != WM_SYSKEYUP {
         return None;
     }
+    shared.keyboard_hook_events.fetch_add(1, Ordering::Relaxed);
 
     // SAFETY: for HC_ACTION the OS passes a valid KBDLLHOOKSTRUCT pointer.
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
@@ -676,12 +708,16 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
     let injected = own_tag || kb.flags.0 & LLKHF_INJECTED.0 != 0;
     if injected {
         shared.injected_seen.fetch_add(1, Ordering::Relaxed);
+        shared
+            .keyboard_injected_seen
+            .fetch_add(1, Ordering::Relaxed);
     }
     if !should_capture_event(
         injected,
         own_tag,
         shared.capture_injected.load(Ordering::Relaxed),
     ) {
+        shared.keyboard_filtered.fetch_add(1, Ordering::Relaxed);
         return None;
     }
 
@@ -694,23 +730,31 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
         return None;
     }
 
+    let swallow = remote(shared);
     let scancode = hid::scancode_from_hook(kb.scanCode, kb.flags.0 & LLKHF_EXTENDED.0 != 0);
     match hid::scancode_to_hid(scancode) {
-        Some(usage) => push(
-            shared,
-            InputEvent::Key {
-                key: HidKey::keyboard(usage),
-                state: KeyState::from_down(down),
-            },
-        ),
+        Some(usage) => {
+            shared.keyboard_mapped.fetch_add(1, Ordering::Relaxed);
+            if swallow {
+                shared.keyboard_suppressed.fetch_add(1, Ordering::Relaxed);
+            }
+            push(
+                shared,
+                InputEvent::Key {
+                    key: HidKey::keyboard(usage),
+                    state: KeyState::from_down(down),
+                },
+            );
+        }
         None => {
-            if kb.scanCode != 0 {
-                shared.unmapped_keys.fetch_add(1, Ordering::Relaxed);
+            shared.unmapped_keys.fetch_add(1, Ordering::Relaxed);
+            if swallow {
+                shared.keyboard_suppressed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
-    Some(remote(shared))
+    Some(swallow)
 }
 
 /// Handle one mouse hook event. `Some(true)` means "swallow".
@@ -953,5 +997,75 @@ mod tests {
         assert!(should_capture_event(true, false, true));
         assert!(!should_capture_event(true, true, true));
         assert!(!should_capture_event(true, true, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs an interactive Windows desktop; uses harmless Shift taps"]
+    fn capture_distinguishes_vk_only_from_scancode_sendinput() {
+        use std::mem::size_of;
+        use std::time::{Duration, Instant};
+
+        use input_model::{HidKey, InputEvent, KeyState};
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+            KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VIRTUAL_KEY, VK_LSHIFT,
+        };
+
+        let capture = super::Capture::start(super::CaptureConfig {
+            capture_injected: true,
+            ..super::CaptureConfig::default()
+        })
+        .expect("capture hooks start");
+        let key_input = |vk, scan, flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let scancode_flags = KEYEVENTF_SCANCODE;
+        let input = [
+            key_input(VK_LSHIFT, 0, KEYBD_EVENT_FLAGS(0)),
+            key_input(VK_LSHIFT, 0, KEYEVENTF_KEYUP),
+            key_input(VIRTUAL_KEY(0), 0x2A, scancode_flags),
+            key_input(VIRTUAL_KEY(0), 0x2A, scancode_flags | KEYEVENTF_KEYUP),
+        ];
+        // SAFETY: all entries are fully initialised KEYBOARD INPUT records.
+        let sent = unsafe { SendInput(&input, size_of::<INPUT>() as i32) };
+        assert_eq!(sent, 4, "Windows must accept both Shift taps");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut down = false;
+        let mut up = false;
+        while Instant::now() < deadline && !(down && up) {
+            if let Ok(super::CaptureEvent::Input(InputEvent::Key { key, state })) =
+                capture.recv_timeout(Duration::from_millis(25))
+            {
+                if key == HidKey::keyboard(0xE1) {
+                    down |= state == KeyState::Down;
+                    up |= state == KeyState::Up;
+                }
+            }
+        }
+        let stats = capture.stats();
+        assert!(
+            down && up,
+            "scancode SendInput must reach the hook as HID left Shift: \
+             down={down} up={up} stats={stats:?}"
+        );
+        assert_eq!(stats.keyboard_hook_events, 4);
+        assert_eq!(stats.keyboard_injected_seen, 4);
+        assert_eq!(stats.keyboard_filtered, 0);
+        assert_eq!(stats.keyboard_mapped, 2);
+        assert_eq!(
+            stats.unmapped_keys, 2,
+            "VK-only keys have no physical scancode"
+        );
     }
 }

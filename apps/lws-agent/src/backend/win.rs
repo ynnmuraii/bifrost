@@ -17,10 +17,10 @@
 //!   `GetAsyncKeyState` pre-check the documents ask for at spike KVM-011 is not
 //!   called here; the injector's own ledger decides what it still holds.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use input_model::{CaptureKind, HidKey, InputEvent, MouseButton};
-use platform_win::capture::{Capture, CaptureConfig, CaptureError, CaptureEvent};
+use platform_win::capture::{Capture, CaptureConfig, CaptureError, CaptureEvent, CaptureStats};
 use platform_win::event::EmergencyCombo;
 use platform_win::inject::Injector;
 
@@ -62,6 +62,8 @@ pub struct Win {
     clipboard: Option<platform_win::clipboard::Clipboard>,
     /// `GetClipboardSequenceNumber` right after this backend's own write.
     applied_sequence: Option<u32>,
+    last_capture_report: Option<Instant>,
+    last_capture_stats: CaptureStats,
 }
 
 impl Win {
@@ -106,6 +108,8 @@ impl Win {
             repeats: RepeatFilter::new(),
             clipboard,
             applied_sequence: None,
+            last_capture_report: None,
+            last_capture_stats: CaptureStats::default(),
         })
     }
 
@@ -207,7 +211,6 @@ impl Win {
             Some(capture) => {
                 capture.set_capture_injected(capture_injected);
                 capture.set_mode(kind);
-                Ok(())
             }
             None => {
                 let config = CaptureConfig {
@@ -216,23 +219,33 @@ impl Win {
                     capture_injected,
                     ..CaptureConfig::default()
                 };
-                match Capture::start(config) {
-                    Ok(capture) => {
-                        self.capture = Some(capture);
-                        Ok(())
-                    }
-                    Err(error) => Err(capture_error(&error)),
-                }
+                let capture = Capture::start(config).map_err(|error| capture_error(&error))?;
+                self.capture = Some(capture);
             }
         }
+        self.last_capture_stats = self
+            .capture
+            .as_ref()
+            .map(Capture::stats)
+            .unwrap_or_default();
+        self.last_capture_report = Some(Instant::now());
+        tracing::info!(
+            ?kind,
+            capture_injected,
+            "Windows keyboard/mouse capture started"
+        );
+        Ok(())
     }
 
     pub fn end_capture(&mut self) -> Result<Released, String> {
+        self.report_capture_stats(true);
         // Dropping the capture stops its thread and uninstalls both hooks, so
         // nothing of this session can keep suppressing input (S1/S2/S3).
         if self.capture.take().is_none() {
             tracing::debug!("EndCapture with no active capture");
         }
+        self.last_capture_report = None;
+        self.last_capture_stats = CaptureStats::default();
         // The keys held now are released locally; their ups never reach this filter, and a
         // stale pressed set would eat the next real press.
         self.repeats.clear();
@@ -380,6 +393,7 @@ impl Win {
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
+        self.report_capture_stats(false);
         if let Some(capture) = &self.capture {
             match capture.try_recv() {
                 Some(CaptureEvent::Input(event)) => {
@@ -436,6 +450,56 @@ impl Win {
             .as_ref()
             .map(|(_, capture)| capture.stats().injected_seen)
             .unwrap_or(0)
+    }
+    /// Emit changed hook counters at most once a second, including the effective
+    /// capture mode and injected-event opt-in. This makes a silent hook/filter/mapping
+    /// failure distinguishable from an idle source without logging every key event.
+    fn report_capture_stats(&mut self, force: bool) {
+        let Some(capture) = self.capture.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if !force
+            && self
+                .last_capture_report
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        let stats = capture.stats();
+        let previous = self.last_capture_stats;
+        if stats != previous {
+            tracing::info!(
+                mode = ?stats.mode,
+                capture_injected = stats.capture_injected,
+                hook_calls = stats.hook_calls.saturating_sub(previous.hook_calls),
+                keyboard_events = stats
+                    .keyboard_hook_events
+                    .saturating_sub(previous.keyboard_hook_events),
+                injected = stats
+                    .keyboard_injected_seen
+                    .saturating_sub(previous.keyboard_injected_seen),
+                filtered = stats.keyboard_filtered.saturating_sub(previous.keyboard_filtered),
+                mapped = stats.keyboard_mapped.saturating_sub(previous.keyboard_mapped),
+                mouse_hook_moves = stats
+                    .hook_mouse_moves
+                    .saturating_sub(previous.hook_mouse_moves),
+                raw_mouse_moves = stats
+                    .raw_mouse_moves
+                    .saturating_sub(previous.raw_mouse_moves),
+                raw_absolute = stats.raw_absolute.saturating_sub(previous.raw_absolute),
+                recenter_count = stats.recenters.saturating_sub(previous.recenters),
+                unmapped = stats.unmapped_keys.saturating_sub(previous.unmapped_keys),
+                suppressed = stats
+                    .keyboard_suppressed
+                    .saturating_sub(previous.keyboard_suppressed),
+                pushes = stats.captured.saturating_sub(previous.captured),
+                dropped = stats.dropped.saturating_sub(previous.dropped),
+                "Windows capture hook counters"
+            );
+        }
+        self.last_capture_report = Some(now);
+        self.last_capture_stats = stats;
     }
 }
 

@@ -240,6 +240,7 @@ pub struct WaylandInjector {
     cursor: Option<Position>,
     started: Instant,
     ei_error: Option<reis::Error>,
+    last_inject_report: Option<Instant>,
 }
 
 impl WaylandInjector {
@@ -458,6 +459,7 @@ impl WaylandInjector {
             cursor: None,
             started: Instant::now(),
             ei_error: None,
+            last_inject_report: None,
         };
         injector.refresh_selection();
         injector.log_selection();
@@ -523,6 +525,43 @@ impl WaylandInjector {
         }
         if let Err(error) = self.connection.flush() {
             outcome.os_error = Some(WaylandError::Io(error.into()));
+        }
+        let now = Instant::now();
+        if self
+            .last_inject_report
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+        {
+            self.last_inject_report = Some(now);
+            let mut keys = 0;
+            let mut pointers = 0;
+            let mut buttons = 0;
+            let mut scrolls = 0;
+            for event in events {
+                match event {
+                    InputEvent::Key { .. } => keys += 1,
+                    InputEvent::PointerAbsolute(_) | InputEvent::PointerRelative { .. } => {
+                        pointers += 1;
+                    }
+                    InputEvent::Button { .. } => buttons += 1,
+                    InputEvent::Scroll { .. } => scrolls += 1,
+                }
+            }
+            let first_key_mapping = events.iter().find_map(|event| match event {
+                InputEvent::Key { key, .. } => Some((key.page, key.usage, hid_key_to_evdev(*key))),
+                _ => None,
+            });
+            tracing::info!(
+                events = events.len(),
+                first_key_mapping = ?first_key_mapping,
+                keys,
+                pointers,
+                buttons,
+                scrolls,
+                applied = outcome.applied_count,
+                os_error = ?outcome.os_error,
+                actual_position = ?outcome.actual,
+                "EIS injection summary"
+            );
         }
         outcome
     }
@@ -871,6 +910,7 @@ impl WaylandInjector {
     }
 
     fn ensure_emulating(&mut self, index: usize) -> bool {
+        let name = self.devices[index].device.name().map(str::to_owned);
         let state = &mut self.devices[index];
         if !state.resumed {
             return false;
@@ -882,6 +922,12 @@ impl WaylandInjector {
                 .device()
                 .start_emulating(state.last_serial, state.sequence);
             state.emulating = true;
+            tracing::info!(
+                device = index,
+                name = ?name,
+                sequence = state.sequence,
+                "EIS device emulation started"
+            );
         }
         true
     }

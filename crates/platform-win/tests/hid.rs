@@ -57,3 +57,8 @@ fn unsupported_scancodes_pause_and_non_keyboard_pages_are_unmapped() {
         }
     }
 }
+
+#[test]
+fn physical_l_scancode_maps_to_hid_l() {
+    assert_eq!(scancode_to_hid(0x26), Some(0x0F));
+}

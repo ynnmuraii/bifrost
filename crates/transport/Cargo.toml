@@ -23,6 +23,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 thiserror = "2"
 socket2.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 # `SO_EXCLUSIVEADDRUSE` is a WinSock constant; transport sets it in `bind_listener`.
