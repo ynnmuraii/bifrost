@@ -497,6 +497,7 @@ impl LinkHandle {
             tx,
             dropped_motion: Arc::new(AtomicU64::new(0)),
             lease_diagnostics: Arc::new(LeaseTransportCounters::default()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
