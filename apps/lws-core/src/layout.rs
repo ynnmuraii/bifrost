@@ -278,8 +278,13 @@ impl Layout {
 
     /// Keeps a divergent local edit: it cannot be applied (a newer author's revision is
     /// applied), so it waits in `layout.pending.toml` for the user's apply or discard.
-    pub fn hold_pending(&mut self, layout_toml: String) {
-        let base = self.applied;
+    ///
+    /// `base` is the pair the *editor* wrote the document against — never [`Self::applied`]
+    /// at the moment the edit is parked. A pending edit waits across a partition while the
+    /// document moves, and `layout_apply` re-sends it with this base, so recording the pair
+    /// that is applied now would turn the coordinator's CAS into a no-op and silently revert
+    /// the revision that arrived meanwhile (ADR-013, KVM-072).
+    pub fn hold_pending(&mut self, base: Pair, layout_toml: String) {
         let edit_id = edit_id(base, &layout_toml);
         self.pending = Some(Pending {
             base,
@@ -464,12 +469,31 @@ mod tests {
         assert!(published.is_newer_than(Pair::new(7, winner)));
     }
 
+    /// Audit F1: the pending slot keeps the pair the *editor* wrote against, not whatever
+    /// this node happens to have applied when the edit is parked.
+    ///
+    /// A pending edit waits across a partition while the document moves; `layout_apply`
+    /// re-sends it with `pending_base`, so storing `applied` would make the coordinator's CAS
+    /// a no-op and silently revert the revision that arrived meanwhile (ADR-013, KVM-072).
+    #[test]
+    fn a_pending_edit_keeps_the_base_it_was_written_against() {
+        let coordinator = node(1);
+        // The document moved to 5 after the editor loaded revision 4.
+        let mut layout = Layout::restore(Pair::new(5, coordinator), Pair::new(5, coordinator));
+        layout.hold_pending(Pair::new(4, coordinator), "links = [\"mine\"]".to_owned());
+        assert_eq!(
+            layout.pending_base(),
+            Some(Pair::new(4, coordinator)),
+            "the pending edit must re-send the base it was written against, never `applied`"
+        );
+    }
+
     /// A divergent local edit is held, not applied, and can be taken once.
     #[test]
     fn a_divergent_edit_waits_in_pending() {
         let coordinator = node(1);
         let mut layout = Layout::restore(Pair::new(3, coordinator), Pair::new(3, coordinator));
-        layout.hold_pending("links = [\"mine\"]".to_owned());
+        layout.hold_pending(Pair::new(3, coordinator), "links = [\"mine\"]".to_owned());
         assert_eq!(layout.pending(), Some("links = [\"mine\"]"));
         assert_eq!(
             layout.applied(),
