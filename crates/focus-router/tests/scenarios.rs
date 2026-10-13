@@ -16,6 +16,29 @@ fn s01_local_switch_starts_temporary_capture() {
     );
     assert_eq!(r.focus(), FocusState::Preparing);
 }
+
+#[test]
+fn preparing_ignores_repeated_edge_samples_without_rearming_capture() {
+    let mut r = router(LOCAL);
+    let mut outputs = r.handle(10, switch(SwitchTrigger::Edge));
+    for now in 11..50 {
+        let repeated = r.handle(now, switch(SwitchTrigger::Edge));
+        assert!(repeated.is_empty(), "duplicate edge produced {repeated:?}");
+        outputs.extend(repeated);
+        assert_eq!(r.focus(), FocusState::Preparing);
+        assert_eq!(r.lease().source().unwrap().lease_id, id(1));
+    }
+    assert_eq!(
+        effects(&outputs),
+        vec![begin(CaptureKind::Temporary, id(1), 200)]
+    );
+    // An explicit timeout still aborts the one pending transition.
+    assert_eq!(
+        r.handle(210, Input::TimerExpired(Timer::PrepareTimeout)),
+        vec![end(id(1), true), notice(Notice::Focus(FocusState::Local))]
+    );
+}
+
 #[test]
 fn s02_capture_ack_capture_commits_and_renews() {
     let mut r = preparing();

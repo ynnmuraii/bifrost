@@ -38,7 +38,6 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -240,13 +239,12 @@ struct Shared {
     keyboard_suppressed: AtomicU64,
 }
 
-/// The process-wide handle the hook callbacks use.
-///
-/// Deliberately not a thread-local: Windows calls low-level hooks on the thread
-/// that installed them, but that is an implementation detail this crate must not
-/// depend on. A `OnceLock` read is wait-free and there is exactly one capture per
-/// process (the agent has one input path), so one slot is enough.
-static CTX: OnceLock<Arc<Shared>> = OnceLock::new();
+// Windows invokes low-level hooks on their installing thread; the Raw Input
+// window is pumped on that same thread. Each capture owns its callback context,
+// including after stop/start and when a takeover detector runs alongside it.
+thread_local! {
+    static CTX: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
+}
 
 /// A running capture.
 pub struct Capture {
@@ -567,7 +565,7 @@ unsafe fn install(
             window,
         });
     });
-    let _ = CTX.set(Arc::clone(shared));
+    CTX.with(|context| *context.borrow_mut() = Some(Arc::clone(shared)));
 
     // SAFETY: thread id of the calling thread.
     thread_id_out.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
@@ -601,10 +599,11 @@ fn teardown() {
             let _ = DestroyWindow(hooks.window);
         }
     }
+    CTX.with(|context| *context.borrow_mut() = None);
 }
 
 fn with_shared<R>(f: impl FnOnce(&Shared) -> R) -> Option<R> {
-    CTX.get().map(|shared| f(shared))
+    CTX.with(|context| context.borrow().as_deref().map(f))
 }
 
 fn push(shared: &Shared, event: InputEvent) {
@@ -893,15 +892,12 @@ fn handle_raw_input(shared: &Shared, lparam: LPARAM) {
     // SAFETY: the union is discriminated by dwType above.
     let mouse = unsafe { &input.data.mouse };
 
-    if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
-        shared.raw_absolute.fetch_add(1, Ordering::Relaxed);
+    let Some(event) = raw_mouse_motion(mouse.usFlags.0, mouse.lLastX, mouse.lLastY) else {
+        if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
+            shared.raw_absolute.fetch_add(1, Ordering::Relaxed);
+        }
         return;
-    }
-
-    let (dx, dy) = (mouse.lLastX, mouse.lLastY);
-    if dx == 0 && dy == 0 {
-        return;
-    }
+    };
 
     if synth::consume_motion() {
         shared.raw_synth_suppressed.fetch_add(1, Ordering::Relaxed);
@@ -909,7 +905,12 @@ fn handle_raw_input(shared: &Shared, lparam: LPARAM) {
     }
 
     shared.raw_mouse_moves.fetch_add(1, Ordering::Relaxed);
-    push(shared, InputEvent::PointerRelative { dx, dy });
+    push(shared, event);
+}
+
+fn raw_mouse_motion(flags: u16, dx: i32, dy: i32) -> Option<InputEvent> {
+    (flags & MOUSE_MOVE_ABSOLUTE.0 == 0 && (dx != 0 || dy != 0))
+        .then_some(InputEvent::PointerRelative { dx, dy })
 }
 
 /// Re-assert the cursor hold point while in Remote.
@@ -989,6 +990,77 @@ fn should_capture_event(injected: bool, own_tag: bool, capture_injected: bool) -
 #[cfg(test)]
 mod tests {
     use super::should_capture_event;
+
+    #[test]
+    fn raw_mouse_motion_preserves_relative_deltas_and_rejects_absolute_records() {
+        use super::*;
+        assert_eq!(
+            raw_mouse_motion(0, -7, 12),
+            Some(InputEvent::PointerRelative { dx: -7, dy: 12 })
+        );
+        assert_eq!(raw_mouse_motion(0, 0, 0), None);
+        assert_eq!(raw_mouse_motion(MOUSE_MOVE_ABSOLUTE.0, 400, 600), None);
+        // Other RAWMOUSE flags do not turn a relative record into absolute.
+        assert_eq!(
+            raw_mouse_motion(0x08, 0, -1),
+            Some(InputEvent::PointerRelative { dx: 0, dy: -1 })
+        );
+    }
+
+    #[test]
+    #[ignore = "needs an interactive Windows desktop; sends bounded mouse motion"]
+    fn restarted_remote_capture_receives_raw_motion() {
+        use super::*;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+        };
+
+        let config = CaptureConfig {
+            capture_injected: true,
+            ..CaptureConfig::default()
+        };
+        let mut first = Capture::start(config).expect("first capture");
+        first.stop();
+        let first_count = first.stats().captured;
+        let second = Capture::start(config).expect("second capture");
+        second.set_mode(CaptureKind::Remote);
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 3,
+                    dy: -2,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: fully initialized untagged dev motion. Remote suppresses
+        // local movement; dropping capture always removes the hook.
+        assert_eq!(unsafe { SendInput(&[input], size_of::<INPUT>() as i32) }, 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut received = false;
+        while std::time::Instant::now() < deadline && !received {
+            received = matches!(
+                second.recv_timeout(Duration::from_millis(25)),
+                Ok(CaptureEvent::Input(InputEvent::PointerRelative {
+                    dx: 3,
+                    dy: -2
+                }))
+            );
+        }
+        assert!(
+            received,
+            "new Remote capture lost motion: {:?}",
+            second.stats()
+        );
+        assert_eq!(
+            first.stats().captured,
+            first_count,
+            "old capture received new input"
+        );
+        assert!(second.stats().raw_input_ok);
+    }
 
     #[test]
     fn injected_event_filter_preserves_physical_input_and_drops_own_injection() {

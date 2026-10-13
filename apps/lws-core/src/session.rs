@@ -2110,7 +2110,7 @@ impl Session {
     async fn track_local(&mut self, position: &geometry::Position, motion: geometry::Point) {
         // Only the owner opens leases, so only the owner reacts to an edge; a follower
         // watches its own pointer without acting on it.
-        if !self.router.is_owner() {
+        if !self.router.is_owner() || self.router.focus() != fr::FocusState::Local {
             return;
         }
         let step = match self.topology.as_ref() {
