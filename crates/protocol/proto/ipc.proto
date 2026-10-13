@@ -164,7 +164,10 @@ message BackendInfo {
   string degraded_reason = 9;      // payload-free actionable text when a capability is missing
 }
 message CaptureReady { bytes lease_id = 1; CaptureKind kind = 2; }
-message CapturedBatch { repeated LocalEvent events = 1; bool at_edge = 2; }
+// Portal activation coordinates are node-logical; edge identifies the accepted barrier.
+enum PortalEdge { PORTAL_EDGE_UNSPECIFIED = 0; PORTAL_EDGE_LEFT = 1; PORTAL_EDGE_RIGHT = 2; PORTAL_EDGE_TOP = 3; PORTAL_EDGE_BOTTOM = 4; }
+message PortalActivation { PointerAbs position = 1; PortalEdge edge = 2; }
+message CapturedBatch { repeated LocalEvent events = 1; bool at_edge = 2; PortalActivation activation = 3; }
 message EmergencyFired { bytes lease_id = 1; } // agent has already restored local control
 message InjectResult { bytes lease_id = 1; uint64 input_batch_seq = 2; uint32 applied_count = 3; string os_error = 4; PointerAbs actual = 5; }
 message DeadlineExpired { bytes lease_id = 1; }

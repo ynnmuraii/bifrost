@@ -90,6 +90,33 @@ fn input_event_counts(events: &[InputEvent]) -> (usize, usize, usize, usize) {
     })
 }
 
+/// Plans a portal activation without granting a follower a source lease.
+fn portal_activation_plan(
+    topology: Option<&geometry::Topology>,
+    node: &NodeId,
+    is_owner: bool,
+    focus: fr::FocusState,
+    activation: Option<&protocol::ipc::PortalActivation>,
+) -> Result<(geometry::Position, geometry::Transition), protocol::ipc::EndCapture> {
+    let resolved = if is_owner && focus == fr::FocusState::Local {
+        topology
+            .zip(activation)
+            .and_then(|(topology, activation)| {
+                crate::topology::portal_transition(topology, node, activation)
+            })
+            .filter(|(_, transition)| transition.target.node != *node)
+    } else {
+        None
+    };
+    if let Some(resolved) = resolved {
+        return Ok(resolved);
+    }
+    Err(protocol::ipc::EndCapture {
+        lease_id: Vec::new(),
+        replay_buffered_locally: true,
+    })
+}
+
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
     router: crate::ids::Router,
@@ -1981,7 +2008,14 @@ impl Session {
                 self.feed(fr::Input::Agent(event)).await;
             }
             AgentSignal::Local(local) => self.feed(fr::Input::Local(local)).await,
-            AgentSignal::Captured(events) => {
+            AgentSignal::Captured(batch) => {
+                if batch.at_edge {
+                    self.on_portal_activation(batch.activation.as_ref()).await;
+                    // The activation seeds local_pointer itself. Do not treat the same
+                    // pointer as a second Windows-style motion sample or forward it.
+                    return Ok(());
+                }
+                let events = batch.events;
                 // The tracker needs the display id, which only the wire form has; the
                 // wire itself needs the normalised events.
                 self.track_pointer(&events).await;
@@ -2118,6 +2152,62 @@ impl Session {
                 self.track_remote(motion).await;
             } else {
                 self.track_local(position, motion).await;
+            }
+        }
+    }
+
+    async fn release_portal_capture(&mut self, end: protocol::ipc::EndCapture) {
+        self.observe_armed = false;
+        if let Err(error) = self.agent.send(Msg::EndCapture(end)).await {
+            tracing::warn!(%error, "could not return the portal activation to local input");
+        }
+    }
+
+    async fn on_portal_activation(&mut self, activation: Option<&protocol::ipc::PortalActivation>) {
+        // A repeated activation must not replace an owner lease already preparing or
+        // forwarding. Followers always release their native capture, even as receivers.
+        if self.router.is_owner() && self.router.focus() != fr::FocusState::Local {
+            return;
+        }
+        match portal_activation_plan(
+            self.topology.as_ref(),
+            &self.node_id,
+            self.router.is_owner(),
+            self.router.focus(),
+            activation,
+        ) {
+            Ok((position, transition)) => {
+                self.local_pointer = Some(position);
+                self.remote_pointer = Some(transition.target_position.clone());
+                self.remote_node = Some(transition.target.node);
+                self.feed(fr::Input::Local(fr::LocalInput::SwitchRequest {
+                    trigger: fr::SwitchTrigger::Edge,
+                    target: transition.target.node,
+                    entry_position: transition.target_position,
+                    topology_revision: self.router.topology_revision(),
+                }))
+                .await;
+                // The FSM can reject a crossing (held buttons, missing capabilities,
+                // offline target). Native activation still needs a local return.
+                if self.router.lease().source().is_none() {
+                    self.remote_pointer = None;
+                    self.remote_node = None;
+                    tracing::info!("portal crossing refused; returning input locally");
+                    self.release_portal_capture(protocol::ipc::EndCapture {
+                        lease_id: Vec::new(),
+                        replay_buffered_locally: true,
+                    })
+                    .await;
+                }
+            }
+            Err(end) => {
+                tracing::info!(
+                    owner = self.router.is_owner(),
+                    has_position =
+                        activation.is_some_and(|activation| activation.position.is_some()),
+                    "portal activation has no owner-local configured link; releasing capture"
+                );
+                self.release_portal_capture(end).await;
             }
         }
     }
@@ -3076,5 +3166,71 @@ mod dev_capture_tests {
         assert!(!source_owner_may_capture_injected(false, true));
         assert!(!source_owner_may_capture_injected(true, false));
         assert!(source_owner_may_capture_injected(true, true));
+    }
+
+    #[test]
+    fn portal_activation_on_a_follower_releases_without_a_source_transition() {
+        let node = geometry::NodeId::new([1; 32]);
+        let peer = config::peer_reference(&[2; 32]);
+        let config = config::Config::from_str(&format!(
+            r#"
+config_version = 2
+[[topology.displays]]
+node = "self"
+id = "local"
+logical = [0, 0, 1920, 1080]
+primary = true
+[[topology.displays]]
+node = "{peer}"
+id = "remote"
+logical = [0, 0, 1920, 1080]
+primary = true
+[[topology.links]]
+id = "right"
+from = {{ node = "self", display = "local", edge = "right", start = 0, end = 1080 }}
+to = {{ node = "{peer}", display = "remote", edge = "left", start = 0, end = 1080 }}
+bidirectional = true
+"#
+        ))
+        .expect("valid configuration");
+        let local = crate::topology::snapshot_displays(&config.topology, node.as_bytes());
+        let peers = crate::topology::snapshot_peers(&config.topology, node.as_bytes());
+        let topology = crate::topology::build(&crate::topology::Documents {
+            local_node_id: *node.as_bytes(),
+            topology: &config.topology,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("configured link");
+        let activation = protocol::ipc::PortalActivation {
+            position: Some(protocol::ipc::PointerAbs {
+                display_id: String::new(),
+                x: 1919.0,
+                y: 540.0,
+            }),
+            edge: protocol::ipc::PortalEdge::Right as i32,
+        };
+        assert!(super::portal_activation_plan(
+            Some(&topology),
+            &node,
+            true,
+            focus_router::FocusState::Local,
+            Some(&activation)
+        )
+        .is_ok());
+        let action = super::portal_activation_plan(
+            Some(&topology),
+            &node,
+            false,
+            focus_router::FocusState::Local,
+            Some(&activation),
+        );
+        assert_eq!(
+            action,
+            Err(protocol::ipc::EndCapture {
+                lease_id: Vec::new(),
+                replay_buffered_locally: true,
+            })
+        );
     }
 }

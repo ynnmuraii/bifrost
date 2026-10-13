@@ -286,7 +286,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(cursor) if capture.is_active() => {
             // Nudge past the barrier we came in through, so the local cursor keeps moving.
             let nudge = Position::new(cursor.x + 1.0, cursor.y + 1.0);
-            capture.release(nudge).await?;
+            capture.release(Some(nudge)).await?;
             println!("released input, local cursor continues at {nudge:?}");
         }
         Some(cursor) => println!("capture not active; cursor was at {cursor:?}"),

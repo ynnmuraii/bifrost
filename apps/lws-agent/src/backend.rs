@@ -108,6 +108,8 @@ pub enum Event {
     AtEdge {
         /// The barrier the compositor named, when it named one.
         barrier_id: Option<u32>,
+        /// The current portal activation's actual position and accepted barrier edge.
+        activation: ipc::PortalActivation,
     },
     /// The bounded capture queue overflowed; the agent must end capture (rule 2).
     ///
