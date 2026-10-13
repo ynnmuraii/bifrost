@@ -714,7 +714,7 @@ impl Session {
     /// `RevokePeer`: remove trust from new handshakes, then close current links.
     ///
     /// The manager shares this pin set with its live TLS verifiers.
-    async fn revoke_peer(&mut self, peer: &[u8]) -> ipc::OpResult {
+    pub(crate) async fn revoke_peer(&mut self, peer: &[u8]) -> ipc::OpResult {
         let Some(node) = node_id_of(peer) else {
             return bad_request();
         };

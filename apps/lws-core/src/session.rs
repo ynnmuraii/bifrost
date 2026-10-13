@@ -3034,6 +3034,7 @@ impl Session {
                 ctl::Response::Stopping.into()
             }
             ctl::Request::Switch(peer) => self.switch_to(&peer).await.into(),
+            ctl::Request::Revoke(peer) => self.revoke_peer_ref(&peer).await.into(),
             ctl::Request::Claim => self.claim().await.into(),
             ctl::Request::Abandon => self.abandon().await.into(),
             ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()).into(),
@@ -3169,6 +3170,33 @@ impl Session {
             .find(|(node, _)| *node == peer)
             .map(|(_, displays)| displays)?;
         crate::topology::start_position(&displays)
+    }
+
+    /// `revoke <peer>` over the control channel: the GUI's revoke, with a peer reference
+    /// resolved here (audit F16).
+    ///
+    /// The trust store, the pin set the TLS verifiers read and the live links are all this
+    /// core's, so the revoke has to happen here — a CLI that edits `trust.toml` behind a
+    /// running core leaves the peer trusted in memory and its link up.
+    async fn revoke_peer_ref(&mut self, peer: &crate::command::PeerRef) -> ctl::Response {
+        let target = match crate::command::resolve_peer(&self.trust, peer) {
+            Ok(target) => target,
+            Err(detail) => {
+                return ctl::Response::Error {
+                    code: "UNKNOWN_PEER".to_owned(),
+                    detail,
+                }
+            }
+        };
+        let result = self.revoke_peer(target.as_bytes()).await;
+        if result.ok {
+            ctl::Response::Status(format!("revoked {}", crate::command::node_id_hex(&target)))
+        } else {
+            ctl::Response::Error {
+                code: result.error_code,
+                detail: "the peer is not in the trust store".to_owned(),
+            }
+        }
     }
 
     /// `claim`: the user (GUI button or the claim hotkey) asks this node to own the

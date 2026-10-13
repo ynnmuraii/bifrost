@@ -664,6 +664,21 @@ impl LinkManager {
                 .await;
         }
 
+        // The peer must still be trusted *now*: a link whose handshake completed before a
+        // revocation that is racing it would otherwise be admitted after it (audit F16 — the
+        // pin set is the live one the verifiers read, and the CLI/GUI revoke drops the live
+        // links, so a link forming at that moment has to be refused here).
+        let still_trusted = self
+            .trusted_peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&peer);
+        if !still_trusted {
+            tracing::warn!(peer = %peer, "a link for a peer that is no longer trusted was refused");
+            pending.handle.close();
+            return;
+        }
+
         // Membership: «пятый член получает `MEMBERSHIP_FULL`».
         let member_count = {
             let inner = self.inner.lock().await;
