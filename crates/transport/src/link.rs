@@ -783,7 +783,7 @@ async fn run(
 ///
 /// Bounded, and short: the peer is either reading or it is gone, and a link that refuses to
 /// end would hold the session's cleanup behind it.
-const GRACEFUL_CLOSE_GRACE: Duration = Duration::from_millis(200);
+const GRACEFUL_CLOSE_GRACE: Duration = Duration::from_millis(1_000);
 
 /// The coordinator's mutable state.
 struct LinkState {
