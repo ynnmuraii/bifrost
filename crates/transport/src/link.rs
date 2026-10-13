@@ -29,7 +29,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::convert::{self, ConvertError, PeerInfo};
+use crate::convert::{self, PeerInfo};
 use crate::policy::{self, LivenessAction};
 use crate::queue::{self, Outbound};
 use crate::TransportError;
@@ -1019,10 +1019,30 @@ impl LinkState {
             }
             _ => {}
         }
-        let message = convert::inbound_from_envelope(envelope)
-            .map_err(|error: ConvertError| LinkDownReason::Protocol(error.to_string()))?;
+        // Recorded before the vocabulary check: the diagnostics counter describes what arrived
+        // on the wire, whether or not this build could read it (audit F4 keeps the link up).
         self.lease_diagnostics
             .record(envelope.payload.as_ref(), false);
+        let message = match convert::inbound_from_envelope(envelope) {
+            Ok(message) => message,
+            Err(error) => {
+                // A payload this node cannot read — an event with no wire form, an absolute
+                // position without a display id, a vocabulary member from another build — is
+                // that frame's problem, not the link's: dropping it costs one batch, while
+                // closing the connection costs every lease on it (audit F4). Framing and
+                // sequence violations are still refused above and end the link.
+                static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                if LOG_RATE.allow() {
+                    tracing::warn!(
+                        peer = ?self.peer,
+                        seq = envelope.seq,
+                        error = %error,
+                        "a frame could not be read into the protocol vocabulary; the frame was dropped"
+                    );
+                }
+                return Ok(());
+            }
+        };
         match &message {
             convert::Inbound::Focus(fr::Message::InputBatch { events, .. }) => {
                 self.report_input_batch("rx", envelope.seq, events);
@@ -1170,18 +1190,69 @@ async fn write_message<W: AsyncWrite + Unpin>(
 ) -> Result<(), LinkDownReason> {
     let lease_id = convert::lease_id_of_message(&message);
     let seq = state.tx_seq;
+    // A batch carrying an event this layer cannot express must not fail — and must not be
+    // able to end the link (audit F4). The events with a wire form still travel, so a key or
+    // button edge in the same batch is not lost; only the unrepresentable ones (a relative
+    // pointer delta) are dropped, and the count is logged rate-limited.
+    let message = match message {
+        fr::Message::InputBatch {
+            lease_id,
+            input_batch_seq,
+            events,
+        } => {
+            let (events, dropped) = convert::split_encodable(&events);
+            if dropped > 0 {
+                static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                if LOG_RATE.allow() {
+                    tracing::warn!(
+                        peer = ?state.peer,
+                        dropped,
+                        kept = events.len(),
+                        "input events with no wire form were dropped from the batch"
+                    );
+                }
+            }
+            if events.is_empty() {
+                // Nothing this layer can send: the frame is skipped, the link stays up.
+                return Ok(());
+            }
+            fr::Message::InputBatch {
+                lease_id,
+                input_batch_seq,
+                events,
+            }
+        }
+        other => other,
+    };
+    let lease_id = convert::lease_id_of_message(&message);
     // A lease is entered on one of the peer's displays, and every absolute position the
     // source sends afterwards is local to it; `EnterPrepare` is where that display is
     // known, so it becomes the batch display of this link (see `convert::batch_display_after`).
     let batch_display = convert::batch_display_after(&message, state.batch_display.as_str());
-    let envelope = convert::to_envelope(
+    let envelope = match convert::to_envelope(
         &message,
         seq,
         &state.connection_id,
         lease_id.as_ref(),
         batch_display.as_str(),
-    )
-    .map_err(|error| LinkDownReason::Protocol(error.to_string()))?;
+    ) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            // Unreachable for an `InputBatch` (the events were split above), and no other
+            // message has an unrepresentable field: a conversion refusal is a programming
+            // error, not a peer's, so it must not take the link down (audit F4).
+            static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+            if LOG_RATE.allow() {
+                tracing::error!(
+                    peer = ?state.peer,
+                    seq,
+                    error = %error,
+                    "a message could not be encoded; the frame was skipped"
+                );
+            }
+            return Ok(());
+        }
+    };
     match &message {
         fr::Message::InputBatch { events, .. } => {
             state.report_input_batch("tx", seq, events);
