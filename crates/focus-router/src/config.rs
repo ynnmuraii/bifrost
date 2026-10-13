@@ -47,6 +47,28 @@ impl Timing {
     /// (`docs/03-architecture.md`, «Что параметризуется, а что нет»; `docs/05-protocol.md`).
     pub const REPEAT_GUARD_MS: u64 = 150;
 
+    /// Lower bound of `lease_ttl_ms` (`docs/05-protocol.md`: 300..1000).
+    pub const LEASE_TTL_MIN_MS: u64 = 300;
+    /// Upper bound of `lease_ttl_ms` (`docs/05-protocol.md`: 300..1000).
+    pub const LEASE_TTL_MAX_MS: u64 = 1_000;
+
+    /// The `lease_ttl_ms` a *peer* advertised, clamped to the documented range.
+    ///
+    /// A `LeaseChallenge` carries the receiver's `lease_ttl_ms`, and that value governs the
+    /// lease's deadlines on both sides («Все дедлайны lease выводятся из одного параметра
+    /// `lease_ttl_ms`»). The wire field is a peer's number, so it is clamped before it governs
+    /// a deadline of ours: a broken or hostile peer must not be able to park a watchdog a
+    /// millisecond or a day away.
+    pub const fn clamp_lease_ttl_ms(ttl_ms: u64) -> u64 {
+        if ttl_ms < Self::LEASE_TTL_MIN_MS {
+            Self::LEASE_TTL_MIN_MS
+        } else if ttl_ms > Self::LEASE_TTL_MAX_MS {
+            Self::LEASE_TTL_MAX_MS
+        } else {
+            ttl_ms
+        }
+    }
+
     /// Challenge period: `lease_ttl_ms / 5` (default 100 ms).
     ///
     /// Computed, never configured — «`challenge = lease_ttl/5` вычисляется, а не
@@ -67,7 +89,12 @@ impl Timing {
     /// Bound check for every field.
     pub fn validate(&self) -> Result<(), ConfigError> {
         check("prepare_timeout_ms", self.prepare_timeout_ms, 150, 400)?;
-        check("lease_ttl_ms", self.lease_ttl_ms, 300, 1000)?;
+        check(
+            "lease_ttl_ms",
+            self.lease_ttl_ms,
+            Self::LEASE_TTL_MIN_MS,
+            Self::LEASE_TTL_MAX_MS,
+        )?;
         if self.claim_grant_timeout_ms == 0 {
             return Err(ConfigError {
                 field: "claim_grant_timeout_ms",
