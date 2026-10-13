@@ -139,7 +139,6 @@ fn author_of(documents: &Documents<'_>) -> Option<NodeId> {
 /// edge needs the display-local form, and this is that conversion: find the display whose
 /// rectangle contains the point. A point outside every display (a gap between monitors,
 /// which the documents allow) has no local position and cannot open a transition.
-
 pub fn position_on(
     topology: &Topology,
     node: &NodeId,
