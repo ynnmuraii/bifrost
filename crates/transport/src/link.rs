@@ -540,6 +540,8 @@ struct LinkState {
     rx_seq: SeqValidator,
     /// The peer's address on this connection, when the socket reports one.
     remote: Option<SocketAddr>,
+    last_batch_log: Option<tokio::time::Instant>,
+    last_ack_log: Option<tokio::time::Instant>,
 }
 
 impl LinkState {
@@ -557,7 +559,71 @@ impl LinkState {
             batch_display: String::new(),
             rx_seq: SeqValidator::new(),
             remote: None,
+            last_batch_log: None,
+            last_ack_log: None,
         }
+    }
+    fn report_input_batch(&mut self, direction: &'static str, seq: u64, events: &[InputEvent]) {
+        let now = tokio::time::Instant::now();
+        if self
+            .last_batch_log
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_batch_log = Some(now);
+        let mut keys = 0;
+        let mut pointers = 0;
+        let mut buttons = 0;
+        let mut scrolls = 0;
+        for event in events {
+            match event {
+                InputEvent::Key { .. } => keys += 1,
+                InputEvent::PointerAbsolute(_) | InputEvent::PointerRelative { .. } => {
+                    pointers += 1;
+                }
+                InputEvent::Button { .. } => buttons += 1,
+                InputEvent::Scroll { .. } => scrolls += 1,
+            }
+        }
+        tracing::info!(
+            peer = %self.peer,
+            direction,
+            seq,
+            events = events.len(),
+            keys,
+            pointers,
+            buttons,
+            scrolls,
+            "transport InputBatch"
+        );
+    }
+
+    fn report_inject_ack(
+        &mut self,
+        direction: &'static str,
+        seq: u64,
+        input_batch_seq: u64,
+        applied_count: u32,
+        status: &fr::InjectStatus,
+    ) {
+        let now = tokio::time::Instant::now();
+        if self
+            .last_ack_log
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_ack_log = Some(now);
+        tracing::info!(
+            peer = %self.peer,
+            direction,
+            seq,
+            input_batch_seq,
+            applied_count,
+            ?status,
+            "transport InjectAck"
+        );
     }
 
     async fn write_hello<W: AsyncWrite + Unpin>(
@@ -708,6 +774,20 @@ impl LinkState {
         }
         let message = convert::inbound_from_envelope(envelope)
             .map_err(|error: ConvertError| LinkDownReason::Protocol(error.to_string()))?;
+        match &message {
+            convert::Inbound::Focus(fr::Message::InputBatch { events, .. }) => {
+                self.report_input_batch("rx", envelope.seq, events);
+            }
+            convert::Inbound::Focus(fr::Message::InjectAck {
+                input_batch_seq,
+                applied_count,
+                status,
+                ..
+            }) => {
+                self.report_inject_ack("rx", envelope.seq, *input_batch_seq, *applied_count, status)
+            }
+            _ => {}
+        }
         reports
             .send(LinkReport::Message {
                 peer: self.peer,
@@ -827,6 +907,18 @@ async fn write_message<W: AsyncWrite + Unpin>(
         batch_display.as_str(),
     )
     .map_err(|error| LinkDownReason::Protocol(error.to_string()))?;
+    match &message {
+        fr::Message::InputBatch { events, .. } => {
+            state.report_input_batch("tx", seq, events);
+        }
+        fr::Message::InjectAck {
+            input_batch_seq,
+            applied_count,
+            status,
+            ..
+        } => state.report_inject_ack("tx", seq, *input_batch_seq, *applied_count, status),
+        _ => {}
+    }
     state.batch_display = batch_display;
     state.tx_seq += 1;
     write_frame(writer, &envelope).await.map_err(reason_from)

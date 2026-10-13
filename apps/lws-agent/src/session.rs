@@ -235,6 +235,8 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     // once core has been told. The batch is sent even when it carries no events,
     // because the crossing itself is the news.
     let mut at_edge = false;
+    let mut last_inject_log = None;
+    let mut last_capture_batch_log = None;
     let mut released_after_silence = false;
     // The node's own display set and its revision (`Hello.displays_revision`).
     let mut displays = crate::displays::DisplaysState::default();
@@ -280,7 +282,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 if let Some(stop) = handle_message(
                     link, backend, ready, message, &mut deadline, &mut self_timeout,
                     &mut held_lease, &mut batch, &mut displays, &mut repeat,
-                    &mut clipboard, dev_capture_injected, now,
+                    &mut clipboard, dev_capture_injected, &mut last_inject_log, now,
                 ).await? {
                     return Ok(stop);
                 }
@@ -341,10 +343,39 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
         // One tick, one batch: keeps the frame rate bounded and lets the transport
         // coalesce motion on the far side. A tick that only learned about an edge
         // crossing still goes out, with no events.
+        let now = now_ms(started);
         if !batch.is_empty() || at_edge {
             let events = std::mem::take(&mut batch);
             let edge = at_edge;
             at_edge = false;
+            if last_capture_batch_log.is_none_or(|last| now.saturating_sub(last) >= 1_000) {
+                last_capture_batch_log = Some(now);
+                let mut keys = 0;
+                let mut pointers = 0;
+                let mut buttons = 0;
+                let mut scrolls = 0;
+                for event in &events {
+                    match backend::to_input_event(event) {
+                        Some(input_model::InputEvent::Key { .. }) => keys += 1,
+                        Some(
+                            input_model::InputEvent::PointerAbsolute(_)
+                            | input_model::InputEvent::PointerRelative { .. },
+                        ) => pointers += 1,
+                        Some(input_model::InputEvent::Button { .. }) => buttons += 1,
+                        Some(input_model::InputEvent::Scroll { .. }) => scrolls += 1,
+                        None => {}
+                    }
+                }
+                tracing::info!(
+                    events = events.len(),
+                    keys,
+                    pointers,
+                    buttons,
+                    scrolls,
+                    at_edge = edge,
+                    "agent CapturedBatch"
+                );
+            }
             link.send(Msg::Captured(CapturedBatch {
                 events,
                 at_edge: edge,
@@ -432,6 +463,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     clipboard: &mut ClipboardState,
     dev_capture_injected: bool,
+    last_inject_log: &mut Option<u64>,
     now: u64,
 ) -> anyhow::Result<Option<Stop>> {
     match message {
@@ -528,6 +560,36 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                 engine.applied(&events, now);
             }
             batch.clear();
+            let report = last_inject_log.is_none_or(|last| now.saturating_sub(last) >= 1_000);
+            if report {
+                *last_inject_log = Some(now);
+                let mut keys = 0;
+                let mut pointers = 0;
+                let mut buttons = 0;
+                let mut scrolls = 0;
+                for event in &events {
+                    match event {
+                        input_model::InputEvent::Key { .. } => keys += 1,
+                        input_model::InputEvent::PointerAbsolute(_)
+                        | input_model::InputEvent::PointerRelative { .. } => pointers += 1,
+                        input_model::InputEvent::Button { .. } => buttons += 1,
+                        input_model::InputEvent::Scroll { .. } => scrolls += 1,
+                    }
+                }
+                tracing::info!(
+                    lease_id = ?inject.lease_id,
+                    input_batch_seq = inject.input_batch_seq,
+                    events = events.len(),
+                    keys,
+                    pointers,
+                    buttons,
+                    scrolls,
+                    accepted = injected.applied,
+                    os_error = ?injected.os_error,
+                    actual_position = ?injected.actual,
+                    "agent InjectResult"
+                );
+            }
             link.send(Msg::InjectResult(InjectResult {
                 lease_id: inject.lease_id.clone(),
                 input_batch_seq: inject.input_batch_seq,
@@ -1087,6 +1149,7 @@ mod tests {
         clipboard: ClipboardState,
         /// The harness's monotonic clock, advanced by the tests that need one.
         clock: u64,
+        last_inject_log: Option<u64>,
     }
 
     impl Harness {
@@ -1134,6 +1197,7 @@ mod tests {
                 )),
                 clipboard: ClipboardState::new(),
                 clock: 0,
+                last_inject_log: None,
             }
         }
 
@@ -1151,6 +1215,7 @@ mod tests {
                 &mut self.repeat,
                 &mut self.clipboard,
                 false,
+                &mut self.last_inject_log,
                 self.clock,
             )
             .await

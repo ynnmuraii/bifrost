@@ -73,6 +73,18 @@ fn is_agent_ready(event: &fr::AgentEvent) -> bool {
     matches!(event, fr::AgentEvent::AgentReady)
 }
 
+fn input_event_counts(events: &[InputEvent]) -> (usize, usize, usize, usize) {
+    events.iter().fold((0, 0, 0, 0), |mut counts, event| {
+        match event {
+            InputEvent::Key { .. } => counts.0 += 1,
+            InputEvent::PointerAbsolute(_) | InputEvent::PointerRelative { .. } => counts.1 += 1,
+            InputEvent::Button { .. } => counts.2 += 1,
+            InputEvent::Scroll { .. } => counts.3 += 1,
+        }
+        counts
+    })
+}
+
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
     router: crate::ids::Router,
@@ -208,6 +220,10 @@ pub struct Session {
     active_layout: String,
     /// The last pairing refusal, for `Status.last_error_code`.
     pairing_error: Option<String>,
+    /// Last second in which an input batch was logged at the agent boundary.
+    last_agent_inject_log: Option<Instant>,
+    /// Last second in which captured input forwarding was logged.
+    last_input_batch_log: Option<Instant>,
 }
 
 impl Session {
@@ -304,7 +320,9 @@ impl Session {
             capabilities,
             portal_state: String::new(),
             active_layout: String::new(),
+            last_agent_inject_log: None,
             pairing_error: None,
+            last_input_batch_log: None,
         };
         session.rebuild_topology();
         session
@@ -574,7 +592,44 @@ impl Session {
                 Effect::Agent(command) => {
                     self.context.on_command(&command);
                     let frame = self.agent_frame(&command);
-                    tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
+                    if let fr::AgentCommand::Inject {
+                        lease_id,
+                        input_batch_seq,
+                        events,
+                    } = &command
+                    {
+                        let report = self
+                            .last_agent_inject_log
+                            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+                        if report {
+                            self.last_agent_inject_log = Some(Instant::now());
+                            let mut keys = 0;
+                            let mut pointers = 0;
+                            let mut buttons = 0;
+                            let mut scrolls = 0;
+                            for event in events {
+                                match event {
+                                    InputEvent::Key { .. } => keys += 1,
+                                    InputEvent::PointerAbsolute(_)
+                                    | InputEvent::PointerRelative { .. } => pointers += 1,
+                                    InputEvent::Button { .. } => buttons += 1,
+                                    InputEvent::Scroll { .. } => scrolls += 1,
+                                }
+                            }
+                            tracing::info!(
+                                lease_id = ?lease_id,
+                                input_batch_seq,
+                                events = events.len(),
+                                keys,
+                                pointers,
+                                buttons,
+                                scrolls,
+                                "core -> agent Inject"
+                            );
+                        }
+                    } else {
+                        tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
+                    }
                     if let Err(error) = self.agent.send(frame).await {
                         tracing::warn!(%error, "cannot reach the agent");
                         self.on_agent_lost().await;
@@ -2135,13 +2190,25 @@ impl Session {
         if events.is_empty() {
             return;
         }
+        let report = self
+            .last_input_batch_log
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+        let counts = report.then(|| input_event_counts(&events));
         let lease = match self.router.lease().source() {
             Some(lease) if lease.state == fr::SourceState::Remote => (lease.peer, lease.lease_id),
             _ => {
-                tracing::warn!(
-                    events = events.len(),
-                    "captured input outside a remote source lease; dropped"
-                );
+                if report {
+                    let (keys, pointers, buttons, scrolls) = counts.unwrap_or_default();
+                    self.last_input_batch_log = Some(Instant::now());
+                    tracing::warn!(
+                        events = events.len(),
+                        keys,
+                        pointers,
+                        buttons,
+                        scrolls,
+                        "captured input outside a remote source lease; dropped"
+                    );
+                }
                 return;
             }
         };
@@ -2149,6 +2216,20 @@ impl Session {
         // The peer receives *its* display's local coordinates: the tracker's virtual
         // position, not the source's node-space numbers (see `topology::forward_events`).
         let events = crate::topology::forward_events(events, self.remote_pointer.as_ref());
+        if report {
+            let (keys, pointers, buttons, scrolls) = counts.unwrap_or_default();
+            self.last_input_batch_log = Some(Instant::now());
+            tracing::info!(
+                peer = %peer,
+                message = "InputBatch",
+                events = events.len(),
+                keys,
+                pointers,
+                buttons,
+                scrolls,
+                "core -> peer"
+            );
+        }
         let message = fr::Message::InputBatch {
             lease_id,
             // Stamped over by the transport (the wire defines the batch sequence as
@@ -2156,7 +2237,6 @@ impl Session {
             input_batch_seq: 0,
             events,
         };
-        tracing::info!(peer = %peer, "core -> peer InputBatch");
         if let Some(handle) = self.manager.handle(&peer).await {
             if let Err(error) = handle.send(message).await {
                 tracing::warn!(peer = %peer, %error, "InputBatch send failed");

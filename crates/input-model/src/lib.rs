@@ -301,3 +301,13 @@ const HID_KEYBOARD: [u16; 256] = [
      29, 42, 56,125, 97, 54,100,126,164,166,165,163,161,115,114,113,
     150,158,159,128,136,177,178,176,142,152,173,140,240,240,240,240,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{hid_usage_to_evdev, HID_PAGE_KEYBOARD};
+
+    #[test]
+    fn hid_l_maps_to_linux_evdev_key_l() {
+        assert_eq!(hid_usage_to_evdev(HID_PAGE_KEYBOARD, 0x0F), Some(38));
+    }
+}
