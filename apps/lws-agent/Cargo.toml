@@ -44,3 +44,6 @@ workspace = true
 # is Linux-only (`std::os::unix`), so it must not be an unconditional dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = "0.13"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse"] }

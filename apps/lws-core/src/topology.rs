@@ -729,6 +729,7 @@ mod tests {
                 state: KeyState::Down,
             },
             InputEvent::Scroll { h120: 0, v120: 120 },
+            InputEvent::PointerRelative { dx: -7, dy: 12 },
         ];
         let forwarded = forward_events(events.clone(), Some(&virtual_position));
         assert_eq!(

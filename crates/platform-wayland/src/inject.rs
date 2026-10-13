@@ -1132,6 +1132,18 @@ mod tests {
         assert_eq!(selection.keyboard, Some(1));
         assert_eq!(selection.button, Some(0));
         assert_eq!(selection.scroll, Some(0));
+        assert_eq!(
+            route_event(selection, InputEvent::PointerRelative { dx: -7, dy: 12 }),
+            Some(1),
+            "Remote deltas must use the relative device despite absolute preference"
+        );
+        assert_eq!(
+            route_event(
+                selection,
+                InputEvent::PointerAbsolute(Position::new(1.0, 2.0))
+            ),
+            Some(0)
+        );
     }
 
     #[test]

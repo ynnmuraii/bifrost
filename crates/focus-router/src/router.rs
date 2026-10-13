@@ -437,16 +437,9 @@ impl<I: Identifiers> FocusRouter<I> {
                 }
             }
             LeaseSlot::Source(lease) if lease.state == SourceState::Preparing => {
-                // A second trigger while preparing cancels the attempt and replays the
-                // buffered events locally: «Нельзя «потерять» нажатие в Preparing».
-                let lease_id = lease.lease_id;
-                out.push(Output::Agent(AgentCommand::EndCapture {
-                    lease_id,
-                    replay_buffered_locally: true,
-                }));
-                out.push(Output::CancelTimer(Timer::PrepareTimeout));
-                self.lease = LeaseSlot::Idle;
-                self.burned.insert(lease_id);
+                // Edge samples can repeat (including raw/absolute pairs) while
+                // capture and Enter are negotiated. Keep the single pending
+                // transition until it commits or an explicit failure aborts it.
             }
             // Releasing, or we are the receiver: only the owner opens leases.
             _ => self.refuse(trigger, TransitionRefusal::NotOwner, out),

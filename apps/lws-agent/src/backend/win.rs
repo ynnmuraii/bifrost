@@ -232,6 +232,7 @@ impl Win {
         tracing::info!(
             ?kind,
             capture_injected,
+            raw_input_ok = self.last_capture_stats.raw_input_ok,
             "Windows keyboard/mouse capture started"
         );
         Ok(())
@@ -488,6 +489,9 @@ impl Win {
                     .raw_mouse_moves
                     .saturating_sub(previous.raw_mouse_moves),
                 raw_absolute = stats.raw_absolute.saturating_sub(previous.raw_absolute),
+                raw_synth_suppressed = stats
+                    .raw_synth_suppressed
+                    .saturating_sub(previous.raw_synth_suppressed),
                 recenter_count = stats.recenters.saturating_sub(previous.recenters),
                 unmapped = stats.unmapped_keys.saturating_sub(previous.unmapped_keys),
                 suppressed = stats
@@ -672,6 +676,77 @@ mod tests {
         println!("stats: {:?}", capture.stats());
         drop(capture);
         assert!(downs >= 1, "even the injected down itself must be seen");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs an interactive Windows desktop; bounded mouse motion and Shift tap"]
+    async fn rearmed_remote_backend_forwards_motion_and_keyboard() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
+            KEYEVENTF_SCANCODE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+        };
+        let ready = Ready {
+            capabilities: Vec::new(),
+            platform: "platform-win".to_owned(),
+            session_kind: "windows".to_owned(),
+            backend: ::protocol::ipc::BackendInfo::default(),
+        };
+        let mut win = Win::new(&ready, "Ctrl+Alt+Shift+F12", None).expect("backend");
+        win.begin_capture(CaptureKind::Observe, true)
+            .expect("observe");
+        win.begin_capture(CaptureKind::Temporary, true)
+            .expect("prepare");
+        win.end_capture().expect("abort");
+        win.begin_capture(CaptureKind::Temporary, true)
+            .expect("rearm");
+        win.begin_capture(CaptureKind::Remote, true)
+            .expect("remote");
+        let key = |flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wScan: 0x2a,
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        };
+        let input = [
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 3,
+                        dy: -2,
+                        dwFlags: MOUSEEVENTF_MOVE,
+                        ..Default::default()
+                    },
+                },
+            },
+            key(KEYEVENTF_SCANCODE),
+            key(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP),
+        ];
+        // SAFETY: bounded untagged dev input; Remote suppresses the local tap.
+        assert_eq!(
+            unsafe { SendInput(&input, std::mem::size_of::<INPUT>() as i32) },
+            3
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (mut motion, mut down, mut up) = (false, false, false);
+        while Instant::now() < deadline && !(motion && down && up) {
+            match win.next_event().await {
+                Some(Event::Input(InputEvent::PointerRelative { dx: 3, dy: -2 })) => motion = true,
+                Some(Event::Input(InputEvent::Key { key, state }))
+                    if key == HidKey::keyboard(0xe1) =>
+                {
+                    down |= state == input_model::KeyState::Down;
+                    up |= state == input_model::KeyState::Up;
+                }
+                _ => {}
+            }
+        }
+        win.end_capture().expect("cleanup");
+        assert!(motion && down && up, "motion={motion} down={down} up={up}");
     }
 
     /// The dry half of KVM-035's proof: an event this process injected must not end a lease.
