@@ -745,6 +745,8 @@ impl ViewModel {
         self.reload_first_run_config();
         self.connection = Connection::Connected;
         self.silent = false;
+        // A sentence from a previous core does not describe this connection.
+        self.outcome = None;
         self.push_log(format!("Служба работает ({endpoint})"));
     }
 
@@ -774,6 +776,10 @@ impl ViewModel {
         self.connection = Connection::Disconnected { why };
         self.inflight.clear();
         self.silent = false;
+        // The banner described what the *core we just lost* did («Готово: …»). Leaving it up
+        // under a header that now says «Служба не запущена» is the window contradicting
+        // itself, so it goes with the connection (batch-8 audit).
+        self.outcome = None;
         // A pairing window belongs to the connection that opened it; the core closes it on
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
