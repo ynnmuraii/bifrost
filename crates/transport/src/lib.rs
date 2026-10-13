@@ -14,8 +14,8 @@ pub use clipboard::{
 };
 pub use convert::{ConvertError, PeerInfo};
 pub use link::{
-    read_frame, write_frame, Direction, Link, LinkConfig, LinkDownReason, LinkEvent, LinkHandle,
-    LinkReport, Stream,
+    read_frame, write_frame, Direction, LeaseTransportSnapshot, Link, LinkConfig, LinkDownReason,
+    LinkEvent, LinkHandle, LinkReport, Stream,
 };
 pub use manager::{LinkManager, ManagerConfig};
 pub use pairing::{PairingConnection, PairingGate};

@@ -147,7 +147,8 @@ fn s02_capture_ack_capture_commits_and_renews() {
                 nonce: N
             }),
             arm(Timer::SourceLeaseWatchdog, 514),
-            notice(Notice::Focus(FocusState::Remote))
+            notice(Notice::Focus(FocusState::Remote)),
+            arm(Timer::LeaseDiagnostic, 1014)
         ]
     );
     assert_eq!(r.focus(), FocusState::Remote);
@@ -505,7 +506,8 @@ fn s15_commit_arms_deadline_challenge_and_repeat_guard() {
             arm(Timer::ReceiverLeaseDeadline, 512),
             arm(Timer::ReceiverChallenge, 112),
             arm(Timer::RepeatGuard, 162),
-            notice(Notice::Focus(FocusState::Remote))
+            notice(Notice::Focus(FocusState::Remote)),
+            arm(Timer::LeaseDiagnostic, 1012)
         ]
     );
     assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Active);

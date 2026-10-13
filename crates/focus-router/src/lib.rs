@@ -138,6 +138,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod diagnostics;
 pub mod flow;
 pub mod lease;
 pub mod ownership;
@@ -145,6 +146,7 @@ pub mod router;
 pub mod wire;
 
 pub use config::{ConfigError, Timing};
+pub use diagnostics::{LeaseCounters, LeaseDiagnosticSnapshot, LeaseInboundAges, LeaseRole};
 pub use flow::{
     AgentCommand, AgentEvent, FocusState, Identifiers, Input, LocalInput, Notice, Output,
     OwnershipState, SequentialIds, SwitchTrigger, Timer, TransitionRefusal,

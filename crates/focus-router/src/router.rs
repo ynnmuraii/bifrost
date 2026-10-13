@@ -124,6 +124,7 @@ pub struct FocusRouter<I: Identifiers = crate::flow::SequentialIds> {
     claim_on_startup: bool,
     ownership: Ownership,
     lease: LeaseSlot,
+    diagnostics: Option<crate::diagnostics::Accounting>,
     pressed: PressedSet,
     peers: BTreeMap<NodeId, Peer>,
     /// `lease_id`s that have expired or been released: «`lease_id` — random bytes16,
@@ -153,6 +154,7 @@ impl<I: Identifiers> FocusRouter<I> {
             require_emergency_hotkey: true,
             claim_on_startup: false,
             lease: LeaseSlot::Idle,
+            diagnostics: None,
             pressed: PressedSet::default(),
             peers: BTreeMap::new(),
             burned: BTreeSet::new(),
@@ -283,6 +285,17 @@ impl<I: Identifiers> FocusRouter<I> {
     /// Handles one input at `now_ms` and returns the outputs it produced.
     pub fn handle(&mut self, now_ms: u64, input: Input) -> Vec<Output> {
         let mut out = Vec::new();
+        if let (Some(accounting), Input::Net { from, message }) = (&mut self.diagnostics, &input) {
+            accounting.receive(*from, message, now_ms);
+        }
+        let diagnostic_tick = matches!(&input, Input::TimerExpired(Timer::LeaseDiagnostic));
+        let inbound_status = match &input {
+            Input::Net {
+                from,
+                message: Message::LeaseStatus { lease_id, .. },
+            } => Some((*from, *lease_id)),
+            _ => None,
+        };
         match input {
             Input::TimerExpired(timer) => self.on_timer(now_ms, timer, &mut out),
             Input::Hello { peer, hello } => self.on_hello(now_ms, peer, hello, &mut out),
@@ -295,7 +308,88 @@ impl<I: Identifiers> FocusRouter<I> {
         self.settle_ownership(&mut out);
         self.emit_ownership(&mut out);
         self.emit_focus(&mut out);
+        self.account_lease(now_ms, diagnostic_tick, inbound_status, &mut out);
         out
+    }
+
+    /// Account at the FSM boundary without altering lease or watchdog decisions.
+    fn account_lease(
+        &mut self,
+        now_ms: u64,
+        tick: bool,
+        inbound_status: Option<(NodeId, LeaseId)>,
+        out: &mut Vec<Output>,
+    ) {
+        use crate::diagnostics::{Accounting, LeaseRole};
+        let current = match &self.lease {
+            LeaseSlot::Source(lease) => Some((
+                lease.lease_id,
+                lease.peer,
+                LeaseRole::Source,
+                lease.state == SourceState::Remote,
+            )),
+            LeaseSlot::Receiver(lease) => Some((
+                lease.lease_id,
+                lease.source,
+                LeaseRole::Receiver,
+                lease.state == ReceiverState::Active,
+            )),
+            LeaseSlot::Idle => None,
+        };
+        if self.diagnostics.is_none() {
+            if let Some((id, peer, role, _)) = current {
+                self.diagnostics = Some(Accounting::new(id, peer, role, self.timing.lease_ttl_ms));
+            }
+        }
+        let Some(a) = &mut self.diagnostics else {
+            return;
+        };
+        let mut applied_status = false;
+        for output in out.iter() {
+            match output {
+                Output::Send { peer, message } => a.send(*peer, message),
+                Output::ArmTimer {
+                    timer: Timer::SourceLeaseWatchdog,
+                    deadline_ms,
+                } => {
+                    a.deadline_ms = *deadline_ms;
+                    applied_status = true;
+                }
+                Output::ArmTimer {
+                    timer: Timer::ReceiverLeaseDeadline,
+                    deadline_ms,
+                } => a.deadline_ms = *deadline_ms,
+                _ => {}
+            }
+        }
+        if inbound_status == Some((a.snapshot.peer, a.snapshot.lease_id)) {
+            let count = if applied_status {
+                &mut a.snapshot.counters.status_accepted
+            } else {
+                &mut a.snapshot.counters.status_rejected
+            };
+            *count = count.saturating_add(1);
+        }
+        let active = current.is_some_and(|(id, _, _, active)| id == a.snapshot.lease_id && active);
+        if a.active && !active && !a.finished {
+            out.insert(0, Output::LeaseDiagnostic(a.report(now_ms, true)));
+            out.push(Output::CancelTimer(Timer::LeaseDiagnostic));
+            a.finished = true;
+        } else if active && !a.finished && (!a.active || tick) {
+            if tick {
+                out.push(Output::LeaseDiagnostic(a.report(now_ms, false)));
+            }
+            out.push(Output::ArmTimer {
+                timer: Timer::LeaseDiagnostic,
+                deadline_ms: now_ms.saturating_add(1000),
+            });
+        }
+        a.active = active;
+        if current.is_none_or(|(id, _, _, _)| id != a.snapshot.lease_id) {
+            self.diagnostics = current.map(|(id, peer, role, _)| {
+                Accounting::new(id, peer, role, self.timing.lease_ttl_ms)
+            });
+        }
     }
 
     // ---------------------------------------------------------------- ownership
@@ -877,6 +971,7 @@ impl<I: Identifiers> FocusRouter<I> {
 
     fn on_timer(&mut self, now_ms: u64, timer: Timer, out: &mut Vec<Output>) {
         match timer {
+            Timer::LeaseDiagnostic => {}
             Timer::PrepareTimeout => match &self.lease {
                 LeaseSlot::Source(lease) if lease.state == SourceState::Preparing => {
                     let lease_id = lease.lease_id;

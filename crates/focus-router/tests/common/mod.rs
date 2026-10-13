@@ -117,6 +117,7 @@ pub fn effects(outputs: &[Output]) -> Vec<Output> {
                 o,
                 Output::ArmTimer { .. }
                     | Output::CancelTimer(_)
+                    | Output::LeaseDiagnostic(_)
                     | Output::Notice(Notice::Focus(_) | Notice::Ownership(_))
             )
         })

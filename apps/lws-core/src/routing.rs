@@ -41,6 +41,8 @@ pub enum Effect {
     CloseLink { peer: NodeId, code: fr::ErrorCode },
     /// A state transition or a refusal, for the log and the control channel.
     Notice(fr::Notice),
+    /// A bounded lease-liveness snapshot, never a wire or input event.
+    LeaseDiagnostic(fr::LeaseDiagnosticSnapshot),
 }
 
 /// Classifies every `Output` the FSM produced, in order.
@@ -68,6 +70,7 @@ fn effect(output: &fr::Output) -> Effect {
             code: *code,
         },
         fr::Output::Notice(notice) => Effect::Notice(notice.clone()),
+        fr::Output::LeaseDiagnostic(snapshot) => Effect::LeaseDiagnostic(*snapshot),
     }
 }
 

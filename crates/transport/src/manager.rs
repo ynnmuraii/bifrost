@@ -24,7 +24,8 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
 use crate::convert::PeerInfo;
 use crate::link::{
-    Direction, LinkConfig, LinkDownReason, LinkEvent, LinkHandle, LinkReport, Stream,
+    Direction, LeaseTransportCounters, LeaseTransportSnapshot, LinkConfig, LinkDownReason,
+    LinkEvent, LinkHandle, LinkReport, Stream,
 };
 use crate::pairing::{PairingConnection, PairingGate};
 use crate::policy;
@@ -191,6 +192,9 @@ pub struct LinkManager {
 #[derive(Default)]
 struct Inner {
     links: BTreeMap<NodeId, LiveLink>,
+    /// Only the counters survive link removal, for the session's final lease snapshot.
+    /// Replaced once on the next established connection; never retains queued payloads.
+    last_lease_diagnostics: BTreeMap<NodeId, Arc<LeaseTransportCounters>>,
     /// Keyed by the link's own key ([`LinkConfig::key`]), which is what makes it unique.
     ///
     /// `(peer, direction)` is not: two nodes that dial each other have two links between them
@@ -216,6 +220,17 @@ struct Inner {
 }
 
 impl Inner {
+    fn lease_diagnostics(&self, peer: &NodeId) -> Option<LeaseTransportSnapshot> {
+        self.links
+            .get(peer)
+            .map(|link| link.handle.lease_diagnostics())
+            .or_else(|| {
+                self.last_lease_diagnostics
+                    .get(peer)
+                    .map(|counters| counters.snapshot())
+            })
+    }
+
     /// Whether a link to `peer` exists, live or still forming.
     fn has_link_to(&self, peer: &NodeId) -> bool {
         self.links.contains_key(peer) || self.pending.values().any(|pending| pending.peer == *peer)
@@ -340,6 +355,15 @@ impl LinkManager {
             .links
             .get(peer)
             .map(|link| link.handle.clone())
+    }
+
+    /// Samples cumulative lease counters for the current or last established connection.
+    ///
+    /// Counters survive link removal so final lease diagnostics can include link loss.
+    /// Returns `None` until a connection has established; the next established connection
+    /// resets the counters. Sampling does not clone a handle or allocate.
+    pub async fn lease_diagnostics(&self, peer: &NodeId) -> Option<LeaseTransportSnapshot> {
+        self.inner.lock().await.lease_diagnostics(peer)
     }
 
     /// The current members (established links).
@@ -672,16 +696,22 @@ impl LinkManager {
         }
 
         let up_at_ns = self.clock.now_ns();
-        self.inner.lock().await.links.insert(
-            peer,
-            LiveLink {
-                key,
-                handle: pending.handle,
-                initiator: pending.initiator,
-                up_at_ns,
-                task: pending.task,
-            },
-        );
+        {
+            let mut inner = self.inner.lock().await;
+            inner
+                .last_lease_diagnostics
+                .insert(peer, pending.handle.lease_diagnostics_counters());
+            inner.links.insert(
+                peer,
+                LiveLink {
+                    key,
+                    handle: pending.handle,
+                    initiator: pending.initiator,
+                    up_at_ns,
+                    task: pending.task,
+                },
+            );
+        }
         let _ = self
             .events_tx
             .send(LinkEvent::Up {
@@ -1045,6 +1075,46 @@ async fn start_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lease_diagnostics_retain_nonzero_counts_after_link_removal() {
+        let peer = NodeId::new([7; 32]);
+        let handle = LinkHandle::for_counter_test(peer);
+        let counters = handle.lease_diagnostics_counters();
+        let renew = wire::envelope::Payload::LeaseRenew(Default::default());
+        counters.record(Some(&renew), true);
+        let mut inner = Inner::default();
+        assert_eq!(inner.lease_diagnostics(&peer), None);
+        inner
+            .last_lease_diagnostics
+            .insert(peer, Arc::clone(&counters));
+        inner.links.insert(
+            peer,
+            LiveLink {
+                key: [1; 16],
+                handle,
+                initiator: peer,
+                up_at_ns: 0,
+                task: tokio::spawn(async {}),
+            },
+        );
+        assert_eq!(inner.lease_diagnostics(&peer).unwrap().renew_written, 1);
+        let removed = inner.links.remove(&peer).unwrap();
+        removed.task.abort();
+        drop(removed);
+        counters.record(Some(&renew), false);
+        let final_snapshot = inner.lease_diagnostics(&peer).unwrap();
+        assert_eq!(final_snapshot.renew_written, 1);
+        assert_eq!(final_snapshot.renew_decoded, 1);
+        let next = LinkHandle::for_counter_test(peer);
+        inner
+            .last_lease_diagnostics
+            .insert(peer, next.lease_diagnostics_counters());
+        assert_eq!(
+            inner.lease_diagnostics(&peer),
+            Some(LeaseTransportSnapshot::default())
+        );
+    }
 
     /// The port belongs to exactly one listener, even to a process that asks to share it.
     ///
