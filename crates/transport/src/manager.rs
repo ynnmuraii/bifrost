@@ -683,7 +683,18 @@ impl LinkManager {
                         related_seq: 0,
                     })
                     .await;
-                pending.handle.close();
+                // The refusal is the last thing this link sends, and it must not be thrown
+                // away: closing here used to end the link immediately, and on Windows a close
+                // with anything of the peer's still unread sends a reset — a reset discards
+                // the frames the peer has not read, so the refused member saw
+                // `Io(... 10054)` instead of `MEMBERSHIP_FULL` in ~1 loaded run in 100
+                // (`mesh::the_membership_cap_refuses_the_extra_member`).
+                //
+                // The peer closes as soon as it has read the refusal, which ends this link
+                // through its own reader; a peer that does not is bounded by the liveness
+                // timeout («офлайн через 3 s без `Pong`»). The pending entry is already
+                // removed, so a retry is not blocked by this one.
+                drop(pending);
                 let _ = self
                     .events_tx
                     .send(LinkEvent::Down {
