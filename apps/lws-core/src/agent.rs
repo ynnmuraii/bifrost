@@ -488,17 +488,18 @@ impl Supervisor {
             None => Err("no agent is attached".to_owned()),
         }
     }
-    /// Drains already-queued portal changes before a restart drops this channel.
-    pub async fn drain_portal_grants(&mut self) -> Vec<ipc::PortalGrantChanged> {
-        let mut grants = Vec::new();
+    /// Everything the dying agent already sent, before a restart drops this channel.
+    ///
+    /// Nothing is discarded (audit F7): the caller reports the portal grants as it always did,
+    /// and hands every other frame to the session — a `Released` or a `DeadlineExpired` that
+    /// is thrown away leaves the FSM waiting for a release that already happened, so the
+    /// transition only finishes when the release guard expires.
+    pub async fn drain_agent_tail(&mut self) -> Vec<ipc::AgentFrame> {
+        let mut frames = Vec::new();
         loop {
             match tokio::time::timeout(Duration::from_millis(1), self.recv()).await {
-                Ok(Ok(frame)) => {
-                    if let Some(Msg::PortalGrant(changed)) = frame.msg {
-                        grants.push(changed);
-                    }
-                }
-                Ok(Err(_)) | Err(_) => return grants,
+                Ok(Ok(frame)) => frames.push(frame),
+                Ok(Err(_)) | Err(_) => return frames,
             }
         }
     }

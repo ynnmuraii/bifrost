@@ -1152,15 +1152,11 @@ mod tests {
              got {expires}"
         );
         assert!(
-            handle
-                .accepts(&parent, &channel, &token, expires - 1)
-                .await,
+            handle.accepts(&parent, &channel, &token, expires - 1).await,
             "one millisecond before the ttl the bind is accepted"
         );
         assert!(
-            !handle
-                .accepts(&parent, &channel, &token, expires + 1)
-                .await,
+            !handle.accepts(&parent, &channel, &token, expires + 1).await,
             "one millisecond after it is refused"
         );
     }

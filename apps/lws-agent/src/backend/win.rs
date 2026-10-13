@@ -485,10 +485,7 @@ impl Win {
                         self.note_motion_without_baseline();
                         return None;
                     }
-                    let motion = self
-                        .source_motion
-                        .as_mut()
-                        .expect("checked just above");
+                    let motion = self.source_motion.as_mut().expect("checked just above");
                     if let InputEvent::PointerAbsolute(native) = event {
                         if let Some(scale) = monitor_scale(&self.source_monitors, native) {
                             motion.scale = scale;
@@ -612,7 +609,10 @@ impl Win {
             "cannot seed source motion: cursor is outside known monitors".to_owned()
         })?;
         self.source_motion = Some(SourceMotion::new(
-            Some(input_model::Position::new(native.x / scale, native.y / scale)),
+            Some(input_model::Position::new(
+                native.x / scale,
+                native.y / scale,
+            )),
             scale,
         ));
         self.source_monitors = monitors;
@@ -636,7 +636,10 @@ impl Win {
 }
 
 /// Whether a capture still needs its source-motion baseline (audit F11).
-fn needs_source_seed(motion: &Option<SourceMotion>, monitors: &[platform_win::displays::Monitor]) -> bool {
+fn needs_source_seed(
+    motion: &Option<SourceMotion>,
+    monitors: &[platform_win::displays::Monitor],
+) -> bool {
     motion.is_none() || monitors.is_empty()
 }
 
