@@ -659,6 +659,11 @@ impl Session {
                     self.arm_observation().await;
                     self.clipboard_on_focus().await;
                     self.expire_pairing_window();
+                    let now = self.now_ms();
+                    let expired = prune_layout_requests(&mut self.layout_requests, now);
+                    if expired > 0 {
+                        tracing::debug!(expired, "layout requests whose verdict cannot arrive");
+                    }
                 }
             }
             // The liveness decision comes *after* the turn's work: whatever the agent
@@ -1439,8 +1444,8 @@ impl Session {
         layout_toml: String,
         expected: crate::layout::Pair,
     ) -> (u64, oneshot::Receiver<ctl::Response>) {
-        self.layout_requests
-            .retain(|_, request| !request.verdict.is_closed());
+        let now = self.now_ms();
+        prune_layout_requests(&mut self.layout_requests, now);
         // `.max(1)` keeps 0 out of the wire: it means «this frame is not a request».
         self.next_layout_nonce = self.next_layout_nonce.wrapping_add(1).max(1);
         let nonce = self.next_layout_nonce;
@@ -1451,6 +1456,7 @@ impl Session {
                 layout_toml,
                 expected,
                 verdict,
+                at_ms: self.now_ms(),
             },
         );
         (nonce, receiver)
@@ -3209,6 +3215,29 @@ struct LayoutRequest {
     expected: crate::layout::Pair,
     /// Where the connection that asked is waiting.
     verdict: oneshot::Sender<ctl::Response>,
+    /// When the request was registered, on the loop's `now_ms` clock.
+    at_ms: u64,
+}
+
+/// How long a layout request may wait for its verdict (batch-2 audit).
+///
+/// The verdict travels one link round trip; a request whose answer has not arrived in this
+/// long is not going to get one (the peer died mid-CAS, or the answer was dropped as
+/// nobody's), and the entry — with its copy of the whole document — used to stay in the map
+/// for the life of the process.
+const LAYOUT_REQUEST_TTL_MS: u64 = 30_000;
+
+/// Keeps the layout requests a verdict can still arrive for (batch-2 audit).
+///
+/// Live means the connection that asked is still there (`verdict` open) **and** the request is
+/// younger than [`LAYOUT_REQUEST_TTL_MS`]. Returns how many were dropped.
+fn prune_layout_requests(requests: &mut HashMap<u64, LayoutRequest>, now_ms: u64) -> usize {
+    let before = requests.len();
+    requests.retain(|_, request| {
+        !request.verdict.is_closed()
+            && now_ms.saturating_sub(request.at_ms) <= LAYOUT_REQUEST_TTL_MS
+    });
+    before - requests.len()
 }
 
 /// The FSM's timers on the loop's millisecond clock.
@@ -3289,6 +3318,54 @@ fn parse_layout_toml(layout_toml: &str) -> Result<config::TopologyConfig, String
         return Err("layout_toml: a document with neither displays nor links".to_owned());
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod layout_request_tests {
+    use super::*;
+
+    fn request(at_ms: u64) -> (LayoutRequest, oneshot::Receiver<ctl::Response>) {
+        let (verdict, receiver) = oneshot::channel();
+        (
+            LayoutRequest {
+                layout_toml: "links = []".to_owned(),
+                expected: crate::layout::Pair::NONE,
+                verdict,
+                at_ms,
+            },
+            receiver,
+        )
+    }
+
+    /// Batch-2 audit: a layout request whose verdict cannot arrive is dropped, so the map (and
+    /// its copy of the whole document) cannot grow for the life of the process.
+    ///
+    /// The connection giving up (`verdict` closed) and the TTL expiring are both checked: a
+    /// peer that died mid-CAS, or an answer dropped as nobody's, left the entry behind
+    /// forever.
+    #[test]
+    fn a_layout_request_whose_verdict_cannot_arrive_is_dropped() {
+        let now = 100_000u64;
+        let mut requests = HashMap::new();
+        let (fresh, _alive) = request(now - LAYOUT_REQUEST_TTL_MS);
+        let (stale, _alive) = request(now - LAYOUT_REQUEST_TTL_MS - 1);
+        let (abandoned, gone) = request(now);
+        drop(gone);
+        requests.insert(1, fresh);
+        requests.insert(2, stale);
+        requests.insert(3, abandoned);
+
+        assert_eq!(
+            prune_layout_requests(&mut requests, now),
+            2,
+            "the stale request and the abandoned one go"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests.contains_key(&1),
+            "the request at the ttl boundary is still waiting for its verdict"
+        );
+    }
 }
 
 #[cfg(test)]
