@@ -546,8 +546,8 @@ async fn run_async(
         config.input.pointer_gain,
         // The ownership pair belongs in the configuration file, so a restart resumes the
         // counter it learned instead of claiming serial 1 again (`ownership_store`).
-        OwnershipStore::new(paths.config_file(), config.clone()),
-        LayoutStore::new(paths.config_file(), config.clone(), node_id),
+        OwnershipStore::new(paths.config_file(), &config),
+        LayoutStore::new(paths.config_file(), &config, node_id),
         clipboard,
         clipboard_events,
         gui_server,

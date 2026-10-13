@@ -1646,9 +1646,9 @@ impl Session {
                 // `Hello` carries the ownership pair as it was when this node started, so
                 // a peer that joins after a local claim (the normal case: the owner claims
                 // at startup, the link forms later) would know no owner and refuse our
-                // `EnterPrepare` with `NOT_OWNER`. The owner therefore states its pair to
-                // every link that comes up, in the same shape the FSM broadcasts when the
-                // claim lands.
+                // `EnterPrepare` with `NOT_OWNER`. Every node states its current view
+                // on link-up, including a follower that remembers a newer serial for
+                // this owner. Only the actual owner marks that state as granted.
                 // KVM-072: a peer may hold a *stored* revision newer than ours (it was the
                 // author, or it was in the other partition half). `docs/05-protocol.md`: the
                 // coordinator asks that author for the document; if the author is
@@ -1709,13 +1709,13 @@ impl Session {
                     .await;
                 }
                 let ownership = self.router.ownership();
-                if ownership.is_owner() {
+                if let Some(owner) = ownership.owner().copied() {
                     self.send_to(
                         peer,
                         fr::Message::OwnerState {
                             serial: ownership.serial(),
-                            owner: ownership.owner().copied(),
-                            granted: true,
+                            owner: Some(owner),
+                            granted: ownership.is_owner(),
                         },
                     )
                     .await;

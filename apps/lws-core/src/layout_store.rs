@@ -2,7 +2,7 @@
 //!
 //! `docs/06-development-plan.md`, KVM-072: «персистятся `max_seen_revision`/`max_seen_author`,
 //! ревизия назад не идёт». The file is the same one the rest of the configuration lives in, so
-//! the store keeps the loaded [`config::Config`] and rewrites it whole, preserving unrelated
+//! the store reloads the latest [`config::Config`] before each rewrite, preserving unrelated
 //! settings while replacing the topology section.
 //!
 //! The authors are stored as the lower-case hex fingerprint (`identity::fingerprint`), which is
@@ -19,8 +19,6 @@ use crate::layout::{Layout, Pair};
 pub struct LayoutStore {
     /// The configuration file this core was started with.
     path: PathBuf,
-    /// The loaded configuration, kept so a rewrite preserves every other setting in it.
-    config: config::Config,
     /// What the file holds, so an unchanged pair is not rewritten.
     saved: (Pair, Pair),
 }
@@ -31,7 +29,7 @@ impl LayoutStore {
     /// `self_node` is what the configuration means by `"self"`: a document authored here is
     /// stored with this node's own fingerprint, and a hand-written `"self"` must mean the same
     /// thing rather than being dropped as unparsable.
-    pub fn new(path: PathBuf, config: config::Config, self_node: NodeId) -> Self {
+    pub fn new(path: PathBuf, config: &config::Config, self_node: NodeId) -> Self {
         let applied = pair_from_config(
             config.topology.revision,
             config.topology.author.as_str(),
@@ -44,7 +42,6 @@ impl LayoutStore {
         );
         Self {
             path,
-            config,
             saved: (applied, max_seen),
         }
     }
@@ -112,16 +109,30 @@ impl LayoutStore {
         if (applied, max_seen) == self.saved {
             return;
         }
-        self.config.topology = topology.clone();
-        self.config.topology.revision = applied.revision;
-        self.config.topology.author = applied
+        let _write_guard = crate::ownership_store::CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut config = match config::Config::load(&self.path) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    revision = applied.revision,
+                    "cannot reload configuration to persist layout; the next change will retry"
+                );
+                return;
+            }
+        };
+        config.topology = topology.clone();
+        config.topology.revision = applied.revision;
+        config.topology.author = applied
             .author
             .map_or_else(String::new, |id| identity::fingerprint(&id));
-        self.config.topology.max_seen_revision = max_seen.revision;
-        self.config.topology.max_seen_author = max_seen
+        config.topology.max_seen_revision = max_seen.revision;
+        config.topology.max_seen_author = max_seen
             .author
             .map_or_else(String::new, |id| identity::fingerprint(&id));
-        match self.config.save(&self.path) {
+        match config.save(&self.path) {
             Ok(()) => self.saved = (applied, max_seen),
             Err(error) => tracing::warn!(
                 %error,
@@ -213,7 +224,7 @@ mod tests {
     #[test]
     fn the_pending_file_follows_the_slot() {
         let (path, config) = temp_config();
-        let store = LayoutStore::new(path, config, node(7));
+        let store = LayoutStore::new(path, &config, node(7));
         let pending = store.pending_path();
 
         // Nothing pending: removing nothing is the normal case, not an error.
@@ -239,7 +250,7 @@ mod tests {
         let (path, config) = temp_config();
         // `self_node` is this node, the same one the reload below names; the pair that comes
         // back is the one `observe` wrote, so the identity is only here to resolve `"self"`.
-        let mut store = LayoutStore::new(path.clone(), config, node(7));
+        let mut store = LayoutStore::new(path.clone(), &config, node(7));
         let mut layout = store.restored();
         assert_eq!(layout.applied(), Pair::NONE);
 
@@ -257,7 +268,7 @@ mod tests {
         store.observe(&layout, &config::TopologyConfig::default());
 
         let reloaded = config::Config::load(&path).expect("the file still parses");
-        let restored = LayoutStore::new(path, reloaded, node(7)).restored();
+        let restored = LayoutStore::new(path, &reloaded, node(7)).restored();
         assert_eq!(restored.applied(), Pair::new(1, node(1)));
         assert_eq!(restored.max_seen(), Pair::new(1, node(1)));
     }
@@ -270,7 +281,7 @@ mod tests {
         config.topology.author = identity::fingerprint(&node(1));
         config.topology.max_seen_revision = 2;
         config.topology.max_seen_author = identity::fingerprint(&node(2));
-        let store = LayoutStore::new(path, config, node(7));
+        let store = LayoutStore::new(path, &config, node(7));
         assert_eq!(store.restored().max_seen(), Pair::new(5, node(1)));
     }
 }

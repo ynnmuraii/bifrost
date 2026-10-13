@@ -107,6 +107,54 @@ fn a_pair_links_and_returns_to_local_with_an_empty_ledger() {
     assert_eq!(status.peer, "-");
 }
 
+/// A restored source must reconcile a newer remembered pair without a manual claim.
+#[test]
+fn restored_owner_reconciles_a_receivers_higher_serial_before_switching() {
+    let _serial = common::serial();
+    const SOURCE_SERIAL: u64 = 1;
+    const RECEIVER_SERIAL: u64 = 2;
+    let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
+        common::seed_restored_source_owner(a_root, b_root, SOURCE_SERIAL, RECEIVER_SERIAL);
+    });
+    harness.wait_linked();
+
+    let source = harness
+        .a
+        .wait_for(
+            "restored source adopts at least the receiver's remembered serial",
+            Duration::from_secs(20),
+            |status| {
+                status.role == "owner"
+                    && status.owner == harness.a.id
+                    && status.serial >= RECEIVER_SERIAL
+            },
+        )
+        .expect("the lower restored source pair must reconcile automatically");
+    let receiver = harness
+        .b
+        .wait_for(
+            "receiver agrees on the restored source's ownership pair",
+            Duration::from_secs(20),
+            |status| status.owner == source.owner && status.serial == source.serial,
+        )
+        .expect("both cores must agree on the same ownership pair");
+    assert_eq!(receiver.owner, harness.a.id);
+    assert_eq!(receiver.serial, source.serial);
+    assert!(source.serial > SOURCE_SERIAL);
+
+    // Only normal switch requests: Remote on both, then Local with no pressed inputs.
+    harness.cycle();
+    for node in [&harness.a, &harness.b] {
+        let status = node.status().expect("status after returning Local");
+        assert_eq!(status.owner, source.owner);
+        assert_eq!(status.serial, source.serial);
+        assert!(
+            status.is_idle(),
+            "cleanup must leave no lease or keys: {status:?}"
+        );
+    }
+}
+
 /// The CI variant of the 1000-cycle run: fifty transitions, every invariant checked.
 #[test]
 fn fifty_transitions_run_in_ci() {

@@ -1044,6 +1044,32 @@ pub fn append_config(root: &Path, fragment: &str) {
     std::fs::write(&path, document).expect("configuration");
 }
 
+/// Seeds divergent remembered pairs before either paired core starts.
+///
+/// Both name the source as owner, but the receiver remembers a newer serial. The source
+/// must recover automatically through its startup claim and the real peer handshake.
+pub fn seed_restored_source_owner(
+    a_root: &PathBuf,
+    b_root: &PathBuf,
+    source_serial: u64,
+    receiver_serial: u64,
+) {
+    let (source_id, _) = peer_ids(a_root, b_root);
+    for (root, serial, claim_on_startup) in [
+        (a_root, source_serial, true),
+        (b_root, receiver_serial, false),
+    ] {
+        let path = root.join("config/config.toml");
+        let mut config = config::Config::load(&path).expect("paired configuration");
+        config.node.claim_on_startup = claim_on_startup;
+        config.workspace.owner_claim_serial = serial;
+        config.workspace.owner_node_id = source_id.clone();
+        config
+            .save(&path)
+            .expect("remembered ownership configuration");
+    }
+}
+
 /// The `[topology]` document `--dry-motion` walks across.
 ///
 /// One 1920×1080 display per node; each side describes the same bidirectional boundary

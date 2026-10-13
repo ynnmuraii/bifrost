@@ -11,8 +11,8 @@
 //! nodes disagreed about who owned the workspace.
 //!
 //! This store owns exactly that write. `Session::apply` calls [`OwnershipStore::observe`]
-//! after every decision batch; the pair is compared with what the file already says and the
-//! file is rewritten (atomically, `.bak` kept) only when it changed.
+//! after every decision batch; a changed pair is merged into the latest loaded configuration
+//! and the file is rewritten (atomically, `.bak` kept), preserving other writers' settings.
 //!
 //! What the schema cannot hold: `WorkspaceConfig` requires a *consistent* pair
 //! («serial > 0 requires a non-empty node_id and vice versa»), so a floor with no owner to
@@ -24,28 +24,26 @@ use std::path::PathBuf;
 
 use focus_router as fr;
 
+// ponytail: one process-wide lock serializes both config stores; use per-path locks only
+// if a core needs to persist multiple independent configurations concurrently.
+pub(crate) static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Writes the ownership pair into `config.toml` when it changes.
 pub struct OwnershipStore {
     /// The configuration file this core was started with.
     path: PathBuf,
-    /// The loaded configuration, kept so a rewrite preserves every other setting in it.
-    config: config::Config,
     /// The pair the file holds: `(serial, owner node id as lower-case hex)`.
     saved: (u64, String),
 }
 
 impl OwnershipStore {
     /// Seeds the store from the configuration that was just loaded.
-    pub fn new(path: PathBuf, config: config::Config) -> Self {
+    pub fn new(path: PathBuf, config: &config::Config) -> Self {
         let saved = (
             config.workspace.owner_claim_serial,
             config.workspace.owner_node_id.clone(),
         );
-        Self {
-            path,
-            config,
-            saved,
-        }
+        Self { path, saved }
     }
 
     /// Persists the router's ownership pair when it changed.
@@ -67,9 +65,25 @@ impl OwnershipStore {
         if pair.0 == 0 || pair == self.saved {
             return;
         }
-        self.config.workspace.owner_claim_serial = pair.0;
-        self.config.workspace.owner_node_id = pair.1.clone();
-        match self.config.save(&self.path) {
+        // The lock protects the whole read-modify-write, including the atomic save.
+        // It holds no mutable state, so a prior panic cannot invalidate its contents.
+        let _write_guard = CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut config = match config::Config::load(&self.path) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    serial = pair.0,
+                    "cannot reload configuration to persist ownership; the next change will retry"
+                );
+                return;
+            }
+        };
+        config.workspace.owner_claim_serial = pair.0;
+        config.workspace.owner_node_id = pair.1.clone();
+        match config.save(&self.path) {
             Ok(()) => self.saved = pair,
             Err(error) => {
                 tracing::warn!(
@@ -125,7 +139,7 @@ mod tests {
     #[test]
     fn the_pair_is_written_only_when_it_changes() {
         let (path, config) = temp_config("changed");
-        let mut store = OwnershipStore::new(path.clone(), config);
+        let mut store = OwnershipStore::new(path.clone(), &config);
         let local = node(1);
 
         store.observe(&adopted(local, 3, local));
@@ -164,7 +178,7 @@ mod tests {
     #[test]
     fn a_reload_keeps_the_floor_so_the_next_claim_is_max_seen_plus_one() {
         let (path, config) = temp_config("reload");
-        let mut store = OwnershipStore::new(path.clone(), config);
+        let mut store = OwnershipStore::new(path.clone(), &config);
         let local = node(1);
         store.observe(&adopted(local, 7, local));
 
@@ -194,9 +208,78 @@ mod tests {
     }
 
     #[test]
+    fn alternating_store_writes_preserve_ownership_layout_and_external_settings() {
+        let (path, config) = temp_config("interleaved");
+        let local = node(1);
+        // Both stores start with the same snapshot, as they do in the running core.
+        let mut ownership_store = OwnershipStore::new(path.clone(), &config);
+        let mut layout_store = crate::layout_store::LayoutStore::new(path.clone(), &config, local);
+        let mut layout = layout_store.restored();
+
+        for serial in 1..=3 {
+            ownership_store.observe(&adopted(local, serial, local));
+            let persisted = config::Config::load(&path).expect("reload after ownership");
+            assert_eq!(persisted.workspace.owner_claim_serial, serial);
+            assert_eq!(persisted.topology.revision, serial - 1);
+            if serial > 1 {
+                assert!(!persisted.node.claim_on_startup);
+                assert_eq!(
+                    persisted.network.listen_address,
+                    format!("192.168.1.{}", 9 + serial)
+                );
+            }
+
+            // A settings editor writes between the two core stores.
+            let mut edited = persisted;
+            edited.node.claim_on_startup = false;
+            edited.network.listen_address = format!("192.168.1.{}", 10 + serial);
+            edited.save(&path).expect("save external settings");
+
+            let outcome = layout.apply_edit(
+                &crate::layout::Edit {
+                    expected: layout.applied(),
+                    editor: local,
+                    layout_toml: "links = []".to_owned(),
+                },
+                local,
+                true,
+                |_| Ok(()),
+            );
+            assert!(matches!(outcome, crate::layout::EditOutcome::Applied(_)));
+            layout_store.observe(&layout, &config::TopologyConfig::default());
+
+            let persisted = config::Config::load(&path).expect("reload after layout");
+            assert_eq!(persisted.workspace.owner_claim_serial, serial);
+            assert_eq!(
+                persisted.workspace.owner_node_id,
+                identity::fingerprint(&local)
+            );
+            assert_eq!(persisted.topology.revision, serial);
+            assert_eq!(persisted.topology.max_seen_revision, serial);
+            assert!(!persisted.node.claim_on_startup);
+            assert_eq!(
+                persisted.network.listen_address,
+                format!("192.168.1.{}", 10 + serial)
+            );
+
+            // Exercise the same reload views the next core consumes.
+            let restored_ownership = fr::Ownership::new(local, true).restore(
+                persisted.workspace.owner_claim_serial,
+                Some((persisted.workspace.owner_claim_serial, local)),
+            );
+            assert_eq!(restored_ownership.serial(), serial);
+            assert_eq!(restored_ownership.max_seen_serial(), serial);
+            let restored_layout =
+                crate::layout_store::LayoutStore::new(path.clone(), &persisted, local).restored();
+            assert_eq!(restored_layout.applied(), layout.applied());
+            assert_eq!(restored_layout.max_seen(), layout.max_seen());
+        }
+    }
+
+    #[test]
     fn a_floor_without_an_owner_leaves_the_file_alone() {
         let (path, config) = temp_config("ownerless");
-        let mut store = OwnershipStore::new(path.clone(), config);
+        let mut store = OwnershipStore::new(path.clone(), &config);
         let before = std::fs::read_to_string(&path).expect("read");
 
         // `max_seen_serial = 5` with nobody to name: the schema's consistent pair has
