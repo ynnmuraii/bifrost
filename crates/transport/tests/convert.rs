@@ -916,3 +916,36 @@ fn the_entry_display_of_a_lease_becomes_the_batch_display() {
     assert_eq!(position.display_id, "eDP-1");
     assert_eq!((position.x, position.y), (640.0, 360.0));
 }
+
+/// The cheap encodability filter `link::write_message` uses must agree exactly with what
+/// [`to_envelope`] accepts, or a future event kind would slip past it and end the link again
+/// (audit F4).
+#[test]
+fn the_encodable_filter_agrees_with_the_encoder() {
+    let events = [
+        InputEvent::PointerAbsolute(input_model::Position::new(1.0, 2.0)),
+        InputEvent::PointerRelative { dx: 1, dy: 2 },
+        InputEvent::Key {
+            key: HidKey::keyboard(0x04),
+            state: KeyState::Down,
+        },
+        InputEvent::Button {
+            button: MouseButton::Left,
+            state: KeyState::Up,
+        },
+        InputEvent::Scroll {
+            h120: 120,
+            v120: -120,
+        },
+    ];
+    for event in events {
+        let batch = fr::Message::InputBatch {
+            lease_id: LEASE,
+            input_batch_seq: 1,
+            events: vec![event],
+        };
+        let encodable = to_envelope(&batch, 1, &CONNECTION, Some(&LEASE), "").is_ok();
+        let kept = transport::convert::split_encodable(&[event]).0.len() == 1;
+        assert_eq!(kept, encodable, "the filter disagrees with the encoder for {event:?}");
+    }
+}

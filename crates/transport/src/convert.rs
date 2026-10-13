@@ -687,7 +687,10 @@ fn from_wire_event(event: &wire::InputEvent) -> Result<InputEvent, ConvertError>
     match event.event.as_ref() {
         Some(Event::PointerAbsolute(position)) => {
             // The display id is part of the wire contract; the normalized event has no field
-            // for it (see `to_envelope`), so it is checked here and then dropped.
+            // for it (see `to_envelope`), so it is checked here and then dropped. The check
+            // stays strict on purpose (the receiver has nothing to resolve an empty id into),
+            // but it is no longer a link teardown: an `InputBatch` that cannot be decoded
+            // drops the frame and the link lives on (audit F4).
             if position.display_id.is_empty() {
                 return Err(ConvertError::Unsupported(
                     "PointerAbsolute without display_id",
@@ -740,6 +743,30 @@ fn from_wire_event(event: &wire::InputEvent) -> Result<InputEvent, ConvertError>
         }),
         None => Err(ConvertError::Unsupported("empty InputEvent")),
     }
+}
+
+/// The events of a batch that this layer can put on the wire, and how many it cannot.
+///
+/// [`to_wire_event`] refuses [`InputEvent::PointerRelative`]: `protocol.proto`'s `InputEvent`
+/// has no relative member, and relative-only *injection* does not exist. One such event must
+/// not be able to fail a whole `InputBatch` — and, through `write_message`, it must not be
+/// able to end the link — so the batch keeps the rest of its events (a key or button edge in
+/// it still travels) and the caller logs the count (audit F4).
+///
+/// The `the_encodable_filter_agrees_with_the_encoder` test pins this list to what
+/// [`to_wire_event`] accepts, so the cheap check here cannot drift from the encoder.
+#[must_use]
+pub fn split_encodable(events: &[InputEvent]) -> (Vec<InputEvent>, usize) {
+    let mut kept = Vec::with_capacity(events.len());
+    let mut dropped = 0usize;
+    for event in events {
+        if matches!(event, InputEvent::PointerRelative { .. }) {
+            dropped += 1;
+        } else {
+            kept.push(*event);
+        }
+    }
+    (kept, dropped)
 }
 
 fn key_state_to_i32(state: KeyState) -> i32 {
