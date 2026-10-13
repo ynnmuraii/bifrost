@@ -38,8 +38,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<WriteOutcome> {
     restrict_file(&temporary)?;
 
     let outcome = if path.exists() {
+        // The backup is made through a temporary file and a `rename`, like the write itself:
+        // `fs::copy` straight onto `<path>.bak` leaves a *torn* backup if it fails or is
+        // interrupted (a full disk, a concurrent writer, a crash), and the documented
+        // recovery («При ошибке разбора: загрузить `.bak`») would then have nothing to load.
+        // This way `.bak` is always either the whole previous file or the whole new one.
         let backup = backup_path(path);
-        fs::copy(path, &backup)?;
+        copy_atomic(path, &backup)?;
         WriteOutcome::Replaced { backup }
     } else {
         WriteOutcome::Created
@@ -48,6 +53,21 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<WriteOutcome> {
     fs::rename(&temporary, path)?;
     sync_directory(directory);
     Ok(outcome)
+}
+
+/// Copies `from` onto `to` atomically: write a temporary sibling, fsync it, rename it over the
+/// destination.
+fn copy_atomic(from: &Path, to: &Path) -> io::Result<()> {
+    let temporary = temporary_path(to);
+    {
+        let mut source = fs::File::open(from)?;
+        let mut target = fs::File::create(&temporary)?;
+        io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+    }
+    restrict_file(&temporary)?;
+    fs::rename(&temporary, to)?;
+    Ok(())
 }
 
 /// Reads `path`; on a parse failure the caller asks for [`read_with_backup`] instead.
@@ -191,4 +211,70 @@ fn sync_directory(_directory: &Path) {
     // Opening a directory as a file needs `FILE_FLAG_BACKUP_SEMANTICS`; the identity key
     // is re-writable at any time, so an unsynced rename is an acceptable failure mode on
     // Windows (the value is regenerated, not lost).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lws-atomic-tests-{}-{}-{label}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a temporary directory");
+        dir
+    }
+
+    /// Batch-5 audit (F18): the backup is the *previous* content, whole, and it parses - the
+    /// documented `.bak` recovery depends on it.
+    #[test]
+    fn the_backup_holds_the_previous_content_and_is_never_torn() {
+        let dir = temp_dir("backup");
+        let path = dir.join("trust.toml");
+        write_atomic(&path, b"first").expect("the first write");
+        let outcome = write_atomic(&path, b"second").expect("the second write");
+        let WriteOutcome::Replaced { backup } = outcome else {
+            panic!("the second write has a backup");
+        };
+        assert_eq!(fs::read(&path).expect("the primary"), b"second");
+        assert_eq!(
+            fs::read(&backup).expect("the backup"),
+            b"first",
+            "the backup is the whole previous file"
+        );
+
+        // A further write replaces the backup the same way, so the *current* file is the one
+        // the recovery rule reads.
+        write_atomic(&path, b"third").expect("the third write");
+        assert_eq!(fs::read(&backup).expect("the backup"), b"second");
+        assert_eq!(fs::read(&path).expect("the primary"), b"third");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed backup leaves the primary exactly as it was: no half-written file, and no
+    /// backup that disagrees with the file it is supposed to protect.
+    #[test]
+    fn a_failed_backup_leaves_the_primary_untouched() {
+        let dir = temp_dir("failed-backup");
+        let path = dir.join("trust.toml");
+        write_atomic(&path, b"first").expect("the first write");
+        // A directory where the backup must go: the final rename onto it fails.
+        fs::create_dir(dir.join("trust.toml.bak")).expect("a directory in the backup's place");
+        assert!(
+            write_atomic(&path, b"second").is_err(),
+            "the write reports the failure"
+        );
+        assert_eq!(
+            fs::read(&path).expect("the primary"),
+            b"first",
+            "the primary is not half-written"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
