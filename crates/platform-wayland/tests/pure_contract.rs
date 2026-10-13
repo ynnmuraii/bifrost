@@ -327,6 +327,38 @@ fn eis_regions_preserve_logical_geometry_and_fractional_scale() {
 }
 
 #[test]
+fn laptop_fractional_scale_keeps_region_bounds_in_logical_units() {
+    let region = Region::from_ei(&reis::event::Region {
+        x: 0,
+        y: 0,
+        width: 1745,
+        height: 1091,
+        scale: 1.1,
+        mapping_id: None,
+    });
+    // These logical positions remain valid even though multiplying them by the
+    // compositor's physical scale would put them outside the advertised region.
+    for position in [
+        Position::new(0.0, 0.0),
+        Position::new(1600.0, 1000.0),
+        Position::new(1744.5, 1090.5),
+    ] {
+        assert!(region.contains(position), "{position:?}");
+    }
+    // Bounds are half-open and must not be expanded to physical dimensions.
+    for position in [
+        Position::new(-0.5, 0.0),
+        Position::new(0.0, -0.5),
+        Position::new(1745.0, 0.0),
+        Position::new(0.0, 1091.0),
+        Position::new(1800.0, 1000.0),
+        Position::new(1600.0, 1150.0),
+    ] {
+        assert!(!region.contains(position), "{position:?}");
+    }
+}
+
+#[test]
 fn regions_reject_nonfinite_positions_and_empty_areas_without_overflow() {
     let region = Region {
         x: u32::MAX,

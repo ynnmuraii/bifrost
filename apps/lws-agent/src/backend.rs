@@ -26,6 +26,8 @@ use std::time::{Duration, Instant, SystemTime};
 mod wayland;
 #[cfg(windows)]
 mod win;
+#[cfg(all(windows, test))]
+pub(crate) use win::SourceMotion;
 #[cfg(target_os = "linux")]
 mod x11;
 // Pure geometry, so its unit tests run on every host; only the Linux backend calls it.

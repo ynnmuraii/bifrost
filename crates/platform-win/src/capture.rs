@@ -316,6 +316,14 @@ impl Capture {
         }
     }
 
+    /// Current physical cursor position, used once to seed a fresh source capture.
+    pub fn cursor_position() -> Result<Position, Error> {
+        let mut point = POINT::default();
+        // SAFETY: GetCursorPos writes into this valid POINT.
+        unsafe { GetCursorPos(&mut point) }?;
+        Ok(Position::new(f64::from(point.x), f64::from(point.y)))
+    }
+
     /// Event stream. Use the convenience methods below instead of draining this
     /// in a hot loop when a bounded wait is enough.
     #[must_use]

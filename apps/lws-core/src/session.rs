@@ -2043,16 +2043,13 @@ impl Session {
             // The captured position is in the node's logical space, so it is resolved
             // against the manifests before anything geometric happens.
             let position = match self.topology.as_ref().and_then(|topology| {
-                crate::topology::position_on_or_last_display(
+                crate::topology::capture_position(
                     topology,
                     &self.node_id,
                     pointer.x,
                     pointer.y,
-                    if remote {
-                        None
-                    } else {
-                        self.local_pointer.as_ref()
-                    },
+                    self.local_pointer.as_ref(),
+                    remote,
                 )
             }) {
                 Some(position) => position,
@@ -2155,12 +2152,7 @@ impl Session {
             return;
         };
         let step = geometry::Point::new(motion.x * self.pointer_gain, motion.y * self.pointer_gain);
-        let crossing = geometry::resolve_motion(topology, &node, &position, step);
-        let advanced = geometry::Position::new(
-            position.display_id.clone(),
-            position.x + step.x,
-            position.y + step.y,
-        );
+        let (advanced, crossing) = crate::topology::remote_step(topology, &node, &position, step);
         let Some(transition) = crossing else {
             self.remote_pointer = Some(advanced);
             return;

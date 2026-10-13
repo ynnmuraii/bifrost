@@ -158,20 +158,28 @@ pub fn position_on(
     ))
 }
 
-/// Maps a captured point to its display-local coordinates, keeping an overshoot on the
-/// last display only when it has left the node's overall display bounds.
+/// Maps a captured source-node point to display-local coordinates.
 ///
-/// Some cursor injection APIs report a requested position beyond the physical desktop
-/// while the actual cursor is clamped to its edge. Continue that sample on the last
-/// display so edge detection can observe it, but do not reinterpret an internal monitor
-/// gap as an edge crossing.
-pub fn position_on_or_last_display(
+/// Local observation follows physical displays and ignores internal gaps. Remote
+/// capture integrates raw deltas into a virtual source point, which may cross any
+/// physical edge or gap; retain its original display basis to preserve those deltas.
+pub fn capture_position(
     topology: &Topology,
     node: &NodeId,
     x: f64,
     y: f64,
     last: Option<&geometry::Position>,
+    remote: bool,
 ) -> Option<geometry::Position> {
+    if remote {
+        let last = last?;
+        let display = topology.display(node, &last.display_id)?;
+        return Some(geometry::Position::new(
+            last.display_id.clone(),
+            x - display.logical_bounds.x,
+            y - display.logical_bounds.y,
+        ));
+    }
     if let Some(position) = position_on(topology, node, x, y) {
         return Some(position);
     }
@@ -190,6 +198,31 @@ pub fn position_on_or_last_display(
         x - display.logical_bounds.x,
         y - display.logical_bounds.y,
     ))
+}
+
+/// Advances the receiver estimate and resolves a return/chained edge before clamping.
+pub fn remote_step(
+    topology: &Topology,
+    node: &NodeId,
+    position: &geometry::Position,
+    motion: geometry::Point,
+) -> (geometry::Position, Option<geometry::Transition>) {
+    let crossing = geometry::resolve_motion(topology, node, position, motion);
+    let mut advanced = geometry::Position::new(
+        position.display_id.clone(),
+        position.x + motion.x,
+        position.y + motion.y,
+    );
+    if let Some(display) = topology.display(node, &position.display_id) {
+        let size = display.logical_size();
+        // EIS encodes positions as f32: keep the exclusive edge exclusive after
+        // that conversion too, rather than rounding a valid f64 up to the edge.
+        let max_x = f64::from((size.width as f32).next_down()).max(0.0);
+        let max_y = f64::from((size.height as f32).next_down()).max(0.0);
+        advanced.x = advanced.x.clamp(0.0, max_x);
+        advanced.y = advanced.y.clamp(0.0, max_y);
+    }
+    (advanced, crossing)
 }
 
 /// The events a peer receives while a source lease is remote.
@@ -816,7 +849,7 @@ mod tests {
 
         // SendInput can report its requested point even though Windows clamps the actual
         // cursor to x=1079 on this 1080-wide virtual desktop.
-        let current = position_on_or_last_display(&document, &node, 1087.0, 959.0, Some(&last))
+        let current = capture_position(&document, &node, 1087.0, 959.0, Some(&last), false)
             .expect("the overshoot continues on the last display");
         assert_eq!(current, geometry::Position::new("eDP-1", 1087.0, 959.0));
         let motion = geometry::Point::new(current.x - last.x, current.y - last.y);
@@ -824,10 +857,157 @@ mod tests {
             geometry::resolve_motion(&document, &node, &current, motion).expect("right edge link");
         assert_eq!(transition.target.node, NodeId::new(peer_id()));
 
-        assert!(
-            position_on_or_last_display(&document, &node, -100.0, 1500.0, Some(&last)).is_none()
+        assert!(capture_position(&document, &node, -100.0, 1500.0, Some(&last), false).is_none());
+        assert!(capture_position(&document, &node, 1087.0, 959.0, None, false).is_none());
+    }
+
+    #[test]
+    fn remote_virtual_source_motion_is_not_lost_in_a_physical_monitor_gap() {
+        let config = config::TopologyConfig::default();
+        let local = [
+            info(
+                "primary",
+                [0.0, 0.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                true,
+            ),
+            info(
+                "right",
+                [3200.0, 0.0, 800.0, 600.0],
+                [3200, 0, 800, 600],
+                false,
+            ),
+        ];
+        let document = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &[],
+        })
+        .unwrap();
+        let node = NodeId::new(local_id());
+        let last = geometry::Position::new("primary", 1919.0, 540.0);
+        let current = capture_position(&document, &node, 1931.0, 546.0, Some(&last), true)
+            .expect("Remote uses the virtual source point, not physical screen membership");
+        assert_eq!(current, geometry::Position::new("primary", 1931.0, 546.0));
+        assert_eq!(
+            geometry::Point::new(current.x - last.x, current.y - last.y),
+            geometry::Point::new(12.0, 6.0)
         );
-        assert!(position_on_or_last_display(&document, &node, 1087.0, 959.0, None).is_none());
+    }
+
+    #[test]
+    fn remote_motion_accumulates_clamps_and_resolves_the_return_edge() {
+        let config = topology_config();
+        let local = [info(
+            "eDP-1",
+            [0.0, 0.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 1745.0, 1091.0], true)],
+        )];
+        let document = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .unwrap();
+        let peer = NodeId::new(peer_id());
+        let mut position = geometry::Position::new("DP-1", 2.0, 540.0);
+        let mut source_position = geometry::Position::new("eDP-1", 1919.0, 540.0);
+        let captured = ipc::CapturedBatch {
+            events: [(1931.0, 546.0), (1943.0, 552.0)]
+                .into_iter()
+                .map(|(x, y)| ipc::LocalEvent {
+                    monotonic_us: 0,
+                    ev: Some(ipc::local_event::Ev::Pointer(ipc::PointerAbs {
+                        display_id: String::new(),
+                        x,
+                        y,
+                    })),
+                })
+                .collect(),
+            at_edge: false,
+        };
+        for (event, (expected_x, expected_y)) in
+            captured.events.iter().zip([(14.0, 546.0), (26.0, 552.0)])
+        {
+            let Some(ipc::local_event::Ev::Pointer(pointer)) = &event.ev else {
+                panic!("expected source pointer");
+            };
+            let current = capture_position(
+                &document,
+                &NodeId::new(local_id()),
+                pointer.x,
+                pointer.y,
+                Some(&source_position),
+                true,
+            )
+            .unwrap();
+            let motion =
+                geometry::Point::new(current.x - source_position.x, current.y - source_position.y);
+            source_position = current;
+            let (advanced, crossing) = remote_step(&document, &peer, &position, motion);
+            assert!(crossing.is_none());
+            position = advanced;
+            let message = focus_router::Message::InputBatch {
+                lease_id: [7; 16],
+                input_batch_seq: 0,
+                events: forward_events(
+                    vec![crate::routing::input_event_of(event).unwrap()],
+                    Some(&position),
+                ),
+            };
+            let envelope =
+                transport::convert::to_envelope(&message, 1, &[2; 16], Some(&[7; 16]), "DP-1")
+                    .unwrap();
+            let focus_router::Message::InputBatch { events, .. } =
+                transport::convert::from_envelope(&envelope).unwrap()
+            else {
+                panic!("expected received InputBatch");
+            };
+            assert_eq!(
+                events,
+                vec![input_model::InputEvent::PointerAbsolute(
+                    input_model::Position::new(expected_x, expected_y)
+                )]
+            );
+            assert_eq!(position.x, expected_x);
+        }
+        assert_eq!(position.y, 552.0);
+        let (clamped, crossing) = remote_step(
+            &document,
+            &peer,
+            &position,
+            geometry::Point::new(3000.0, 2000.0),
+        );
+        assert!(crossing.is_none(), "an unlinked edge does not open a lease");
+        assert!(clamped.x >= 0.0 && clamped.x < 1745.0);
+        assert!(clamped.y >= 0.0 && clamped.y < 1091.0);
+        for expected_x in [14.0, 2.0] {
+            let (advanced, crossing) = remote_step(
+                &document,
+                &peer,
+                &position,
+                geometry::Point::new(-12.0, 0.0),
+            );
+            assert!(crossing.is_none());
+            position = advanced;
+            assert_eq!(position.x, expected_x);
+        }
+        let (_, crossing) =
+            remote_step(&document, &peer, &position, geometry::Point::new(-3.0, 0.0));
+        assert_eq!(
+            crossing
+                .expect("accumulated deltas cross the entry edge")
+                .target
+                .node,
+            NodeId::new(local_id())
+        );
     }
 
     #[test]
