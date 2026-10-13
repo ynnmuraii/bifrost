@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use identity::{IdentityPaths, NodeIdentity, TrustStore, TrustedPeer, now_unix_ms};
+use identity::{now_unix_ms, IdentityPaths, NodeIdentity, TrustStore, TrustedPeer};
 use input_model::{HidKey, InputEvent, KeyState};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -79,7 +79,9 @@ async fn a_batch_with_an_unrepresentable_event_does_not_end_the_link() {
         identity::trusted_client_config(&client, &trust_of(&[(server_id, address)]))
             .expect("client config");
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let tcp = tokio::net::TcpStream::connect(address).await.expect("connect");
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
     tcp.set_nodelay(true).expect("nodelay");
     let tls = connector
         .connect(identity::server_name(address.ip()), tcp)
@@ -230,7 +232,9 @@ async fn an_unreadable_inbound_batch_does_not_end_the_link() {
         identity::trusted_client_config(&client, &trust_of(&[(server_id, address)]))
             .expect("client config");
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let tcp = tokio::net::TcpStream::connect(address).await.expect("connect");
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
     tcp.set_nodelay(true).expect("nodelay");
     let tls = connector
         .connect(identity::server_name(address.ip()), tcp)
@@ -273,14 +277,15 @@ async fn an_unreadable_inbound_batch_does_not_end_the_link() {
         can_own: true,
         ..Default::default()
     };
-    let envelope = |seq: u64, payload: protocol::wire::envelope::Payload| protocol::wire::Envelope {
-        major: protocol::limits::PROTOCOL_MAJOR,
-        minor: protocol::limits::PROTOCOL_MINOR,
-        connection_id: connection_id.clone(),
-        seq,
-        lease_id: Vec::new(),
-        payload: Some(payload),
-    };
+    let envelope =
+        |seq: u64, payload: protocol::wire::envelope::Payload| protocol::wire::Envelope {
+            major: protocol::limits::PROTOCOL_MAJOR,
+            minor: protocol::limits::PROTOCOL_MINOR,
+            connection_id: connection_id.clone(),
+            seq,
+            lease_id: Vec::new(),
+            payload: Some(payload),
+        };
     let batch = |x: f64, display: &str| {
         protocol::wire::envelope::Payload::InputBatch(protocol::wire::InputBatch {
             events: vec![protocol::wire::InputEvent {
@@ -316,7 +321,10 @@ async fn an_unreadable_inbound_batch_does_not_end_the_link() {
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(50), report_rx.recv()).await {
             Ok(Some(LinkReport::Message {
-                message: transport::convert::Inbound::Focus(focus_router::Message::InputBatch { events, .. }),
+                message:
+                    transport::convert::Inbound::Focus(focus_router::Message::InputBatch {
+                        events, ..
+                    }),
                 ..
             })) => {
                 assert_eq!(events.len(), 1, "the good batch carries its one event");

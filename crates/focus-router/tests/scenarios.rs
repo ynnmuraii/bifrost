@@ -982,7 +982,10 @@ fn source_router(lease_ttl_ms: u64) -> FocusRouter {
 fn the_source_watchdog_uses_the_receivers_advertised_lease_ttl() {
     let mut r = source_router(300);
     r.handle(10, switch(SwitchTrigger::Edge));
-    r.handle(11, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+    r.handle(
+        11,
+        Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+    );
     r.handle(12, net(ack(id(1), None)));
     // The receiver's own `lease_ttl_ms` is 1000 ms, more than three times the source's.
     r.handle(
@@ -993,7 +996,10 @@ fn the_source_watchdog_uses_the_receivers_advertised_lease_ttl() {
             ttl_ms: 1000,
         }),
     );
-    let committed = r.handle(14, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+    let committed = r.handle(
+        14,
+        Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+    );
     assert_eq!(r.focus(), FocusState::Remote);
     assert!(
         committed.contains(&arm(Timer::SourceLeaseWatchdog, 1_014)),
@@ -1021,7 +1027,10 @@ fn a_lease_challenge_ttl_outside_the_documented_range_is_clamped() {
     for (advertised, effective) in [(1u32, 300u64), (600_000, 1_000)] {
         let mut r = source_router(300);
         r.handle(10, switch(SwitchTrigger::Edge));
-        r.handle(11, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+        r.handle(
+            11,
+            Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+        );
         r.handle(12, net(ack(id(1), None)));
         r.handle(
             13,
@@ -1031,7 +1040,10 @@ fn a_lease_challenge_ttl_outside_the_documented_range_is_clamped() {
                 ttl_ms: advertised,
             }),
         );
-        let committed = r.handle(14, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+        let committed = r.handle(
+            14,
+            Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+        );
         assert!(
             committed.contains(&arm(Timer::SourceLeaseWatchdog, 14 + effective)),
             "advertised {advertised} ms must clamp to {effective} ms: {committed:?}"

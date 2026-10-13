@@ -14,11 +14,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use identity::{IdentityPaths, NodeIdentity, TrustStore, TrustedPeer, now_unix_ms};
+use identity::{now_unix_ms, IdentityPaths, NodeIdentity, TrustStore, TrustedPeer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use transport::link::LinkConfig;
-use transport::{read_frame, Direction, LinkReport, LinkLiveness, Stream};
+use transport::{read_frame, Direction, LinkLiveness, LinkReport, Stream};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -67,18 +67,22 @@ async fn a_saturated_queue_cannot_swallow_the_link_close() {
         .expect("bind an ephemeral port");
     let address = listener.local_addr().expect("local address");
 
-    let server_config = identity::trusted_server_config(&server, &trust_of(&[(client_id, address)]))
-        .expect("server config");
+    let server_config =
+        identity::trusted_server_config(&server, &trust_of(&[(client_id, address)]))
+            .expect("server config");
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let accepting = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.expect("accept");
         acceptor.accept(tcp).await.expect("handshake")
     });
 
-    let client_config = identity::trusted_client_config(&client, &trust_of(&[(server_id, address)]))
-        .expect("client config");
+    let client_config =
+        identity::trusted_client_config(&client, &trust_of(&[(server_id, address)]))
+            .expect("client config");
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let tcp = tokio::net::TcpStream::connect(address).await.expect("connect");
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
     tcp.set_nodelay(true).expect("nodelay");
     let tls = connector
         .connect(identity::server_name(address.ip()), tcp)

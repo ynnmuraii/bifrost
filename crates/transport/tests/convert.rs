@@ -946,6 +946,9 @@ fn the_encodable_filter_agrees_with_the_encoder() {
         };
         let encodable = to_envelope(&batch, 1, &CONNECTION, Some(&LEASE), "").is_ok();
         let kept = transport::convert::split_encodable(&[event]).0.len() == 1;
-        assert_eq!(kept, encodable, "the filter disagrees with the encoder for {event:?}");
+        assert_eq!(
+            kept, encodable,
+            "the filter disagrees with the encoder for {event:?}"
+        );
     }
 }

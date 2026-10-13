@@ -2614,8 +2614,17 @@ impl Session {
         // The agent process is going away with whatever capture it held: a restarted agent
         // starts with none, so the observation must be armed again once it is back.
         self.disarm_observation();
-        for grant in self.agent.drain_portal_grants().await {
-            self.on_portal_grant(grant).await;
+        // The agent's last frames: the portal grants go where they always did, and nothing
+        // else is thrown away (audit F7) — a `Released`/`DeadlineExpired` in the tail is what
+        // finishes a release the FSM is waiting for, instead of the release guard.
+        let (grants, rest) = split_agent_tail(self.agent.drain_agent_tail().await);
+        for changed in grants {
+            self.on_portal_grant(changed).await;
+        }
+        for frame in rest {
+            if let Err(error) = Box::pin(self.on_agent_frame(frame)).await {
+                tracing::warn!(%error, "an agent frame from the tail could not be handled");
+            }
         }
         self.agent_lost_reported = true;
         self.agent.stop().await;
@@ -3185,6 +3194,31 @@ impl Timers {
     }
 }
 
+/// Splits the frames a dying agent left behind (audit F7).
+///
+/// The portal grants are the ones core persists and must be reported before the channel is
+/// dropped; **every other frame keeps its normal meaning** and is handed to the session —
+/// throwing the tail away left the FSM waiting for a `Released` that had already arrived, so
+/// the transition only finished when the release guard expired. An empty frame carries no
+/// message and is dropped here, which is what the live loop does with it too.
+fn split_agent_tail(
+    frames: Vec<protocol::ipc::AgentFrame>,
+) -> (
+    Vec<protocol::ipc::PortalGrantChanged>,
+    Vec<protocol::ipc::AgentFrame>,
+) {
+    let mut grants = Vec::new();
+    let mut rest = Vec::new();
+    for frame in frames {
+        match frame.msg {
+            Some(Msg::PortalGrant(changed)) => grants.push(changed),
+            Some(_) => rest.push(frame),
+            None => {}
+        }
+    }
+    (grants, rest)
+}
+
 /// Revalidates an edited layout document (KVM-072: the coordinator validates the whole
 /// document; ADR-013 rejected merging rows for exactly that reason).
 ///
@@ -3198,6 +3232,49 @@ fn parse_layout_toml(layout_toml: &str) -> Result<config::TopologyConfig, String
         return Err("layout_toml: a document with neither displays nor links".to_owned());
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod agent_tail_tests {
+    use super::*;
+    use protocol::ipc::agent_frame::Msg;
+
+    fn frame(msg: Msg) -> protocol::ipc::AgentFrame {
+        protocol::ipc::AgentFrame {
+            msg: Some(msg),
+            ..Default::default()
+        }
+    }
+
+    /// Audit F7: the frames an agent left behind are never thrown away.
+    ///
+    /// `drain_portal_grants` kept only the portal grants, so a `Released`/`DeadlineExpired`
+    /// that arrived just before the agent died was consumed and dropped: the FSM waited for a
+    /// release it had already been sent, and only the release guard finished the transition.
+    #[test]
+    fn a_dying_agents_tail_keeps_every_non_portal_frame() {
+        let (grants, rest) = split_agent_tail(vec![
+            frame(Msg::PortalGrant(
+                protocol::ipc::PortalGrantChanged::default(),
+            )),
+            frame(Msg::Released(protocol::ipc::Released::default())),
+            frame(Msg::DeadlineExpired(
+                protocol::ipc::DeadlineExpired::default(),
+            )),
+            frame(Msg::Pong(protocol::ipc::Pong { nonce: 7 })),
+        ]);
+        assert_eq!(grants.len(), 1, "the portal grant is reported");
+        assert_eq!(
+            rest.len(),
+            3,
+            "the released, the deadline and the pong keep their meaning: {rest:?}"
+        );
+        assert!(
+            rest.iter()
+                .any(|frame| matches!(frame.msg, Some(Msg::Released(_)))),
+            "the release the FSM is waiting for survives"
+        );
+    }
 }
 
 #[cfg(test)]
