@@ -1462,8 +1462,11 @@ impl Session {
     /// when the slot clears (see [`Self::release_layout_pending`]), so «a
     /// `layout.pending.toml` is here» always means «this node holds an edit the coordinator has
     /// not applied».
-    fn hold_layout_pending(&mut self, layout_toml: &str) {
-        self.layout_state.hold_pending(layout_toml.to_owned());
+    ///
+    /// `base` is the pair the editor wrote the document against (audit F1): the slot keeps it
+    /// for the later `layout apply`, which re-sends the edit through the coordinator's CAS.
+    fn hold_layout_pending(&mut self, base: crate::layout::Pair, layout_toml: &str) {
+        self.layout_state.hold_pending(base, layout_toml.to_owned());
         self.layout_store.write_pending(layout_toml);
     }
 
@@ -1700,7 +1703,7 @@ impl Session {
     ) -> Handled {
         let is_coordinator = self.router.ownership().is_owner();
         if let Some(reason) = self.layout_editing_disabled.clone() {
-            self.hold_layout_pending(&document_text);
+            self.hold_layout_pending(expected, &document_text);
             return Handled::Reply(ctl::Response::Error {
                 code: "NO_COORDINATOR".to_owned(),
                 detail: format!("{reason}; the edit is kept as pending"),
@@ -1711,7 +1714,7 @@ impl Session {
             // comes back; only a partition keeps it pending (`docs/05-protocol.md`).
             let applied = self.layout_state.applied();
             let Some(owner) = self.router.ownership().owner().copied() else {
-                self.hold_layout_pending(&document_text);
+                self.hold_layout_pending(expected, &document_text);
                 tracing::warn!(
                     expected_revision = expected.revision,
                     expected_author = ?expected.author.map(|id| identity::fingerprint(&id)),
@@ -1726,7 +1729,7 @@ impl Session {
             };
             // The edit occupies the pending slot until the verdict says it was applied, so a
             // refusal or a lost answer leaves the edit — slot and file — for the user's reload.
-            self.hold_layout_pending(&document_text);
+            self.hold_layout_pending(expected, &document_text);
             tracing::info!(
                 owner = %owner,
                 expected_revision = expected.revision,
