@@ -73,6 +73,13 @@ pub use schema::{
 };
 pub use topology::{node_id_from_hex, parse_node_ref, peer_reference};
 
+/// The `[[topology.links]] … display` value that anchors a link at a node's whole desktop
+/// instead of at one monitor (`Endpoint::is_auto`, `geometry::resolve_auto_links`).
+///
+/// One definition, re-exported from `geometry`, so the configuration, the wire and the
+/// resolver cannot drift apart on the spelling.
+pub const AUTO_DISPLAY: &str = geometry::AUTO_DISPLAY_ID;
+
 /// The only accepted `config_version`.
 ///
 /// `docs/03-architecture.md`: «Текущая схема — `config_version = 2` (см. раздел

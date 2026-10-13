@@ -362,6 +362,10 @@ message LinkView {
   bool active = 5;
   // The missing display id when `active` is false; "" otherwise. GUI text only.
   string inactive_reason = 6;
+  // The displays a desktop-anchored endpoint (`display = "auto"`, shown as «Весь рабочий стол
+  // (авто)») resolves to against the live manifests right now, in document order. Empty for a
+  // link that names its displays. GUI text only.
+  repeated string auto_displays = 7;
 }
 message EndpointView {
   string node_id = 1;

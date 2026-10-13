@@ -116,6 +116,10 @@ pub enum Request {
     LayoutApply,
     /// `layout discard`: drop the pending edit.
     LayoutDiscard,
+    /// `layout auto`: replace the document with the desktop-anchored default layout, through
+    /// the coordinator's CAS — the one explicit action that turns a layout naming monitors by
+    /// hand into one that follows them.
+    LayoutAuto,
     /// `pair-open [seconds]`: open the pairing window on the running core
     /// (`GuiFrame.StartPairing`), sized by the optional argument.
     PairOpen(Option<u32>),
@@ -148,7 +152,8 @@ impl Request {
             )),
             "layout" if argument.trim() == "apply" => Ok(Request::LayoutApply),
             "layout" if argument.trim() == "discard" => Ok(Request::LayoutDiscard),
-            "layout" => Err("layout takes show, edit <file>, apply, or discard".to_owned()),
+            "layout" if argument.trim() == "auto" => Ok(Request::LayoutAuto),
+            "layout" => Err("layout takes show, edit <file>, apply, discard, or auto".to_owned()),
             "ping" if argument.is_empty() => Ok(Request::Ping),
             "quit" if argument.is_empty() => Ok(Request::Quit),
             "reset-portals" if argument.is_empty() => Ok(Request::ResetPortals),

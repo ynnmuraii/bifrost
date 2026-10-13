@@ -179,6 +179,26 @@ pub fn build(documents: &Documents<'_>) -> Result<Built, BuildError> {
         links,
     );
 
+    // `display = "auto"` names the desktop, not a display: expand every such endpoint against
+    // the manifests assembled just above, so the resolver only ever sees concrete display
+    // segments and the mapping code stays the one `geometry` already has. A monitor that is
+    // switched off, added back or re-arranged changes the manifests and therefore the resolved
+    // segments on the next rebuild — no configuration edit.
+    let resolution = geometry::resolve_auto_links(&topology);
+    for id in &resolution.unresolved {
+        tracing::debug!(
+            link = %id,
+            "auto layout link unresolved: a node it names reports no display on that edge"
+        );
+    }
+    let Topology {
+        revision,
+        author,
+        nodes,
+        ..
+    } = topology;
+    let topology = Topology::new(revision, author, nodes, resolution.links);
+
     match geometry::validate_topology(&topology) {
         Ok(()) => Ok(Built {
             topology,
@@ -276,6 +296,73 @@ pub fn alias_layout(
             None
         }
     }
+}
+
+/// The stable id of the link [`auto_layout`] writes.
+pub const DEFAULT_LINK_ID: &str = "auto-right";
+
+/// The layout a fresh pair starts from: one desktop-anchored link to the **right** of this
+/// desktop.
+///
+/// The link is `self right` → `peer left`, bidirectional, and *both* endpoints are
+/// `display = "auto"` (`geometry::resolve_auto_links`): the document keeps working when a
+/// monitor is switched off, added back or re-arranged, because the core re-resolves the edges
+/// against the manifests on the next `DisplaysReport` with no edit.
+///
+/// `None` — the user's document is never overwritten — unless the applied document has no
+/// links *and* nobody has applied a document at all (`revision == 0`: a new pair, or a legacy
+/// configuration whose `[topology]` only held display snapshots) or the document is empty
+/// (neither links nor displays). A document someone applied is their choice even when it has
+/// no links. `None` as well when the workspace does not have exactly one peer: with two or
+/// more, where each one goes is the user's call and the GUI is the place to make it.
+#[must_use]
+pub fn default_layout(
+    document: &config::TopologyConfig,
+    peers: &[NodeId],
+) -> Option<config::TopologyConfig> {
+    if !document.links.is_empty() {
+        return None;
+    }
+    if document.revision > 0 && !document.displays.is_empty() {
+        return None;
+    }
+    let mut layout = auto_layout(peers)?;
+    layout.displays = document.displays.clone();
+    Some(layout)
+}
+
+/// [`default_layout`] without the «the applied document is empty» rule, for the explicit
+/// `lws-core layout auto` the owner runs once to replace their document.
+///
+/// `None` unless the workspace has exactly one peer.
+#[must_use]
+pub fn auto_layout(peers: &[NodeId]) -> Option<config::TopologyConfig> {
+    if peers.len() != 1 {
+        return None;
+    }
+    let peer = peers[0];
+    Some(config::TopologyConfig {
+        displays: Vec::new(),
+        links: vec![config::LinkConfig {
+            id: DEFAULT_LINK_ID.to_owned(),
+            from: config::EndpointConfig {
+                node: "self".to_owned(),
+                display: config::AUTO_DISPLAY.to_owned(),
+                edge: config::Edge::Right,
+                start: 0.0,
+                end: 0.0,
+            },
+            to: config::EndpointConfig {
+                node: config::peer_reference(peer.as_bytes()),
+                display: config::AUTO_DISPLAY.to_owned(),
+                edge: config::Edge::Left,
+                start: 0.0,
+                end: 0.0,
+            },
+            bidirectional: true,
+        }],
+        ..config::TopologyConfig::default()
+    })
 }
 
 /// The author of the applied revision, when the configuration names one that parses.
@@ -2234,5 +2321,151 @@ logical = [0, 0, 800, 600]
         .expect("a document with no links is valid")
         .topology;
         assert!(document.links.is_empty());
+    }
+
+    /// (d) An empty document with exactly one peer becomes one desktop-anchored link to the
+    /// right; a document with links, or two peers, becomes nothing.
+    #[test]
+    fn the_default_layout_is_one_auto_link_to_the_right_of_one_peer() {
+        let peer = NodeId::new(peer_id());
+        let empty = config::TopologyConfig::default();
+
+        let layout = default_layout(&empty, &[peer]).expect("one peer is enough");
+        assert_eq!(layout.links.len(), 1);
+        let link = &layout.links[0];
+        assert_eq!(link.id, DEFAULT_LINK_ID);
+        assert_eq!(link.from.node, "self");
+        assert!(link.from.is_auto());
+        assert_eq!(link.from.edge, config::Edge::Right);
+        assert_eq!(link.to.node, config::peer_reference(&peer_id()));
+        assert!(link.to.is_auto());
+        assert_eq!(link.to.edge, config::Edge::Left);
+        assert!(link.bidirectional);
+
+        // It is a valid document the ordinary CAS path can apply.
+        let mut whole = config::Config::default();
+        whole.network.listen_address = "192.168.1.10".to_owned();
+        whole.topology = layout.clone();
+        whole.validate().expect("the default layout is valid");
+
+        assert!(
+            default_layout(&layout, &[peer]).is_none(),
+            "a document with links is never overwritten"
+        );
+        // A document someone applied is theirs even when it has no links: only a pair nobody
+        // has applied to, or a truly empty document, gets the default.
+        let applied = config::TopologyConfig {
+            revision: 2,
+            displays: vec![config::DisplayConfig {
+                node: "self".to_owned(),
+                id: "eDP-1".to_owned(),
+                logical: [0.0, 0.0, 1920.0, 1080.0],
+                primary: true,
+            }],
+            ..config::TopologyConfig::default()
+        };
+        assert!(
+            default_layout(&applied, &[peer]).is_none(),
+            "an applied document without links is the user's choice"
+        );
+        assert!(default_layout(&empty, &[]).is_none(), "no peer, no default");
+        assert!(
+            default_layout(&empty, &[peer, NodeId::new([0xBB; 32])]).is_none(),
+            "with two peers the placement is the user's call"
+        );
+    }
+
+    /// A document whose links are desktop anchors resolves against the live manifests, and a
+    /// monitor that disappears changes the resolved edge with no configuration edit.
+    #[test]
+    fn an_auto_document_follows_the_live_manifests() {
+        let document = config::TopologyConfig {
+            links: auto_layout(&[NodeId::new(peer_id())])
+                .expect("one peer")
+                .links,
+            ..config::TopologyConfig::default()
+        };
+
+        let two = vec![
+            info("left", [0.0, 0.0, 1920.0, 1080.0], [0, 0, 1920, 1080], true),
+            named_info(
+                "right",
+                "\\\\.\\DISPLAY2",
+                [1920.0, 0.0, 1920.0, 1080.0],
+                [1920, 0, 1920, 1080],
+                false,
+            ),
+        ];
+        let peer_displays = vec![(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 1920.0, 1080.0], false)],
+        )];
+
+        let built = build(&Documents {
+            local_node_id: local_id(),
+            topology: &document,
+            local_displays: &two,
+            peer_displays: &peer_displays,
+        })
+        .expect("the auto document is valid");
+        assert!(built.inactive.is_empty());
+        assert_eq!(built.topology.links.len(), 1);
+        assert_eq!(
+            built.topology.links[0].source.display.as_str(),
+            "right",
+            "the right-most monitor owns the right edge"
+        );
+
+        // The second monitor is switched off: the same document resolves to what is left.
+        let one = vec![info(
+            "left",
+            [0.0, 0.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        let built = build(&Documents {
+            local_node_id: local_id(),
+            topology: &document,
+            local_displays: &one,
+            peer_displays: &peer_displays,
+        })
+        .expect("a missing monitor is not an error for an auto link");
+        assert!(built.inactive.is_empty());
+        assert_eq!(built.topology.links.len(), 1);
+        assert_eq!(built.topology.links[0].source.display.as_str(), "left");
+        assert_eq!(
+            built.topology.links[0].source.segment,
+            geometry::Segment::new(0.0, 1080.0)
+        );
+
+        // A step from just inside its right edge leaves the node, and comes back in reverse.
+        let position = geometry::Position::new("left", 1910.0, 540.0);
+        let out = geometry::resolve_motion(
+            &built.topology,
+            &NodeId::new(local_id()),
+            &position,
+            geometry::Point::new(20.0, 0.0),
+        )
+        .expect("the auto right edge is an exit");
+        assert_eq!(out.target.display.as_str(), "DP-1");
+    }
+
+    /// (f) The `auto` anchor is the display id itself, so it survives the wire document.
+    #[test]
+    fn an_auto_anchor_survives_the_wire_round_trip() {
+        let layout = auto_layout(&[NodeId::new(peer_id())]).expect("one peer");
+        let document = wire_document(&layout, 0, NodeId::new(local_id()), NodeId::new(local_id()));
+        let endpoint = document.links[0]
+            .source_endpoint
+            .as_ref()
+            .expect("the source endpoint");
+        assert_eq!(endpoint.display_id, config::AUTO_DISPLAY);
+
+        let back = config_from_wire(&document, NodeId::new(local_id())).expect("it converts back");
+        assert_eq!(back.links.len(), 1);
+        assert!(back.links[0].from.is_auto());
+        assert_eq!(back.links[0].from.edge, config::Edge::Right);
+        assert!(back.links[0].to.is_auto());
+        assert_eq!(back.links[0].to.edge, config::Edge::Left);
     }
 }

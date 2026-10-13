@@ -59,6 +59,22 @@ pub fn draw(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
     });
 
     actions.extend(side_block(vm, ui));
+    let auto = vm.auto_link_lines();
+    if !auto.is_empty() {
+        block(
+            ui,
+            "Связи со всем рабочим столом",
+            |ui| {
+                for line in &auto {
+                    ui.label(line);
+                }
+                hint(
+                    ui,
+                    "Связь следует за мониторами: выключенный или новый экран её не ломает",
+                );
+            },
+        );
+    }
     let inactive = vm.inactive_link_lines();
     if !inactive.is_empty() {
         block(ui, "Неактивные связи", |ui| {

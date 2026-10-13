@@ -206,7 +206,7 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
         // KVM-072: the layout document's CAS surface, until the GUI owns it.
         "layout" => {
             let verb = args.rest.first().ok_or_else(|| {
-                Failure::Usage("layout takes show, edit <file>, apply, or discard".to_owned())
+                Failure::Usage("layout takes show, edit <file>, apply, discard, or auto".to_owned())
             })?;
             let line = match verb.as_str() {
                 "edit" => {
