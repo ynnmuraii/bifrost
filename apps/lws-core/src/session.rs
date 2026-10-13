@@ -294,6 +294,10 @@ pub struct Session {
     /// any member's manifest. They are not an error: the link comes back on the next rebuild
     /// once the monitor is reported. Only the GUI and the log read this.
     inactive_links: Vec<crate::topology::InactiveLink>,
+    /// The `[topology]` document to persist because it still names displays by a device name
+    /// Windows has renumbered. Filled by [`Session::rebuild_topology`], taken and handed to the
+    /// ordinary CAS path once by the main loop ([`Session::sync_display_ids`]).
+    display_id_migration: Option<String>,
     /// `[topology]` from `config.toml`: the links and the display snapshot the document
     /// is assembled from.
     layout: config::TopologyConfig,
@@ -448,6 +452,7 @@ impl Session {
             agent_lost_reported: false,
             topology: None,
             inactive_links: Vec::new(),
+            display_id_migration: None,
             layout,
             pointer_gain,
             agent_displays: Vec::new(),
@@ -552,6 +557,21 @@ impl Session {
                 }
                 self.topology = Some(document);
                 self.inactive_links = built.inactive;
+                // A stored document that names a display by an old Windows device name still
+                // works through the alias `build` applies; this makes the stored revision carry
+                // the stable id too, through the ordinary CAS path (see `sync_display_ids`).
+                let aliases = crate::topology::display_aliases(&displays);
+                if !aliases.is_empty() {
+                    if let Some(text) = crate::topology::alias_layout(
+                        &self.layout,
+                        self.node_id.as_bytes(),
+                        &aliases,
+                    ) {
+                        if self.display_id_migration.as_deref() != Some(text.as_str()) {
+                            self.display_id_migration = Some(text);
+                        }
+                    }
+                }
             }
             Err(error) => {
                 tracing::error!(
@@ -561,6 +581,41 @@ impl Session {
                 self.topology = None;
                 self.inactive_links = Vec::new();
             }
+        }
+    }
+
+    /// Hands a pending display-id migration to the ordinary layout CAS path.
+    ///
+    /// Windows renumbers `\\.\DISPLAYn` when monitors change, so an applied document can name a
+    /// display by a name that no longer exists. `rebuild_topology` resolves such a name through
+    /// the manifest, so the running document is already correct; this makes the *stored* one
+    /// correct too, once, through the same whole-document CAS a GUI edit uses. The coordinator
+    /// is the only writer (`layout_store` persists exactly what the CAS applied), so a node that
+    /// is not the coordinator leaves the alias in effect and says so.
+    async fn sync_display_ids(&mut self) {
+        let Some(text) = self.display_id_migration.take() else {
+            return;
+        };
+        if !self.router.ownership().is_owner() {
+            tracing::debug!(
+                "the layout names displays by renumbered Windows device names; the alias keeps \
+                 it working until the coordinator rewrites the document"
+            );
+            return;
+        }
+        let expected = self.layout_state.applied();
+        tracing::info!(
+            expected_revision = expected.revision,
+            "rewriting the layout's display ids to the ids the agent reports"
+        );
+        match self.layout_edit_document(text, expected).await {
+            Handled::Reply(ctl::Response::Error { code, detail }) => {
+                tracing::warn!(%code, %detail, "the display-id rewrite was refused")
+            }
+            Handled::Reply(_) => {
+                tracing::info!("layout display ids rewritten to the stable ids")
+            }
+            Handled::Deferred(_) => {}
         }
     }
 
@@ -702,6 +757,9 @@ impl Session {
                 );
                 self.on_agent_lost().await;
             }
+            // A stored layout that names displays by a renumbered Windows device name is
+            // rewritten once, through the ordinary CAS path, by this node when it coordinates.
+            self.sync_display_ids().await;
             // Once per turn, and only what changed: the GUI's `Status` and, on a new revision,
             // the document its editor works on.
             self.publish_gui_state().await;
