@@ -626,7 +626,7 @@ impl Win {
     /// is visible in the log instead of looking like an idle one (audit F11).
     fn note_motion_without_baseline(&mut self) {
         self.motion_without_baseline = self.motion_without_baseline.saturating_add(1);
-        if self.motion_without_baseline == 1 || self.motion_without_baseline % 100 == 0 {
+        if self.motion_without_baseline == 1 || self.motion_without_baseline.is_multiple_of(100) {
             tracing::warn!(
                 count = self.motion_without_baseline,
                 "a captured event arrived with no source-motion baseline; it was dropped"
