@@ -376,6 +376,13 @@ pub struct LinkHandle {
     tx: mpsc::Sender<Outbound>,
     dropped_motion: Arc<AtomicU64>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
+    /// Ends the link's task without depending on the queue's capacity.
+    ///
+    /// The bounded outbound queue is the normal path (`close` puts a `Shutdown` in it), but a
+    /// saturated queue must not be able to swallow the request: the link would then run on
+    /// with nothing left to close it, and the peer would see the socket go instead of a
+    /// `Shutdown` (audit F3).
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl LinkHandle {
@@ -494,12 +501,17 @@ impl LinkHandle {
     }
 
     /// Asks the link to close: a `Shutdown` is queued, and the task ends after writing it.
+    ///
+    /// The queued frame is the in-order path (whatever is already queued goes out first). If
+    /// the queue is saturated the request must not be lost: the link's own task is the only
+    /// writer, so it is signalled instead and writes the `Shutdown` itself.
     pub fn close(&self) {
-        let _ = self
-            .tx
-            .try_send(Outbound::Guaranteed(fr::Message::Shutdown {
-                reason: fr::LeaveReason::Shutdown,
-            }));
+        let shutdown = Outbound::Guaranteed(fr::Message::Shutdown {
+            reason: fr::LeaveReason::Shutdown,
+        });
+        if self.tx.try_send(shutdown).is_err() {
+            self.shutdown.notify_one();
+        }
     }
 }
 
@@ -578,13 +590,15 @@ pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
     let (tx, rx) = mpsc::channel::<Outbound>(config.queue_capacity.max(1));
     let dropped_motion = Arc::new(AtomicU64::new(0));
     let lease_diagnostics = Arc::new(LeaseTransportCounters::default());
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let handle = LinkHandle {
         peer: config.peer,
         tx,
         dropped_motion,
         lease_diagnostics: Arc::clone(&lease_diagnostics),
+        shutdown: Arc::clone(&shutdown),
     };
-    let task = tokio::spawn(run(config, rx, lease_diagnostics));
+    let task = tokio::spawn(run(config, rx, lease_diagnostics, shutdown));
     Ok(Link { handle, task })
 }
 
@@ -592,6 +606,7 @@ async fn run(
     config: LinkConfig,
     outbound: mpsc::Receiver<Outbound>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) {
     let LinkConfig {
         key,
@@ -669,12 +684,15 @@ async fn run(
             Frame(Option<Result<wire::Envelope, TransportError>>),
             Outbound(Option<Outbound>),
             Tick,
+            /// `close()` could not use the queue (it was full): the request came out of band.
+            Shutdown,
         }
 
         let step = tokio::select! {
             frame = frames_rx.recv() => Step::Frame(frame),
             item = outbound.recv() => Step::Outbound(item),
             () = tokio::time::sleep(sleep) => Step::Tick,
+            () = shutdown.notified() => Step::Shutdown,
         };
 
         match step {
@@ -702,6 +720,21 @@ async fn run(
                 {
                     break reason;
                 }
+            }
+            Step::Shutdown => {
+                // `close()` found the queue full. This task is the link's only writer, so the
+                // frame is written here rather than lost (audit F3); the peer sees a
+                // `Shutdown` instead of a bare socket close. Failing to write it (a dead
+                // socket) still ends the link.
+                let _ = write_message(
+                    &mut writer,
+                    &mut state,
+                    fr::Message::Shutdown {
+                        reason: fr::LeaveReason::Shutdown,
+                    },
+                )
+                .await;
+                break LinkDownReason::LocalClosed;
             }
             Step::Tick => {
                 let now_ms = state.started.elapsed().as_millis() as u64;
