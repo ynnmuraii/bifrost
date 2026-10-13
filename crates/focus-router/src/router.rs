@@ -1266,6 +1266,7 @@ impl<I: Identifiers> FocusRouter<I> {
         // Second `BeginCapture` (the Remote one) answered: commit.
         let peer = lease.peer;
         let unanswered: Vec<_> = lease.unanswered_challenges.clone();
+        let lease_ttl_ms = lease.deadline_ttl_ms(self.timing.lease_ttl_ms);
         if let Some(lease) = self.lease.source_mut() {
             lease.state = SourceState::Remote;
             lease.commit_ms = Some(now_ms);
@@ -1283,7 +1284,7 @@ impl<I: Identifiers> FocusRouter<I> {
         }
         out.push(Output::ArmTimer {
             timer: Timer::SourceLeaseWatchdog,
-            deadline_ms: self.timing.lease_deadline_ms(now_ms),
+            deadline_ms: now_ms.saturating_add(lease_ttl_ms),
         });
     }
 
@@ -2056,7 +2057,13 @@ impl<I: Identifiers> FocusRouter<I> {
             self.mismatch(from, lease_id, out);
             return;
         }
-        let _ = ttl_ms;
+        // The receiver issues the challenges and anchors every deadline on
+        // `issue_time + lease_ttl` (docs/05-protocol.md, «Watchdog без зависимости от
+        // синхронизации часов»), so its `lease_ttl_ms` — carried on the wire for exactly
+        // this — governs this lease on our side too. Each node configures its own value, and
+        // a source that used its own would close a lease the receiver still considers alive
+        // (or keep one it has already expired).
+        lease.receiver_ttl_ms = Some(Timing::clamp_lease_ttl_ms(u64::from(ttl_ms)));
         match lease.state {
             SourceState::Preparing => {
                 // The first challenge arrives before `EnterCommit`; renew it then.
@@ -2084,6 +2091,7 @@ impl<I: Identifiers> FocusRouter<I> {
         out: &mut Vec<Output>,
     ) {
         let Frame { from, lease_id } = frame;
+        let our_ttl_ms = self.timing.lease_ttl_ms;
         let Some(lease) = self.lease.source_mut() else {
             self.mismatch(from, lease_id, out);
             return;
@@ -2092,13 +2100,17 @@ impl<I: Identifiers> FocusRouter<I> {
             return;
         }
         lease.last_applied_batch_seq = last_input_batch_seq;
+        // The watchdog is bounded by the receiver's `lease_ttl_ms` when it advertised one:
+        // it is the number that bounds the receiver's own deadline, and «Source при
+        // отсутствии `LeaseStatus` за `lease_ttl` закрывает канал» has to use the same one.
+        let lease_ttl_ms = lease.deadline_ttl_ms(our_ttl_ms);
         if accepted && lease.take_challenge(&nonce) {
             // «Source при отсутствии `LeaseStatus` за `lease_ttl` закрывает канал»: an
             // *applied* status for a challenge we actually answered re-arms the
             // watchdog; a replayed status for an unknown nonce does not.
             out.push(Output::ArmTimer {
                 timer: Timer::SourceLeaseWatchdog,
-                deadline_ms: self.timing.lease_deadline_ms(now_ms),
+                deadline_ms: now_ms.saturating_add(lease_ttl_ms),
             });
         }
     }

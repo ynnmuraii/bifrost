@@ -118,6 +118,16 @@ pub struct SourceLease {
     pub commit_ms: Option<u64>,
     /// Challenges we received and have not renewed yet (FIFO, bounded).
     pub unanswered_challenges: Vec<Nonce>,
+    /// The `lease_ttl_ms` the receiver advertised in its `LeaseChallenge`, clamped to the
+    /// documented 300..=1000 range.
+    ///
+    /// The receiver issues the challenges and anchors every deadline (`issue_time +
+    /// lease_ttl`), so *its* value is the one that governs this lease: the source's own
+    /// configured `lease_ttl_ms` may differ (each node configures it), and a source that
+    /// used its own number would close the channel on a lease the receiver still considers
+    /// alive. `None` until the first challenge arrives (the first one is issued with
+    /// `EnterAck`), and our own value stands in until then.
+    pub receiver_ttl_ms: Option<u64>,
     /// Last `input_batch_seq` the receiver acknowledged.
     pub last_applied_batch_seq: u64,
     /// Last position the receiver reported in `InjectAck`.
@@ -156,6 +166,7 @@ impl SourceLease {
             remote_capture_requested: false,
             commit_ms: None,
             unanswered_challenges: Vec::new(),
+            receiver_ttl_ms: None,
             last_applied_batch_seq: 0,
             actual_position: None,
             channel_gone: false,
@@ -191,6 +202,14 @@ impl SourceLease {
         }
         self.unanswered_challenges.push(nonce);
         true
+    }
+
+    /// The `lease_ttl_ms` that governs this lease's deadlines.
+    ///
+    /// The receiver's advertised value when a `LeaseChallenge` has arrived, and `fallback_ms`
+    /// (our own configured `lease_ttl_ms`) until then.
+    pub fn deadline_ttl_ms(&self, fallback_ms: u64) -> u64 {
+        self.receiver_ttl_ms.unwrap_or(fallback_ms)
     }
 
     /// Marks a challenge as renewed (one-use nonce).

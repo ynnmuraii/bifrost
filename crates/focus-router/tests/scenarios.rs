@@ -953,3 +953,88 @@ fn s34_refused_switches_send_nothing() {
         assert!(r.lease().is_idle());
     }
 }
+
+/// A source-side router whose own `lease_ttl_ms` is `lease_ttl_ms` (audit F2).
+fn source_router(lease_ttl_ms: u64) -> FocusRouter {
+    let mut r = FocusRouter::new(
+        LOCAL,
+        Timing {
+            lease_ttl_ms,
+            ..Timing::default()
+        },
+        SequentialIds::default(),
+        capabilities(),
+    )
+    .with_persisted_ownership(1, Some((1, LOCAL)));
+    r.handle(0, hello(PEER, LOCAL, 1));
+    r
+}
+
+/// Audit F2: the source's lease watchdog is bounded by the `lease_ttl_ms` the *receiver*
+/// advertised in its `LeaseChallenge`, not by the source's own configured value.
+///
+/// `docs/05-protocol.md`, «Watchdog без зависимости от синхронизации часов»: the receiver
+/// issues the challenges and anchors every deadline at `issue_time + lease_ttl`, and «Все
+/// дедлайны lease выводятся из одного параметра `lease_ttl_ms`». Each node configures its
+/// own value, so the source must adopt the number on the wire: with its own 300 ms it closed
+/// a lease the 1000 ms receiver still considered alive.
+#[test]
+fn the_source_watchdog_uses_the_receivers_advertised_lease_ttl() {
+    let mut r = source_router(300);
+    r.handle(10, switch(SwitchTrigger::Edge));
+    r.handle(11, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+    r.handle(12, net(ack(id(1), None)));
+    // The receiver's own `lease_ttl_ms` is 1000 ms, more than three times the source's.
+    r.handle(
+        13,
+        net(Message::LeaseChallenge {
+            lease_id: id(1),
+            nonce: N,
+            ttl_ms: 1000,
+        }),
+    );
+    let committed = r.handle(14, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+    assert_eq!(r.focus(), FocusState::Remote);
+    assert!(
+        committed.contains(&arm(Timer::SourceLeaseWatchdog, 1_014)),
+        "the commit watchdog must be bounded by the receiver's ttl (14 + 1000): {committed:?}"
+    );
+    let status = r.handle(
+        600,
+        net(Message::LeaseStatus {
+            lease_id: id(1),
+            nonce: N,
+            accepted: true,
+            last_input_batch_seq: 0,
+        }),
+    );
+    assert!(
+        status.contains(&arm(Timer::SourceLeaseWatchdog, 1_600)),
+        "the re-armed watchdog must use the receiver's ttl (600 + 1000): {status:?}"
+    );
+}
+
+/// The advertised value is a peer's number: outside the documented 300..=1000 it is clamped,
+/// so a broken peer cannot park our watchdog a millisecond or a day away (audit F2).
+#[test]
+fn a_lease_challenge_ttl_outside_the_documented_range_is_clamped() {
+    for (advertised, effective) in [(1u32, 300u64), (600_000, 1_000)] {
+        let mut r = source_router(300);
+        r.handle(10, switch(SwitchTrigger::Edge));
+        r.handle(11, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+        r.handle(12, net(ack(id(1), None)));
+        r.handle(
+            13,
+            net(Message::LeaseChallenge {
+                lease_id: id(1),
+                nonce: N,
+                ttl_ms: advertised,
+            }),
+        );
+        let committed = r.handle(14, Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }));
+        assert!(
+            committed.contains(&arm(Timer::SourceLeaseWatchdog, 14 + effective)),
+            "advertised {advertised} ms must clamp to {effective} ms: {committed:?}"
+        );
+    }
+}
