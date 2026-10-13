@@ -180,6 +180,38 @@ fn an_older_document_does_not_become_the_editors_base() {
     assert_eq!(vm.editor.revision, 9);
 }
 
+/// Batch-8 audit: the outcome banner is about the core that answered, so losing that core
+/// takes the sentence with it instead of leaving it under a «Служба не запущена» header.
+#[test]
+fn a_lost_service_takes_its_outcome_sentence_with_it() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    let id = vm.begin_request(Request::Claim, Instant::now());
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+    assert!(
+        vm.outcome.as_ref().is_some_and(|outcome| outcome.ok),
+        "the success is shown while the service is there"
+    );
+
+    vm.on_disconnected("the service is gone".to_owned());
+    assert!(
+        vm.outcome.is_none(),
+        "a sentence about a service that is gone must not stay on screen"
+    );
+
+    // And a new connection starts clean too: a sentence from a previous core would describe
+    // the wrong one.
+    vm.on_connected("gui.sock");
+    assert!(vm.outcome.is_none());
+}
+
 /// The «Расположить автоматически» button: the frame it sends, and the sentence the status
 /// bar shows when the core has done it.
 #[test]
