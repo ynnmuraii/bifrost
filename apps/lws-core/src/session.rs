@@ -32,6 +32,7 @@ use crate::command::PeerRef;
 use crate::ctl;
 use crate::ownership_store::OwnershipStore;
 use crate::routing::{self, AgentSignal, Effect};
+use ipc::clock::{Clock, SuspendDetector, SystemClock};
 
 /// The GUI's half of the session: `GuiFrame` requests and the events pushed to the window.
 mod gui;
@@ -45,18 +46,122 @@ mod pairing;
 const IDLE_TICK: Duration = Duration::from_millis(50);
 const RESTART_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(8);
-const RESTART_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const RESTART_CIRCUIT_FAILURES: usize = 3;
-fn record_restart_failure(failures: &mut VecDeque<Instant>, now: Instant) -> bool {
-    while failures
-        .front()
-        .is_some_and(|failed| now.duration_since(*failed) > RESTART_FAILURE_WINDOW)
-    {
-        failures.pop_front();
-    }
-    failures.push_back(now);
-    failures.len() >= RESTART_CIRCUIT_FAILURES
+/// How much wall time the monotonic clock may fail to account for before the machine is
+/// judged to have been suspended.
+///
+/// `CLOCK_MONOTONIC` ([`Instant`]) is frozen across a suspend while `CLOCK_REALTIME`
+/// (`SystemTime`) is not, so a resume leaves wall time ahead by the length of the sleep.
+/// Two seconds is far above the scheduling jitter that separates the two clocks in
+/// ordinary operation and far below the sleeps that matter; a shorter sleep that goes
+/// unnoticed is harmless, because the frozen monotonic clock leaves the heartbeat's
+/// silence reading unchanged too.
+const SUSPEND_THRESHOLD: Duration = Duration::from_secs(2);
+/// Wall-clock window the restart losses are counted in.
+const RESTART_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// How long an open circuit waits before it closes itself and the agent is retried.
+///
+/// A breaker that only the user can reset leaves the daemon degraded for ever after one
+/// bad minute (`target/live-e2e/agent-lost-20261013T1800Z`: the laptop slept, three
+/// losses landed inside the window, and the node stayed `Blocked` with no agent and
+/// `members = 0` until the process was restarted by hand).
+const RESTART_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// Core's agent-restart policy: the recent losses, the circuit they open, and whether the
+/// machine was just suspended.
+///
+/// Three losses inside [`RESTART_FAILURE_WINDOW`] of **wall-clock** time stop the
+/// automatic restarts; [`RESTART_CIRCUIT_COOLDOWN`] after the circuit opens it closes
+/// itself and the agent is retried. The window is wall time and not monotonic time: a
+/// laptop that slept between two losses did not suffer two losses «within 60 seconds»,
+/// however little `CLOCK_MONOTONIC` advanced while it was suspended. A loss that follows a
+/// suspend is not the agent's at all — the machine froze — so it is not counted and cannot
+/// trip the breaker.
+#[derive(Debug)]
+struct RestartWatch {
+    /// Wall-clock milliseconds of the recent losses, oldest first.
+    losses: VecDeque<u64>,
+    /// When the circuit opened, in wall-clock milliseconds; `None` while it is closed.
+    opened_at: Option<u64>,
+    /// The machine was suspended since the last agent frame (see [`SuspendDetector`]).
+    suspend_recent: bool,
 }
+
+impl RestartWatch {
+    fn new() -> Self {
+        Self {
+            losses: VecDeque::new(),
+            opened_at: None,
+            suspend_recent: false,
+        }
+    }
+
+    /// Whether the circuit is open: automatic restarts are stopped.
+    fn is_open(&self) -> bool {
+        self.opened_at.is_some()
+    }
+
+    /// A suspend was detected: the loss it would produce is the freeze's, not the agent's.
+    fn on_suspend(&mut self) {
+        self.suspend_recent = true;
+    }
+
+    /// The agent answered: whatever happened across a suspend, it is alive again, so a
+    /// later loss is its own.
+    fn on_frame(&mut self) {
+        self.suspend_recent = false;
+    }
+
+    /// Consumes the suspend flag: whether the machine was suspended since the last frame.
+    fn take_suspend(&mut self) -> bool {
+        std::mem::take(&mut self.suspend_recent)
+    }
+
+    /// Records a loss; `true` when that opens the circuit and the restarts must stop.
+    fn record_loss(&mut self, wall_ms: u64) -> bool {
+        self.forget_expired(wall_ms);
+        self.losses.push_back(wall_ms);
+        if self.losses.len() >= RESTART_CIRCUIT_FAILURES {
+            self.opened_at = Some(wall_ms);
+            return true;
+        }
+        false
+    }
+
+    /// Closes the circuit once the cool-down has passed; `true` when it just closed.
+    fn close_if_cooled(&mut self, wall_ms: u64) -> bool {
+        match self.opened_at {
+            Some(opened)
+                if wall_ms.saturating_sub(opened)
+                    >= RESTART_CIRCUIT_COOLDOWN.as_millis() as u64 =>
+            {
+                self.close();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The user asked (`RetryAgent`): the circuit and the recorded losses go.
+    fn close(&mut self) {
+        self.losses.clear();
+        self.opened_at = None;
+        self.suspend_recent = false;
+    }
+
+    /// Drops the losses that are older than the window.
+    fn forget_expired(&mut self, wall_ms: u64) {
+        let window = RESTART_FAILURE_WINDOW.as_millis() as u64;
+        while self
+            .losses
+            .front()
+            .is_some_and(|failed| wall_ms.saturating_sub(*failed) > window)
+        {
+            self.losses.pop_front();
+        }
+    }
+}
+
 fn next_restart_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_RESTART_BACKOFF)
 }
@@ -126,7 +231,11 @@ pub struct Session {
     ctl: ctl::Server,
     timers: Timers,
     context: routing::AgentContext,
-    started: Instant,
+    /// The loop's clock: monotonic milliseconds for the FSM and the deadlines, wall
+    /// milliseconds beside them to recognise a suspend.
+    clock: SystemClock,
+    /// The suspend detector: samples both clocks once per turn.
+    suspend: SuspendDetector,
     ping_nonce: u64,
     node_id: NodeId,
     local_hello: protocol::wire::Hello,
@@ -165,12 +274,10 @@ pub struct Session {
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
     agent_restart_due: Option<Instant>,
-    /// Recent automatic restart failures, used by the circuit breaker.
-    agent_restart_failures: VecDeque<Instant>,
+    /// Recent losses and the circuit they open, measured in wall-clock time.
+    agent_restart_circuit: RestartWatch,
     /// Exponential delay after unsuccessful restart attempts.
     agent_restart_backoff: Duration,
-    /// Automatic restarts stop here until the user explicitly retries.
-    agent_restart_circuit_open: bool,
     /// First typed portal/backend error, preserved across automatic restarts.
     agent_degraded_reason: String,
     /// Once a portal fails, automatic launches must not open another portal session.
@@ -299,6 +406,12 @@ impl Session {
         let (gui_requests_tx, gui_requests) = mpsc::channel(64);
         let (pairing_events_tx, pairing_events) = mpsc::channel(16);
         let gui_events = gui_server.publisher();
+        let clock = SystemClock::new();
+        let suspend = SuspendDetector::new(
+            clock.monotonic_ms(),
+            clock.wall_ms(),
+            SUSPEND_THRESHOLD.as_millis() as u64,
+        );
         let mut session = Session {
             router,
             manager,
@@ -308,7 +421,8 @@ impl Session {
             timers: Timers::default(),
             refusal: None,
             context: routing::AgentContext::default(),
-            started: Instant::now(),
+            clock,
+            suspend,
             ping_nonce: 0,
             node_id,
             backend,
@@ -323,9 +437,8 @@ impl Session {
             next_layout_nonce: 0,
             stopping: false,
             agent_restart_due: None,
-            agent_restart_failures: VecDeque::new(),
+            agent_restart_circuit: RestartWatch::new(),
             agent_restart_backoff: RESTART_BACKOFF,
-            agent_restart_circuit_open: false,
             agent_degraded_reason: String::new(),
             portal_failure: false,
             agent_lost_reported: false,
@@ -430,7 +543,34 @@ impl Session {
 
     /// The monotonic millisecond clock shared with the FSM.
     fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
+        self.clock.monotonic_ms()
+    }
+
+    /// The wall-clock millisecond reading: what `now_ms` cannot account for across a
+    /// suspend is the sleep.
+    fn wall_ms(&self) -> u64 {
+        self.clock.wall_ms()
+    }
+
+    /// Recognises a suspend, once per turn and before the step is acted on.
+    ///
+    /// A laptop that slept shows up as wall time having jumped far ahead of the monotonic
+    /// clock. Everything core times on the monotonic clock was frozen with it, so the
+    /// agent heartbeat is re-armed here: the freeze is not the agent's silence, and the
+    /// loss it would otherwise produce is not a failure of the agent. Rule 6 is about
+    /// *core* going quiet, not the machine going to sleep, and the sleep also cancels no
+    /// lease on its own — `docs/05-protocol.md`: «Просыпание после suspend всегда отменяет
+    /// lease», which the agent's own release and the FSM's deadlines carry out.
+    fn observe_clock(&mut self) {
+        let Some(slept_ms) = self.suspend.observe(self.now_ms(), self.wall_ms()) else {
+            return;
+        };
+        tracing::warn!(
+            slept_ms,
+            "the machine was suspended (or this process was not running); re-arming the agent heartbeat"
+        );
+        self.agent.on_resume();
+        self.agent_restart_circuit.on_suspend();
     }
 
     /// Runs until `quit`, a signal, or a fatal link error.
@@ -469,6 +609,9 @@ impl Session {
                     () = tokio::time::sleep_until(deadline) => Step::Tick,
                 }
             };
+            // Before the step is acted on: a resume re-arms the agent heartbeat, so the
+            // liveness decision below cannot blame the agent for the machine's sleep.
+            self.observe_clock();
             let step_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
             let link_backlog = self.link_events.len();
 
@@ -558,6 +701,21 @@ impl Session {
     async fn service_clock(&mut self) {
         let now = self.now_ms();
 
+        // The circuit closes itself so a machine that slept through a bad minute is
+        // retried: a breaker only the user can reset leaves the daemon degraded for ever
+        // after one storm. The check is cheap and the loop wakes at least every
+        // `IDLE_TICK`, so no deadline of its own is needed.
+        if self.agent_restart_circuit.close_if_cooled(self.wall_ms()) {
+            tracing::info!(
+                cooldown_ms = RESTART_CIRCUIT_COOLDOWN.as_millis() as u64,
+                "agent restart circuit closed after the cool-down; retrying the agent"
+            );
+            self.refusal = None;
+            self.agent_degraded_reason.clear();
+            self.agent_restart_backoff = RESTART_BACKOFF;
+            self.agent_restart_due = Some(Instant::now());
+        }
+
         for timer in self.timers.due(now) {
             tracing::debug!(?timer, "timer expired");
             self.feed(fr::Input::TimerExpired(timer)).await;
@@ -608,7 +766,7 @@ impl Session {
 
     /// An `Instant` for a `now_ms`-scale deadline.
     fn instant_of(&self, deadline_ms: u64) -> tokio::time::Instant {
-        tokio::time::Instant::from_std(self.started + Duration::from_millis(deadline_ms))
+        tokio::time::Instant::from_std(self.clock.origin() + Duration::from_millis(deadline_ms))
     }
 
     /// Feeds the FSM and performs what it decided.
@@ -1965,7 +2123,10 @@ impl Session {
 
     async fn on_agent_frame(&mut self, frame: protocol::ipc::AgentFrame) -> anyhow::Result<()> {
         // The frame is liveness wherever it was received: `Supervisor::recv` already
-        // marked it on the heartbeat, so nothing to do here but handle it.
+        // marked it on the heartbeat, so nothing to do here but handle it. It also
+        // clears the "we just woke up" flag: an agent that answers is alive, and a later
+        // loss is its own.
+        self.agent_restart_circuit.on_frame();
         let Some(message) = frame.msg else {
             return Ok(());
         };
@@ -2029,7 +2190,7 @@ impl Session {
                     self.agent_restart_due = None;
                     // A new session starts with a clean slate; the previous crash's
                     // error is not this session's state.
-                    if !self.portal_failure && !self.agent_restart_circuit_open {
+                    if !self.portal_failure && !self.agent_restart_circuit.is_open() {
                         self.refusal = None;
                         self.portal_state.clear();
                         self.agent_degraded_reason.clear();
@@ -2456,7 +2617,11 @@ impl Session {
         self.agent_lost_reported = true;
         self.agent.stop().await;
         self.feed(fr::Input::Agent(fr::AgentEvent::AgentLost)).await;
-        if record_restart_failure(&mut self.agent_restart_failures, Instant::now()) {
+        if self.agent_restart_circuit.take_suspend() {
+            // The machine was suspended: the frozen agent is not a broken one, so this
+            // loss is not the agent's and is not counted towards the circuit.
+            tracing::warn!("the agent was silent across a suspend; not counting it as a loss");
+        } else if self.agent_restart_circuit.record_loss(self.wall_ms()) {
             self.open_restart_circuit("agent lost three times within 60 seconds");
             return;
         }
@@ -2467,7 +2632,7 @@ impl Session {
 
     /// The `RECOVERY` restart from core's conservative ledger.
     async fn restart_agent(&mut self) {
-        if self.agent_restart_circuit_open {
+        if self.agent_restart_circuit.is_open() {
             return;
         }
         let keys: Vec<input_model::HidKey> = self.router.pressed().keys().collect();
@@ -2483,7 +2648,7 @@ impl Session {
             }
             Err(error) => {
                 tracing::error!(%error, "agent restart failed");
-                if record_restart_failure(&mut self.agent_restart_failures, Instant::now()) {
+                if self.agent_restart_circuit.record_loss(self.wall_ms()) {
                     self.open_restart_circuit("agent restart failed three times within 60 seconds");
                 } else {
                     self.agent_restart_due = Some(Instant::now() + self.agent_restart_backoff);
@@ -2494,15 +2659,15 @@ impl Session {
     }
 
     fn open_restart_circuit(&mut self, reason: &str) {
-        self.agent_restart_circuit_open = true;
         self.agent_restart_due = None;
-        self.agent_degraded_reason =
-            format!("Ввод остановлен: {reason}; нажмите «Повторить» для ручного запуска");
+        self.agent_degraded_reason = format!(
+            "Ввод остановлен: {reason}; повтор через {} мин или «Повторить»",
+            RESTART_CIRCUIT_COOLDOWN.as_secs() / 60
+        );
         tracing::error!(reason, "agent restart circuit breaker opened");
     }
     async fn retry_agent(&mut self) -> protocol::ipc::OpResult {
-        self.agent_restart_circuit_open = false;
-        self.agent_restart_failures.clear();
+        self.agent_restart_circuit.close();
         self.agent_restart_backoff = RESTART_BACKOFF;
         self.agent_restart_due = None;
         self.portal_failure = false;
@@ -3035,47 +3200,123 @@ fn parse_layout_toml(layout_toml: &str) -> Result<config::TopologyConfig, String
 #[cfg(test)]
 mod timer_tests {
     use super::*;
+    use ipc::clock::ManualClock;
 
     #[test]
-    fn three_restart_failures_open_the_circuit_only_inside_the_window() {
-        let start = Instant::now();
-        let mut failures = VecDeque::new();
-        assert!(!record_restart_failure(&mut failures, start));
-        assert!(!record_restart_failure(
-            &mut failures,
-            start + Duration::from_secs(10)
-        ));
-        assert!(record_restart_failure(
-            &mut failures,
-            start + Duration::from_secs(20)
-        ));
+    fn losses_spread_over_the_window_in_wall_time_do_not_open_the_circuit() {
+        // The three losses of `target/live-e2e/agent-lost-20261013T1800Z`: 137 s and
+        // 158 s apart on the wall clock (296 s in all), with the machine asleep in
+        // between. `CLOCK_MONOTONIC` — the clock the old window was measured on — barely
+        // moved across those sleeps (20 s and 23 s of it, from the logs), which is what
+        // made the old code read them as "three losses within 60 seconds". The losses are
+        // recorded directly here, so the test is about the window's clock and not about
+        // the suspend classification (that is `a_suspend_is_not_a_loss_of_the_agent`).
+        let mut clock = ManualClock::new();
+        let mut watch = RestartWatch::new();
+        assert!(!watch.record_loss(clock.wall_ms()));
+        clock.suspend(137_000);
+        assert!(!watch.record_loss(clock.wall_ms()));
+        clock.suspend(158_000);
+        assert!(
+            !watch.record_loss(clock.wall_ms()),
+            "296 s of wall time passed between the three losses"
+        );
+        assert!(!watch.is_open());
+    }
 
-        let mut failures = VecDeque::new();
-        assert!(!record_restart_failure(&mut failures, start));
-        assert!(!record_restart_failure(
-            &mut failures,
-            start + RESTART_FAILURE_WINDOW + Duration::from_millis(1)
-        ));
-        assert_eq!(failures.len(), 1);
+    #[test]
+    fn losses_inside_the_window_open_the_circuit_and_the_cool_down_closes_it() {
+        let mut clock = ManualClock::new();
+        let mut watch = RestartWatch::new();
+        assert!(!watch.record_loss(clock.wall_ms()));
+        clock.advance(10_000);
+        assert!(!watch.record_loss(clock.wall_ms()));
+        clock.advance(10_000);
+        assert!(
+            watch.record_loss(clock.wall_ms()),
+            "three in twenty seconds"
+        );
+        assert!(watch.is_open());
+
+        // Still inside the cool-down: nothing has closed it yet.
+        clock.advance(RESTART_CIRCUIT_COOLDOWN.as_millis() as u64 - 1);
+        assert!(!watch.close_if_cooled(clock.wall_ms()));
+        assert!(watch.is_open(), "still inside the cool-down");
+
+        // One millisecond later it closes itself, so the agent is retried.
+        clock.advance(1);
+        assert!(watch.close_if_cooled(clock.wall_ms()));
+        assert!(!watch.is_open());
+        assert!(
+            !watch.close_if_cooled(clock.wall_ms()),
+            "closing a closed circuit is a no-op"
+        );
+
+        // The losses went with it: a fresh pair does not re-open it.
+        assert!(!watch.record_loss(clock.wall_ms()));
+        clock.advance(1_000);
+        assert!(!watch.record_loss(clock.wall_ms()));
+        assert!(!watch.is_open());
+    }
+
+    #[test]
+    fn a_suspend_is_not_a_loss_of_the_agent() {
+        // `Session::observe_clock` samples the two clocks once a turn and calls
+        // `on_suspend`; `Session::on_agent_lost` then declines to count the loss. Three
+        // such losses must not read as a crash loop.
+        let mut clock = ManualClock::new();
+        let mut detector = SuspendDetector::new(
+            clock.monotonic_ms(),
+            clock.wall_ms(),
+            SUSPEND_THRESHOLD.as_millis() as u64,
+        );
+        let mut watch = RestartWatch::new();
+        for _ in 0..RESTART_CIRCUIT_FAILURES {
+            clock.suspend(130_000);
+            assert!(
+                detector
+                    .observe(clock.monotonic_ms(), clock.wall_ms())
+                    .is_some_and(|slept| slept >= 130_000),
+                "wall time ran while the monotonic clock did not"
+            );
+            watch.on_suspend();
+            let opened = !watch.take_suspend() && watch.record_loss(clock.wall_ms());
+            assert!(!opened, "the silence across a suspend is not the agent's");
+            // Ordinary time again, and the agent answers.
+            clock.advance(1_000);
+            assert_eq!(
+                detector.observe(clock.monotonic_ms(), clock.wall_ms()),
+                None
+            );
+            watch.on_frame();
+        }
+        assert!(!watch.is_open(), "three suspends are not three losses");
+
+        // The same three losses *without* a suspend behind them are the agent's.
+        let mut clock = ManualClock::new();
+        let mut watch = RestartWatch::new();
+        for _ in 0..RESTART_CIRCUIT_FAILURES {
+            clock.advance(1_000);
+            watch.record_loss(clock.wall_ms());
+        }
+        assert!(watch.is_open());
     }
 
     #[test]
     fn restart_policy_stops_retries_instead_of_spawning_a_ten_second_storm() {
-        let start = Instant::now();
-        let mut failures = VecDeque::new();
+        let mut clock = ManualClock::new();
+        let mut watch = RestartWatch::new();
         let mut backoff = RESTART_BACKOFF;
-        let mut now = start;
         let mut automatic_spawns = 0;
-        while !record_restart_failure(&mut failures, now)
-            && now.duration_since(start) < Duration::from_secs(10)
-        {
-            now += backoff;
+        while !watch.record_loss(clock.wall_ms()) && clock.monotonic_ms() < 10_000 {
+            clock.advance(backoff.as_millis() as u64);
             automatic_spawns += 1;
             backoff = next_restart_backoff(backoff);
         }
         assert_eq!(automatic_spawns, 2);
-        assert!(now.duration_since(start) < Duration::from_secs(10));
+        assert!(clock.monotonic_ms() < 10_000);
         assert_eq!(backoff, Duration::from_secs(2));
+        assert!(watch.is_open(), "the third loss inside the window stops it");
     }
 
     #[test]
