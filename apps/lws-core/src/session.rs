@@ -403,6 +403,7 @@ impl Session {
             "core running"
         );
 
+        let step_log_rate = logging::LogRateLimit::new();
         loop {
             self.service_clock().await;
             if self.stopping {
@@ -428,6 +429,8 @@ impl Session {
                     () = tokio::time::sleep_until(deadline) => Step::Tick,
                 }
             };
+            let step_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+            let link_backlog = self.link_events.len();
 
             match step {
                 Step::Link(None) => {
@@ -491,6 +494,17 @@ impl Session {
             // Once per turn, and only what changed: the GUI's `Status` and, on a new revision,
             // the document its editor works on.
             self.publish_gui_state().await;
+            let elapsed = step_started.map_or(Duration::ZERO, |start| start.elapsed());
+            if elapsed >= Duration::from_millis(25)
+                && tracing::enabled!(tracing::Level::DEBUG)
+                && step_log_rate.allow()
+            {
+                tracing::debug!(
+                    elapsed_ms = elapsed.as_millis(),
+                    link_backlog,
+                    "core step processing slow"
+                );
+            }
         }
     }
 
@@ -627,8 +641,6 @@ impl Session {
                                 "core -> agent Inject"
                             );
                         }
-                    } else {
-                        tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
                     }
                     if let Err(error) = self.agent.send(frame).await {
                         tracing::warn!(%error, "cannot reach the agent");
@@ -688,7 +700,6 @@ impl Session {
             lease_id: lease_id.to_vec(),
             remaining_ms,
         });
-        tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
         if let Err(error) = self.agent.send(frame).await {
             tracing::warn!(%error, "cannot reach the agent");
             self.on_agent_lost().await;
@@ -696,7 +707,6 @@ impl Session {
     }
     async fn query_agent_displays(&mut self) -> bool {
         let frame = Msg::QueryDisplays(protocol::ipc::QueryDisplays {});
-        tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
         match self.agent.send(frame).await {
             Ok(()) => true,
             Err(error) => {
@@ -726,7 +736,10 @@ impl Session {
         let name = routing::message_name(&message);
         match self.manager.handle(&peer).await {
             Some(handle) => {
-                tracing::info!(peer = %peer, message = name, "core -> peer");
+                static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
+                    tracing::debug!(peer = %peer, message = name, "core -> peer");
+                }
                 if let Err(error) = handle.send(message).await {
                     tracing::warn!(peer = %peer, message = name, %error, "send failed");
                 }
@@ -1710,11 +1723,14 @@ impl Session {
             }
             LinkEvent::Message { peer, message } => match message {
                 transport::convert::Inbound::Focus(message) => {
-                    tracing::info!(
-                        peer = %peer,
-                        message = routing::message_name(&message),
-                        "peer -> core"
-                    );
+                    static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                    if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
+                        tracing::debug!(
+                            peer = %peer,
+                            message = routing::message_name(&message),
+                            "peer -> core"
+                        );
+                    }
                     self.feed(fr::Input::Net {
                         from: peer,
                         message,
@@ -1836,7 +1852,6 @@ impl Session {
                     }
                 }
                 crate::clipboard::Out::Agent(frame) => {
-                    tracing::info!(frame = routing::agent_frame_name(&frame), "core -> agent");
                     if let Err(error) = self.agent.send(frame).await {
                         tracing::warn!(%error, "cannot reach the agent");
                         self.on_agent_lost().await;
@@ -1861,7 +1876,10 @@ impl Session {
         let Some(message) = frame.msg else {
             return Ok(());
         };
-        tracing::info!(frame = routing::agent_frame_name(&message), "agent -> core");
+        static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+        if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
+            tracing::debug!(frame = routing::agent_frame_name(&message), "agent -> core");
+        }
         if let Msg::Error(error) = &message {
             if error.code.starts_with("PORTAL_") {
                 self.portal_failure = true;

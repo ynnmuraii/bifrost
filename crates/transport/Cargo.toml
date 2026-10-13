@@ -17,6 +17,7 @@ identity = { path = "../identity" }
 input-model = { path = "../input-model" }
 focus-router = { path = "../focus-router" }
 protocol = { path = "../protocol" }
+logging = { path = "../logging" }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }

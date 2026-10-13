@@ -701,6 +701,7 @@ pub async fn dial_clipboard(
     let config = identity::clipboard_client_config(identity, trust)?;
     let connector = TlsConnector::from(Arc::new(config));
     let tcp = TcpStream::connect(address).await?;
+    tcp.set_nodelay(true)?;
     let stream = connector
         .connect(identity::server_name(address.ip()), tcp)
         .await?;
@@ -785,6 +786,7 @@ impl ClipboardListener {
     ) -> Result<(ClipboardConnection, ClipboardMessage), TransportError> {
         loop {
             let (tcp, _address) = self.listener.accept().await?;
+            tcp.set_nodelay(true)?;
             let Ok(stream) = self.acceptor.accept(tcp).await else {
                 continue;
             };
@@ -908,5 +910,72 @@ impl Outgoing {
     /// SHA-256 of the whole payload.
     pub fn sha256(&self) -> &[u8] {
         &self.sha256
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use identity::{IdentityPaths, NodeIdentity, TrustStore, TrustedPeer};
+
+    #[tokio::test]
+    async fn established_clipboard_links_disable_nagle_on_both_ends() {
+        let root = std::env::temp_dir().join(format!(
+            "lws-nodelay-{}-{:x}",
+            std::process::id(),
+            u128::from_le_bytes(identity::random16().expect("entropy"))
+        ));
+        let server = Arc::new(
+            NodeIdentity::load_or_create(&IdentityPaths::rooted_at(root.join("server")))
+                .expect("server identity")
+                .0,
+        );
+        let client = NodeIdentity::load_or_create(&IdentityPaths::rooted_at(root.join("client")))
+            .expect("client identity")
+            .0;
+        let mut server_trust = TrustStore::new();
+        server_trust.trust(TrustedPeer::paired(client.node_id(), "client", None, 0));
+        let mut client_trust = TrustStore::new();
+        client_trust.trust(TrustedPeer::paired(server.node_id(), "server", None, 0));
+        let mut listener = ClipboardListener::bind(
+            Arc::clone(&server),
+            server_trust,
+            "127.0.0.1:0".parse().expect("address"),
+        )
+        .await
+        .expect("listener");
+        let address = listener.local_addr();
+        let (accepted, dialed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                listener.accept(),
+                dial_clipboard(
+                    &client,
+                    &client_trust,
+                    server.node_id(),
+                    address,
+                    [1; 16],
+                    [2; 16],
+                    [3; 32],
+                )
+            )
+        })
+        .await
+        .expect("TLS link deadline");
+        let (accepted, _) = accepted.expect("accepted TLS link");
+        let dialed = dialed.expect("dialed TLS link");
+        let Stream::Server(accepted_stream) = &accepted.stream else {
+            panic!("accepted stream");
+        };
+        let Stream::Client(dialed_stream) = &dialed.stream else {
+            panic!("dialed stream");
+        };
+        assert!(accepted_stream
+            .get_ref()
+            .0
+            .nodelay()
+            .expect("accepted option"));
+        assert!(dialed_stream.get_ref().0.nodelay().expect("dialed option"));
+        drop((accepted, dialed, listener, server, client));
+        std::fs::remove_dir_all(root).expect("remove identities");
     }
 }

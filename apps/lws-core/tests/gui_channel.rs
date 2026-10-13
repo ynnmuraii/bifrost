@@ -266,11 +266,6 @@ fn linked_cores_share_agent_displays_with_the_gui_without_a_layout() {
             .flat_map(|member| member.displays.iter().map(|display| display.id.as_str()))
             .collect();
         assert_eq!(ids, ["dry-0", "dry-0"]);
-        let log = std::fs::read_to_string(&node.log).expect("core log");
-        assert!(
-            log.contains("core -> agent") && log.contains("QueryDisplays"),
-            "the core must request the agent's display report on startup:\n{log}"
-        );
         assert!(
             doc.members
                 .iter()

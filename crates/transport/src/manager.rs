@@ -429,6 +429,8 @@ impl LinkManager {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (tcp, address) = accepted?;
+                    // Lease frames must not wait for a delayed TCP ACK during idle input.
+                    tcp.set_nodelay(true)?;
                     let messages = self.messages_tx.clone();
                     let events = self.events_tx.clone();
                     let identity = Arc::clone(&self.identity);
@@ -528,10 +530,25 @@ impl LinkManager {
                     remote,
                 } => self.on_up(key, peer, hello, connection_id, remote).await,
                 LinkReport::Message { peer, message } => {
-                    let _ = self
+                    let send_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+                    static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                    let result = self
                         .events_tx
                         .send(LinkEvent::Message { peer, message })
                         .await;
+                    let send_wait = send_started.map_or(Duration::ZERO, |start| start.elapsed());
+                    if send_wait >= Duration::from_millis(10)
+                        && tracing::enabled!(tracing::Level::DEBUG)
+                        && LOG_RATE.allow()
+                    {
+                        tracing::debug!(
+                            peer = ?peer,
+                            elapsed_ms = send_wait.as_millis(),
+                            remaining_capacity = self.events_tx.capacity(),
+                            "manager event queue blocked"
+                        );
+                    }
+                    let _ = result;
                 }
                 LinkReport::Down { key, peer, reason } => {
                     let removed = {
@@ -906,6 +923,7 @@ async fn dial_loop(
         }
         let connected = tokio::time::timeout(dial_timeout, async {
             let tcp = TcpStream::connect(address).await.ok()?;
+            tcp.set_nodelay(true).ok()?;
             connector
                 .connect(identity::server_name(address.ip()), tcp)
                 .await
