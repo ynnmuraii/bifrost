@@ -134,6 +134,13 @@ pub enum Request {
     },
     /// `pair-with <address>`: dial a peer that opened its window (`GuiFrame.PairWith`).
     PairWith(String),
+    /// `revoke <peer>`: tombstone the trust record, drop the peer's live links and stop its
+    /// dialer — the same path as the GUI's revoke button (`GuiFrame.RevokePeer`).
+    ///
+    /// One implementation, so the file and the running core cannot disagree (audit F16): the
+    /// CLI used to edit `trust.toml` behind a running core's back, which kept the peer
+    /// trusted in memory and its link up.
+    Revoke(PeerRef),
 }
 
 impl Request {
@@ -187,6 +194,8 @@ impl Request {
             },
             "pair-with" if !argument.is_empty() => Ok(Request::PairWith(argument.to_owned())),
             "pair-with" => Err("pair-with needs an address".to_owned()),
+            "revoke" if !argument.is_empty() => Ok(Request::Revoke(PeerRef::new(argument))),
+            "revoke" => Err("revoke needs a peer id or display name".to_owned()),
             "claim" if argument.is_empty() => Ok(Request::Claim),
             "claim" => Err("claim takes no argument".to_owned()),
             "abandon" if argument.is_empty() => Ok(Request::Abandon),

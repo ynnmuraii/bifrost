@@ -892,6 +892,13 @@ fn peers(args: &Args) -> Result<(), Failure> {
 
     if let Some(id) = revoke {
         let reference = command::PeerRef::new(id);
+        // A running core owns the trust store, the pin set its TLS verifiers read and the
+        // peer's live links, so the revoke goes through it — one implementation, and the file
+        // cannot disagree with the running state (audit F16). Only when no core is listening
+        // does the CLI edit the file itself.
+        if control_if_running(paths, &format!("revoke {reference}"))? {
+            return Ok(());
+        }
         let node_id = command::resolve_peer(&trust, &reference).map_err(Failure::Run)?;
         let removed = trust.revoke(&node_id, identity::now_unix_ms());
         if removed {
@@ -919,6 +926,34 @@ fn peers(args: &Args) -> Result<(), Failure> {
         );
     }
     Ok(())
+}
+
+/// One request to a running core, when there may be none.
+///
+/// `Ok(true)`: a core answered (its reply was printed, and an `ERR` reply is a
+/// [`Failure`]). `Ok(false)`: nothing is listening on the control endpoint, so the caller
+/// does its own file-level work. A core that is there but does not answer in time is an
+/// error for the caller — silently editing files under a stuck core would be worse.
+fn control_if_running(paths: &Paths, line: &str) -> Result<bool, Failure> {
+    let endpoint =
+        ctl::endpoint(private_root(paths)).map_err(|error| format!("control endpoint: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("cannot start the runtime: {error}"))?;
+    let reply = match runtime.block_on(async move {
+        tokio::time::timeout(Duration::from_secs(5), ctl::request(&endpoint, line)).await
+    }) {
+        Err(_) => return Err(Failure::Run("the running core did not answer".to_owned())),
+        // Nobody is listening: the endpoint is missing or refused the connection.
+        Ok(Err(_)) => return Ok(false),
+        Ok(Ok(reply)) => reply,
+    };
+    println!("{}", reply.trim_end());
+    match ctl::Response::parse(&reply) {
+        Ok(ctl::Response::Error { code, .. }) => Err(Failure::Run(code)),
+        _ => Ok(true),
+    }
 }
 
 /// `status`/`switch`: one request to a running core.
