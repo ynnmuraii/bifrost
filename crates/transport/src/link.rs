@@ -727,6 +727,19 @@ async fn run(
                 // frame is written here rather than lost (audit F3); the peer sees a
                 // `Shutdown` instead of a bare socket close. Failing to write it (a dead
                 // socket) still ends the link.
+                //
+                // What the queue already holds goes first: a queued key or button edge must
+                // not be lost to a close, and `select!` would otherwise be free to pick this
+                // branch before `Step::Outbound` and drop it (found by the link_close test
+                // under load: the peer read the `Hello` and the `Shutdown` but not the motion
+                // batch that was waiting between them).
+                if let Ok(first) = outbound.try_recv() {
+                    if let Err(reason) =
+                        drain_outbound(&mut writer, &mut outbound, first, &mut state).await
+                    {
+                        break reason;
+                    }
+                }
                 let _ = write_message(
                     &mut writer,
                     &mut state,
