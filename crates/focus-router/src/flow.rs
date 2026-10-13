@@ -361,6 +361,10 @@ pub enum Notice {
     LeaseMismatch {
         /// The peer that sent it.
         peer: NodeId,
+        /// The lease id the message carried.
+        received: LeaseId,
+        /// The lease id this node holds, when it holds one (it is idle otherwise).
+        expected: Option<LeaseId>,
     },
     /// The peer took its link down deliberately (`Shutdown`).
     PeerShutdown {

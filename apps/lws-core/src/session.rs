@@ -73,6 +73,11 @@ fn is_agent_ready(event: &fr::AgentEvent) -> bool {
     matches!(event, fr::AgentEvent::AgentReady)
 }
 
+/// The first four bytes of a lease id in hex, for a log line that a human scans.
+fn lease_hex(lease_id: &fr::LeaseId) -> String {
+    crate::command::hex16(lease_id).chars().take(8).collect()
+}
+
 fn input_event_counts(events: &[InputEvent]) -> (usize, usize, usize, usize) {
     events.iter().fold((0, 0, 0, 0), |mut counts, event| {
         match event {
@@ -605,6 +610,14 @@ impl Session {
                 }
                 Effect::Agent(command) => {
                     self.context.on_command(&command);
+                    if matches!(command, fr::AgentCommand::EndCapture { .. }) {
+                        // `EndCapture` tears down the session-owned capture, and the
+                        // observation the owner armed with it: without re-arming, the
+                        // owner's `observe_armed` latches `true` and no later return to
+                        // `Local` can start a second crossing, because `arm_observation`
+                        // short-circuits on it (the pointer is never watched again).
+                        self.observe_armed = false;
+                    }
                     let frame = self.agent_frame(&command);
                     if let fr::AgentCommand::Inject {
                         lease_id,
@@ -1594,6 +1607,16 @@ impl Session {
             fr::Notice::Rejected { peer, code } => {
                 tracing::warn!(peer = %peer, ?code, "peer refused")
             }
+            fr::Notice::LeaseMismatch {
+                peer,
+                received,
+                expected,
+            } => tracing::warn!(
+                peer = %peer,
+                received = %lease_hex(received),
+                expected = %expected.as_ref().map_or_else(|| "none".to_owned(), lease_hex),
+                "lease mismatch"
+            ),
             other => tracing::info!(notice = ?other, "notice"),
         }
     }

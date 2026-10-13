@@ -1639,11 +1639,11 @@ impl<I: Identifiers> FocusRouter<I> {
         out: &mut Vec<Output>,
     ) {
         let Some(lease) = self.lease.receiver() else {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         };
         if lease.source != from || lease.lease_id != lease_id {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         }
         match lease.state {
@@ -1706,11 +1706,11 @@ impl<I: Identifiers> FocusRouter<I> {
         out: &mut Vec<Output>,
     ) {
         let Some(lease) = self.lease.receiver_mut() else {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         };
         if lease.source != from || lease.lease_id != lease_id {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         }
         let last_input_batch_seq = lease.last_input_batch_seq;
@@ -1775,11 +1775,11 @@ impl<I: Identifiers> FocusRouter<I> {
             out.push(Output::Notice(Notice::Rejected { peer: from, code }));
         };
         let Some(lease) = self.lease.receiver_mut() else {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         };
         if lease.source != from || lease.lease_id != lease_id {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         }
         if !lease.accepts_input() {
@@ -1864,7 +1864,7 @@ impl<I: Identifiers> FocusRouter<I> {
                     lease.pending_leave = None;
                 }
             }
-            _ => self.mismatch(from, out),
+            _ => self.mismatch(from, lease_id, out),
         }
     }
 
@@ -1886,7 +1886,7 @@ impl<I: Identifiers> FocusRouter<I> {
             }
             // A `LeaveAck` may arrive after we already released locally: benign.
             LeaseSlot::Idle => {}
-            _ => self.mismatch(from, out),
+            _ => self.mismatch(from, lease_id, out),
         }
     }
 
@@ -1902,12 +1902,12 @@ impl<I: Identifiers> FocusRouter<I> {
         out: &mut Vec<Output>,
     ) {
         let Some(lease) = self.lease.source() else {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         };
         if lease.peer != from || lease.lease_id != lease_id || lease.state != SourceState::Preparing
         {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         }
         if !accepted {
@@ -1954,11 +1954,11 @@ impl<I: Identifiers> FocusRouter<I> {
         out: &mut Vec<Output>,
     ) {
         let Some(lease) = self.lease.source_mut() else {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         };
         if lease.peer != from || lease.lease_id != lease_id {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         }
         let _ = ttl_ms;
@@ -1990,7 +1990,7 @@ impl<I: Identifiers> FocusRouter<I> {
     ) {
         let Frame { from, lease_id } = frame;
         let Some(lease) = self.lease.source_mut() else {
-            self.mismatch(from, out);
+            self.mismatch(from, lease_id, out);
             return;
         };
         if lease.peer != from || lease.lease_id != lease_id || lease.state != SourceState::Remote {
@@ -2014,8 +2014,17 @@ impl<I: Identifiers> FocusRouter<I> {
         out.push(Output::Notice(Notice::SwitchRefused { trigger, reason }));
     }
 
-    fn mismatch(&mut self, peer: NodeId, out: &mut Vec<Output>) {
-        out.push(Output::Notice(Notice::LeaseMismatch { peer }));
+    fn mismatch(&mut self, peer: NodeId, received: LeaseId, out: &mut Vec<Output>) {
+        let expected = match &self.lease {
+            LeaseSlot::Idle => None,
+            LeaseSlot::Source(lease) => Some(lease.lease_id),
+            LeaseSlot::Receiver(lease) => Some(lease.lease_id),
+        };
+        out.push(Output::Notice(Notice::LeaseMismatch {
+            peer,
+            received,
+            expected,
+        }));
     }
 
     fn lease_peer(&self) -> Option<NodeId> {
