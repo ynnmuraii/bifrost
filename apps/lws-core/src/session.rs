@@ -2575,6 +2575,25 @@ impl Session {
             }
         };
         let (peer, lease_id) = lease;
+        // A Remote lease with no estimate (a manual switch that could not resolve a display, a
+        // chained link, a layout that became unusable) still has to send positions the
+        // receiver can use: seed the estimate on its primary display and integrate the
+        // captured deltas from there (batch-2 audit).
+        if self.remote_pointer.is_none() {
+            self.remote_pointer = self.receiver_start_position(peer);
+            self.remote_node = Some(peer);
+            match self.remote_pointer.as_ref() {
+                Some(seed) => tracing::warn!(
+                    peer = %peer,
+                    display = seed.display_id.as_str(),
+                    "a remote lease had no estimate; it was seeded on the peer's primary display"
+                ),
+                None => tracing::warn!(
+                    peer = %peer,
+                    "a remote lease has no estimate and no known display for the peer"
+                ),
+            }
+        }
         // The peer receives *its* display's local coordinates: the tracker's virtual
         // position, not the source's node-space numbers (see `topology::forward_events`).
         let events = crate::topology::forward_events(events, self.remote_pointer.as_ref());
@@ -2849,10 +2868,28 @@ impl Session {
                 }
             }
         };
-        // The layout document (KVM-072) is what supplies a real entry point; the
-        // receiver ignores the position (`focus_router` treats it as advisory on
-        // `EnterPrepare`), so the manual trigger carries a neutral one.
-        let entry_position = geometry::Position::new(String::new(), 0.0, 0.0);
+        // A manual switch has no edge to cross, so the entry point comes from the receiver's
+        // own manifest: the centre of its primary display. This is not cosmetic — the
+        // `EnterPrepare` position's `display_id` is what every later `InputBatch` of the lease
+        // is stamped with (`transport::convert::batch_display_after`), so the neutral empty
+        // position this used to carry blanked the whole pointer stream for the lease, and the
+        // receiver refuses (or drops) batches whose display is empty (batch-2 audit).
+        let entry_position = match self.receiver_start_position(target) {
+            Some(position) => position,
+            None => {
+                tracing::warn!(
+                    peer = %target,
+                    "no display is known for the switch target; the transition starts without \
+                     a display id"
+                );
+                geometry::Position::new(String::new(), 0.0, 0.0)
+            }
+        };
+        if !entry_position.display_id.as_str().is_empty() {
+            // The captured deltas integrate from here for the whole lease.
+            self.remote_pointer = Some(entry_position.clone());
+            self.remote_node = Some(target);
+        }
         let revision = self.router.topology_revision();
         let now = self.now_ms();
         let outputs = self.router.handle(
@@ -2878,6 +2915,26 @@ impl Session {
             },
             None => ctl::Response::Switched(peer.clone()),
         }
+    }
+
+    /// Where a transition to `peer` starts when there is no edge to cross (batch-2 audit).
+    ///
+    /// The peer's live manifest first (`Hello`/`DisplaysChanged`), then the configured
+    /// snapshot — the same two sources `rebuild_topology` assembles the document from, but
+    /// this works even when the document is unusable, which is exactly when a manual switch
+    /// has nothing else to go on.
+    fn receiver_start_position(&self, peer: NodeId) -> Option<geometry::Position> {
+        if let Some((_, displays)) = self.peer_displays.get(&peer) {
+            if let Some(position) = crate::topology::start_position(displays) {
+                return Some(position);
+            }
+        }
+        let configured = crate::topology::snapshot_peers(&self.layout, self.node_id.as_bytes());
+        let displays = configured
+            .into_iter()
+            .find(|(node, _)| *node == peer)
+            .map(|(_, displays)| displays)?;
+        crate::topology::start_position(&displays)
     }
 
     /// `claim`: the user (GUI button or the claim hotkey) asks this node to own the
