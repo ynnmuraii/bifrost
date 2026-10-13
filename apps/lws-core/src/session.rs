@@ -724,6 +724,23 @@ impl Session {
                         handle.close();
                     }
                 }
+                Effect::LeaseDiagnostic(snapshot) => {
+                    // FSM totals are per lease; socket totals are per connection. Snapshot
+                    // before teardown so the final line retains the live transport counters.
+                    let transport = self.manager.lease_diagnostics(&snapshot.peer).await;
+                    tracing::info!(
+                        peer = %snapshot.peer,
+                        lease_id = %lease_hex(&snapshot.lease_id),
+                        role = ?snapshot.role,
+                        ttl_ms = snapshot.ttl_ms,
+                        remaining_ms = snapshot.remaining_ms,
+                        final_snapshot = snapshot.final_snapshot,
+                        fsm = ?snapshot.counters,
+                        inbound_ages_ms = ?snapshot.ages,
+                        transport_connection = ?transport,
+                        "lease liveness diagnostics"
+                    );
+                }
                 Effect::Notice(notice) => {
                     if let fr::Notice::RepeatGuardElapsed { lease_id } = notice {
                         // AC-14 and the IPC table of `docs/03-architecture.md`: this is the
@@ -787,7 +804,15 @@ impl Session {
         match self.manager.handle(&peer).await {
             Some(handle) => {
                 static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
-                if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
+                if tracing::enabled!(tracing::Level::DEBUG)
+                    && !matches!(
+                        message,
+                        fr::Message::LeaseChallenge { .. }
+                            | fr::Message::LeaseRenew { .. }
+                            | fr::Message::LeaseStatus { .. }
+                    )
+                    && LOG_RATE.allow()
+                {
                     tracing::debug!(peer = %peer, message = name, "core -> peer");
                 }
                 if let Err(error) = handle.send(message).await {
@@ -1784,7 +1809,15 @@ impl Session {
             LinkEvent::Message { peer, message } => match message {
                 transport::convert::Inbound::Focus(message) => {
                     static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
-                    if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
+                    if tracing::enabled!(tracing::Level::DEBUG)
+                        && !matches!(
+                            message,
+                            fr::Message::LeaseChallenge { .. }
+                                | fr::Message::LeaseRenew { .. }
+                                | fr::Message::LeaseStatus { .. }
+                        )
+                        && LOG_RATE.allow()
+                    {
                         tracing::debug!(
                             peer = %peer,
                             message = routing::message_name(&message),

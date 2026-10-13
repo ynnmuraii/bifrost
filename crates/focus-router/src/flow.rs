@@ -241,6 +241,8 @@ pub enum Input {
 /// Timers the router asks the caller to arm. At most one of each kind is live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Timer {
+    /// Allocation-free lease report, every 1000 ms while Remote.
+    LeaseDiagnostic,
     /// `prepare_timeout_ms` for the temporary source capture / the receiver's
     /// `Prepared` lease.
     PrepareTimeout,
@@ -424,6 +426,8 @@ pub enum AgentCommand {
 /// An output of the router.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Output {
+    /// Per-lease FSM counts and inbound ages; final reports precede teardown.
+    LeaseDiagnostic(crate::diagnostics::LeaseDiagnosticSnapshot),
     /// Send a message to one peer.
     Send {
         /// The peer.

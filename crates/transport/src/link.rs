@@ -211,6 +211,58 @@ mod tests {
     use super::*;
     use std::io;
 
+    #[test]
+    fn lease_counters_classify_each_direction_and_ignore_other_payloads() {
+        use wire::envelope::Payload;
+        let counters = LeaseTransportCounters::default();
+        assert_eq!(counters.snapshot(), LeaseTransportSnapshot::default());
+        let challenge = Payload::LeaseChallenge(Default::default());
+        let renew = Payload::LeaseRenew(Default::default());
+        let status = Payload::LeaseStatus(Default::default());
+        for (payload, written, decoded) in [(&challenge, 1, 4), (&renew, 2, 5), (&status, 3, 6)] {
+            for _ in 0..written {
+                counters.record(Some(payload), true);
+            }
+            for _ in 0..decoded {
+                counters.record(Some(payload), false);
+            }
+        }
+        let ping = Payload::Ping(Default::default());
+        for written in [true, false] {
+            counters.record(None, written);
+            counters.record(Some(&ping), written);
+        }
+        assert_eq!(
+            counters.snapshot(),
+            LeaseTransportSnapshot {
+                challenge_written: 1,
+                renew_written: 2,
+                status_written: 3,
+                challenge_decoded: 4,
+                renew_decoded: 5,
+                status_decoded: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn lease_counters_share_connection_state_but_reset_for_new_connections() {
+        let connection = Arc::new(LeaseTransportCounters::default());
+        let handle = Arc::clone(&connection);
+        let renew = wire::envelope::Payload::LeaseRenew(Default::default());
+        connection.record(Some(&renew), true);
+        handle.record(Some(&renew), false);
+        assert_eq!(handle.snapshot(), connection.snapshot());
+        assert_eq!(handle.snapshot().renew_written, 1);
+        assert_eq!(handle.snapshot().renew_decoded, 1);
+        let next_connection = LeaseTransportCounters::default();
+        assert_eq!(
+            next_connection.snapshot(),
+            LeaseTransportSnapshot::default()
+        );
+        assert_eq!(handle.snapshot().renew_written, 1);
+    }
+
     struct BufferedWriter {
         pending: Vec<u8>,
         delivered: Vec<u8>,
@@ -259,12 +311,71 @@ mod tests {
     }
 }
 
+/// Cumulative lease-frame counters for one connection, reset on reconnect.
+///
+/// Written means the framed write and flush succeeded; decoded means envelope validation
+/// and inbound conversion succeeded. Independent relaxed loads are diagnostic observations,
+/// not a transactionally consistent view. Updating and sampling never allocate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeaseTransportSnapshot {
+    /// Successfully flushed lease challenges.
+    pub challenge_written: u64,
+    /// Successfully flushed lease renewals.
+    pub renew_written: u64,
+    /// Successfully flushed lease statuses.
+    pub status_written: u64,
+    /// Validated and converted inbound lease challenges.
+    pub challenge_decoded: u64,
+    /// Validated and converted inbound lease renewals.
+    pub renew_decoded: u64,
+    /// Validated and converted inbound lease statuses.
+    pub status_decoded: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LeaseTransportCounters {
+    challenge_written: AtomicU64,
+    renew_written: AtomicU64,
+    status_written: AtomicU64,
+    challenge_decoded: AtomicU64,
+    renew_decoded: AtomicU64,
+    status_decoded: AtomicU64,
+}
+
+impl LeaseTransportCounters {
+    pub(crate) fn record(&self, payload: Option<&wire::envelope::Payload>, written: bool) {
+        use wire::envelope::Payload;
+        let counter = match (payload, written) {
+            (Some(Payload::LeaseChallenge(_)), true) => &self.challenge_written,
+            (Some(Payload::LeaseRenew(_)), true) => &self.renew_written,
+            (Some(Payload::LeaseStatus(_)), true) => &self.status_written,
+            (Some(Payload::LeaseChallenge(_)), false) => &self.challenge_decoded,
+            (Some(Payload::LeaseRenew(_)), false) => &self.renew_decoded,
+            (Some(Payload::LeaseStatus(_)), false) => &self.status_decoded,
+            _ => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> LeaseTransportSnapshot {
+        LeaseTransportSnapshot {
+            challenge_written: self.challenge_written.load(Ordering::Relaxed),
+            renew_written: self.renew_written.load(Ordering::Relaxed),
+            status_written: self.status_written.load(Ordering::Relaxed),
+            challenge_decoded: self.challenge_decoded.load(Ordering::Relaxed),
+            renew_decoded: self.renew_decoded.load(Ordering::Relaxed),
+            status_decoded: self.status_decoded.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A cloneable handle to one link's outbound queue.
 #[derive(Debug, Clone)]
 pub struct LinkHandle {
     peer: NodeId,
     tx: mpsc::Sender<Outbound>,
     dropped_motion: Arc<AtomicU64>,
+    lease_diagnostics: Arc<LeaseTransportCounters>,
 }
 
 impl LinkHandle {
@@ -362,6 +473,26 @@ impl LinkHandle {
         self.dropped_motion.load(Ordering::Relaxed)
     }
 
+    /// Samples this connection's cumulative lease counters without allocating.
+    pub fn lease_diagnostics(&self) -> LeaseTransportSnapshot {
+        self.lease_diagnostics.snapshot()
+    }
+
+    pub(crate) fn lease_diagnostics_counters(&self) -> Arc<LeaseTransportCounters> {
+        Arc::clone(&self.lease_diagnostics)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_counter_test(peer: NodeId) -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self {
+            peer,
+            tx,
+            dropped_motion: Arc::new(AtomicU64::new(0)),
+            lease_diagnostics: Arc::new(LeaseTransportCounters::default()),
+        }
+    }
+
     /// Asks the link to close: a `Shutdown` is queued, and the task ends after writing it.
     pub fn close(&self) {
         let _ = self
@@ -446,16 +577,22 @@ pub struct LinkConfig {
 pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
     let (tx, rx) = mpsc::channel::<Outbound>(config.queue_capacity.max(1));
     let dropped_motion = Arc::new(AtomicU64::new(0));
+    let lease_diagnostics = Arc::new(LeaseTransportCounters::default());
     let handle = LinkHandle {
         peer: config.peer,
         tx,
         dropped_motion,
+        lease_diagnostics: Arc::clone(&lease_diagnostics),
     };
-    let task = tokio::spawn(run(config, rx));
+    let task = tokio::spawn(run(config, rx, lease_diagnostics));
     Ok(Link { handle, task })
 }
 
-async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
+async fn run(
+    config: LinkConfig,
+    outbound: mpsc::Receiver<Outbound>,
+    lease_diagnostics: Arc<LeaseTransportCounters>,
+) {
     let LinkConfig {
         key,
         peer,
@@ -503,7 +640,7 @@ async fn run(config: LinkConfig, outbound: mpsc::Receiver<Outbound>) {
     let (frames_tx, mut frames_rx) = mpsc::channel::<Result<wire::Envelope, TransportError>>(8);
     let reader_task = tokio::spawn(read_loop(reader, frames_tx));
 
-    let mut state = LinkState::new(peer, connection_id, key);
+    let mut state = LinkState::new(peer, connection_id, key, lease_diagnostics);
     state.remote = remote;
 
     // The dialer speaks first: its `Hello` is the first frame of its direction (`seq = 1`).
@@ -612,10 +749,16 @@ struct LinkState {
     remote: Option<SocketAddr>,
     last_batch_log: Option<tokio::time::Instant>,
     last_ack_log: Option<tokio::time::Instant>,
+    lease_diagnostics: Arc<LeaseTransportCounters>,
 }
 
 impl LinkState {
-    fn new(peer: NodeId, connection_id: [u8; 16], key: [u8; 16]) -> Self {
+    fn new(
+        peer: NodeId,
+        connection_id: [u8; 16],
+        key: [u8; 16],
+        lease_diagnostics: Arc<LeaseTransportCounters>,
+    ) -> Self {
         Self {
             peer,
             key,
@@ -631,6 +774,7 @@ impl LinkState {
             remote: None,
             last_batch_log: None,
             last_ack_log: None,
+            lease_diagnostics,
         }
     }
     fn report_input_batch(&mut self, direction: &'static str, seq: u64, events: &[InputEvent]) {
@@ -844,6 +988,8 @@ impl LinkState {
         }
         let message = convert::inbound_from_envelope(envelope)
             .map_err(|error: ConvertError| LinkDownReason::Protocol(error.to_string()))?;
+        self.lease_diagnostics
+            .record(envelope.payload.as_ref(), false);
         match &message {
             convert::Inbound::Focus(fr::Message::InputBatch { events, .. }) => {
                 self.report_input_batch("rx", envelope.seq, events);
@@ -887,38 +1033,10 @@ async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: ReadHalf<R>,
     frames: mpsc::Sender<Result<wire::Envelope, TransportError>>,
 ) {
-    let log_rate = logging::LogRateLimit::new();
     loop {
         let frame = read_frame(&mut reader).await;
         let stop = frame.is_err();
-        let lease_seq = match frame.as_ref() {
-            Ok(envelope)
-                if matches!(
-                    envelope.payload.as_ref(),
-                    Some(
-                        wire::envelope::Payload::LeaseChallenge(_)
-                            | wire::envelope::Payload::LeaseRenew(_)
-                            | wire::envelope::Payload::LeaseStatus(_)
-                    )
-                ) =>
-            {
-                Some(envelope.seq)
-            }
-            _ => None,
-        };
-        let queued_at = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let queued = frames.send(frame).await;
-        let queue_wait = queued_at.map_or(Duration::ZERO, |start| start.elapsed());
-        if let Some(seq) = lease_seq {
-            if tracing::enabled!(tracing::Level::DEBUG) && log_rate.allow() {
-                tracing::debug!(
-                    seq,
-                    elapsed_ms = queue_wait.as_millis(),
-                    remaining_capacity = frames.capacity(),
-                    "socket reader queued lease envelope"
-                );
-            }
-        }
         if queued.is_err() || stop {
             return;
         }
@@ -1045,25 +1163,11 @@ async fn write_message<W: AsyncWrite + Unpin>(
     }
     state.batch_display = batch_display;
     state.tx_seq += 1;
-    let is_lease_frame = matches!(
-        &message,
-        fr::Message::LeaseChallenge { .. }
-            | fr::Message::LeaseRenew { .. }
-            | fr::Message::LeaseStatus { .. }
-    );
-    let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
-    static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
-    let result = write_frame(writer, &envelope).await.map_err(reason_from);
-    if is_lease_frame && tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
-        tracing::debug!(
-            peer = ?state.peer,
-            seq,
-            elapsed_ms = started.map_or(Duration::ZERO, |start| start.elapsed()).as_millis(),
-            success = result.is_ok(),
-            "socket writer flushed lease frame"
-        );
-    }
-    result
+    write_frame(writer, &envelope).await.map_err(reason_from)?;
+    state
+        .lease_diagnostics
+        .record(envelope.payload.as_ref(), true);
+    Ok(())
 }
 
 fn reason_from(error: TransportError) -> LinkDownReason {
