@@ -178,6 +178,10 @@ message DisplayInfo {
   double lx = 2; double ly = 3; double lw = 4; double lh = 5;
   int32 nx = 6; int32 ny = 7; int32 nw = 8; int32 nh = 9;
   uint32 rotation = 10; double scale = 11; bool primary = 12;
+  // The OS device name this display answers at (`\\.\DISPLAY1` on Windows), "" when the
+  // backend has none. Windows renumbers that name when monitors change, so `id` is the
+  // stable device-interface id and this field is the alias core maps an older layout through.
+  string name = 13;
 }
 message LocalInputDetected { bytes lease_id = 1; }
 

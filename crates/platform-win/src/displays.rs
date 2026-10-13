@@ -6,8 +6,14 @@
 //! monitor are its virtual-screen rectangle divided by that monitor's scale
 //! (`dpi / 96`). `native_*` keeps the physical pixels `EnumDisplayMonitors` reports.
 //!
-//! Identity: the monitor's device name (`\\.\DISPLAY1`) — stable for the session and
-//! distinct per monitor, which is what `Display.id` needs («stable within node»).
+//! Identity: the monitor's device-interface path (`\\?\DISPLAY#<mfg+product>#<instance>
+//! #{guid}`) read with `EnumDisplayDevicesW(EDD_GET_DEVICE_INTERFACE_NAME)`, which is derived
+//! from the monitor's EDID and its instance rather than from the adapter numbering, so it
+//! survives the renumbering of `\\.\DISPLAYn` when monitors are added or removed. The device
+//! name is kept beside it: the log prints it, and core's alias maps a layout written under
+//! the old name to the display that now carries that name. When Windows will not describe an
+//! interface (the call fails, or the output has no monitor attached), the device name is the
+//! id — the pre-existing behaviour.
 //!
 //! Not implemented here: per-display rotation. Windows rotates the *logical* desktop
 //! itself, so the logical bounds are already correct; only the diagnostic `rotation`
@@ -15,19 +21,26 @@
 //! it.
 #![cfg(windows)]
 
-use windows::core::BOOL;
+use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC, HMONITOR,
+    MONITORINFOEXW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY,
+};
 
 /// One monitor, in both coordinate spaces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Monitor {
-    /// Device name, e.g. `\\.\DISPLAY1`.
+    /// Stable id: the monitor's device-interface path (`\\?\DISPLAY#…`) when Windows
+    /// describes one, the `\\.\DISPLAYn` device name otherwise.
     pub id: String,
+    /// The adapter device name (`\\.\DISPLAYn`) this monitor answers at, kept for the log
+    /// and for the alias that maps a document written before the id changed.
+    pub device_name: String,
     /// Logical bounds (DIP): `[x, y, width, height]`.
     pub logical: [f64; 4],
     /// Physical bounds in device pixels: `[x, y, width, height]`.
@@ -132,8 +145,12 @@ unsafe extern "system" fn collect_monitor(
         f64::from(native[3]) / scale,
     ];
 
+    let device = utf16_z(&info.szDevice);
+    let id = stable_id(device_interface_name(&device).as_deref(), &device);
+
     collected.push(Monitor {
-        id: device_name(&info.szDevice),
+        id,
+        device_name: device,
         logical,
         native,
         scale,
@@ -142,8 +159,50 @@ unsafe extern "system" fn collect_monitor(
     TRUE
 }
 
-/// `MONITORINFOEXW.szDevice` is a fixed-size UTF-16 buffer.
-fn device_name(buffer: &[u16; 32]) -> String {
+/// The `id` a monitor is reported under.
+///
+/// The device-interface name wins when Windows gives one: it is built from the monitor's
+/// EDID and its instance and does not move with the adapter's `\\.\DISPLAYn` numbering. An
+/// empty or missing interface leaves the device name, which is what this crate reported
+/// before the interface name was read.
+fn stable_id(interface: Option<&str>, device_name: &str) -> String {
+    match interface {
+        Some(interface) if !interface.is_empty() => interface.to_owned(),
+        _ => device_name.to_owned(),
+    }
+}
+
+/// The monitor's device-interface path, or `None` when Windows will not describe one.
+///
+/// `EnumDisplayDevicesW` on the adapter device name with `EDD_GET_DEVICE_INTERFACE_NAME`
+/// answers with the monitor's interface name (`\\?\DISPLAY#DEL4098#5&…#{e6f07b5f-…}`), whose
+/// instance component keeps two identical models apart. An adapter output with no monitor
+/// attached (a spare port) answers with an empty `DeviceID`, which is also "no interface".
+fn device_interface_name(device: &str) -> Option<String> {
+    let name: Vec<u16> = device.encode_utf16().chain(core::iter::once(0)).collect();
+    let mut monitor = DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `name` is NUL-terminated UTF-16 and outlives the call, `monitor.cb` is the
+    // size the API checks, and `monitor` is valid for writes for the duration.
+    let ok = unsafe {
+        EnumDisplayDevicesW(
+            PCWSTR(name.as_ptr()),
+            0,
+            &mut monitor,
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        )
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+    let interface = utf16_z(&monitor.DeviceID);
+    (!interface.is_empty()).then_some(interface)
+}
+
+/// One fixed-size UTF-16 buffer as text, up to its NUL (or its end).
+fn utf16_z(buffer: &[u16]) -> String {
     let end = buffer
         .iter()
         .position(|unit| *unit == 0)
@@ -163,10 +222,57 @@ mod tests {
         for (index, unit) in "\\\\.\\DISPLAY1".encode_utf16().enumerate() {
             buffer[index] = unit;
         }
-        assert_eq!(device_name(&buffer), "\\\\.\\DISPLAY1");
+        assert_eq!(utf16_z(&buffer), "\\\\.\\DISPLAY1");
 
         let empty = [0u16; 32];
-        assert_eq!(device_name(&empty), "");
+        assert_eq!(utf16_z(&empty), "");
+    }
+
+    #[test]
+    fn a_monitor_without_an_interface_keeps_its_device_name() {
+        // `EnumDisplayDevicesW` failed, or the output has no monitor attached: the id is the
+        // device name, exactly what this crate reported before.
+        assert_eq!(stable_id(None, "\\\\.\\DISPLAY2"), "\\\\.\\DISPLAY2");
+        assert_eq!(stable_id(Some(""), "\\\\.\\DISPLAY2"), "\\\\.\\DISPLAY2");
+        let interface =
+            "\\\\?\\DISPLAY#DEL4098#5&2a4b1c3&0&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        assert_eq!(stable_id(Some(interface), "\\\\.\\DISPLAY1"), interface);
+    }
+
+    #[test]
+    fn two_identical_monitors_get_different_ids() {
+        // Same model, same EDID-derived prefix, different instance component: the interface
+        // name is what keeps the two apart, which the hardware id alone would not.
+        let left =
+            "\\\\?\\DISPLAY#DEL4098#5&2a4b1c3&0&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        let right =
+            "\\\\?\\DISPLAY#DEL4098#5&2a4b1c3&0&UID4354#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        assert_eq!(stable_id(Some(left), "\\\\.\\DISPLAY1"), left);
+        assert_eq!(stable_id(Some(right), "\\\\.\\DISPLAY2"), right);
+        assert_ne!(
+            stable_id(Some(left), "\\\\.\\DISPLAY1"),
+            stable_id(Some(right), "\\\\.\\DISPLAY2")
+        );
+    }
+
+    /// The id `enumerate` reports is the interface name when the enumeration can read one,
+    /// and the device name otherwise; both cases must still be distinct per monitor.
+    #[test]
+    fn enumerated_ids_are_distinct_and_carry_their_device_name() {
+        let monitors = enumerate().expect("a Windows host always has a monitor");
+        for monitor in &monitors {
+            assert!(!monitor.id.is_empty());
+            assert!(
+                monitor.device_name.starts_with("\\\\.\\DISPLAY"),
+                "device name: {}",
+                monitor.device_name
+            );
+        }
+        let ids: Vec<&str> = monitors.iter().map(|monitor| monitor.id.as_str()).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "ids: {ids:?}");
     }
 
     /// The invariant that catches a monitor being silently dropped: the number of

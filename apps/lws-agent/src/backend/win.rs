@@ -449,6 +449,7 @@ impl Win {
             .into_iter()
             .map(|monitor| crate::displays::RawDisplay {
                 id: monitor.id,
+                name: monitor.device_name,
                 logical: monitor.logical,
                 native: Some(monitor.native),
                 scale: monitor.scale,
@@ -853,6 +854,7 @@ mod tests {
         );
         let monitor = platform_win::displays::Monitor {
             id: "\\.\\DISPLAY1".to_owned(),
+            device_name: "\\.\\DISPLAY1".to_owned(),
             logical: [0.0, 0.0, 1920.0, 1080.0],
             native: [0, 0, 1920, 1080],
             scale: 1.0,

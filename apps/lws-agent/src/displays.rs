@@ -24,6 +24,10 @@ use protocol::ipc;
 pub struct RawDisplay {
     /// Stable id inside this node.
     pub id: String,
+    /// The OS device name this display answers at (`\\.\DISPLAY1` on Windows), when the
+    /// backend has one; empty otherwise. Carried so core can map a layout written under the
+    /// old name after Windows renumbers its displays.
+    pub name: String,
     /// Logical bounds `[x, y, width, height]` in the node's logical space.
     pub logical: [f64; 4],
     /// Native bounds in device pixels, or `None` when the platform does not expose
@@ -42,6 +46,7 @@ impl RawDisplay {
     pub fn without_native(id: impl Into<String>, logical: [f64; 4], primary: bool) -> Self {
         RawDisplay {
             id: id.into(),
+            name: String::new(),
             logical,
             native: None,
             scale: 1.0,
@@ -54,6 +59,7 @@ impl RawDisplay {
         let native = self.native.unwrap_or([0, 0, 0, 0]);
         ipc::DisplayInfo {
             id: self.id.clone(),
+            name: self.name.clone(),
             lx: self.logical[0],
             ly: self.logical[1],
             lw: self.logical[2],
@@ -118,6 +124,7 @@ mod tests {
         vec![
             RawDisplay {
                 id: "primary".to_owned(),
+                name: "\\\\.\\DISPLAY1".to_owned(),
                 logical: [0.0, 0.0, 1920.0, 1080.0],
                 native: Some([0, 0, 1920, 1080]),
                 scale: 1.0,
@@ -125,6 +132,7 @@ mod tests {
             },
             RawDisplay {
                 id: "left".to_owned(),
+                name: String::new(),
                 logical: [-1280.0, 0.0, 1280.0, 1024.0],
                 native: Some([-1280, 0, 1280, 1024]),
                 scale: 1.25,
@@ -141,6 +149,10 @@ mod tests {
 
         let primary = &report.displays[0];
         assert_eq!(primary.id, "primary");
+        assert_eq!(
+            primary.name, "\\\\.\\DISPLAY1",
+            "the device name travels beside the stable id for the alias"
+        );
         assert_eq!(
             (primary.lx, primary.ly, primary.lw, primary.lh),
             (0.0, 0.0, 1920.0, 1080.0)

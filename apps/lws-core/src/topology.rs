@@ -129,12 +129,28 @@ impl std::error::Error for BuildError {}
 /// [`geometry::TopologyError::UnknownDisplay`] — this function decides which errors are soft
 /// for the *live* document, and leaves every structural rule fatal.
 pub fn build(documents: &Documents<'_>) -> Result<Built, BuildError> {
-    let links = documents
+    let mut links = documents
         .topology
         .to_transition_links(&documents.local_node_id)
         .map_err(BuildError::Links)?;
 
     let local = NodeId::new(documents.local_node_id);
+    // A link written before Windows renumbered its displays names the display by an old
+    // device name; the manifest says which stable id carries that name now, so the reference
+    // is resolved here instead of failing as an unknown display.
+    let aliases = display_aliases(documents.local_displays);
+    if !aliases.is_empty() {
+        for link in &mut links {
+            for endpoint in [&mut link.source, &mut link.target] {
+                if endpoint.node == local {
+                    if let Some(target) = aliases.get(endpoint.display.as_str()) {
+                        endpoint.display = DisplayId::new(target.clone());
+                    }
+                }
+            }
+        }
+    }
+
     let mut nodes: BTreeMap<NodeId, Vec<Display>> = BTreeMap::new();
     let mut local_named = Vec::new();
     for info in documents.local_displays {
@@ -219,6 +235,45 @@ pub fn build(documents: &Documents<'_>) -> Result<Built, BuildError> {
                 }),
                 Err(errors) => Err(BuildError::Invalid(errors.into_errors())),
             }
+        }
+    }
+}
+
+/// Windows renumbers `\\.\DISPLAYn` when monitors change, so a document edited earlier may
+/// name a display by the device name it had then. A manifest entry carries both the stable id
+/// and the device name it currently answers at, which is what makes an alias out of that:
+/// `device name -> stable id`. Entries without a name, and entries whose name already is the
+/// id (the platform had no interface to read), produce no alias.
+#[must_use]
+pub fn display_aliases(displays: &[ipc::DisplayInfo]) -> BTreeMap<String, String> {
+    displays
+        .iter()
+        .filter(|display| !display.name.is_empty() && display.name != display.id)
+        .map(|display| (display.name.clone(), display.id.clone()))
+        .collect()
+}
+
+/// The `[topology]` document to persist once a stored layout names a display by a device name
+/// Windows has since renumbered, or `None` when nothing has to move.
+///
+/// The rewrite itself is [`config::TopologyConfig::rewrite_display_ids`]; this renders the
+/// result as the TOML the ordinary CAS path carries ([`crate::Session::layout_edit_document`]),
+/// so the document is written by the coordinator's one writer and never by a side door.
+#[must_use]
+pub fn alias_layout(
+    layout: &config::TopologyConfig,
+    local_node_id: &[u8; 32],
+    aliases: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut rewritten = layout.clone();
+    if !rewritten.rewrite_display_ids(local_node_id, aliases) {
+        return None;
+    }
+    match toml::to_string_pretty(&rewritten) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            tracing::warn!(%error, "cannot render the display-id migration for the layout");
+            None
         }
     }
 }
@@ -637,6 +692,9 @@ pub fn snapshot_displays(
         .filter(|display| display.node == self_node || display.node == local)
         .map(|display| ipc::DisplayInfo {
             id: display.id.clone(),
+            // A snapshot has no OS device name: it was written by the GUI, not read from the
+            // platform, so it can neither be an alias source nor a target.
+            name: String::new(),
             lx: display.logical[0],
             ly: display.logical[1],
             lw: display.logical[2],
@@ -1415,8 +1473,20 @@ bidirectional = true
     }
 
     fn info(id: &str, logical: [f64; 4], native: [i32; 4], primary: bool) -> ipc::DisplayInfo {
+        named_info(id, "", logical, native, primary)
+    }
+
+    /// A manifest entry with the OS device name it answers at (`\\.\DISPLAY1` on Windows).
+    fn named_info(
+        id: &str,
+        name: &str,
+        logical: [f64; 4],
+        native: [i32; 4],
+        primary: bool,
+    ) -> ipc::DisplayInfo {
         ipc::DisplayInfo {
             id: id.to_owned(),
+            name: name.to_owned(),
             lx: logical[0],
             ly: logical[1],
             lw: logical[2],
@@ -1614,6 +1684,193 @@ bidirectional = true
                 .expect("the right edge is a link");
         assert_eq!(transition.target.node, NodeId::new(peer_id()));
         assert_eq!(transition.target.display.as_str(), "DP-1");
+    }
+
+    /// A Windows monitor's stable id and the device name it currently answers at.
+    const STABLE_WINDOWS_ID: &str =
+        "\\\\?\\DISPLAY#DEL4098#5&2a4b1c3&0&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+    const WINDOWS_DEVICE_NAME: &str = "\\\\.\\DISPLAY1";
+
+    /// A document written before the device names were renumbered: the display row and the link
+    /// name the monitor by `\\.\DISPLAY1`, plus a peer row that must never be rewritten.
+    fn renumbered_layout() -> config::TopologyConfig {
+        let mut config = config::TopologyConfig::default();
+        config.displays.push(config::DisplayConfig {
+            node: "self".to_owned(),
+            id: WINDOWS_DEVICE_NAME.to_owned(),
+            logical: [0.0, 0.0, 1920.0, 1080.0],
+            primary: true,
+        });
+        config.displays.push(config::DisplayConfig {
+            node: config::peer_reference(&peer_id()),
+            id: WINDOWS_DEVICE_NAME.to_owned(),
+            logical: [0.0, 0.0, 1920.0, 1080.0],
+            primary: true,
+        });
+        config.links.push(config::LinkConfig {
+            id: "self-to-peer".to_owned(),
+            from: config::EndpointConfig {
+                node: "self".to_owned(),
+                display: WINDOWS_DEVICE_NAME.to_owned(),
+                edge: config::Edge::Right,
+                start: 0.0,
+                end: 1080.0,
+            },
+            to: config::EndpointConfig {
+                node: config::peer_reference(&peer_id()),
+                display: "DP-1".to_owned(),
+                edge: config::Edge::Left,
+                start: 0.0,
+                end: 1080.0,
+            },
+            bidirectional: true,
+        });
+        config
+    }
+
+    #[test]
+    fn an_alias_table_maps_device_names_and_ignores_the_rest() {
+        let displays = [
+            named_info(
+                STABLE_WINDOWS_ID,
+                WINDOWS_DEVICE_NAME,
+                [0.0, 0.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                true,
+            ),
+            // An id that already is the platform name (no interface was read) is no alias.
+            named_info(
+                "eDP-1",
+                "eDP-1",
+                [0.0, 0.0, 800.0, 600.0],
+                [0, 0, 0, 0],
+                false,
+            ),
+            // A GUI snapshot carries no device name.
+            info("snapshot", [0.0, 0.0, 1024.0, 768.0], [0, 0, 0, 0], false),
+        ];
+        let aliases = display_aliases(&displays);
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[WINDOWS_DEVICE_NAME], STABLE_WINDOWS_ID);
+    }
+
+    #[test]
+    fn a_link_naming_a_renumbered_device_name_resolves_through_the_alias() {
+        let config = renumbered_layout();
+        // The agent now reports the monitor under its stable interface id, carrying the device
+        // name it answers at; the stored link still names `\\.\DISPLAY1`.
+        let local = [named_info(
+            STABLE_WINDOWS_ID,
+            WINDOWS_DEVICE_NAME,
+            [0.0, 0.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
+
+        let built = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("the alias resolves the old device name");
+
+        assert!(built.inactive.is_empty());
+        assert_eq!(built.topology.links.len(), 1);
+        assert_eq!(
+            built.topology.links[0].source.display.as_str(),
+            STABLE_WINDOWS_ID,
+            "the endpoint moved to the display that answers at the old device name"
+        );
+        let local_node = built.topology.node(&NodeId::new(local_id())).unwrap();
+        assert!(local_node
+            .display(&DisplayId::new(STABLE_WINDOWS_ID))
+            .is_some());
+    }
+
+    #[test]
+    fn a_renumbered_layout_renders_a_migration_and_leaves_peers_alone() {
+        let aliases =
+            BTreeMap::from([(WINDOWS_DEVICE_NAME.to_owned(), STABLE_WINDOWS_ID.to_owned())]);
+        let text = alias_layout(&renumbered_layout(), &local_id(), &aliases)
+            .expect("the local rows move, so a document is rendered");
+        let parsed: config::TopologyConfig =
+            toml::from_str(&text).expect("the migration renders a readable layout document");
+
+        assert_eq!(parsed.displays[0].id, STABLE_WINDOWS_ID);
+        assert_eq!(
+            parsed.displays[1].id, WINDOWS_DEVICE_NAME,
+            "a peer id is its own"
+        );
+        assert_eq!(parsed.links[0].from.display, STABLE_WINDOWS_ID);
+        assert_eq!(parsed.links[0].to.display, "DP-1");
+
+        // Nothing to move: no alias, or an alias the document does not name.
+        assert!(alias_layout(&renumbered_layout(), &local_id(), &BTreeMap::new()).is_none());
+        let unrelated =
+            BTreeMap::from([("\\\\.\\DISPLAY9".to_owned(), STABLE_WINDOWS_ID.to_owned())]);
+        assert!(alias_layout(&renumbered_layout(), &local_id(), &unrelated).is_none());
+    }
+
+    #[test]
+    fn a_migration_that_would_duplicate_a_display_keeps_the_stable_row() {
+        let mut config = renumbered_layout();
+        // The document already carries the stable id as well (the GUI saved the live editor):
+        // rewriting the old row must not leave two rows with the same id.
+        config.displays.insert(
+            1,
+            config::DisplayConfig {
+                node: "self".to_owned(),
+                id: STABLE_WINDOWS_ID.to_owned(),
+                logical: [0.0, 0.0, 1920.0, 1080.0],
+                primary: true,
+            },
+        );
+        let aliases =
+            BTreeMap::from([(WINDOWS_DEVICE_NAME.to_owned(), STABLE_WINDOWS_ID.to_owned())]);
+        let text = alias_layout(&config, &local_id(), &aliases).expect("the old row moves");
+        let parsed: config::TopologyConfig = toml::from_str(&text).expect("readable document");
+        let self_rows: Vec<&str> = parsed
+            .displays
+            .iter()
+            .filter(|display| display.node == "self")
+            .map(|display| display.id.as_str())
+            .collect();
+        assert_eq!(self_rows, vec![STABLE_WINDOWS_ID]);
+    }
+
+    #[test]
+    fn a_document_with_no_alias_keeps_the_fatal_missing_display() {
+        // No manifest name matches `\\.\DISPLAY1`, so there is nothing to alias and the link
+        // is still inactive (2b558c1 behaviour), not resolved to some other display.
+        let config = renumbered_layout();
+        let local = [info(
+            "eDP-1",
+            [0.0, 0.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
+        let built = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("an unknown display is inactive, not fatal");
+        assert!(built.topology.links.is_empty());
+        assert_eq!(built.inactive.len(), 1);
+        assert_eq!(
+            built.inactive[0].missing[0].display.as_str(),
+            WINDOWS_DEVICE_NAME
+        );
     }
 
     /// Two links, one per half of a local display's right edge and of the peer's left edge.

@@ -1004,6 +1004,7 @@ impl Backend {
         match self {
             Backend::Dry(dry) if dry.dry_displays => vec![crate::displays::RawDisplay {
                 id: "dry-0".to_owned(),
+                name: String::new(),
                 logical: [0.0, 0.0, 1920.0, 1080.0],
                 native: Some([0, 0, 1920, 1080]),
                 scale: 1.0,

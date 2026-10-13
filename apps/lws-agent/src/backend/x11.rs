@@ -319,6 +319,9 @@ impl X11 {
             .into_iter()
             .map(|monitor| crate::displays::RawDisplay {
                 id: monitor.id,
+                // X11's id (an output name such as `eDP-1`) is already its own stable name;
+                // the alias field exists for Windows renumbering and is not used here.
+                name: String::new(),
                 logical: monitor.logical,
                 native: Some(monitor.native),
                 scale: monitor.scale,

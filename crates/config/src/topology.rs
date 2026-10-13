@@ -16,6 +16,8 @@
 //! The local node id is a parameter because the configuration does not contain
 //! it — identity lives in the trust store.
 
+use std::collections::BTreeMap;
+
 use crate::error::{ConfigError, ErrorCode};
 use crate::schema::{EndpointConfig, TopologyConfig};
 
@@ -75,6 +77,62 @@ pub fn parse_node_ref(
 }
 
 impl TopologyConfig {
+    /// Rewrites a document whose display ids are old platform device names to the stable ids
+    /// the manifests report now, and reports whether anything moved.
+    ///
+    /// `aliases` maps a device name Windows currently reports (`\\.\DISPLAY1`) to the stable id
+    /// that carries it. Only rows and endpoints on `local_node_id` are rewritten: a peer's ids
+    /// are the peer's own and are never touched. A rewrite that would leave two display rows
+    /// with the same id on one node keeps the first and drops the rest — the rows are a GUI
+    /// snapshot, and the live manifest is the source of truth for what exists.
+    ///
+    /// Returns `false` (and changes nothing) for an empty alias table.
+    pub fn rewrite_display_ids(
+        &mut self,
+        local_node_id: &[u8; 32],
+        aliases: &BTreeMap<String, String>,
+    ) -> bool {
+        if aliases.is_empty() {
+            return false;
+        }
+        let is_local = |node: &str| {
+            parse_node_ref(node, local_node_id).is_ok_and(|id| id.as_bytes() == local_node_id)
+        };
+
+        let mut changed = false;
+        let mut seen: Vec<(String, String)> = Vec::with_capacity(self.displays.len());
+        let mut displays = Vec::with_capacity(self.displays.len());
+        for display in &self.displays {
+            let mut display = display.clone();
+            if is_local(&display.node) {
+                if let Some(target) = aliases.get(&display.id) {
+                    display.id = target.clone();
+                    changed = true;
+                }
+                let key = (display.node.clone(), display.id.clone());
+                if seen.contains(&key) {
+                    changed = true;
+                    continue;
+                }
+                seen.push(key);
+            }
+            displays.push(display);
+        }
+        self.displays = displays;
+
+        for link in &mut self.links {
+            for endpoint in [&mut link.from, &mut link.to] {
+                if is_local(&endpoint.node) {
+                    if let Some(target) = aliases.get(&endpoint.display) {
+                        endpoint.display = target.clone();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// The transition graph as [`geometry::TransitionLink`] values.
     ///
     /// `local_node_id` resolves `"self"`; `[topology].author`,
@@ -121,4 +179,103 @@ fn endpoint(
         config.edge.to_geometry(),
         geometry::Segment::new(config.start, config.end),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{DisplayConfig, Edge, EndpointConfig, LinkConfig};
+
+    fn local() -> [u8; 32] {
+        [0x11; 32]
+    }
+
+    fn document() -> TopologyConfig {
+        let mut config = TopologyConfig::default();
+        config.displays.push(DisplayConfig {
+            node: "self".to_owned(),
+            id: "\\\\.\\DISPLAY1".to_owned(),
+            logical: [0.0, 0.0, 1920.0, 1080.0],
+            primary: true,
+        });
+        config.displays.push(DisplayConfig {
+            node: peer_reference(&[0xAA; 32]),
+            id: "\\\\.\\DISPLAY1".to_owned(),
+            logical: [0.0, 0.0, 1920.0, 1080.0],
+            primary: true,
+        });
+        config.links.push(LinkConfig {
+            id: "self-to-peer".to_owned(),
+            from: EndpointConfig {
+                node: "self".to_owned(),
+                display: "\\\\.\\DISPLAY1".to_owned(),
+                edge: Edge::Right,
+                start: 0.0,
+                end: 1080.0,
+            },
+            to: EndpointConfig {
+                node: peer_reference(&[0xAA; 32]),
+                display: "\\\\.\\DISPLAY1".to_owned(),
+                edge: Edge::Left,
+                start: 0.0,
+                end: 1080.0,
+            },
+            bidirectional: true,
+        });
+        config
+    }
+
+    #[test]
+    fn an_alias_rewrites_the_local_rows_and_leaves_the_peer_alone() {
+        let mut config = document();
+        let aliases = BTreeMap::from([(
+            "\\\\.\\DISPLAY1".to_owned(),
+            "display-interface-path".to_owned(),
+        )]);
+        assert!(config.rewrite_display_ids(&local(), &aliases));
+
+        assert_eq!(config.displays[0].id, "display-interface-path");
+        assert_eq!(
+            config.displays[1].id, "\\\\.\\DISPLAY1",
+            "a peer's display id belongs to the peer"
+        );
+        assert_eq!(config.links[0].from.display, "display-interface-path");
+        assert_eq!(config.links[0].to.display, "\\\\.\\DISPLAY1");
+    }
+
+    #[test]
+    fn an_empty_or_unmatched_alias_table_changes_nothing() {
+        let mut config = document();
+        assert!(!config.rewrite_display_ids(&local(), &BTreeMap::new()));
+        let unrelated = BTreeMap::from([("\\\\.\\DISPLAY9".to_owned(), "other".to_owned())]);
+        assert!(!config.rewrite_display_ids(&local(), &unrelated));
+        assert_eq!(config, document());
+    }
+
+    #[test]
+    fn a_rewrite_that_would_duplicate_a_display_keeps_one_row() {
+        let mut config = document();
+        config.displays.insert(
+            1,
+            DisplayConfig {
+                node: "self".to_owned(),
+                id: "display-interface-path".to_owned(),
+                logical: [0.0, 0.0, 1920.0, 1080.0],
+                primary: true,
+            },
+        );
+        let aliases = BTreeMap::from([(
+            "\\\\.\\DISPLAY1".to_owned(),
+            "display-interface-path".to_owned(),
+        )]);
+        assert!(config.rewrite_display_ids(&local(), &aliases));
+
+        let self_rows: Vec<&str> = config
+            .displays
+            .iter()
+            .filter(|display| display.node == "self")
+            .map(|display| display.id.as_str())
+            .collect();
+        assert_eq!(self_rows, vec!["display-interface-path"]);
+    }
 }
