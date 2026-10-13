@@ -1188,7 +1188,6 @@ async fn write_message<W: AsyncWrite + Unpin>(
     state: &mut LinkState,
     message: fr::Message,
 ) -> Result<(), LinkDownReason> {
-    let lease_id = convert::lease_id_of_message(&message);
     let seq = state.tx_seq;
     // A batch carrying an event this layer cannot express must not fail — and must not be
     // able to end the link (audit F4). The events with a wire form still travel, so a key or
