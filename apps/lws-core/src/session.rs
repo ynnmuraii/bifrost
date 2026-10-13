@@ -172,11 +172,19 @@ pub struct Session {
     /// A link the pointer left through *while remote*; applied once the lease is
     /// released, which is how a chain A→B→C is walked as two leases and no relay.
     pending_target: Option<(NodeId, geometry::Position)>,
-    /// Whether the agent was asked to observe the local pointer (`BeginCapture(OBSERVE)`).
+    /// Whether the agent currently holds the local observation (`BeginCapture(OBSERVE)`).
     ///
     /// The FSM only asks for capture when a transition starts, but an edge has to be
     /// *noticed* before there is any transition: «OBSERVE: Local: watch edges, no
     /// suppression», so core arms the observation itself for the node that owns input.
+    ///
+    /// This is never a latch: the observation rides on the agent's capture, so every way
+    /// that capture goes away clears it ([`Session::disarm_observation`] — the FSM's
+    /// `EndCapture`/`ReleaseSession`, the agent's own `EmergencyFired`/
+    /// `LocalInputDetected`/`Error` reports, an agent restart) and it is also cleared
+    /// whenever this node stops being the owner or leaves `Local`. `arm_observation`
+    /// re-arms it on the next tick while input is still ours, so the next crossing starts
+    /// without a core restart.
     observe_armed: bool,
     /// Development-only permission to capture externally injected Windows input.
     dev_capture_injected: bool,
@@ -610,13 +618,15 @@ impl Session {
                 }
                 Effect::Agent(command) => {
                     self.context.on_command(&command);
-                    if matches!(command, fr::AgentCommand::EndCapture { .. }) {
-                        // `EndCapture` tears down the session-owned capture, and the
-                        // observation the owner armed with it: without re-arming, the
-                        // owner's `observe_armed` latches `true` and no later return to
-                        // `Local` can start a second crossing, because `arm_observation`
-                        // short-circuits on it (the pointer is never watched again).
-                        self.observe_armed = false;
+                    if matches!(
+                        command,
+                        fr::AgentCommand::EndCapture { .. }
+                            | fr::AgentCommand::ReleaseSession { .. }
+                    ) {
+                        // The capture the observation rode on is being torn down (a source's
+                        // `EndCapture`, a receiver's `ReleaseSession`); forget it so the next
+                        // tick can re-arm while input is still ours.
+                        self.disarm_observation();
                     }
                     let frame = self.agent_frame(&command);
                     if let fr::AgentCommand::Inject {
@@ -1899,6 +1909,18 @@ impl Session {
         let Some(message) = frame.msg else {
             return Ok(());
         };
+        // The observation rides on the agent's capture, and these frames are the agent
+        // saying that capture is gone: the emergency combination and a receiver takeover
+        // release everything before reporting, and a capture failure or overflow ends it.
+        // When core is already `Local` the FSM emits no `EndCapture` for any of them, so
+        // this is the only place that can forget the observation. The next tick re-arms it
+        // while input is still ours, which is what makes the next crossing work.
+        if matches!(
+            message,
+            Msg::Emergency(_) | Msg::LocalInput(_) | Msg::Error(_)
+        ) {
+            self.disarm_observation();
+        }
         static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
         if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
             tracing::debug!(frame = routing::agent_frame_name(&message), "agent -> core");
@@ -2106,7 +2128,15 @@ impl Session {
     /// is also why the FSM ignores the `CaptureReady` that answers it
     /// (`routing::agent_signal`: an empty lease id is not a transition).
     async fn arm_observation(&mut self) {
-        if self.observe_armed || !self.router.is_owner() {
+        if !self.router.is_owner() || self.router.focus() != fr::FocusState::Local {
+            // Somewhere else the observation is not ours to hold: a transition replaces
+            // the capture, and losing ownership takes the local pointer away. Forgetting
+            // it here is what makes the next return to `Local` (or regaining ownership)
+            // arm a fresh one rather than latch a stale `true`.
+            self.disarm_observation();
+            return;
+        }
+        if self.observe_armed {
             return;
         }
         let command = fr::AgentCommand::BeginCapture {
@@ -2123,6 +2153,18 @@ impl Session {
                 tracing::info!("asked the agent to observe the local pointer");
             }
             Err(error) => tracing::warn!(%error, "cannot arm the local observation"),
+        }
+    }
+
+    /// Forgets the armed observation: the agent's capture it rode on is gone.
+    ///
+    /// Called from every path that tears that capture down, so `observe_armed` follows the
+    /// agent's actual capture state instead of latching `true` forever (which left the
+    /// next crossing unable to start until core was restarted).
+    fn disarm_observation(&mut self) {
+        if self.observe_armed {
+            self.observe_armed = false;
+            tracing::debug!("the local observation was torn down; it re-arms while we own input");
         }
     }
 
@@ -2282,6 +2324,9 @@ impl Session {
         if self.agent_lost_reported {
             return;
         }
+        // The agent process is going away with whatever capture it held: a restarted agent
+        // starts with none, so the observation must be armed again once it is back.
+        self.disarm_observation();
         for grant in self.agent.drain_portal_grants().await {
             self.on_portal_grant(grant).await;
         }

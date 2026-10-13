@@ -345,12 +345,25 @@ pub struct Dry {
     scheduled: Vec<InputEvent>,
     /// One entry per poll tick: an event, or `None` for a tick that says nothing.
     ///
-    /// Only `--dry-motion` fills this, and it is emitted whether or not a capture is
-    /// armed: the whole point of the aid is that the pointer moves while the node is
-    /// `Local`, and core's edge trigger is what notices it.
+    /// Only `--dry-motion` fills this. A real agent only produces pointer events while a
+    /// capture is armed, so this aid does the same: the steps wait in the queue until
+    /// `begin_capture` arms it (the owner's `Observe` is a capture too) and stop flowing
+    /// the moment capture is torn down. That is what lets a test see the difference between
+    /// an observation core re-armed and one it let latch.
     motion: std::collections::VecDeque<Option<InputEvent>>,
     dry_displays: bool,
+    /// `--dry-input-events` flows only under a `Remote` capture, matching the real hook.
     capturing: bool,
+    /// Whether *any* capture is armed (the owner's `Observe`, a `Temporary`, a `Remote`).
+    ///
+    /// This is what [`Dry::next_event`] gates `--dry-motion` on; `end_capture` clears it,
+    /// exactly as the real capture hook stops producing events when the OS hook is torn
+    /// down.
+    armed: bool,
+    /// A test aid for the emergency path with no desktop: when `LWS_DRY_EMERGENCY_FILE`
+    /// names a path and that file appears, the dry backend reports the emergency
+    /// combination once (and removes the file). `None` disables the aid.
+    emergency_file: Option<std::path::PathBuf>,
     /// The clipboard, when `--dry-clipboard-dir` named one. `None` is a dry agent with no
     /// clipboard at all, which is what it reports.
     clipboard: Option<DryClipboard>,
@@ -558,6 +571,9 @@ impl Dry {
                 std::collections::VecDeque::new()
             },
             capturing: false,
+            armed: false,
+            emergency_file: std::env::var_os("LWS_DRY_EMERGENCY_FILE")
+                .map(std::path::PathBuf::from),
             clipboard,
             dry_displays,
         }
@@ -888,6 +904,9 @@ impl Backend {
                 // outside a remote source lease, and `TEMPORARY` is exactly that window, so
                 // emitting them there would consume the aid before the lease exists.
                 dry.capturing = matches!(kind, CaptureKind::Remote);
+                // Every kind of capture produces events while it is armed, the owner's
+                // `Observe` included: that is what `--dry-motion` rides on.
+                dry.armed = true;
                 tracing::info!(?kind, "dry mode: capture begins (no OS hooks)");
                 Ok(())
             }
@@ -908,6 +927,7 @@ impl Backend {
                     tracing::info!("dry mode: buffered events would be replayed locally");
                 }
                 dry.capturing = false;
+                dry.armed = false;
                 Ok(Released::default())
             }
             #[cfg(windows)]
@@ -1020,18 +1040,31 @@ impl Backend {
     pub async fn next_event(&mut self) -> Option<Event> {
         match self {
             Backend::Dry(dry) => {
+                // The no-desktop emergency aid: when the harness drops the marker file,
+                // report the combination once (a real agent gets this from its capture
+                // hook, which no dry session has).
+                if let Some(path) = &dry.emergency_file {
+                    if std::fs::remove_file(path).is_ok() {
+                        return Some(Event::Emergency);
+                    }
+                }
                 if dry.capturing && !dry.scheduled.is_empty() {
                     return Some(Event::Input(dry.scheduled.remove(0)));
                 }
-                if let Some(step) = dry.motion.pop_front() {
-                    return match step {
-                        Some(event) => Some(Event::Input(event)),
-                        // A tick that only passes time (`--dry-motion`'s pauses).
-                        None => {
-                            tokio::time::sleep(POLL_TICK).await;
-                            None
-                        }
-                    };
+                // Motion flows only while a capture is armed, like the real hook: a
+                // torn-down (and not re-armed) observation must stop producing events, or
+                // core would keep seeing an edge it can no longer act on.
+                if dry.armed {
+                    if let Some(step) = dry.motion.pop_front() {
+                        return match step {
+                            Some(event) => Some(Event::Input(event)),
+                            // A tick that only passes time (`--dry-motion`'s pauses).
+                            None => {
+                                tokio::time::sleep(POLL_TICK).await;
+                                None
+                            }
+                        };
+                    }
                 }
                 tokio::time::sleep(POLL_TICK).await;
                 None
