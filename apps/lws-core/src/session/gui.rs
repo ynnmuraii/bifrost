@@ -160,6 +160,22 @@ impl Session {
     /// exactly the document the peers hold.
     pub(crate) fn gui_topology_doc(&self) -> ipc::TopologyDoc {
         let applied = self.layout_state.applied();
+        // The display an inactive link is missing, matched straight from the endpoint the
+        // document carries rather than by position, so a link's state cannot drift with the
+        // order of the two lists. `None` means the endpoint's display is present.
+        let missing_display = |side: geometry::EndpointSide,
+                               endpoint: &protocol::wire::Endpoint| {
+            self.inactive_links.iter().find_map(|link| {
+                link.missing
+                    .iter()
+                    .find(|missing| {
+                        missing.side == side
+                            && missing.node.as_bytes() == endpoint.node_id.as_slice()
+                            && missing.display.as_str() == endpoint.display_id
+                    })
+                    .map(|missing| missing.display.as_str().to_owned())
+            })
+        };
         let document = match self.applied_wire.clone() {
             Some(document) => document,
             // Before the first revision is published — a fresh workspace, a node that has just
@@ -207,6 +223,11 @@ impl Session {
                 .filter_map(|(index, link)| {
                     let from = link.source_endpoint.as_ref()?;
                     let to = link.target_endpoint.as_ref()?;
+                    // A link the last rebuild left out because a monitor is not reported is
+                    // carried as-is, marked inactive: the editor still shows the authored link,
+                    // and says which display is missing instead of dropping it silently.
+                    let missing = missing_display(geometry::EndpointSide::Source, from)
+                        .or_else(|| missing_display(geometry::EndpointSide::Target, to));
                     Some(ipc::LinkView {
                         // The protocol's `TransitionLink` has no id: the document's own order
                         // identifies one, and it is stable for as long as that revision is.
@@ -216,6 +237,8 @@ impl Session {
                         // A link's reverse direction is resolved by the same document
                         // (`geometry::resolve_motion`), which is what the editor shows.
                         bidirectional: true,
+                        active: missing.is_none(),
+                        inactive_reason: missing.unwrap_or_default(),
                     })
                 })
                 .collect(),
