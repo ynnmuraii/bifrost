@@ -159,9 +159,17 @@ pub fn ensure_config(paths: &Paths) -> Result<bool, String> {
              pick a concrete address in the settings screen"
         );
     }
-    let config = default_config(listen);
+    // The directory first (the lock file lives in it, and the permission policy is this
+    // function's job), then the lock: two first runs (two CLIs, a CLI racing a core's first
+    // persistence) must not both decide the file is missing and write their own copy over the
+    // other's (audit F17). The existence check is repeated inside the lock for that reason.
     create_config_dir(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    let _lock = crate::lock::FileLock::acquire(&path).map_err(|error| error.to_string())?;
+    if path.exists() {
+        return Ok(false);
+    }
+    let config = default_config(listen);
     let text = config.to_toml().map_err(|error| error.to_string())?;
     save_atomic(&path, &text)
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
@@ -175,6 +183,8 @@ pub fn ensure_config(paths: &Paths) -> Result<bool, String> {
 /// [`ensure_config`] creates one.
 pub fn set_listen_address(paths: &Paths, address: Ipv4Addr) -> Result<(), String> {
     let path = paths.config_file();
+    // The whole read-modify-write, under the same lock every other writer takes (audit F17).
+    let _lock = crate::lock::FileLock::acquire(&path).map_err(|error| error.to_string())?;
     let mut config = Config::load(&path).map_err(|error| error.to_string())?;
     config.network.listen_address = address.to_string();
     if address.is_unspecified() {

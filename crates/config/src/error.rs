@@ -70,6 +70,11 @@ impl fmt::Display for ErrorCode {
 /// writing the configuration.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// Another writer held the configuration lock for longer than the wait allows.
+    Locked {
+        /// The lock file that could not be taken.
+        path: PathBuf,
+    },
     /// The file could not be read or written.
     Io {
         /// File the operation addressed.
@@ -159,6 +164,12 @@ impl ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConfigError::Locked { path } => write!(
+                f,
+                "{}: another writer holds the configuration lock ({})",
+                path.display(),
+                crate::lock::ACQUIRE_TIMEOUT.as_secs()
+            ),
             ConfigError::Io { path, source } => {
                 write!(f, "{}: {source}", path.display())
             }
