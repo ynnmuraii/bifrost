@@ -539,6 +539,7 @@ async fn run_async(
         // resolve against (`docs/03-architecture.md`, «Топология и движение»).
         config.topology.clone(),
         config.input.pointer_gain,
+        f64::from(config.input.edge_hysteresis_px),
         // The ownership pair belongs in the configuration file, so a restart resumes the
         // counter it learned instead of claiming serial 1 again (`ownership_store`).
         OwnershipStore::new(paths.config_file(), &config),
