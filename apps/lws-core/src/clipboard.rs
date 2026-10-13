@@ -165,7 +165,6 @@ pub struct Clipboard {
     /// `network.port_clipboard`: the port this node's own listener is bound to, which every
     /// grant it issues advertises.
     clipboard_port: u16,
-    epoch: Instant,
 }
 
 /// One member's clipboard state.
@@ -226,7 +225,6 @@ impl Clipboard {
             payload: Vec::new(),
             queue_capacity,
             clipboard_port: listen.port(),
-            epoch: Instant::now(),
         };
         Ok((endpoint, events))
     }
@@ -265,10 +263,6 @@ impl Clipboard {
                 },
             )
             .await;
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.epoch.elapsed().as_millis() as u64
     }
 
     /// `SetClipboard` from the GUI: transfer clipboard content, or stop transferring it.
@@ -397,7 +391,6 @@ impl Clipboard {
     /// Offers one copy to every member, opening a channel where there is none.
     async fn fan_out(&mut self, offer: cb::Offer) -> Vec<Out> {
         let mut out = Vec::new();
-        let now_ms = self.now_ms();
         for (peer, state) in self.peers.iter_mut() {
             let peer = *peer;
             if !state.text_clipboard {
@@ -423,7 +416,7 @@ impl Clipboard {
             };
             // The grant travels on the input link: the peer cannot dial a channel it has not
             // been told about yet.
-            let (channel_id, token) = self.runtime.issue(parent, now_ms).await;
+            let (channel_id, token) = self.runtime.issue(parent).await;
             tracing::info!(peer = %peer, "clipboard grant");
             out.push(Out::Grant {
                 peer,
@@ -883,8 +876,37 @@ impl Handle {
     }
 
     /// Mints a channel id and a one-use token for `parent`.
-    async fn issue(&self, parent: [u8; 16], now_ms: u64) -> ([u8; 16], [u8; 32]) {
+    ///
+    /// The expiry is stamped from **this** clock, the one [`Grants::accept`] checks the bind
+    /// against (audit F5): the endpoint's clock used to be passed in, and its `Instant` origin
+    /// is a different one, so the 60 s window was really `60 s - <startup delta>` and the two
+    /// numbers were not comparable at all.
+    async fn issue(&self, parent: [u8; 16]) -> ([u8; 16], [u8; 32]) {
+        let now_ms = self.now_ms();
         self.inner.lock().await.grants.issue(parent, now_ms)
+    }
+
+    /// The expiry the store holds for `channel_id`, for the one-clock test (audit F5).
+    #[cfg(test)]
+    async fn grant_expiry_ms(&self, channel_id: &[u8; 16]) -> Option<u64> {
+        self.inner.lock().await.grants.expires_ms(channel_id)
+    }
+
+    /// Whether a bind would be accepted at this instant, for the one-clock test (audit F5).
+    #[cfg(test)]
+    async fn accepts(
+        &self,
+        parent: &[u8; 16],
+        channel: &[u8; 16],
+        token: &[u8; 32],
+        now_ms: u64,
+    ) -> bool {
+        self.inner
+            .lock()
+            .await
+            .grants
+            .accept(parent, channel, token, now_ms)
+            .is_ok()
     }
 
     /// Queues one message on the peer's channel.
@@ -1076,6 +1098,72 @@ async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime whose grants are checked on the clock they were issued on (audit F5).
+    ///
+    /// `Handle::start` needs a listener, so the endpoint is bound to an ephemeral port of the
+    /// loopback interface and dropped with the test.
+    async fn test_handle() -> Handle {
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-clock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(root))
+                .expect("identity")
+                .0,
+        );
+        let (handle, _events) = Handle::start(
+            identity,
+            identity::TrustStore::new(),
+            "127.0.0.1:0".parse().expect("an address"),
+            4,
+        )
+        .await
+        .expect("the clipboard runtime starts");
+        handle
+    }
+
+    /// Audit F5: the grant's expiry and the check that accepts the bind are on one clock.
+    ///
+    /// The two `Instant` origins used to differ (`Clipboard::epoch` stamped the expiry,
+    /// `Handle::epoch` checked it), so the 60 s window was really `60 s - <startup delta>`
+    /// and the two numbers were not comparable.
+    #[tokio::test]
+    async fn a_grant_expires_on_the_clock_that_accepts_it() {
+        let handle = test_handle().await;
+        let parent = [0x11u8; 16];
+        let before = handle.now_ms();
+        let (channel, token) = handle.issue(parent).await;
+        let after = handle.now_ms();
+        let expires = handle
+            .grant_expiry_ms(&channel)
+            .await
+            .expect("the grant is open");
+        let ttl = cb::CHANNEL_TTL_MS;
+        assert!(
+            (before.saturating_add(ttl)..=after.saturating_add(ttl)).contains(&expires),
+            "the expiry must be stamped from the accepting clock ({before}..={after} + {ttl} ms), \
+             got {expires}"
+        );
+        assert!(
+            handle
+                .accepts(&parent, &channel, &token, expires - 1)
+                .await,
+            "one millisecond before the ttl the bind is accepted"
+        );
+        assert!(
+            !handle
+                .accepts(&parent, &channel, &token, expires + 1)
+                .await,
+            "one millisecond after it is refused"
+        );
+    }
 
     #[test]
     fn every_marker_name_maps_to_its_marker() {

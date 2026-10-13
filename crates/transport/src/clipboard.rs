@@ -464,6 +464,16 @@ impl Grants {
     pub fn open(&self) -> usize {
         self.open.len()
     }
+
+    /// When the grant for `channel_id` expires, on the clock the issuer stamped it from
+    /// (diagnostics/tests).
+    ///
+    /// One clock matters: [`Grants::accept`] compares this value, so the issuer and the
+    /// acceptor must share it (audit F5).
+    #[must_use]
+    pub fn expires_ms(&self, channel_id: &[u8; 16]) -> Option<u64> {
+        self.open.get(channel_id).map(|grant| grant.expires_ms)
+    }
 }
 
 /// One dialed or accepted clipboard connection: TLS, ALPN clipboard/1,
