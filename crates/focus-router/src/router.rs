@@ -261,7 +261,7 @@ impl<I: Identifiers> FocusRouter<I> {
     /// Startup: claim ownership when `claim_on_startup` is set.
     pub fn on_start(&mut self, now_ms: u64) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.claim_on_startup && !self.ownership.is_owner() {
+        if self.claim_on_startup {
             self.begin_claim(now_ms, ClaimReason::Startup, &mut out);
         }
         out
@@ -312,12 +312,15 @@ impl<I: Identifiers> FocusRouter<I> {
         // like an OwnerState, and a deposed owner must return to Local at once.
         if let Some(owner) = hello.owner {
             if hello.owner_serial > 0
-                && owner != self.local
                 && self
                     .ownership
                     .is_newer_than_current(hello.owner_serial, &owner)
             {
-                self.begin_deposition(now_ms, hello.owner_serial, owner, Some(peer), out);
+                if owner == self.local {
+                    self.on_owner_state(now_ms, peer, hello.owner_serial, Some(owner), false, out);
+                } else {
+                    self.begin_deposition(now_ms, hello.owner_serial, owner, Some(peer), out);
+                }
             }
             self.ownership.observe_serial(hello.owner_serial);
         }
@@ -627,14 +630,20 @@ impl<I: Identifiers> FocusRouter<I> {
             return;
         };
         if !self.ownership.is_newer_than_current(serial, &owner) {
-            // Confirms our own ownership, or is stale: adopt it only when it is ours.
-            if owner == self.local && serial == self.ownership.serial() {
-                self.ownership.adopt(serial, owner);
-            }
+            // An echo of our old pair must not cancel a newer in-flight claim.
             return;
         }
         if owner == self.local {
+            let pending = self.ownership.pending_claim();
+            let reclaim = self.ownership.owner() == Some(&self.local)
+                || pending.is_some_and(|claim| claim.serial < serial);
+            if pending.is_some() {
+                out.push(Output::CancelTimer(Timer::ClaimGrant));
+            }
             self.ownership.adopt(serial, owner);
+            if reclaim {
+                self.begin_claim(now_ms, ClaimReason::Startup, out);
+            }
             return;
         }
         if self.ownership.is_owner() {
@@ -1911,6 +1920,9 @@ impl<I: Identifiers> FocusRouter<I> {
             self.lease = LeaseSlot::Idle;
             self.burned.insert(lease_id);
             out.push(Output::Notice(Notice::Rejected { peer: from, code }));
+            if code == ErrorCode::StaleOwnerSerial {
+                self.begin_claim(now_ms, ClaimReason::Startup, out);
+            }
             return;
         }
         let peer = lease.peer;

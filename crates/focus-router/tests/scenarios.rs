@@ -40,6 +40,77 @@ fn preparing_ignores_repeated_edge_samples_without_rearming_capture() {
 }
 
 #[test]
+fn startup_reclaims_even_when_the_restored_owner_is_self() {
+    let mut r = router(LOCAL).with_claim_on_startup(true);
+    let out = r.on_start(10);
+    assert!(out.contains(&Output::Broadcast(Message::OwnerClaim {
+        serial: 2,
+        reason: ClaimReason::Startup,
+    })));
+    assert_eq!(r.ownership().pending_claim().unwrap().serial, 2);
+    r.handle(610, Input::TimerExpired(Timer::ClaimGrant));
+    assert!(r.is_owner());
+    assert_eq!(r.serial(), 2);
+}
+
+#[test]
+fn startup_claim_moves_past_a_matching_serial_remembered_by_a_receiver() {
+    let mut r = router(LOCAL).with_claim_on_startup(true);
+    r.on_start(0);
+    r.handle(1, hello(PEER, LOCAL, 2));
+    assert_eq!(r.ownership().pending_claim().unwrap().serial, 3);
+    r.handle(601, Input::TimerExpired(Timer::ClaimGrant));
+    assert!(r.is_owner());
+    assert_eq!(r.serial(), 3);
+}
+
+#[test]
+fn higher_self_owner_gossip_reclaims_without_an_old_echo_cancelling_it() {
+    for input in [
+        hello(PEER, LOCAL, 7),
+        net(Message::OwnerState {
+            serial: 7,
+            owner: Some(LOCAL),
+            granted: false,
+        }),
+    ] {
+        let mut r = router(LOCAL);
+        r.handle(10, input);
+        assert_eq!(r.max_seen_serial(), 7);
+        assert_eq!(r.ownership().pending_claim().unwrap().serial, 8);
+        r.handle(
+            11,
+            net(Message::OwnerState {
+                serial: 7,
+                owner: Some(LOCAL),
+                granted: false,
+            }),
+        );
+        assert_eq!(r.ownership().pending_claim().unwrap().serial, 8);
+        r.handle(610, Input::TimerExpired(Timer::ClaimGrant));
+        assert!(r.is_owner());
+        assert_eq!(r.serial(), 8);
+    }
+}
+
+#[test]
+fn stale_enter_ack_reclaims_and_allows_the_next_edge() {
+    let mut r = preparing();
+    let out = r.handle(12, net(ack(id(1), Some(ErrorCode::StaleOwnerSerial))));
+    assert!(out.contains(&end(id(1), true)));
+    assert_eq!(r.focus(), FocusState::Local);
+    assert!(r.lease().is_idle());
+    assert_eq!(r.ownership().pending_claim().unwrap().serial, 2);
+    r.handle(612, Input::TimerExpired(Timer::ClaimGrant));
+    r.handle(613, switch(SwitchTrigger::Edge));
+    let out = r.handle(
+        614,
+        Input::Agent(AgentEvent::CaptureReady { lease_id: id(2) }),
+    );
+    assert!(out.contains(&send(prepare(id(2), 2))));
+}
+
+#[test]
 fn s02_capture_ack_capture_commits_and_renews() {
     let mut r = preparing();
     assert_eq!(
