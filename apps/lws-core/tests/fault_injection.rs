@@ -247,6 +247,39 @@ fn the_edge_trigger_drives_a_cycle_without_the_ctl_channel() {
     );
 }
 
+/// A return to `Local` tears the session capture down — and with it the owner's own
+/// observation of the local pointer. If the owner does not re-arm it, the observer is
+/// latched as armed forever and no later edge crossing can start: the pointer is never
+/// watched again, so the second crossing never happens.
+#[test]
+fn the_owner_re_arms_its_observation_after_returning_to_local() {
+    // One harness at a time: see `common::serial`.
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    let armed_before = harness.a.observe_arms();
+    assert!(
+        armed_before >= 1,
+        "the owning source must observe the local pointer once the workspace is its own"
+    );
+
+    // Two full there-and-back cycles: each return to `Local` must re-arm exactly once.
+    harness.cycle();
+    harness.cycle();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.a.observe_arms() < armed_before + 2 {
+        let armed = harness.a.observe_arms();
+        assert!(
+            Instant::now() < deadline,
+            "the owner stopped observing after {armed} arm(s): a second crossing cannot \
+             start without a live observer (while {armed_before} were expected before the \
+             cycles)"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `AC-02`, blackhole: the link stays up at the socket level and says nothing.
 #[test]
 fn a_blackholed_link_returns_both_sides_to_local() {

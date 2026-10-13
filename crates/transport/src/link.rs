@@ -281,8 +281,8 @@ impl LinkHandle {
     /// and visible through [`LinkHandle::dropped_motion_batches`].
     pub async fn send(&self, message: fr::Message) -> Result<(), TransportError> {
         match queue::outbound_of(message) {
-            Outbound::Motion(events) => {
-                self.send_motion(events);
+            Outbound::Motion { lease_id, events } => {
+                self.send_motion(lease_id, events);
                 Ok(())
             }
             Outbound::Guaranteed(message) => {
@@ -341,11 +341,14 @@ impl LinkHandle {
     }
 
     /// Enqueues pointer motion without waiting; returns whether it was queued.
-    pub fn send_motion(&self, events: Vec<InputEvent>) -> bool {
+    ///
+    /// `lease_id` is the lease the motion belongs to and rides with it into the queue so the
+    /// written batch keeps it (see [`Outbound::Motion`]).
+    pub fn send_motion(&self, lease_id: [u8; 16], events: Vec<InputEvent>) -> bool {
         if events.is_empty() {
             return true;
         }
-        match self.tx.try_send(Outbound::Motion(events)) {
+        match self.tx.try_send(Outbound::Motion { lease_id, events }) {
             Ok(()) => true,
             Err(_) => {
                 self.dropped_motion.fetch_add(1, Ordering::Relaxed);
@@ -956,18 +959,28 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
                 write_clipboard_message(writer, state, message.clone()).await?;
                 index += 1;
             }
-            Outbound::Motion(_) => {
-                // Merge the contiguous motion run that starts here.
+            Outbound::Motion { .. } => {
+                // Merge the contiguous motion run that shares this lease. Motion from
+                // different leases is never merged: the receiver checks the lease of every
+                // batch, and a batch that mixed two leases (or lost the lease) would be
+                // refused as a `LeaseMismatch`.
+                let lease_id = match &queued[index] {
+                    Outbound::Motion { lease_id, .. } => *lease_id,
+                    _ => unreachable!(),
+                };
                 let mut events = Vec::new();
-                while let Some(Outbound::Motion(next)) = queued.get(index) {
+                while let Some(Outbound::Motion {
+                    lease_id: next_lease,
+                    events: next,
+                }) = queued.get(index)
+                {
+                    if *next_lease != lease_id {
+                        break;
+                    }
                     events.extend(next.iter().copied());
                     index += 1;
                 }
-                let batch = fr::Message::InputBatch {
-                    lease_id: [0u8; 16],
-                    input_batch_seq: 0,
-                    events: queue::coalesce_motion(events),
-                };
+                let batch = queue::motion_batch(lease_id, events);
                 write_message(writer, state, batch).await?;
             }
         }

@@ -222,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     // Motion is droppable and counted, key/button traffic is not: show the difference.
-    let motion_queued = handle.send_motion(Vec::new());
+    let motion_queued = handle.send_motion([0u8; 16], Vec::new());
     println!("  A -> B: OwnerClaim serial 7 sent (empty motion accepted: {motion_queued})");
     tokio::time::sleep(Duration::from_millis(300)).await;
 

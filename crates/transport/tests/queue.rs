@@ -217,7 +217,13 @@ fn merge_motion_batches_flattens_and_then_coalesces() {
 fn outbound_of_routes_motion_to_the_droppable_path() {
     let motion = batch(vec![abs(1.0, 1.0), rel(1, 1)]);
     let outbound = transport::queue::outbound_of(motion.clone());
-    assert_eq!(outbound, Outbound::Motion(vec![abs(1.0, 1.0), rel(1, 1)]));
+    assert_eq!(
+        outbound,
+        Outbound::Motion {
+            lease_id: [1u8; 16],
+            events: vec![abs(1.0, 1.0), rel(1, 1)],
+        }
+    );
     assert_eq!(
         outbound.motion_events(),
         Some([abs(1.0, 1.0), rel(1, 1)].as_slice())
@@ -239,4 +245,39 @@ fn outbound_of_routes_motion_to_the_droppable_path() {
     let outbound = transport::queue::outbound_of(control.clone());
     assert_eq!(outbound, Outbound::Guaranteed(control));
     assert_eq!(outbound.motion_events(), None);
+}
+
+/// A motion-only `InputBatch` travels on the droppable path and is rebuilt for the wire with
+/// the very lease it carried. The receiver validates that lease on every batch, so rebuilding
+/// it with the empty id turned every coalesced pointer frame into a `LeaseMismatch` while the
+/// key/button batches (guaranteed, lease intact) still arrived.
+#[test]
+fn a_motion_only_batch_keeps_its_lease_through_the_droppable_path() {
+    let lease_id = [7u8; 16];
+    let motion = Message::InputBatch {
+        lease_id,
+        input_batch_seq: 9,
+        events: vec![abs(1.0, 1.0), rel(2, 3)],
+    };
+
+    let outbound = transport::queue::outbound_of(motion);
+    assert_eq!(
+        outbound.motion_lease(),
+        Some(lease_id),
+        "the droppable path must carry the lease, not drop it with the events"
+    );
+
+    let rebuilt = transport::queue::motion_batch(
+        outbound.motion_lease().expect("motion"),
+        outbound.motion_events().expect("motion").to_vec(),
+    );
+    assert_eq!(
+        rebuilt,
+        Message::InputBatch {
+            lease_id,
+            input_batch_seq: 0,
+            events: vec![abs(1.0, 1.0), rel(2, 3)],
+        },
+        "the rebuilt batch must keep the lease its motion belonged to"
+    );
 }

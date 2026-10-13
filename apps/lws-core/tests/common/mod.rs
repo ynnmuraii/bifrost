@@ -313,6 +313,16 @@ impl Node {
             .collect()
     }
 
+    /// How many times this core asked its agent to observe the local pointer.
+    ///
+    /// The owner arms the observation once, and must re-arm it after every return to
+    /// `Local` (the capture teardown destroys it), or a second crossing can never start.
+    pub fn observe_arms(&self) -> usize {
+        self.log()
+            .matches("asked the agent to observe the local pointer")
+            .count()
+    }
+
     /// The focus transitions each `control request request=Switch` produced.
     ///
     /// One window per request: the states between it and the next request, each with the
