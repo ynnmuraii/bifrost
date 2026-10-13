@@ -20,6 +20,9 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use focus_router as fr;
+
 use geometry::{Display, DisplayId, NodeDisplays, NodeId, Rect, Rotation, Scale, Topology};
 use protocol::ipc;
 use protocol::wire;
@@ -286,6 +289,38 @@ pub fn remote_step(
         advanced.y = advanced.y.clamp(0.0, max_y);
     }
     (advanced, crossing)
+}
+
+/// Where a transition to a peer starts when there is no edge to cross (batch-2 audit).
+///
+/// A manual `switch <peer>` (and any transition whose document is unusable) has no crossing
+/// to derive an entry point from. The anchor is the receiver's **primary** display (its first
+/// when none is flagged), and the position is display-local — `protocol.proto` `Position` is
+/// «local to display top-left» — at that display's centre.
+///
+/// The `display_id` is the part that matters beyond this function: `transport` stamps every
+/// later `InputBatch` of the lease with the display of the `EnterPrepare` that opened it
+/// (`convert::batch_display_after`), so a source that started a lease with an empty id sent
+/// the whole pointer stream with an empty one — which a receiver refuses, and which the
+/// batch-1 audit then made it drop in silence.
+#[must_use]
+pub fn start_position(displays: &[wire::Display]) -> Option<geometry::Position> {
+    let display = displays
+        .iter()
+        .find(|display| display.primary)
+        .or_else(|| displays.first())?;
+    if display.id.is_empty() {
+        return None;
+    }
+    let bounds = display.logical_bounds.as_ref()?;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return None;
+    }
+    Some(geometry::Position::new(
+        display.id.clone(),
+        bounds.width / 2.0,
+        bounds.height / 2.0,
+    ))
 }
 
 /// The events a peer receives while a source lease is remote.
@@ -1301,6 +1336,117 @@ bidirectional = true
             primary,
             native_known: false,
         }
+    }
+
+    /// Batch-2 audit: a transition with no edge starts on the receiver's primary display, and
+    /// the wire carries that display id — the value every later batch of the lease is stamped
+    /// with.
+    #[test]
+    fn a_transition_without_an_edge_starts_on_the_receivers_primary_display() {
+        let displays = vec![
+            wire_display("HDMI-1", [0.0, 0.0, 1920.0, 1080.0], false),
+            wire_display("eDP-1", [1920.0, 0.0, 2560.0, 1440.0], true),
+        ];
+        let position = start_position(&displays).expect("a primary display is an anchor");
+        assert_eq!(
+            position.display_id.as_str(),
+            "eDP-1",
+            "the primary display anchors"
+        );
+        assert_eq!(
+            (position.x, position.y),
+            (1280.0, 720.0),
+            "display-local coordinates: the centre of the display"
+        );
+
+        // Without a primary flag the first display is used, so a manifest that never set the
+        // flag still gives the lease a display.
+        let unmarked = vec![wire_display("DP-1", [0.0, 0.0, 800.0, 600.0], false)];
+        let first = start_position(&unmarked).expect("the first display is the fallback");
+        assert_eq!(first.display_id.as_str(), "DP-1");
+        assert_eq!((first.x, first.y), (400.0, 300.0));
+
+        // Nothing to anchor on: the caller falls back to its neutral position and says so.
+        assert_eq!(start_position(&[]), None);
+        assert_eq!(
+            start_position(&[wire_display("", [0.0, 0.0, 100.0, 100.0], true)]),
+            None,
+            "a display with no id cannot be named on the wire"
+        );
+    }
+
+    /// Batch-2 audit, the wire half: the entry position the switch seeds becomes the display
+    /// every `InputBatch` of that lease carries, and the position inside the batch is inside
+    /// the receiver's display rather than the source's node space.
+    #[test]
+    fn the_first_batch_of_a_manual_switch_carries_the_receivers_display() {
+        use transport::convert;
+
+        let displays = vec![wire_display("eDP-1", [1920.0, 0.0, 1600.0, 900.0], true)];
+        let entry = start_position(&displays).expect("a display to start on");
+        let prepare = fr::Message::EnterPrepare {
+            lease_id: [9u8; 16],
+            topology_revision: 0,
+            position: entry.clone(),
+            owner_serial: 1,
+        };
+        let lease = [9u8; 16];
+        // This is exactly what the link does: the batch display comes from the `EnterPrepare`.
+        let batch_display = convert::batch_display_after(&prepare, "");
+        assert_eq!(
+            batch_display, "eDP-1",
+            "the lease opens on the receiver's display"
+        );
+        let batch = fr::Message::InputBatch {
+            lease_id: lease,
+            input_batch_seq: 0,
+            events: vec![input_model::InputEvent::PointerAbsolute(
+                input_model::Position::new(entry.x, entry.y),
+            )],
+        };
+        let envelope = convert::to_envelope(&batch, 2, &[1u8; 16], Some(&lease), &batch_display)
+            .expect("the batch converts");
+        let back = convert::from_envelope(&envelope).expect("the receiver accepts the batch");
+        let fr::Message::InputBatch { events, .. } = back else {
+            panic!("expected an InputBatch");
+        };
+        let input_model::InputEvent::PointerAbsolute(position) = events[0] else {
+            panic!("expected an absolute position");
+        };
+        assert!(
+            position.x >= 0.0 && position.x <= 1600.0 && position.y >= 0.0 && position.y <= 900.0,
+            "the position must be inside the receiver's display, got {position:?}"
+        );
+        assert_eq!((position.x, position.y), (800.0, 450.0), "the centre");
+
+        // The position `Session::switch_to` used to carry: an empty display id. On the wire it
+        // blanks every batch of the lease and the receiver refuses each one, which is the
+        // defect this anchor removes.
+        let lease_id = [9u8; 16];
+        let neutral = fr::Message::EnterPrepare {
+            lease_id,
+            topology_revision: 0,
+            position: geometry::Position::new(String::new(), 0.0, 0.0),
+            owner_serial: 1,
+        };
+        assert_eq!(
+            convert::batch_display_after(&neutral, ""),
+            "",
+            "an empty entry display id is what every later batch is stamped with"
+        );
+        let blanked = fr::Message::InputBatch {
+            lease_id,
+            input_batch_seq: 0,
+            events: vec![input_model::InputEvent::PointerAbsolute(
+                input_model::Position::new(0.0, 0.0),
+            )],
+        };
+        let envelope = convert::to_envelope(&blanked, 2, &[1u8; 16], Some(&lease), "")
+            .expect("the source can encode it");
+        assert!(
+            convert::from_envelope(&envelope).is_err(),
+            "and the receiver cannot read it"
+        );
     }
 
     #[test]
