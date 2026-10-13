@@ -298,6 +298,11 @@ pub struct Session {
     /// Windows has renumbered. Filled by [`Session::rebuild_topology`], taken and handed to the
     /// ordinary CAS path once by the main loop ([`Session::sync_display_ids`]).
     display_id_migration: Option<String>,
+    /// The default layout to publish once, as `layout_toml`. Filled by
+    /// [`Session::rebuild_topology`] when the applied document has no links and the workspace
+    /// has exactly one peer, taken and handed to the ordinary CAS path by the main loop
+    /// ([`Session::publish_default_layout`]).
+    pending_default_layout: Option<String>,
     /// `[topology]` from `config.toml`: the links and the display snapshot the document
     /// is assembled from.
     layout: config::TopologyConfig,
@@ -453,6 +458,7 @@ impl Session {
             topology: None,
             inactive_links: Vec::new(),
             display_id_migration: None,
+            pending_default_layout: None,
             layout,
             pointer_gain,
             agent_displays: Vec::new(),
@@ -555,6 +561,26 @@ impl Session {
                         self.node_id,
                     ));
                 }
+                // A workspace with no document at all starts from the peer to the right; the
+                // publication itself is the owner's and goes through the ordinary CAS path
+                // (`publish_default_layout`). A document that has links, however, is the user's
+                // and is never replaced here.
+                if self.router.ownership().is_owner() && self.layout_state.pending().is_none() {
+                    let peers: Vec<NodeId> = document
+                        .nodes
+                        .iter()
+                        .map(|node| node.node)
+                        .filter(|node| *node != self.node_id)
+                        .collect();
+                    if let Some(layout) = crate::topology::default_layout(&self.layout, &peers) {
+                        match toml::to_string_pretty(&layout) {
+                            Ok(text) => self.pending_default_layout = Some(text),
+                            Err(error) => {
+                                tracing::warn!(%error, "cannot render the default layout")
+                            }
+                        }
+                    }
+                }
                 self.topology = Some(document);
                 self.inactive_links = built.inactive;
                 // A stored document that names a display by an old Windows device name still
@@ -617,6 +643,76 @@ impl Session {
             }
             Handled::Deferred(_) => {}
         }
+    }
+
+    /// Publishes the workspace's starting layout once: the peer to the right of this desktop.
+    ///
+    /// Only the coordinator publishes a document (`docs/03-architecture.md`: the layout is
+    /// authored by the owner alone), and only when [`Session::rebuild_topology`] found an
+    /// applied document with no links and exactly one peer. It goes through the ordinary
+    /// whole-document CAS ([`Session::layout_edit_document`]), so it takes a new revision like
+    /// any other edit and the document it publishes can never replace one that has links.
+    async fn publish_default_layout(&mut self) {
+        let Some(text) = self.pending_default_layout.take() else {
+            return;
+        };
+        if !self.router.ownership().is_owner() {
+            return;
+        }
+        let peer = self
+            .live_peers()
+            .first()
+            .copied()
+            .map_or_else(|| "-".to_owned(), |peer| identity::fingerprint(&peer));
+        tracing::info!("default layout published: {peer} to the right");
+        let expected = self.layout_state.applied();
+        match self.layout_edit_document(text, expected).await {
+            Handled::Reply(ctl::Response::Error { code, detail }) => {
+                tracing::warn!(%code, %detail, "the default layout was refused")
+            }
+            Handled::Reply(_) => tracing::info!("layout follows the peers: default applied"),
+            Handled::Deferred(_) => {}
+        }
+    }
+
+    /// The peers the live document knows: every member other than this node.
+    fn live_peers(&self) -> Vec<NodeId> {
+        self.topology.as_ref().map_or_else(Vec::new, |topology| {
+            topology
+                .nodes
+                .iter()
+                .map(|node| node.node)
+                .filter(|node| *node != self.node_id)
+                .collect()
+        })
+    }
+
+    /// `layout auto`: replace the applied document with the desktop-anchored default.
+    ///
+    /// The explicit action the owner takes once: a document whose links name monitors one by
+    /// one keeps working as it is, and this replaces it with `self right` → `peer left`, both
+    /// `display = "auto"`, through the coordinator's CAS — the same path a GUI edit takes, so
+    /// it takes a new revision and reaches every member.
+    async fn layout_auto(&mut self) -> Handled {
+        let peers = self.live_peers();
+        let Some(mut layout) = crate::topology::auto_layout(&peers) else {
+            return Handled::Reply(ctl::Response::Error {
+                code: "BAD_REQUEST".to_owned(),
+                detail: "layout auto needs exactly one peer in the workspace".to_owned(),
+            });
+        };
+        layout.displays = self.layout.displays.clone();
+        let text = match toml::to_string_pretty(&layout) {
+            Ok(text) => text,
+            Err(error) => {
+                return Handled::Reply(ctl::Response::Error {
+                    code: "BAD_REQUEST".to_owned(),
+                    detail: format!("cannot render the default layout: {error}"),
+                })
+            }
+        };
+        let expected = self.layout_state.applied();
+        self.layout_edit_document(text, expected).await
     }
 
     /// The monotonic millisecond clock shared with the FSM.
@@ -760,6 +856,8 @@ impl Session {
             // A stored layout that names displays by a renumbered Windows device name is
             // rewritten once, through the ordinary CAS path, by this node when it coordinates.
             self.sync_display_ids().await;
+            // And a workspace with no layout at all gets its one default link, once.
+            self.publish_default_layout().await;
             // Once per turn, and only what changed: the GUI's `Status` and, on a new revision,
             // the document its editor works on.
             self.publish_gui_state().await;
@@ -2893,6 +2991,7 @@ impl Session {
             ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()).into(),
             ctl::Request::LayoutEdit(path) => self.layout_edit(&path).await,
             ctl::Request::LayoutApply => self.layout_apply().await,
+            ctl::Request::LayoutAuto => self.layout_auto().await,
             ctl::Request::PairOpen(seconds) => {
                 let window_s = seconds.unwrap_or(120);
                 match self.open_pairing_window(window_s) {

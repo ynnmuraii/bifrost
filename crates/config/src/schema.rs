@@ -1083,9 +1083,10 @@ impl TopologyConfig {
                          non-empty display id",
                     ));
                 }
-                if !endpoint.start.is_finite()
-                    || !endpoint.end.is_finite()
-                    || endpoint.start >= endpoint.end
+                if !endpoint.is_auto()
+                    && (!endpoint.start.is_finite()
+                        || !endpoint.end.is_finite()
+                        || endpoint.start >= endpoint.end)
                 {
                     return Err(ConfigError::coded(
                         ErrorCode::Topology,
@@ -1139,17 +1140,37 @@ pub struct LinkConfig {
 }
 
 /// One end of a [`LinkConfig`].
+///
+/// `display` is either a stable display id or the sentinel [`crate::AUTO_DISPLAY`] (`"auto"`),
+/// which anchors the endpoint at the whole desktop edge of `node` with no monitor named. An
+/// auto endpoint carries no meaningful segment: `start`/`end` may be omitted (they default to
+/// `0`), and are ignored by the resolver.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     /// `"self"` or `"peer:<64 hex digits>"`.
     pub node: String,
-    /// Display inside that node.
+    /// Display inside that node, or [`crate::AUTO_DISPLAY`] for the whole desktop.
     pub display: String,
-    /// Which edge of the display.
+    /// Which edge of the display (or of the desktop, for an auto anchor).
     pub edge: Edge,
-    /// Distance along the edge where the segment starts.
+    /// Distance along the edge where the segment starts; ignored for an auto anchor.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub start: f64,
-    /// Distance along the edge where the segment ends; `> start`.
+    /// Distance along the edge where the segment ends; `> start`. Ignored for an auto anchor.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub end: f64,
+}
+
+impl EndpointConfig {
+    /// `true` when this endpoint is anchored at the node's whole desktop rather than at one
+    /// monitor.
+    pub fn is_auto(&self) -> bool {
+        self.display == crate::AUTO_DISPLAY
+    }
+}
+
+/// Serde helper: a `0.0` segment bound is the default and is not written.
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
 }

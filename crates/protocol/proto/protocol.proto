@@ -158,7 +158,9 @@ enum Edge { EDGE_UNSPECIFIED = 0; EDGE_LEFT = 1; EDGE_RIGHT = 2; EDGE_TOP = 3; E
 
 message Endpoint {
   bytes node_id = 1;
-  string display_id = 2;
+  string display_id = 2;     // a stable display id, or "auto": that edge of the node's whole
+                             // desktop, resolved against the receiver's own manifest. An
+                             // "auto" endpoint carries no segment (fields 4/5 are 0).
   Edge edge = 3;
   double segment_start = 4;  // distance along the edge from its start, display logical units
   double segment_end = 5;    // strictly greater than start, <= edge length

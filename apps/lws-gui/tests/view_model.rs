@@ -245,7 +245,12 @@ fn the_editors_document_round_trips_through_the_configuration_schema() {
     assert_eq!(link.to.node, format!("peer:{PEER_NODE}"));
     assert_eq!(link.from.edge.to_string(), "right");
     assert_eq!(link.to.edge.to_string(), "left");
-    assert!(link.from.start < link.from.end && link.from.end > 0.0);
+    // Choosing a side is a statement about the desktops, so neither end pins a display: the
+    // core derives the segment from the live manifests and the edge follows the monitors.
+    assert!(
+        link.from.is_auto() && link.to.is_auto(),
+        "a picked side writes desktop anchors, not display ids"
+    );
     let moved = topology
         .displays
         .iter()

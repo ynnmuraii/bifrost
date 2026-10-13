@@ -71,7 +71,10 @@ pub mod transition;
 pub mod validate;
 
 pub use display::{Display, DisplayId, Edge, NodeId, Point, Rect, Rotation, Scale, Size};
-pub use topology::{Endpoint, LinkId, NodeDisplays, Position, Segment, Topology, TransitionLink};
+pub use topology::{
+    boundary_displays, resolve_auto_links, AutoResolution, Endpoint, LinkId, NodeDisplays,
+    Position, Segment, Topology, TransitionLink, AUTO_DISPLAY_ID,
+};
 pub use transition::{
     crossing, crossing_with_motion, map_crossing, map_endpoints, resolve_motion,
     resolve_transition, EdgeCrossing, LinkDirection, Transition, ENTRY_INSET_LOGICAL,

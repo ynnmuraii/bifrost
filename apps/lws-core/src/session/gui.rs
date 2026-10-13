@@ -160,6 +160,34 @@ impl Session {
     /// exactly the document the peers hold.
     pub(crate) fn gui_topology_doc(&self) -> ipc::TopologyDoc {
         let applied = self.layout_state.applied();
+        // The screens a desktop-anchored endpoint resolves to right now: «Весь рабочий стол
+        // (авто)» is one line in the editor, and this is what it currently means. Empty for a
+        // link that names its displays.
+        let auto_displays = |endpoint: &protocol::wire::Endpoint| -> Vec<String> {
+            if endpoint.display_id != config::AUTO_DISPLAY {
+                return Vec::new();
+            }
+            let edge = match protocol::wire::Edge::try_from(endpoint.edge) {
+                Ok(protocol::wire::Edge::Left) => geometry::Edge::Left,
+                Ok(protocol::wire::Edge::Right) => geometry::Edge::Right,
+                Ok(protocol::wire::Edge::Top) => geometry::Edge::Top,
+                Ok(protocol::wire::Edge::Bottom) => geometry::Edge::Bottom,
+                _ => return Vec::new(),
+            };
+            node_id_of(&endpoint.node_id)
+                .and_then(|node| {
+                    self.topology
+                        .as_ref()
+                        .and_then(|live| live.node(&node))
+                        .map(|member| {
+                            geometry::boundary_displays(member, edge)
+                                .iter()
+                                .map(|display| display.id.as_str().to_owned())
+                                .collect::<Vec<String>>()
+                        })
+                })
+                .unwrap_or_default()
+        };
         // The display an inactive link is missing, matched straight from the endpoint the
         // document carries rather than by position, so a link's state cannot drift with the
         // order of the two lists. `None` means the endpoint's display is present.
@@ -228,6 +256,8 @@ impl Session {
                     // and says which display is missing instead of dropping it silently.
                     let missing = missing_display(geometry::EndpointSide::Source, from)
                         .or_else(|| missing_display(geometry::EndpointSide::Target, to));
+                    let mut resolved = auto_displays(from);
+                    resolved.extend(auto_displays(to));
                     Some(ipc::LinkView {
                         // The protocol's `TransitionLink` has no id: the document's own order
                         // identifies one, and it is stable for as long as that revision is.
@@ -239,6 +269,7 @@ impl Session {
                         bidirectional: true,
                         active: missing.is_none(),
                         inactive_reason: missing.unwrap_or_default(),
+                        auto_displays: resolved,
                     })
                 })
                 .collect(),

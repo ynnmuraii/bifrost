@@ -1246,6 +1246,36 @@ impl ViewModel {
             .collect()
     }
 
+    /// One line per link anchored at a whole desktop instead of at a named display.
+    ///
+    /// «Весь рабочий стол (авто)» says what the link is, and the screens listed after it are
+    /// what the core resolves it to against the live manifests right now — the monitors on the
+    /// outer edge of each side. Empty when every link names its displays.
+    pub fn auto_link_lines(&self) -> Vec<String> {
+        self.editor
+            .links
+            .iter()
+            .filter_map(|link| {
+                let from = link.from.as_ref()?;
+                let to = link.to.as_ref()?;
+                let anchored =
+                    |endpoint: &ipc::EndpointView| endpoint.display_id == config::AUTO_DISPLAY;
+                if !anchored(from) && !anchored(to) {
+                    return None;
+                }
+                let screens = if link.auto_displays.is_empty() {
+                    "экраны ещё не получены".to_owned()
+                } else {
+                    link.auto_displays.join(", ")
+                };
+                Some(format!(
+                    "Связь {}: Весь рабочий стол (авто) — {screens}",
+                    link.id
+                ))
+            })
+            .collect()
+    }
+
     /// One line per **other** computer, or the sentence that says there are none.
     ///
     /// This computer is not a peer of itself: listing it here read as a third machine and the
@@ -1633,43 +1663,34 @@ impl ViewModel {
 
     /// The link between this computer and the other one, as the user placed them.
     ///
-    /// The door is the shared part of the two edges: the two displays are placed by the side
-    /// the user picked (and by dragging), and both ends of the link name the same stretch of
-    /// that edge — `0..min(my extent, their extent)`, which is the whole edge when either
-    /// size is unknown.
+    /// Choosing a side («ноутбук справа») is a statement about the two *desktops*, so both
+    /// endpoints are desktop anchors (`display = "auto"`): the link then follows the monitors —
+    /// one switched off, one added back, a rotation — with no further edit, which is the whole
+    /// point of not pinning displays in a document. The segment is not written for an anchor:
+    /// the core derives it from the live manifests.
     fn pair_link(&self, this: &str, other: &str) -> Option<config::LinkConfig> {
-        let mine = self.editor.nodes.iter().find(|node| node.node_id == this)?;
-        let theirs = self
-            .editor
+        self.editor.nodes.iter().find(|node| node.node_id == this)?;
+        self.editor
             .nodes
             .iter()
             .find(|node| node.node_id == other)?;
-        let my_display = mine.main_display()?;
-        let their_display = theirs.main_display()?;
         let side = self.editor.side;
         let (my_edge, their_edge) = side.edges();
-        let (my_extent, their_extent) = if side.horizontal() {
-            (my_display.h, their_display.h)
-        } else {
-            (my_display.w, their_display.w)
-        };
-        let end = edge_span(my_extent, their_extent);
-        let end = if end > 0.0 { end } else { 1.0 };
         Some(config::LinkConfig {
             id: format!("gui-{}-{}", short_key(this), short_key(other)),
             from: config::EndpointConfig {
                 node: node_reference(this),
-                display: my_display.id.clone(),
+                display: config::AUTO_DISPLAY.to_owned(),
                 edge: my_edge,
                 start: 0.0,
-                end,
+                end: 0.0,
             },
             to: config::EndpointConfig {
                 node: node_reference(other),
-                display: their_display.id.clone(),
+                display: config::AUTO_DISPLAY.to_owned(),
                 edge: their_edge,
                 start: 0.0,
-                end,
+                end: 0.0,
             },
             bidirectional: true,
         })
@@ -2820,6 +2841,17 @@ fn endpoint_config(view: &ipc::EndpointView) -> Option<config::EndpointConfig> {
         return None;
     }
     let edge = config::Edge::parse(&view.edge).ok()?;
+    if view.display_id == config::AUTO_DISPLAY {
+        // A desktop anchor carries no segment: the core derives it from the live manifests, and
+        // writing one back would be a claim about a monitor the document does not name.
+        return Some(config::EndpointConfig {
+            node: node_reference(&view.node_id),
+            display: config::AUTO_DISPLAY.to_owned(),
+            edge,
+            start: 0.0,
+            end: 0.0,
+        });
+    }
     let start = finite(view.segment_start, 0.0);
     let end = finite(view.segment_end, start + 1.0);
     let (start, end) = if start < end {

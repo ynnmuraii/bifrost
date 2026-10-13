@@ -173,6 +173,11 @@ fn endpoint(
             "\"self\" or \"peer:<64 hexadecimal digits>\"",
         )
     })?;
+    if config.is_auto() {
+        // `display = "auto"`: the edge of the whole desktop. The segment is derived from the
+        // live manifests by `geometry::resolve_auto_links`, so nothing else is read here.
+        return Ok(geometry::Endpoint::auto(node, config.edge.to_geometry()));
+    }
     Ok(geometry::Endpoint::new(
         node,
         geometry::DisplayId::new(config.display.clone()),
@@ -223,6 +228,79 @@ mod tests {
             bidirectional: true,
         });
         config
+    }
+
+    #[test]
+    fn an_auto_anchor_round_trips_through_toml_and_the_wire_shape() {
+        let peer = peer_reference(&[0xAA; 32]);
+        let text = format!(
+            r#"
+config_version = 2
+[network]
+listen_address = "192.168.1.10"
+
+[topology]
+[[topology.links]]
+id = "auto-right"
+from = {{ node = "self", display = "auto", edge = "right" }}
+to = {{ node = "{peer}", display = "auto", edge = "left" }}
+bidirectional = true
+"#
+        );
+        let config = crate::Config::from_str(&text).expect("the document parses");
+        config
+            .validate()
+            .expect("an auto anchor is a valid endpoint");
+        assert!(config.topology.links[0].from.is_auto());
+
+        // The segment is not part of an auto anchor: it is neither written nor missed.
+        let rendered = toml::to_string_pretty(&config.topology).expect("the document renders");
+        assert!(
+            !rendered.contains("start"),
+            "an auto endpoint carries no segment: {rendered}"
+        );
+        let back: TopologyConfig = toml::from_str(&rendered).expect("the document reloads");
+        assert_eq!(back, config.topology);
+
+        let links = back
+            .to_transition_links(&local())
+            .expect("the links convert");
+        assert!(links[0].source.is_auto());
+        assert_eq!(links[0].source.display.as_str(), crate::AUTO_DISPLAY);
+        assert_eq!(links[0].source.edge, geometry::Edge::Right);
+        assert!(links[0].target.is_auto());
+    }
+
+    #[test]
+    fn a_concrete_endpoint_still_needs_an_ordered_segment() {
+        let mut config = TopologyConfig::default();
+        config.links.push(LinkConfig {
+            id: "hand-written".to_owned(),
+            from: EndpointConfig {
+                node: "self".to_owned(),
+                display: "\\\\.\\DISPLAY1".to_owned(),
+                edge: Edge::Right,
+                start: 0.0,
+                end: 0.0,
+            },
+            to: EndpointConfig {
+                node: peer_reference(&[0xAA; 32]),
+                display: "\\\\.\\DISPLAY1".to_owned(),
+                edge: Edge::Left,
+                start: 0.0,
+                end: 1080.0,
+            },
+            bidirectional: true,
+        });
+        let text = toml::to_string_pretty(&config).expect("the document renders");
+        let back: TopologyConfig = toml::from_str(&text).expect("the document reloads");
+        let mut whole = crate::Config::default();
+        whole.network.listen_address = "192.168.1.10".to_owned();
+        whole.topology = back;
+        assert!(
+            whole.validate().is_err(),
+            "a display endpoint without an extent is still refused"
+        );
     }
 
     #[test]
