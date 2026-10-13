@@ -538,6 +538,106 @@ pub fn remote_step(
     (advanced, crossing)
 }
 
+/// The axis of the edge a return came back through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    /// The horizontal axis.
+    X,
+    /// The vertical axis.
+    Y,
+}
+
+/// The band of the edge a pointer came home through: the edge is disarmed until the
+/// pointer leaves it.
+///
+/// `[input] edge_hysteresis_px` was parsed and never read (audit F6), so a pointer that
+/// returned sitting *on* the edge resolved a fresh crossing on the very next sample that
+/// pushed the same way, and the focus oscillated `Local`/`Remote` once per sample — the
+/// owner's cursor jumping back and forth at the boundary. This is that hysteresis: the
+/// axis and the sign of the step that carried the pointer out, the edge's own coordinate
+/// on that axis, and the band width. It holds while the pointer is still inside the band
+/// and lets go as soon as it is clear of it, which is also when the edge may trigger
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReturnGuard {
+    axis: Axis,
+    /// `+1.0` for the right/bottom edge, `-1.0` for the left/top one.
+    outward: f64,
+    /// The edge's coordinate on `axis`: the display's width or height, or `0.0`.
+    edge: f64,
+    hysteresis: f64,
+}
+
+impl ReturnGuard {
+    /// The guard a return through `step` arms, or `None` for a step with no axis.
+    ///
+    /// `step` is the captured delta that crossed the edge, in the *local* node's frame:
+    /// its dominant axis is the edge and its sign says which side of the display it left by.
+    #[must_use]
+    pub fn after_return(
+        step: geometry::Point,
+        width: f64,
+        height: f64,
+        hysteresis: f64,
+    ) -> Option<ReturnGuard> {
+        let (axis, outward, edge) = if step.x.abs() >= step.y.abs() && step.x != 0.0 {
+            (
+                Axis::X,
+                step.x.signum(),
+                if step.x > 0.0 { width } else { 0.0 },
+            )
+        } else if step.y != 0.0 {
+            (
+                Axis::Y,
+                step.y.signum(),
+                if step.y > 0.0 { height } else { 0.0 },
+            )
+        } else {
+            return None;
+        };
+        Some(ReturnGuard {
+            axis,
+            outward,
+            edge,
+            hysteresis,
+        })
+    }
+
+    /// Whether `position` is still inside the band, i.e. the edge is still disarmed.
+    #[must_use]
+    pub fn holds(&self, position: &geometry::Position) -> bool {
+        let coordinate = match self.axis {
+            Axis::X => position.x,
+            Axis::Y => position.y,
+        };
+        (self.edge - coordinate) * self.outward <= self.hysteresis
+    }
+
+    /// Where the pointer is placed when it comes home: the edge inset by the band.
+    #[must_use]
+    pub fn entry(&self, position: &geometry::Position) -> geometry::Position {
+        let mut entry = position.clone();
+        let inset = self.edge - self.outward * self.hysteresis;
+        match self.axis {
+            Axis::X => entry.x = inset,
+            Axis::Y => entry.y = inset,
+        }
+        entry
+    }
+
+    /// The axis this band runs perpendicular to.
+    #[must_use]
+    pub fn axis(&self) -> Axis {
+        self.axis
+    }
+
+    /// The band width in logical units.
+    #[must_use]
+    pub fn hysteresis(&self) -> f64 {
+        self.hysteresis
+    }
+}
+
 /// Where a transition to a peer starts when there is no edge to cross (batch-2 audit).
 ///
 /// A manual `switch <peer>` (and any transition whose document is unusable) has no crossing
@@ -1301,6 +1401,61 @@ mod tests {
             geometry::Point::new(current.x - last.x, current.y - last.y),
             geometry::Point::new(12.0, 6.0)
         );
+    }
+
+    /// A pointer that comes home must not re-open the lease by being pushed at the edge it
+    /// came home through: that oscillation is the owner's jumping cursor, and
+    /// `input.edge_hysteresis_px` is the band that stops it.
+    #[test]
+    fn a_return_disarms_the_edge_until_the_pointer_leaves_the_band() {
+        let (width, height) = (1080.0_f64, 1920.0_f64);
+        let guard = ReturnGuard::after_return(geometry::Point::new(100.0, 0.0), width, height, 8.0)
+            .expect("a horizontal return arms the guard");
+        let home = guard.entry(&geometry::Position::new("eDP-1", width - 1.0, 540.0));
+        assert_eq!(home.x, width - 8.0, "the entry point is inside the band");
+        for x in [home.x, home.x + 1.0, width - 1.0, width] {
+            let sample = geometry::Position::new("eDP-1", x, 540.0);
+            assert!(guard.holds(&sample), "a push at {x} is inside the band");
+        }
+        let clear = geometry::Position::new("eDP-1", home.x - 10.0, 540.0);
+        assert!(
+            !guard.holds(&clear),
+            "ten pixels inward is clear of the band"
+        );
+        assert_eq!(guard.axis(), Axis::X);
+        assert_eq!(guard.hysteresis(), 8.0);
+    }
+
+    /// The band is the same on the other three edges.
+    #[test]
+    fn every_edge_arms_its_own_band() {
+        let (width, height) = (1080.0_f64, 1920.0_f64);
+        for (step, x, y, inside) in [
+            (geometry::Point::new(-100.0, 0.0), 8.0, 540.0, 18.0),
+            (geometry::Point::new(0.0, -100.0), 540.0, 8.0, 18.0),
+            (
+                geometry::Point::new(0.0, 100.0),
+                540.0,
+                height - 8.0,
+                height - 18.0,
+            ),
+        ] {
+            let guard = ReturnGuard::after_return(step, width, height, 8.0)
+                .expect("a return with an axis arms the guard");
+            let home = guard.entry(&geometry::Position::new("eDP-1", width / 2.0, height / 2.0));
+            let held = geometry::Position::new(
+                "eDP-1",
+                if home.x == width / 2.0 { x } else { home.x },
+                if home.y == height / 2.0 { y } else { home.y },
+            );
+            assert!(guard.holds(&held), "{step:?} is still inside its band");
+            let clear = geometry::Position::new(
+                "eDP-1",
+                if held.x == x { inside } else { held.x },
+                if held.y == y { inside } else { held.y },
+            );
+            assert!(!guard.holds(&clear), "{step:?} is clear of its band");
+        }
     }
 
     /// A coarse return step must cross the entry edge exactly like a fine one.

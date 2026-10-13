@@ -308,6 +308,10 @@ pub struct Session {
     layout: config::TopologyConfig,
     /// `input.pointer_gain`, applied to captured deltas while a source lease is remote.
     pointer_gain: f64,
+    /// `input.edge_hysteresis_px` in logical units: the band a return disarms its edge by.
+    edge_hysteresis_px: f64,
+    /// The edge a return came back through, until the pointer leaves its band.
+    edge_guard: Option<crate::topology::ReturnGuard>,
     /// The last non-empty agent display report; empty reports never replace it.
     agent_displays: Vec<protocol::ipc::DisplayInfo>,
     /// The last captured local position: the input of an edge crossing in `Local`.
@@ -401,6 +405,7 @@ impl Session {
         trust: identity::TrustStore,
         layout: config::TopologyConfig,
         pointer_gain: f64,
+        edge_hysteresis_px: f64,
         ownership_store: OwnershipStore,
         layout_store: crate::layout_store::LayoutStore,
         clipboard: Option<crate::clipboard::Clipboard>,
@@ -461,6 +466,8 @@ impl Session {
             pending_default_layout: None,
             layout,
             pointer_gain,
+            edge_hysteresis_px,
+            edge_guard: None,
             agent_displays: Vec::new(),
             local_hello,
             peer_displays: BTreeMap::new(),
@@ -2640,8 +2647,50 @@ impl Session {
         }
     }
 
+    /// Arms the band of the edge the pointer just came home through, and places the local
+    /// pointer inside it.
+    ///
+    /// `step` is the scaled captured delta that carried the pointer out of the peer's
+    /// display: its dominant axis and sign are the edge, and `input.edge_hysteresis_px` is
+    /// the band. Without this a pointer that came home sitting on the edge resolved a fresh
+    /// crossing on the next sample — the `Local`/`Remote` oscillation at the boundary.
+    fn arm_return_guard(&mut self, step: geometry::Point) {
+        let (Some(topology), Some(position)) =
+            (self.topology.as_ref(), self.local_pointer.as_ref())
+        else {
+            return;
+        };
+        let Some(display) = topology.display(&self.node_id, &position.display_id) else {
+            return;
+        };
+        let size = display.logical_size();
+        let Some(guard) = crate::topology::ReturnGuard::after_return(
+            step,
+            size.width,
+            size.height,
+            self.edge_hysteresis_px,
+        ) else {
+            return;
+        };
+        self.local_pointer = Some(guard.entry(position));
+        self.edge_guard = Some(guard);
+        tracing::debug!(
+            axis = ?guard.axis(),
+            hysteresis = guard.hysteresis(),
+            "the edge stays disarmed until the pointer leaves its band"
+        );
+    }
+
     /// `Local`: a step that leaves a display through a link endpoint opens the transition.
     async fn track_local(&mut self, position: &geometry::Position, motion: geometry::Point) {
+        // A pointer still inside the band of the edge it came home through is not a
+        // crossing, however hard it is pushed at that edge (`input.edge_hysteresis_px`).
+        if let Some(guard) = self.edge_guard {
+            if guard.holds(position) {
+                return;
+            }
+            self.edge_guard = None;
+        }
         // Only the owner opens leases, so only the owner reacts to an edge; a follower
         // watches its own pointer without acting on it.
         if !self.router.is_owner() || self.router.focus() != fr::FocusState::Local {
@@ -2703,6 +2752,10 @@ impl Session {
             tracing::info!("the pointer came back over the entry edge; returning to Local");
             self.remote_pointer = None;
             self.remote_node = None;
+            // Disarm the edge the pointer came home through until it leaves the band: a
+            // pointer that came home sitting on the edge would otherwise resolve a fresh
+            // crossing on the next sample (see `arm_return_guard`).
+            self.arm_return_guard(step);
         } else {
             // A link that leads further on: the lease has to be released first, so the
             // target is remembered and walked once the FSM is Local again.
