@@ -24,10 +24,6 @@ use std::path::PathBuf;
 
 use focus_router as fr;
 
-// ponytail: one process-wide lock serializes both config stores; use per-path locks only
-// if a core needs to persist multiple independent configurations concurrently.
-pub(crate) static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Writes the ownership pair into `config.toml` when it changes.
 pub struct OwnershipStore {
     /// The configuration file this core was started with.
@@ -65,25 +61,13 @@ impl OwnershipStore {
         if pair.0 == 0 || pair == self.saved {
             return;
         }
-        // The lock protects the whole read-modify-write, including the atomic save.
-        // It holds no mutable state, so a prior panic cannot invalidate its contents.
-        let _write_guard = CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut config = match config::Config::load(&self.path) {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    serial = pair.0,
-                    "cannot reload configuration to persist ownership; the next change will retry"
-                );
-                return;
-            }
-        };
-        config.workspace.owner_claim_serial = pair.0;
-        config.workspace.owner_node_id = pair.1.clone();
-        match config.save(&self.path) {
+        // The lock protects the whole read-modify-write, including the atomic save — and it
+        // is the *file* lock, not a process-local mutex: another process (a CLI, a second
+        // core) writing the same file is the case that lost a change (audit F17).
+        match config::lock::update_locked(&self.path, |config| {
+            config.workspace.owner_claim_serial = pair.0;
+            config.workspace.owner_node_id = pair.1.clone();
+        }) {
             Ok(()) => self.saved = pair,
             Err(error) => {
                 tracing::warn!(

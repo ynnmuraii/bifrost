@@ -109,30 +109,19 @@ impl LayoutStore {
         if (applied, max_seen) == self.saved {
             return;
         }
-        let _write_guard = crate::ownership_store::CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut config = match config::Config::load(&self.path) {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    revision = applied.revision,
-                    "cannot reload configuration to persist layout; the next change will retry"
-                );
-                return;
-            }
-        };
-        config.topology = topology.clone();
-        config.topology.revision = applied.revision;
-        config.topology.author = applied
+        let author = applied
             .author
             .map_or_else(String::new, |id| identity::fingerprint(&id));
-        config.topology.max_seen_revision = max_seen.revision;
-        config.topology.max_seen_author = max_seen
+        let max_seen_author = max_seen
             .author
             .map_or_else(String::new, |id| identity::fingerprint(&id));
-        match config.save(&self.path) {
+        match config::lock::update_locked(&self.path, |config| {
+            config.topology = topology.clone();
+            config.topology.revision = applied.revision;
+            config.topology.author = author;
+            config.topology.max_seen_revision = max_seen.revision;
+            config.topology.max_seen_author = max_seen_author;
+        }) {
             Ok(()) => self.saved = (applied, max_seen),
             Err(error) => tracing::warn!(
                 %error,
