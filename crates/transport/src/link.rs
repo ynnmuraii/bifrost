@@ -757,9 +757,33 @@ async fn run(
         }
     };
 
+    if reason == LinkDownReason::LocalClosed {
+        // Our own close, so the frames we just wrote are ours to deliver: a `Shutdown`, or the
+        // membership refusal that made the manager close this link. Aborting the reader and
+        // dropping the socket here is not enough — on Windows a close with anything of the
+        // peer's still unread sends a **reset**, and a reset discards the frames the peer has
+        // not read yet. The refused member then reported `Io(... 10054)` instead of
+        // `MEMBERSHIP_FULL` (1 failure in ~100 loaded runs of
+        // `mesh::the_membership_cap_refuses_the_extra_member`; every failure had that shape).
+        //
+        // So: TLS `close_notify` (the peer sees a clean end, not a truncation), then read what
+        // the peer already sent until it ends or the grace runs out, so the receive queue is
+        // empty when the socket goes and the OS has no reason to reset it.
+        let _ = tokio::time::timeout(GRACEFUL_CLOSE_GRACE, writer.shutdown()).await;
+        let _ = tokio::time::timeout(GRACEFUL_CLOSE_GRACE, async {
+            while frames_rx.recv().await.is_some() {}
+        })
+        .await;
+    }
     reader_task.abort();
     report_down(&reports, key, peer, reason).await;
 }
+
+/// How long a link we are closing ourselves gives the peer to read its last frames.
+///
+/// Bounded, and short: the peer is either reading or it is gone, and a link that refuses to
+/// end would hold the session's cleanup behind it.
+const GRACEFUL_CLOSE_GRACE: Duration = Duration::from_millis(200);
 
 /// The coordinator's mutable state.
 struct LinkState {

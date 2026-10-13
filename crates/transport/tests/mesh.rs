@@ -360,6 +360,11 @@ async fn an_untrusted_node_never_becomes_a_member() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Whether an event is a `Down` for `peer` (any reason).
+fn is_peer_down(peer: NodeId) -> impl Fn(&LinkEvent) -> bool {
+    move |event: &LinkEvent| matches!(event, LinkEvent::Down { peer: event_peer, .. } if *event_peer == peer)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_membership_cap_refuses_the_extra_member() {
     let root = temp_root("membership");
@@ -429,21 +434,42 @@ async fn the_membership_cap_refuses_the_extra_member() {
     // full workspace apart from a protocol failure, so its own link-down reason must be the
     // membership refusal too.
     let refused = if refused_peer == id_b { &mut b } else { &mut c };
-    let observed = wait_for_event(
-        &mut refused.events,
-        |event| matches!(event, LinkEvent::Down { peer, .. } if *peer == id_a),
-        EVENT_TIMEOUT,
-    )
-    .await
-    .expect("the refused member notices that it was not admitted");
-    match observed {
-        LinkEvent::Down { reason, .. } => assert_eq!(
-            reason,
-            LinkDownReason::MembershipFull,
-            "the refused member must learn that membership is full"
-        ),
-        other => panic!("unexpected event {other:?}"),
-    }
+    // The dialer retries inside this window, so several links to the same peer can end here:
+    // the test is about the *refusal* being delivered, not about which of them ends first.
+    // Waiting for the first `Down` of any kind and then demanding the reason made the test
+    // flaky (`Io(... 10054)` from a reset connection instead of the refusal, ~1 run in 100
+    // under load), which said nothing about whether the refusal arrived — this collector
+    // reports every reason it saw when the refusal is missing.
+    let mut observed: Vec<LinkDownReason> = Vec::new();
+    let refusal_seen = {
+        let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            match tokio::time::timeout(
+                left,
+                wait_for_event(&mut refused.events, is_peer_down(id_a), left),
+            )
+            .await
+            {
+                Ok(Some(LinkEvent::Down { reason, .. })) => {
+                    observed.push(reason.clone());
+                    if reason == LinkDownReason::MembershipFull {
+                        break true;
+                    }
+                }
+                Ok(Some(other)) => panic!("unexpected event {other:?}"),
+                Ok(None) => break false,
+                Err(_) => break false,
+            }
+        }
+    };
+    assert!(
+        refusal_seen,
+        "the refused member must learn that membership is full; reasons seen: {observed:?}"
+    );
 
     // The admitted member keeps its link.
     assert_eq!(a.manager.member_count().await, 1);

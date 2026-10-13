@@ -140,11 +140,11 @@ async fn a_saturated_queue_cannot_swallow_the_link_close() {
     })
     .expect("spawn a link");
 
-    // Let the link's task run once before the queue is filled: it writes its `Hello` and its
-    // reader task consumes the peer's post-handshake messages, so our receive buffer is empty
-    // when the link closes (a Windows close with unread data sends an RST, which would discard
-    // the very frame this test is about, on the peer's side).
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // No settling delay here on purpose: the link has to end *politely* by itself, whether or
+    // not the peer's post-handshake messages are still unread by the time it closes. Closing
+    // with anything unread sends a reset on Windows, and a reset discards the frames the peer
+    // has not read yet — which is the shape of the `mesh::the_membership_cap_refuses_the_extra_member`
+    // flake (1 failure in ~100 loaded runs: `Io(... 10054)` instead of `MEMBERSHIP_FULL`).
     let lease_id = [7u8; 16];
     let one = vec![input_model::InputEvent::PointerAbsolute(
         input_model::Position::new(1.0, 2.0),
@@ -159,13 +159,17 @@ async fn a_saturated_queue_cannot_swallow_the_link_close() {
     );
     link.handle.close();
 
-    // What the peer read decides it: the `Shutdown` frame must arrive (the `Hello` and the
-    // queued motion come first; either order of the last two is fine).
+    // What the peer read decides it: every frame we wrote must arrive — the `Hello`, the
+    // queued motion and the `Shutdown` — because a reset would have thrown them all away.
     let _ = tokio::time::timeout(Duration::from_secs(5), reader).await;
+    let read = seen.lock().expect("lock").clone();
     assert!(
-        seen.lock().expect("lock").contains(&"shutdown"),
-        "the peer must receive a Shutdown frame even though the queue was full; read: {:?}",
-        seen.lock().expect("lock")
+        read.contains(&"shutdown"),
+        "the peer must receive a Shutdown frame even though the queue was full; read: {read:?}"
+    );
+    assert!(
+        read.contains(&"hello") && read.contains(&"batch"),
+        "a polite close must not discard the frames written before it; read: {read:?}"
     );
 
     let _ = tokio::time::timeout(Duration::from_secs(5), link.task).await;
