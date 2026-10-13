@@ -1970,7 +1970,17 @@ impl Session {
             // The captured position is in the node's logical space, so it is resolved
             // against the manifests before anything geometric happens.
             let position = match self.topology.as_ref().and_then(|topology| {
-                crate::topology::position_on(topology, &self.node_id, pointer.x, pointer.y)
+                crate::topology::position_on_or_last_display(
+                    topology,
+                    &self.node_id,
+                    pointer.x,
+                    pointer.y,
+                    if remote {
+                        None
+                    } else {
+                        self.local_pointer.as_ref()
+                    },
+                )
             }) {
                 Some(position) => position,
                 None => continue,
