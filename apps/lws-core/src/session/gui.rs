@@ -364,6 +364,12 @@ impl Session {
                 let handled = self.layout_edit_document(text, expected).await;
                 self.reply_handled(request_id, out, handled).await;
             }
+            Msg::LayoutAuto(_) => {
+                // The same path the `layout auto` control command takes: the GUI button and
+                // the CLI cannot disagree about what "automatic" means.
+                let handled = self.layout_auto().await;
+                self.reply_handled(request_id, out, handled).await;
+            }
             Msg::ApplyPendingEdit(apply) => {
                 let matches = matches!(
                     self.layout_state.pending_with_id(),

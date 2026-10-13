@@ -236,6 +236,45 @@ fn the_gui_endpoint_answers_and_pushes_the_status() {
     );
 }
 
+/// The «Расположить автоматически» button, end to end: the GUI channel reaches the same
+/// `layout_auto` the `layout auto` command runs, and the layout the window then reads is the
+/// automatic one.
+#[test]
+fn the_auto_layout_button_arranges_the_desktop_over_the_gui_channel() {
+    let _guard = common::serial();
+    // The dry agents have to report displays: the automatic layout is a document about
+    // displays, and a workspace of two empty manifests has nothing to arrange.
+    let harness = Harness::start_with_displays();
+    harness.wait_linked();
+    let mut window = Window::open(&gui_endpoint_of(&harness.a.root));
+
+    let answer = window.request(gui_frame::Msg::LayoutAuto(protocol::ipc::LayoutAuto {}));
+    match answer {
+        gui_frame::Msg::OpResult(result) => {
+            assert!(result.ok, "the auto layout applies: {result:?}")
+        }
+        other => panic!("LayoutAuto answered {other:?}"),
+    }
+
+    let doc = match window.request(gui_frame::Msg::GetTopology(protocol::ipc::GetTopology {})) {
+        gui_frame::Msg::TopologyDoc(doc) => doc,
+        other => panic!("GetTopology answered {other:?}"),
+    };
+    assert!(
+        doc.revision >= 1,
+        "the automatic layout is an applied revision"
+    );
+    assert_eq!(
+        doc.members.len(),
+        2,
+        "this computer and the other one: {doc:?}"
+    );
+    assert!(
+        !doc.links.is_empty(),
+        "the automatic layout links the two computers: {doc:?}"
+    );
+}
+
 #[test]
 fn linked_cores_share_agent_displays_with_the_gui_without_a_layout() {
     let _guard = common::serial();
