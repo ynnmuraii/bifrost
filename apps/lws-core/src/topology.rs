@@ -1303,6 +1303,65 @@ mod tests {
         );
     }
 
+    /// A coarse return step must cross the entry edge exactly like a fine one.
+    ///
+    /// `remote_step` resolves the crossing from the *unclamped* motion and only then clamps
+    /// the estimate, so the size of a captured delta cannot decide whether the pointer is
+    /// allowed to leave the peer's display: a fast flick has to come home. A live probe once
+    /// read as «-32 px never returns while -16 px does»; the step was innocent — the probe's
+    /// own status polling was aliasing with the boundary ping-pong the same motion produces —
+    /// and this pins the property the estimate actually has.
+    #[test]
+    fn a_coarse_return_step_crosses_like_a_fine_one() {
+        let config = topology_config();
+        let local = [info(
+            "eDP-1",
+            [0.0, 0.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 1745.0, 1091.0], true)],
+        )];
+        let document = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .unwrap()
+        .topology;
+        let peer = NodeId::new(peer_id());
+        let mut steps = Vec::new();
+        for step in [-16.0_f64, -32.0, -100.0, -400.0] {
+            let mut position = geometry::Position::new("DP-1", 100.0, 540.0);
+            let mut taken = 0;
+            loop {
+                let (advanced, crossing) =
+                    remote_step(&document, &peer, &position, geometry::Point::new(step, 0.0));
+                taken += 1;
+                match crossing {
+                    Some(transition) => {
+                        assert_eq!(
+                            transition.target.node,
+                            NodeId::new(local_id()),
+                            "a {step} px step returns to the local node"
+                        );
+                        break;
+                    }
+                    None => position = advanced,
+                }
+                assert!(taken < 100, "a {step} px step never crossed in 100 pushes");
+            }
+            steps.push(taken);
+        }
+        assert!(
+            steps.windows(2).all(|pair| pair[0] >= pair[1]),
+            "crossing must not need more pushes as the step grows: {steps:?}"
+        );
+    }
+
     #[test]
     fn remote_motion_accumulates_clamps_and_resolves_the_return_edge() {
         let config = topology_config();
