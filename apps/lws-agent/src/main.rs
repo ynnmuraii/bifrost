@@ -172,17 +172,13 @@ fn init_logging(logs_dir: Option<&std::path::Path>) {
     let sink = logs_dir.and_then(|dir| logging::file_sink(dir, "lws-agent", 5, 5));
     let filter = tracing_subscriber::EnvFilter::try_from_env("LWS_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        // Same rule as core: colour is for a terminal, not for the file or pipe the agent
-        // is usually redirected into (its stderr is often core's).
-        .with_ansi(std::io::stderr().is_terminal())
-        .with_writer({
-            let sink = sink.clone();
-            move || logging::Tee::new(sink.clone())
-        })
-        .with_target(false)
-        .init();
+    // Same rule as core: colour is for the stderr terminal, never for the file
+    // (`logging::subscriber`), whose reader is usually a parser.
+    logging::init(
+        filter,
+        sink.clone().map(logging::file_writer),
+        std::io::stderr().is_terminal(),
+    );
 }
 
 fn main() -> ExitCode {

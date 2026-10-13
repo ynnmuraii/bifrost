@@ -289,19 +289,14 @@ fn init_logging(paths: &Paths) {
     let sink = logging::file_sink(&paths.logs_dir(), "lws-core", max_file_mb, max_files);
     let filter = tracing_subscriber::EnvFilter::try_from_env("LWS_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        // Colour only what a human reads. `tracing` colours by default, and a *redirected*
-        // stderr is not a terminal: a log file or a pipe would otherwise carry `ESC[…m`
-        // around every field, which breaks anything that parses it (the fault-injection
-        // harness did) and wastes bytes in the file sink.
-        .with_ansi(std::io::stderr().is_terminal())
-        .with_writer({
-            let sink = sink.clone();
-            move || logging::Tee::new(sink.clone())
-        })
-        .with_target(false)
-        .init();
+    // Colour belongs to the destination: stderr is coloured only on a terminal, and the log
+    // file never is (`logging::subscriber`). A hidden console on stderr used to colour the
+    // file with it, which broke every parser that read the log.
+    logging::init(
+        filter,
+        sink.clone().map(logging::file_writer),
+        std::io::stderr().is_terminal(),
+    );
     if let Some(sink) = sink {
         let path = sink.lock().map(|file| file.path().to_path_buf());
         if let Ok(path) = path {

@@ -12,18 +12,22 @@
 //! or clipboard content is never logged is kept where the events are *written*
 //! (`crates/identity` never logs key material, `crates/clipboard` never logs payloads).
 //!
-//! # One writer, two destinations
+//! # Two layers, one format
 //!
-//! [`Tee`] is what `tracing_subscriber::fmt().with_writer(...)` gets: every record goes to
-//! stderr **and** to the file. stderr stays, and not only for a human: `lws-core`'s own
-//! integration tests read a core's log from a redirected stderr, and a daemon started from a
-//! terminal should say what it is doing there too.
+//! [`subscriber`] puts one filter over two `tracing_subscriber` layers: stderr, coloured
+//! only when it is a terminal, and the file, never coloured. Colour is a property of the
+//! destination, not of the process: a console on stderr — a *hidden* console is enough —
+//! must not put `ESC[…m` into a file that parsers and grep read, which is what a single
+//! `fmt()` subscriber whose `with_ansi` follows stderr did. stderr stays for a second
+//! reason: `lws-core`'s own integration tests read a core's log from a redirected stderr.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use tracing_subscriber::layer::SubscriberExt as _;
 
 /// Limits a diagnostic stage to one log record per second across concurrent callers.
 #[derive(Default)]
@@ -176,44 +180,85 @@ pub fn file_sink(
     RotatingFile::open(dir, name, max_file_mb, max_files).map(|file| Arc::new(Mutex::new(file)))
 }
 
-/// The per-record writer: stderr always, the log file when one is open.
+/// The writer of the file layer: one rotating file, and nothing else.
 ///
-/// `tracing_subscriber::fmt().with_writer(move || Tee::new(sink.clone()))` is how the two
+/// `tracing_subscriber::fmt::layer().with_writer(logging::file_writer(sink))` is how the two
 /// binaries use it; the closure is what `MakeWriter` is implemented for, so no new trait
 /// shows up in either `main.rs`.
-pub struct Tee {
-    file: Option<Arc<Mutex<RotatingFile>>>,
+pub struct FileOnly {
+    file: Arc<Mutex<RotatingFile>>,
 }
 
-impl Tee {
-    /// A writer for an open log file, or for stderr alone.
-    pub fn new(file: Option<Arc<Mutex<RotatingFile>>>) -> Tee {
-        Tee { file }
+impl FileOnly {
+    /// A writer for an open log file.
+    pub fn new(file: Arc<Mutex<RotatingFile>>) -> FileOnly {
+        FileOnly { file }
     }
 }
 
-impl Write for Tee {
+impl Write for FileOnly {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // stderr first: it is the destination that always exists, and a busy file must not
-        // be able to swallow the line a person watching a terminal is waiting for.
-        let _ = io::stderr().write_all(buf);
-        if let Some(file) = &self.file {
-            if let Ok(mut file) = file.lock() {
-                let _ = file.write_all(buf);
-            }
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.write_all(buf);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let _ = io::stderr().flush();
-        if let Some(file) = &self.file {
-            if let Ok(mut file) = file.lock() {
-                let _ = file.flush();
-            }
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.flush();
         }
         Ok(())
     }
+}
+
+/// The `MakeWriter` of the file layer, for a sink from [`file_sink`].
+pub fn file_writer(
+    file: Arc<Mutex<RotatingFile>>,
+) -> impl Fn() -> FileOnly + Send + Sync + 'static {
+    move || FileOnly::new(Arc::clone(&file))
+}
+
+/// The logger both binaries install: one filter, a stderr layer and an optional file layer.
+///
+/// `stderr_is_terminal` is the *only* thing that decides colour, and it decides it for the
+/// stderr layer alone. A daemon started with a console — `Start-Process` gives it a hidden
+/// one — therefore still writes a file that no parser has to strip escapes out of.
+pub fn subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    file: Option<W>,
+    stderr_is_terminal: bool,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    // The bridge to `log`, which dependencies (winit, zbus) still emit, is installed by
+    // `SubscriberInitExt::try_init` itself: calling `LogTracer::init` here would consume the
+    // one-time `log::set_logger` slot and make that install fail.
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(stderr_is_terminal)
+        .with_writer(io::stderr)
+        .with_target(false);
+    let file_layer = file.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_target(false)
+    });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer)
+}
+
+/// Installs [`subscriber`] as the global logger.
+///
+/// Panics when one is already installed, which only happens if a binary installs two.
+pub fn init<W>(filter: tracing_subscriber::EnvFilter, file: Option<W>, stderr_is_terminal: bool)
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::util::SubscriberInitExt::init(subscriber(filter, file, stderr_is_terminal))
 }
 
 #[cfg(test)]
@@ -249,15 +294,58 @@ mod tests {
     }
 
     #[test]
-    fn the_tee_writes_the_same_bytes_to_the_file() {
-        let dir = temp_dir("tee");
+    fn the_file_writer_writes_the_file() {
+        let dir = temp_dir("file-only");
         let sink = file_sink(&dir, "lws-agent", 5, 5).expect("a log file");
-        let mut tee = Tee::new(Some(Arc::clone(&sink)));
-        tee.write_all(b"an event\n").expect("write");
-        tee.flush().expect("flush");
+        let mut writer = FileOnly::new(Arc::clone(&sink));
+        writer.write_all(b"an event\n").expect("write");
+        writer.flush().expect("flush");
         let text = std::fs::read_to_string(dir.join("lws-agent.log")).expect("the log file");
         assert_eq!(text, "an event\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The regression this crate is named for twice over: a console on stderr (a Windows
+    /// hidden console is one) used to colour the *file* as well, and `ESC[…m` around every
+    /// field broke the fault-injection harness' parser. The file layer is the one that must
+    /// stay plain, even with `stderr_is_terminal` true.
+    #[test]
+    fn the_file_layer_never_writes_ansi_escapes() {
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("the buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = {
+            let bytes = Arc::clone(&bytes);
+            move || Buffer(Arc::clone(&bytes))
+        };
+        let logger = subscriber(
+            tracing_subscriber::EnvFilter::new("info"),
+            Some(writer),
+            true,
+        );
+        tracing::subscriber::with_default(logger, || {
+            tracing::info!(field = "value", "a record for the file layer");
+        });
+        let text = String::from_utf8(bytes.lock().expect("the buffer").clone()).expect("utf-8");
+        assert!(
+            !text.contains('\u{1b}'),
+            "the file layer carried an escape: {text:?}"
+        );
+        assert!(
+            text.contains("field") && text.contains("a record for the file layer"),
+            "the record reached the file layer: {text:?}"
+        );
     }
 
     #[test]
