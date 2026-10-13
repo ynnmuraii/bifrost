@@ -28,10 +28,49 @@ use crate::backend::{ClipboardChange, Event, Injected, Ready, Released, Takeover
 use crate::takeover::Detector;
 use input_model::RepeatFilter;
 
+/// Source motion state, shared by the capture adapter and deterministic session tests.
+pub(crate) struct SourceMotion {
+    position: Option<input_model::Position>,
+    scale: f64,
+}
+
+impl SourceMotion {
+    pub(crate) fn new(position: Option<input_model::Position>, scale: f64) -> Self {
+        Self { position, scale }
+    }
+
+    pub(crate) fn normalize(&mut self, kind: CaptureKind, event: InputEvent) -> Option<InputEvent> {
+        match event {
+            InputEvent::PointerRelative { .. } if kind == CaptureKind::Observe => None,
+            InputEvent::PointerRelative { dx, dy } => {
+                let position = self.position.as_mut()?;
+                position.x += f64::from(dx) / self.scale;
+                position.y += f64::from(dy) / self.scale;
+                // This source accumulator deliberately extends beyond its physical screens.
+                Some(InputEvent::PointerAbsolute(*position))
+            }
+            InputEvent::PointerAbsolute(native) => {
+                let logical =
+                    input_model::Position::new(native.x / self.scale, native.y / self.scale);
+                self.position = Some(logical);
+                Some(InputEvent::PointerAbsolute(logical))
+            }
+            event => Some(event),
+        }
+    }
+
+    pub(crate) fn seed_event(&self) -> Option<InputEvent> {
+        self.position.map(InputEvent::PointerAbsolute)
+    }
+}
+
 /// The Windows input path.
 pub struct Win {
     ready: Ready,
     capture: Option<Capture>,
+    source_motion: Option<SourceMotion>,
+    source_monitors: Vec<platform_win::displays::Monitor>,
+    pending_source_seed: bool,
     injector: Injector,
     emergency: EmergencyCombo,
     /// The receiver-takeover detector, when `[input].takeover_detection` armed it.
@@ -101,6 +140,9 @@ impl Win {
         Ok(Win {
             ready,
             capture: None,
+            source_motion: None,
+            source_monitors: Vec::new(),
+            pending_source_seed: false,
             injector: Injector::new(),
             emergency,
             detector: None,
@@ -213,6 +255,20 @@ impl Win {
                 capture.set_mode(kind);
             }
             None => {
+                let monitors = platform_win::displays::enumerate()
+                    .map_err(|error| format!("cannot seed source motion: {error}"))?;
+                let native = Capture::cursor_position()
+                    .map_err(|error| format!("cannot seed source motion: {error}"))?;
+                let scale = monitor_scale(&monitors, native).ok_or_else(|| {
+                    "cannot seed source motion: cursor is outside known monitors".to_owned()
+                })?;
+                let motion = SourceMotion::new(
+                    Some(input_model::Position::new(
+                        native.x / scale,
+                        native.y / scale,
+                    )),
+                    scale,
+                );
                 let config = CaptureConfig {
                     mode: kind,
                     emergency: self.emergency,
@@ -220,6 +276,11 @@ impl Win {
                     ..CaptureConfig::default()
                 };
                 let capture = Capture::start(config).map_err(|error| capture_error(&error))?;
+                self.source_motion = Some(motion);
+                self.source_monitors = monitors;
+                // Core needs a baseline before the first delta, including manual capture
+                // that had no preceding Observe motion.
+                self.pending_source_seed = true;
                 self.capture = Some(capture);
             }
         }
@@ -245,6 +306,9 @@ impl Win {
         if self.capture.take().is_none() {
             tracing::debug!("EndCapture with no active capture");
         }
+        self.source_motion = None;
+        self.source_monitors.clear();
+        self.pending_source_seed = false;
         self.last_capture_report = None;
         self.last_capture_stats = CaptureStats::default();
         // The keys held now are released locally; their ups never reach this filter, and a
@@ -395,6 +459,16 @@ impl Win {
 
     pub async fn next_event(&mut self) -> Option<Event> {
         self.report_capture_stats(false);
+        if self.pending_source_seed {
+            self.pending_source_seed = false;
+            if let Some(event) = self
+                .source_motion
+                .as_ref()
+                .and_then(SourceMotion::seed_event)
+            {
+                return Some(Event::Input(event));
+            }
+        }
         if let Some(capture) = &self.capture {
             match capture.try_recv() {
                 Some(CaptureEvent::Input(event)) => {
@@ -404,7 +478,13 @@ impl Win {
                         tracing::trace!(?event, "dropping an OS autorepeat");
                         return None;
                     }
-                    return Some(Event::Input(event));
+                    let motion = self.source_motion.as_mut()?;
+                    if let InputEvent::PointerAbsolute(native) = event {
+                        if let Some(scale) = monitor_scale(&self.source_monitors, native) {
+                            motion.scale = scale;
+                        }
+                    }
+                    return motion.normalize(capture.mode(), event).map(Event::Input);
                 }
                 Some(CaptureEvent::Emergency) => return Some(Event::Emergency),
                 Some(CaptureEvent::QueueOverflow) => return Some(Event::QueueOverflow),
@@ -505,6 +585,19 @@ impl Win {
         self.last_capture_report = Some(now);
         self.last_capture_stats = stats;
     }
+}
+
+fn monitor_scale(
+    monitors: &[platform_win::displays::Monitor],
+    point: input_model::Position,
+) -> Option<f64> {
+    monitors
+        .iter()
+        .find(|monitor| {
+            let [x, y, width, height] = monitor.native.map(f64::from);
+            point.x >= x && point.x < x + width && point.y >= y && point.y < y + height
+        })
+        .map(|monitor| monitor.scale)
 }
 
 fn capture_error(error: &CaptureError) -> String {
@@ -701,6 +794,10 @@ mod tests {
             .expect("rearm");
         win.begin_capture(CaptureKind::Remote, true)
             .expect("remote");
+        let source = win.source_motion.as_ref().expect("source motion seed");
+        let seed = source.position.expect("seeded position");
+        let expected_motion =
+            input_model::Position::new(seed.x + 3.0 / source.scale, seed.y - 2.0 / source.scale);
         let key = |flags| INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -735,7 +832,11 @@ mod tests {
         let (mut motion, mut down, mut up) = (false, false, false);
         while Instant::now() < deadline && !(motion && down && up) {
             match win.next_event().await {
-                Some(Event::Input(InputEvent::PointerRelative { dx: 3, dy: -2 })) => motion = true,
+                Some(Event::Input(InputEvent::PointerAbsolute(position)))
+                    if position == expected_motion =>
+                {
+                    motion = true
+                }
                 Some(Event::Input(InputEvent::Key { key, state }))
                     if key == HidKey::keyboard(0xe1) =>
                 {

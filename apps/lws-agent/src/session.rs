@@ -343,45 +343,14 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
         // One tick, one batch: keeps the frame rate bounded and lets the transport
         // coalesce motion on the far side. A tick that only learned about an edge
         // crossing still goes out, with no events.
-        let now = now_ms(started);
-        if !batch.is_empty() || at_edge {
-            let events = std::mem::take(&mut batch);
-            let edge = at_edge;
-            at_edge = false;
-            if last_capture_batch_log.is_none_or(|last| now.saturating_sub(last) >= 1_000) {
-                last_capture_batch_log = Some(now);
-                let mut keys = 0;
-                let mut pointers = 0;
-                let mut buttons = 0;
-                let mut scrolls = 0;
-                for event in &events {
-                    match backend::to_input_event(event) {
-                        Some(input_model::InputEvent::Key { .. }) => keys += 1,
-                        Some(
-                            input_model::InputEvent::PointerAbsolute(_)
-                            | input_model::InputEvent::PointerRelative { .. },
-                        ) => pointers += 1,
-                        Some(input_model::InputEvent::Button { .. }) => buttons += 1,
-                        Some(input_model::InputEvent::Scroll { .. }) => scrolls += 1,
-                        None => {}
-                    }
-                }
-                tracing::info!(
-                    events = events.len(),
-                    keys,
-                    pointers,
-                    buttons,
-                    scrolls,
-                    at_edge = edge,
-                    "agent CapturedBatch"
-                );
-            }
-            link.send(Msg::Captured(CapturedBatch {
-                events,
-                at_edge: edge,
-            }))
-            .await?;
-        }
+        flush_captured(
+            link,
+            &mut batch,
+            &mut at_edge,
+            &mut last_capture_batch_log,
+            now_ms(started),
+        )
+        .await?;
     }
 }
 
@@ -892,6 +861,54 @@ async fn send_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentLink<S>,
+    batch: &mut Vec<LocalEvent>,
+    at_edge: &mut bool,
+    last_log: &mut Option<u64>,
+    now: u64,
+) -> anyhow::Result<()> {
+    if batch.is_empty() && !*at_edge {
+        return Ok(());
+    }
+    let events = std::mem::take(batch);
+    let edge = std::mem::take(at_edge);
+    if last_log.is_none_or(|last| now.saturating_sub(last) >= 1_000) {
+        *last_log = Some(now);
+        let mut keys = 0;
+        let mut pointers = 0;
+        let mut buttons = 0;
+        let mut scrolls = 0;
+        for event in &events {
+            match backend::to_input_event(event) {
+                Some(input_model::InputEvent::Key { .. }) => keys += 1,
+                Some(
+                    input_model::InputEvent::PointerAbsolute(_)
+                    | input_model::InputEvent::PointerRelative { .. },
+                ) => pointers += 1,
+                Some(input_model::InputEvent::Button { .. }) => buttons += 1,
+                Some(input_model::InputEvent::Scroll { .. }) => scrolls += 1,
+                None => {}
+            }
+        }
+        tracing::info!(
+            events = events.len(),
+            keys,
+            pointers,
+            buttons,
+            scrolls,
+            at_edge = edge,
+            "agent CapturedBatch"
+        );
+    }
+    link.send(Msg::Captured(CapturedBatch {
+        events,
+        at_edge: edge,
+    }))
+    .await?;
+    Ok(())
+}
+
 /// Handles one backend event.
 #[allow(clippy::too_many_arguments)]
 async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1252,6 +1269,96 @@ mod tests {
                 Ok(Err(error)) => panic!("the link ended instead of staying quiet: {error}"),
             }
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_remote_raw_motion_reaches_captured_batch() {
+        use crate::backend::SourceMotion;
+        use input_model::{CaptureKind, InputEvent, Position};
+
+        let mut harness = Harness::new().await;
+        let mut motion = SourceMotion::new(Some(Position::new(100.0, 200.0)), 1.0);
+        for (kind, input) in [
+            (
+                CaptureKind::Observe,
+                InputEvent::PointerRelative { dx: 12, dy: 6 },
+            ),
+            (
+                CaptureKind::Observe,
+                InputEvent::PointerAbsolute(Position::new(120.0, 210.0)),
+            ),
+            (
+                CaptureKind::Temporary,
+                InputEvent::PointerRelative { dx: 12, dy: 6 },
+            ),
+            (
+                CaptureKind::Remote,
+                InputEvent::PointerRelative { dx: 12, dy: 6 },
+            ),
+        ] {
+            if let Some(input) = motion.normalize(kind, input) {
+                harness.event(Event::Input(input)).await;
+            }
+        }
+        let mut last_log = None;
+        flush_captured(
+            &mut harness.agent,
+            &mut harness.batch,
+            &mut harness.at_edge,
+            &mut last_log,
+            0,
+        )
+        .await
+        .expect("production capture flush");
+        let Msg::Captured(batch) = harness.recv().await else {
+            panic!("expected CapturedBatch");
+        };
+        let positions: Vec<_> = batch
+            .events
+            .iter()
+            .map(|event| {
+                let Some(ipc::local_event::Ev::Pointer(pointer)) = &event.ev else {
+                    panic!("expected absolute pointer");
+                };
+                (pointer.x, pointer.y)
+            })
+            .collect();
+        assert_eq!(positions, [(120.0, 210.0), (132.0, 216.0), (144.0, 222.0)]);
+
+        // A fresh capture must use its new OS seed, not the old virtual accumulator.
+        let mut motion = SourceMotion::new(Some(Position::new(300.0, 400.0)), 2.0);
+        harness
+            .event(Event::Input(motion.seed_event().expect("startup baseline")))
+            .await;
+        let input = motion
+            .normalize(
+                CaptureKind::Remote,
+                InputEvent::PointerRelative { dx: 12, dy: 6 },
+            )
+            .expect("seeded remote motion");
+        harness.event(Event::Input(input)).await;
+        flush_captured(
+            &mut harness.agent,
+            &mut harness.batch,
+            &mut harness.at_edge,
+            &mut last_log,
+            1_000,
+        )
+        .await
+        .expect("production capture flush after new seed");
+        let Msg::Captured(batch) = harness.recv().await else {
+            panic!("expected restart CapturedBatch");
+        };
+        assert_eq!(batch.events.len(), 2);
+        let Some(ipc::local_event::Ev::Pointer(seed)) = &batch.events[0].ev else {
+            panic!("expected restart baseline");
+        };
+        assert_eq!((seed.x, seed.y), (300.0, 400.0));
+        let Some(ipc::local_event::Ev::Pointer(pointer)) = &batch.events[1].ev else {
+            panic!("expected restart absolute pointer");
+        };
+        assert_eq!((pointer.x, pointer.y), (306.0, 403.0));
     }
 
     static CLIPBOARD_DIRS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
