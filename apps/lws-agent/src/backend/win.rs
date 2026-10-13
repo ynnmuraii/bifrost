@@ -103,6 +103,11 @@ pub struct Win {
     applied_sequence: Option<u32>,
     last_capture_report: Option<Instant>,
     last_capture_stats: CaptureStats,
+    /// Captured events that arrived with no source-motion baseline (audit F11).
+    ///
+    /// `next_event` used to `?`-return on a missing baseline, which read exactly like "no
+    /// event this tick": the source then forwarded no motion at all with nothing in the log.
+    motion_without_baseline: u64,
 }
 
 impl Win {
@@ -152,6 +157,7 @@ impl Win {
             applied_sequence: None,
             last_capture_report: None,
             last_capture_stats: CaptureStats::default(),
+            motion_without_baseline: 0,
         })
     }
 
@@ -253,22 +259,20 @@ impl Win {
             Some(capture) => {
                 capture.set_capture_injected(capture_injected);
                 capture.set_mode(kind);
+                // Idempotent re-arm (audit F11): the FSM asks for the `Remote` capture right
+                // after the `Temporary` one, without a trip through `end_capture`, so this is
+                // the branch a live transition takes. Skipping the seed here left `next_event`
+                // with no accumulator and no baseline: the source silently forwarded no
+                // relative motion and never sent the seed position.
+                if needs_source_seed(&self.source_motion, &self.source_monitors) {
+                    self.seed_source_motion()?;
+                    tracing::warn!(
+                        ?kind,
+                        "a re-armed capture had no source-motion baseline; it was seeded"
+                    );
+                }
             }
             None => {
-                let monitors = platform_win::displays::enumerate()
-                    .map_err(|error| format!("cannot seed source motion: {error}"))?;
-                let native = Capture::cursor_position()
-                    .map_err(|error| format!("cannot seed source motion: {error}"))?;
-                let scale = monitor_scale(&monitors, native).ok_or_else(|| {
-                    "cannot seed source motion: cursor is outside known monitors".to_owned()
-                })?;
-                let motion = SourceMotion::new(
-                    Some(input_model::Position::new(
-                        native.x / scale,
-                        native.y / scale,
-                    )),
-                    scale,
-                );
                 let config = CaptureConfig {
                     mode: kind,
                     emergency: self.emergency,
@@ -276,11 +280,7 @@ impl Win {
                     ..CaptureConfig::default()
                 };
                 let capture = Capture::start(config).map_err(|error| capture_error(&error))?;
-                self.source_motion = Some(motion);
-                self.source_monitors = monitors;
-                // Core needs a baseline before the first delta, including manual capture
-                // that had no preceding Observe motion.
-                self.pending_source_seed = true;
+                self.seed_source_motion()?;
                 self.capture = Some(capture);
             }
         }
@@ -478,7 +478,17 @@ impl Win {
                         tracing::trace!(?event, "dropping an OS autorepeat");
                         return None;
                     }
-                    let motion = self.source_motion.as_mut()?;
+                    if self.source_motion.is_none() {
+                        // No accumulator and no baseline: the event cannot be normalised, so
+                        // it is dropped *visibly* (audit F11) instead of returning a bare
+                        // `None`, which was indistinguishable from "no event this tick".
+                        self.note_motion_without_baseline();
+                        return None;
+                    }
+                    let motion = self
+                        .source_motion
+                        .as_mut()
+                        .expect("checked just above");
                     if let InputEvent::PointerAbsolute(native) = event {
                         if let Some(scale) = monitor_scale(&self.source_monitors, native) {
                             motion.scale = scale;
@@ -585,6 +595,49 @@ impl Win {
         self.last_capture_report = Some(now);
         self.last_capture_stats = stats;
     }
+}
+
+/// The source-motion state and monitors a capture needs, from the current cursor.
+///
+/// Seeded on **both** `begin_capture` branches (audit F11) so a re-armed capture always has
+/// the accumulator the deltas are integrated into and the baseline `pending_source_seed`
+/// sends.
+impl Win {
+    fn seed_source_motion(&mut self) -> Result<(), String> {
+        let monitors = platform_win::displays::enumerate()
+            .map_err(|error| format!("cannot seed source motion: {error}"))?;
+        let native = Capture::cursor_position()
+            .map_err(|error| format!("cannot seed source motion: {error}"))?;
+        let scale = monitor_scale(&monitors, native).ok_or_else(|| {
+            "cannot seed source motion: cursor is outside known monitors".to_owned()
+        })?;
+        self.source_motion = Some(SourceMotion::new(
+            Some(input_model::Position::new(native.x / scale, native.y / scale)),
+            scale,
+        ));
+        self.source_monitors = monitors;
+        // Core needs a baseline before the first delta, including manual capture that had no
+        // preceding Observe motion.
+        self.pending_source_seed = true;
+        Ok(())
+    }
+
+    /// Counts a captured event that arrived with no baseline, so a silent no-motion capture
+    /// is visible in the log instead of looking like an idle one (audit F11).
+    fn note_motion_without_baseline(&mut self) {
+        self.motion_without_baseline = self.motion_without_baseline.saturating_add(1);
+        if self.motion_without_baseline == 1 || self.motion_without_baseline % 100 == 0 {
+            tracing::warn!(
+                count = self.motion_without_baseline,
+                "a captured event arrived with no source-motion baseline; it was dropped"
+            );
+        }
+    }
+}
+
+/// Whether a capture still needs its source-motion baseline (audit F11).
+fn needs_source_seed(motion: &Option<SourceMotion>, monitors: &[platform_win::displays::Monitor]) -> bool {
+    motion.is_none() || monitors.is_empty()
 }
 
 fn monitor_scale(
@@ -769,6 +822,58 @@ mod tests {
         println!("stats: {:?}", capture.stats());
         drop(capture);
         assert!(downs >= 1, "even the injected down itself must be seen");
+    }
+
+    /// Audit F11: a capture that is re-armed on the `Some(capture)` branch has to get its
+    /// source-motion baseline back, and an event that still arrives without one is counted
+    /// rather than dropped in silence.
+    ///
+    /// The FSM asks for the `Remote` capture right after the `Temporary` one, so that branch
+    /// is the one a live transition takes; leaving `source_motion` unset there meant the
+    /// source forwarded no motion and sent no seed position, with nothing in the log.
+    #[test]
+    fn a_rearmed_capture_needs_and_reports_its_baseline() {
+        let ready = Ready {
+            capabilities: Vec::new(),
+            platform: "platform-win".to_owned(),
+            session_kind: "windows".to_owned(),
+            backend: ::protocol::ipc::BackendInfo::default(),
+        };
+        let mut win = Win::new(&ready, "Ctrl+Alt+Shift+F12", None).expect("backend");
+        assert!(
+            win.source_motion.is_none(),
+            "nothing is seeded before the first capture"
+        );
+        assert!(
+            needs_source_seed(&win.source_motion, &win.source_monitors),
+            "an existing capture with no baseline must be re-seeded"
+        );
+        let monitor = platform_win::displays::Monitor {
+            id: "\\.\\DISPLAY1".to_owned(),
+            logical: [0.0, 0.0, 1920.0, 1080.0],
+            native: [0, 0, 1920, 1080],
+            scale: 1.0,
+            primary: true,
+        };
+        let seeded = Some(SourceMotion::new(
+            Some(input_model::Position::new(10.0, 20.0)),
+            1.0,
+        ));
+        assert!(
+            !needs_source_seed(&seeded, std::slice::from_ref(&monitor)),
+            "a seeded capture is left alone"
+        );
+        assert!(
+            needs_source_seed(&seeded, &[]),
+            "a capture without monitors has no scale to integrate with"
+        );
+        // The silent `?`-return became a count: a capture that loses its baseline says so.
+        assert_eq!(win.motion_without_baseline, 0);
+        win.note_motion_without_baseline();
+        assert_eq!(
+            win.motion_without_baseline, 1,
+            "the dropped event is counted"
+        );
     }
 
     #[tokio::test]
