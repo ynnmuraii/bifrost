@@ -216,6 +216,8 @@ pub enum Request {
     RetryAgent,
     /// `Shutdown`.
     Shutdown,
+    /// `LayoutAuto`: rebuild the shared layout from this desktop.
+    LayoutAuto,
     /// `ListPendingEdits`.
     ListPendingEdits,
     /// `ApplyPendingEdit`.
@@ -242,6 +244,7 @@ impl Request {
             Request::ResetPortalGrants => "забыть разрешения порталов",
             Request::RetryAgent => "повторить запуск службы ввода",
             Request::Shutdown => "остановить службу",
+            Request::LayoutAuto => "расположить автоматически",
             Request::ListPendingEdits => "список непринятых правок",
             Request::ApplyPendingEdit => "применить непринятую правку",
             Request::DiscardPendingEdit => "отбросить непринятую правку",
@@ -1150,6 +1153,13 @@ impl ViewModel {
     ///
     /// The pairing answer names the peer; the live link status arrives separately in `Status`.
     fn success_text(&self, request: Request) -> String {
+        if request == Request::LayoutAuto {
+            // The owner asked for this in one sentence: what the automatic layout did.
+            return match self.auto_layout_summary() {
+                Some(summary) => format!("расположено автоматически: {summary}"),
+                None => "расположено автоматически".to_owned(),
+            };
+        }
         if request == Request::PairingAnswer {
             let name = self
                 .pairing
@@ -1164,6 +1174,31 @@ impl ViewModel {
     }
 
     // ------------------------------------------------------------ derived text
+
+    /// What the automatic layout produced, for the status line: which computer it placed,
+    /// on which side, and that the whole desktop is part of it.
+    ///
+    /// Derived from the applied document the window already holds (the auto layout is one
+    /// current node plus the peer, side by side), so the sentence describes what happened
+    /// rather than what was asked for.
+    fn auto_layout_summary(&self) -> Option<String> {
+        let other = self.other_node()?;
+        let name = self
+            .editor
+            .nodes
+            .iter()
+            .find(|node| node.node_id == other)
+            .map(|node| node.label())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| "второй компьютер".to_owned());
+        let side = match self.editor.side {
+            Side::Left => "слева",
+            Side::Right => "справа",
+            Side::Top => "сверху",
+            Side::Bottom => "снизу",
+        };
+        Some(format!("{name} {side}, весь рабочий стол"))
+    }
 
     /// The header's status line, in the words of someone who did not install anything: the
     /// thing that must be running is «служба», not «ядро».
@@ -1954,6 +1989,8 @@ pub enum Action {
     },
     /// Turn the shared clipboard on or off.
     SetClipboard(bool),
+    /// Rebuild the shared layout from this desktop (`LayoutAuto`).
+    LayoutAuto,
     /// Apply the edited layout document.
     UpdateTopology {
         /// The document, in the `[topology]` schema.
@@ -2060,6 +2097,7 @@ impl Action {
                 Request::SetClipboard,
                 Msg::SetClipboard(ipc::SetClipboard { enabled: *enabled }),
             ),
+            Action::LayoutAuto => (Request::LayoutAuto, Msg::LayoutAuto(ipc::LayoutAuto {})),
             Action::UpdateTopology {
                 layout_toml,
                 expected_revision,
@@ -2968,6 +3006,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::ExportDiagnostics(_) => "ExportDiagnostics",
         Msg::ResetPortalGrants(_) => "ResetPortalGrants",
         Msg::RetryAgent(_) => "RetryAgent",
+        Msg::LayoutAuto(_) => "LayoutAuto",
         Msg::Shutdown(_) => "Shutdown",
         Msg::ClaimOwnership(_) => "ClaimOwnership",
         Msg::AbandonOwnership(_) => "AbandonOwnership",
@@ -3025,6 +3064,9 @@ fn success_text(request: Request) -> String {
         Request::PairWith => "подключение начато".to_owned(),
         Request::PairingAnswer => "ответ отправлен".to_owned(),
         Request::UpdateTopology => "раскладка отправлена".to_owned(),
+        // The window's own wording is the `ViewModel::success_text` one (it can name the
+        // computer and the side); this is the plain fall-back.
+        Request::LayoutAuto => "расположено автоматически".to_owned(),
         Request::SetClipboard => "буфер обмена переключён".to_owned(),
         Request::RevokePeer => "компьютер удалён из пары".to_owned(),
         Request::ResetPortalGrants => "разрешения порталов забыты".to_owned(),
@@ -3043,6 +3085,9 @@ fn success_text(request: Request) -> String {
 fn failure_text(request: Request, code: &str) -> String {
     let label = code_label(code);
     match request {
+        Request::LayoutAuto => {
+            format!("автоматическая раскладка не готова: {label}")
+        }
         Request::UpdateTopology if code == "LAYOUT_CONFLICT" => {
             "раскладку изменили на другом компьютере — обновите документ и повторите".to_owned()
         }

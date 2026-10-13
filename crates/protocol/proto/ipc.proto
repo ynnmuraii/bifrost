@@ -257,6 +257,7 @@ message GuiFrame {
     DiscardPendingEdit discard_pending_edit = 25;
     RetryAgent retry_agent = 26;
     Shutdown shutdown = 27;               // ask this core to shut down cleanly
+    LayoutAuto layout_auto = 28;           // «Расположить автоматически»: rebuild the layout from this desktop
 
     Status status = 40;          // response and pushed event
     PairingPrompt pairing_prompt = 41;
@@ -267,6 +268,7 @@ message GuiFrame {
   }
 }
 message GetStatus {}
+message LayoutAuto {} // the core runs the same layout_auto the `layout auto` command does
 message ClaimOwnership {}
 message AbandonOwnership {}
 message StartPairing { uint32 window_s = 1; } // max 120

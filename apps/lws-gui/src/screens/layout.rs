@@ -416,6 +416,20 @@ fn side_block(vm: &ViewModel, ui: &mut egui::Ui) -> Vec<Action> {
                     expected_author: crate::view_model::node_id_bytes(&vm.editor.author),
                 });
             }
+            // The owner's one-click layout: this desktop plus the peer, side by side, built
+            // by the core (`LayoutAuto`, the same `layout_auto` the CLI calls). It needs no
+            // document to be loaded - that is the point: it is what someone presses when the
+            // file still names monitors by hand.
+            let can_auto = vm.connection.is_connected() && vm.status.is_some();
+            if ui
+                .add_enabled(can_auto, egui::Button::new("Расположить автоматически"))
+                .on_hover_text(
+                    "Собрать раскладку по текущему рабочему столу: второй компьютер справа",
+                )
+                .clicked()
+            {
+                actions.push(Action::LayoutAuto);
+            }
             if !vm.editor.editable {
                 hint(ui, "Кнопка станет доступна, когда появится координатор");
             } else if !vm.connection.is_connected() {

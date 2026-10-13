@@ -180,6 +180,59 @@ fn an_older_document_does_not_become_the_editors_base() {
     assert_eq!(vm.editor.revision, 9);
 }
 
+/// The «Расположить автоматически» button: the frame it sends, and the sentence the status
+/// bar shows when the core has done it.
+#[test]
+fn the_auto_layout_button_reports_what_it_did() {
+    let (request, message) = Action::LayoutAuto
+        .wire()
+        .expect("the action sends a request");
+    assert_eq!(request, Request::LayoutAuto);
+    assert_eq!(message, Msg::LayoutAuto(protocol::ipc::LayoutAuto {}));
+
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    let id = vm.begin_request(Request::LayoutAuto, Instant::now());
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+
+    let outcome = vm.outcome.as_ref().expect("the result is shown");
+    assert!(outcome.ok, "a successful auto layout is a success");
+    assert!(
+        outcome.line().contains("расположено автоматически"),
+        "the status bar names the action: {}",
+        outcome.line()
+    );
+    assert!(
+        outcome.line().contains("справа"),
+        "and what it did with the other computer: {}",
+        outcome.line()
+    );
+
+    // The refusal reaches the same line, in words rather than a code.
+    let id = vm.begin_request(Request::LayoutAuto, Instant::now());
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: false,
+            error_code: "BAD_REQUEST".to_owned(),
+        }),
+    ));
+    let outcome = vm.outcome.as_ref().expect("the refusal is shown");
+    assert!(!outcome.ok);
+    assert!(
+        outcome.line().contains("автоматическая раскладка"),
+        "the refusal explains itself: {}",
+        outcome.line()
+    );
+}
+
 #[test]
 fn a_layout_conflict_says_what_to_do_about_it() {
     let mut vm = view();
@@ -465,6 +518,7 @@ fn every_wire_request_is_the_message_it_names() {
             Request::PairingAnswer,
         ),
         (Action::SetClipboard(true), Request::SetClipboard),
+        (Action::LayoutAuto, Request::LayoutAuto),
         (
             Action::UpdateTopology {
                 layout_toml: b"links = []".to_vec(),
