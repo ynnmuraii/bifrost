@@ -139,7 +139,8 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
 
     // Both endings leave nothing of this session behind (rules 4, 6, 10; S2).
     if let Stop::LostCore = stop {
-        release_everything(&mut backend).await;
+        // The loop is over, so nothing can inject any more; the state still goes with it.
+        release_everything(&mut backend, &mut None, &mut None, &mut None, &mut None).await;
     }
     tracing::info!("agent exiting");
     Ok(())
@@ -319,6 +320,9 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                     handle_backend_event(
                         link,
                         backend,
+                        &mut repeat,
+                        &mut deadline,
+                        &mut self_timeout,
                         event,
                         &mut held_lease,
                         &mut batch,
@@ -333,6 +337,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
         service_timers(
             link,
             backend,
+            &mut repeat,
             &mut deadline,
             &mut self_timeout,
             &mut held_lease,
@@ -367,6 +372,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
 async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
     link: &mut AgentLink<S>,
     backend: &mut Backend,
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     deadline: &mut Option<(Instant, Vec<u8>)>,
     self_timeout: &mut Option<(Instant, Vec<u8>)>,
     held_lease: &mut Option<Vec<u8>>,
@@ -380,11 +386,14 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
             let lease_id = lease_id.clone();
             *deadline = None;
             tracing::warn!("deadline expired; releasing the session");
+            // The lease is over: the repeat engine, the deadlines and the held lease all go
+            // with it, or the engine keeps injecting a key that was just released (batch-3
+            // audit, F12).
+            forget_lease_state(repeat, deadline, self_timeout, held_lease);
             let released = backend.release_session().await;
             link.send(Msg::DeadlineExpired(DeadlineExpired { lease_id }))
                 .await?;
             tracing::info!(keys = released.keys, buttons = released.buttons, "released");
-            *held_lease = None;
         }
     }
     // Rule 5: a TEMPORARY capture ends by itself and the buffered edge
@@ -394,6 +403,7 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
             let lease_id = lease_id.clone();
             *self_timeout = None;
             tracing::warn!("self-timeout of a temporary capture");
+            forget_capture_state(repeat, self_timeout);
             let _ = backend.end_capture(true).await;
             send_error(
                 link,
@@ -412,10 +422,7 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
             silence_ms = watchdog.silence_ms(now),
             "core silent past the limit; releasing locally"
         );
-        release_everything(backend).await;
-        *deadline = None;
-        *self_timeout = None;
-        *held_lease = None;
+        release_everything(backend, repeat, deadline, self_timeout, held_lease).await;
     }
     Ok(())
 }
@@ -485,10 +492,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             // its injection lease and repeat engine must continue unchanged.
             let capture_only = end.lease_id.is_empty();
             if !capture_only {
-                if let Some(engine) = repeat.as_mut() {
-                    engine.resume();
-                }
-                *self_timeout = None;
+                forget_capture_state(repeat, self_timeout);
             }
             match backend.end_capture(end.replay_buffered_locally).await {
                 Ok(released) => {
@@ -621,13 +625,8 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Msg::ReleaseSession(release) => {
-            if let Some(engine) = repeat.as_mut() {
-                engine.resume();
-            }
-            *deadline = None;
-            *self_timeout = None;
+            forget_lease_state(repeat, deadline, self_timeout, held_lease);
             let released = backend.release_session().await;
-            *held_lease = None;
             link.send(Msg::Released(Released {
                 lease_id: release.lease_id.clone(),
                 keys_released: released.keys,
@@ -692,7 +691,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         }
         Msg::Shutdown(_) => {
             tracing::info!("shutdown requested by core");
-            release_everything(backend).await;
+            release_everything(backend, repeat, deadline, self_timeout, held_lease).await;
             return Ok(Some(Stop::Shutdown));
         }
         // Agent → core messages arriving here are a protocol error.
@@ -924,6 +923,9 @@ async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
 async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
     link: &mut AgentLink<S>,
     backend: &mut Backend,
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    deadline: &mut Option<(Instant, Vec<u8>)>,
+    self_timeout: &mut Option<(Instant, Vec<u8>)>,
     event: Event,
     held_lease: &mut Option<Vec<u8>>,
     batch: &mut Vec<LocalEvent>,
@@ -973,11 +975,11 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
         Event::Emergency => {
             // Rule 3: agent restores local control itself, then tells core.
             tracing::warn!("emergency combination: releasing local capture");
-            release_everything(backend).await;
-            link.send(Msg::Emergency(EmergencyFired {
-                lease_id: held_lease.take().unwrap_or_default(),
-            }))
-            .await?;
+            let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
+                .await
+                .unwrap_or_default();
+            link.send(Msg::Emergency(EmergencyFired { lease_id }))
+                .await?;
         }
         Event::LocalTakeover {
             reason,
@@ -992,15 +994,16 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
                 distance_px = ?distance_px,
                 "physical input on the receiver: releasing the lease locally"
             );
-            release_everything(backend).await;
-            link.send(Msg::LocalInput(ipc::LocalInputDetected {
-                lease_id: held_lease.take().unwrap_or_default(),
-            }))
-            .await?;
+            let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
+                .await
+                .unwrap_or_default();
+            link.send(Msg::LocalInput(ipc::LocalInputDetected { lease_id }))
+                .await?;
         }
         Event::QueueOverflow => {
             // Rule 2: the agent ends capture itself and reports the overflow.
             tracing::error!("capture queue overflow; ending capture");
+            forget_capture_state(repeat, self_timeout);
             let _ = backend.end_capture(false).await;
             send_error(link, "QUEUE_OVERFLOW", "capture queue overflowed").await?;
         }
@@ -1010,6 +1013,7 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
                 detail = detail.as_str(),
                 "capture failed; ending capture"
             );
+            forget_capture_state(repeat, self_timeout);
             let _ = backend.end_capture(false).await;
             send_error(link, code, &detail).await?;
         }
@@ -1017,9 +1021,53 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Forgets the capture-side state a release ends: the repeat engine's slot and the
+/// `TEMPORARY` self-timeout (batch-3 audit, F12).
+///
+/// The engine is the piece every release path has to clear: it holds the key the OS is
+/// repeating for us, so a release that leaves it armed injects a fresh down for a key it has
+/// just released — and, with no core left to send `StopRepeat`, keeps doing it for ever. The
+/// injection deadline and the held lease belong to the *lease*, not to the capture, and an
+/// `EndCapture` must not touch them.
+fn forget_capture_state(
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    self_timeout: &mut Option<(Instant, Vec<u8>)>,
+) {
+    if let Some(engine) = repeat.as_mut() {
+        engine.resume();
+    }
+    *self_timeout = None;
+}
+
+/// Forgets the state a *lease* release ends: everything [`forget_capture_state`] clears, plus
+/// the injection deadline and the held lease (batch-3 audit, F12).
+///
+/// Returns the lease that was held, for the frame that reports the release.
+fn forget_lease_state(
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    deadline: &mut Option<(Instant, Vec<u8>)>,
+    self_timeout: &mut Option<(Instant, Vec<u8>)>,
+    held_lease: &mut Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    forget_capture_state(repeat, self_timeout);
+    *deadline = None;
+    held_lease.take()
+}
+
 /// Capture and ledger both go, in that order (rule 8 for lock/suspend, rule 10 for
-/// portal sessions).
-async fn release_everything(backend: &mut Backend) {
+/// portal sessions), and so does every piece of session state that goes with them.
+///
+/// The single release entry point for the paths that end a *session* (core silence, the
+/// shutdown frame, an emergency, a receiver takeover) — see [`forget_lease_state`] for why one
+/// place matters (batch-3 audit, F12).
+async fn release_everything(
+    backend: &mut Backend,
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    deadline: &mut Option<(Instant, Vec<u8>)>,
+    self_timeout: &mut Option<(Instant, Vec<u8>)>,
+    held_lease: &mut Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let lease = forget_lease_state(repeat, deadline, self_timeout, held_lease);
     if let Err(detail) = backend.end_capture(true).await {
         tracing::warn!(detail = detail.as_str(), "EndCapture failed");
     }
@@ -1029,6 +1077,7 @@ async fn release_everything(backend: &mut Backend) {
         buttons = released.buttons,
         "session-owned state released"
     );
+    lease
 }
 
 async fn send_error<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1332,6 +1381,9 @@ mod tests {
             handle_backend_event(
                 &mut self.agent,
                 &mut self.backend,
+                &mut self.repeat,
+                &mut self.deadline,
+                &mut self.self_timeout,
                 event,
                 &mut self.held,
                 &mut self.batch,
@@ -1951,6 +2003,88 @@ mod tests {
 
     fn before(ms: u64) -> Instant {
         Instant::now() + Duration::from_millis(ms)
+    }
+
+    /// Batch-3 audit (F12): the lease deadline is a release path, and it has to stop the
+    /// software repeat engine like `EndCapture`/`ReleaseSession` do.
+    ///
+    /// The engine keeps the key the OS is repeating for us. A held key whose repeat guard never
+    /// fired (core kept renewing) was released on the OS by the deadline path, yet the engine
+    /// still held the slot: the next tick injected a fresh down for that key and, with no core
+    /// left to send `StopRepeat`, repeated it for ever.
+    #[tokio::test]
+    async fn the_deadline_release_stops_the_software_repeat() {
+        let mut harness = Harness::new().await;
+        // An injection lease with a deadline that is already due, and a key in the engine's
+        // slot: `Inject` is what feeds the engine (`engine.applied`).
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(1),
+                remaining_ms: 1,
+            }))
+            .await;
+        harness
+            .send(Msg::Inject(ipc::Inject {
+                lease_id: lease(1),
+                input_batch_seq: 1,
+                events: vec![ipc::LocalEvent {
+                    monotonic_us: 0,
+                    ev: Some(ipc::local_event::Ev::Key(ipc::HidKey {
+                        usage_page: 7,
+                        usage: 0x04,
+                        down: true,
+                    })),
+                }],
+            }))
+            .await;
+        let Msg::InjectResult(applied) = harness.recv().await else {
+            panic!("expected the injection report")
+        };
+        assert!(applied.applied_count > 0, "the down reaches the backend");
+        let engine = harness.repeat.as_ref().expect("software repeat");
+        assert_eq!(
+            engine.holding(),
+            Some(input_model::HidKey::keyboard(0x04)),
+            "the injected down takes the repeat slot"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut released_after_silence = false;
+        // A watchdog that has just seen a frame: the silence path must not be what ends this
+        // session, or the test would pass without the deadline path doing anything.
+        let mut watchdog = Watchdog::for_core_silence_ms(300, harness.clock).expect("watchdog");
+        service_timers(
+            &mut harness.agent,
+            &mut harness.backend,
+            &mut harness.repeat,
+            &mut harness.deadline,
+            &mut harness.self_timeout,
+            &mut harness.held,
+            &mut released_after_silence,
+            &mut watchdog,
+            harness.clock,
+        )
+        .await
+        .expect("the timers run");
+        assert!(
+            !released_after_silence,
+            "the deadline path ended the session, not the silence watchdog"
+        );
+        let Msg::DeadlineExpired(expired) = harness.recv().await else {
+            panic!("expected the deadline to be reported")
+        };
+        assert_eq!(expired.lease_id, lease(1));
+        let engine = harness.repeat.as_mut().expect("software repeat");
+        assert_eq!(
+            engine.holding(),
+            None,
+            "the release must clear the key the engine was repeating"
+        );
+        assert_eq!(
+            engine.due(harness.clock + 60_000),
+            None,
+            "no tick may produce a down after the release"
+        );
     }
 
     #[tokio::test]
