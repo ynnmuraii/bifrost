@@ -4274,6 +4274,7 @@ dependencies = [
  "geometry",
  "identity",
  "input-model",
+ "logging",
  "protocol",
  "rustls",
  "socket2",

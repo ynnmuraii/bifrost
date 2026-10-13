@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use focus_router as fr;
 use geometry::NodeId;
@@ -194,7 +194,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
         .ok_or_else(|| TransportError::Protocol("incomplete frame".into()))
 }
 
-/// Writes one framed `Envelope`.
+/// Writes one framed `Envelope` and flushes buffered transports such as TLS.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     envelope: &wire::Envelope,
@@ -202,7 +202,61 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     let bytes = encode_message(Channel::InputControl, envelope)
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
     writer.write_all(&bytes).await?;
+    writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    struct BufferedWriter {
+        pending: Vec<u8>,
+        delivered: Vec<u8>,
+    }
+
+    impl AsyncWrite for BufferedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let pending = std::mem::take(&mut self.pending);
+            self.delivered.extend_from_slice(&pending);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_flushes_buffered_output() {
+        let mut writer = BufferedWriter {
+            pending: Vec::new(),
+            delivered: Vec::new(),
+        };
+        let envelope = wire::Envelope {
+            major: limits::PROTOCOL_MAJOR,
+            minor: limits::PROTOCOL_MINOR,
+            connection_id: vec![0; 16],
+            seq: 1,
+            payload: Some(wire::envelope::Payload::Hello(wire::Hello::default())),
+            ..Default::default()
+        };
+        let expected = encode_message(Channel::InputControl, &envelope).unwrap();
+
+        write_frame(&mut writer, &envelope).await.unwrap();
+
+        assert_eq!(writer.delivered, expected);
+    }
 }
 
 /// A cloneable handle to one link's outbound queue.
@@ -231,11 +285,24 @@ impl LinkHandle {
                 self.send_motion(events);
                 Ok(())
             }
-            Outbound::Guaranteed(message) => self
-                .tx
-                .send(Outbound::Guaranteed(message))
-                .await
-                .map_err(|_| TransportError::LinkClosed),
+            Outbound::Guaranteed(message) => {
+                static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+                let result = self.tx.send(Outbound::Guaranteed(message)).await;
+                let elapsed = started.map_or(Duration::ZERO, |start| start.elapsed());
+                if elapsed >= Duration::from_millis(10)
+                    && tracing::enabled!(tracing::Level::DEBUG)
+                    && LOG_RATE.allow()
+                {
+                    tracing::debug!(
+                        peer = ?self.peer,
+                        elapsed_ms = elapsed.as_millis(),
+                        remaining_capacity = self.tx.capacity(),
+                        "outbound queue blocked"
+                    );
+                }
+                result.map_err(|_| TransportError::LinkClosed)
+            }
             // `outbound_of` never produces this arm; it exists because `Outbound` is shared.
             Outbound::Layout(message) => self.send_layout(message).await,
             // The same: a clipboard message is queued through `send_clipboard`, never here.
@@ -788,13 +855,28 @@ impl LinkState {
             }
             _ => {}
         }
-        reports
+        let report_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+        static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+        let result = reports
             .send(LinkReport::Message {
                 peer: self.peer,
                 message,
             })
-            .await
-            .map_err(|_| LinkDownReason::LocalClosed)
+            .await;
+        let report_wait = report_started.map_or(Duration::ZERO, |start| start.elapsed());
+        if report_wait >= Duration::from_millis(10)
+            && tracing::enabled!(tracing::Level::DEBUG)
+            && LOG_RATE.allow()
+        {
+            tracing::debug!(
+                peer = ?self.peer,
+                seq = envelope.seq,
+                elapsed_ms = report_wait.as_millis(),
+                remaining_capacity = reports.capacity(),
+                "link report queue blocked"
+            );
+        }
+        result.map_err(|_| LinkDownReason::LocalClosed)
     }
 }
 
@@ -802,10 +884,39 @@ async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: ReadHalf<R>,
     frames: mpsc::Sender<Result<wire::Envelope, TransportError>>,
 ) {
+    let log_rate = logging::LogRateLimit::new();
     loop {
         let frame = read_frame(&mut reader).await;
         let stop = frame.is_err();
-        if frames.send(frame).await.is_err() || stop {
+        let lease_seq = match frame.as_ref() {
+            Ok(envelope)
+                if matches!(
+                    envelope.payload.as_ref(),
+                    Some(
+                        wire::envelope::Payload::LeaseChallenge(_)
+                            | wire::envelope::Payload::LeaseRenew(_)
+                            | wire::envelope::Payload::LeaseStatus(_)
+                    )
+                ) =>
+            {
+                Some(envelope.seq)
+            }
+            _ => None,
+        };
+        let queued_at = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+        let queued = frames.send(frame).await;
+        let queue_wait = queued_at.map_or(Duration::ZERO, |start| start.elapsed());
+        if let Some(seq) = lease_seq {
+            if tracing::enabled!(tracing::Level::DEBUG) && log_rate.allow() {
+                tracing::debug!(
+                    seq,
+                    elapsed_ms = queue_wait.as_millis(),
+                    remaining_capacity = frames.capacity(),
+                    "socket reader queued lease envelope"
+                );
+            }
+        }
+        if queued.is_err() || stop {
             return;
         }
     }
@@ -921,7 +1032,25 @@ async fn write_message<W: AsyncWrite + Unpin>(
     }
     state.batch_display = batch_display;
     state.tx_seq += 1;
-    write_frame(writer, &envelope).await.map_err(reason_from)
+    let is_lease_frame = matches!(
+        &message,
+        fr::Message::LeaseChallenge { .. }
+            | fr::Message::LeaseRenew { .. }
+            | fr::Message::LeaseStatus { .. }
+    );
+    let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+    static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+    let result = write_frame(writer, &envelope).await.map_err(reason_from);
+    if is_lease_frame && tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
+        tracing::debug!(
+            peer = ?state.peer,
+            seq,
+            elapsed_ms = started.map_or(Duration::ZERO, |start| start.elapsed()).as_millis(),
+            success = result.is_ok(),
+            "socket writer flushed lease frame"
+        );
+    }
+    result
 }
 
 fn reason_from(error: TransportError) -> LinkDownReason {

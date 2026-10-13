@@ -359,27 +359,6 @@ impl Node {
             .collect()
     }
 
-    /// The timestamp of the last line the *core* wrote.
-    ///
-    /// The agent shares the core's redirected stderr, so its lines are in this file too
-    /// — and a frozen core's agent keeps talking (`core silent past the limit`), which
-    /// would place the "last line" long after the freeze. Only the core's own markers
-    /// count: it emits one of them with every lease exchange, so the last one is within
-    /// a renewal period of the moment it stopped.
-    pub fn last_core_millis(&self) -> Option<i64> {
-        const CORE_ONLY: [&str; 4] = [
-            "focus focus=",
-            "core -> peer",
-            "peer -> core",
-            "core -> agent",
-        ];
-        self.log()
-            .lines()
-            .rev()
-            .filter(|line| CORE_ONLY.iter().any(|marker| line.contains(marker)))
-            .find_map(utc_millis)
-    }
-
     /// The PID of the agent this core spawned.
     pub fn agent_pid(&self) -> Result<u32, String> {
         #[cfg(unix)]

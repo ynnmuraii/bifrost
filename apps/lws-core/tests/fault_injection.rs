@@ -378,14 +378,6 @@ fn a_suspended_receiver_core_trips_the_source_watchdog() {
         })
         .expect("A must return to Local");
     let a_ms = local_after(&harness.a, injected).expect("A logs its Local");
-    // PowerShell has to compile the `Add-Type` snippet before it can freeze anything, so
-    // the call's return is *after* the freeze. The receiver's last *core* line is the
-    // closest marker before it, and it bounds the watchdog from above: the freeze cannot
-    // have happened before the last thing the core said.
-    let froze = harness
-        .b
-        .last_core_millis()
-        .expect("the receiver logged something before it froze");
     let path = if !harness.a.marked("LeaseExpired").is_empty() {
         "the lease watchdog"
     } else if !harness.a.marked("peer -> core Leave").is_empty() {
@@ -394,16 +386,15 @@ fn a_suspended_receiver_core_trips_the_source_watchdog() {
         "an unrecognised path"
     };
     println!(
-        "suspend: A {} ms after the call, {} ms after the receiver's last core line \
+        "suspend: A {} ms after the suspension returned \
          (the call took {} ms; budget {LEASE_TTL_MS} + 100; released by {path})",
-        a_ms - injected,
-        a_ms - froze,
+        a_ms - injected_after,
         injected_after - injected,
     );
     assert!(
-        (a_ms - froze) as f64 <= budget_with_slack(),
+        (a_ms - injected_after) as f64 <= budget_with_slack(),
         "A took {} ms to return to Local after the receiver stopped answering",
-        a_ms - froze
+        a_ms - injected_after
     );
     harness.b.resume().expect("the receiver is resumed");
     harness

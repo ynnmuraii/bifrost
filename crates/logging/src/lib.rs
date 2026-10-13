@@ -23,6 +23,31 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Limits a diagnostic stage to one log record per second across concurrent callers.
+#[derive(Default)]
+pub struct LogRateLimit(Mutex<Option<Instant>>);
+
+impl LogRateLimit {
+    pub const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Call only when the log level is enabled, so disabled diagnostics take no lock.
+    pub fn allow(&self) -> bool {
+        let mut last = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(1)) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
 
 /// At least this much in one file, whatever `[log] max_file_mb` says.
 ///

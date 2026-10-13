@@ -438,10 +438,20 @@ impl Supervisor {
     /// Sends one frame.
     pub async fn send(&mut self, message: Msg) -> Result<(), String> {
         match self.link.as_mut() {
-            Some(link) => link.send(message).await.map_err(|error| match error {
-                IpcError::Closed => "the agent channel is closed".to_owned(),
-                other => other.to_string(),
-            }),
+            Some(link) => {
+                let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+                static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                let frame = crate::routing::agent_frame_name(&message);
+                let result = link.send(message).await;
+                let elapsed = started.map_or(Duration::ZERO, |start| start.elapsed());
+                if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
+                    tracing::debug!(frame, elapsed_ms = elapsed.as_millis(), "core -> agent");
+                }
+                result.map_err(|error| match error {
+                    IpcError::Closed => "the agent channel is closed".to_owned(),
+                    other => other.to_string(),
+                })
+            }
             None => Err("no agent is attached".to_owned()),
         }
     }
