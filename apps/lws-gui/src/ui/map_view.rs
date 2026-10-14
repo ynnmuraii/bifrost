@@ -416,11 +416,15 @@ fn draw_link(
     );
     let size = galley.size() + Vec2::new(16.0, 4.0);
     let mid = Pos2::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
-    let pill = if horizontal {
-        Rect::from_min_size(Pos2::new(mid.x - size.x / 2.0, mid.y - 7.0 - size.y), size)
-    } else {
-        Rect::from_min_size(Pos2::new(a.x + 8.0, mid.y - size.y / 2.0), size)
+    let box_left = |index: usize, carry: Vec2| {
+        xf.p(model.nodes[index].at.x, model.nodes[index].at.y).x + carry.x
     };
+    let pill = link_pill(
+        horizontal,
+        mid,
+        size,
+        box_left(link.a, carry_a).min(box_left(link.b, carry_b)),
+    );
     painter.rect(
         pill,
         egui::CornerRadius::same((size.y / 2.0) as u8),
@@ -429,6 +433,23 @@ fn draw_link(
         StrokeKind::Inside,
     );
     painter.galley(pill.min + Vec2::new(8.0, 2.0), galley, pal.ink2);
+}
+
+/// Where a link's label pill goes.
+///
+/// A side-by-side link's label sits above the line's midpoint. A stacked link's label sits
+/// beside the line, to the **left** of the pair's boxes, and that is the one place it can
+/// never cover anything: a computer's caption is left-aligned at its box's left edge, so every
+/// caption, however wide it is, starts to the right of this rect.
+fn link_pill(horizontal: bool, mid: Pos2, size: Vec2, boxes_left: f32) -> Rect {
+    if horizontal {
+        Rect::from_min_size(Pos2::new(mid.x - size.x / 2.0, mid.y - 7.0 - size.y), size)
+    } else {
+        Rect::from_min_size(
+            Pos2::new(boxes_left - 8.0 - size.x, mid.y - size.y / 2.0),
+            size,
+        )
+    }
 }
 
 fn fade(c: Color32, k: f32) -> Color32 {
@@ -910,6 +931,50 @@ fn legend_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, mark: LegendMark) 
 #[cfg(test)]
 mod transform_tests {
     use super::*;
+
+    /// The caption of a computer is left-aligned at its box's left edge and can be wider than
+    /// the box itself, which is what made a stacked link's label collide with it.
+    fn caption(box_rect: Rect) -> Rect {
+        Rect::from_min_size(
+            Pos2::new(box_rect.min.x, box_rect.max.y + 10.0),
+            Vec2::new(box_rect.width() + 64.0, 44.0),
+        )
+    }
+
+    #[test]
+    fn link_labels_never_cover_a_caption_or_a_box() {
+        let size = Vec2::new(72.0, 18.0);
+        let box_size = Vec2::new(144.0, 96.0);
+        let upper = Rect::from_min_size(Pos2::new(320.0, 120.0), box_size);
+        let lower = Rect::from_min_size(Pos2::new(320.0, 282.0), box_size);
+        // A stacked pair: the label goes to the left of both boxes, clear of every caption.
+        let mid = Pos2::new(
+            (upper.center().x + lower.center().x) / 2.0,
+            (upper.max.y + lower.min.y) / 2.0,
+        );
+        let pill = link_pill(false, mid, size, upper.min.x.min(lower.min.x));
+        for rect in [upper, lower, caption(upper), caption(lower)] {
+            assert!(
+                !pill.intersects(rect),
+                "{pill:?} must not touch {rect:?}"
+            );
+        }
+        assert!(pill.max.x <= upper.min.x, "the label is outside the boxes");
+        // A side-by-side pair: the label sits above the line, clear of both captions, which
+        // are below their boxes.
+        let left = Rect::from_min_size(Pos2::new(120.0, 200.0), box_size);
+        let right = Rect::from_min_size(Pos2::new(384.0, 200.0), box_size);
+        let mid = Pos2::new((left.max.x + right.min.x) / 2.0, left.center().y);
+        let pill = link_pill(true, mid, size, left.min.x.min(right.min.x));
+        assert_eq!(pill.center().x, mid.x);
+        assert!(pill.max.y <= mid.y - 7.0);
+        for rect in [left, right, caption(left), caption(right)] {
+            assert!(
+                !pill.intersects(rect),
+                "{pill:?} must not touch {rect:?}"
+            );
+        }
+    }
 
     #[test]
     fn zoomed_drag_deltas_round_trip_without_changing_stage_coordinates() {
