@@ -168,11 +168,11 @@ fn emergency_during_preparing_returns_local_within_one_hundred_milliseconds() {
     harness.wait_linked();
     harness.proxy.as_ref().expect("proxy").blackhole();
     harness.a.switch(&harness.b.id).expect("start preparation");
+    // `Temporary` is commanded inside `Preparing`, so the state is armed here. Fire at
+    // once: a `status` round trip spawns a second CLI process (up to five attempts with
+    // 100 ms sleeps) and on a loaded runner outlives the 200 ms prepare, so the check saw
+    // the timeout's `Local`. The phase is read from the FSM's own log below instead.
     harness.a.wait_dry_capture("Temporary");
-    assert_eq!(
-        harness.a.status().expect("preparing status").focus,
-        "Preparing"
-    );
     let fired = common::now_millis();
     harness.a.trigger_emergency();
     harness
@@ -186,6 +186,14 @@ fn emergency_during_preparing_returns_local_within_one_hundred_milliseconds() {
         local - fired <= 100,
         "emergency took {}ms during Preparing (budget 100ms)",
         local - fired
+    );
+    assert!(
+        harness
+            .a
+            .focus_events()
+            .iter()
+            .any(|(_, focus)| focus == "Preparing"),
+        "the emergency must interrupt a Preparing phase, not an already-local node"
     );
     harness.a.wait_dry_capture("Observe");
 }
