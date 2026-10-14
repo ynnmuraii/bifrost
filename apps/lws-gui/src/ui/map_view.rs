@@ -954,10 +954,7 @@ mod transform_tests {
         );
         let pill = link_pill(false, mid, size, upper.min.x.min(lower.min.x));
         for rect in [upper, lower, caption(upper), caption(lower)] {
-            assert!(
-                !pill.intersects(rect),
-                "{pill:?} must not touch {rect:?}"
-            );
+            assert!(!pill.intersects(rect), "{pill:?} must not touch {rect:?}");
         }
         assert!(pill.max.x <= upper.min.x, "the label is outside the boxes");
         // A side-by-side pair: the label sits above the line, clear of both captions, which
@@ -969,10 +966,7 @@ mod transform_tests {
         assert_eq!(pill.center().x, mid.x);
         assert!(pill.max.y <= mid.y - 7.0);
         for rect in [left, right, caption(left), caption(right)] {
-            assert!(
-                !pill.intersects(rect),
-                "{pill:?} must not touch {rect:?}"
-            );
+            assert!(!pill.intersects(rect), "{pill:?} must not touch {rect:?}");
         }
     }
 
