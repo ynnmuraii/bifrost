@@ -880,10 +880,13 @@ async fn serve_connection(
     settings: LinkSettings,
     clock: Clock,
 ) {
+    let handshake_timeout = Duration::from_millis(settings.liveness.offline_ms.max(1));
     let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp);
-    let start = match acceptor.await {
-        Ok(start) => start,
-        Err(_) => return,
+    let start = match tokio::time::timeout(handshake_timeout, acceptor).await {
+        Ok(Ok(start)) => start,
+        // A connection that says nothing (or sends a malformed ClientHello) is dropped
+        // rather than pinning a task for ever.
+        _ => return,
     };
     let wants_pairing = start
         .client_hello()
@@ -896,9 +899,15 @@ async fn serve_connection(
             Ok(window) => window,
             Err(_reason) => return,
         };
-        let stream = match start.into_stream(pairing_config).await {
-            Ok(stream) => stream,
-            Err(_) => return,
+        // Every early return past this point releases the admitted slot; only a connection
+        // actually handed to the application disarms it, because only then does a ceremony
+        // own it and call `PairingGate::finish`.
+        let guard = gate.admit_guard();
+        let stream = match tokio::time::timeout(handshake_timeout, start.into_stream(pairing_config))
+            .await
+        {
+            Ok(Ok(stream)) => stream,
+            _ => return,
         };
         let _ = events
             .send(LinkEvent::Pairing(Box::new(PairingConnection {
@@ -907,12 +916,13 @@ async fn serve_connection(
                 window,
             })))
             .await;
+        guard.disarm();
         return;
     }
 
-    let stream = match start.into_stream(link_config).await {
-        Ok(stream) => stream,
-        Err(_) => return,
+    let stream = match tokio::time::timeout(handshake_timeout, start.into_stream(link_config)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return,
     };
     accept_one(stream, identity, hello, messages, settings).await;
 }

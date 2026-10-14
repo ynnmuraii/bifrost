@@ -23,8 +23,10 @@
 //! Constants, quoted:
 //!
 //! * window «120 s» — [`WINDOW_MS`];
-//! * «не более 3 ожидающих peers, rate limit handshakes» — [`MAX_PENDING_PEERS`];
-//! * «при лимите 3 попытки на 120 s» — [`MAX_ATTEMPTS`];
+//! * «не более 3 ожидающих peers, rate limit handshakes» — [`MAX_PENDING_PEERS`] names the
+//!   concurrent part of the budget;
+//! * «при лимите 3 попытки на 120 s» — [`MAX_ATTEMPTS`] caps the whole budget
+//!   (`pending + attempts`), so the window never admits more than three handshakes;
 //! * «Пока ключ неизвестен, allowlist разрешает только `PairHello` и статус» — the only
 //!   outputs a session in `Handshaking`/`Comparing` can produce are `PairHello` and
 //!   `PairDecision`, so a pairing connection can never carry runtime payload.
@@ -723,12 +725,17 @@ impl PairingWindow {
         self.attempts
     }
 
-    /// Admits a dialer, enforcing «не более 3 ожидающих peers» and the attempt limit.
+    /// Admits a dialer, enforcing «не более 3 ожидающих peers, rate limit handshakes».
+    ///
+    /// The two quoted limits are one budget: every admitted handshake occupies a slot until
+    /// it concludes (`finish`) or is abandoned (`release_pending`), and «3 попытки на 120 s»
+    /// caps how many handshakes the window ever admits — `pending + attempts` — so a peer
+    /// cannot keep opening new connections while earlier ones conclude.
     pub fn admit(&mut self, now_ms: u64) -> Result<(), RejectionReason> {
         if !self.is_open(now_ms) {
             return Err(RejectionReason::Expired);
         }
-        if self.pending >= MAX_PENDING_PEERS || self.attempts >= MAX_ATTEMPTS {
+        if self.pending + self.attempts >= MAX_ATTEMPTS {
             return Err(RejectionReason::TooManyAttempts);
         }
         self.pending += 1;
@@ -739,5 +746,11 @@ impl PairingWindow {
     pub fn finish(&mut self) {
         self.pending = self.pending.saturating_sub(1);
         self.attempts = self.attempts.saturating_add(1);
+    }
+
+    /// Releases a slot whose handshake never became a ceremony (a failed TLS accept, a
+    /// dropped connection): the handshake is not an attempt, so only `pending` moves.
+    pub fn release_pending(&mut self) {
+        self.pending = self.pending.saturating_sub(1);
     }
 }
