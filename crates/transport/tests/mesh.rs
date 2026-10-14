@@ -756,12 +756,14 @@ async fn a_deliberate_shutdown_is_reported_as_such() {
     let identity_b = Arc::new(identity_at(&root, "b"));
     let (id_a, id_b) = (identity_a.node_id(), identity_b.node_id());
 
+    // Graceful close needs one established link, not simultaneous-dial dedup.
+    // Keep one initiator; the formation races have their own dedicated tests.
     let mut a = spawn_node(
         "a",
         Arc::clone(&identity_a),
         address_a,
         &[(id_b, address_b)],
-        &[address_b],
+        &[],
         3,
     )
     .await;
@@ -778,8 +780,7 @@ async fn a_deliberate_shutdown_is_reported_as_such() {
     assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
 
     // The graceful path is a `Shutdown`, which the peer can tell apart from a crash.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    while a.events.try_recv().is_ok() {}
+    settle(&mut a, Duration::from_millis(300)).await;
     let handle = b.manager.handle(&id_a).await.expect("a handle to a");
     handle.close();
 

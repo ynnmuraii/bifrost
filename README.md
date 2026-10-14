@@ -117,6 +117,10 @@ Fault harness ожидает `agent=ready` перед переключением
 Dry click regression проверяет ровно down→up на receiver сразу после входа в Remote
 и спустя две секунды. Linux-тест с локальной Unix socket pair проверяет настоящие
 EIS button frames и release_all для всех удерживаемых кнопок, без portal/desktop ввода.
+Preparing-emergency harness стреляет аварийным сигналом сразу после Temporary-захвата,
+а фазу подтверждает записанным focus — запуск CLI status не съедает окно prepare.
+Graceful-shutdown transport test устанавливает один link
+с одним инициатором и ждёт завершения formation events; dedup-races проверяются отдельно.
 
 ## Структура workspace
 
