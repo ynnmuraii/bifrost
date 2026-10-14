@@ -623,10 +623,15 @@ fn offline_trusted_peers_remain_in_status_and_the_applied_map() {
     harness.wait_linked();
     let peer_id = harness.b.id.clone();
     let mut window = Window::open(&gui_endpoint_of(&harness.a.root));
-    assert!(window.status().members.iter().any(|peer| peer.node_id == peer_id && peer.online));
+    assert!(window
+        .status()
+        .members
+        .iter()
+        .any(|peer| peer.node_id == peer_id && peer.online));
     let before = window.wait_event("both live display manifests", |event| match event {
         gui_frame::Msg::TopologyDoc(doc)
-            if doc.members.len() == 2 && doc.members.iter().all(|member| !member.displays.is_empty()) =>
+            if doc.members.len() == 2
+                && doc.members.iter().all(|member| !member.displays.is_empty()) =>
         {
             Some(doc.clone())
         }
@@ -635,23 +640,44 @@ fn offline_trusted_peers_remain_in_status_and_the_applied_map() {
     harness.b.stop();
     let offline = window.wait_event("offline trusted peer status", |event| match event {
         gui_frame::Msg::Status(status)
-            if status.members.iter().any(|peer| peer.node_id == peer_id && !peer.online) =>
+            if status
+                .members
+                .iter()
+                .any(|peer| peer.node_id == peer_id && !peer.online) =>
         {
             Some(status.clone())
         }
         _ => None,
     });
-    assert_eq!(offline.members.iter().find(|peer| peer.node_id == peer_id).expect("trusted peer").link_state, "OFFLINE");
+    assert_eq!(
+        offline
+            .members
+            .iter()
+            .find(|peer| peer.node_id == peer_id)
+            .expect("trusted peer")
+            .link_state,
+        "OFFLINE"
+    );
     let after = window.wait_event("offline applied map member", |event| match event {
         gui_frame::Msg::TopologyDoc(doc)
-            if doc.members.iter().any(|peer| peer.node_id == peer_id && !peer.online) =>
+            if doc
+                .members
+                .iter()
+                .any(|peer| peer.node_id == peer_id && !peer.online) =>
         {
             Some(doc.clone())
         }
         _ => None,
     });
-    assert_eq!(after.revision, before.revision, "going offline is not a layout edit");
-    let peer = after.members.iter().find(|peer| peer.node_id == peer_id).expect("known displays stay visible");
+    assert_eq!(
+        after.revision, before.revision,
+        "going offline is not a layout edit"
+    );
+    let peer = after
+        .members
+        .iter()
+        .find(|peer| peer.node_id == peer_id)
+        .expect("known displays stay visible");
     assert!(!peer.displays.is_empty());
 }
 
@@ -661,7 +687,9 @@ fn a_second_gui_replays_the_live_pairing_window_and_unanswered_code() {
     let two = Unpaired::start("gui-pairing-replay");
     two.wait_ready();
     let mut opener = Window::open(&gui_endpoint_of(&two.a.root));
-    let result = opener.request(gui_frame::Msg::StartPairing(protocol::ipc::StartPairing { window_s: 120 }));
+    let result = opener.request(gui_frame::Msg::StartPairing(protocol::ipc::StartPairing {
+        window_s: 120,
+    }));
     assert!(matches!(result, gui_frame::Msg::OpResult(result) if result.ok));
     let original_window = opener.wait_event("opened pairing window", |event| match event {
         gui_frame::Msg::PairingWindow(window) if window.open => Some(window.clone()),
@@ -676,10 +704,15 @@ fn a_second_gui_replays_the_live_pairing_window_and_unanswered_code() {
     });
     assert_eq!(replayed_window.attempt_id, original_window.attempt_id);
     assert_eq!(replayed_window.address, original_window.address);
-    assert!(replayed_window.seconds_remaining > 0 && replayed_window.seconds_remaining <= original_window.seconds_remaining);
+    assert!(
+        replayed_window.seconds_remaining > 0
+            && replayed_window.seconds_remaining <= original_window.seconds_remaining
+    );
 
     let mut dialer = Window::open(&gui_endpoint_of(&two.b.root));
-    let result = dialer.request(gui_frame::Msg::PairWith(protocol::ipc::PairWith { address: original_window.address }));
+    let result = dialer.request(gui_frame::Msg::PairWith(protocol::ipc::PairWith {
+        address: original_window.address,
+    }));
     assert!(matches!(result, gui_frame::Msg::OpResult(result) if result.ok));
     let code = reconnected.wait_event("real opener SAS prompt", |event| match event {
         gui_frame::Msg::PairingPrompt(prompt) => Some(prompt.clone()),
@@ -698,8 +731,10 @@ fn a_second_gui_replays_the_live_pairing_window_and_unanswered_code() {
         _ => None,
     });
     assert_eq!(replayed, code);
-    second.send(gui_frame::Msg::PairingAnswer(protocol::ipc::PairingAnswer {
-        attempt_id: replayed.attempt_id,
-        approve: false,
-    }));
+    second.send(gui_frame::Msg::PairingAnswer(
+        protocol::ipc::PairingAnswer {
+            attempt_id: replayed.attempt_id,
+            approve: false,
+        },
+    ));
 }

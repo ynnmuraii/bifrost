@@ -81,8 +81,13 @@ impl GuiApp {
             ui: UiState::new(Instant::now()),
             look_file,
             saved_look,
-            frame_probe: std::env::var_os("MDF_FRAME_PROBE")
-                .map(|path| (PathBuf::from(path), Instant::now() + Duration::from_secs(5), 0)),
+            frame_probe: std::env::var_os("MDF_FRAME_PROBE").map(|path| {
+                (
+                    PathBuf::from(path),
+                    Instant::now() + Duration::from_secs(5),
+                    0,
+                )
+            }),
         }
     }
 
@@ -153,7 +158,12 @@ impl Drop for GuiApp {
         if let Some((path, started, frames)) = &self.frame_probe {
             let _ = std::fs::write(
                 path,
-                format!("{frames},{}\n", Instant::now().saturating_duration_since(*started).as_secs_f64()),
+                format!(
+                    "{frames},{}\n",
+                    Instant::now()
+                        .saturating_duration_since(*started)
+                        .as_secs_f64()
+                ),
             );
         }
     }

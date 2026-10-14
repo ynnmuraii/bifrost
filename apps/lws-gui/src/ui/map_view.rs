@@ -223,7 +223,13 @@ fn zoom_controls(
     if widgets::button(&mut controls, pal, "−", Kind::Ghost, current > 70).clicked() {
         wanted = current.saturating_sub(5).max(70);
     }
-    widgets::text(&mut controls, &format!("{current}%"), 12.0, fam::mono(), pal.ink2);
+    widgets::text(
+        &mut controls,
+        &format!("{current}%"),
+        12.0,
+        fam::mono(),
+        pal.ink2,
+    );
     if widgets::button(&mut controls, pal, "+", Kind::Ghost, current < 150).clicked() {
         wanted = (current + 5).min(150);
     }

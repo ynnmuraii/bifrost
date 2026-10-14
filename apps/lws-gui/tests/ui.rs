@@ -497,7 +497,10 @@ fn text_position(harness: &mut Harness, vm: &ViewModel, label: &str) -> egui::Po
             },
         );
     });
-    let at = output.shapes.iter().find_map(|shape| find(&shape.shape, label));
+    let at = output
+        .shapes
+        .iter()
+        .find_map(|shape| find(&shape.shape, label));
     output.drop_without_applying_deltas();
     at.unwrap_or_else(|| panic!("{label:?} was not drawn"))
 }
@@ -515,7 +518,10 @@ fn key(key: egui::Key) -> egui::Event {
 fn dry_bridge() -> lws_gui::view_model::Bridge {
     use lws_gui::view_model::{Bridge, GuiClient, Launch};
     // No endpoint: this cannot reach the user's running service or launch a core.
-    Bridge::new(connected(), GuiClient::start(None, Launch::with_flags(Vec::new())))
+    Bridge::new(
+        connected(),
+        GuiClient::start(None, Launch::with_flags(Vec::new())),
+    )
 }
 
 fn dispatch_frame(bridge: &mut lws_gui::view_model::Bridge, frame: Frame, now: Instant) {
@@ -545,9 +551,15 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
 
     // Real map widget focus and its arrow-key handler, not Action::wire in isolation.
     let monitor = egui::Id::new(("mon", &SELF_NODE.to_owned(), 0_usize));
-    harness.ctx.memory_mut(|memory| memory.request_focus(monitor));
+    harness
+        .ctx
+        .memory_mut(|memory| memory.request_focus(monitor));
     let frame = harness.frame(bridge.view(), false, SIZE, vec![key(egui::Key::ArrowRight)]);
-    assert!(frame.output.actions.iter().any(|action| matches!(action, Action::NudgeNode { .. })));
+    assert!(frame
+        .output
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::NudgeNode { .. })));
     dispatch_frame(&mut bridge, frame, harness.now);
     assert!(bridge.view().editor.dirty());
     assert_no_layout_requests(&bridge);
@@ -568,18 +580,28 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
         vec![egui::Event::PointerMoved(at + egui::vec2(72.0, 0.0))],
     ] {
         let frame = harness.frame(bridge.view(), false, SIZE, events);
-        moved |= frame.output.actions.iter().any(|action| matches!(action, Action::MoveNode { .. }));
+        moved |= frame
+            .output
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::MoveNode { .. }));
         dispatch_frame(&mut bridge, frame, harness.now);
     }
     assert!(moved, "the real map drag must produce a local move");
     let frame = harness.frame(
-        bridge.view(), false, SIZE,
-        vec![egui::Event::PointerButton {
-            pos: at + egui::vec2(72.0, 0.0),
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        }, egui::Event::PointerGone, egui::Event::WindowFocused(false)],
+        bridge.view(),
+        false,
+        SIZE,
+        vec![
+            egui::Event::PointerButton {
+                pos: at + egui::vec2(72.0, 0.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerGone,
+            egui::Event::WindowFocused(false),
+        ],
     );
     dispatch_frame(&mut bridge, frame, harness.now);
     assert_no_layout_requests(&bridge);
@@ -591,9 +613,13 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
     dispatch_frame(&mut bridge, frame, harness.now);
     assert_no_layout_requests(&bridge);
 
-    bridge.view_mut().on_disconnected("dry reconnect".to_owned());
+    bridge
+        .view_mut()
+        .on_disconnected("dry reconnect".to_owned());
     bridge.view_mut().on_connected("endpoint");
-    bridge.view_mut().apply(event(Msg::TopologyDoc(two_node_doc(13))));
+    bridge
+        .view_mut()
+        .apply(event(Msg::TopologyDoc(two_node_doc(13))));
     bridge.view_mut().tick(harness.now);
     bridge.pump();
     let frame = harness.settle(bridge.view(), false);
@@ -602,19 +628,58 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
 
     // Restore a connected draft after the deliberately endpoint-free client reports offline.
     bridge.view_mut().on_connected("endpoint");
-    bridge.dispatch(Action::NudgeNode { node_id: PEER_NODE.to_owned(), dx: 16.0, dy: 0.0 }, harness.now);
+    bridge.dispatch(
+        Action::NudgeNode {
+            node_id: PEER_NODE.to_owned(),
+            dx: 16.0,
+            dy: 0.0,
+        },
+        harness.now,
+    );
     harness.settle(bridge.view(), false);
     let at = text_position(&mut harness, bridge.view(), "Применить");
     let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
-    assert_eq!(frame.output.actions.iter().filter(|action| matches!(action, Action::UpdateTopology { .. })).count(), 1);
+    assert_eq!(
+        frame
+            .output
+            .actions
+            .iter()
+            .filter(|action| matches!(action, Action::UpdateTopology { .. }))
+            .count(),
+        1
+    );
     dispatch_frame(&mut bridge, frame, harness.now);
-    assert_eq!(bridge.view().inflight.iter().filter(|request| request.request == Request::UpdateTopology).count(), 1);
+    assert_eq!(
+        bridge
+            .view()
+            .inflight
+            .iter()
+            .filter(|request| request.request == Request::UpdateTopology)
+            .count(),
+        1
+    );
 
     let at = text_position(&mut harness, bridge.view(), "Авто");
     let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
-    assert_eq!(frame.output.actions.iter().filter(|action| matches!(action, Action::LayoutAuto)).count(), 1);
+    assert_eq!(
+        frame
+            .output
+            .actions
+            .iter()
+            .filter(|action| matches!(action, Action::LayoutAuto))
+            .count(),
+        1
+    );
     dispatch_frame(&mut bridge, frame, harness.now);
-    assert_eq!(bridge.view().inflight.iter().filter(|request| request.request == Request::LayoutAuto).count(), 1);
+    assert_eq!(
+        bridge
+            .view()
+            .inflight
+            .iter()
+            .filter(|request| request.request == Request::LayoutAuto)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -623,14 +688,24 @@ fn enter_in_the_dial_field_only_pairs_even_with_a_dirty_layout() {
     let mut bridge = dry_bridge();
     let address = "192.168.1.10:47901";
     bridge.view_mut().pairing.address = address.to_owned();
-    bridge.dispatch(Action::NudgeNode { node_id: PEER_NODE.to_owned(), dx: 16.0, dy: 0.0 }, Instant::now());
+    bridge.dispatch(
+        Action::NudgeNode {
+            node_id: PEER_NODE.to_owned(),
+            dx: 16.0,
+            dy: 0.0,
+        },
+        Instant::now(),
+    );
     let mut harness = Harness::new();
     harness.settle(bridge.view(), false);
     let at = text_position(&mut harness, bridge.view(), address);
     let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
     dispatch_frame(&mut bridge, frame, harness.now);
     let frame = harness.frame(bridge.view(), false, SIZE, vec![key(egui::Key::Enter)]);
-    assert_eq!(frame.output.actions, vec![Action::PairWith(address.to_owned())]);
+    assert_eq!(
+        frame.output.actions,
+        vec![Action::PairWith(address.to_owned())]
+    );
     dispatch_frame(&mut bridge, frame, harness.now);
     assert_no_layout_requests(&bridge);
     assert_eq!(bridge.view().inflight.len(), 1);
@@ -642,4 +717,97 @@ fn enter_in_the_dial_field_only_pairs_even_with_a_dirty_layout() {
     drop(bridge);
     assert_eq!(final_requests.len(), 1);
     assert_eq!(final_requests[0].request, Request::PairWith);
+}
+
+#[test]
+fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
+    let mut vm = connected();
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    let percent = text_position(&mut harness, &vm, "100%");
+    let frame = harness.frame(&vm, false, SIZE, click_at(percent + egui::vec2(48.0, 0.0)));
+    let wanted = frame
+        .output
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            Action::SetLook(look) => Some(*look),
+            _ => None,
+        })
+        .expect("the + button changes local zoom");
+    assert_eq!(wanted.zoom_percent, 105);
+    assert!(frame
+        .output
+        .actions
+        .iter()
+        .all(|action| action.wire().is_none()));
+    vm.local(&Action::SetLook(wanted));
+    let wheel = |y| {
+        vec![
+            egui::Event::PointerMoved(egui::pos2(250.0, 230.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, y),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let frame = harness.frame(&vm, false, SIZE, wheel(-32.0));
+    assert!(frame.output.actions.contains(&Action::SetLook(Look {
+        zoom_percent: 100,
+        ..vm.look
+    })));
+    vm.look.zoom_percent = 150;
+    let frame = harness.frame(&vm, false, SIZE, wheel(32.0));
+    assert!(!frame
+        .output
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::SetLook(_))));
+    vm.modal = Some(Modal::Layout);
+    let frame = harness.frame(&vm, false, SIZE, wheel(-32.0));
+    assert!(!frame
+        .output
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::SetLook(_))));
+}
+
+#[test]
+fn layout_modal_has_no_second_layout_editor_and_pairing_close_is_disabled() {
+    let mut vm = connected();
+    vm.modal = Some(Modal::Layout);
+    let mut harness = Harness::new();
+    let frame = harness.settle(&vm, false);
+    expect(
+        &frame,
+        &["ПРИМЕНЕНО", "Расположить автоматически", "Применить"],
+    );
+    for removed in [
+        "СОЕДИНИТЬ С",
+        "СТОРОНА",
+        "Слева",
+        "Справа",
+        "Сверху",
+        "Снизу",
+    ] {
+        assert!(
+            !frame.texts.iter().any(|text| text == removed),
+            "{removed} must not be drawn"
+        );
+    }
+    vm.modal = None;
+    vm.apply(event(Msg::PairingWindow(protocol::ipc::PairingWindow {
+        open: true,
+        address: "127.0.0.1:47901".to_owned(),
+        seconds_remaining: 60,
+        attempt_id: support::attempt_id(),
+    })));
+    harness.settle(&vm, false);
+    let at = text_position(&mut harness, &vm, "Закрыть окно · скоро");
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(
+        frame.output.actions.is_empty(),
+        "unimplemented close must not send a command"
+    );
 }
