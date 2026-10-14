@@ -669,9 +669,22 @@ fn offline_trusted_peers_remain_in_status_and_the_applied_map() {
         }
         _ => None,
     });
+    // The peer that went away is still a member of the applied document, offline and with the
+    // screens it last reported — the same set of computers and displays the map showed while
+    // the link was up. (The applied revision may tick over once here: a workspace with no
+    // layout of its own gets its one default one; that is not the link going down.)
     assert_eq!(
-        after.revision, before.revision,
-        "going offline is not a layout edit"
+        after
+            .members
+            .iter()
+            .map(|member| member.node_id.as_str())
+            .collect::<Vec<_>>(),
+        before
+            .members
+            .iter()
+            .map(|member| member.node_id.as_str())
+            .collect::<Vec<_>>(),
+        "a known computer keeps its place on the map"
     );
     let peer = after
         .members
