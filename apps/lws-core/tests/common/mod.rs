@@ -783,7 +783,11 @@ fn bridge(mut from: TcpStream, mut to: TcpStream, mode: Arc<Mutex<Mode>>) {
         match from.read(&mut buffer) {
             Ok(0) => return,
             Ok(read) => {
-                if current == Mode::Forward && to.write_all(&buffer[..read]).is_err() {
+                // A read may have begun before blackhole() changed the mode. Check
+                // after it returns, and keep the lock through forwarding so a
+                // completed mode change cannot leak a prepare/ack already read.
+                let current = mode.lock().expect("proxy");
+                if *current == Mode::Forward && to.write_all(&buffer[..read]).is_err() {
                     return;
                 }
             }
