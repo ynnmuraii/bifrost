@@ -629,8 +629,43 @@ impl Dry {
                 tracing::warn!(%error, "cannot write dry local passthrough count");
             }
         }
-        // Drain paired button-up before generating another held-pointer sample.
-        if matches!(self.motion.front(), Some(Some(InputEvent::Button { .. }))) {
+        // A dry wheel, the way `click` is a dry click: the file holds the signed number of
+        // notches, and every notch becomes its own event — a wheel run may not be merged, so
+        // the queue hands them over one by one.
+        if let Ok(text) = std::fs::read_to_string(dir.join("wheel")) {
+            if std::fs::remove_file(dir.join("wheel")).is_ok() {
+                let detents = text.trim().parse::<i32>().unwrap_or(0);
+                if self.capturing && detents != 0 {
+                    let step = detents.signum().saturating_mul(120);
+                    for _ in 1..detents.unsigned_abs() {
+                        self.motion.push_back(Some(InputEvent::Scroll {
+                            h120: 0,
+                            v120: step,
+                        }));
+                    }
+                    return Some(InputEvent::Scroll {
+                        h120: 0,
+                        v120: step,
+                    });
+                }
+                if !self.capturing {
+                    // Outside Remote the local desktop would have scrolled; this is the same
+                    // "the edge stayed local" observation the click makes.
+                    self.local_passthrough += 1;
+                    if let Err(error) = std::fs::write(
+                        dir.join("local-passthrough.txt"),
+                        self.local_passthrough.to_string(),
+                    ) {
+                        tracing::warn!(%error, "cannot write dry local passthrough count");
+                    }
+                }
+            }
+        }
+        // Drain a control-generated event before generating another held-pointer sample.
+        if matches!(
+            self.motion.front(),
+            Some(Some(InputEvent::Button { .. } | InputEvent::Scroll { .. }))
+        ) {
             return self.motion.pop_front().flatten();
         }
         let text = std::fs::read_to_string(dir.join("held-pointer.txt")).ok()?;
@@ -1050,20 +1085,39 @@ impl Backend {
         match self {
             Backend::Dry(dry) => {
                 if let Some(dir) = &dry.control_dir {
-                    use std::io::Write;
-                    if let Err(error) = (|| -> std::io::Result<()> {
-                        let mut file = std::fs::OpenOptions::new()
+                    use std::fmt::Write as _;
+                    use std::io::Write as _;
+                    // What this node actually applied, one line per event, in order: the wheel
+                    // is recorded beside the buttons because it is the input whose delivery a
+                    // test cannot infer from a balanced pair of edges.
+                    let mut buttons = String::new();
+                    let mut wheels = String::new();
+                    for event in events {
+                        match event {
+                            InputEvent::Button { button, state } => {
+                                let _ = writeln!(buttons, "{button:?} {state:?}");
+                            }
+                            InputEvent::Scroll { h120, v120 } => {
+                                let _ = writeln!(wheels, "{h120} {v120}");
+                            }
+                            _ => {}
+                        }
+                    }
+                    for (name, lines) in [
+                        ("injected-buttons.txt", buttons),
+                        ("injected-wheel.txt", wheels),
+                    ] {
+                        if lines.is_empty() {
+                            continue;
+                        }
+                        if let Err(error) = std::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
-                            .open(dir.join("injected-buttons.txt"))?;
-                        for event in events {
-                            if let InputEvent::Button { button, state } = event {
-                                writeln!(file, "{button:?} {state:?}")?;
-                            }
+                            .open(dir.join(name))
+                            .and_then(|mut file| file.write_all(lines.as_bytes()))
+                        {
+                            tracing::warn!(%error, %name, "cannot record dry injected input");
                         }
-                        Ok(())
-                    })() {
-                        tracing::warn!(%error, "cannot record dry injected buttons");
                     }
                 }
                 tracing::info!(

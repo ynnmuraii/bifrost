@@ -430,6 +430,24 @@ impl Node {
             .expect("write the synthetic click");
     }
 
+    /// A dry wheel turn of `detents` signed notches, the way [`Self::trigger_dry_click`] is one
+    /// dry click: the dry source turns each notch into its own event, never one merged batch.
+    pub fn trigger_dry_wheel(&self, detents: i32) {
+        std::fs::write(self.dry_control_dir().join("wheel"), detents.to_string())
+            .expect("write the synthetic wheel turn");
+    }
+
+    /// The `h120 v120` of every wheel event this node applied, in the order it applied them.
+    /// An absent file is "nothing applied yet", which is what a poll loop has to be able to
+    /// see without a panic.
+    pub fn dry_injected_wheel(&self) -> Vec<String> {
+        match std::fs::read_to_string(self.dry_control_dir().join("injected-wheel.txt")) {
+            Ok(text) => text.lines().map(str::to_owned).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read dry injected wheel: {error}"),
+        }
+    }
+
     pub fn dry_injected_buttons(&self) -> Vec<String> {
         match std::fs::read_to_string(self.dry_control_dir().join("injected-buttons.txt")) {
             Ok(value) => value.lines().map(str::to_owned).collect(),
