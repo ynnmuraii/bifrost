@@ -513,8 +513,33 @@ impl LinkManager {
                 }
             }
             ManagerMessage::RemovePeer { peer } => {
-                if let Some(dialer) = self.inner.lock().await.peer_dialers.remove(&peer) {
+                let mut inner = self.inner.lock().await;
+                if let Some(dialer) = inner.peer_dialers.remove(&peer) {
                     dialer.abort();
+                }
+                inner.dial_waiters.remove(&peer);
+                let pending_keys: Vec<_> = inner
+                    .pending
+                    .iter()
+                    .filter_map(|(k, p)| if p.peer == peer { Some(*k) } else { None })
+                    .collect();
+                for key in pending_keys {
+                    if let Some(pending) = inner.pending.remove(&key) {
+                        pending.task.abort();
+                    }
+                }
+                let live = inner.links.remove(&peer);
+                drop(inner);
+                if let Some(live) = live {
+                    live.handle.close();
+                    live.task.abort();
+                    let _ = self
+                        .events_tx
+                        .send(LinkEvent::Down {
+                            peer,
+                            reason: LinkDownReason::LocalClosed,
+                        })
+                        .await;
                 }
             }
             ManagerMessage::Register {

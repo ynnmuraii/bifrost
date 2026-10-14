@@ -1400,3 +1400,116 @@ async fn a_second_link_in_the_same_direction_cannot_evict_the_live_one() {
         "the live link must stay a member while a same-direction newcomer is refused"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_drops_only_target_peer_and_preserves_other_links() {
+    let root = temp_root("revoke-mesh");
+    let address_a = free_address().await;
+    let address_b = free_address().await;
+    let address_c = free_address().await;
+
+    let identity_a = Arc::new(identity_at(&root, "a"));
+    let identity_b = Arc::new(identity_at(&root, "b"));
+    let identity_c = Arc::new(identity_at(&root, "c"));
+    let (id_a, id_b, id_c) = (
+        identity_a.node_id(),
+        identity_b.node_id(),
+        identity_c.node_id(),
+    );
+
+    let mut a = spawn_node(
+        "a",
+        Arc::clone(&identity_a),
+        address_a,
+        &[(id_b, address_b), (id_c, address_c)],
+        &[address_b, address_c],
+        3,
+    )
+    .await;
+    let b = spawn_node(
+        "b",
+        Arc::clone(&identity_b),
+        address_b,
+        &[(id_a, address_a), (id_c, address_c)],
+        &[address_a, address_c],
+        3,
+    )
+    .await;
+    let c = spawn_node(
+        "c",
+        Arc::clone(&identity_c),
+        address_c,
+        &[(id_a, address_a), (id_b, address_b)],
+        &[address_a, address_b],
+        3,
+    )
+    .await;
+
+    for node in [&a, &b, &c] {
+        assert!(
+            wait_for_members(node, 2, FORM_TIMEOUT).await,
+            "{} did not reach two members",
+            node.name
+        );
+    }
+    settle(&mut a, Duration::from_millis(200)).await;
+
+    // Now A revokes B via remove_peer.
+    a.manager.remove_peer(&id_b).await.expect("remove_peer");
+    // The link to B must be dropped on A.
+    let down_b = wait_for_event(
+        &mut a.events,
+        |event| matches!(event, LinkEvent::Down { peer, .. } if *peer == id_b),
+        EVENT_TIMEOUT,
+    )
+    .await;
+    assert!(down_b.is_some(), "link to B must be dropped when revoked");
+
+    // The link to C must stay UP on A!
+    assert_eq!(
+        a.manager.member_count().await,
+        1,
+        "A must still have C as a member"
+    );
+    assert!(
+        a.manager.handle(&id_c).await.is_some(),
+        "handle to C must still be live"
+    );
+    assert!(
+        a.manager.handle(&id_b).await.is_none(),
+        "handle to B must be gone"
+    );
+
+    // Now bounce C: drop C's node, then start a new C with the same identity and address.
+    c.kill().await;
+
+    // A sees C go down.
+    let down_c = wait_for_event(
+        &mut a.events,
+        |event| matches!(event, LinkEvent::Down { peer, .. } if *peer == id_c),
+        OFFLINE_TIMEOUT,
+    )
+    .await;
+    assert!(down_c.is_some(), "A must observe C go down");
+
+    // Respawn C.
+    let _c2 = spawn_node(
+        "c2",
+        Arc::clone(&identity_c),
+        address_c,
+        &[(id_a, address_a)],
+        &[address_a],
+        3,
+    )
+    .await;
+
+    // A must redial / reconnect to C!
+    assert!(
+        wait_for_members(&a, 1, FORM_TIMEOUT).await,
+        "A must reconnect to C after C bounces"
+    );
+    assert!(
+        a.manager.handle(&id_c).await.is_some(),
+        "handle to C must be live again"
+    );
+}
