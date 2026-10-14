@@ -555,6 +555,18 @@ fn write_control(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&staging, path)
 }
 
+/// Takes the dry wheel turn a test left in `path`: the signed notch count, with the file removed.
+///
+/// A writer that is not atomic (`fs::write`) is visible as an empty file for a moment; consuming
+/// that would drop the turn and the writer's text would land in an unlinked file. Anything that
+/// is not yet a number stays in place for the next poll.
+fn take_wheel_control(path: &Path) -> Option<i32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let detents = text.trim().parse::<i32>().ok()?;
+    std::fs::remove_file(path).ok()?;
+    Some(detents)
+}
+
 impl Dry {
     fn new(
         ready: Ready,
@@ -632,32 +644,29 @@ impl Dry {
         // A dry wheel, the way `click` is a dry click: the file holds the signed number of
         // notches, and every notch becomes its own event — a wheel run may not be merged, so
         // the queue hands them over one by one.
-        if let Ok(text) = std::fs::read_to_string(dir.join("wheel")) {
-            if std::fs::remove_file(dir.join("wheel")).is_ok() {
-                let detents = text.trim().parse::<i32>().unwrap_or(0);
-                if self.capturing && detents != 0 {
-                    let step = detents.signum().saturating_mul(120);
-                    for _ in 1..detents.unsigned_abs() {
-                        self.motion.push_back(Some(InputEvent::Scroll {
-                            h120: 0,
-                            v120: step,
-                        }));
-                    }
-                    return Some(InputEvent::Scroll {
+        if let Some(detents) = take_wheel_control(&dir.join("wheel")) {
+            if self.capturing && detents != 0 {
+                let step = detents.signum().saturating_mul(120);
+                for _ in 1..detents.unsigned_abs() {
+                    self.motion.push_back(Some(InputEvent::Scroll {
                         h120: 0,
                         v120: step,
-                    });
+                    }));
                 }
-                if !self.capturing {
-                    // Outside Remote the local desktop would have scrolled; this is the same
-                    // "the edge stayed local" observation the click makes.
-                    self.local_passthrough += 1;
-                    if let Err(error) = write_control(
-                        &dir.join("local-passthrough.txt"),
-                        &self.local_passthrough.to_string(),
-                    ) {
-                        tracing::warn!(%error, "cannot write dry local passthrough count");
-                    }
+                return Some(InputEvent::Scroll {
+                    h120: 0,
+                    v120: step,
+                });
+            }
+            if !self.capturing {
+                // Outside Remote the local desktop would have scrolled; this is the same
+                // "the edge stayed local" observation the click makes.
+                self.local_passthrough += 1;
+                if let Err(error) = write_control(
+                    &dir.join("local-passthrough.txt"),
+                    &self.local_passthrough.to_string(),
+                ) {
+                    tracing::warn!(%error, "cannot write dry local passthrough count");
                 }
             }
         }
@@ -1460,6 +1469,26 @@ fn describe_session(snapshot: &EnvSnapshot) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wheel_file_caught_empty_mid_write_is_left_for_the_next_poll() {
+        let dir = std::env::temp_dir().join(format!("lws-wheel-control-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel");
+        // What a truncating writer shows for a moment before its text lands.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            take_wheel_control(&path),
+            None,
+            "an empty file is not a turn yet"
+        );
+        assert!(path.exists(), "and it must not be consumed");
+        std::fs::write(&path, "-3").unwrap();
+        assert_eq!(take_wheel_control(&path), Some(-3));
+        assert!(!path.exists());
+        assert_eq!(take_wheel_control(&path), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn a_restore_token_announces_restoration_instead_of_a_permission_dialog() {
         const REMOTE_DESKTOP: &str = "org.freedesktop.portal.RemoteDesktop";
