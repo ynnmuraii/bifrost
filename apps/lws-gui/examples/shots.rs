@@ -88,10 +88,7 @@ fn main() -> std::process::ExitCode {
             let mut zoomed = view.clone();
             zoomed.look.zoom_percent = zoom;
             states.push((format!("{prefix}-zoom-{tag}"), zoomed));
-            states.push((
-                format!("{prefix}-window-{tag}"),
-                with_window(view.clone()),
-            ));
+            states.push((format!("{prefix}-window-{tag}"), with_window(view.clone())));
             if let Some(stacked) = with_vertical_peer(&view) {
                 states.push((format!("{prefix}-vertical-{tag}"), stacked));
             }
