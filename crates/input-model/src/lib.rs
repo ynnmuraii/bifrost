@@ -40,6 +40,49 @@ pub mod repeat;
 
 pub use repeat::RepeatFilter;
 
+/// Cumulative discrete input edges at a diagnostic stage boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeCounters {
+    pub keys_down: u64,
+    pub keys_up: u64,
+    pub buttons_down: u64,
+    pub buttons_up: u64,
+}
+
+impl EdgeCounters {
+    pub fn record(&mut self, event: &InputEvent) {
+        let counter = match event {
+            InputEvent::Key {
+                state: KeyState::Down,
+                ..
+            } => &mut self.keys_down,
+            InputEvent::Key {
+                state: KeyState::Up,
+                ..
+            } => &mut self.keys_up,
+            InputEvent::Button {
+                state: KeyState::Down,
+                ..
+            } => &mut self.buttons_down,
+            InputEvent::Button {
+                state: KeyState::Up,
+                ..
+            } => &mut self.buttons_up,
+            _ => return,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    pub fn since(self, baseline: Self) -> Self {
+        Self {
+            keys_down: self.keys_down.saturating_sub(baseline.keys_down),
+            keys_up: self.keys_up.saturating_sub(baseline.keys_up),
+            buttons_down: self.buttons_down.saturating_sub(baseline.buttons_down),
+            buttons_up: self.buttons_up.saturating_sub(baseline.buttons_up),
+        }
+    }
+}
+
 /// USB HID usage page for a keyboard (spec: "Keyboard/Keypad", page `0x07`).
 pub const HID_PAGE_KEYBOARD: u16 = 0x07;
 
@@ -308,5 +351,36 @@ mod tests {
     #[test]
     fn hid_l_maps_to_linux_evdev_key_l() {
         assert_eq!(hid_usage_to_evdev(HID_PAGE_KEYBOARD, 0x0F), Some(38));
+    }
+
+    #[test]
+    fn edge_counters_accumulate_and_subtract_a_lease_baseline() {
+        use super::{EdgeCounters, HidKey, InputEvent, KeyState, MouseButton};
+        let mut counts = EdgeCounters::default();
+        counts.record(&InputEvent::Button {
+            button: MouseButton::Left,
+            state: KeyState::Down,
+        });
+        let baseline = counts;
+        for state in [KeyState::Down, KeyState::Up] {
+            counts.record(&InputEvent::Button {
+                button: MouseButton::Left,
+                state,
+            });
+            counts.record(&InputEvent::Key {
+                key: HidKey::keyboard(4),
+                state,
+            });
+        }
+        assert_eq!(
+            counts.since(baseline),
+            EdgeCounters {
+                keys_down: 1,
+                keys_up: 1,
+                buttons_down: 1,
+                buttons_up: 1
+            }
+        );
+        assert_eq!(baseline.since(counts), EdgeCounters::default());
     }
 }

@@ -241,8 +241,45 @@ mod tests {
                 challenge_decoded: 4,
                 renew_decoded: 5,
                 status_decoded: 6,
+                ..LeaseTransportSnapshot::default()
             }
         );
+    }
+
+    #[test]
+    fn input_edge_counters_keep_both_click_edges_across_batches_and_directions() {
+        let counters = LeaseTransportCounters::default();
+        for state in [wire::KeyState::Down, wire::KeyState::Up] {
+            let payload = wire::envelope::Payload::InputBatch(wire::InputBatch {
+                events: vec![
+                    wire::InputEvent {
+                        event: Some(wire::input_event::Event::Button(wire::Button {
+                            button: wire::ButtonKind::Left as i32,
+                            state: state as i32,
+                        })),
+                        ..Default::default()
+                    },
+                    wire::InputEvent {
+                        event: Some(wire::input_event::Event::Key(wire::Key {
+                            usage_page: 7,
+                            usage: 4,
+                            state: state as i32,
+                        })),
+                        ..Default::default()
+                    },
+                ],
+            });
+            counters.record(Some(&payload), true);
+            counters.record(Some(&payload), false);
+        }
+        let expected = input_model::EdgeCounters {
+            keys_down: 1,
+            keys_up: 1,
+            buttons_down: 1,
+            buttons_up: 1,
+        };
+        assert_eq!(counters.snapshot().input_tx, expected);
+        assert_eq!(counters.snapshot().input_rx, expected);
     }
 
     #[test]
@@ -330,6 +367,8 @@ pub struct LeaseTransportSnapshot {
     pub renew_decoded: u64,
     /// Validated and converted inbound lease statuses.
     pub status_decoded: u64,
+    pub input_tx: input_model::EdgeCounters,
+    pub input_rx: input_model::EdgeCounters,
 }
 
 #[derive(Debug, Default)]
@@ -340,11 +379,34 @@ pub(crate) struct LeaseTransportCounters {
     challenge_decoded: AtomicU64,
     renew_decoded: AtomicU64,
     status_decoded: AtomicU64,
+    input_tx: [AtomicU64; 4],
+    input_rx: [AtomicU64; 4],
 }
 
 impl LeaseTransportCounters {
     pub(crate) fn record(&self, payload: Option<&wire::envelope::Payload>, written: bool) {
         use wire::envelope::Payload;
+        if let Some(Payload::InputBatch(batch)) = payload {
+            let counters = if written {
+                &self.input_tx
+            } else {
+                &self.input_rx
+            };
+            for event in &batch.events {
+                let (offset, state) = match &event.event {
+                    Some(wire::input_event::Event::Key(key)) => (0, key.state),
+                    Some(wire::input_event::Event::Button(button)) => (2, button.state),
+                    _ => continue,
+                };
+                let index = match wire::KeyState::try_from(state) {
+                    Ok(wire::KeyState::Down) => offset,
+                    Ok(wire::KeyState::Up) => offset + 1,
+                    _ => continue,
+                };
+                counters[index].fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
         let counter = match (payload, written) {
             (Some(Payload::LeaseChallenge(_)), true) => &self.challenge_written,
             (Some(Payload::LeaseRenew(_)), true) => &self.renew_written,
@@ -365,7 +427,18 @@ impl LeaseTransportCounters {
             challenge_decoded: self.challenge_decoded.load(Ordering::Relaxed),
             renew_decoded: self.renew_decoded.load(Ordering::Relaxed),
             status_decoded: self.status_decoded.load(Ordering::Relaxed),
+            input_tx: edge_snapshot(&self.input_tx),
+            input_rx: edge_snapshot(&self.input_rx),
         }
+    }
+}
+
+fn edge_snapshot(counters: &[AtomicU64; 4]) -> input_model::EdgeCounters {
+    input_model::EdgeCounters {
+        keys_down: counters[0].load(Ordering::Relaxed),
+        keys_up: counters[1].load(Ordering::Relaxed),
+        buttons_down: counters[2].load(Ordering::Relaxed),
+        buttons_up: counters[3].load(Ordering::Relaxed),
     }
 }
 

@@ -429,9 +429,14 @@ impl Wayland {
     /// first pointer event, so an aborted prepare does not move the local cursor.
     pub async fn prepare_inject(&mut self) -> Result<(), String> {
         self.injector.pump().await;
+        self.injector.reset_applied_edges();
         self.relative_cursor = None;
         self.receiving = true;
         Ok(())
+    }
+
+    pub fn applied_edges(&self) -> input_model::EdgeCounters {
+        self.injector.applied_edges()
     }
     fn initialize_relative_cursor(&mut self) {
         if select_pointer_mode(self.injector.capabilities()) != PointerMode::Relative {

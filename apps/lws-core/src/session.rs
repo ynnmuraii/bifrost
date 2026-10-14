@@ -223,6 +223,26 @@ fn portal_activation_plan(
     })
 }
 
+#[derive(Default)]
+struct InputDiagnostics {
+    lease_id: Option<fr::LeaseId>,
+    hook: Option<protocol::ipc::EdgeCounters>,
+    captured: input_model::EdgeCounters,
+    inject: input_model::EdgeCounters,
+    applied: Option<protocol::ipc::EdgeCounters>,
+}
+
+impl InputDiagnostics {
+    fn for_lease(&mut self, lease_id: fr::LeaseId) {
+        if self.lease_id != Some(lease_id) {
+            *self = Self {
+                lease_id: Some(lease_id),
+                ..Self::default()
+            };
+        }
+    }
+}
+
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
     router: crate::ids::Router,
@@ -391,6 +411,7 @@ pub struct Session {
     last_agent_inject_log: Option<Instant>,
     /// Last second in which captured input forwarding was logged.
     last_input_batch_log: Option<Instant>,
+    input_diagnostics: InputDiagnostics,
 }
 
 impl Session {
@@ -504,6 +525,7 @@ impl Session {
             last_agent_inject_log: None,
             pairing_error: None,
             last_input_batch_log: None,
+            input_diagnostics: InputDiagnostics::default(),
         };
         session.rebuild_topology();
         session
@@ -1072,6 +1094,10 @@ impl Session {
                         events,
                     } = &command
                     {
+                        self.input_diagnostics.for_lease(*lease_id);
+                        for event in events {
+                            self.input_diagnostics.inject.record(event);
+                        }
                         let report = self
                             .last_agent_inject_log
                             .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
@@ -1138,6 +1164,7 @@ impl Session {
                     // FSM totals are per lease; socket totals are per connection. Snapshot
                     // before teardown so the final line retains the live transport counters.
                     let transport = self.manager.lease_diagnostics(&snapshot.peer).await;
+                    self.input_diagnostics.for_lease(snapshot.lease_id);
                     tracing::info!(
                         peer = %snapshot.peer,
                         lease_id = %lease_hex(&snapshot.lease_id),
@@ -1148,6 +1175,10 @@ impl Session {
                         fsm = ?snapshot.counters,
                         inbound_ages_ms = ?snapshot.ages,
                         transport_connection = ?transport,
+                        hook_edges = ?self.input_diagnostics.hook,
+                        captured_edges = ?self.input_diagnostics.captured,
+                        inject_edges = ?self.input_diagnostics.inject,
+                        eis_applied_edges = ?self.input_diagnostics.applied,
                         "lease liveness diagnostics"
                     );
                 }
@@ -2409,6 +2440,15 @@ impl Session {
         let Some(message) = frame.msg else {
             return Ok(());
         };
+        match (&message, self.router.lease().receiver()) {
+            (Msg::InjectResult(result), Some(lease))
+                if result.lease_id.as_slice() == lease.lease_id.as_slice() =>
+            {
+                self.input_diagnostics.for_lease(lease.lease_id);
+                self.input_diagnostics.applied = result.applied_edges;
+            }
+            _ => {}
+        }
         // The observation rides on the agent's capture, and these frames are the agent
         // saying that capture is gone: the emergency combination and a receiver takeover
         // release everything before reporting, and a capture failure or overflow ends it.
@@ -2482,6 +2522,15 @@ impl Session {
             }
             AgentSignal::Local(local) => self.feed(fr::Input::Local(local)).await,
             AgentSignal::Captured(batch) => {
+                if let Some(lease) = self.router.lease().source() {
+                    if lease.state == fr::SourceState::Remote {
+                        self.input_diagnostics.for_lease(lease.lease_id);
+                        self.input_diagnostics.hook = batch.hook_edges;
+                        for event in batch.events.iter().filter_map(routing::input_event_of) {
+                            self.input_diagnostics.captured.record(&event);
+                        }
+                    }
+                }
                 if batch.at_edge {
                     self.on_portal_activation(batch.activation.as_ref()).await;
                     // The activation seeds local_pointer itself. Do not treat the same
@@ -2907,7 +2956,7 @@ impl Session {
                 if report {
                     let (keys, pointers, buttons, scrolls) = counts.unwrap_or_default();
                     self.last_input_batch_log = Some(Instant::now());
-                    tracing::warn!(
+                    tracing::debug!(
                         events = events.len(),
                         keys,
                         pointers,

@@ -1588,6 +1588,7 @@ mod tests {
                 .collect(),
             at_edge: false,
             activation: None,
+            hook_edges: None,
         };
         for (event, (expected_x, expected_y)) in
             captured.events.iter().zip([(14.0, 546.0), (26.0, 552.0)])

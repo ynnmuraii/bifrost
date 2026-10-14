@@ -25,6 +25,19 @@ challenge/renew/status на границе FSM, принятые/отклонё�
 финальный снимок. `fsm` считается для одного lease, `transport_connection` — для
 соединения: успешные записи в сокет и декодированные lease-кадры. Эти записи не
 продлевают lease и не меняют TTL или правила watchdog.
+Тот же снимок содержит накопленные `keys_down/keys_up/buttons_down/buttons_up`:
+`hook_edges` (Windows, mapped-события до enqueue, включая dropped и OS autorepeat),
+`captured_edges` (полученные core CapturedBatch в Remote), `inject_edges` (команды
+Inject в агент) и `eis_applied_edges` (события, закодированные в EIS frames; ошибка
+flush по-прежнему отражается в InjectResult). Эти поля считаются для одного lease;
+`None` означает, что этап не применим или ещё не прислал снимок. `transport_connection`
+дополнительно содержит `input_tx/input_rx` — discrete edges всех InputBatch за
+соединение, после успешной записи / проверки входящего envelope соответственно.
+Снимки диагностические, не атомарная транзакция между процессами. Старые односекундные
+`agent CapturedBatch` / `transport InputBatch` / `EIS injection summary` показывают
+только первый batch интервала: отсутствие отдельной строки up не доказывает потерю
+release. Нормальный Observe в Local остаётся нужен для edge tracking; сообщение
+`captured input outside a remote source lease; dropped` теперь DEBUG.
 
 Heartbeat core↔agent учитывает задержку собственного цикла: если он проснулся позже
 планового срока хотя бы на половину `core_silence_ms`, watchdog молчания переармируется,
@@ -38,7 +51,7 @@ BeginCapture события идут в новую очередь. В Preparing 
 возврат по-прежнему отменяют переход. Агент интегрирует относительные Raw Input-дельты
 в absolute logical-позиции до CapturedBatch; абсолютные Raw Input-записи не трактуются как дельты.
 Core ведёт оценку на дисплее receiver от entry point, проверяет return edge перед clamp
-и отправляет только absolute InputBatch. Форматы IPC и сети не меняются.
+и отправляет только absolute InputBatch. Форма событий ввода в IPC и сети не меняется.
 
 При старте owner заново заявляет `max_seen + 1`, даже если сохранённый владелец — он сам.
 При соединении оба узла сообщают текущую пару `(serial, owner)`; более новая пара для
@@ -101,6 +114,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 `-noreset` предотвращает сброс X-сервера между короткими probe-подключениями.
 Fault harness ожидает `agent=ready` перед переключением и восстановление наблюдения
 после каждого возврата в Local; завершение FSM не означает, что следующий tick уже прошёл.
+Dry click regression проверяет ровно down→up на receiver сразу после входа в Remote
+и спустя две секунды. Linux-тест с локальной Unix socket pair проверяет настоящие
+EIS button frames и release_all для всех удерживаемых кнопок, без portal/desktop ввода.
 
 ## Структура workspace
 

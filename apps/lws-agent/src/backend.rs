@@ -910,6 +910,24 @@ impl Backend {
         }
     }
 
+    pub fn hook_edges(&self) -> Option<ipc::EdgeCounters> {
+        match self {
+            #[cfg(windows)]
+            Backend::Win(backend) => backend.hook_edges().map(crate::events::edge_counters),
+            _ => None,
+        }
+    }
+
+    pub fn applied_edges(&self) -> Option<ipc::EdgeCounters> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => {
+                Some(crate::events::edge_counters(backend.applied_edges()))
+            }
+            _ => None,
+        }
+    }
+
     /// `ForgetPortalGrants`: drop in-memory portal tokens so the next session asks
     /// again. Core stays the owner of the persisted file.
     pub async fn forget_portal_grants(&mut self) {
@@ -1016,7 +1034,24 @@ impl Backend {
     /// Injects one batch.
     pub async fn inject(&mut self, events: &[InputEvent]) -> Injected {
         match self {
-            Backend::Dry(_) => {
+            Backend::Dry(dry) => {
+                if let Some(dir) = &dry.control_dir {
+                    use std::io::Write;
+                    if let Err(error) = (|| -> std::io::Result<()> {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(dir.join("injected-buttons.txt"))?;
+                        for event in events {
+                            if let InputEvent::Button { button, state } = event {
+                                writeln!(file, "{button:?} {state:?}")?;
+                            }
+                        }
+                        Ok(())
+                    })() {
+                        tracing::warn!(%error, "cannot record dry injected buttons");
+                    }
+                }
                 tracing::info!(
                     count = events.len(),
                     "dry mode: Inject logged, not injected"

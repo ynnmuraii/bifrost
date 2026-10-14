@@ -55,6 +55,15 @@ pub fn to_local_event(event: &InputEvent, monotonic_us: u64) -> Option<ipc::Loca
     })
 }
 
+pub fn edge_counters(counters: input_model::EdgeCounters) -> ipc::EdgeCounters {
+    ipc::EdgeCounters {
+        keys_down: counters.keys_down,
+        keys_up: counters.keys_up,
+        buttons_down: counters.buttons_down,
+        buttons_up: counters.buttons_up,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

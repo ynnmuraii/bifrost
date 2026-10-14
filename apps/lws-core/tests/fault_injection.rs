@@ -230,6 +230,65 @@ fn a_click_during_a_failed_temporary_capture_reaches_the_local_desktop() {
     );
 }
 
+#[test]
+fn remote_clicks_deliver_both_edges_immediately_and_after_settling() {
+    let _serial = common::serial();
+    let harness = Harness::start_fault_controls(false, false);
+    harness.wait_linked();
+    harness.a.switch(&harness.b.id).expect("start remote lease");
+    harness
+        .a
+        .wait_for("A is Remote", Duration::from_secs(10), |status| {
+            status.focus == "Remote"
+        })
+        .expect("source must enter Remote");
+    for click in 1..=2 {
+        harness.a.trigger_dry_click();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let actual = harness.b.dry_injected_buttons();
+            if actual.len() >= click * 2 {
+                assert_eq!(
+                    actual,
+                    ["Left Down", "Left Up"].repeat(click),
+                    "receiver must apply every click edge exactly once and in order"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "remote click lost: {actual:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if click == 1 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    harness.return_to_local();
+    assert_eq!(
+        harness.b.dry_injected_buttons(),
+        ["Left Down", "Left Up"].repeat(2)
+    );
+    for (node, stage) in [(&harness.a, "captured_edges"), (&harness.b, "inject_edges")] {
+        let log = node.log();
+        let snapshot = log
+            .lines()
+            .find(|line| {
+                line.contains("lease liveness diagnostics") && line.contains("final_snapshot=true")
+            })
+            .expect("lease end must retain its final input counters");
+        let edges = snapshot
+            .split_once(&format!("{stage}="))
+            .expect("stage counters in final snapshot")
+            .1
+            .split('}')
+            .next()
+            .expect("counter fields");
+        assert!(
+            edges.contains("buttons_down: 2, buttons_up: 2"),
+            "both clicks must remain counted after summary throttling: {snapshot}"
+        );
+    }
+}
+
 /// A stale topology link cannot arm suppression when its transport is absent.
 #[test]
 fn a_held_edge_without_a_live_link_never_enters_preparing() {
