@@ -239,7 +239,17 @@ fn zoom_controls(
                 .pointer
                 .hover_pos()
                 .filter(|point| rect.contains(*point))
-                .map_or(0.0, |_| input.raw_scroll_delta.y)
+                .map_or(0.0, |_| {
+                    input
+                        .raw
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                            _ => None,
+                        })
+                        .sum::<f32>()
+                })
         });
         if wheel > 0.0 {
             wanted = (current + 5).min(150);
