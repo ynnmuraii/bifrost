@@ -31,7 +31,8 @@
 //!    emptying the slot first.
 //! 2. **Expiry is irreversible.** A lease that expires (deadline, `prepare_timeout`,
 //!    injection failure, disconnect) leaves the slot and its `lease_id` goes into
-//!    `FocusRouter::burned`; `EnterPrepare`/`EnterCommit` for a burned id are refused
+//!    the bounded 1024-ID `FocusRouter::burned` replay history; prepares for a
+//!    recently burned id and commits outside the current prepared lease are refused
 //!    and [`lease::ReceiverLease::apply_renew`] returns `None` unless the lease is
 //!    still `Active`, so a late `LeaseRenew` cannot revive it — it only draws an
 //!    `accepted = false` `LeaseStatus`. The *source* side re-arms its watchdog only
@@ -104,7 +105,7 @@
 //! | S5 | `Preparing` + agent `CaptureFailed` | `EndCapture{replay = true}`, `Local` |
 //! | S6 | switch request while a key is held | refused (`PressedInputHeld`), still `Local` |
 //! | S7 | `Remote` + switch (edge/hotkey) | `EndCapture` + `Leave{ReturnEdge/Hotkey}`, `Releasing` |
-//! | S8 | `Remote` + `LeaveAck` | `Local`; the old `lease_id` can never re-enter |
+//! | S8 | `Remote` + `LeaveAck` | `Local`; the old `lease_id` is rejected in the recent replay window |
 //! | S9 | `Remote` + no `LeaseStatus` for `lease_ttl` | `EndCapture` + `CloseLink{LEASE_EXPIRED}`, `Local` |
 //! | S10 | `Remote` + `InjectAck{FAILED}` | `EndCapture`, `Local` at once (`InjectionAborted`) |
 //! | S11 | `Remote` + emergency | `EndCapture` + `Leave{Emergency}`, `Local` immediately |
