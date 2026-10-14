@@ -208,8 +208,31 @@ impl Node {
         Status::parse(&self.ctl("status")?)
     }
 
+    /// Recovery is transient, unlike a semantic switch refusal. Wait for a ready agent
+    /// before asking, and retry only AgentBlocked if recovery started between the poll
+    /// and the request. Fault tests still observe the actual recovery through status.
     pub fn switch(&self, peer: &str) -> Result<String, String> {
-        self.ctl(&format!("switch {peer}"))
+        let timeout = Duration::from_secs(15);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "the agent did not recover before switching within {timeout:?}"
+                ));
+            }
+            self.wait_for("the agent is ready before switching", remaining, |status| {
+                status.agent == "ready" && status.focus != "Blocked"
+            })?;
+            match self.ctl(&format!("switch {peer}")) {
+                Err(error) if error == "ERR SWITCH_REFUSED AgentBlocked" => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                reply => return reply,
+            }
+        }
     }
 
     /// Waits for a `status` the predicate accepts, polling instead of sleeping blindly.

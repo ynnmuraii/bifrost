@@ -270,20 +270,21 @@ fn the_owner_re_arms_its_observation_after_returning_to_local() {
     }
     let armed_before = harness.a.observe_arms();
 
-    // Two full there-and-back cycles: each return to `Local` must re-arm exactly once.
-    harness.cycle();
-    harness.cycle();
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while harness.a.observe_arms() < armed_before + 2 {
-        let armed = harness.a.observe_arms();
-        assert!(
-            Instant::now() < deadline,
-            "the owner stopped observing after {armed} arm(s): a second crossing cannot \
-             start without a live observer (while {armed_before} were expected before the \
-             cycles)"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    // Observation is armed on a session tick, not synchronously with Local. Wait after
+    // each return: two ctl-driven cycles can otherwise finish inside one tick and
+    // legitimately share the same final re-arm.
+    for cycle in 1..=2 {
+        harness.cycle();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while harness.a.observe_arms() < armed_before + cycle {
+            let armed = harness.a.observe_arms();
+            assert!(
+                Instant::now() < deadline,
+                "the owner stopped observing after {armed} arm(s): return {cycle} must \
+                 restore a live observer (while {armed_before} were expected before the cycles)"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

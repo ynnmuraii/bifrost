@@ -174,6 +174,11 @@ impl AgentHeartbeat {
         self.watchdog.next_heartbeat_in_ms(self.now_ms())
     }
 
+    /// The peer-silence limit, also used to distinguish core's own loop stalls.
+    pub fn silence_limit_ms(&self) -> u64 {
+        self.watchdog.silence_limit_ms()
+    }
+
     /// Whether the agent must be considered lost.
     ///
     /// Before the first frame of a launch only the launch timeout counts: the agent is
@@ -518,6 +523,11 @@ impl Supervisor {
     /// not read as the agent's silence (see [`AgentHeartbeat::on_resume`]).
     pub fn on_resume(&mut self) {
         self.heartbeat.on_resume();
+    }
+
+    /// The peer-silence limit configured for this channel.
+    pub fn silence_limit_ms(&self) -> u64 {
+        self.heartbeat.silence_limit_ms()
     }
 
     /// Whether the agent must be considered lost (the grace and rule 6's limit).

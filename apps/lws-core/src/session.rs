@@ -754,6 +754,20 @@ impl Session {
         self.agent_restart_circuit.on_suspend();
     }
 
+    /// Keep peer silence separate from time core could not service its own loop.
+    /// Carry the next expected wake across turn work as well as the select wait.
+    fn observe_loop_wake(&mut self, planned_wake_ms: &mut u64) {
+        let now = self.now_ms();
+        if let Some(stalled_ms) =
+            SuspendDetector::wake_lateness(*planned_wake_ms, now, self.agent.silence_limit_ms() / 2)
+        {
+            tracing::debug!("core loop stalled {stalled_ms} ms; not blaming the agent");
+            self.agent.on_resume();
+        }
+        // An already-expired service timer is immediate work, not a late wake.
+        *planned_wake_ms = self.next_deadline(now).max(now);
+    }
+
     /// Runs until `quit`, a signal, or a fatal link error.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let outputs = self.router.on_start(self.now_ms());
@@ -765,15 +779,19 @@ impl Session {
         );
 
         let step_log_rate = logging::LogRateLimit::new();
+        let now = self.now_ms();
+        let mut planned_wake_ms = self.next_deadline(now).max(now);
         loop {
+            self.observe_loop_wake(&mut planned_wake_ms);
             self.service_clock().await;
             if self.stopping {
                 self.shutdown_agent().await;
                 return Ok(());
             }
 
-            let now = self.now_ms();
-            let deadline = self.instant_of(self.next_deadline(now));
+            // Service work can itself stall; observe it before replacing its wake plan.
+            self.observe_loop_wake(&mut planned_wake_ms);
+            let deadline = self.instant_of(planned_wake_ms);
             let attached = self.agent.is_attached();
             // The clipboard runtime owns the sender of `clipboard_events`; with the clipboard
             // off there is no runtime, and the arm must not fire on a closed channel.
@@ -793,6 +811,7 @@ impl Session {
             // Before the step is acted on: a resume re-arms the agent heartbeat, so the
             // liveness decision below cannot blame the agent for the machine's sleep.
             self.observe_clock();
+            self.observe_loop_wake(&mut planned_wake_ms);
             let step_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
             let link_backlog = self.link_events.len();
 
@@ -847,10 +866,9 @@ impl Session {
                     }
                 }
             }
-            // The liveness decision comes *after* the turn's work: whatever the agent
-            // sent during this turn was processed by the step above, and a loop that
-            // woke late (a starved worker on a loaded machine) must not condemn an
-            // agent whose answer is already sitting in the link's buffer.
+            // Include slow step processing, not just a late select wake: a buffered
+            // agent response cannot be blamed on core's inability to service it.
+            self.observe_loop_wake(&mut planned_wake_ms);
             if self.agent.is_attached()
                 && (self.agent.child_exited() || self.agent.silence_exceeded())
             {

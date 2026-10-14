@@ -193,7 +193,9 @@ jobs:
         env:
           LWS_KEEP_ROOTS: "1"
           TMPDIR: ${{ runner.temp }}/lws-roots
-        run: xvfb-run -a cargo test --workspace
+        # Keep the server alive between short-lived probe clients. Xvfb otherwise resets
+        # when its last client disconnects, racing the next core's capability probe.
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" cargo test --workspace
 
       # The kept roots are the point of `LWS_KEEP_ROOTS` above: one directory per
       # harness (`lws-<label>-<pid>-<n>`) with each core's log, config and state.
