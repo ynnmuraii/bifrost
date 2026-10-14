@@ -1,7 +1,7 @@
 # Third-party notices
 
 Generated file — do not edit by hand. It lists the third-party crates a shipped binary
-(`lws-core`, `lws-agent`, `lws-gui`) contains, with the terms each one is distributed under.
+(`multideskflow`: core, agent, GUI and lightweight tray roles) contains, with their terms.
 The project itself is MIT: see [`../LICENSE`](../LICENSE).
 
 Regenerate from the repository root, after `cargo fetch`:
@@ -3190,6 +3190,7 @@ Used by:
 - pkg-config 0.3.34 — https://github.com/rust-lang/pkg-config-rs
 - scoped-tls 1.0.1 — https://github.com/alexcrichton/scoped-tls
 - socket2 0.6.5 — https://github.com/rust-lang/socket2
+- toml 0.5.11 — https://github.com/toml-rs/toml
 - wasm-bindgen-futures 0.4.79 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
 - wasm-bindgen-macro-support 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support
 - wasm-bindgen-macro 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
@@ -5859,6 +5860,41 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- winres 0.1.12 — https://github.com/mxre/winres
+
+```text
+Copyright 2016 Max Resch
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
 - synstructure 0.14.0 — https://github.com/mystor/synstructure
 
 ```text
@@ -6167,25 +6203,6 @@ THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-```
-
-## MIT License
-
-Used by:
-
-- epaint_default_fonts 0.36.2 — https://github.com/emilk/egui/tree/main/crates/epaint_default_fonts
-
-```text
-MIT License
-
-Copyright (c) 2014 John Slegers
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -7014,6 +7031,7 @@ Used by:
 - once_cell 1.21.4 — https://github.com/matklad/once_cell
 - ordered-stream 0.2.0 — https://github.com/danieldg/ordered-stream
 - parking 2.2.1 — https://github.com/smol-rs/parking
+- pastey 0.2.3 — https://github.com/as1100k/pastey
 - pin-project-internal 1.1.13 — https://github.com/taiki-e/pin-project
 - pin-project-lite 0.2.17 — https://github.com/taiki-e/pin-project-lite
 - pin-project 1.1.13 — https://github.com/taiki-e/pin-project
@@ -7839,214 +7857,6 @@ THE SOFTWARE.
 
 ```
 
-## SIL Open Font License 1.1
-
-Used by:
-
-- epaint_default_fonts 0.36.2 — https://github.com/emilk/egui/tree/main/crates/epaint_default_fonts
-
-```text
-This Font Software is licensed under the SIL Open Font License,
-Version 1.1.
-
-This license is copied below, and is also available with a FAQ at:
-http://scripts.sil.org/OFL
-
------------------------------------------------------------
-SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
------------------------------------------------------------
-
-PREAMBLE
-The goals of the Open Font License (OFL) are to stimulate worldwide
-development of collaborative font projects, to support the font
-creation efforts of academic and linguistic communities, and to
-provide a free and open framework in which fonts may be shared and
-improved in partnership with others.
-
-The OFL allows the licensed fonts to be used, studied, modified and
-redistributed freely as long as they are not sold by themselves. The
-fonts, including any derivative works, can be bundled, embedded,
-redistributed and/or sold with any software provided that any reserved
-names are not used by derivative works. The fonts and derivatives,
-however, cannot be released under any other type of license. The
-requirement for fonts to remain under this license does not apply to
-any document created using the fonts or their derivatives.
-
-DEFINITIONS
-"Font Software" refers to the set of files released by the Copyright
-Holder(s) under this license and clearly marked as such. This may
-include source files, build scripts and documentation.
-
-"Reserved Font Name" refers to any names specified as such after the
-copyright statement(s).
-
-"Original Version" refers to the collection of Font Software
-components as distributed by the Copyright Holder(s).
-
-"Modified Version" refers to any derivative made by adding to,
-deleting, or substituting -- in part or in whole -- any of the
-components of the Original Version, by changing formats or by porting
-the Font Software to a new environment.
-
-"Author" refers to any designer, engineer, programmer, technical
-writer or other person who contributed to the Font Software.
-
-PERMISSION & CONDITIONS
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of the Font Software, to use, study, copy, merge, embed,
-modify, redistribute, and sell modified and unmodified copies of the
-Font Software, subject to the following conditions:
-
-1) Neither the Font Software nor any of its individual components, in
-Original or Modified Versions, may be sold by itself.
-
-2) Original or Modified Versions of the Font Software may be bundled,
-redistributed and/or sold with any software, provided that each copy
-contains the above copyright notice and this license. These can be
-included either as stand-alone text files, human-readable headers or
-in the appropriate machine-readable metadata fields within text or
-binary files as long as those fields can be easily viewed by the user.
-
-3) No Modified Version of the Font Software may use the Reserved Font
-Name(s) unless explicit written permission is granted by the
-corresponding Copyright Holder. This restriction only applies to the
-primary font name as presented to the users.
-
-4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
-Software shall not be used to promote, endorse or advertise any
-Modified Version, except to acknowledge the contribution(s) of the
-Copyright Holder(s) and the Author(s) or with their explicit written
-permission.
-
-5) The Font Software, modified or unmodified, in part or in whole,
-must be distributed entirely under this license, and must not be
-distributed under any other license. The requirement for fonts to
-remain under this license does not apply to any document created using
-the Font Software.
-
-TERMINATION
-This license becomes null and void if any of the above conditions are
-not met.
-
-DISCLAIMER
-THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
-OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
-COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
-DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
-OTHER DEALINGS IN THE FONT SOFTWARE.
-
-```
-
-## Ubuntu Font Licence v1.0
-
-Used by:
-
-- epaint_default_fonts 0.36.2 — https://github.com/emilk/egui/tree/main/crates/epaint_default_fonts
-
-```text
--------------------------------
-UBUNTU FONT LICENCE Version 1.0
--------------------------------
-
-PREAMBLE
-This licence allows the licensed fonts to be used, studied, modified and
-redistributed freely. The fonts, including any derivative works, can be
-bundled, embedded, and redistributed provided the terms of this licence
-are met. The fonts and derivatives, however, cannot be released under
-any other licence. The requirement for fonts to remain under this
-licence does not require any document created using the fonts or their
-derivatives to be published under this licence, as long as the primary
-purpose of the document is not to be a vehicle for the distribution of
-the fonts.
-
-DEFINITIONS
-"Font Software" refers to the set of files released by the Copyright
-Holder(s) under this licence and clearly marked as such. This may
-include source files, build scripts and documentation.
-
-"Original Version" refers to the collection of Font Software components
-as received under this licence.
-
-"Modified Version" refers to any derivative made by adding to, deleting,
-or substituting -- in part or in whole -- any of the components of the
-Original Version, by changing formats or by porting the Font Software to
-a new environment.
-
-"Copyright Holder(s)" refers to all individuals and companies who have a
-copyright ownership of the Font Software.
-
-"Substantially Changed" refers to Modified Versions which can be easily
-identified as dissimilar to the Font Software by users of the Font
-Software comparing the Original Version with the Modified Version.
-
-To "Propagate" a work means to do anything with it that, without
-permission, would make you directly or secondarily liable for
-infringement under applicable copyright law, except executing it on a
-computer or modifying a private copy. Propagation includes copying,
-distribution (with or without modification and with or without charging
-a redistribution fee), making available to the public, and in some
-countries other activities as well.
-
-PERMISSION & CONDITIONS
-This licence does not grant any rights under trademark law and all such
-rights are reserved.
-
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of the Font Software, to propagate the Font Software, subject to
-the below conditions:
-
-1) Each copy of the Font Software must contain the above copyright
-notice and this licence. These can be included either as stand-alone
-text files, human-readable headers or in the appropriate machine-
-readable metadata fields within text or binary files as long as those
-fields can be easily viewed by the user.
-
-2) The font name complies with the following:
-(a) The Original Version must retain its name, unmodified.
-(b) Modified Versions which are Substantially Changed must be renamed to
-avoid use of the name of the Original Version or similar names entirely.
-(c) Modified Versions which are not Substantially Changed must be
-renamed to both (i) retain the name of the Original Version and (ii) add
-additional naming elements to distinguish the Modified Version from the
-Original Version. The name of such Modified Versions must be the name of
-the Original Version, with "derivative X" where X represents the name of
-the new work, appended to that name.
-
-3) The name(s) of the Copyright Holder(s) and any contributor to the
-Font Software shall not be used to promote, endorse or advertise any
-Modified Version, except (i) as required by this licence, (ii) to
-acknowledge the contribution(s) of the Copyright Holder(s) or (iii) with
-their explicit written permission.
-
-4) The Font Software, modified or unmodified, in part or in whole, must
-be distributed entirely under this licence, and must not be distributed
-under any other licence. The requirement for fonts to remain under this
-licence does not affect any document created using the Font Software,
-except any version of the Font Software extracted from a document
-created using the Font Software may only be distributed under this
-licence.
-
-TERMINATION
-This licence becomes null and void if any of the above conditions are
-not met.
-
-DISCLAIMER
-THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
-COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
-DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER
-DEALINGS IN THE FONT SOFTWARE.
-
-```
-
 ## Unicode License v3
 
 Used by:
@@ -8166,6 +7976,40 @@ SPDX-License-Identifier: Unicode-3.0
 
 Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
+
+```
+
+## The Unlicense
+
+Used by:
+
+- ksni 0.3.6 — https://github.com/iovxw/ksni
+
+```text
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
 
 ```
 

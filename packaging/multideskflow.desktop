@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MultiDeskFlow
+Comment=Share your keyboard and mouse between computers
+Exec=multideskflow
+Icon=multideskflow
+Terminal=false
+Categories=Utility;RemoteAccess;
+StartupWMClass=multideskflow
