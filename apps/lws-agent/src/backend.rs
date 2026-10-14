@@ -869,15 +869,17 @@ impl Backend {
     /// Async because the real backends do Win32/X work: the response rides a blocking
     /// thread (Windows) or the selection's own thread (X11), so the runtime thread — the
     /// poll tick, the IPC frames and the watchdog — never waits for the platform.
-    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
+    pub async fn clipboard_change(
+        &mut self,
+    ) -> Result<Option<ClipboardChange>, clipboard::ClipboardError> {
         match self {
-            Backend::Dry(dry) => dry.clipboard_change(),
+            Backend::Dry(dry) => Ok(dry.clipboard_change()),
             #[cfg(windows)]
             Backend::Win(backend) => backend.clipboard_change().await,
             #[cfg(target_os = "linux")]
-            Backend::X11(backend) => backend.clipboard_change().await,
+            Backend::X11(backend) => Ok(backend.clipboard_change().await),
             #[cfg(target_os = "linux")]
-            Backend::Wayland(backend) => backend.clipboard_change().await,
+            Backend::Wayland(backend) => Ok(backend.clipboard_change().await),
         }
     }
 

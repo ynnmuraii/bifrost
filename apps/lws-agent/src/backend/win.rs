@@ -179,19 +179,28 @@ impl Win {
     /// clipboard), so it runs on a blocking thread. That keeps the runtime thread — the one
     /// the 5 ms poll tick, the IPC frames and the core-silence watchdog share — free: a busy
     /// loop must not be able to delay the `Pong`.
-    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
-        let clipboard = self.clipboard.as_ref()?;
-        clipboard.wait(Duration::ZERO)?;
+    pub async fn clipboard_change(
+        &mut self,
+    ) -> Result<Option<ClipboardChange>, clipboard::ClipboardError> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Ok(None);
+        };
+        if clipboard.wait(Duration::ZERO).is_none() {
+            return Ok(None);
+        }
         let snapshot =
             match tokio::task::spawn_blocking(platform_win::clipboard::read_clipboard).await {
                 Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(platform_win::clipboard::ClipboardError::Content(error))) => {
+                    return Err(error);
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "the clipboard could not be read; ignoring the change");
-                    return None;
+                    return Ok(None);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "the clipboard read task failed; ignoring the change");
-                    return None;
+                    return Ok(None);
                 }
             };
         if Some(snapshot.sequence) == self.applied_sequence {
@@ -203,12 +212,12 @@ impl Win {
                 bytes = snapshot.text.len(),
                 "swallowing the clipboard update this node applied"
             );
-            return None;
+            return Ok(None);
         }
         if !snapshot.has_text {
             // An image-only or empty item: nothing this agent can offer.
             tracing::debug!(sequence = snapshot.sequence, "the clipboard holds no text");
-            return None;
+            return Ok(None);
         }
         tracing::info!(
             sequence = snapshot.sequence,
@@ -216,10 +225,10 @@ impl Win {
             markers = snapshot.markers.len(),
             "local clipboard change"
         );
-        Some(ClipboardChange {
+        Ok(Some(ClipboardChange {
             text: snapshot.text,
             markers: snapshot.markers,
-        })
+        }))
     }
 
     /// Owns the local selection: `Some` puts `text` on it, `None` empties it.
