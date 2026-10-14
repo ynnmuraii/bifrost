@@ -150,10 +150,10 @@ pub enum Side {
 }
 
 impl Side {
-    /// Every side, in the order the radio buttons show them.
+    /// Every map direction, horizontal first and then vertical.
     pub const ALL: [Side; 4] = [Side::Left, Side::Right, Side::Top, Side::Bottom];
 
-    /// The button label.
+    /// The direction's human-readable label.
     pub const fn label(self) -> &'static str {
         match self {
             Side::Left => "Слева",

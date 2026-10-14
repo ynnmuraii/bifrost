@@ -92,7 +92,7 @@ impl Session {
             },
             focus: focus_word(focus.as_str()).to_owned(),
             active_peer,
-            connected: self.manager.member_count().await > 0,
+            connected: !online.is_empty(),
             clipboard_enabled: self
                 .clipboard
                 .as_ref()
