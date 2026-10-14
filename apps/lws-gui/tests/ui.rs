@@ -748,6 +748,7 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
             egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, y),
+                phase: egui::TouchPhase::Move,
                 modifiers: egui::Modifiers::NONE,
             },
         ]
