@@ -3594,10 +3594,10 @@ fn prompt_of(prompt: oneshot::Receiver<pairing::Prompt>) -> oneshot::Receiver<ct
     tokio::spawn(async move {
         let response = match prompt.await {
             Ok(prompt) => ctl::Response::Status(format!(
-                "sas={} peer={} attempt={} address={}",
+                "sas={} peer={} ceremony={} address={}",
                 prompt.sas_code,
                 prompt.peer_name,
-                crate::command::hex16(&prompt.attempt_id),
+                crate::command::hex16(&prompt.ceremony_id),
                 prompt.address.unwrap_or_default()
             )),
             Err(_) => ctl::Response::Error {

@@ -438,12 +438,12 @@ impl Session {
                 spawn_op_result(request_id, out, wait).await;
             }
             Msg::PairingAnswer(peer_answer) => {
-                let attempt: pairing::AttemptId = match peer_answer.attempt_id.as_slice().try_into()
+                let ceremony: pairing::CeremonyId = match peer_answer.attempt_id.as_slice().try_into()
                 {
-                    Ok(attempt) => attempt,
+                    Ok(ceremony) => ceremony,
                     Err(_) => return answer(&out, request_id, Msg::OpResult(bad_request())).await,
                 };
-                match self.pairing.answer(&attempt, peer_answer.approve) {
+                match self.pairing.answer(&ceremony, peer_answer.approve) {
                     Ok(wait) => spawn_op_result(request_id, out, wait).await,
                     Err((code, _detail)) => {
                         answer(
@@ -500,7 +500,7 @@ impl Session {
                     "pairing: the six digits are on both screens"
                 );
                 self.publish(Msg::PairingPrompt(ipc::PairingPrompt {
-                    attempt_id: prompt.attempt_id.to_vec(),
+                    attempt_id: prompt.ceremony_id.to_vec(),
                     peer_name: prompt.peer_name,
                     sas_code: prompt.sas_code,
                     local_fingerprint: prompt.local_fingerprint,
@@ -625,11 +625,14 @@ impl Session {
 
     /// `PairWith`: dial the address the user typed and run the dialer's half.
     pub(super) fn spawn_pair_dial(&mut self, address: String) {
+        // The dialer's ceremony exists before the dial, under its own id: a dial that never
+        // reaches the peer is reported back against that id, and two dials can never share one.
+        let (ceremony_id, answer) = self.pairing.begin();
         let parsed: std::net::SocketAddr = match address.parse() {
             Ok(address) => address,
             Err(error) => {
                 self.pairing
-                    .dial_failed("BAD_ADDRESS", format!("{address:?}: {error}"));
+                    .dial_failed(&ceremony_id, "BAD_ADDRESS", format!("{address:?}: {error}"));
                 return;
             }
         };
@@ -641,7 +644,6 @@ impl Session {
         // The port this node listens on, which the opener records as *this* node's address
         // (`PairHello.listen_port`): the dialer's source port is ephemeral.
         let listen_port = self.listen.port();
-        let answer = self.pairing.reserve();
         tokio::spawn(async move {
             match identity::dial(
                 parsed,
@@ -653,13 +655,15 @@ impl Session {
             .await
             {
                 Ok(driver) => {
-                    pairing::run(driver, answer, false, local_fingerprint, events).await;
+                    pairing::run(driver, ceremony_id, answer, false, local_fingerprint, events)
+                        .await;
                 }
                 Err(error) => {
-                    // No ceremony exists yet, so this is the dial's own failure: the loop
-                    // resolves the `PairWith` reply with it.
+                    // The dial never reached a ceremony: the loop drops the registered
+                    // ceremony and resolves the `PairWith` reply with this failure.
                     let _ = events
                         .send(pairing::Event::DialFailed {
+                            ceremony_id,
                             code: "PAIR_FAILED".to_owned(),
                             detail: error.to_string(),
                         })
@@ -671,10 +675,9 @@ impl Session {
 
     /// One accepted `pair/1` connection: the opener's half of the ceremony.
     pub(crate) fn spawn_pair_accept(&mut self, connection: transport::PairingConnection) {
-        // The window opener generated the `attempt_id`, so its ceremony is registered before
-        // the task starts and `PairingAnswer` can name it at once.
-        let attempt_id = *connection.window.attempt_id();
-        let answer = self.pairing.begin(attempt_id);
+        // Each connection gets its own ceremony id, so a second concurrent dialer of the same
+        // window cannot overwrite the first (`docs/05-protocol.md` admits up to three).
+        let (ceremony_id, answer) = self.pairing.begin();
         let identity = Arc::clone(&self.identity);
         let events = self.pairing_events_tx.clone();
         let local_fingerprint = self.local_fingerprint();
@@ -694,12 +697,13 @@ impl Session {
             .await
             {
                 Ok(driver) => {
-                    pairing::run(driver, answer, true, local_fingerprint, events).await;
+                    pairing::run(driver, ceremony_id, answer, true, local_fingerprint, events)
+                        .await;
                 }
                 Err(error) => {
                     let _ = events
                         .send(pairing::Event::Finished {
-                            attempt_id,
+                            ceremony_id,
                             outcome: pairing::Outcome::Failed(error.to_string()),
                         })
                         .await;
