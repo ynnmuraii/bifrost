@@ -886,6 +886,9 @@ fn the_pairing_wizard_pairs_two_cores_through_the_view_model() {
     right.dispatch(Action::PairWith(address), Instant::now());
 
     // 3. Both screens show six digits, and they are the same six.
+    // PairWith's success only acknowledges reaching the prompt. Core may deliver that
+    // reply before or after the pushed code; neither order completes the ceremony or
+    // removes the code before the users answer.
     let left_code = wait_for(&mut left, "the left screen's six digits", |view| {
         view.pairing.code()
     });
