@@ -220,30 +220,51 @@ impl Session {
                 None => protocol::wire::Topology::default(),
             },
         };
+        let mut members: Vec<ipc::MemberTopology> = document
+            .nodes
+            .iter()
+            .map(|node| ipc::MemberTopology {
+                node_id: hex(&node.node_id),
+                display_name: if node_id_of(&node.node_id) == Some(self.node_id) {
+                    self.display_name.clone()
+                } else {
+                    node_id_of(&node.node_id)
+                        .and_then(|node| self.trust.get(&node))
+                        .map(|record| record.display_name.clone())
+                        .unwrap_or_default()
+                },
+                displays: node.displays.iter().map(display_view).collect(),
+                online: node_id_of(&node.node_id)
+                    .is_some_and(|node| node == self.node_id || online.contains(&node)),
+            })
+            .collect();
+        // A peer the user paired with is on the map whether or not its link is up: a computer
+        // that stopped answering is shown offline with the screens it last reported, instead of
+        // disappearing until it comes back. Only a revoke removes it (then it is not trusted).
+        for record in self.trust.peers.iter().filter(|record| record.is_active()) {
+            let node_id = crate::command::node_id_hex(&record.node_id);
+            if members.iter().any(|member| member.node_id == node_id) {
+                continue;
+            }
+            let last_known = self
+                .peer_displays
+                .get(&record.node_id)
+                .map(|(_, displays)| displays.as_slice())
+                .unwrap_or_default();
+            members.push(ipc::MemberTopology {
+                node_id,
+                display_name: record.display_name.clone(),
+                displays: last_known.iter().map(display_view).collect(),
+                online: false,
+            });
+        }
         ipc::TopologyDoc {
             revision: applied.revision,
             author_node_id: applied
                 .author
                 .map(|author| crate::command::node_id_hex(&author))
                 .unwrap_or_default(),
-            members: document
-                .nodes
-                .iter()
-                .map(|node| ipc::MemberTopology {
-                    node_id: hex(&node.node_id),
-                    display_name: if node_id_of(&node.node_id) == Some(self.node_id) {
-                        self.display_name.clone()
-                    } else {
-                        node_id_of(&node.node_id)
-                            .and_then(|node| self.trust.get(&node))
-                            .map(|record| record.display_name.clone())
-                            .unwrap_or_default()
-                    },
-                    displays: node.displays.iter().map(display_view).collect(),
-                    online: node_id_of(&node.node_id)
-                        .is_some_and(|node| node == self.node_id || online.contains(&node)),
-                })
-                .collect(),
+            members,
             links: document
                 .links
                 .iter()
@@ -797,6 +818,10 @@ impl Session {
         if let Some(clipboard) = self.clipboard.as_mut() {
             clipboard.on_link_down(node).await;
         }
+        // A revoke is the one case where the last known manifest goes away with the peer:
+        // a link drop keeps it, so the map still shows the computer offline.
+        self.peer_displays.remove(&node);
+        self.rebuild_topology();
         tracing::info!(
             peer = crate::command::node_id_hex(&node).as_str(),
             "peer revoked"

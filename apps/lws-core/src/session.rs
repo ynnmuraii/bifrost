@@ -2410,7 +2410,9 @@ impl Session {
                 if let Some(clipboard) = self.clipboard.as_mut() {
                     clipboard.on_link_down(peer).await;
                 }
-                self.peer_displays.remove(&peer);
+                // The manifest of a peer that just went away is the *last known* one, and it
+                // stays: the map keeps showing the computer, offline, with the screens it had.
+                // Only a revoke forgets it (there the peer itself is gone).
                 self.rebuild_topology();
                 self.feed(fr::Input::LinkDown { peer }).await;
             }
