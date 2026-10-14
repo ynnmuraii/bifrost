@@ -433,8 +433,12 @@ impl Node {
     /// A dry wheel turn of `detents` signed notches, the way [`Self::trigger_dry_click`] is one
     /// dry click: the dry source turns each notch into its own event, never one merged batch.
     pub fn trigger_dry_wheel(&self, detents: i32) {
-        std::fs::write(self.dry_control_dir().join("wheel"), detents.to_string())
-            .expect("write the synthetic wheel turn");
+        // Staged and renamed, as the agent's own `write_control` does: the agent polls this
+        // directory every few milliseconds and must never see the truncated, empty file.
+        let dir = self.dry_control_dir();
+        let staging = dir.join("wheel.writing");
+        std::fs::write(&staging, detents.to_string()).expect("stage the synthetic wheel turn");
+        std::fs::rename(&staging, dir.join("wheel")).expect("write the synthetic wheel turn");
     }
 
     /// The `h120 v120` of every wheel event this node applied, in the order it applied them.
