@@ -781,10 +781,11 @@ fn footer(
                         actions.push(action);
                     }
                 }
+                // The embedded Geist faces support ↔, not the mockup's ⇄; no OS font fallback.
                 let label = if transfer.target.is_empty() {
-                    "⇄ Передать ввод".to_owned()
+                    "↔ Передать ввод".to_owned()
                 } else {
-                    format!("⇄ Передать ввод → {}", transfer.target)
+                    format!("↔ Передать ввод → {}", transfer.target)
                 };
                 let go = widgets::button(ui, pal, &label, Kind::Hot, transfer.enabled);
                 if let Some(why) = &transfer.why {

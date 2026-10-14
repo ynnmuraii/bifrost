@@ -441,7 +441,7 @@ fn the_dial_button_sends_the_typed_address_and_the_transfer_button_the_switch() 
         frame.output.actions
     );
 
-    let at = find(&mut harness, &vm, "⇄ Передать ввод → linux-box");
+    let at = find(&mut harness, &vm, "↔ Передать ввод → linux-box");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(
         frame
