@@ -304,9 +304,7 @@ impl ViewModel {
             .filter_map(|(index, link)| {
                 let from = link.from.as_ref()?;
                 let to = link.to.as_ref()?;
-                let ends = self
-                    .index_of(&from.node_id)
-                    .zip(self.index_of(&to.node_id));
+                let ends = self.index_of(&from.node_id).zip(self.index_of(&to.node_id));
                 Some((
                     ends,
                     config::LinkConfig {
@@ -504,11 +502,7 @@ impl ViewModel {
             let mut mons = Vec::with_capacity(node.displays.len());
             for (k, display) in node.displays.iter().enumerate() {
                 number += 1;
-                let rect = editor.shapes[i]
-                    .mons
-                    .get(k)
-                    .copied()
-                    .unwrap_or_default();
+                let rect = editor.shapes[i].mons.get(k).copied().unwrap_or_default();
                 let tag = if is_target && (display.primary || single) {
                     "ввод"
                 } else if !node.online {

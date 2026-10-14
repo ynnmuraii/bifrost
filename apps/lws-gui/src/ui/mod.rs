@@ -39,8 +39,10 @@ const TOP_H: f32 = 60.0;
 const RAIL_W: f32 = 64.0;
 /// Below this window width the dock is 2 × 2 and the peer pills are hidden.
 const NARROW: f32 = 1180.0;
-/// The frame interval of the animated field: 30 fps.
-pub const FIELD_FRAME: Duration = Duration::from_millis(33);
+/// How long the field asks to wait between frames. eframe's event loop wakes a little before
+/// the requested time, so 50 ms measured as 28 frames a second on Windows (33 ms measured as
+/// 58 — twice the cap), and that is the number the 30 fps ceiling is kept to.
+pub const FIELD_FRAME: Duration = Duration::from_millis(50);
 
 /// What the app tells the drawing code about the window.
 #[derive(Debug, Clone, Copy)]
@@ -166,7 +168,10 @@ fn topbar(
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment(
-        [Pos2::new(rect.min.x, rect.max.y - 0.5), Pos2::new(rect.max.x, rect.max.y - 0.5)],
+        [
+            Pos2::new(rect.min.x, rect.max.y - 0.5),
+            Pos2::new(rect.max.x, rect.max.y - 0.5),
+        ],
         pal.hairline(),
     );
     let mut bar = ui.new_child(
@@ -182,14 +187,22 @@ fn topbar(
     // Brand: the three-rectangle mark and the pixel wordmark.
     let (mark, _) = bar.allocate_exact_size(Vec2::new(22.0, 14.0), Sense::hover());
     let at = |x: f32, y: f32| Pos2::new(mark.min.x + x, mark.min.y + y);
-    painter.rect_filled(Rect::from_min_max(at(0.0, 3.0), at(6.0, 11.0)), 1.5, pal.ink);
+    painter.rect_filled(
+        Rect::from_min_max(at(0.0, 3.0), at(6.0, 11.0)),
+        1.5,
+        pal.ink,
+    );
     painter.rect_stroke(
         Rect::from_min_max(at(9.5, 4.5), at(12.5, 9.5)),
         1.0,
         Stroke::new(1.5, pal.ink),
         egui::StrokeKind::Middle,
     );
-    painter.rect_filled(Rect::from_min_max(at(16.0, 3.0), at(22.0, 11.0)), 1.5, pal.accent);
+    painter.rect_filled(
+        Rect::from_min_max(at(16.0, 3.0), at(22.0, 11.0)),
+        1.5,
+        pal.accent,
+    );
     widgets::text(bar, "MULTIDESKFLOW", 16.0, fam::pixel(), pal.ink);
     bar.add_space(-6.0);
 
@@ -215,7 +228,10 @@ fn topbar(
         bar,
         pal,
         Some(if live { Dot::Live } else { Dot::Off }),
-        &[Run::plain("Ввод ", pal.ink2), Run::strong(&route, if live { pal.accent } else { pal.ink })],
+        &[
+            Run::plain("Ввод ", pal.ink2),
+            Run::strong(&route, if live { pal.accent } else { pal.ink }),
+        ],
     );
 
     bar.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -225,15 +241,29 @@ fn topbar(
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         let hover = response.hovered();
-        let label = if pal.theme == Theme::Dark { "Светлая тема" } else { "Тёмная тема" };
+        let label = if pal.theme == Theme::Dark {
+            "Светлая тема"
+        } else {
+            "Тёмная тема"
+        };
         let painter = ui.painter();
         painter.circle(
             rect.center(),
             20.0,
             if hover { pal.ink } else { pal.bg2 },
-            if hover { Stroke::new(1.0, pal.ink) } else { pal.hairline() },
+            if hover {
+                Stroke::new(1.0, pal.ink)
+            } else {
+                pal.hairline()
+            },
         );
-        widgets::paint_icon(painter, Icon::Theme, rect.center(), 18.0, if hover { pal.bg } else { pal.ink });
+        widgets::paint_icon(
+            painter,
+            Icon::Theme,
+            rect.center(),
+            18.0,
+            if hover { pal.bg } else { pal.ink },
+        );
         if response.on_hover_text(label).clicked() {
             let mut look = vm.look;
             look.theme = look.theme.toggled();
@@ -245,26 +275,54 @@ fn topbar(
         }
         let peers = vm.peers();
         for peer in peers.iter().rev() {
-            let state = if peer.online { " в сети" } else { " не в сети" };
-            let runs = [Run::strong(&peer.name, pal.ink), Run::plain(state, pal.ink2)];
+            let state = if peer.online {
+                " в сети"
+            } else {
+                " не в сети"
+            };
+            let runs = [
+                Run::strong(&peer.name, pal.ink),
+                Run::plain(state, pal.ink2),
+            ];
             let probe = widgets::mono_runs(ui, &runs, 11.0, f32::INFINITY).size().x + 39.0;
             if probe > ui.available_width() - 12.0 {
                 break;
             }
-            widgets::pill(ui, pal, Some(if peer.online { Dot::Ok } else { Dot::Off }), &runs);
+            widgets::pill(
+                ui,
+                pal,
+                Some(if peer.online { Dot::Ok } else { Dot::Off }),
+                &runs,
+            );
         }
     });
 }
 
 /// The left rail: the six sections and the version caption.
-fn rail_draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) {
+fn rail_draw(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    rect: Rect,
+    actions: &mut Vec<Action>,
+) {
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment(
-        [Pos2::new(rect.min.x + 0.5, rect.min.y), Pos2::new(rect.min.x + 0.5, rect.max.y)],
+        [
+            Pos2::new(rect.min.x + 0.5, rect.min.y),
+            Pos2::new(rect.min.x + 0.5, rect.max.y),
+        ],
         pal.hairline(),
     );
-    let icons = [Icon::Layout, Icon::Pairs, Icon::Keys, Icon::Clip, Icon::Diag, Icon::Settings];
+    let icons = [
+        Icon::Layout,
+        Icon::Pairs,
+        Icon::Keys,
+        Icon::Clip,
+        Icon::Diag,
+        Icon::Settings,
+    ];
     let mut tip: Option<(Rect, &'static str)> = None;
     for (i, modal) in Modal::ALL.iter().enumerate() {
         // Settings sits at the bottom; the other five stack from the top.
@@ -280,9 +338,21 @@ fn rail_draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actio
         let on = vm.modal == Some(*modal);
         let hover = response.hovered() || response.has_focus();
         if on {
-            painter.rect(btn, pal.rad_sm(), pal.accent_soft, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
+            painter.rect(
+                btn,
+                pal.rad_sm(),
+                pal.accent_soft,
+                Stroke::new(1.0, pal.accent),
+                egui::StrokeKind::Inside,
+            );
         } else if hover {
-            painter.rect(btn, pal.rad_sm(), pal.bg2, pal.hairline(), egui::StrokeKind::Inside);
+            painter.rect(
+                btn,
+                pal.rad_sm(),
+                pal.bg2,
+                pal.hairline(),
+                egui::StrokeKind::Inside,
+            );
         }
         let ink = if on {
             pal.accent
@@ -292,9 +362,16 @@ fn rail_draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actio
             pal.ink2
         };
         widgets::paint_icon(&painter, icons[i], btn.center(), 20.0, ink);
-        let num = painter.layout_no_wrap(modal.num().to_owned(), font(8.0, fam::mono()), Color32::PLACEHOLDER);
+        let num = painter.layout_no_wrap(
+            modal.num().to_owned(),
+            font(8.0, fam::mono()),
+            Color32::PLACEHOLDER,
+        );
         painter.add(egui::epaint::TextShape::new(
-            Pos2::new(btn.max.x - 3.0 - num.size().x, btn.max.y - 2.0 - num.size().y),
+            Pos2::new(
+                btn.max.x - 3.0 - num.size().x,
+                btn.max.y - 2.0 - num.size().y,
+            ),
             num,
             Color32::from_rgba_unmultiplied(ink.r(), ink.g(), ink.b(), 150),
         ));
@@ -328,8 +405,16 @@ fn rail_draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actio
             Pos2::new(btn.min.x - 10.0 - size.x, btn.center().y - size.y / 2.0),
             size,
         );
-        layer.rect_filled(pill, egui::CornerRadius::same((size.y / 2.0) as u8), pal.ink);
-        layer.galley(Pos2::new(pill.min.x + 10.0, pill.min.y + 5.0), galley, pal.bg);
+        layer.rect_filled(
+            pill,
+            egui::CornerRadius::same((size.y / 2.0) as u8),
+            pal.ink,
+        );
+        layer.galley(
+            Pos2::new(pill.min.x + 10.0, pill.min.y + 5.0),
+            galley,
+            pal.bg,
+        );
     }
 }
 

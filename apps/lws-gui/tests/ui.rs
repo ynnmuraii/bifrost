@@ -40,7 +40,13 @@ impl Harness {
         }
     }
 
-    fn frame(&mut self, vm: &ViewModel, animate: bool, size: egui::Vec2, events: Vec<egui::Event>) -> Frame {
+    fn frame(
+        &mut self,
+        vm: &ViewModel,
+        animate: bool,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> Frame {
         let mut input = egui::RawInput::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         input.screen_rect = Some(rect);
@@ -52,7 +58,10 @@ impl Harness {
             },
         );
         input.events = events;
-        let env = Env { now: self.now, animate };
+        let env = Env {
+            now: self.now,
+            animate,
+        };
         let mut produced = Output::default();
         let state = &mut self.state;
         let output = self.ctx.run_ui(input, |ui| {
@@ -63,7 +72,10 @@ impl Harness {
             collect(&clipped.shape, &mut texts);
         }
         output.drop_without_applying_deltas();
-        Frame { texts, output: produced }
+        Frame {
+            texts,
+            output: produced,
+        }
     }
 
     /// Two frames: the first one sizes the panels and the font atlas, the second is the window.
@@ -87,7 +99,11 @@ fn shows(frame: &Frame, needle: &str) -> bool {
 
 fn expect(frame: &Frame, needles: &[&str]) {
     for needle in needles {
-        assert!(shows(frame, needle), "missing {needle:?} in {:?}", frame.texts);
+        assert!(
+            shows(frame, needle),
+            "missing {needle:?} in {:?}",
+            frame.texts
+        );
     }
 }
 
@@ -140,7 +156,10 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
 fn both_themes_draw_the_same_window() {
     let mut vm = connected();
     for theme in [Theme::Light, Theme::Dark] {
-        vm.look = Look { theme, ..Look::default() };
+        vm.look = Look {
+            theme,
+            ..Look::default()
+        };
         let mut harness = Harness::new();
         let frame = harness.settle(&vm, false);
         expect(&frame, &["MULTIDESKFLOW", "2 компьютера · 2 экрана"]);
@@ -153,7 +172,10 @@ fn a_window_with_no_service_says_so_and_offers_to_start_it() {
     vm.on_disconnected("no core".to_owned());
     let mut harness = Harness::new();
     let frame = harness.settle(&vm, false);
-    expect(&frame, &["Служба не запущена", "Запустить", "Нет данных от службы"]);
+    expect(
+        &frame,
+        &["Служба не запущена", "Запустить", "Нет данных от службы"],
+    );
     assert!(!shows(&frame, "Служба работает"));
 }
 
@@ -164,18 +186,47 @@ fn every_modal_shows_its_own_real_data() {
     vm.config.claim_hotkey = "Ctrl+Alt+Shift+F11".to_owned();
     vm.settings.lan.candidates = vec!["192.168.1.24".to_owned(), "10.0.0.5".to_owned()];
     let cases: [(Modal, &[&str]); 6] = [
-        (Modal::Layout, &["Раскладка", "mdf layout", "ПРИМЕНЕНО", "СТОРОНА", "Слева", "Расположить автоматически"]),
-        (Modal::Pairs, &["Пары", "linux-box", "BB22·BB22", "в сети", "Удалить"]),
+        (
+            Modal::Layout,
+            &[
+                "Раскладка",
+                "mdf layout",
+                "ПРИМЕНЕНО",
+                "СТОРОНА",
+                "Слева",
+                "Расположить автоматически",
+            ],
+        ),
+        (
+            Modal::Pairs,
+            &["Пары", "linux-box", "BB22·BB22", "в сети", "Удалить"],
+        ),
         (
             Modal::Keys,
             // The emergency chord is the one `Status` carries, key by key.
             &["Клавиши", "АВАРИЙНАЯ", "F12", "Shift", "→", "F11"],
         ),
         (Modal::Clip, &["Буфер обмена", "Включён", "Только текст"]),
-        (Modal::Diag, &["Диагностика", "Сохранить диагностику", "Отчёт ещё не сохранялся"]),
+        (
+            Modal::Diag,
+            &[
+                "Диагностика",
+                "Сохранить диагностику",
+                "Отчёт ещё не сохранялся",
+            ],
+        ),
         (
             Modal::Settings,
-            &["Настройки", "АДРЕС В LAN", "Перезапустить", "Остановить", "Antigravity Light", "Overmind Dark", "Без движения", "ASCII-облака"],
+            &[
+                "Настройки",
+                "АДРЕС В LAN",
+                "Перезапустить",
+                "Остановить",
+                "Antigravity Light",
+                "Overmind Dark",
+                "Без движения",
+                "ASCII-облака",
+            ],
         ),
     ];
     for (modal, needles) in cases {
@@ -202,20 +253,45 @@ fn the_pairing_dock_shows_the_real_window_countdown_and_the_real_code() {
     })));
     let mut harness = Harness::new();
     let frame = harness.settle(&vm, false);
-    expect(&frame, &["192.168.1.24:47901", "Ждём, пока другой компьютер подключится…"]);
+    expect(
+        &frame,
+        &[
+            "192.168.1.24:47901",
+            "Ждём, пока другой компьютер подключится…",
+        ],
+    );
     assert!(
-        frame.texts.iter().any(|t| t.starts_with('[') || t.contains("] ")),
+        frame
+            .texts
+            .iter()
+            .any(|t| t.starts_with('[') || t.contains("] ")),
         "the bar: {:?}",
         frame.texts
     );
-    assert!(frame.texts.iter().any(|t| t.contains(" с") && t.contains(']')));
+    assert!(frame
+        .texts
+        .iter()
+        .any(|t| t.contains(" с") && t.contains(']')));
 
     vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
     vm.local(&Action::ToggleDetails(true));
     let frame = harness.settle(&vm, false);
     expect(
         &frame,
-        &["подключается — коды совпадают?", "4", "8", "2", "9", "1", "3", "Да, совпадают", "Нет", "Свернуть", "D4:E5:F6", "A1:B2:C3"],
+        &[
+            "подключается — коды совпадают?",
+            "4",
+            "8",
+            "2",
+            "9",
+            "1",
+            "3",
+            "Да, совпадают",
+            "Нет",
+            "Свернуть",
+            "D4:E5:F6",
+            "A1:B2:C3",
+        ],
     );
 }
 
@@ -228,7 +304,10 @@ fn an_idle_window_asks_for_no_frame_and_an_animated_one_for_thirty_a_second() {
     // Default look: field «Без движения». Visible and focused, and still nothing is scheduled.
     assert_eq!(vm.look.field, FieldMode::Off);
     let frame = harness.settle(&vm, true);
-    assert_eq!(frame.output.repaint_after, None, "an idle window must not repaint on a timer");
+    assert_eq!(
+        frame.output.repaint_after, None,
+        "an idle window must not repaint on a timer"
+    );
 
     // The field moves: 30 fps, and not faster.
     vm.look.field = FieldMode::Repel;
@@ -281,7 +360,12 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
     harness.settle(&vm, false);
 
     // The rail: 64 px at the right edge, the first button's centre is 12 + 22 below the bar.
-    let frame = harness.frame(&vm, false, SIZE, click_at(egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + 22.0)));
+    let frame = harness.frame(
+        &vm,
+        false,
+        SIZE,
+        click_at(egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + 22.0)),
+    );
     assert!(
         frame
             .output
@@ -292,7 +376,12 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
     );
 
     // The theme toggle is the last control of the top bar.
-    let frame = harness.frame(&vm, false, SIZE, click_at(egui::pos2(SIZE.x - 12.0 - 20.0, 30.0)));
+    let frame = harness.frame(
+        &vm,
+        false,
+        SIZE,
+        click_at(egui::pos2(SIZE.x - 12.0 - 20.0, 30.0)),
+    );
     let wanted = frame
         .output
         .actions
@@ -317,7 +406,10 @@ fn the_dial_button_sends_the_typed_address_and_the_transfer_button_the_switch() 
         let mut input = egui::RawInput::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE);
         input.screen_rect = Some(rect);
-        let env = Env { now: harness.now, animate: false };
+        let env = Env {
+            now: harness.now,
+            animate: false,
+        };
         let state = &mut harness.state;
         let mut found = None;
         let output = harness.ctx.run_ui(input, |ui| {
@@ -342,7 +434,10 @@ fn the_dial_button_sends_the_typed_address_and_the_transfer_button_the_switch() 
     let at = find(&mut harness, &vm, "Подключиться");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(
-        frame.output.actions.contains(&Action::PairWith("192.168.1.10:47901".to_owned())),
+        frame
+            .output
+            .actions
+            .contains(&Action::PairWith("192.168.1.10:47901".to_owned())),
         "{:?}",
         frame.output.actions
     );
@@ -350,7 +445,10 @@ fn the_dial_button_sends_the_typed_address_and_the_transfer_button_the_switch() 
     let at = find(&mut harness, &vm, "↔ Передать ввод → linux-box");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(
-        frame.output.actions.contains(&Action::SwitchTo(PEER_NODE.to_owned())),
+        frame
+            .output
+            .actions
+            .contains(&Action::SwitchTo(PEER_NODE.to_owned())),
         "{:?}",
         frame.output.actions
     );
@@ -366,6 +464,11 @@ fn a_narrow_window_folds_the_dock_into_two_rows_and_keeps_every_cell() {
     let frame = harness.frame(&vm, false, narrow, Vec::new());
     expect(
         &frame,
-        &["ЭТОТ КОМПЬЮТЕР", "ОКНО СОПРЯЖЕНИЯ", "ПОДКЛЮЧИТЬСЯ ПО АДРЕСУ", "КОД СОПРЯЖЕНИЯ"],
+        &[
+            "ЭТОТ КОМПЬЮТЕР",
+            "ОКНО СОПРЯЖЕНИЯ",
+            "ПОДКЛЮЧИТЬСЯ ПО АДРЕСУ",
+            "КОД СОПРЯЖЕНИЯ",
+        ],
     );
 }

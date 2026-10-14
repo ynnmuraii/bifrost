@@ -7,9 +7,9 @@ use eframe::egui::{
     self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2,
 };
 
+use super::act;
 use super::theme::{fam, font, Palette};
 use super::widgets::{self, Kind, Run};
-use super::act;
 use crate::view_model::{Action, ViewModel};
 
 /// The dock's usual height.
@@ -22,7 +22,11 @@ const WINDOW_S: u32 = 120;
 /// The height of the dock for the current state.
 pub fn height(vm: &ViewModel, narrow: bool) -> f32 {
     // A prompt names the other computer and wraps in a quarter of the window: it needs room.
-    let prompt = if vm.pairing.prompt.is_some() { 40.0 } else { 0.0 };
+    let prompt = if vm.pairing.prompt.is_some() {
+        40.0
+    } else {
+        0.0
+    };
     let extra = prompt
         + if vm.pairing.prompt.is_some() && vm.pairing.details {
             DETAILS_H
@@ -90,7 +94,13 @@ fn cell_head(ui: &mut egui::Ui, pal: &Palette, letter: &str, caption: &str) {
         ui.spacing_mut().item_spacing.x = 8.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
         let painter = ui.painter();
-        painter.rect(rect, egui::CornerRadius::same(6), pal.bg2, pal.hairline(), StrokeKind::Inside);
+        painter.rect(
+            rect,
+            egui::CornerRadius::same(6),
+            pal.bg2,
+            pal.hairline(),
+            StrokeKind::Inside,
+        );
         let galley = painter.layout_no_wrap(letter.to_owned(), font(10.0, fam::pixel()), pal.ink);
         painter.galley(rect.center() - galley.size() / 2.0, galley, pal.ink);
         widgets::cap(ui, pal, caption);
@@ -115,12 +125,22 @@ fn this_computer(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
             ui.available_width(),
         );
         widgets::show_galley(ui, galley);
-        widgets::hint(ui, pal, "Этот адрес вводят на другом компьютере. Сменить — в настройках.");
+        widgets::hint(
+            ui,
+            pal,
+            "Этот адрес вводят на другом компьютере. Сменить — в настройках.",
+        );
     }
 }
 
 /// B: the pairing window and its countdown.
-fn window(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions: &mut Vec<Action>) {
+fn window(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) {
     cell_head(ui, pal, "B", "Окно сопряжения");
     match (&vm.pairing.window, vm.pairing.window_deadline) {
         (Some(window), Some(deadline)) => {
@@ -141,14 +161,30 @@ fn window(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, action
                 f32::INFINITY,
             );
             widgets::show_galley(ui, galley);
-            widgets::hint(ui, pal, "Скажите этот адрес владельцу другого компьютера. Окно закроется само.");
+            widgets::hint(
+                ui,
+                pal,
+                "Скажите этот адрес владельцу другого компьютера. Окно закроется само.",
+            );
         }
         _ => {
-            widgets::wrapped(ui, "На одном компьютере откройте окно, на другом введите адрес.", 14.0, fam::sans(), pal.ink);
+            widgets::wrapped(
+                ui,
+                "На одном компьютере откройте окно, на другом введите адрес.",
+                14.0,
+                fam::sans(),
+                pal.ink,
+            );
             let connected = vm.connection.is_connected();
-            act(ui, pal, "Открыть окно сопряжения", Kind::Solid, connected, actions, || {
-                Action::StartPairing { window_s: WINDOW_S }
-            });
+            act(
+                ui,
+                pal,
+                "Открыть окно сопряжения",
+                Kind::Solid,
+                connected,
+                actions,
+                || Action::StartPairing { window_s: WINDOW_S },
+            );
             widgets::hint(ui, pal, "Окно закроется само через 120 секунд");
         }
     }
@@ -157,14 +193,24 @@ fn window(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, action
 /// C: dial an address.
 fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     cell_head(ui, pal, "C", "Подключиться по адресу");
-    widgets::text(ui, "Адрес с экрана другого компьютера", 12.0, fam::sans(), pal.ink2);
+    widgets::text(
+        ui,
+        "Адрес с экрана другого компьютера",
+        12.0,
+        fam::sans(),
+        pal.ink2,
+    );
     let mut address = vm.pairing.address.clone();
     let mut submit = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let button_w = 18.0 * 2.0
             + ui.painter()
-                .layout_no_wrap("Подключиться".to_owned(), font(13.0, fam::sans_medium()), Color32::WHITE)
+                .layout_no_wrap(
+                    "Подключиться".to_owned(),
+                    font(13.0, fam::sans_medium()),
+                    Color32::WHITE,
+                )
                 .size()
                 .x;
         let input_w = (ui.available_width() - button_w - 8.0).max(80.0);
@@ -193,7 +239,11 @@ fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Acti
             submit = true;
         }
         let can = vm.connection.is_connected() && !address.trim().is_empty() && !vm.pairing.dialing;
-        let label = if vm.pairing.dialing { "Подключаемся…" } else { "Подключиться" };
+        let label = if vm.pairing.dialing {
+            "Подключаемся…"
+        } else {
+            "Подключиться"
+        };
         if widgets::button(ui, pal, label, Kind::Solid, can).clicked() {
             submit = true;
         }
@@ -207,7 +257,11 @@ fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Acti
     if submit {
         actions.push(Action::PairWith(address.trim().to_owned()));
     }
-    widgets::hint(ui, pal, "Адрес показывает окно сопряжения на другом компьютере");
+    widgets::hint(
+        ui,
+        pal,
+        "Адрес показывает окно сопряжения на другом компьютере",
+    );
 }
 
 /// One box of the six-digit code.
@@ -216,7 +270,11 @@ fn code_box(ui: &mut egui::Ui, pal: &Palette, glyph: &str, wait: bool, lit: bool
     let painter = ui.painter();
     let radius = egui::CornerRadius::same(8);
     if wait {
-        let (fill, edge) = if lit { (pal.accent_soft, pal.accent) } else { (Color32::TRANSPARENT, pal.line) };
+        let (fill, edge) = if lit {
+            (pal.accent_soft, pal.accent)
+        } else {
+            (Color32::TRANSPARENT, pal.line)
+        };
         painter.rect_filled(rect, radius, fill);
         painter.add(egui::Shape::dashed_line(
             &[
@@ -233,7 +291,13 @@ fn code_box(ui: &mut egui::Ui, pal: &Palette, glyph: &str, wait: bool, lit: bool
         let galley = painter.layout_no_wrap(glyph.to_owned(), font(16.0, fam::pixel()), pal.ink2);
         painter.galley(rect.center() - galley.size() / 2.0, galley, pal.ink2);
     } else {
-        painter.rect(rect, radius, pal.bg, Stroke::new(1.0, pal.line), StrokeKind::Inside);
+        painter.rect(
+            rect,
+            radius,
+            pal.bg,
+            Stroke::new(1.0, pal.line),
+            StrokeKind::Inside,
+        );
         let galley = painter.layout_no_wrap(glyph.to_owned(), font(24.0, fam::pixel()), pal.ink);
         painter.galley(rect.center() - galley.size() / 2.0, galley, pal.ink);
     }
@@ -256,44 +320,75 @@ fn code_row(ui: &mut egui::Ui, pal: &Palette, digits: [&str; 6], wait: bool, lit
 fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions: &mut Vec<Action>) {
     cell_head(ui, pal, "D", "Код сопряжения");
     if let Some(prompt) = &vm.pairing.prompt {
-        let name = if prompt.peer_name.is_empty() { "Компьютер" } else { prompt.peer_name.as_str() };
+        let name = if prompt.peer_name.is_empty() {
+            "Компьютер"
+        } else {
+            prompt.peer_name.as_str()
+        };
         let galley = widgets::sans_runs(
             ui,
-            &[Run::strong(name, pal.ink), Run::plain(" подключается — коды совпадают?", pal.ink)],
+            &[
+                Run::strong(name, pal.ink),
+                Run::plain(" подключается — коды совпадают?", pal.ink),
+            ],
             14.0,
             ui.available_width(),
         );
         widgets::show_galley(ui, galley);
         let digits: Vec<String> = prompt.sas_code.chars().map(String::from).collect();
         let at = |i: usize| digits.get(i).map_or("·", String::as_str);
-        code_row(ui, pal, [at(0), at(1), at(2), at(3), at(4), at(5)], false, None);
+        code_row(
+            ui,
+            pal,
+            [at(0), at(1), at(2), at(3), at(4), at(5)],
+            false,
+            None,
+        );
         widgets::duo(ui, |ui| {
             let attempt = vm.pairing.attempt_id();
             let can = attempt.is_some();
             if widgets::button(ui, pal, "Да, совпадают", Kind::Hot, can).clicked() {
                 if let Some(attempt_id) = attempt.clone() {
-                    actions.push(Action::Answer { attempt_id, approve: true });
+                    actions.push(Action::Answer {
+                        attempt_id,
+                        approve: true,
+                    });
                 }
             }
             if widgets::button(ui, pal, "Нет", Kind::Plain, can).clicked() {
                 if let Some(attempt_id) = attempt {
-                    actions.push(Action::Answer { attempt_id, approve: false });
+                    actions.push(Action::Answer {
+                        attempt_id,
+                        approve: false,
+                    });
                 }
             }
-            let label = if vm.pairing.details { "Свернуть" } else { "Подробнее" };
+            let label = if vm.pairing.details {
+                "Свернуть"
+            } else {
+                "Подробнее"
+            };
             if widgets::button(ui, pal, label, Kind::Link, true).clicked() {
                 actions.push(Action::ToggleDetails(!vm.pairing.details));
             }
         });
         if vm.pairing.details {
             let mono = |ui: &mut egui::Ui, text: String| {
-                let galley = ui.painter().layout(text, font(11.0, fam::mono()), pal.ink2, ui.available_width());
+                let galley = ui.painter().layout(
+                    text,
+                    font(11.0, fam::mono()),
+                    pal.ink2,
+                    ui.available_width(),
+                );
                 widgets::show_galley(ui, galley);
             };
             ui.spacing_mut().item_spacing.y = 4.0;
             mono(ui, format!("{name} · SHA-256 {}", prompt.peer_fingerprint));
             mono(ui, format!("ЭТОТ · SHA-256 {}", prompt.local_fingerprint));
-            mono(ui, "Отпечатки совпадают, а коды нет — не соглашайтесь.".to_owned());
+            mono(
+                ui,
+                "Отпечатки совпадают, а коды нет — не соглашайтесь.".to_owned(),
+            );
         }
     } else if let Some(name) = &vm.pairing.paired {
         widgets::text(ui, "Пара создана", 24.0, fam::sans_semibold(), pal.ink);
@@ -304,7 +399,9 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
             fam::sans(),
             pal.ink,
         );
-        act(ui, pal, "Готово", Kind::Plain, true, actions, || Action::DonePairing);
+        act(ui, pal, "Готово", Kind::Plain, true, actions, || {
+            Action::DonePairing
+        });
     } else {
         let window_open = vm.pairing.window.is_some();
         let text = if vm.pairing.dialing {
@@ -337,7 +434,9 @@ mod tests {
     #[test]
     fn the_dock_grows_only_for_the_fingerprints() {
         let mut vm = ViewModel::new(
-            CoreEndpoint::Ready { description: String::new() },
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
             LocalConfig::default(),
         );
         assert_eq!(height(&vm, false), BASE_H);

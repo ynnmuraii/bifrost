@@ -25,11 +25,7 @@ fn rgb(hex: u32) -> Color32 {
 /// plain background, as one opaque colour.
 fn over(under: Color32, r: u8, g: u8, b: u8, a: f32) -> Color32 {
     let mix = |u: u8, s: u8| (f32::from(s) * a + f32::from(u) * (1.0 - a)).round() as u8;
-    Color32::from_rgb(
-        mix(under.r(), r),
-        mix(under.g(), g),
-        mix(under.b(), b),
-    )
+    Color32::from_rgb(mix(under.r(), r), mix(under.g(), g), mix(under.b(), b))
 }
 
 /// One theme's tokens.
@@ -233,9 +229,10 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(fam::mono(), chain(&["geist-mono", "geist"]));
-    fonts
-        .families
-        .insert(fam::mono_medium(), chain(&["geist-mono-medium", "geist-mono"]));
+    fonts.families.insert(
+        fam::mono_medium(),
+        chain(&["geist-mono-medium", "geist-mono"]),
+    );
     fonts
         .families
         .insert(fam::pixel(), chain(&["silkscreen", "geist-mono", "geist"]));
@@ -292,26 +289,21 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
         style.spacing.scroll.floating = true;
         style.spacing.scroll.bar_width = 6.0;
         style.animation_time = 0.12;
-        style.text_styles.insert(
-            egui::TextStyle::Body,
-            font(14.0, fam::sans()),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Button,
-            font(13.0, fam::sans_medium()),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Monospace,
-            font(13.0, fam::mono()),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Small,
-            font(11.0, fam::mono()),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Heading,
-            font(24.0, fam::sans_semibold()),
-        );
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, font(14.0, fam::sans()));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, font(13.0, fam::sans_medium()));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Monospace, font(13.0, fam::mono()));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, font(11.0, fam::mono()));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, font(24.0, fam::sans_semibold()));
     });
 }
 
@@ -334,7 +326,13 @@ mod tests {
 
     #[test]
     fn a_pill_is_half_its_height_and_a_dark_button_is_square_ish() {
-        assert_eq!(Palette::of(Theme::Light).rad_btn(44.0), CornerRadius::same(22));
-        assert_eq!(Palette::of(Theme::Dark).rad_btn(44.0), CornerRadius::same(8));
+        assert_eq!(
+            Palette::of(Theme::Light).rad_btn(44.0),
+            CornerRadius::same(22)
+        );
+        assert_eq!(
+            Palette::of(Theme::Dark).rad_btn(44.0),
+            CornerRadius::same(8)
+        );
     }
 }

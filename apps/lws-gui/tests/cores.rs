@@ -741,13 +741,24 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
         }
     };
 
-    // This is the same request the layout screen dispatches: serialize its editor and CAS
-    // against the revision/author shown in that editor.
+    // This is the request the window dispatches for «Применить»: the user puts the other
+    // computer at this one's right edge (the «Сторона» button does what a drag does), and the
+    // draft becomes a document against the revision and author the editor shows.
+    owner.dispatch(
+        Action::SetSide(lws_gui::view_model::Side::Right),
+        Instant::now(),
+    );
     let (request, expected_author) = {
         let view = owner.view();
-        let layout_toml = view.layout_toml();
+        let request = view
+            .layout_action()
+            .expect("a placed computer is a draft that can be applied");
+        let Action::UpdateTopology { layout_toml, .. } = &request else {
+            panic!("a draft is applied through UpdateTopology");
+        };
         let parsed: config::TopologyConfig =
-            toml::from_str(&layout_toml).expect("the layout editor emits a topology document");
+            toml::from_str(std::str::from_utf8(layout_toml).expect("text"))
+                .expect("the layout editor emits a topology document");
         assert_eq!(
             parsed.links.len(),
             1,
@@ -757,11 +768,7 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
             parsed.displays
         );
         (
-            Action::UpdateTopology {
-                layout_toml: layout_toml.into_bytes(),
-                expected_revision: view.editor.revision,
-                expected_author: lws_gui::view_model::node_id_bytes(&view.editor.author),
-            },
+            request,
             lws_gui::view_model::node_id_bytes(&view.editor.author),
         )
     };
