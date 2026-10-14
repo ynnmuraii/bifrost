@@ -9,6 +9,18 @@ env:
   CARGO_TERM_COLOR: always
   # Match the required workspace gate and bound concurrent native linker work.
   CARGO_BUILD_JOBS: 2
+  # This workflow links the workspace twice: `Build` produces the binaries and
+  # `Test` re-links every crate as a test binary. On ubuntu-latest the second set
+  # used to grow `target/` from 4.5 GiB to 12 GiB on a 72 GiB runner that the
+  # cache restore leaves at 8 GiB free, and the linker died with
+  # `collect2: fatal error: ld terminated with signal 7 [Bus error]` — GNU ld
+  # mmaps the output file, so a page fault on a full filesystem is SIGBUS, not
+  # ENOSPC (run 38619266437, linking the `spike_probe` example). Debug info is
+  # most of that 12 GiB and CI never steps through a binary, so the dev and test
+  # profiles carry none of it; panics still name the function through the symbol
+  # table. This does not change what the gate compiles, runs or asserts.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   build:
@@ -41,6 +53,29 @@ jobs:
 
       - name: Cache cargo and target
         uses: Swatinem/rust-cache@v2
+        with:
+          # `v1`, not the default `v0-rust`: that namespace holds 4.5 GiB of
+          # DWARF-laden artifacts built before the profile settings above, which
+          # cargo would rebuild anyway (debuginfo is part of the fingerprint)
+          # after the restore had spent the disk this build needs.
+          prefix-key: v1-rust
+
+      # Defence in depth for the SIGBUS above: a restored cache, a bigger
+      # workspace or a runner image with less free space must not end in the
+      # linker. Below the floor it is cheaper to rebuild from scratch than to
+      # die while linking, so the cache is dropped and the build is honest about
+      # starting empty. The floor is what the two target sets need without debug
+      # info; the `Linux resources …` steps below report the real numbers.
+      - name: Linux free space guard
+        if: runner.os == 'Linux'
+        run: |
+          available=$(df -Pk --output=avail "$GITHUB_WORKSPACE" | tail -1)
+          echo "$((available / 1024)) MiB free in the workspace filesystem"
+          if [ "$available" -lt 6291456 ]; then
+            echo "less than 6 GiB free: dropping the restored target cache"
+            cargo clean
+          fi
+          df -h "$GITHUB_WORKSPACE"
 
       # The only native code in the dependency graph is ring (rustls), which
       # needs a C compiler and an archiver for its C and assembly parts;
@@ -143,7 +178,18 @@ jobs:
 
       - name: Prepare diagnostics root
         if: runner.os == 'Linux'
-        run: mkdir -p "$RUNNER_TEMP/lws-roots"
+        # A *short* root, because a socket path cannot be longer than
+        # `sockaddr_un.sun_path` (108 bytes) and two harnesses put their whole
+        # temporary tree under it. `apps/lws-core`'s agent launcher builds
+        # `<temp>/lws-core-agent-<pid>-<n>-<label>/lan-workspace/agent-<pid>-<n>.sock`,
+        # which measures `<len(temp)> + 66 + 2 * <digits of pid>`: with
+        # `$RUNNER_TEMP` (33) that fits a four-digit pid (107) and overflows on a
+        # five-digit one (109), so run 38624252563 failed
+        # `agent::launch_tests::successful_attach_keeps_the_token_until_stop_or_supervisor_drop`
+        # with «path must be shorter than SUN_LEN» as soon as the runner's pids
+        # passed 10000. `/tmp/lws-roots` (14) keeps the same path at 90 and
+        # leaves room up to a seven-digit pid. Windows has no such limit.
+        run: mkdir -p /tmp/lws-roots
 
       - name: Linux resources before test linking
         if: runner.os == 'Linux'
@@ -168,7 +214,7 @@ jobs:
         if: runner.os == 'Linux'
         env:
           LWS_KEEP_ROOTS: "1"
-          TMPDIR: ${{ runner.temp }}/lws-roots
+          TMPDIR: /tmp/lws-roots
         # Keep the server alive between short-lived probe clients. Xvfb otherwise resets
         # when its last client disconnects, racing the next core's capability probe.
         run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" cargo test --workspace
@@ -189,5 +235,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lws-roots-${{ runner.os }}
-          path: ${{ runner.temp }}/lws-roots
+          # Linux keeps its roots in `/tmp` so that socket paths fit (see
+          # `Prepare diagnostics root` above); Windows uses the job's temp
+          # directory, which has no length limit.
+          path: ${{ runner.os == 'Linux' && '/tmp/lws-roots' || format('{0}/lws-roots', runner.temp) }}
           if-no-files-found: ignore
