@@ -65,6 +65,45 @@ async fn the_socket_and_its_directory_are_owner_only() {
 }
 
 #[tokio::test]
+async fn an_owned_runtime_directory_is_repaired_and_listener_drop_removes_socket() {
+    let temp = TempSocket::new("repair");
+    fs::create_dir(&temp.dir).expect("directory");
+    fs::set_permissions(&temp.dir, fs::Permissions::from_mode(0o755)).expect("mode");
+    let listener = transport::listen(&temp.endpoint).expect("binding");
+    assert_eq!(mode(&temp.dir), 0o700);
+    drop(listener);
+    assert!(!temp.endpoint.path().exists());
+}
+
+#[tokio::test]
+async fn a_symlink_runtime_directory_is_rejected() {
+    let temp = TempSocket::new("symlink");
+    let target = TempSocket::new("symlink-target");
+    fs::create_dir(&target.dir).expect("target");
+    std::os::unix::fs::symlink(&target.dir, &temp.dir).expect("symlink");
+    assert!(transport::listen(&temp.endpoint).is_err());
+}
+
+#[tokio::test]
+async fn a_runtime_directory_owned_by_another_uid_is_rejected() {
+    let temp = TempSocket::new("foreign-owner");
+    fs::create_dir(&temp.dir).expect("directory");
+    fs::set_permissions(&temp.dir, fs::Permissions::from_mode(0o755)).expect("mode");
+    let uid = ipc::peer::current_uid().expect("uid");
+    if uid != 0 {
+        return; // Changing ownership requires root; the Linux Docker gate runs as root.
+    }
+    assert!(std::process::Command::new("chown")
+        .arg("1")
+        .arg(&temp.dir)
+        .status()
+        .expect("chown")
+        .success());
+    assert!(transport::listen(&temp.endpoint).is_err());
+    assert_eq!(mode(&temp.dir), 0o755, "foreign permissions are untouched");
+}
+
+#[tokio::test]
 async fn a_live_socket_is_reported_and_a_stale_one_is_replaced() {
     let temp = TempSocket::new("stale");
     let listener = transport::listen(&temp.endpoint).expect("first bind");
@@ -76,12 +115,9 @@ async fn a_live_socket_is_reported_and_a_stale_one_is_replaced() {
         "{error:?}"
     );
 
-    // After the owner is gone the file is stale: it is replaced, not reported.
+    // Simulate a crash: a raw listener leaves a stale path, unlike orderly Drop.
     drop(listener);
-    assert!(
-        temp.endpoint.path().exists(),
-        "the file outlives the listener"
-    );
+    drop(std::os::unix::net::UnixListener::bind(temp.endpoint.path()).expect("crash fixture"));
     let listener = transport::listen(&temp.endpoint).expect("stale socket replaced");
     assert_eq!(listener.socket_mode().expect("mode"), 0o600);
 }

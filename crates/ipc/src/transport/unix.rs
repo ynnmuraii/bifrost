@@ -17,7 +17,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tokio::net::{UnixListener, UnixStream};
@@ -85,6 +85,7 @@ pub fn gui_socket_path(runtime_dir: &Path) -> PathBuf {
 pub struct GuiListener {
     listener: UnixListener,
     path: PathBuf,
+    identity: (u64, u64),
 }
 
 /// Bind the GUI socket, creating the runtime directory 0700 when missing.
@@ -111,13 +112,27 @@ pub fn listen(endpoint: &Endpoint) -> Result<GuiListener, IpcError> {
         Err(error) => return Err(IpcError::io("binding the GUI socket", error)),
     };
 
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| IpcError::io("reading the bound socket metadata", source))?;
+    let listener = GuiListener {
+        listener,
+        path: path.to_path_buf(),
+        identity: (metadata.dev(), metadata.ino()),
+    };
     fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))
         .map_err(|source| IpcError::io("setting the GUI socket mode to 0600", source))?;
 
-    Ok(GuiListener {
-        listener,
-        path: path.to_path_buf(),
-    })
+    Ok(listener)
+}
+
+impl Drop for GuiListener {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl GuiListener {
@@ -185,12 +200,20 @@ fn ensure_runtime_dir(socket: &Path) -> Result<(), IpcError> {
     else {
         return Ok(());
     };
-    if parent.exists() {
-        return Ok(());
-    }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(DIR_MODE);
-    builder
-        .create(parent)
-        .map_err(|source| IpcError::io("creating the runtime directory", source))
+    match builder.create(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(IpcError::io("creating the runtime directory", error)),
+    }
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|source| IpcError::io("reading the runtime directory metadata", source))?;
+    if !metadata.is_dir() || Some(metadata.uid()) != crate::peer::current_uid() {
+        return Err(IpcError::config(
+            "IPC runtime directory must be a real directory owned by the effective uid",
+        ));
+    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(DIR_MODE))
+        .map_err(|source| IpcError::io("setting the runtime directory mode to 0700", source))
 }

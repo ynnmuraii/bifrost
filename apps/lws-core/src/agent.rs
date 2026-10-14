@@ -266,6 +266,8 @@ pub struct Supervisor {
     /// kills the agent, which is what core wants whenever it owns no agent any more.
     job: Option<crate::job::KillOnCoreExit>,
     link: Option<AgentLink<AgentStream>>,
+    /// Retained after attach until the agent consumes it or this launch is stopped.
+    token_file: Option<LaunchTokenFile>,
     state: AgentState,
 }
 
@@ -313,6 +315,7 @@ impl Supervisor {
             child: None,
             job: None,
             link: None,
+            token_file: None,
             state: AgentState::Starting,
         }
     }
@@ -346,9 +349,17 @@ impl Supervisor {
         self.launches += 1;
         let endpoint = launch_endpoint(&self.runtime_dir, self.launches)?;
         let mut listener = transport::listen(&endpoint).map_err(|error| error.to_string())?;
+        #[cfg(target_os = "linux")]
+        {
+            clean_stale_launches(&self.private_dir, "launch-", ".token", self.launches)?;
+            if let Some(directory) = endpoint.path().parent() {
+                clean_stale_launches(directory, "agent-", ".sock", self.launches)?;
+            }
+        }
         let token = random_token()?;
         let token_path = token_file(&self.private_dir, self.launches);
         write_token_file(&token_path, &token)?;
+        let token_cleanup = LaunchTokenFile(token_path.clone());
 
         let mut command = tokio::process::Command::new(&self.program);
         command
@@ -455,6 +466,7 @@ impl Supervisor {
             "agent started"
         );
         self.link = Some(link);
+        self.token_file = Some(token_cleanup);
         Ok(())
     }
 
@@ -576,6 +588,7 @@ impl Supervisor {
         // Dropping the job is the belt to `start_kill`'s braces: whatever the child did with
         // the kill, the kernel takes it out with the job.
         self.job = None;
+        self.token_file = None;
         if matches!(self.state, AgentState::Ready | AgentState::Starting) {
             self.state = AgentState::Lost;
         }
@@ -602,6 +615,7 @@ impl Supervisor {
         }
         self.link = None;
         self.job = None;
+        self.token_file = None;
         self.state = AgentState::Lost;
     }
 
@@ -704,19 +718,75 @@ fn random_token() -> Result<[u8; 32], String> {
     Ok(token)
 }
 
-/// `launch-<n>.token` inside the private directory.
+/// `launch-<pid>-<n>.token` inside the private directory.
 fn token_file(private_dir: &Path, launch: u64) -> PathBuf {
-    private_dir.join(format!("launch-{launch}.token"))
+    private_dir.join(format!("launch-{}-{launch}.token", std::process::id()))
 }
 
 /// Writes the token where only this user can read it and the agent deletes it.
 fn write_token_file(path: &Path, token: &[u8]) -> Result<(), String> {
-    std::fs::write(path, token).map_err(|error| format!("writing {}: {error}", path.display()))?;
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("setting {} to 0600: {error}", path.display()))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("creating {}: {error}", path.display()))?;
+    if let Err(error) = file.write_all(token).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(format!("writing {}: {error}", path.display()));
+    }
+    Ok(())
+}
+
+/// The agent normally consumes this file; every early return must clean it too.
+struct LaunchTokenFile(PathBuf);
+
+impl Drop for LaunchTokenFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clean_stale_launches(
+    directory: &Path,
+    prefix: &str,
+    suffix: &str,
+    current_launch: u64,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("reading {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("reading launch artifact: {error}"))?;
+        let name = entry.file_name();
+        let Some((pid, launch)) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix))
+            .and_then(|name| name.strip_suffix(suffix))
+            .and_then(|name| name.split_once('-'))
+            .and_then(|(pid, launch)| {
+                Some((pid.parse::<u32>().ok()?, launch.parse::<u64>().ok()?))
+            })
+        else {
+            continue;
+        };
+        let older_own_launch = pid == std::process::id() && launch < current_launch;
+        // Missing /proc is not evidence of a dead process.
+        let dead = Path::new("/proc/self").exists()
+            && std::fs::metadata(format!("/proc/{pid}"))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if older_own_launch || dead {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("removing stale launch artifact: {error}")),
+            }
+        }
     }
     Ok(())
 }
@@ -780,7 +850,10 @@ mod launch_tests {
     fn the_token_file_is_per_launch_and_written_owner_only() {
         let private = temp_dir("private");
         let path = token_file(&private, 7);
-        assert_eq!(path, private.join("launch-7.token"));
+        assert_eq!(
+            path,
+            private.join(format!("launch-{}-7.token", std::process::id()))
+        );
         assert_ne!(path, token_file(&private, 8));
 
         let mut token = [0u8; 32];
@@ -802,6 +875,16 @@ mod launch_tests {
         }
 
         let _ = std::fs::remove_dir_all(&private);
+    }
+
+    #[test]
+    fn an_existing_token_is_never_overwritten() {
+        let private = temp_dir("exclusive-token");
+        let path = token_file(&private, 1);
+        std::fs::write(&path, b"existing secret").expect("existing token");
+        assert!(write_token_file(&path, &[42; 32]).is_err());
+        assert_eq!(std::fs::read(&path).expect("unchanged"), b"existing secret");
+        std::fs::remove_dir_all(private).expect("cleanup");
     }
 
     #[test]
@@ -861,10 +944,88 @@ mod launch_tests {
         assert!(!command_args(true).contains(&"--dry-inject".to_owned()));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_attach_keeps_the_token_until_stop_or_supervisor_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let runtime = temp_dir("successful-runtime");
+        let private = temp_dir("successful-private");
+        let program = private.join("waiting-agent");
+        std::fs::write(&program, b"#!/bin/sh\nexec sleep 30\n").expect("agent fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("executable");
+        for stop_explicitly in [true, false] {
+            let mut supervisor = Supervisor::new(
+                program.clone(),
+                private.clone(),
+                runtime.clone(),
+                private.join("logs"),
+                false,
+                0,
+                false,
+                false,
+                false,
+                "Ctrl+Alt+Shift+F12".to_owned(),
+                ipc::BackendKind::Auto,
+                true,
+                300,
+                crate::portal::PortalGrants::default(),
+                TakeoverSettings {
+                    detection: ipc::TakeoverDetection::Auto,
+                    threshold_px: 12,
+                },
+                ipc::RepeatMode::ReceiverSoftware,
+            );
+            let endpoint = launch_endpoint(&runtime, 1).expect("endpoint");
+            let (started, peer) = tokio::join!(supervisor.start(AgentMode::Normal), async {
+                let stream = transport::connect(&endpoint).await.expect("connect");
+                let mut peer =
+                    AgentLink::new(stream, FRAME_MAJOR, protocol::limits::PROTOCOL_MINOR);
+                peer.recv().await.expect("attach");
+                peer
+            });
+            started.expect("successful start");
+            let token_path = token_file(&private, 1);
+            assert_eq!(
+                std::fs::read(&token_path)
+                    .expect("agent has not consumed the token yet")
+                    .len(),
+                32
+            );
+            if stop_explicitly {
+                supervisor.stop().await;
+                assert!(!token_path.exists(), "stop removes an unconsumed token");
+            } else if let Some(child) = supervisor.child.as_mut() {
+                child.start_kill().expect("kill fixture");
+            }
+            drop(supervisor);
+            assert!(!token_path.exists(), "Drop removes an unconsumed token");
+            drop(peer);
+        }
+        std::fs::remove_dir_all(runtime).expect("runtime cleanup");
+        std::fs::remove_dir_all(private).expect("private cleanup");
+    }
+
     #[tokio::test]
     async fn an_agent_that_cannot_be_spawned_is_reported_as_an_error() {
         let runtime = temp_dir("runtime");
         let private = temp_dir("private");
+        #[cfg(target_os = "linux")]
+        let stale_paths = {
+            let sockets = transport::gui_socket_path(&runtime)
+                .parent()
+                .expect("parent")
+                .to_path_buf();
+            std::fs::create_dir_all(&sockets).expect("sockets");
+            let dead_token = private.join("launch-4294967295-1.token");
+            let dead_socket = sockets.join("agent-4294967295-1.sock");
+            let live_token = private.join(format!("launch-{}-99.token", std::process::id()));
+            let live_socket = sockets.join(format!("agent-{}-99.sock", std::process::id()));
+            for path in [&dead_token, &dead_socket, &live_token, &live_socket] {
+                std::fs::write(path, b"fixture").expect("launch artifact");
+            }
+            (dead_token, dead_socket, live_token, live_socket)
+        };
         let mut supervisor = Supervisor::new(
             PathBuf::from("definitely-not-an-agent-program"),
             private.clone(),
@@ -898,6 +1059,32 @@ mod launch_tests {
             .expect_err("a missing program cannot be started");
         assert!(error.contains("cannot spawn"), "{error}");
         assert!(!supervisor.is_attached());
+        assert!(
+            !token_file(&private, 1).exists(),
+            "failed spawn leaks its token"
+        );
+        #[cfg(unix)]
+        assert!(
+            !launch_endpoint(&runtime, 1)
+                .expect("endpoint")
+                .path()
+                .exists(),
+            "failed spawn leaks its socket"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let (dead_token, dead_socket, live_token, live_socket) = stale_paths;
+            assert!(!dead_token.exists());
+            assert!(!dead_socket.exists());
+            assert!(
+                live_token.exists(),
+                "never delete a live/newer launch token"
+            );
+            assert!(
+                live_socket.exists(),
+                "never delete a live/newer launch socket"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&runtime);
         let _ = std::fs::remove_dir_all(&private);
