@@ -9,6 +9,8 @@
 //! Dry file controls also cover held-edge refusal storms, emergency cancellation in
 //! Preparing, local click passthrough during failed Temporary capture, and stale
 //! topology edges without a live link. None of these controls inject desktop input.
+//! Short Temporary captures are observed from the agent's durable log concurrently
+//! with the switch CLI; click completion must precede the logged capture release.
 //!
 //! ```text
 //! # the fast variant that runs with the workspace suite (50 cycles + the fault cases)
@@ -205,19 +207,26 @@ fn a_click_during_a_failed_temporary_capture_reaches_the_local_desktop() {
     let harness = Harness::start_fault_controls(true, false);
     harness.wait_linked();
     harness.proxy.as_ref().expect("proxy").blackhole();
-    harness.a.switch(&harness.b.id).expect("start preparation");
-    harness.a.wait_dry_capture("Temporary");
     let before = harness.a.dry_local_passthrough();
-    harness.a.trigger_dry_click();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while harness.a.dry_local_passthrough() == before {
-        assert!(
-            Instant::now() < deadline,
-            "the local click was lost during Preparing"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    harness.a.wait_dry_capture("Temporary");
+    let started = common::now_millis();
+    let (temporary, clicked) = std::thread::scope(|scope| {
+        // Watch concurrently: the switch CLI can return after the short capture ended.
+        let click = scope.spawn(|| {
+            let temporary = harness.a.wait_dry_capture_started("Temporary", started);
+            harness.a.trigger_dry_click();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while harness.a.dry_local_passthrough() == before {
+                assert!(
+                    Instant::now() < deadline,
+                    "the local click was lost during Preparing"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (temporary, common::now_millis())
+        });
+        harness.a.switch(&harness.b.id).expect("start preparation");
+        click.join().expect("click observer")
+    });
     assert_eq!(
         harness.a.dry_local_passthrough() - before,
         2,
@@ -228,6 +237,27 @@ fn a_click_during_a_failed_temporary_capture_reaches_the_local_desktop() {
         .wait_for("prepare times out", Duration::from_secs(2), |s| s.is_idle())
         .expect("failed Temporary capture must release input");
     assert_eq!(harness.a.dry_local_passthrough() - before, 2);
+    harness.a.wait_dry_capture("Observe");
+    let agent_log = std::fs::read_to_string(harness.a.root.join("state/logs/lws-agent.log"))
+        .expect("agent capture log");
+    let released = agent_log
+        .lines()
+        .filter(|line| {
+            line.contains("self-timeout of a temporary capture")
+                || line.contains("dry mode: buffered events would be replayed locally")
+        })
+        .filter_map(common::utc_millis)
+        .find(|at| *at >= temporary)
+        .expect("failed Temporary capture must log its release");
+    assert!(
+        clicked >= temporary && clicked < released,
+        "the click must pass through during Temporary, not after its release"
+    );
+    // Re-observe after teardown deliberately: a current-mode snapshot loses this evidence.
+    assert_eq!(
+        harness.a.wait_dry_capture_started("Temporary", started),
+        temporary
+    );
     assert!(
         !harness
             .a

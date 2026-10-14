@@ -446,6 +446,27 @@ impl Node {
         }
     }
 
+    /// Durable capture evidence, scoped to this action rather than an earlier capture.
+    pub fn wait_dry_capture_started(&self, expected: &str, since: i64) -> i64 {
+        let path = self.root.join("state/logs/lws-agent.log");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let marker = format!("dry mode: capture begins (no OS hooks) kind={expected}");
+        loop {
+            let log = std::fs::read_to_string(&path).unwrap_or_default();
+            if let Some(at) = log.lines().find_map(|line| {
+                let at = utc_millis(line)?;
+                (at >= since && line.contains(&marker)).then_some(at)
+            }) {
+                return at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent never logged {expected} capture since {since}:\n{log}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     pub fn wait_dry_capture(&self, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
