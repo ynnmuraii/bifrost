@@ -762,10 +762,10 @@ impl WaylandCapture {
                     None
                 }
             },
-            EiEvent::ScrollDiscrete(scroll) => Some(CapturedEvent::Input(InputEvent::Scroll {
-                h120: scroll.discrete_dx.saturating_mul(DETENT_UNITS as i32),
-                v120: scroll.discrete_dy.saturating_mul(DETENT_UNITS as i32),
-            })),
+            EiEvent::ScrollDiscrete(scroll) => {
+                let (h120, v120) = discrete_scroll(scroll.discrete_dx, scroll.discrete_dy);
+                Some(CapturedEvent::Input(InputEvent::Scroll { h120, v120 }))
+            }
             EiEvent::ScrollDelta(delta) => self.smooth_scroll(delta.dx, delta.dy),
             // Frames, emulation markers, modifiers and touch/text events do not map onto
             // the product's normalized event set.
@@ -773,12 +773,15 @@ impl WaylandCapture {
         }
     }
 
-    /// Converts pixel-precise scroll into 120ths of a detent, keeping the remainder
-    /// (and the direction) for the next event.
+    /// Converts pixel-precise scroll into 120ths of a detent, keeping the remainder for the
+    /// next event.
+    ///
+    /// The vertical sign flips here for the same reason it does in the injector: `ei_scroll`
+    /// counts positive `y` as *down*, the wire counts it as *up*.
     fn smooth_scroll(&mut self, dx: f32, dy: f32) -> Option<CapturedEvent> {
         let (mut rem_h, mut rem_v) = self.scroll_remainder;
         rem_h += f64::from(dx) * DETENT_UNITS / SMOOTH_SCROLL_UNITS_PER_DETENT;
-        rem_v += f64::from(dy) * DETENT_UNITS / SMOOTH_SCROLL_UNITS_PER_DETENT;
+        rem_v -= f64::from(dy) * DETENT_UNITS / SMOOTH_SCROLL_UNITS_PER_DETENT;
         let units_h = rem_h.trunc();
         let units_v = rem_v.trunc();
         rem_h -= units_h;
@@ -808,6 +811,22 @@ fn integrate_motion(cursor: &mut Option<Position>, dx: f64, dy: f64) -> Option<P
 /// Clamps a 120th-of-a-detent count into `i32`.
 pub(crate) fn clamp_h120(units: f64) -> i32 {
     units.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// One `ei_scroll.scroll_discrete` event as the wire's 120ths of a detent.
+///
+/// Both sides count 120 per detent (`ei-scroll.xml`: "The value for one scroll unit is 120"),
+/// but the vertical sign is the protocol's: `ei_scroll` follows `wl_pointer`/libinput, where
+/// positive `y` is *down* (mutter maps `> 0` to `CLUTTER_SCROLL_DOWN`), while the wire — like
+/// Windows `WHEEL_DELTA` and X11 buttons 4/5 — counts positive as *up*. Horizontal keeps its
+/// sign: positive is right on both sides.
+pub(crate) fn discrete_scroll(discrete_dx: i32, discrete_dy: i32) -> (i32, i32) {
+    (
+        discrete_dx.saturating_mul(DETENT_UNITS as i32),
+        discrete_dy
+            .saturating_mul(DETENT_UNITS as i32)
+            .saturating_neg(),
+    )
 }
 
 fn key_state(state: ei::keyboard::KeyState) -> KeyState {
