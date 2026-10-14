@@ -382,9 +382,14 @@ impl Clipboard {
             "clipboard offer"
         );
         self.payload = payload;
-        // «Локальное копирование побеждает»: a fresh local copy cancels what an incoming
-        // transfer was going to deliver, so a newer offer must supersede the one on the wire.
+        // «Локальное копирование побеждает»: a fresh local copy cancels the **incoming**
+        // transfer the wire was about to deliver — otherwise a late `ClipboardComplete` would
+        // apply the peer's payload over this one. The outgoing offers go too: the payload they
+        // carry belongs to the copy this one replaced. (`incoming` and `pending_request` are
+        // what the peer's transfer would otherwise complete into.)
         self.offered.clear();
+        self.incoming.clear();
+        self.pending_request = None;
         self.fan_out(offer).await
     }
 
@@ -1263,6 +1268,116 @@ mod tests {
             matches!(closed, Ok(Err(_))),
             "a revoked peer's bound clipboard channel must be closed, got {closed:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R5: a local copy must cancel the incoming transfer, or a late `Complete` overwrites it.
+    ///
+    /// `on_local_copy` used to clear only `offered` (the outgoing side), leaving `incoming`
+    /// and `pending_request` alive: the peer's `ClipboardComplete` then called
+    /// `deliver_to_agent`, replacing the newer local copy and handing the stale payload to the
+    /// agent.
+    #[tokio::test]
+    async fn a_local_copy_cancels_the_incoming_transfer_before_a_late_complete() {
+        use std::collections::BTreeSet;
+        use std::sync::RwLock;
+
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-local-copy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(&root))
+                .expect("identity")
+                .0,
+        );
+        let settings = Settings {
+            enabled: true,
+            policy: cb::Policy {
+                enabled: true,
+                skip_secret_marked: true,
+                max_bytes: cb::MAX_BYTES,
+            },
+            rate_bytes_per_s: 0,
+            // `transfer = "on_focus_enter"`: the offer is held, which is the deferred path.
+            eager: false,
+        };
+        let (mut clipboard, _events) = Clipboard::start(
+            identity.node_id(),
+            settings,
+            identity,
+            Arc::new(RwLock::new(BTreeSet::new())),
+            "127.0.0.1:0".parse().expect("an address"),
+            4,
+        )
+        .await
+        .expect("the clipboard endpoint starts");
+
+        let peer: NodeId = [0x21u8; 32].into();
+        let origin = [0x31u8; 32];
+        let offer_id = [0x41u8; 16];
+        let remote = b"the peer's payload".to_vec();
+        let size = remote.len() as u64;
+
+        // The offer arrives and is held for focus.
+        let out = clipboard
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Offer {
+                    offer_id,
+                    origin_node_id: origin,
+                    origin_version: 9,
+                    mime: cb::MIME.to_owned(),
+                    size_bytes: size,
+                },
+            )
+            .await;
+        assert!(out.is_empty());
+        assert!(clipboard.pending_request.is_some(), "the offer is held");
+
+        // Its data is already in flight.
+        let out = clipboard
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Data {
+                    offer_id,
+                    chunk_index: 0,
+                    chunk_count: 1,
+                    data: remote.clone(),
+                },
+            )
+            .await;
+        assert!(out.is_empty());
+
+        // The user copies something newer on this node.
+        let local = b"a newer local copy".to_vec();
+        let _ = clipboard.on_local_copy(local.clone(), Vec::new()).await;
+
+        // The peer's `Complete` arrives late.
+        let out = clipboard
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Complete {
+                    offer_id,
+                    sha256: cb::sha256(&remote),
+                },
+            )
+            .await;
+        assert!(
+            out.iter().all(|out| !matches!(out, Out::Agent(_))),
+            "a superseded incoming transfer must not reach the agent"
+        );
+        assert_eq!(
+            clipboard.payload, local,
+            "the newer local copy must not be overwritten"
+        );
+        assert!(clipboard.incoming.is_empty(), "the incoming transfer is gone");
+        assert!(clipboard.pending_request.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
