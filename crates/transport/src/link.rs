@@ -267,6 +267,13 @@ mod tests {
                         })),
                         ..Default::default()
                     },
+                    wire::InputEvent {
+                        event: Some(wire::input_event::Event::Scroll(wire::Scroll {
+                            horizontal_units120: 0,
+                            vertical_units120: 120,
+                        })),
+                        ..Default::default()
+                    },
                 ],
             });
             counters.record(Some(&payload), true);
@@ -277,6 +284,8 @@ mod tests {
             keys_up: 1,
             buttons_down: 1,
             buttons_up: 1,
+            wheel_v: 2,
+            wheel_h: 0,
         };
         assert_eq!(counters.snapshot().input_tx, expected);
         assert_eq!(counters.snapshot().input_rx, expected);
@@ -379,8 +388,8 @@ pub(crate) struct LeaseTransportCounters {
     challenge_decoded: AtomicU64,
     renew_decoded: AtomicU64,
     status_decoded: AtomicU64,
-    input_tx: [AtomicU64; 4],
-    input_rx: [AtomicU64; 4],
+    input_tx: [AtomicU64; 6],
+    input_rx: [AtomicU64; 6],
 }
 
 impl LeaseTransportCounters {
@@ -396,6 +405,17 @@ impl LeaseTransportCounters {
                 let (offset, state) = match &event.event {
                     Some(wire::input_event::Event::Key(key)) => (0, key.state),
                     Some(wire::input_event::Event::Button(button)) => (2, button.state),
+                    // The wire's `Scroll` has no edge: it counts one per axis that carried
+                    // units, so a wheel that never arrives is visible at the link too.
+                    Some(wire::input_event::Event::Scroll(scroll)) => {
+                        if scroll.vertical_units120 != 0 {
+                            counters[4].fetch_add(1, Ordering::Relaxed);
+                        }
+                        if scroll.horizontal_units120 != 0 {
+                            counters[5].fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
                     _ => continue,
                 };
                 let index = match wire::KeyState::try_from(state) {
@@ -433,12 +453,14 @@ impl LeaseTransportCounters {
     }
 }
 
-fn edge_snapshot(counters: &[AtomicU64; 4]) -> input_model::EdgeCounters {
+fn edge_snapshot(counters: &[AtomicU64; 6]) -> input_model::EdgeCounters {
     input_model::EdgeCounters {
         keys_down: counters[0].load(Ordering::Relaxed),
         keys_up: counters[1].load(Ordering::Relaxed),
         buttons_down: counters[2].load(Ordering::Relaxed),
         buttons_up: counters[3].load(Ordering::Relaxed),
+        wheel_v: counters[4].load(Ordering::Relaxed),
+        wheel_h: counters[5].load(Ordering::Relaxed),
     }
 }
 

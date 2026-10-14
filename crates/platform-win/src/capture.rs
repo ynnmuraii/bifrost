@@ -242,6 +242,8 @@ struct Shared {
     keys_up: AtomicU64,
     buttons_down: AtomicU64,
     buttons_up: AtomicU64,
+    wheel_v: AtomicU64,
+    wheel_h: AtomicU64,
 }
 
 // Windows invokes low-level hooks on their installing thread; the Raw Input
@@ -284,6 +286,8 @@ impl Capture {
             keys_up: AtomicU64::new(0),
             buttons_down: AtomicU64::new(0),
             buttons_up: AtomicU64::new(0),
+            wheel_v: AtomicU64::new(0),
+            wheel_h: AtomicU64::new(0),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             unmapped_keys: AtomicU64::new(0),
@@ -408,6 +412,8 @@ impl Capture {
                 keys_up: load(&self.shared.keys_up),
                 buttons_down: load(&self.shared.buttons_down),
                 buttons_up: load(&self.shared.buttons_up),
+                wheel_v: load(&self.shared.wheel_v),
+                wheel_h: load(&self.shared.wheel_h),
             },
             capture_injected: self.shared.capture_injected.load(Ordering::Relaxed),
             mode: capture_kind(&self.shared),
@@ -646,6 +652,16 @@ fn push(shared: &Shared, event: InputEvent) {
             state: KeyState::Up,
             ..
         } => Some(&shared.buttons_up),
+        // The wheel has no edge to balance, but it is the input whose loss is otherwise
+        // invisible: count one per axis that carried units, at the hook itself.
+        InputEvent::Scroll { h120, v120 } => {
+            for (units, counter) in [(v120, &shared.wheel_v), (h120, &shared.wheel_h)] {
+                if *units != 0 {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            None
+        }
         _ => None,
     };
     if let Some(counter) = edge {
@@ -1129,6 +1145,8 @@ mod tests {
             keys_up: AtomicU64::new(0),
             buttons_down: AtomicU64::new(0),
             buttons_up: AtomicU64::new(0),
+            wheel_v: AtomicU64::new(0),
+            wheel_h: AtomicU64::new(0),
         };
         (shared, rx)
     }
@@ -1237,6 +1255,69 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(shared.buttons_down.load(Ordering::Relaxed), 1);
         assert_eq!(shared.buttons_up.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    /// The hook end of the wheel: `WHEEL_DELTA` is 120 per notch, signed in the high word
+    /// (positive is away from the user), the axis is told by the message, and a
+    /// high-resolution wheel's fraction of a notch travels as it is — the receiver
+    /// accumulates it, so normalising it here would lose the user's slow scroll.
+    #[test]
+    fn remote_wheel_messages_keep_their_units_sign_and_axis() {
+        use super::*;
+        let (shared, rx) = hook_state(CaptureKind::Remote);
+        let wheel = |delta: i16| MSLLHOOKSTRUCT {
+            mouseData: u32::from(delta as u16) << 16,
+            ..Default::default()
+        };
+        for (message, delta, expected) in [
+            (
+                WM_MOUSEWHEEL,
+                120i16,
+                InputEvent::Scroll { h120: 0, v120: 120 },
+            ),
+            (
+                WM_MOUSEWHEEL,
+                -120,
+                InputEvent::Scroll {
+                    h120: 0,
+                    v120: -120,
+                },
+            ),
+            (WM_MOUSEWHEEL, 30, InputEvent::Scroll { h120: 0, v120: 30 }),
+            (
+                WM_MOUSEHWHEEL,
+                120,
+                InputEvent::Scroll { h120: 120, v120: 0 },
+            ),
+            (
+                WM_MOUSEHWHEEL,
+                -30,
+                InputEvent::Scroll { h120: -30, v120: 0 },
+            ),
+        ] {
+            let ms = wheel(delta);
+            assert_eq!(
+                handle_mouse(
+                    &shared,
+                    WPARAM(message as usize),
+                    LPARAM(&ms as *const _ as isize)
+                ),
+                Some(true),
+                "a wheel turn in Remote must be swallowed locally"
+            );
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Ok(CaptureEvent::Input(event)) if event == expected
+                ),
+                "message {message:#x} delta {delta} must queue {expected:?}"
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(shared.wheel_v.load(Ordering::Relaxed), 3);
+        assert_eq!(shared.wheel_h.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.captured.load(Ordering::Relaxed), 5);
         assert_eq!(shared.dropped.load(Ordering::Relaxed), 0);
     }
 

@@ -40,13 +40,19 @@ pub mod repeat;
 
 pub use repeat::RepeatFilter;
 
-/// Cumulative discrete input edges at a diagnostic stage boundary.
+/// Cumulative discrete input at a diagnostic stage boundary: the key and button edges the
+/// stuck-state guarantees rest on, plus the wheel events that make a silently lost scroll
+/// visible in the same line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EdgeCounters {
     pub keys_down: u64,
     pub keys_up: u64,
     pub buttons_down: u64,
     pub buttons_up: u64,
+    /// Wheel events that carried vertical units, either sign.
+    pub wheel_v: u64,
+    /// Wheel events that carried horizontal units, either sign.
+    pub wheel_h: u64,
 }
 
 impl EdgeCounters {
@@ -68,6 +74,17 @@ impl EdgeCounters {
                 state: KeyState::Up,
                 ..
             } => &mut self.buttons_up,
+            // A wheel event has no edge, but it is the one input the receiver can lose
+            // without leaving a trace on either side: one count per axis that carried units.
+            InputEvent::Scroll { h120, v120 } => {
+                if *v120 != 0 {
+                    self.wheel_v = self.wheel_v.saturating_add(1);
+                }
+                if *h120 != 0 {
+                    self.wheel_h = self.wheel_h.saturating_add(1);
+                }
+                return;
+            }
             _ => return,
         };
         *counter = counter.saturating_add(1);
@@ -79,6 +96,8 @@ impl EdgeCounters {
             keys_up: self.keys_up.saturating_sub(baseline.keys_up),
             buttons_down: self.buttons_down.saturating_sub(baseline.buttons_down),
             buttons_up: self.buttons_up.saturating_sub(baseline.buttons_up),
+            wheel_v: self.wheel_v.saturating_sub(baseline.wheel_v),
+            wheel_h: self.wheel_h.saturating_sub(baseline.wheel_h),
         }
     }
 }
@@ -361,6 +380,24 @@ mod tests {
             button: MouseButton::Left,
             state: KeyState::Down,
         });
+        counts.record(&InputEvent::Scroll { h120: 0, v120: 120 });
+        counts.record(&InputEvent::Scroll {
+            h120: -120,
+            v120: 120,
+        });
+        counts.record(&InputEvent::Scroll { h120: 0, v120: 0 });
+        assert_eq!(
+            counts,
+            EdgeCounters {
+                keys_down: 0,
+                keys_up: 0,
+                buttons_down: 1,
+                buttons_up: 0,
+                wheel_v: 2,
+                wheel_h: 1,
+            },
+            "a wheel event counts on each axis that carried units, and a zero delta on none"
+        );
         let baseline = counts;
         for state in [KeyState::Down, KeyState::Up] {
             counts.record(&InputEvent::Button {
@@ -372,13 +409,19 @@ mod tests {
                 state,
             });
         }
+        counts.record(&InputEvent::Scroll {
+            h120: 0,
+            v120: -120,
+        });
         assert_eq!(
             counts.since(baseline),
             EdgeCounters {
                 keys_down: 1,
                 keys_up: 1,
                 buttons_down: 1,
-                buttons_up: 1
+                buttons_up: 1,
+                wheel_v: 1,
+                wheel_h: 0,
             }
         );
         assert_eq!(baseline.since(counts), EdgeCounters::default());
