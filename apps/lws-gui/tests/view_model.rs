@@ -723,10 +723,13 @@ fn dragging_chooses_all_four_edges() {
             &vm.editor.shapes[peer],
             side,
         );
+        // The drag lands exactly on the edge. `y` is not offset: a snap picks the *nearest*
+        // candidate, and on a vertical edge the top-aligned candidate can be closer than the
+        // centred one when the two computers have different heights.
         vm.local(&Action::MoveNode {
             node_id: PEER_NODE.to_owned(),
             x: target.x + 3.0,
-            y: target.y + 3.0,
+            y: target.y,
         });
         assert_eq!(vm.editor.placement[peer].x, target.x.round());
         assert_eq!(vm.editor.placement[peer].y, target.y.round());
