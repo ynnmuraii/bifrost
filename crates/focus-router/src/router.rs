@@ -25,7 +25,7 @@
 //! Everything is deterministic: no clock reads (every call takes `now_ms`), no
 //! randomness ([`Identifiers`] is injected), no I/O, no async.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use geometry::{NodeId, Position};
 use input_model::{CaptureKind, HidKey, MouseButton};
@@ -113,6 +113,39 @@ enum PendingOwnership {
     SelfGrant { serial: u64 },
 }
 
+/// Recent terminal leases only: random 128-bit IDs are never reused by a source.
+/// The last 1024 IDs guard delayed/replayed prepares across recent transitions;
+/// active frames also require the current lease, owner/serial and connection-bound
+/// nonce (docs/05-protocol.md). This is not a lifetime registry of random IDs.
+#[derive(Debug, Default)]
+struct BurnedLeases {
+    ids: HashSet<LeaseId>,
+    order: VecDeque<LeaseId>,
+}
+
+impl BurnedLeases {
+    const CAPACITY: usize = 1024;
+
+    fn insert(&mut self, id: LeaseId) {
+        if self.ids.insert(id) {
+            self.order.push_back(id);
+            if self.order.len() > Self::CAPACITY {
+                self.ids
+                    .remove(&self.order.pop_front().expect("nonempty history"));
+            }
+        }
+    }
+
+    fn contains(&self, id: &LeaseId) -> bool {
+        self.ids.contains(id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 /// One node's focus/lease/ownership router.
 #[derive(Debug)]
 pub struct FocusRouter<I: Identifiers = crate::flow::SequentialIds> {
@@ -127,10 +160,8 @@ pub struct FocusRouter<I: Identifiers = crate::flow::SequentialIds> {
     diagnostics: Option<crate::diagnostics::Accounting>,
     pressed: PressedSet,
     peers: BTreeMap<NodeId, Peer>,
-    /// `lease_id`s that have expired or been released: «`lease_id` — random bytes16,
-    /// never reused» and «После истечения deadline lease необратимо Expired ... нужен
-    /// новый `EnterPrepare`».
-    burned: BTreeSet<LeaseId>,
+    /// Bounded replay history for recently expired or released lease IDs.
+    burned: BurnedLeases,
     /// The applied topology revision, checked against `EnterPrepare`.
     topology_revision: u64,
     /// The input agent is gone (`Blocked`).
@@ -157,7 +188,7 @@ impl<I: Identifiers> FocusRouter<I> {
             diagnostics: None,
             pressed: PressedSet::default(),
             peers: BTreeMap::new(),
-            burned: BTreeSet::new(),
+            burned: BurnedLeases::default(),
             topology_revision: 0,
             blocked: false,
             pending_ownership: None,
@@ -2186,5 +2217,50 @@ impl<I: Identifiers> FocusRouter<I> {
             self.last_ownership = state;
             out.push(Output::Notice(Notice::Ownership(state)));
         }
+    }
+}
+
+#[cfg(test)]
+mod burned_tests {
+    use super::*;
+
+    #[test]
+    fn burned_history_is_bounded_and_keeps_recent_ids() {
+        let mut router = FocusRouter::new(
+            [0; 32].into(),
+            Timing::default(),
+            crate::flow::SequentialIds::default(),
+            Capabilities::default(),
+        );
+        for serial in 0u128..1050 {
+            router.burned.insert(serial.to_le_bytes());
+        }
+        assert!(router.burned.len() <= 1024);
+        assert!(router.burned.contains(&1049u128.to_le_bytes()));
+        let recent = 1049u128.to_le_bytes();
+        let mut out = Vec::new();
+        router.on_enter_prepare(
+            0,
+            Frame {
+                from: [1; 32].into(),
+                lease_id: recent,
+            },
+            0,
+            Position::new("display", 0.0, 0.0),
+            0,
+            &mut out,
+        );
+        assert!(out.iter().any(|output| matches!(
+            output,
+            Output::Send {
+                message: Message::EnterAck {
+                    lease_id,
+                    accepted: false,
+                    reason: Some(ErrorCode::LeaseMismatch),
+                    ..
+                },
+                ..
+            } if *lease_id == recent
+        )));
     }
 }
