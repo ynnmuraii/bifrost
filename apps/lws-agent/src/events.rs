@@ -61,6 +61,8 @@ pub fn edge_counters(counters: input_model::EdgeCounters) -> ipc::EdgeCounters {
         keys_up: counters.keys_up,
         buttons_down: counters.buttons_down,
         buttons_up: counters.buttons_up,
+        wheel_v: counters.wheel_v,
+        wheel_h: counters.wheel_h,
     }
 }
 

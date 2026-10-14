@@ -167,12 +167,17 @@ message CaptureReady { bytes lease_id = 1; CaptureKind kind = 2; }
 // Portal activation coordinates are node-logical; edge identifies the accepted barrier.
 enum PortalEdge { PORTAL_EDGE_UNSPECIFIED = 0; PORTAL_EDGE_LEFT = 1; PORTAL_EDGE_RIGHT = 2; PORTAL_EDGE_TOP = 3; PORTAL_EDGE_BOTTOM = 4; }
 message PortalActivation { PointerAbs position = 1; PortalEdge edge = 2; }
-// Cumulative discrete edges; snapshots are per capture/injection lease, not log interval.
+// Cumulative discrete edges and wheel events; snapshots are per capture/injection lease,
+// not log interval.
 message EdgeCounters {
   uint64 keys_down = 1;
   uint64 keys_up = 2;
   uint64 buttons_down = 3;
   uint64 buttons_up = 4;
+  // Wheel events that carried vertical units (either sign).
+  uint64 wheel_v = 5;
+  // Wheel events that carried horizontal units (either sign).
+  uint64 wheel_h = 6;
 }
 message CapturedBatch { repeated LocalEvent events = 1; bool at_edge = 2; PortalActivation activation = 3; EdgeCounters hook_edges = 4; }
 message EmergencyFired { bytes lease_id = 1; } // agent has already restored local control
