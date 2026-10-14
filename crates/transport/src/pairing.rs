@@ -202,7 +202,11 @@ mod tests {
         }
         let window = gate.window(0).expect("the window must stay open");
         assert_eq!(window.pending(), 0, "a dropped guard releases its slot");
-        assert_eq!(window.attempts(), 0, "an abandoned handshake is not an attempt");
+        assert_eq!(
+            window.attempts(),
+            0,
+            "an abandoned handshake is not an attempt"
+        );
         // The budget is whole again.
         assert!(gate.admit(0).is_ok());
     }

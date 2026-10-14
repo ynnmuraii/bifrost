@@ -571,7 +571,11 @@ fn releasing_a_pending_handshake_does_not_spend_an_attempt() {
     window.admit(0).expect("the first handshake");
     window.release_pending();
     assert_eq!(window.pending(), 0);
-    assert_eq!(window.attempts(), 0, "an abandoned handshake is not an attempt");
+    assert_eq!(
+        window.attempts(),
+        0,
+        "an abandoned handshake is not an attempt"
+    );
     assert!(window.is_open(0));
 }
 

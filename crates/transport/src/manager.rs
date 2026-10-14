@@ -903,8 +903,11 @@ async fn serve_connection(
         // actually handed to the application disarms it, because only then does a ceremony
         // own it and call `PairingGate::finish`.
         let guard = gate.admit_guard();
-        let stream = match tokio::time::timeout(handshake_timeout, start.into_stream(pairing_config))
-            .await
+        let stream = match tokio::time::timeout(
+            handshake_timeout,
+            start.into_stream(pairing_config),
+        )
+        .await
         {
             Ok(Ok(stream)) => stream,
             _ => return,
@@ -920,7 +923,8 @@ async fn serve_connection(
         return;
     }
 
-    let stream = match tokio::time::timeout(handshake_timeout, start.into_stream(link_config)).await {
+    let stream = match tokio::time::timeout(handshake_timeout, start.into_stream(link_config)).await
+    {
         Ok(Ok(stream)) => stream,
         _ => return,
     };

@@ -859,7 +859,16 @@ async fn a_silent_connection_does_not_block_a_valid_one() {
 
     // A real dialer, queued behind it.
     let dial = tokio::spawn(async move {
-        dial_clipboard(&identity_b, b_pins, id_a, address, [1; 16], [2; 16], [3; 32]).await
+        dial_clipboard(
+            &identity_b,
+            b_pins,
+            id_a,
+            address,
+            [1; 16],
+            [2; 16],
+            [3; 32],
+        )
+        .await
     });
 
     let accepted = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
