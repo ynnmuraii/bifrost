@@ -263,6 +263,9 @@ impl X11Injector {
     /// release fails (the first error is reported); entries whose release failed
     /// stay in the ledger so a later attempt can retry them.
     pub fn release_all(&mut self) -> InjectResult {
+        // A fraction of a notch left over from one lease must not scroll in the next one.
+        self.scroll_remainder_h = 0;
+        self.scroll_remainder_v = 0;
         let keys = self.ledger.keys();
         let buttons = self.ledger.buttons();
         let mut applied_count = 0usize;

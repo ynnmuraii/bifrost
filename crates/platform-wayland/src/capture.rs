@@ -821,12 +821,8 @@ pub(crate) fn clamp_h120(units: f64) -> i32 {
 /// Windows `WHEEL_DELTA` and X11 buttons 4/5 — counts positive as *up*. Horizontal keeps its
 /// sign: positive is right on both sides.
 pub(crate) fn discrete_scroll(discrete_dx: i32, discrete_dy: i32) -> (i32, i32) {
-    (
-        discrete_dx.saturating_mul(DETENT_UNITS as i32),
-        discrete_dy
-            .saturating_mul(DETENT_UNITS as i32)
-            .saturating_neg(),
-    )
+    // The values are already 120ths: no unit conversion, only the vertical sign.
+    (discrete_dx, discrete_dy.saturating_neg())
 }
 
 fn key_state(state: ei::keyboard::KeyState) -> KeyState {
