@@ -1005,10 +1005,20 @@ impl WaylandInjector {
                 let scroll = self.scroll.as_ref().ok_or(WaylandError::MissingInterface {
                     interface: "ei_scroll",
                 })?;
-                let steps_x = split_detents(h120, &mut self.scroll_remainder.0);
-                let steps_y = split_detents(v120, &mut self.scroll_remainder.1);
-                if steps_x != 0 || steps_y != 0 {
-                    scroll.scroll_discrete(steps_x, steps_y);
+                let units_x = discrete_units(h120, &mut self.scroll_remainder.0);
+                let units_y = discrete_units(v120, &mut self.scroll_remainder.1);
+                if units_x != 0 || units_y != 0 {
+                    // Sending whole *detents* here (`1`) instead of 120ths is what made the
+                    // wheel do nothing on a KDE/KWin receiver: KWin reads the request as
+                    // `value * 15/120` degrees, so one detent arrived as 0.125 degrees and
+                    // rounded away to no scroll at all. `ei-scroll.xml` says the same in
+                    // words: "The value for one scroll unit is 120" — mutter divides by 120.
+                    //
+                    // The vertical sign also belongs to this boundary: `ei_scroll` follows
+                    // `wl_pointer`/libinput, where positive `y` is *down*, while the wire —
+                    // like Windows `WHEEL_DELTA` and X11 buttons 4/5 — counts positive as
+                    // *up*. Horizontal keeps its sign: positive is right on both sides.
+                    scroll.scroll_discrete(units_x, units_y.saturating_neg());
                     self.commit_frame();
                 }
                 Ok(None)
@@ -1084,19 +1094,22 @@ fn declare_device_ready(device: &event::Device) {
     }
 }
 
-/// Splits `value` (in 120ths of a wheel detent) into whole detents, keeping the
-/// sub-detent remainder in `remainder` for the next event.
-pub(crate) fn split_detents(value: i32, remainder: &mut i32) -> i32 {
-    // `i64` accumulator on purpose: the previous `i32::saturating_add` *lost* units at the
-    // integer limits (a remainder of `i32::MAX` plus a positive value saturated instead of
-    // carrying the excess into the next event), which broke the conservation invariant
-    // `steps * 120 + remainder == value + previous_remainder`.
+/// The whole detents in `value` (in 120ths), as the units `ei_scroll.scroll_discrete`
+/// counts, keeping the sub-detent remainder in `remainder` for the next event.
+///
+/// One detent is 120 on both sides of this boundary (`DETENT_UNITS`), so the returned value
+/// is `steps * 120` and never a step count: `1` per detent is what a receiver rounds away.
+/// It saturates at the `i32` limits — `|total| <= 2 * i32::MAX`, and only the multiply can
+/// leave the range (the previous `i32` implementation instead *lost* units at the limits: a
+/// remainder of `i32::MAX` plus a positive value saturated instead of carrying the excess
+/// into the next event, which broke the conservation invariant
+/// `units + remainder == value + previous_remainder`).
+pub(crate) fn discrete_units(value: i32, remainder: &mut i32) -> i32 {
+    // `i64` accumulator on purpose: the sum of two `i32` cannot overflow it.
     let total = i64::from(value) + i64::from(*remainder);
     let steps = total / i64::from(DETENT_UNITS);
     *remainder = (total - steps * i64::from(DETENT_UNITS)) as i32;
-    // `|total| <= 2 * i32::MAX` and `DETENT_UNITS == 120`, so `|steps| < 2^31` by a wide
-    // margin; the cast cannot truncate.
-    steps as i32
+    (steps * i64::from(DETENT_UNITS)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 fn key_state(state: KeyState) -> ei::keyboard::KeyState {
@@ -1118,7 +1131,7 @@ fn button_state(state: KeyState) -> ei::button::ButtonState {
 #[cfg(test)]
 mod tests {
 
-    use super::{route_event, select_devices, split_detents, DeviceOffer, DeviceSelection};
+    use super::{discrete_units, route_event, select_devices, DeviceOffer, DeviceSelection};
     use input_model::{HidKey, InputEvent, KeyState, MouseButton, Position};
 
     #[tokio::test]
@@ -1233,6 +1246,144 @@ mod tests {
         );
     }
 
+    /// A wheel on the wire reaches the device that carries `ei_scroll`, as whole detents of
+    /// 120 in the protocol's own vertical sign, each one inside its own frame.
+    ///
+    /// This is the receiver end of the "the wheel does nothing on the other computer" bug:
+    /// the request used to carry whole *detents* (`1`) instead of the 120ths
+    /// `ei_scroll.scroll_discrete` counts, which KWin turns into `1 * 15/120` degrees — a
+    /// scroll too small to become a step.
+    #[tokio::test]
+    async fn eis_scroll_goes_to_the_scroll_device_in_120ths_with_a_frame_each() {
+        use super::{InjectSource, PortalVersions, UnixStream, WaylandInjector};
+        use reis::request::{DeviceCapability, EisRequest, EisRequestConverter};
+        use reis::{eis, handshake::EisHandshaker};
+
+        // An in-process EIS server, never a desktop or portal connection. Device 0 has the
+        // scroll interface, device 1 is the keyboard: a request on device 1 would be the
+        // "wrong device" failure this test also guards.
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let server = tokio::spawn(async move {
+            let context = eis::Context::new(server).expect("server context");
+            let mut handshake = EisHandshaker::new(&context, 1);
+            let mut converter: Option<EisRequestConverter> = None;
+            let mut scroll_device = None;
+            let mut scrolls: Vec<(bool, i32, i32)> = Vec::new();
+            let mut frames = 0usize;
+            while scrolls.len() < 4 || frames < 4 {
+                context.read().expect("read client requests");
+                while let Some(request) = context.pending_request() {
+                    let reis::PendingRequestResult::Request(request) = request else {
+                        panic!("invalid EIS request");
+                    };
+                    if let Some(converter) = converter.as_mut() {
+                        converter.handle_request(request).expect("convert request");
+                        while let Some(request) = converter.next_request() {
+                            match request {
+                                EisRequest::Bind(bind) => {
+                                    let pointer = bind.seat.add_device(
+                                        Some("test pointer"),
+                                        eis::device::DeviceType::Virtual,
+                                        (DeviceCapability::Pointer
+                                            | DeviceCapability::Button
+                                            | DeviceCapability::Scroll)
+                                            .into(),
+                                        |_| {},
+                                    );
+                                    scroll_device = Some(pointer.clone());
+                                    pointer.resumed();
+                                    let keyboard = bind.seat.add_device(
+                                        Some("test keyboard"),
+                                        eis::device::DeviceType::Virtual,
+                                        DeviceCapability::Keyboard.into(),
+                                        |_| {},
+                                    );
+                                    keyboard.resumed();
+                                }
+                                EisRequest::Ready(ready) => ready.device.resumed(),
+                                EisRequest::ScrollDiscrete(scroll) => scrolls.push((
+                                    Some(&scroll.device) == scroll_device.as_ref(),
+                                    scroll.discrete_dx,
+                                    scroll.discrete_dy,
+                                )),
+                                EisRequest::ScrollDelta(discrete) => panic!(
+                                    "a wheel must be injected discretely, not smoothly: {discrete:?}"
+                                ),
+                                EisRequest::Frame(_) => frames += 1,
+                                _ => {}
+                            }
+                        }
+                    } else if let Some(response) =
+                        handshake.handle_request(request).expect("handshake")
+                    {
+                        let requests = EisRequestConverter::new(&context, response, 1);
+                        let _ = requests.handle().add_seat(
+                            Some("test seat"),
+                            (DeviceCapability::Pointer
+                                | DeviceCapability::Keyboard
+                                | DeviceCapability::Button
+                                | DeviceCapability::Scroll)
+                                .into(),
+                        );
+                        converter = Some(requests);
+                    }
+                }
+                context.flush().expect("flush server");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            (scrolls, frames)
+        });
+        let mut injector = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            WaylandInjector::attach(
+                reis::ei::Context::new(client).expect("client context"),
+                InjectSource::Direct,
+                None,
+                PortalVersions::default(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("bounded handshake")
+        .expect("attach test injector");
+        assert_eq!(
+            injector.device_for_event(InputEvent::Scroll { h120: 0, v120: 120 }),
+            Some(0),
+            "the scroll-capable pointer device is the one to emulate"
+        );
+        // One detent up, then two half detents (one detent), then a detent right, then one
+        // detent down: four requests, each in its own frame.
+        for event in [
+            InputEvent::Scroll { h120: 0, v120: 120 },
+            InputEvent::Scroll { h120: 0, v120: 60 },
+            InputEvent::Scroll { h120: 0, v120: 60 },
+            InputEvent::Scroll { h120: 120, v120: 0 },
+            InputEvent::Scroll { h120: 0, v120: -120 },
+        ] {
+            let outcome = injector.inject(&[event]);
+            assert!(outcome.os_error.is_none(), "{outcome:?}");
+            assert_eq!(outcome.applied_count, 1);
+        }
+        let (scrolls, frames) = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("bounded server observation")
+            .expect("server task");
+        assert_eq!(
+            scrolls,
+            [
+                // Positive wire units are *up*; `ei_scroll` counts positive as down.
+                (true, 0, -120),
+                // Two halves were accumulated, not dropped, and not sent twice.
+                (true, 0, -120),
+                // Horizontal keeps its sign: positive is right on both sides.
+                (true, 120, 0),
+                (true, 0, 120),
+            ]
+        );
+        assert_eq!(frames, 4, "one frame per emulated scroll request");
+    }
+
     #[test]
     fn selects_absolute_pointer_over_relative_and_keeps_keyboard() {
         let selection = select_devices(&[
@@ -1343,21 +1494,25 @@ mod tests {
     }
     #[test]
     fn detents_truncate_toward_zero_and_keep_signed_remainders() {
-        for (input, steps, leftover) in [
-            (-121, -1, -1),
-            (-120, -1, 0),
+        for (input, units, leftover) in [
+            (-121, -120, -1),
+            (-120, -120, 0),
             (-119, 0, -119),
             (0, 0, 0),
             (119, 0, 119),
-            (120, 1, 0),
-            (121, 1, 1),
-            (i32::MAX, 17895697, 7),
-            (i32::MIN, -17895697, -8),
+            (120, 120, 0),
+            (121, 120, 1),
+            (i32::MAX, 2147483640, 7),
+            (i32::MIN, -2147483640, -8),
         ] {
             let mut remainder = 0;
-            assert_eq!(split_detents(input, &mut remainder), steps);
+            assert_eq!(discrete_units(input, &mut remainder), units);
             assert_eq!(remainder, leftover);
         }
+        // The unit is the protocol's (`ei_scroll.scroll_discrete` counts 120 per detent);
+        // a whole step is never `1` here.
+        let mut remainder = 0;
+        assert_eq!(discrete_units(120, &mut remainder), 120);
     }
 
     #[test]
@@ -1367,22 +1522,24 @@ mod tests {
         let mut output_sum = 0_i64;
         for delta in [119, 1, -40, -40, -41, 2, 239, -119, -121, 0] {
             input_sum += i64::from(delta);
-            output_sum += i64::from(split_detents(delta, &mut remainder)) * 120;
+            output_sum += i64::from(discrete_units(delta, &mut remainder));
             assert_eq!(output_sum + i64::from(remainder), input_sum);
             assert!(remainder.abs() < 120);
         }
     }
 
     #[test]
-    fn detents_preserve_existing_remainder_at_integer_limits() {
-        for (input, previous) in [(i32::MAX, 119), (i32::MIN, -119)] {
+    fn detents_saturate_at_the_integer_limits_instead_of_wrapping() {
+        // `|value + remainder|` is at most `2 * i32::MAX`, which does not fit the 120ths
+        // `scroll_discrete` takes; the excess is clamped, and the remainder keeps the
+        // sub-detent part so the stream stays signed.
+        for (input, previous, units, leftover) in [
+            (i32::MAX, 119, i32::MAX, 6),
+            (i32::MIN, -119, i32::MIN, -7),
+        ] {
             let mut remainder = previous;
-            let steps = split_detents(input, &mut remainder);
-            assert_eq!(
-                i64::from(steps) * 120 + i64::from(remainder),
-                i64::from(input) + i64::from(previous)
-            );
-            assert!(remainder.abs() < 120);
+            assert_eq!(discrete_units(input, &mut remainder), units);
+            assert_eq!(remainder, leftover);
         }
     }
 }
