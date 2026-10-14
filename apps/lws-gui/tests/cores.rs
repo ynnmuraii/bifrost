@@ -23,7 +23,6 @@
 //! Every wait is event-driven with a deadline and a message naming what was seen, never a
 //! sleep that is hoped to be long enough.
 
-use std::ffi::OsString;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -32,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use lws_gui::view_model::{boot, stop_core, Action, Bridge, CliArgs, ViewModel};
+use lws_gui::view_model::{boot_with_program, stop_core, Action, Bridge, CliArgs, ViewModel};
 
 /// How long any one state the window has to reach may take.
 ///
@@ -55,59 +54,32 @@ fn serial() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// ---------------------------------------------------------------- the binaries
+// ---------------------------------------------------------------- the binary
 
-/// The directory the two binaries live in.
+/// The `multideskflow` executable, which is every role: the daemon these tests start, its
+/// agent, and the one the window itself starts through `boot_with_program`.
 ///
 /// This test's own executable is `target/debug/deps/cores-<hash>` (`.exe` on Windows), so
-/// `target/debug` is two levels up — the same place `cargo build --workspace` puts
-/// `lws-core` and `lws-agent`.
-fn binaries() -> PathBuf {
+/// `target/debug` is two levels up — the same place `cargo build --workspace` puts it. (Only
+/// the package that owns a binary gets `CARGO_BIN_EXE_*`, and that is not this one.)
+fn multideskflow() -> PathBuf {
     let exe = std::env::current_exe().expect("this test's own path");
-    exe.parent()
+    let directory = exe
+        .parent()
         .and_then(Path::parent)
-        .expect("target/debug above target/debug/deps")
-        .to_path_buf()
-}
-
-/// One of the two binaries, under the name it has on this host.
-fn program(name: &str) -> PathBuf {
-    let file = if cfg!(windows) {
-        format!("{name}.exe")
+        .expect("target/debug above target/debug/deps");
+    let path = directory.join(if cfg!(windows) {
+        "multideskflow.exe"
     } else {
-        name.to_owned()
-    };
-    let path = binaries().join(file);
+        "multideskflow"
+    });
     assert!(
         path.is_file(),
-        "{} is missing: run `cargo build --workspace` first — it is what puts `lws-core` and \
-         `lws-agent` in target/debug, next to this test",
+        "{} is missing: run `cargo build --workspace` first — it is what puts `multideskflow` \
+         in target/debug, next to this test",
         path.display()
     );
     path
-}
-
-/// Makes `lws-core` in target/debug visible to the GUI worker spawned by this test.
-struct CorePath(Option<OsString>);
-
-impl CorePath {
-    fn expose() -> CorePath {
-        let previous = std::env::var_os("PATH");
-        let mut paths = vec![binaries()];
-        if let Some(previous) = &previous {
-            paths.extend(std::env::split_paths(previous));
-        }
-        std::env::set_var("PATH", std::env::join_paths(paths).expect("valid PATH"));
-        CorePath(previous)
-    }
-}
-
-impl Drop for CorePath {
-    fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
-            std::env::set_var("PATH", previous);
-        }
-    }
 }
 
 /// A directory no other test of this run shares, under the system temporary directory.
@@ -154,7 +126,7 @@ impl Core {
         let log = root.join(format!("{label}.log"));
         let out = std::fs::File::create(&log).expect("log file");
         let err = out.try_clone().expect("log file");
-        let mut command = Command::new(program("lws-core"));
+        let mut command = Command::new(multideskflow());
         command
             .arg("--root")
             .arg(&root)
@@ -163,8 +135,6 @@ impl Core {
             command.arg("--dry-displays");
         }
         let child = command
-            .args(["--agent"])
-            .arg(program("lws-agent"))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -397,7 +367,7 @@ fn write_topology_revision(
 /// then arrives before the listener is up.
 fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
     let listen = format!("127.0.0.1:{b_port}");
-    let mut opener = Command::new(program("lws-core"))
+    let mut opener = Command::new(multideskflow())
         .arg("--root")
         .arg(b_root)
         .args(["pair", "--open", "--listen", listen.as_str()])
@@ -437,7 +407,7 @@ fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
         .expect("the pairing window must open before the other side dials it");
 
     let dial = format!("127.0.0.1:{b_port}");
-    let mut dialer = Command::new(program("lws-core"))
+    let mut dialer = Command::new(multideskflow())
         .arg("--root")
         .arg(a_root)
         .args(["pair", "--dial", dial.as_str()])
@@ -485,7 +455,7 @@ fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
 
 /// One node's own id, from the `peers` subcommand (`node <64 hex>`).
 fn node_id(root: &Path) -> String {
-    let output = Command::new(program("lws-core"))
+    let output = Command::new(multideskflow())
         .arg("--root")
         .arg(root)
         .arg("peers")
@@ -504,7 +474,7 @@ fn node_id(root: &Path) -> String {
 fn ctl(root: &Path, request: &str) -> String {
     let mut last = String::new();
     for attempt in 0..5 {
-        let output = Command::new(program("lws-core"))
+        let output = Command::new(multideskflow())
             .arg("--root")
             .arg(root)
             .args(request.split(' '))
@@ -550,10 +520,10 @@ fn links(root: &Path) -> usize {
 /// endpoint of that core and opens the client thread with its own 2 s reconnect loop; the
 /// `Bridge` is what the window then owns and draws.
 fn bridge_for(root: &Path) -> Bridge {
-    let (view, client) = boot(CliArgs::parse([
-        "--root".to_owned(),
-        root.display().to_string(),
-    ]));
+    let (view, client) = boot_with_program(
+        CliArgs::parse(["--root".to_owned(), root.display().to_string()]),
+        multideskflow(),
+    );
     Bridge::new(view, client)
 }
 
@@ -1079,7 +1049,6 @@ fn the_claim_button_makes_the_follower_the_owner() {
 #[test]
 fn the_window_restarts_its_core_and_applies_a_lan_address() {
     let _serial = serial();
-    let _core_path = CorePath::expose();
     let root = unique_dir("gui-restart");
     std::fs::create_dir_all(root.join("config")).expect("config directory");
     let ports = free_ports(2);

@@ -2588,14 +2588,20 @@ fn answer_offline(
 /// flags are carried through verbatim instead of being rebuilt from [`Paths`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
-    /// The global flags, exactly as `lws-core` wants them.
+    /// The executable that is started with `<flags> run`: `multideskflow`, which is this
+    /// process's own executable unless a test names another.
+    pub program: PathBuf,
+    /// The global flags, exactly as `multideskflow` wants them.
     pub flags: Vec<String>,
 }
 
 impl Launch {
-    /// A launch that names the documented directories.
+    /// A launch that names the documented directories, started from this very executable.
     pub fn with_flags(flags: Vec<String>) -> Self {
-        Launch { flags }
+        Launch {
+            program: own_program(),
+            flags,
+        }
     }
 }
 
@@ -2702,13 +2708,16 @@ pub fn resolve_endpoint(paths: &Paths) -> (CoreEndpoint, Option<Endpoint>) {
     }
 }
 
-/// The program name `lws-core` runs under on this host.
-fn core_program_name() -> &'static str {
-    if cfg!(windows) {
-        "lws-core.exe"
-    } else {
-        "lws-core"
-    }
+/// The program a window-started core runs as: this very executable, `multideskflow`, in its
+/// command-line role (`multideskflow <flags> run`).
+fn own_program() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| {
+        PathBuf::from(if cfg!(windows) {
+            "multideskflow.exe"
+        } else {
+            "multideskflow"
+        })
+    })
 }
 
 /// Stops the core process this window started, by the pid [`StartedCore`] names.
@@ -2771,17 +2780,12 @@ pub fn lan_addresses() -> Vec<String> {
         .collect()
 }
 
-/// Starts `lws-core run` detached, with the flags the window was given.
+/// Starts `multideskflow run` detached, with the flags the window was given.
 ///
 /// `docs/03-architecture.md`: «Закрытие окна GUI не влияет на активный сеанс». The child gets
 /// no inherited standard streams, so its lifetime is its own; it is never waited for.
 pub fn launch_core(launch: &Launch) -> Result<StartedCore, String> {
-    let name = core_program_name();
-    let beside_exe = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
-        .filter(|candidate| candidate.is_file());
-    let program = beside_exe.unwrap_or_else(|| PathBuf::from(name));
+    let program = launch.program.clone();
     let mut command = std::process::Command::new(&program);
     command
         .args(&launch.flags)
@@ -2808,7 +2812,16 @@ pub fn launch_core(launch: &Launch) -> Result<StartedCore, String> {
 
 /// Opens the window's two halves: the state that draws and the client that talks.
 pub fn boot(args: CliArgs) -> (ViewModel, GuiClient) {
-    let launch = Launch::with_flags(args.flags());
+    boot_with_program(args, own_program())
+}
+
+/// [`boot`] with the executable the window starts its core from named explicitly: an
+/// integration test is not `multideskflow`, so it points at the real binary.
+pub fn boot_with_program(args: CliArgs, program: PathBuf) -> (ViewModel, GuiClient) {
+    let launch = Launch {
+        program,
+        flags: args.flags(),
+    };
     let paths = match args.resolve() {
         Ok(paths) => paths,
         Err(why) => {

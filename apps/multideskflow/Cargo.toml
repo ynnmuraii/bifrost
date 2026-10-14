@@ -1,0 +1,44 @@
+[package]
+name = "multideskflow"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The one executable: `multideskflow` is a dispatcher over three library crates (see
+# `src/main.rs`). Everything that used to be `lws-core`, `lws-agent` and `lws-gui` is still a
+# separate crate with its own dependency graph — which is what the agent's no-network check
+# (`apps/lws-agent/tests/no_network.rs`) relies on.
+[[bin]]
+name = "multideskflow"
+path = "src/main.rs"
+
+[dependencies]
+lws-agent = { path = "../lws-agent" }
+lws-core = { path = "../lws-core" }
+lws-gui = { path = "../lws-gui" }
+
+[target.'cfg(windows)'.dependencies]
+# `AttachConsole` / `SetStdHandle`: the binary is a Windows-subsystem program (no console for
+# the window), and the command-line roles bind the parent terminal back (`src/console.rs`).
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+# The harnesses under `tests/` are integration tests of this package because only the package
+# that owns a binary gets `CARGO_BIN_EXE_multideskflow` — they drive real `multideskflow`
+# processes, and read the cores' answers through the same crates the window uses.
+config = { path = "../../crates/config" }
+ipc = { path = "../../crates/ipc" }
+protocol = { path = "../../crates/protocol" }
+tokio = { version = "1", features = ["rt", "time"] }
+# The fault-injection harness forces an RST (`SO_LINGER 0`) to simulate an abrupt link
+# loss. `std`'s `TcpStream::set_linger` is still unstable, and `socket2` is already in
+# the tree through tokio (`Cargo.lock`), so this adds no new crate to the graph.
+socket2 = "0.6"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[lints]
+workspace = true

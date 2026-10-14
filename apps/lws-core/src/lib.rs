@@ -1,13 +1,16 @@
 //! `lws-core` — the process that owns TLS, the protocol, the router, the focus and
 //! ownership FSMs, the link manager and agent supervision.
 //!
+//! This is a library: the executable is `apps/multideskflow`, which hands every
+//! command-line role other than `gui` and `agent` to [`run_core`].
+//!
 //! # CLI
 //!
 //! ```text
-//! lws-core [--root DIR] [--config-dir DIR] [--data-dir DIR] [--state-dir DIR]
-//!          [--runtime-dir DIR] <command>
+//! multideskflow [--root DIR] [--config-dir DIR] [--data-dir DIR] [--state-dir DIR]
+//!               [--runtime-dir DIR] <command>
 //!
-//!          run      [--dev-capture-injected] [--dry-inject] [--dry-displays] [--dry-input-events N] [--agent PATH]
+//!          run      [--dev-capture-injected] [--dry-inject] [--dry-displays] [--dry-input-events N]
 //!                   [--listen IP] [--port-input N] [--port-clipboard N]
 //!   peers    [--revoke NODE_ID]
 //!   status
@@ -16,8 +19,8 @@
 //!
 //! `pair` and `peers` work offline against the configuration directory; `status` and
 //! `switch` talk to a running core over the local control channel
-//! ([`ctl`]). `run` is the daemon: it spawns and supervises `lws-agent`, and it is
-//! the only process that listens on the network.
+//! ([`ctl`]). `run` is the daemon: it spawns and supervises the agent (the same executable
+//! started as `multideskflow agent …`), and it is the only role that listens on the network.
 
 mod agent;
 mod clipboard;
@@ -60,17 +63,18 @@ const FRAME_MAJOR: u32 = protocol::limits::PROTOCOL_MAJOR;
 /// Outbound queue capacity per link.
 const QUEUE_CAPACITY: usize = 64;
 
-fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch(&argv) {
+/// Runs the core CLI. `args` is argv after the program name (global options, then the
+/// command); the returned code is the process exit code (0 ok, 1 failure, 2 usage).
+pub fn run_core(args: Vec<String>) -> ExitCode {
+    match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Usage(message)) => {
-            eprintln!("lws-core: {message}");
+            eprintln!("multideskflow: {message}");
             eprintln!("\n{USAGE}");
             ExitCode::from(2)
         }
         Err(Failure::Run(error)) => {
-            eprintln!("lws-core: {error}");
+            eprintln!("multideskflow: {error}");
             ExitCode::FAILURE
         }
     }
@@ -108,10 +112,15 @@ impl From<identity::IdentityError> for Failure {
 }
 
 const USAGE: &str = "\
-lws-core — LAN Workspace core process
+multideskflow — LAN Workspace (software KVM)
 
 USAGE:
-    lws-core [GLOBAL] <command> [ARGS]
+    multideskflow                       open the window (same as `multideskflow gui`)
+    multideskflow gui [GLOBAL]          open the window
+    multideskflow [GLOBAL] <command> [ARGS]
+                                        command line and daemon (commands below)
+    multideskflow agent …               internal: the input agent, started by `run`
+                                        as a separate process; not for hand use
 
 GLOBAL:
     --root DIR          put config/, data/, state/ and run/ under DIR
@@ -580,7 +589,6 @@ impl RunOptions {
         let mut dry_input_events = 0usize;
         let mut dry_motion = false;
         let mut dry_displays = false;
-        let mut agent = None;
         let mut listen = None;
         let mut index = 0;
         while index < rest.len() {
@@ -611,13 +619,6 @@ impl RunOptions {
                         .map_err(|_| Failure::Usage(format!("{value} is not a number")))?;
                     index += 2;
                 }
-                "--agent" => {
-                    agent =
-                        Some(PathBuf::from(rest.get(index + 1).ok_or_else(|| {
-                            Failure::Usage("--agent needs a path".to_owned())
-                        })?));
-                    index += 2;
-                }
                 "--listen" => {
                     listen = Some(
                         rest.get(index + 1)
@@ -634,10 +635,7 @@ impl RunOptions {
                 "--dry-displays requires --dry-inject".to_owned(),
             ));
         }
-        let agent = match agent {
-            Some(agent) => agent,
-            None => agent::default_agent_program().map_err(Failure::Run)?,
-        };
+        let agent = agent::agent_program().map_err(Failure::Run)?;
         Ok(RunOptions {
             dev_capture_injected,
             dry_inject,
@@ -991,7 +989,7 @@ mod run_options_tests {
                 .collect::<Vec<_>>();
             RunOptions::parse(&arguments).unwrap_or_else(|_| panic!("valid run options"))
         };
-        assert!(!parse(&["--agent", "agent"]).dev_capture_injected);
-        assert!(parse(&["--dev-capture-injected", "--agent", "agent"]).dev_capture_injected);
+        assert!(!parse(&[]).dev_capture_injected);
+        assert!(parse(&["--dev-capture-injected"]).dev_capture_injected);
     }
 }

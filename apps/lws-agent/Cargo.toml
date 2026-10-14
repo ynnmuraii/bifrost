@@ -47,3 +47,12 @@ ashpd = "0.13"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
+# The network guard (`src/netguard.rs`) reads this process's own TCP/UDP tables to prove rule 1
+# at run time; it creates no socket and does not touch Winsock.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }

@@ -36,3 +36,35 @@ pub use eframe::egui;
 
 /// The window's title, used by the binary and by the tests.
 pub const TITLE: &str = "LAN Workspace";
+
+/// Opens the window and returns when it is closed. This is the `gui` role of the one
+/// `multideskflow` executable (`apps/multideskflow`); `args` is argv after the program name and
+/// after the `gui` token, and the window reads its global flags (`--root`, …) from the process
+/// command line itself (`view_model::cli_args_from_env`, which ignores what it does not know).
+///
+/// Everything the window needs before its first frame — the directories, the endpoint,
+/// `config.toml`, the client thread — is resolved by [`app::GuiApp::new`].
+pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
+    // `--help` is answered by the dispatcher; a window has no other arguments of its own.
+    let _ = args;
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1024.0, 760.0])
+            .with_min_inner_size([720.0, 480.0])
+            .with_title(TITLE),
+        ..Default::default()
+    };
+    let result = eframe::run_native(
+        TITLE,
+        options,
+        Box::new(|cc| Ok(Box::new(app::GuiApp::new(cc)))),
+    );
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // No console in this role on Windows; the message is for a terminal launch.
+            eprintln!("multideskflow gui: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
