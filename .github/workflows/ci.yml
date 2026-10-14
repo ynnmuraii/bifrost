@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Match the required workspace gate and bound concurrent native linker work.
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   build:
