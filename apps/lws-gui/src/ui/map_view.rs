@@ -39,8 +39,8 @@ impl Xf {
         }
     }
 
-    fn stage_delta(self, delta: Vec2) -> crate::map::Point {
-        crate::map::Point {
+    fn stage_delta(self, delta: Vec2) -> crate::map::Pt {
+        crate::map::Pt {
             x: f64::from(delta.x / self.s),
             y: f64::from(delta.y / self.s),
         }
