@@ -8,6 +8,11 @@
 //! starts a core, applies a layout or sends a pairing decision. Both modes render
 //! offscreen and never open a desktop window.
 //!
+//! `--prefix NAME` names the files (`foo-main-light.png`); `--zoom PCT` sets the scale of the
+//! dedicated zoomed-map picture (150 by default). Real mode also draws one picture of a
+//! vertical stack: the real snapshot plus one extra member placed below it, which is exactly
+//! what a drag onto the bottom edge produces.
+//!
 //! Each state is drawn into an `egui_kittest` harness with the wgpu renderer and written to
 //! `target/ui-shots/<name>.png`. This is an example and not a test on purpose: `cargo test`
 //! has to pass on a host with no display and no GPU. The states are hand-built `ViewModel`s from
@@ -48,6 +53,10 @@ fn main() -> std::process::ExitCode {
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
     let real = args.iter().any(|arg| arg == "--live" || arg == "--root");
     let prefix = option("--prefix").unwrap_or_else(|| "real".to_owned());
+    let zoom = option("--zoom")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(150)
+        .clamp(70, 150);
     let snapshot = if real {
         match real_snapshot(CliArgs::parse(args)) {
             Ok(view) => Some(view),
@@ -76,6 +85,16 @@ fn main() -> std::process::ExitCode {
             view.look.theme = theme;
             view.modal = None;
             states.push((format!("{prefix}-main-{tag}"), view.clone()));
+            let mut zoomed = view.clone();
+            zoomed.look.zoom_percent = zoom;
+            states.push((format!("{prefix}-zoom-{tag}"), zoomed));
+            states.push((
+                format!("{prefix}-window-{tag}"),
+                with_window(view.clone()),
+            ));
+            if let Some(stacked) = with_vertical_peer(&view) {
+                states.push((format!("{prefix}-vertical-{tag}"), stacked));
+            }
             for modal in Modal::ALL {
                 view.modal = Some(modal);
                 states.push((
@@ -357,6 +376,73 @@ fn mockup(theme: Theme, modal: Option<Modal>) -> ViewModel {
         vm.local(&Action::ToggleModal(modal));
     }
     vm
+}
+
+/// The real snapshot plus one more member placed directly below this computer, which is what a
+/// drag onto the bottom edge produces: the map draws the pair as a `Bottom ↔ Top` link.
+///
+/// The extra member repeats the displays the dry core really reported, so the picture is the
+/// real data with a real second computer rather than a mockup.
+fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
+    let local = view.editor.nodes.first()?.clone();
+    if local.displays.is_empty() {
+        return None;
+    }
+    let peer = "ab".repeat(32);
+    let wire = |display: &lws_gui::view_model::EditorDisplay| ipc::DisplayView {
+        id: display.id.clone(),
+        logical_x: display.x,
+        logical_y: display.y,
+        logical_w: display.w,
+        logical_h: display.h,
+        rotation_degrees: display.rotation,
+        primary: display.primary,
+        native_known: display.native_known,
+        scale: 1.0,
+    };
+    let mut view = view.clone();
+    let mut document = ipc::TopologyDoc {
+        revision: view.editor.revision,
+        author_node_id: view.editor.author.clone(),
+        members: view
+            .editor
+            .nodes
+            .iter()
+            .map(|node| ipc::MemberTopology {
+                node_id: node.node_id.clone(),
+                display_name: node.display_name.clone(),
+                online: node.online,
+                displays: node.displays.iter().map(wire).collect(),
+            })
+            .collect(),
+        links: view.editor.links.clone(),
+    };
+    document.members.push(ipc::MemberTopology {
+        node_id: peer.clone(),
+        display_name: "LAPTOP".to_owned(),
+        online: true,
+        displays: local.displays.iter().map(wire).collect(),
+    });
+    document.links.push(ipc::LinkView {
+        id: "final-vertical".to_owned(),
+        from: auto(&local.node_id, "BOTTOM"),
+        to: auto(&peer, "TOP"),
+        bidirectional: true,
+        active: true,
+        inactive_reason: String::new(),
+        auto_displays: Vec::new(),
+    });
+    view.apply(event(Msg::TopologyDoc(document)));
+    if let Some(status) = view.status.as_mut() {
+        status.members.push(ipc::MemberStatus {
+            node_id: peer,
+            display_name: "LAPTOP".to_owned(),
+            online: true,
+            is_owner: false,
+            link_state: "READY".to_owned(),
+        });
+    }
+    Some(view)
 }
 
 /// The same, with an open pairing window instead of a prompt.
