@@ -304,7 +304,7 @@ mod platform {
             Ok(Handle(raw))
         }
     }
-    fn name(namespace: &str, role: Role, suffix: &str) -> io::Result<Vec<u16>> {
+    pub(super) fn name(namespace: &str, role: Role, suffix: &str) -> io::Result<Vec<u16>> {
         let mut token = null_mut();
         // SAFETY: output storage is valid and the current process pseudo-handle is valid.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -342,7 +342,7 @@ mod platform {
             let _ = write!(identity, "{byte:02x}");
         }
         Ok(
-            format!("Global\\{namespace}-{identity}-{}-{suffix}", role.name())
+            format!("Local\\{namespace}-{identity}-{}-{suffix}", role.name())
                 .encode_utf16()
                 .chain(Some(0))
                 .collect(),
@@ -419,6 +419,21 @@ mod platform {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_names_are_per_session_not_global() {
+        // `Global\` would make a second logon session of the same user believe the first one's
+        // window and tray are its own, and start nothing.
+        let name = platform::name("multideskflow", Role::Gui, "show").unwrap();
+        let text = String::from_utf16(&name[..name.len() - 1]).unwrap();
+        assert!(text.starts_with("Local\\multideskflow-"), "{text}");
+        assert!(text.ends_with("-gui-show"), "{text}");
     }
 }
 
