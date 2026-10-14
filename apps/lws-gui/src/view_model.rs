@@ -244,7 +244,7 @@ pub enum Request {
     Abandon,
     /// `StartPairing`.
     StartPairing,
-    /// `PairWith`.
+    /// `PairWith`: success acknowledges the dial reaching a prompt, not a completed pair.
     PairWith,
     /// `PairingAnswer`.
     PairingAnswer,
@@ -1210,7 +1210,8 @@ impl ViewModel {
                 Request::ExportDiagnostics => {
                     self.settings.export = Some(Outcome::done(text.clone()));
                 }
-                Request::PairWith | Request::PairingAnswer => self.finish_pairing(true),
+                Request::PairWith => self.pairing.dialing = false,
+                Request::PairingAnswer => self.finish_pairing(true),
                 _ => {}
             }
             self.push_log(format!("{}: готово ({text})", request.label()));

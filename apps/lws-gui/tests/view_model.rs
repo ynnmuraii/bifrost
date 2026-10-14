@@ -883,6 +883,20 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
             error_code: String::new(),
         }),
     ));
+    assert_eq!(
+        vm.pairing.code().as_deref(),
+        Some("482 913"),
+        "the dial acknowledgement must preserve the code awaiting confirmation"
+    );
+    assert_eq!(vm.pairing.paired, None, "dialling is not a completed pair");
+    let id = vm.begin_request(Request::PairingAnswer, now);
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
     assert!(!vm.pairing.dialing);
     assert!(
         vm.pairing.prompt.is_none(),
@@ -904,6 +918,25 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
     ));
     assert!(!vm.pairing.dialing);
     assert_eq!(vm.pairing.paired, None);
+}
+
+#[test]
+fn the_dial_acknowledgement_before_the_prompt_does_not_claim_a_pair() {
+    let mut vm = view();
+    vm.on_connected("endpoint");
+    vm.local(&Action::PairWith("192.168.1.10:47901".to_owned()));
+    let id = vm.begin_request(Request::PairWith, Instant::now());
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+    assert!(!vm.pairing.dialing);
+    assert_eq!(vm.pairing.paired, None, "the users have not confirmed yet");
+    vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
+    assert_eq!(vm.pairing.code().as_deref(), Some("482 913"));
 }
 
 #[test]
