@@ -40,6 +40,22 @@ mod gui;
 mod pairing;
 mod transition_retry;
 
+/// Attribution belongs to the operation, never to mutable "last requester" state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LayoutSource {
+    source: &'static str,
+    connection_id: Option<[u8; 16]>,
+    peer: Option<NodeId>,
+}
+
+impl LayoutSource {
+    const AUTO: Self = Self { source: "auto", connection_id: None, peer: None };
+
+    fn local(source: &'static str, connection_id: [u8; 16]) -> Self {
+        Self { source, connection_id: Some(connection_id), peer: None }
+    }
+}
+
 /// How long the loop sleeps when nothing else has a deadline.
 ///
 /// It bounds how long a dead agent child can go unnoticed; the IPC heartbeat and the
@@ -291,6 +307,8 @@ pub struct Session {
     layout_requests: HashMap<u64, LayoutRequest>,
     /// The next `LayoutEdit.request_nonce`; 0 is reserved for "no request".
     next_layout_nonce: u64,
+    /// Negotiated identities of currently established peer connections.
+    layout_connections: HashMap<NodeId, [u8; 16]>,
     /// Set by `quit` on the control channel.
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
@@ -477,6 +495,7 @@ impl Session {
             last_layout_error: None,
             layout_requests: HashMap::new(),
             next_layout_nonce: 0,
+            layout_connections: HashMap::new(),
             stopping: false,
             agent_restart_due: None,
             agent_restart_circuit: RestartWatch::new(),
@@ -668,7 +687,7 @@ impl Session {
             expected_revision = expected.revision,
             "rewriting the layout's display ids to the ids the agent reports"
         );
-        match self.layout_edit_document(text, expected).await {
+        match self.layout_edit_document(text, expected, LayoutSource::AUTO).await {
             Handled::Reply(ctl::Response::Error { code, detail }) => {
                 tracing::warn!(%code, %detail, "the display-id rewrite was refused")
             }
@@ -700,7 +719,7 @@ impl Session {
             .map_or_else(|| "-".to_owned(), |peer| identity::fingerprint(&peer));
         tracing::info!("default layout published: {peer} to the right");
         let expected = self.layout_state.applied();
-        match self.layout_edit_document(text, expected).await {
+        match self.layout_edit_document(text, expected, LayoutSource::AUTO).await {
             Handled::Reply(ctl::Response::Error { code, detail }) => {
                 tracing::warn!(%code, %detail, "the default layout was refused")
             }
@@ -727,7 +746,7 @@ impl Session {
     /// one keeps working as it is, and this replaces it with `self right` → `peer left`, both
     /// `display = "auto"`, through the coordinator's CAS — the same path a GUI edit takes, so
     /// it takes a new revision and reaches every member.
-    async fn layout_auto(&mut self) -> Handled {
+    async fn layout_auto(&mut self, source: LayoutSource) -> Handled {
         let peers = self.live_peers();
         let Some(mut layout) = crate::topology::auto_layout(&peers) else {
             return Handled::Reply(ctl::Response::Error {
@@ -746,7 +765,7 @@ impl Session {
             }
         };
         let expected = self.layout_state.applied();
-        self.layout_edit_document(text, expected).await
+        self.layout_edit_document(text, expected, source).await
     }
 
     /// The monotonic millisecond clock shared with the FSM.
@@ -1307,6 +1326,11 @@ impl Session {
     /// applies.
     async fn on_layout(&mut self, from: NodeId, message: transport::convert::LayoutMessage) {
         use transport::convert::LayoutMessage;
+        let source = LayoutSource {
+            source: "peer",
+            connection_id: self.layout_connections.get(&from).copied(),
+            peer: Some(from),
+        };
 
         match message {
             LayoutMessage::DisplaysChanged { revision, displays } => {
@@ -1351,7 +1375,7 @@ impl Session {
                         self.layout_editing_disabled = None;
                         self.last_layout_error = None;
                         let layout = parsed.expect("accepted topology was converted");
-                        self.install_applied_layout(layout, pair);
+                        self.install_applied_layout(layout, pair, source);
                         // The coordinator asked for it (rejoin) or published it; either way the
                         // answer is the confirmation `docs/05-protocol.md` names.
                         self.send_layout_to(
@@ -1448,8 +1472,7 @@ impl Session {
                         self.layout_editing_disabled = None;
                         self.last_layout_error = None;
                         let layout = candidate.expect("applied layout was parsed");
-                        let document = self.install_applied_layout(layout, pair);
-                        tracing::info!(peer = %from, revision = pair.revision, "layout edit applied");
+                        let document = self.install_applied_layout(layout, pair, source);
                         self.send_layout_to(
                             from,
                             transport::convert::LayoutMessage::TopologyApplied {
@@ -1578,6 +1601,7 @@ impl Session {
         &mut self,
         mut layout: config::TopologyConfig,
         pair: crate::layout::Pair,
+        source: LayoutSource,
     ) -> protocol::wire::Topology {
         let author = pair.author.unwrap_or(self.node_id);
         let max_seen = self.layout_state.max_seen();
@@ -1605,6 +1629,14 @@ impl Session {
             }
         };
         self.applied_wire = Some(document.clone());
+        tracing::info!(
+            source = source.source,
+            connection_id = ?source.connection_id.map(u128::from_be_bytes),
+            peer = ?source.peer,
+            revision = pair.revision,
+            author = %author,
+            "layout applied by the coordinator"
+        );
         document
     }
 
@@ -1620,8 +1652,10 @@ impl Session {
         }
         let published = self.layout_state.republish(self.node_id);
         let layout = self.layout.clone();
-        let wire = self.install_applied_layout(layout, published);
+        let wire = self.install_applied_layout(layout, published, LayoutSource::AUTO);
         tracing::info!(
+            source = "auto",
+            connection_id = tracing::field::Empty,
             revision = published.revision,
             "republishing the winning layout"
         );
@@ -1801,7 +1835,7 @@ impl Session {
     /// On the coordinator the verdict is immediate. A follower sends the edit with the base it
     /// names and answers with the coordinator's verdict, which is why the reply is a
     /// [`Handled`]: this node is not the one that decides.
-    async fn layout_apply(&mut self) -> Handled {
+    async fn layout_apply(&mut self, source: LayoutSource) -> Handled {
         let (base_pair, layout_toml) = match self.layout_state.pending() {
             Some(toml) => (
                 self.layout_state
@@ -1884,7 +1918,7 @@ impl Session {
             crate::layout::EditOutcome::Applied(pair) => {
                 self.release_layout_pending();
                 let layout = candidate.expect("applied pending layout was parsed");
-                let document = self.install_applied_layout(layout, pair);
+                let document = self.install_applied_layout(layout, pair, source);
                 self.publish_layout(document).await;
                 ctl::Response::Status(format!("applied revision={}", pair.revision))
             }
@@ -1959,7 +1993,7 @@ impl Session {
     /// conflict instead of guessing what the caller meant. A follower's answer is the
     /// coordinator's own verdict: `OK applied revision=N` and `ERR LAYOUT_CONFLICT …` mean the
     /// same thing on both sides of the link.
-    async fn layout_edit(&mut self, path: &str) -> Handled {
+    async fn layout_edit(&mut self, path: &str, source: LayoutSource) -> Handled {
         let document_text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
@@ -1970,7 +2004,7 @@ impl Session {
             }
         };
         let applied = self.layout_state.applied();
-        self.layout_edit_document(document_text, applied).await
+        self.layout_edit_document(document_text, applied, source).await
     }
 
     /// The whole-document CAS itself, for both front-ends.
@@ -1984,6 +2018,7 @@ impl Session {
         &mut self,
         document_text: String,
         expected: crate::layout::Pair,
+        source: LayoutSource,
     ) -> Handled {
         let is_coordinator = self.router.ownership().is_owner();
         if let Some(reason) = self.layout_editing_disabled.clone() {
@@ -2058,13 +2093,8 @@ impl Session {
         Handled::Reply(match outcome {
             crate::layout::EditOutcome::Applied(pair) => {
                 let layout = candidate.expect("applied layout was parsed");
-                let document = self.install_applied_layout(layout, pair);
+                let document = self.install_applied_layout(layout, pair, source);
                 self.publish_layout(document).await;
-                tracing::info!(
-                    revision = pair.revision,
-                    author = identity::fingerprint(&self.node_id).as_str(),
-                    "layout applied by the coordinator"
-                );
                 ctl::Response::Status(format!("applied revision={}", pair.revision))
             }
             crate::layout::EditOutcome::Conflict(current) => {
@@ -2153,6 +2183,7 @@ impl Session {
                 connection_id,
                 remote,
             } => {
+                self.layout_connections.insert(peer, connection_id);
                 tracing::info!(
                     peer = %peer,
                     name = hello.display_name.as_str(),
@@ -2316,6 +2347,7 @@ impl Session {
                 }
             },
             LinkEvent::Down { peer, reason } => {
+                self.layout_connections.remove(&peer);
                 tracing::warn!(peer = %peer, ?reason, "link down");
                 if let Some(clipboard) = self.clipboard.as_mut() {
                     clipboard.on_link_down(peer).await;
@@ -3126,6 +3158,7 @@ impl Session {
     /// single line, so it never reads again after answering (that second read is what used
     /// to race the client's close and log every answer as a failure).
     async fn on_control(&mut self, mut stream: ctl::ClientStream) {
+        let connection_id = identity::random16().expect("system entropy source");
         let line = match ctl::read_line(&mut stream).await {
             Ok(Some(line)) => line,
             Ok(None) => {
@@ -3141,7 +3174,7 @@ impl Session {
                 return;
             }
         };
-        let response = self.handle_request(&line).await;
+        let response = self.handle_request(&line, LayoutSource::local("ctl", connection_id)).await;
         match response {
             Handled::Reply(response) => {
                 let reply = response.render();
@@ -3175,7 +3208,7 @@ impl Session {
         }
     }
 
-    async fn handle_request(&mut self, line: &str) -> Handled {
+    async fn handle_request(&mut self, line: &str, source: LayoutSource) -> Handled {
         let request = match ctl::Request::parse(line) {
             Ok(request) => request,
             Err(detail) => {
@@ -3199,9 +3232,9 @@ impl Session {
             ctl::Request::Claim => self.claim().await.into(),
             ctl::Request::Abandon => self.abandon().await.into(),
             ctl::Request::LayoutShow => ctl::Response::Status(self.layout_line()).into(),
-            ctl::Request::LayoutEdit(path) => self.layout_edit(&path).await,
-            ctl::Request::LayoutApply => self.layout_apply().await,
-            ctl::Request::LayoutAuto => self.layout_auto().await,
+            ctl::Request::LayoutEdit(path) => self.layout_edit(&path, source).await,
+            ctl::Request::LayoutApply => self.layout_apply(source).await,
+            ctl::Request::LayoutAuto => self.layout_auto(source).await,
             ctl::Request::PairOpen(seconds) => {
                 let window_s = seconds.unwrap_or(120);
                 match self.open_pairing_window(window_s) {

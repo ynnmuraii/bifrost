@@ -442,7 +442,7 @@ fn the_dial_button_sends_the_typed_address_and_the_transfer_button_the_switch() 
         frame.output.actions
     );
 
-    let at = find(&mut harness, &vm, "↔ Передать ввод → linux-box");
+    let at = find(&mut harness, &vm, "⇄ Передать ввод → linux-box");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(
         frame
@@ -471,4 +471,176 @@ fn a_narrow_window_folds_the_dock_into_two_rows_and_keeps_every_cell() {
             "КОД СОПРЯЖЕНИЯ",
         ],
     );
+}
+
+fn text_position(harness: &mut Harness, vm: &ViewModel, label: &str) -> egui::Pos2 {
+    fn find(shape: &Shape, label: &str) -> Option<egui::Pos2> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == label => {
+                Some(text.pos + text.galley.size() / 2.0)
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+            _ => None,
+        }
+    }
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE)),
+        ..Default::default()
+    };
+    let output = harness.ctx.run_ui(input, |ui| {
+        let _ = ui::draw(
+            ui,
+            vm,
+            &mut harness.state,
+            Env {
+                now: harness.now,
+                animate: false,
+            },
+        );
+    });
+    let at = output.shapes.iter().find_map(|shape| find(&shape.shape, label));
+    output.drop_without_applying_deltas();
+    at.unwrap_or_else(|| panic!("{label:?} was not drawn"))
+}
+
+fn key(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn dry_bridge() -> lws_gui::view_model::Bridge {
+    use lws_gui::view_model::{Bridge, GuiClient, Launch};
+    // No endpoint: this cannot reach the user's running service or launch a core.
+    Bridge::new(connected(), GuiClient::start(None, Launch::with_flags(Vec::new())))
+}
+
+fn dispatch_frame(bridge: &mut lws_gui::view_model::Bridge, frame: Frame, now: Instant) {
+    for action in frame.output.actions {
+        bridge.dispatch(action, now);
+    }
+}
+
+fn assert_no_layout_requests(bridge: &lws_gui::view_model::Bridge) {
+    use lws_gui::view_model::Request;
+    assert!(
+        bridge.view().inflight.iter().all(|request| !matches!(
+            request.request,
+            Request::UpdateTopology | Request::LayoutAuto
+        )),
+        "{:?}",
+        bridge.view().inflight
+    );
+}
+
+#[test]
+fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
+    use lws_gui::view_model::Request;
+    let mut bridge = dry_bridge();
+    let mut harness = Harness::new();
+    harness.settle(bridge.view(), false);
+
+    // Real map widget focus and its arrow-key handler, not Action::wire in isolation.
+    let monitor = egui::Id::new(("mon", &SELF_NODE.to_owned(), 0_usize));
+    harness.ctx.memory_mut(|memory| memory.request_focus(monitor));
+    let frame = harness.frame(bridge.view(), false, SIZE, vec![key(egui::Key::ArrowRight)]);
+    assert!(frame.output.actions.iter().any(|action| matches!(action, Action::NudgeNode { .. })));
+    dispatch_frame(&mut bridge, frame, harness.now);
+    assert!(bridge.view().editor.dirty());
+    assert_no_layout_requests(&bridge);
+
+    // Drag the rendered monitor. Start the drag on one frame and move again on another,
+    // because egui records the grab point when the drag threshold is first crossed.
+    let at = text_position(&mut harness, bridge.view(), "1920×1080");
+    let press = egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let mut moved = false;
+    for events in [
+        vec![egui::Event::PointerMoved(at), press],
+        vec![egui::Event::PointerMoved(at + egui::vec2(24.0, 0.0))],
+        vec![egui::Event::PointerMoved(at + egui::vec2(72.0, 0.0))],
+    ] {
+        let frame = harness.frame(bridge.view(), false, SIZE, events);
+        moved |= frame.output.actions.iter().any(|action| matches!(action, Action::MoveNode { .. }));
+        dispatch_frame(&mut bridge, frame, harness.now);
+    }
+    assert!(moved, "the real map drag must produce a local move");
+    let frame = harness.frame(
+        bridge.view(), false, SIZE,
+        vec![egui::Event::PointerButton {
+            pos: at + egui::vec2(72.0, 0.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }, egui::Event::PointerGone, egui::Event::WindowFocused(false)],
+    );
+    dispatch_frame(&mut bridge, frame, harness.now);
+    assert_no_layout_requests(&bridge);
+
+    bridge.dispatch(Action::ToggleModal(Modal::Layout), harness.now);
+    harness.settle(bridge.view(), false);
+    let frame = harness.frame(bridge.view(), false, SIZE, vec![key(egui::Key::Escape)]);
+    assert!(frame.output.actions.contains(&Action::CloseModal));
+    dispatch_frame(&mut bridge, frame, harness.now);
+    assert_no_layout_requests(&bridge);
+
+    bridge.view_mut().on_disconnected("dry reconnect".to_owned());
+    bridge.view_mut().on_connected("endpoint");
+    bridge.view_mut().apply(event(Msg::TopologyDoc(two_node_doc(13))));
+    bridge.view_mut().tick(harness.now);
+    bridge.pump();
+    let frame = harness.settle(bridge.view(), false);
+    dispatch_frame(&mut bridge, frame, harness.now);
+    assert_no_layout_requests(&bridge);
+
+    // Restore a connected draft after the deliberately endpoint-free client reports offline.
+    bridge.view_mut().on_connected("endpoint");
+    bridge.dispatch(Action::SetSide(lws_gui::view_model::Side::Left), harness.now);
+    harness.settle(bridge.view(), false);
+    let at = text_position(&mut harness, bridge.view(), "Применить");
+    let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
+    assert_eq!(frame.output.actions.iter().filter(|action| matches!(action, Action::UpdateTopology { .. })).count(), 1);
+    dispatch_frame(&mut bridge, frame, harness.now);
+    assert_eq!(bridge.view().inflight.iter().filter(|request| request.request == Request::UpdateTopology).count(), 1);
+
+    let at = text_position(&mut harness, bridge.view(), "Авто");
+    let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
+    assert_eq!(frame.output.actions.iter().filter(|action| matches!(action, Action::LayoutAuto)).count(), 1);
+    dispatch_frame(&mut bridge, frame, harness.now);
+    assert_eq!(bridge.view().inflight.iter().filter(|request| request.request == Request::LayoutAuto).count(), 1);
+}
+
+#[test]
+fn enter_in_the_dial_field_only_pairs_even_with_a_dirty_layout() {
+    use lws_gui::view_model::Request;
+    let mut bridge = dry_bridge();
+    let address = "192.168.1.10:47901";
+    bridge.view_mut().pairing.address = address.to_owned();
+    bridge.dispatch(Action::SetSide(lws_gui::view_model::Side::Left), Instant::now());
+    let mut harness = Harness::new();
+    harness.settle(bridge.view(), false);
+    let at = text_position(&mut harness, bridge.view(), address);
+    let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
+    dispatch_frame(&mut bridge, frame, harness.now);
+    let frame = harness.frame(bridge.view(), false, SIZE, vec![key(egui::Key::Enter)]);
+    assert_eq!(frame.output.actions, vec![Action::PairWith(address.to_owned())]);
+    dispatch_frame(&mut bridge, frame, harness.now);
+    assert_no_layout_requests(&bridge);
+    assert_eq!(bridge.view().inflight.len(), 1);
+    assert_eq!(bridge.view().inflight[0].request, Request::PairWith);
+
+    // Closing a dirty window drops only its client; it has no save-on-drop action.
+    // Keep the request ledger outside the bridge to make the final state observable.
+    let final_requests = bridge.view().inflight.clone();
+    drop(bridge);
+    assert_eq!(final_requests.len(), 1);
+    assert_eq!(final_requests[0].request, Request::PairWith);
 }

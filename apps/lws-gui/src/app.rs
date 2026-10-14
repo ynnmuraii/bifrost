@@ -52,6 +52,7 @@ pub struct GuiApp {
     look_file: Option<PathBuf>,
     /// The look as last written, so a file is written only when it changes.
     saved_look: Look,
+    frame_probe: Option<(PathBuf, Instant, u64)>,
 }
 
 impl GuiApp {
@@ -80,6 +81,8 @@ impl GuiApp {
             ui: UiState::new(Instant::now()),
             look_file,
             saved_look,
+            frame_probe: std::env::var_os("MDF_FRAME_PROBE")
+                .map(|path| (PathBuf::from(path), Instant::now() + Duration::from_secs(5), 0)),
         }
     }
 
@@ -100,6 +103,11 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Instant::now();
+        if let Some((_, started, frames)) = &mut self.frame_probe {
+            if now >= *started {
+                *frames += 1;
+            }
+        }
         let arrived = self.bridge.pump();
         self.bridge.view_mut().tick(now);
 
@@ -136,6 +144,17 @@ impl eframe::App for GuiApp {
         };
         if let Some(after) = wanted {
             ui.ctx().request_repaint_after(after);
+        }
+    }
+}
+
+impl Drop for GuiApp {
+    fn drop(&mut self) {
+        if let Some((path, started, frames)) = &self.frame_probe {
+            let _ = std::fs::write(
+                path,
+                format!("{frames},{}\n", Instant::now().saturating_duration_since(*started).as_secs_f64()),
+            );
         }
     }
 }

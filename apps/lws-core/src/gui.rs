@@ -45,6 +45,8 @@ const OUTBOUND_QUEUE: usize = 64;
 pub struct Request {
     /// The `request_id` of the frame, echoed on every answer.
     pub request_id: u64,
+    /// Fresh server-assigned identity of the connection, shared by all its requests.
+    pub connection_id: [u8; 16],
     /// The message itself.
     pub message: gui_frame::Msg,
     /// Where every answer frame goes.
@@ -101,7 +103,8 @@ impl Server {
         stream: ClientStream,
         requests: mpsc::Sender<Request>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(serve(stream, requests, self.events.subscribe()))
+        let connection_id = identity::random16().expect("system entropy source");
+        tokio::spawn(serve(stream, requests, self.events.subscribe(), connection_id))
     }
 }
 
@@ -110,6 +113,7 @@ async fn serve(
     stream: ClientStream,
     requests: mpsc::Sender<Request>,
     mut events: broadcast::Receiver<Outgoing>,
+    connection_id: [u8; 16],
 ) {
     let (out_tx, mut out_rx) = mpsc::channel::<Outgoing>(OUTBOUND_QUEUE);
     let mut link = GuiLink::new(stream);
@@ -125,7 +129,7 @@ async fn serve(
                         continue;
                     };
                     if requests
-                        .send(Request { request_id, message, out: out_tx.clone() })
+                        .send(Request { request_id, connection_id, message, out: out_tx.clone() })
                         .await
                         .is_err()
                     {

@@ -171,7 +171,7 @@ Cargo-воркспейс `apps/*` + `crates/*`; платформенный ко�
 MIT — см. [LICENSE](LICENSE).
 
 Сторонние компоненты: [licenses/THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md) — список крейтов
-и их условий (в том числе шрифты Ubuntu Font Licence / OFL-1.1 в egui), генерируется
+и их условий, включая встроенные Geist, Geist Mono и Silkscreen под OFL-1.1; генерируется
 `cargo about generate --workspace --fail -o licenses/THIRD_PARTY_NOTICES.md licenses/notices.hbs` из
 [about.toml](about.toml). Политику допустимых лицензий задаёт [deny.toml](deny.toml) и проверяет CI
 командой `cargo deny check licenses`: GPL/LGPL/AGPL запрещены, MPL возможен только в dev-зависимостях.

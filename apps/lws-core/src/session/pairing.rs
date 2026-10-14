@@ -127,6 +127,8 @@ struct Ceremony {
     reply: Option<oneshot::Sender<Verdict>>,
     /// Where the peer is reachable, for the trust record's `last_address`.
     address: Option<String>,
+    /// The unanswered code, retained so a newly connected GUI can show the real ceremony.
+    prompt: Option<Prompt>,
 }
 
 /// Everything the loop knows about pairing.
@@ -168,6 +170,15 @@ impl Pairing {
     /// The window, for the status line and the GUI's pairing screen.
     pub fn window(&self) -> Option<&Window> {
         self.window.as_ref()
+    }
+
+    /// The oldest unanswered ceremony a newly connected GUI can confirm.
+    pub fn pending_prompt(&self) -> Option<&Prompt> {
+        self.ceremonies
+            .values()
+            .filter(|ceremony| ceremony.answer.is_some())
+            .filter_map(|ceremony| ceremony.prompt.as_ref())
+            .min_by_key(|prompt| prompt.ceremony_id)
     }
 
     /// Opens the window: a fresh `attempt_id`, the gate opened, the address to type.
@@ -252,6 +263,7 @@ impl Pairing {
                 answer: Some(answer),
                 reply: None,
                 address: None,
+                prompt: None,
             },
         );
         (ceremony_id, receiver)
@@ -360,6 +372,7 @@ impl Pairing {
                 let prompt = *prompt;
                 if let Some(ceremony) = self.ceremonies.get_mut(&prompt.ceremony_id) {
                     ceremony.address = prompt.address.clone();
+                    ceremony.prompt = Some(prompt.clone());
                 }
                 // A waiter whose receiver is gone has nobody to tell; `send` consumes it.
                 for waiter in std::mem::take(&mut self.waiting) {

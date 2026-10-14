@@ -16,9 +16,8 @@ not part of a shipped artifact. The same policy is enforced as a gate by
 `cargo deny check licenses` (see [`../deny.toml`](../deny.toml)); the human-readable audit is
 `docs/08-reuse-and-licenses.md`.
 
-Two entries below need attention when a GUI build is packaged: `epaint_default_fonts` ships the
-Ubuntu font family under the Ubuntu Font Licence and the OFL-1.1, so the licence texts in this
-file must travel with the binary.
+The GUI disables egui's default fonts and embeds the OFL-licensed families listed below.
+These licence texts must travel with the binary.
 
 The fonts bundled with `lws-gui` (Geist, Geist Mono, Silkscreen; `apps/lws-gui/assets/fonts/`) are
 not crates and are therefore not produced by cargo-about: the last section is static text kept in
