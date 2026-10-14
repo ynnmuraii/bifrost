@@ -706,9 +706,9 @@ fn footer(
                     }
                 }
                 let label = if transfer.target.is_empty() {
-                    "↔ Передать ввод".to_owned()
+                    "⇄ Передать ввод".to_owned()
                 } else {
-                    format!("↔ Передать ввод → {}", transfer.target)
+                    format!("⇄ Передать ввод → {}", transfer.target)
                 };
                 let go = widgets::button(ui, pal, &label, Kind::Hot, transfer.enabled);
                 if let Some(why) = &transfer.why {

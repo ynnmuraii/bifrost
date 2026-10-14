@@ -66,24 +66,21 @@ impl Session {
                     .map(|record| record.display_name.clone())
             })
             .unwrap_or_default();
+        let online = self.manager.members().await;
         let members = self
-            .manager
-            .members()
-            .await
-            .into_iter()
-            .map(|node| ipc::MemberStatus {
-                node_id: crate::command::node_id_hex(&node),
-                display_name: self
-                    .trust
-                    .get(&node)
-                    .map(|record| record.display_name.clone())
-                    .unwrap_or_default(),
-                // `members()` is the set of *established* links, so a member it names is
-                // online by construction; `link_state` is the protocol's own progression and a
-                // live link is past it.
-                online: true,
-                is_owner: owner == Some(node),
-                link_state: "READY".to_owned(),
+            .trust
+            .peers
+            .iter()
+            .filter(|record| record.is_active())
+            .map(|record| {
+                let connected = online.contains(&record.node_id);
+                ipc::MemberStatus {
+                    node_id: crate::command::node_id_hex(&record.node_id),
+                    display_name: record.display_name.clone(),
+                    online: connected,
+                    is_owner: owner == Some(record.node_id),
+                    link_state: if connected { "READY" } else { "OFFLINE" }.to_owned(),
+                }
             })
             .collect();
         let applied = self.layout_state.applied();
@@ -159,8 +156,9 @@ impl Session {
     ///
     /// Built from the same [`Session::applied_wire`] the replication sends, so the GUI edits
     /// exactly the document the peers hold.
-    pub(crate) fn gui_topology_doc(&self) -> ipc::TopologyDoc {
+    pub(crate) async fn gui_topology_doc(&self) -> ipc::TopologyDoc {
         let applied = self.layout_state.applied();
+        let online = self.manager.members().await;
         // The screens a desktop-anchored endpoint resolves to right now: «Весь рабочий стол
         // (авто)» is one line in the editor, and this is what it currently means. Empty for a
         // link that names its displays.
@@ -242,7 +240,8 @@ impl Session {
                             .unwrap_or_default()
                     },
                     displays: node.displays.iter().map(display_view).collect(),
-                    online: node.online,
+                    online: node_id_of(&node.node_id)
+                        .is_some_and(|node| node == self.node_id || online.contains(&node)),
                 })
                 .collect(),
             links: document
@@ -311,10 +310,38 @@ impl Session {
                 let status = self.gui_status().await;
                 self.gui_status = Some(status.clone());
                 answer(&out, request_id, Msg::Status(status)).await;
+                // Broadcast events are not history: a second/reconnected GUI needs the
+                // current window and unanswered ceremony as well as the workspace status.
+                let window = self.pairing.window();
+                answer(
+                    &out,
+                    0,
+                    Msg::PairingWindow(ipc::PairingWindow {
+                        open: window.is_some(),
+                        address: window.map_or_else(String::new, |window| window.address.clone()),
+                        seconds_remaining: window.map_or(0, |window| window.remaining_s(self.now_ms())),
+                        attempt_id: window.map_or_else(Vec::new, |window| window.attempt_id.to_vec()),
+                    }),
+                )
+                .await;
+                if let Some(prompt) = self.pairing.pending_prompt() {
+                    answer(
+                        &out,
+                        0,
+                        Msg::PairingPrompt(ipc::PairingPrompt {
+                            attempt_id: prompt.ceremony_id.to_vec(),
+                            peer_name: prompt.peer_name.clone(),
+                            sas_code: prompt.sas_code.clone(),
+                            local_fingerprint: prompt.local_fingerprint.clone(),
+                            peer_fingerprint: prompt.peer_fingerprint.clone(),
+                        }),
+                    )
+                    .await;
+                }
             }
             Msg::GetTopology(_) => {
                 self.query_agent_displays().await;
-                let doc = self.gui_topology_doc();
+                let doc = self.gui_topology_doc().await;
                 self.gui_topology = Some(doc.clone());
                 answer(&out, request_id, Msg::TopologyDoc(doc)).await;
             }
@@ -482,7 +509,7 @@ impl Session {
             self.gui_status = Some(status.clone());
             self.publish(Msg::Status(status));
         }
-        let document = self.gui_topology_doc();
+        let document = self.gui_topology_doc().await;
         if self.gui_topology.as_ref() != Some(&document) {
             self.gui_topology = Some(document.clone());
             self.publish(Msg::TopologyDoc(document));
