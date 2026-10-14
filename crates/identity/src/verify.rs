@@ -92,6 +92,24 @@ impl TrustPolicy {
     }
 }
 
+impl From<&crate::TrustStore> for TrustPolicy {
+    fn from(trust: &crate::TrustStore) -> Self {
+        TrustPolicy::Pinned(trust.pinned())
+    }
+}
+
+impl From<crate::TrustStore> for TrustPolicy {
+    fn from(trust: crate::TrustStore) -> Self {
+        TrustPolicy::Pinned(trust.pinned())
+    }
+}
+
+impl From<Arc<RwLock<BTreeSet<NodeId>>>> for TrustPolicy {
+    fn from(pins: Arc<RwLock<BTreeSet<NodeId>>>) -> Self {
+        TrustPolicy::PinnedShared(pins)
+    }
+}
+
 /// Why a peer certificate was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinError {

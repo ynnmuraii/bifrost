@@ -205,11 +205,11 @@ impl Clipboard {
         node: NodeId,
         settings: Settings,
         identity: Arc<identity::NodeIdentity>,
-        trust: identity::TrustStore,
+        trusted_peers: Arc<std::sync::RwLock<std::collections::BTreeSet<NodeId>>>,
         listen: SocketAddr,
         queue_capacity: usize,
     ) -> Result<(Self, mpsc::Receiver<Inbound>), String> {
-        let (runtime, events) = Handle::start(identity, trust, listen, queue_capacity)
+        let (runtime, events) = Handle::start(identity, trusted_peers, listen, queue_capacity)
             .await
             .map_err(|error| format!("clipboard channel: {error}"))?;
         let endpoint = Clipboard {
@@ -831,9 +831,12 @@ const MARKER_NAMES: [&str; 5] = [
 struct Handle {
     inner: Arc<Mutex<Inner>>,
     identity: Arc<identity::NodeIdentity>,
-    trust: identity::TrustStore,
+    trusted_peers: Arc<std::sync::RwLock<std::collections::BTreeSet<NodeId>>>,
     events: mpsc::Sender<Inbound>,
     epoch: Instant,
+    /// The listener's address, for the tests that dial in from a real peer.
+    #[cfg(test)]
+    listen_address: SocketAddr,
 }
 
 struct Inner {
@@ -841,31 +844,44 @@ struct Inner {
     grants: Grants,
     /// Bound channels, by peer.
     channels: BTreeMap<NodeId, mpsc::Sender<ClipboardMessage>>,
+    /// The reader task of each bound channel, so a revocation can close the connection.
+    ///
+    /// Dropping the sender only ends the writer task; the TLS stream stays open because the
+    /// reader task still owns its half, so a revoked peer would keep its bound channel. The
+    /// handle is aborted to drop that half too.
+    readers: BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
 }
 
 impl Handle {
     async fn start(
         identity: Arc<identity::NodeIdentity>,
-        trust: identity::TrustStore,
+        trusted_peers: Arc<std::sync::RwLock<std::collections::BTreeSet<NodeId>>>,
         listen: SocketAddr,
         queue_capacity: usize,
     ) -> Result<(Self, mpsc::Receiver<Inbound>), String> {
         let (events, receiver) = mpsc::channel(256);
+        let listener = ClipboardListener::bind(
+            Arc::clone(&identity),
+            Arc::clone(&trusted_peers),
+            listen,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let local_addr = listener.local_addr();
+        tracing::info!(address = %local_addr, "clipboard channel listening");
         let handle = Handle {
             inner: Arc::new(Mutex::new(Inner {
                 grants: Grants::default(),
                 channels: BTreeMap::new(),
+                readers: BTreeMap::new(),
             })),
             identity,
-            trust,
+            trusted_peers,
             events,
             epoch: Instant::now(),
+            #[cfg(test)]
+            listen_address: local_addr,
         };
-        let listener =
-            ClipboardListener::bind(Arc::clone(&handle.identity), handle.trust.clone(), listen)
-                .await
-                .map_err(|error| error.to_string())?;
-        tracing::info!(address = %listener.local_addr(), "clipboard channel listening");
         let acceptor = handle.clone();
         tokio::spawn(async move { acceptor.accept_loop(listener, queue_capacity).await });
         Ok((handle, receiver))
@@ -950,9 +966,15 @@ impl Handle {
         Ok(())
     }
 
-    /// Drops the channel to `peer`.
+    /// Drops the channel to `peer` and closes its connection.
     async fn close(&self, peer: NodeId) {
-        self.inner.lock().await.channels.remove(&peer);
+        let mut inner = self.inner.lock().await;
+        inner.channels.remove(&peer);
+        if let Some(task) = inner.readers.remove(&peer) {
+            // Aborting drops the reader half; with the sender already gone the whole TLS
+            // stream is closed, so a revoked peer's bound channel does not survive.
+            task.abort();
+        }
     }
 
     /// The accept loop: bind, validate, then read.
@@ -1010,15 +1032,21 @@ impl Handle {
     ) {
         let (reader, writer) = connection.into_split();
         let (tx, rx) = mpsc::channel(queue_capacity.max(1));
-        self.inner.lock().await.channels.insert(peer, tx);
         let events = self.events.clone();
-        let _ = events.send(Inbound::Bound { peer, channel_id }).await;
         let handle = self.clone();
-        tokio::spawn(async move {
-            handle.read_task(peer, reader, events.clone()).await;
-            let _ = events.send(Inbound::Down { peer }).await;
-            handle.inner.lock().await.channels.remove(&peer);
+        let reader_events = events.clone();
+        let reader_task = tokio::spawn(async move {
+            handle.read_task(peer, reader, reader_events.clone()).await;
+            let _ = reader_events.send(Inbound::Down { peer }).await;
+            let mut inner = handle.inner.lock().await;
+            inner.channels.remove(&peer);
+            inner.readers.remove(&peer);
         });
+        let mut inner = self.inner.lock().await;
+        inner.channels.insert(peer, tx);
+        inner.readers.insert(peer, reader_task);
+        drop(inner);
+        let _ = events.send(Inbound::Bound { peer, channel_id }).await;
         tokio::spawn(async move { write_task(writer, rx).await });
     }
 
@@ -1063,7 +1091,7 @@ impl Handle {
     ) {
         let result = dial_clipboard(
             &self.identity,
-            &self.trust,
+            Arc::clone(&self.trusted_peers),
             peer,
             address,
             parent,
@@ -1120,7 +1148,7 @@ mod tests {
         );
         let (handle, _events) = Handle::start(
             identity,
-            identity::TrustStore::new(),
+            Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
             "127.0.0.1:0".parse().expect("an address"),
             4,
         )
@@ -1159,6 +1187,83 @@ mod tests {
             !handle.accepts(&parent, &channel, &token, expires + 1).await,
             "one millisecond after it is refused"
         );
+    }
+
+    /// R2: revocation must close the clipboard connection the peer already holds.
+    ///
+    /// `Handle::close` used to drop only the channel's sender, which ends the writer task but
+    /// leaves the reader task holding half of the TLS stream (`tokio::io::split` keeps the
+    /// socket open until both halves are gone), so a revoked peer kept its bound channel. The
+    /// reader task is now aborted too, and the peer observes the connection close.
+    #[tokio::test]
+    async fn revoking_a_peer_closes_its_bound_channel() {
+        use std::collections::BTreeSet;
+        use std::sync::RwLock;
+
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-revoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let load = |name: &str| {
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(
+                root.join(name),
+            ))
+            .expect("identity")
+            .0
+        };
+        let identity_a = Arc::new(load("a"));
+        let identity_b = load("b");
+        let id_a = identity_a.node_id();
+        let id_b = identity_b.node_id();
+
+        let a_pins = Arc::new(RwLock::new(BTreeSet::from([id_b])));
+        let (handle, mut events) = Handle::start(
+            Arc::clone(&identity_a),
+            Arc::clone(&a_pins),
+            "127.0.0.1:0".parse().expect("an address"),
+            4,
+        )
+        .await
+        .expect("the clipboard runtime starts");
+
+        let parent = [7u8; 16];
+        let (channel, token) = handle.issue(parent).await;
+        let address = handle.listen_address;
+        let b_pins = Arc::new(RwLock::new(BTreeSet::from([id_a])));
+        let dialer = tokio::spawn(async move {
+            dial_clipboard(&identity_b, b_pins, id_a, address, parent, channel, token).await
+        });
+
+        // The runtime binds the channel before the test revokes it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, Inbound::Bound { peer, .. } if peer == id_b) {
+                    return;
+                }
+            }
+            panic!("the clipboard runtime stopped before the channel bound");
+        })
+        .await
+        .expect("the peer's channel must bind");
+
+        handle.close(id_b).await;
+
+        let connection = dialer
+            .await
+            .expect("the dial task")
+            .expect("the dial succeeded");
+        let (mut reader, _writer) = connection.into_split();
+        let closed = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "a revoked peer's bound clipboard channel must be closed, got {closed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

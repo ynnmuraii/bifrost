@@ -714,3 +714,80 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() {
+    let root = temp_root("clipboard-pins");
+    let identity_a = Arc::new(identity_at(&root, "a"));
+    let identity_b = Arc::new(identity_at(&root, "b"));
+    let id_a = identity_a.node_id();
+    let id_b = identity_b.node_id();
+
+    // Node A starts with an EMPTY shared pin set (B is not yet paired).
+    let a_pins = Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new()));
+    let b_pins = Arc::new(std::sync::RwLock::new([id_a].into_iter().collect()));
+
+    let address_a = free_address().await;
+    let mut listener = ClipboardListener::bind(
+        Arc::clone(&identity_a),
+        Arc::clone(&a_pins),
+        address_a,
+    )
+    .await
+    .expect("bind listener");
+
+    // Before pairing: B dials A. Handshake MUST fail because A has not pinned B.
+    let fail_dial = dial_clipboard(
+        &identity_b,
+        Arc::clone(&b_pins),
+        id_a,
+        address_a,
+        [1; 16],
+        [2; 16],
+        [3; 32],
+    )
+    .await;
+    assert!(fail_dial.is_err(), "dial before pairing must be refused");
+
+    // Runtime pairing: A adds B to its shared pins WITHOUT restarting the listener.
+    a_pins.write().unwrap().insert(id_b);
+
+    // Now B dials A again. Handshake MUST succeed with no restart!
+    let identity_b_clone = Arc::clone(&identity_b);
+    let b_pins_clone = Arc::clone(&b_pins);
+    let dial_task = tokio::spawn(async move {
+        dial_clipboard(
+            &identity_b_clone,
+            b_pins_clone,
+            id_a,
+            address_a,
+            [1; 16],
+            [2; 16],
+            [3; 32],
+        )
+        .await
+    });
+
+    let (conn_a, bind_msg) = listener.accept().await.expect("accept");
+    assert_eq!(conn_a.peer, id_b);
+    let conn_b = dial_task.await.expect("join").expect("dial succeeds");
+    assert_eq!(conn_b.peer, id_a);
+    assert!(matches!(bind_msg, ClipboardMessage::Bind { .. }));
+
+    // Revoke: A removes B from its shared pins.
+    a_pins.write().unwrap().remove(&id_b);
+
+    // B tries to dial A again. Handshake MUST be refused!
+    let b_pins_2 = Arc::new(std::sync::RwLock::new([id_a].into_iter().collect()));
+    let fail_revoked = dial_clipboard(
+        &identity_b,
+        b_pins_2,
+        id_a,
+        address_a,
+        [4; 16],
+        [5; 16],
+        [6; 32],
+    )
+    .await;
+    assert!(fail_revoked.is_err(), "dial after revocation must be refused");
+}

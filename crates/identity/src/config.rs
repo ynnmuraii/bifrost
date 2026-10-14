@@ -111,11 +111,11 @@ pub fn trusted_server_config(
 /// cannot reach this one.
 pub fn clipboard_client_config(
     identity: &NodeIdentity,
-    trust: &TrustStore,
+    trust: impl Into<TrustPolicy>,
 ) -> Result<ClientConfig, IdentityError> {
     client_config(
         identity,
-        TrustPolicy::Pinned(trust.pinned()),
+        trust.into(),
         &[protocol::limits::ALPN_CLIPBOARD],
     )
 }
@@ -123,11 +123,11 @@ pub fn clipboard_client_config(
 /// Server config for the **clipboard channel only**. See [`clipboard_client_config`].
 pub fn clipboard_server_config(
     identity: &NodeIdentity,
-    trust: &TrustStore,
+    trust: impl Into<TrustPolicy>,
 ) -> Result<ServerConfig, IdentityError> {
     server_config(
         identity,
-        TrustPolicy::Pinned(trust.pinned()),
+        trust.into(),
         &[protocol::limits::ALPN_CLIPBOARD],
     )
 }
