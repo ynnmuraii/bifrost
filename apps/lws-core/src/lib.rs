@@ -391,29 +391,6 @@ async fn run_async(
     peers.sort();
     peers.dedup();
 
-    // `[clipboard]`: the second channel (ADR-008) exists only when the setting is on. It has a
-    // listener of its own on `network.port_clipboard` and a dial list of its own, because
-    // `KVM-042` («объём clipboard не блокирует key-up») is exactly about the two channels not
-    // sharing a socket, a queue or a task.
-    let (clipboard, clipboard_events) = if config.clipboard.enabled {
-        let clipboard_listen = SocketAddr::new(listen.ip(), config.network.port_clipboard);
-        let (endpoint, events) = clipboard::Clipboard::start(
-            node_id,
-            clipboard::Settings::from_config(&config.clipboard),
-            Arc::clone(&identity),
-            trust.clone(),
-            clipboard_listen,
-            QUEUE_CAPACITY,
-        )
-        .await?;
-        (Some(endpoint), events)
-    } else {
-        // Nothing listens and nothing dials, and the `select!` arm is disabled by the
-        // `clipboard.is_some()` guard, so this receiver never fires.
-        let (_unused, events) = tokio::sync::mpsc::channel(1);
-        (None, events)
-    };
-
     let local_hello = routing::hello(
         node_id,
         config.node.display_name.as_str(),
@@ -465,6 +442,29 @@ async fn run_async(
             tracing::error!(%error, "the link manager stopped");
         }
     });
+
+    // `[clipboard]`: the second channel (ADR-008) exists only when the setting is on. It has a
+    // listener of its own on `network.port_clipboard` and a dial list of its own, because
+    // `KVM-042` («объём clipboard не блокирует key-up») is exactly about the two channels not
+    // sharing a socket, a queue or a task.
+    let (clipboard, clipboard_events) = if config.clipboard.enabled {
+        let clipboard_listen = SocketAddr::new(listen.ip(), config.network.port_clipboard);
+        let (endpoint, events) = clipboard::Clipboard::start(
+            node_id,
+            clipboard::Settings::from_config(&config.clipboard),
+            Arc::clone(&identity),
+            manager.shared_pins(),
+            clipboard_listen,
+            QUEUE_CAPACITY,
+        )
+        .await?;
+        (Some(endpoint), events)
+    } else {
+        // Nothing listens and nothing dials, and the `select!` arm is disabled by the
+        // `clipboard.is_some()` guard, so this receiver never fires.
+        let (_unused, events) = tokio::sync::mpsc::channel(1);
+        (None, events)
+    };
 
     // The sibling change to `focus_router::Timing` removed `repeat_guard_ms`; the
     // literal names every field it has today, so a new field would break the build

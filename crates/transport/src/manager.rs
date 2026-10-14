@@ -342,6 +342,11 @@ impl LinkManager {
             .remove(peer);
     }
 
+    /// The shared pin set read by TLS verifiers.
+    pub fn shared_pins(&self) -> Arc<std::sync::RwLock<BTreeSet<NodeId>>> {
+        Arc::clone(&self.trusted_peers)
+    }
+
     /// Replaces the Hello carried by links formed from now on.
     pub async fn update_local_hello(&self, hello: wire::Hello) {
         *self.local_hello.write().await = hello;

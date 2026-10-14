@@ -701,7 +701,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
 /// Dialer: TLS to `address` with ALPN clipboard/1, then the first frame is `Bind`.
 pub async fn dial_clipboard(
     identity: &identity::NodeIdentity,
-    trust: &identity::TrustStore,
+    trust: impl Into<identity::TrustPolicy>,
     peer: NodeId,
     address: SocketAddr,
     parent_connection_id: [u8; 16],
@@ -771,10 +771,10 @@ impl ClipboardListener {
     /// Binds `listen` and builds the pinned clipboard TLS acceptor.
     pub async fn bind(
         identity: Arc<identity::NodeIdentity>,
-        trust: identity::TrustStore,
+        trust: impl Into<identity::TrustPolicy>,
         listen: SocketAddr,
     ) -> Result<Self, TransportError> {
-        let config = identity::clipboard_server_config(&identity, &trust)?;
+        let config = identity::clipboard_server_config(&identity, trust)?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = crate::manager::bind_listener(listen).await?;
         Ok(Self { listener, acceptor })

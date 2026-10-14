@@ -748,6 +748,9 @@ impl Session {
         if let Err(error) = self.manager.remove_peer(&node).await {
             tracing::warn!(%error, "cannot remove the live peer pin");
         }
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            clipboard.on_link_down(node).await;
+        }
         tracing::info!(
             peer = crate::command::node_id_hex(&node).as_str(),
             "peer revoked"
