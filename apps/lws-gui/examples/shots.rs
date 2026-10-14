@@ -3,6 +3,10 @@
 //! ```text
 //! cargo run -p lws-gui --example shots
 //! ```
+//! Pass `--root DIR --output DIR` (or `--live` for the user's default endpoint) to
+//! snapshot a real core over IPC instead. This mode only queries state; it never
+//! starts a core, applies a layout or sends a pairing decision. Both modes render
+//! offscreen and never open a desktop window.
 //!
 //! Each state is drawn into an `egui_kittest` harness with the wgpu renderer and written to
 //! `target/ui-shots/<name>.png`. This is an example and not a test on purpose: `cargo test`
@@ -19,7 +23,9 @@ use egui_kittest::Harness;
 use lws_gui::egui;
 use lws_gui::gui_settings::{Look, Theme};
 use lws_gui::ui::{self, Env, UiState};
-use lws_gui::view_model::{Action, CoreEndpoint, LocalConfig, Modal, ViewModel};
+use lws_gui::view_model::{
+    self, Action, Bridge, CliArgs, CoreEndpoint, LocalConfig, Modal, ViewModel,
+};
 use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
@@ -33,7 +39,26 @@ static LAPTOP: LazyLock<String> = LazyLock::new(|| format!("{:0<64}", "7f3a91c20
 static HTPC: LazyLock<String> = LazyLock::new(|| format!("{:0<64}", "c04e5b175b17"));
 
 fn main() -> std::process::ExitCode {
-    let dir = PathBuf::from(OUT_DIR);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let option = |name: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == name)
+            .map(|pair| pair[1].clone())
+    };
+    let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    let real = args.iter().any(|arg| arg == "--live" || arg == "--root");
+    let prefix = option("--prefix").unwrap_or_else(|| "real".to_owned());
+    let snapshot = if real {
+        match real_snapshot(CliArgs::parse(args)) {
+            Ok(view) => Some(view),
+            Err(error) => {
+                eprintln!("cannot snapshot core: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = std::fs::create_dir_all(&dir) {
         eprintln!("cannot create {}: {error}", dir.display());
         return std::process::ExitCode::FAILURE;
@@ -45,18 +70,31 @@ fn main() -> std::process::ExitCode {
         } else {
             "dark"
         };
-        let mut states: Vec<(String, ViewModel)> = vec![
-            (format!("main-{tag}"), mockup(theme, None)),
-            (
+        let mut states = Vec::new();
+        if let Some(snapshot) = &snapshot {
+            let mut view = snapshot.clone();
+            view.look.theme = theme;
+            view.modal = None;
+            states.push((format!("{prefix}-main-{tag}"), view.clone()));
+            for modal in Modal::ALL {
+                view.modal = Some(modal);
+                states.push((
+                    format!("{prefix}-modal-{}-{tag}", modal_name(modal)),
+                    view.clone(),
+                ));
+            }
+        } else {
+            states.push((format!("main-{tag}"), mockup(theme, None)));
+            states.push((
                 format!("main-window-{tag}"),
                 with_window(mockup(theme, None)),
-            ),
-        ];
-        for modal in Modal::ALL {
-            states.push((
-                format!("modal-{}-{tag}", modal_name(modal)),
-                mockup(theme, Some(modal)),
             ));
+            for modal in Modal::ALL {
+                states.push((
+                    format!("modal-{}-{tag}", modal_name(modal)),
+                    mockup(theme, Some(modal)),
+                ));
+            }
         }
         for (name, state) in states {
             let file = dir.join(format!("{name}.png"));
@@ -74,6 +112,55 @@ fn main() -> std::process::ExitCode {
     }
     println!("{written} pictures in {}", dir.display());
     std::process::ExitCode::SUCCESS
+}
+
+fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
+    let (view, client) = view_model::boot(args);
+    let mut bridge = Bridge::new(view, client);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut queried_edits = false;
+    loop {
+        bridge.pump();
+        let view = bridge.view();
+        if view.connection.is_connected() && view.status.is_some() && view.editor.has_document() {
+            if !queried_edits {
+                bridge.dispatch(Action::ListPendingEdits, Instant::now());
+                queried_edits = true;
+            } else if view.inflight.is_empty() {
+                let mut snapshot = view.clone();
+                if let Some(paths) = &snapshot.config.paths {
+                    snapshot.look = lws_gui::gui_settings::load(&lws_gui::gui_settings::path_in(
+                        paths.config_dir(),
+                    ));
+                }
+                snapshot.pairing.details = snapshot.pairing.prompt.is_some();
+                println!(
+                    "data_source=IPC node_names={:?} topology_revision={} pairing_open={} sas={:?}",
+                    snapshot
+                        .editor
+                        .nodes
+                        .iter()
+                        .map(|node| &node.display_name)
+                        .collect::<Vec<_>>(),
+                    snapshot.editor.revision,
+                    snapshot.pairing.window.is_some(),
+                    snapshot
+                        .pairing
+                        .prompt
+                        .as_ref()
+                        .map(|prompt| &prompt.sas_code),
+                );
+                return Ok(snapshot);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no complete status/topology snapshot: {:?}",
+                bridge.view().connection
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn modal_name(modal: Modal) -> &'static str {
