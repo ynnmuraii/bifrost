@@ -11,7 +11,8 @@
 //!   (`platform_x11::EMERGENCY_F12_X11_KEYCODE`), not from
 //!   `AgentAttach.emergency_hotkey`; the X11 spike never took the combination as a
 //!   parameter. The keycode is checked against the current XKB map by that crate.
-//! * As on Windows, nothing buffers a `TEMPORARY` capture for a local replay.
+//! * Temporary capture leaves the X11 grabs released. Discrete local events
+//!   are not forwarded or buffered for replay.
 
 use std::time::Duration;
 
@@ -190,9 +191,22 @@ impl X11 {
             self.capture = Some(capture);
         }
         let capture = self.capture.as_mut().expect("just inserted");
-        if kind == CaptureKind::Observe {
+        if !kind.is_suppressed() {
             capture.ungrab();
             return Ok(());
+        }
+        // Discard observation events already delivered locally before committing
+        // the grab; otherwise a queued local click could be duplicated remotely.
+        if !capture.grab_active() {
+            while let Some(event) = capture
+                .next_event(Some(Duration::ZERO))
+                .map_err(|error| error.to_string())?
+            {
+                if matches!(event, CapturedEvent::Emergency) {
+                    return Err("EMERGENCY: capture commit cancelled by local hotkey".to_owned());
+                }
+            }
+            self.repeats.clear();
         }
         capture.grab().map_err(|error| error.to_string())
     }
@@ -369,6 +383,11 @@ impl X11 {
                 || capture.next_event(Some(Duration::ZERO)),
                 &mut self.repeats,
             ) {
+                // An ungrabbed observation/Temporary edge already reached the
+                // local desktop; never make it a deferred peer input.
+                Ok(Some(Event::Input(
+                    InputEvent::Key { .. } | InputEvent::Button { .. } | InputEvent::Scroll { .. },
+                ))) if !capture.grab_active() => {}
                 Ok(Some(event)) => return Some(event),
                 Ok(None) => {}
                 Err(error) => {

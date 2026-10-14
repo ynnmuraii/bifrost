@@ -6,6 +6,9 @@
 //! criteria they measure. Every scenario drives two real `lws-core` processes on loopback
 //! through the control channel — the E2 slice as a user runs it, with dry agents standing
 //! in for the OS input.
+//! Dry file controls also cover held-edge refusal storms, emergency cancellation in
+//! Preparing, local click passthrough during failed Temporary capture, and stale
+//! topology edges without a live link. None of these controls inject desktop input.
 //!
 //! ```text
 //! # the fast variant that runs with the workspace suite (50 cycles + the fault cases)
@@ -105,6 +108,156 @@ fn a_pair_links_and_returns_to_local_with_an_empty_ledger() {
     assert_eq!(status.focus, "Local");
     assert_eq!(status.pressed, 0);
     assert_eq!(status.peer, "-");
+}
+
+/// A held edge is one intent, not an unbounded stream of prepare retries.
+#[test]
+fn an_always_refusing_peer_gets_at_most_five_attempts_in_ten_seconds() {
+    let _serial = common::serial();
+    let harness = Harness::start_fault_controls(false, true);
+    harness.wait_linked();
+    harness.a.wait_dry_capture("Observe");
+    harness.a.seed_dry_pointer(1600.0, 540.0);
+    let before = harness.a.marked("pointer reached a link edge").len();
+    harness.a.hold_dry_pointer(1960.0, 540.0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        assert!(
+            harness.a.marked("pointer reached a link edge").len() - before <= 5,
+            "a held pointer caused a transition storm against a refusing peer"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let attempts = harness.a.marked("pointer reached a link edge").len() - before;
+    assert!(
+        attempts > 0,
+        "the held edge must actually exercise preparation"
+    );
+    assert!(attempts <= 5, "{attempts} attempts in ten seconds");
+    harness
+        .a
+        .wait_for(
+            "failed preparation releases input",
+            Duration::from_secs(2),
+            |s| s.is_idle(),
+        )
+        .expect("a refusal must leave input local");
+    assert!(
+        harness
+            .a
+            .focus_events()
+            .iter()
+            .any(|(_, focus)| focus == "Preparing"),
+        "the refusing receiver must be reached, not bypassed by a source preflight"
+    );
+    assert!(
+        !harness
+            .a
+            .focus_events()
+            .iter()
+            .any(|(_, focus)| focus == "Remote"),
+        "the always-refusing receiver must never gain input"
+    );
+}
+
+/// The emergency interrupts a pending prepare, without waiting for its timeout.
+#[test]
+fn emergency_during_preparing_returns_local_within_one_hundred_milliseconds() {
+    let _serial = common::serial();
+    let harness = Harness::start_fault_controls(true, false);
+    harness.wait_linked();
+    harness.proxy.as_ref().expect("proxy").blackhole();
+    harness.a.switch(&harness.b.id).expect("start preparation");
+    harness.a.wait_dry_capture("Temporary");
+    assert_eq!(
+        harness.a.status().expect("preparing status").focus,
+        "Preparing"
+    );
+    let fired = common::now_millis();
+    harness.a.trigger_emergency();
+    harness
+        .a
+        .wait_for("emergency restores Local", Duration::from_secs(2), |s| {
+            s.is_idle()
+        })
+        .expect("emergency must release the pending prepare");
+    let local = local_after(&harness.a, fired).expect("Local transition after emergency");
+    assert!(
+        local - fired <= 100,
+        "emergency took {}ms during Preparing (budget 100ms)",
+        local - fired
+    );
+    harness.a.wait_dry_capture("Observe");
+}
+
+/// Temporary does not suppress discrete local input even if the prepare times out.
+#[test]
+fn a_click_during_a_failed_temporary_capture_reaches_the_local_desktop() {
+    let _serial = common::serial();
+    let harness = Harness::start_fault_controls(true, false);
+    harness.wait_linked();
+    harness.proxy.as_ref().expect("proxy").blackhole();
+    harness.a.switch(&harness.b.id).expect("start preparation");
+    harness.a.wait_dry_capture("Temporary");
+    let before = harness.a.dry_local_passthrough();
+    harness.a.trigger_dry_click();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while harness.a.dry_local_passthrough() == before {
+        assert!(
+            Instant::now() < deadline,
+            "the local click was lost during Preparing"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    harness.a.wait_dry_capture("Temporary");
+    assert_eq!(
+        harness.a.dry_local_passthrough() - before,
+        2,
+        "both the local button down and up must pass through exactly once"
+    );
+    harness
+        .a
+        .wait_for("prepare times out", Duration::from_secs(2), |s| s.is_idle())
+        .expect("failed Temporary capture must release input");
+    assert_eq!(harness.a.dry_local_passthrough() - before, 2);
+    assert!(
+        !harness
+            .a
+            .focus_events()
+            .iter()
+            .any(|(_, focus)| focus == "Remote"),
+        "the blackholed prepare must not commit"
+    );
+}
+
+/// A stale topology link cannot arm suppression when its transport is absent.
+#[test]
+fn a_held_edge_without_a_live_link_never_enters_preparing() {
+    let _serial = common::serial();
+    let harness = Harness::start_fault_controls(false, false);
+    harness.wait_linked();
+    harness.a.wait_dry_capture("Observe");
+    harness.a.seed_dry_pointer(1600.0, 540.0);
+    common::Node::kill_pid(harness.b.pid()).expect("stop the dry peer");
+    harness
+        .a
+        .wait_for("peer link is gone", Duration::from_secs(10), |s| {
+            s.members == 0 && s.is_idle()
+        })
+        .expect("the source must observe link loss");
+    let before = harness.a.focus_events().len();
+    harness.a.hold_dry_pointer(1960.0, 540.0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        assert!(
+            harness.a.focus_events()[before..]
+                .iter()
+                .all(|(_, focus)| focus != "Preparing"),
+            "a dead peer must be rejected before Temporary capture"
+        );
+        assert!(harness.a.status().expect("unlinked status").is_idle());
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A restored source must reconcile a newer remembered pair without a manual claim.

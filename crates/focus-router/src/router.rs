@@ -789,7 +789,11 @@ impl<I: Identifiers> FocusRouter<I> {
                 }
                 out.push(Output::Notice(Notice::ClaimRefused { code: Some(code) }));
             }
-            ErrorCode::NotOwner | ErrorCode::UnsupportedSession | ErrorCode::CaptureFailed => {
+            ErrorCode::NotOwner
+            | ErrorCode::UnsupportedSession
+            | ErrorCode::CaptureFailed
+            | ErrorCode::LeaseMismatch
+            | ErrorCode::InvalidFrame => {
                 out.push(Output::Notice(Notice::Rejected { peer: from, code }));
                 self.cancel_preparing_source(from, out);
             }
@@ -983,13 +987,17 @@ impl<I: Identifiers> FocusRouter<I> {
                     self.burned.insert(lease_id);
                 }
                 LeaseSlot::Receiver(lease) if lease.state == ReceiverState::Prepared => {
-                    // «Prepared expires через prepare_timeout (по умолчанию 200 ms)»
+                    // Bound both adapter readiness and a missing EnterCommit.
                     let lease_id = lease.lease_id;
                     out.push(Output::Agent(AgentCommand::ReleaseSession { lease_id }));
                     if let Some(lease) = self.lease.receiver_mut() {
                         lease.state = ReceiverState::Expired;
                     }
                     self.burned.insert(lease_id);
+                    out.push(Output::ArmTimer {
+                        timer: Timer::ReleaseGuard,
+                        deadline_ms: now_ms.saturating_add(self.timing.claim_grant_timeout_ms),
+                    });
                     out.push(Output::Notice(Notice::LeaseExpired { lease_id }));
                 }
                 _ => {}
@@ -1085,7 +1093,12 @@ impl<I: Identifiers> FocusRouter<I> {
                     self.burned.insert(lease_id);
                     self.lease = LeaseSlot::Idle;
                 }
-                LeaseSlot::Receiver(lease) if lease.state == ReceiverState::Releasing => {
+                LeaseSlot::Receiver(lease)
+                    if matches!(
+                        lease.state,
+                        ReceiverState::Releasing | ReceiverState::Expired
+                    ) =>
+                {
                     let lease_id = lease.lease_id;
                     self.burned.insert(lease_id);
                     self.lease = LeaseSlot::Idle;
@@ -1166,6 +1179,15 @@ impl<I: Identifiers> FocusRouter<I> {
                         code,
                     })),
                 },
+                ErrorCode::InvalidFrame
+                    if lease_id.is_some_and(|id| {
+                        self.lease.receiver().is_some_and(|lease| {
+                            lease.lease_id == id && lease.state == ReceiverState::Prepared
+                        })
+                    }) =>
+                {
+                    self.cancel_failed_transition(now_ms, lease_id.unwrap(), code, out);
+                }
                 _ => out.push(Output::Notice(Notice::Rejected {
                     peer: self.local,
                     code,
@@ -1707,6 +1729,10 @@ impl<I: Identifiers> FocusRouter<I> {
             now_ms,
         )));
         out.push(Output::Agent(AgentCommand::PrepareInject { lease_id }));
+        out.push(Output::ArmTimer {
+            timer: Timer::PrepareTimeout,
+            deadline_ms: now_ms.saturating_add(self.timing.prepare_timeout_ms),
+        });
     }
 
     fn reject_prepare(
@@ -1931,14 +1957,11 @@ impl<I: Identifiers> FocusRouter<I> {
             }
             LeaseSlot::Receiver(lease) if lease.source == from && lease.lease_id == lease_id => {
                 if lease.state == ReceiverState::Releasing {
-                    // We already released (takeover); just acknowledge.
-                    out.push(Output::Send {
-                        peer: from,
-                        message: Message::LeaveAck { lease_id },
-                    });
-                    out.push(Output::CancelTimer(Timer::ReleaseGuard));
-                    self.burned.insert(lease_id);
-                    self.lease = LeaseSlot::Idle;
+                    // Releasing means cleanup was requested, not confirmed. A crossed
+                    // Leave is acknowledged only after the agent reports Released.
+                    if let Some(lease) = self.lease.receiver_mut() {
+                        lease.pending_leave = None;
+                    }
                     return;
                 }
                 // «RC->>RA: ReleaseSession L; RA-->>RC: Released; RC-->>SC: LeaveAck L»:
@@ -1976,9 +1999,8 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::ReleaseGuard));
             }
             LeaseSlot::Receiver(lease) if lease.source == from && lease.lease_id == lease_id => {
-                self.burned.insert(lease_id);
-                self.lease = LeaseSlot::Idle;
-                out.push(Output::CancelTimer(Timer::ReleaseGuard));
+                // The peer's ack confirms its capture cleanup, not our injection
+                // cleanup. Keep the slot and guard until Released or guard expiry.
             }
             // A `LeaveAck` may arrive after we already released locally: benign.
             LeaseSlot::Idle => {}

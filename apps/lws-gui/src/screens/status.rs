@@ -72,6 +72,11 @@ fn input_block(vm: &ViewModel, ui: &mut egui::Ui) {
         if let Some(detail) = vm.focus_detail() {
             hint(ui, &detail);
         }
+        if let Some(status) = &vm.status {
+            if !status.transition_disabled_reason.is_empty() {
+                important(ui, &status.transition_disabled_reason);
+            }
+        }
     });
 }
 

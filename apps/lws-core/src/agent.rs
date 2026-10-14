@@ -322,6 +322,11 @@ impl Supervisor {
         self.state
     }
 
+    /// Whether this supervisor launches agents without any desktop input paths.
+    pub const fn is_dry(&self) -> bool {
+        self.dry_inject
+    }
+
     /// The portal token store: the session writes back what the agent reported and
     /// clears it when the user forgets the grants.
     pub fn portal(&mut self) -> &mut crate::portal::PortalGrants {

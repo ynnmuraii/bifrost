@@ -228,9 +228,8 @@ pub enum CaptureKind {
     /// Pass-through: events are reported, the local desktop keeps working.
     #[default]
     Observe,
-    /// Suppress and buffer with a self-timeout, for a transfer that is not yet
-    /// committed. Suppression-wise identical to [`CaptureKind::Remote`]; the
-    /// self-timeout and the local replay of the buffer belong to the agent.
+    /// Observe an uncommitted transfer with a self-timeout. Local input remains
+    /// usable; discrete events must not be replayed or forwarded after commit.
     Temporary,
     /// Suppress locally (and hold the cursor) and forward to the agent.
     Remote,
@@ -239,7 +238,7 @@ pub enum CaptureKind {
 impl CaptureKind {
     /// Whether local input is suppressed in this mode.
     pub const fn is_suppressed(self) -> bool {
-        matches!(self, CaptureKind::Temporary | CaptureKind::Remote)
+        matches!(self, CaptureKind::Remote)
     }
 }
 

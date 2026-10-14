@@ -48,7 +48,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
+    GetAsyncKeyState, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
@@ -98,10 +98,9 @@ pub enum CaptureEvent {
 pub struct CaptureConfig {
     /// Starting mode.
     ///
-    /// [`CaptureKind::Temporary`] is suppression-wise identical to
-    /// [`CaptureKind::Remote`] (REMOTE plus a self-timeout and a local replay of
-    /// the buffer, both of which belong to the agent, not to this adapter); no
-    /// self-timeout is implemented here.
+    /// [`CaptureKind::Temporary`] observes local input without suppressing it.
+    /// Keys, buttons and scroll are not queued in that mode: replaying them after
+    /// commit would duplicate input already delivered to the local desktop.
     pub mode: CaptureKind,
     /// Emergency combination.
     pub emergency: EmergencyCombo,
@@ -350,13 +349,11 @@ impl Capture {
     /// Switch mode.
     ///
     /// Entering [`CaptureKind::Remote`] snapshots the cursor position as the hold
-    /// point; leaving it releases the hold. [`CaptureKind::Temporary`] suppresses
-    /// identically to `.Remote` (its self-timeout and buffer replay belong to the
-    /// agent, not to this adapter) and so shares the hold branch. The mode flip
-    /// itself is a single atomic store, so the hook sees it immediately.
+    /// point; leaving it releases the hold. Temporary leaves all local input
+    /// untouched. The mode flip is a single atomic store.
     pub fn set_mode(&self, mode: CaptureKind) {
         match mode {
-            CaptureKind::Temporary | CaptureKind::Remote => {
+            CaptureKind::Remote => {
                 let mut point = POINT { x: 0, y: 0 };
                 // SAFETY: `GetCursorPos` writes into a valid `POINT`.
                 if unsafe { GetCursorPos(&mut point) }.is_ok() {
@@ -367,12 +364,12 @@ impl Capture {
                 } else {
                     self.shared.hold_valid.store(false, Ordering::SeqCst);
                 }
-                self.shared.emergency_fired.store(false, Ordering::SeqCst);
             }
-            CaptureKind::Observe => {
+            CaptureKind::Observe | CaptureKind::Temporary => {
                 self.shared.hold_valid.store(false, Ordering::SeqCst);
             }
         }
+        self.shared.emergency_fired.store(false, Ordering::SeqCst);
         self.shared.mode.store(mode as u8, Ordering::SeqCst);
     }
 
@@ -647,8 +644,7 @@ fn capture_kind(shared: &Shared) -> CaptureKind {
     }
 }
 
-/// Whether local input is currently suppressed. `Temporary` suppresses exactly
-/// like `Remote`; its self-timeout and buffer replay belong to the agent.
+/// Only a committed Remote capture suppresses local input.
 fn remote(shared: &Shared) -> bool {
     capture_kind(shared).is_suppressed()
 }
@@ -672,14 +668,49 @@ fn update_modifiers(shared: &Shared, vk: u16, down: bool) {
 }
 
 fn is_emergency(shared: &Shared, vk: u16) -> bool {
-    let combo = shared.combo;
+    emergency_matches(
+        shared.combo,
+        vk,
+        shared.modifiers.load(Ordering::Relaxed),
+        physical_modifiers,
+    )
+}
+
+fn emergency_matches(
+    combo: EmergencyCombo,
+    vk: u16,
+    mask: u32,
+    physical: impl FnOnce() -> u32,
+) -> bool {
     if vk != combo.vk {
         return false;
     }
-    let mask = shared.modifiers.load(Ordering::Relaxed);
-    (!combo.ctrl || mask & MOD_CTRL != 0)
-        && (!combo.alt || mask & MOD_ALT != 0)
-        && (!combo.shift || mask & MOD_SHIFT != 0)
+    let required = (if combo.ctrl { MOD_CTRL } else { 0 })
+        | (if combo.alt { MOD_ALT } else { 0 })
+        | (if combo.shift { MOD_SHIFT } else { 0 });
+    // A restarted hook did not see modifiers pressed before it was installed.
+    // Query only for the emergency key, and only when its ledger is incomplete.
+    mask & required == required || (mask | physical()) & required == required
+}
+
+fn physical_modifiers() -> u32 {
+    let down = |left, right| {
+        // SAFETY: querying current key state has no input side effects.
+        unsafe { GetAsyncKeyState(left) < 0 || GetAsyncKeyState(right) < 0 }
+    };
+    (if down(i32::from(VK_LCONTROL.0), i32::from(VK_RCONTROL.0)) {
+        MOD_CTRL
+    } else {
+        0
+    }) | (if down(i32::from(VK_LMENU.0), i32::from(VK_RMENU.0)) {
+        MOD_ALT
+    } else {
+        0
+    }) | (if down(i32::from(VK_LSHIFT.0), i32::from(VK_RSHIFT.0)) {
+        MOD_SHIFT
+    } else {
+        0
+    })
 }
 
 /// Restore local mode unconditionally. This is the one path that must work even
@@ -737,6 +768,10 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
         return None;
     }
 
+    if capture_kind(shared) == CaptureKind::Temporary {
+        return Some(false);
+    }
+
     let swallow = remote(shared);
     let scancode = hid::scancode_from_hook(kb.scanCode, kb.flags.0 & LLKHF_EXTENDED.0 != 0);
     match hid::scancode_to_hid(scancode) {
@@ -784,6 +819,9 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
     }
 
     let swallow = remote(shared);
+    if capture_kind(shared) == CaptureKind::Temporary && message != WM_MOUSEMOVE {
+        return Some(false);
+    }
 
     match message {
         WM_MOUSEMOVE => {
@@ -998,6 +1036,136 @@ fn should_capture_event(injected: bool, own_tag: bool, capture_injected: bool) -
 #[cfg(test)]
 mod tests {
     use super::should_capture_event;
+
+    #[test]
+    fn restarted_hook_recognizes_modifiers_pressed_before_installation() {
+        use super::*;
+        let combo = EmergencyCombo::default();
+        let held = MOD_CTRL | MOD_ALT | MOD_SHIFT;
+        assert!(emergency_matches(combo, combo.vk, 0, || held));
+        assert!(emergency_matches(combo, combo.vk, MOD_CTRL, || held));
+        assert!(!emergency_matches(combo, combo.vk, 0, || MOD_CTRL));
+        assert!(!emergency_matches(
+            combo,
+            combo.vk.wrapping_add(1),
+            0,
+            || { panic!("ordinary keys must not query physical state") }
+        ));
+        assert!(emergency_matches(combo, combo.vk, held, || {
+            panic!("complete hook ledger needs no physical query")
+        }));
+    }
+    fn hook_state(
+        mode: super::CaptureKind,
+    ) -> (super::Shared, super::Receiver<super::CaptureEvent>) {
+        use super::*;
+        let (tx, rx) = mpsc::sync_channel(16);
+        let shared = Shared {
+            tx,
+            mode: AtomicU8::new(mode as u8),
+            hold: AtomicI64::new(0),
+            hold_valid: AtomicBool::new(true),
+            emergency_fired: AtomicBool::new(false),
+            modifiers: AtomicU32::new(MOD_CTRL | MOD_ALT | MOD_SHIFT),
+            combo: EmergencyCombo::default(),
+            captured: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            unmapped_keys: AtomicU64::new(0),
+            injected_seen: AtomicU64::new(0),
+            hook_mouse_moves: AtomicU64::new(0),
+            raw_mouse_moves: AtomicU64::new(0),
+            raw_absolute: AtomicU64::new(0),
+            raw_synth_suppressed: AtomicU64::new(0),
+            recenters: AtomicU64::new(0),
+            emergencies: AtomicU64::new(0),
+            overflowed: AtomicBool::new(false),
+            raw_input_ok: AtomicBool::new(false),
+            hook_calls: AtomicU64::new(0),
+            capture_injected: AtomicBool::new(false),
+            keyboard_hook_events: AtomicU64::new(0),
+            keyboard_injected_seen: AtomicU64::new(0),
+            keyboard_filtered: AtomicU64::new(0),
+            keyboard_mapped: AtomicU64::new(0),
+            keyboard_suppressed: AtomicU64::new(0),
+        };
+        (shared, rx)
+    }
+
+    #[test]
+    fn emergency_restores_local_input_in_every_capture_mode() {
+        use super::*;
+        for mode in [
+            CaptureKind::Observe,
+            CaptureKind::Temporary,
+            CaptureKind::Remote,
+        ] {
+            let (shared, rx) = hook_state(mode);
+            let kb = KBDLLHOOKSTRUCT {
+                vkCode: u32::from(shared.combo.vk),
+                ..Default::default()
+            };
+            assert_eq!(
+                handle_keyboard(
+                    &shared,
+                    WPARAM(WM_KEYDOWN as usize),
+                    LPARAM(&kb as *const _ as isize)
+                ),
+                None
+            );
+            assert_eq!(capture_kind(&shared), CaptureKind::Observe);
+            assert!(!shared.hold_valid.load(Ordering::SeqCst));
+            assert!(matches!(rx.try_recv(), Ok(CaptureEvent::Emergency)));
+            assert!(!remote(&shared));
+        }
+    }
+
+    #[test]
+    fn temporary_passes_keys_buttons_and_motion_without_buffering_edges() {
+        use super::*;
+        let (shared, rx) = hook_state(CaptureKind::Temporary);
+        let kb = KBDLLHOOKSTRUCT {
+            vkCode: 0x41,
+            scanCode: 0x1e,
+            ..Default::default()
+        };
+        for message in [WM_KEYDOWN, WM_KEYUP] {
+            assert_eq!(
+                handle_keyboard(
+                    &shared,
+                    WPARAM(message as usize),
+                    LPARAM(&kb as *const _ as isize)
+                ),
+                Some(false)
+            );
+        }
+        let ms = MSLLHOOKSTRUCT::default();
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL] {
+            assert_eq!(
+                handle_mouse(
+                    &shared,
+                    WPARAM(message as usize),
+                    LPARAM(&ms as *const _ as isize)
+                ),
+                Some(false)
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "local edges must never reach a committed peer"
+        );
+        assert_eq!(
+            handle_mouse(
+                &shared,
+                WPARAM(WM_MOUSEMOVE as usize),
+                LPARAM(&ms as *const _ as isize)
+            ),
+            Some(false)
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CaptureEvent::Input(InputEvent::PointerAbsolute(_)))
+        ));
+    }
 
     #[test]
     fn raw_mouse_motion_preserves_relative_deltas_and_rejects_absolute_records() {

@@ -105,9 +105,9 @@ fn key_edges_preserve_ipc_down_boolean() {
 }
 
 #[test]
-fn capture_defaults_to_observe_and_only_active_modes_suppress() {
+fn capture_defaults_to_observe_and_only_committed_remote_suppresses() {
     assert_eq!(CaptureKind::default(), CaptureKind::Observe);
     assert!(!CaptureKind::Observe.is_suppressed());
-    assert!(CaptureKind::Temporary.is_suppressed());
+    assert!(!CaptureKind::Temporary.is_suppressed());
     assert!(CaptureKind::Remote.is_suppressed());
 }

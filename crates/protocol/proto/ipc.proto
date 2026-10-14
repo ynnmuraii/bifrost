@@ -110,8 +110,8 @@ enum CaptureKind {
   CAPTURE_KIND_UNSPECIFIED = 0;
   CAPTURE_KIND_OBSERVE = 1;   // Local: watch edges, no suppression.
                               // Wayland: keep the InputCapture session armed (barriers set, Enable).
-  CAPTURE_KIND_TEMPORARY = 2; // Preparing: suppress + buffer, self-timeout.
-                              // Wayland: the compositor already activated capture; abort = Release + local replay.
+  CAPTURE_KIND_TEMPORARY = 2; // Preparing: Windows/X11/dry keys/buttons pass through, no duplicate replay; self-timeout.
+                              // Native Wayland: compositor diverted input; abort = Release + buffered local replay.
   CAPTURE_KIND_REMOTE = 3;    // Remote: suppress, forward to core
 }
 
@@ -305,6 +305,7 @@ message Status {
   string active_layout = 21;               // receiver's active keyboard layout while focus is REMOTE ("" otherwise); e.g. "ru"
   string agent_degraded_reason = 22;        // last typed agent/portal failure or restart breaker reason
   bool agent_restart_circuit_open = 23;     // automatic restarts stopped; manual retry is available
+  string transition_disabled_reason = 24;  // complete user-facing sentence; "" when transitions are available
 }
 message MemberStatus {
   string node_id = 1;

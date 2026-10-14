@@ -404,6 +404,77 @@ impl Node {
             .expect("write the emergency marker");
     }
 
+    /// File-only controls consumed by the dry backend, never desktop input.
+    pub fn dry_control_dir(&self) -> PathBuf {
+        self.root.join("run").join("control-dry")
+    }
+
+    pub fn hold_dry_pointer(&self, x: f64, y: f64) {
+        let sample = format!("{x} {y}");
+        std::fs::write(self.dry_control_dir().join("held-pointer.txt"), &sample)
+            .expect("hold the synthetic pointer");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed =
+                std::fs::read_to_string(self.dry_control_dir().join("pointer-observed.txt"));
+            if observed.as_deref().is_ok_and(|value| value == sample) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dry pointer sample was not consumed: {sample}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Waits until core has processed the in-display seed, not merely until
+    /// the dry agent has generated it. IPC batching must not erase the crossing.
+    pub fn seed_dry_pointer(&self, x: f64, y: f64) {
+        const PROCESSED: &str = "captured input outside a remote source lease";
+        let before = self.marked(PROCESSED).len();
+        self.hold_dry_pointer(x, y);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.marked(PROCESSED).len() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "core never processed the dry pointer seed at {x}, {y}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    pub fn trigger_dry_click(&self) {
+        std::fs::write(self.dry_control_dir().join("click"), b"click")
+            .expect("write the synthetic click");
+    }
+
+    pub fn dry_local_passthrough(&self) -> u64 {
+        match std::fs::read_to_string(self.dry_control_dir().join("local-passthrough.txt")) {
+            Ok(value) => value.trim().parse().expect("dry local passthrough counter"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("read dry local passthrough counter: {error}"),
+        }
+    }
+
+    pub fn wait_dry_capture(&self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let actual = std::fs::read_to_string(self.dry_control_dir().join("capture-mode.txt"));
+            if actual
+                .as_deref()
+                .is_ok_and(|value| value.trim() == expected)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dry capture never became {expected}: {actual:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// The PID of the agent this core spawned.
     pub fn agent_pid(&self) -> Result<u32, String> {
         #[cfg(unix)]
@@ -760,6 +831,21 @@ impl Harness {
     /// Starts two dry agents with synthetic displays for topology-sharing tests.
     pub fn start_with_displays() -> Harness {
         Harness::start_with_options(false, false, true, |_, _| ()).0
+    }
+
+    /// A manually driven dry edge; no scheduled pointer walk races the fault.
+    pub fn start_fault_controls(proxied: bool, refuse_prepare: bool) -> Harness {
+        Harness::start_with(proxied, true, |a_root, b_root| {
+            for root in [a_root, b_root] {
+                std::fs::create_dir_all(root.join("run/control-dry"))
+                    .expect("dry controls directory");
+            }
+            if refuse_prepare {
+                std::fs::write(b_root.join("run/refuse-prepare-dry"), b"refuse")
+                    .expect("dry prepare refusal marker");
+            }
+        })
+        .0
     }
 
     /// The same, with a hook that runs once both roots are paired and the topology is
@@ -1328,7 +1414,8 @@ fn spawn_node(
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err));
-    if dry_motion && label == "a" {
+    let dry_control_dir = root.join("run/control-dry");
+    if dry_motion && label == "a" && !dry_control_dir.is_dir() {
         command.arg("--dry-motion");
     }
     if dry_displays {
@@ -1340,6 +1427,12 @@ fn spawn_node(
         "LWS_DRY_EMERGENCY_FILE",
         root.join("run").join("emergency-dry"),
     );
+    if dry_control_dir.is_dir() {
+        command.env("LWS_DRY_CONTROL_DIR", dry_control_dir);
+    }
+    if root.join("run/refuse-prepare-dry").is_file() {
+        command.env("LWS_DRY_REFUSE_PREPARE", "1");
+    }
     let child = command.spawn().expect("the core starts");
     let pid = child.id();
     Node {

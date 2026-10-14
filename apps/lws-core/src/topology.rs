@@ -1422,6 +1422,50 @@ mod tests {
         assert_eq!(guard.hysteresis(), 8.0);
     }
 
+    /// A failed outward crossing re-arms only after a deliberate inward retreat.
+    #[test]
+    fn a_failed_edge_stays_disarmed_while_the_pointer_is_held_outward() {
+        for (outward, boundary, held, further_out, retreat) in [
+            (
+                geometry::Point::new(32.0, 0.0),
+                1919.0,
+                geometry::Position::new("dry-0", 1919.0, 540.0),
+                geometry::Position::new("dry-0", 1960.0, 540.0),
+                geometry::Position::new("dry-0", 1911.0, 540.0),
+            ),
+            (
+                geometry::Point::new(-32.0, 0.0),
+                0.0,
+                geometry::Position::new("dry-0", 0.0, 540.0),
+                geometry::Position::new("dry-0", -40.0, 540.0),
+                geometry::Position::new("dry-0", 8.0, 540.0),
+            ),
+            (
+                geometry::Point::new(0.0, 32.0),
+                1079.0,
+                geometry::Position::new("dry-0", 960.0, 1079.0),
+                geometry::Position::new("dry-0", 960.0, 1120.0),
+                geometry::Position::new("dry-0", 960.0, 1071.0),
+            ),
+            (
+                geometry::Point::new(0.0, -32.0),
+                0.0,
+                geometry::Position::new("dry-0", 960.0, 0.0),
+                geometry::Position::new("dry-0", 960.0, -40.0),
+                geometry::Position::new("dry-0", 960.0, 8.0),
+            ),
+        ] {
+            // Failure keeps the pointer on the source: inward is the opposite
+            // of the attempted crossing, not the direction toward the peer.
+            let inward = geometry::Point::new(-outward.x, -outward.y);
+            let guard = ReturnGuard::after_return(inward, boundary, 8.0)
+                .expect("a failed crossing has a motion axis");
+            assert!(guard.holds(&held));
+            assert!(guard.holds(&further_out));
+            assert!(!guard.holds(&retreat));
+        }
+    }
+
     /// What matters on the other edges is the direction the pointer came home in: that is
     /// the inward direction on this side, whatever the document calls the edge.
     #[test]

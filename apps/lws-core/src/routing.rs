@@ -606,7 +606,7 @@ pub fn inject_status(applied: u32, offered: Option<usize>, os_error: &str) -> fr
 /// `AgentError.code` → the FSM's code.
 pub fn error_code(code: &str) -> fr::ErrorCode {
     match code {
-        "CAPTURE_FAILED" | "QUEUE_OVERFLOW" => fr::ErrorCode::CaptureFailed,
+        "CAPTURE_FAILED" | "QUEUE_OVERFLOW" | "STARTUP_ONLY" => fr::ErrorCode::CaptureFailed,
         "UNSUPPORTED_SESSION" => fr::ErrorCode::UnsupportedSession,
         "INJECTION_FAILED" => fr::ErrorCode::InjectionFailed,
         "AGENT_LOST" => fr::ErrorCode::AgentLost,
@@ -1500,6 +1500,7 @@ mod contract_tests {
     fn error_codes_map_or_fall_back_to_invalid_frame() {
         assert_eq!(error_code("CAPTURE_FAILED"), fr::ErrorCode::CaptureFailed);
         assert_eq!(error_code("QUEUE_OVERFLOW"), fr::ErrorCode::CaptureFailed);
+        assert_eq!(error_code("STARTUP_ONLY"), fr::ErrorCode::CaptureFailed);
         assert_eq!(
             error_code("UNSUPPORTED_SESSION"),
             fr::ErrorCode::UnsupportedSession

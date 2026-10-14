@@ -362,6 +362,10 @@ pub struct Dry {
     /// exactly as the real capture hook stops producing events when the OS hook is torn
     /// down.
     armed: bool,
+    /// Optional no-desktop fault harness controls; never injects OS input.
+    control_dir: Option<PathBuf>,
+    local_passthrough: u64,
+    control_pointer_jitter: bool,
     /// A test aid for the emergency path with no desktop: when `LWS_DRY_EMERGENCY_FILE`
     /// names a path and that file appears, the dry backend reports the emergency
     /// combination once (and removes the file). `None` disables the aid.
@@ -567,18 +571,71 @@ impl Dry {
         Dry {
             ready,
             scheduled,
-            motion: if motion {
+            motion: if motion && std::env::var_os("LWS_DRY_CONTROL_DIR").is_none() {
                 motion_schedule()
             } else {
                 std::collections::VecDeque::new()
             },
             capturing: false,
             armed: false,
+            control_dir: std::env::var_os("LWS_DRY_CONTROL_DIR").map(PathBuf::from),
+            local_passthrough: 0,
+            control_pointer_jitter: false,
             emergency_file: std::env::var_os("LWS_DRY_EMERGENCY_FILE")
                 .map(std::path::PathBuf::from),
             clipboard,
             dry_displays,
         }
+    }
+
+    fn write_capture_mode(&self, kind: CaptureKind) {
+        if let Some(dir) = &self.control_dir {
+            if let Err(error) = std::fs::write(dir.join("capture-mode.txt"), format!("{kind:?}")) {
+                tracing::warn!(%error, "cannot write dry capture mode");
+            }
+        }
+    }
+
+    async fn poll_control(&mut self) -> Option<InputEvent> {
+        let dir = self.control_dir.as_ref()?;
+        if std::fs::remove_file(dir.join("click")).is_ok() {
+            if self.capturing {
+                self.motion.push_front(Some(InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: input_model::KeyState::Up,
+                }));
+                return Some(InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: input_model::KeyState::Down,
+                });
+            }
+            self.local_passthrough += 2;
+            if let Err(error) = std::fs::write(
+                dir.join("local-passthrough.txt"),
+                self.local_passthrough.to_string(),
+            ) {
+                tracing::warn!(%error, "cannot write dry local passthrough count");
+            }
+        }
+        // Drain paired button-up before generating another held-pointer sample.
+        if matches!(self.motion.front(), Some(Some(InputEvent::Button { .. }))) {
+            return self.motion.pop_front().flatten();
+        }
+        let text = std::fs::read_to_string(dir.join("held-pointer.txt")).ok()?;
+        let mut coordinates = text.split_whitespace();
+        let x: f64 = coordinates.next()?.parse().ok()?;
+        let y: f64 = coordinates.next()?.parse().ok()?;
+        self.control_pointer_jitter = !self.control_pointer_jitter;
+        let sample_x = x + if self.control_pointer_jitter {
+            1.0
+        } else {
+            0.0
+        };
+        if let Err(error) = std::fs::write(dir.join("pointer-observed.txt"), &text) {
+            tracing::warn!(%error, "cannot acknowledge dry pointer sample");
+        }
+        tokio::time::sleep(POLL_TICK).await;
+        Some(InputEvent::PointerAbsolute(Position::new(sample_x, y)))
     }
 
     /// Whether this dry agent has a clipboard at all (`--dry-clipboard-dir`).
@@ -905,10 +962,11 @@ impl Backend {
                 // after `BeginCapture(REMOTE)`: the core drops captured input that arrives
                 // outside a remote source lease, and `TEMPORARY` is exactly that window, so
                 // emitting them there would consume the aid before the lease exists.
-                dry.capturing = matches!(kind, CaptureKind::Remote);
-                // Every kind of capture produces events while it is armed, the owner's
+                dry.capturing = kind.is_suppressed();
+                // Every kind of capture produces events while it is armed.
                 // `Observe` included: that is what `--dry-motion` rides on.
                 dry.armed = true;
+                dry.write_capture_mode(kind);
                 tracing::info!(?kind, "dry mode: capture begins (no OS hooks)");
                 Ok(())
             }
@@ -930,6 +988,7 @@ impl Backend {
                 }
                 dry.capturing = false;
                 dry.armed = false;
+                dry.write_capture_mode(CaptureKind::Observe);
                 Ok(Released::default())
             }
             #[cfg(windows)]
@@ -1048,7 +1107,14 @@ impl Backend {
                 // hook, which no dry session has).
                 if let Some(path) = &dry.emergency_file {
                     if std::fs::remove_file(path).is_ok() {
+                        dry.capturing = false;
+                        dry.write_capture_mode(CaptureKind::Observe);
                         return Some(Event::Emergency);
+                    }
+                }
+                if dry.armed {
+                    if let Some(event) = dry.poll_control().await {
+                        return Some(Event::Input(event));
                     }
                 }
                 if dry.capturing && !dry.scheduled.is_empty() {
@@ -1391,6 +1457,44 @@ mod tests {
 
     fn write(path: &std::path::Path, text: &str) {
         std::fs::write(path, text).expect("the dry clipboard file must be writable");
+    }
+
+    #[tokio::test]
+    async fn dry_temporary_click_is_local_only_and_emergency_releases_immediately() {
+        let dir = temp_dir("local-passthrough");
+        let mut dry = Dry::new(
+            Ready::degraded("test", "platform-test", "windows"),
+            0,
+            false,
+            None,
+            false,
+        );
+        dry.control_dir = Some(dir.clone());
+        dry.emergency_file = Some(dir.join("emergency"));
+        let mut backend = Backend::Dry(Box::new(dry));
+        backend
+            .begin_capture(CaptureKind::Temporary, false)
+            .await
+            .expect("prepare");
+        write(&dir.join("click"), "");
+        assert!(backend.next_event().await.is_none());
+        assert_eq!(read(&dir.join("local-passthrough.txt")), "2");
+        backend
+            .begin_capture(CaptureKind::Remote, false)
+            .await
+            .expect("commit");
+        assert!(
+            backend.next_event().await.is_none(),
+            "local click must not be buffered"
+        );
+        write(&dir.join("emergency"), "");
+        assert!(matches!(backend.next_event().await, Some(Event::Emergency)));
+        let Backend::Dry(dry) = &backend else {
+            panic!("dry backend");
+        };
+        assert!(!dry.capturing, "release precedes emergency delivery");
+        assert_eq!(read(&dir.join("capture-mode.txt")), "Observe");
+        std::fs::remove_dir_all(dir).expect("remove test controls");
     }
 
     /// The dry hook: `out.txt` mirrors the selection, a payload applied from core is never
