@@ -130,6 +130,7 @@ impl Session {
             active_layout: self.active_layout.clone(),
             agent_degraded_reason: self.agent_degraded_reason.clone(),
             agent_restart_circuit_open: self.agent_restart_circuit.is_open(),
+            transition_disabled_reason: self.transition_disabled_reason(),
         }
     }
 

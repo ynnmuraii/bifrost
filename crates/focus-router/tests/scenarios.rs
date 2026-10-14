@@ -422,12 +422,152 @@ fn s11_emergency_releases_immediately() {
     );
     assert_eq!(r.focus(), FocusState::Local);
 }
+
+#[test]
+fn emergency_cancels_preparing_without_waiting_for_capture_or_peer() {
+    for capture_ready in [false, true] {
+        let mut r = preparing();
+        if capture_ready {
+            r.handle(
+                11,
+                Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+            );
+        }
+        let out = r.handle(12, Input::Local(LocalInput::Emergency));
+        assert_eq!(
+            effects(&out),
+            vec![end(id(1), false), leave(id(1), LeaveReason::Emergency)]
+        );
+        assert!(out.contains(&Output::CancelTimer(Timer::PrepareTimeout)));
+        assert_eq!(r.focus(), FocusState::Local);
+        assert!(r.lease().is_idle());
+
+        for input in [
+            Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+            net(ack(id(1), None)),
+            Input::TimerExpired(Timer::PrepareTimeout),
+        ] {
+            let out = r.handle(13, input);
+            assert!(!out.iter().any(|output| matches!(
+                output,
+                Output::Agent(AgentCommand::BeginCapture { .. })
+                    | Output::Send {
+                        message: Message::EnterCommit { .. },
+                        ..
+                    }
+            )));
+            assert_eq!(r.focus(), FocusState::Local);
+            assert!(r.lease().is_idle());
+        }
+    }
+}
+
+#[test]
+fn emergency_clears_idle_releasing_and_receiver_states_immediately() {
+    let mut source_releasing = remote();
+    source_releasing.handle(20, switch(SwitchTrigger::Edge));
+    let mut receiver_preparing = router(PEER);
+    receiver_preparing.handle(10, net(prepare(L, 1)));
+    let mut receiver_releasing = active();
+    receiver_releasing.handle(
+        20,
+        Input::Agent(AgentEvent::LocalInputDetected { lease_id: L }),
+    );
+    let mut receiver_expired = active();
+    receiver_expired.handle(
+        20,
+        Input::Agent(AgentEvent::DeadlineExpired { lease_id: L }),
+    );
+    for mut r in [
+        router(LOCAL),
+        source_releasing,
+        receiver_preparing,
+        prepared(),
+        active(),
+        receiver_releasing,
+        receiver_expired,
+    ] {
+        let expected = match r.lease() {
+            LeaseSlot::Idle => vec![],
+            LeaseSlot::Source(lease) => vec![
+                end(lease.lease_id, false),
+                leave(lease.lease_id, LeaveReason::Emergency),
+            ],
+            LeaseSlot::Receiver(lease) => vec![
+                release(lease.lease_id),
+                leave(lease.lease_id, LeaveReason::Emergency),
+            ],
+        };
+        assert_eq!(
+            effects(&r.handle(30, Input::Local(LocalInput::Emergency))),
+            expected
+        );
+        assert!(r.lease().is_idle());
+        assert_eq!(r.focus(), FocusState::Local);
+    }
+}
+
+#[test]
+fn protocol_refusal_aborts_only_matching_preparing_source() {
+    for code in [ErrorCode::LeaseMismatch, ErrorCode::InvalidFrame] {
+        let refusal = Message::ProtocolError {
+            code,
+            related_seq: 0,
+        };
+        let mut r = preparing();
+        let out = r.handle(
+            11,
+            Input::Net {
+                from: OTHER,
+                message: refusal.clone(),
+            },
+        );
+        assert_eq!(
+            effects(&out),
+            vec![notice(Notice::Rejected { peer: OTHER, code })]
+        );
+        assert_eq!(r.focus(), FocusState::Preparing);
+        assert_eq!(r.lease().source().unwrap().lease_id, id(1));
+
+        let out = r.handle(12, net(refusal.clone()));
+        assert_eq!(
+            effects(&out),
+            vec![
+                notice(Notice::Rejected { peer: PEER, code }),
+                end(id(1), true)
+            ]
+        );
+        assert!(out.contains(&Output::CancelTimer(Timer::PrepareTimeout)));
+        assert_eq!(r.focus(), FocusState::Local);
+        assert!(r.lease().is_idle());
+        r.handle(
+            13,
+            Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+        );
+        r.handle(14, net(ack(id(1), None)));
+        r.handle(210, Input::TimerExpired(Timer::PrepareTimeout));
+        assert_eq!(r.focus(), FocusState::Local);
+        assert!(r.lease().is_idle());
+
+        let mut r = remote();
+        let out = r.handle(20, net(refusal));
+        assert_eq!(
+            effects(&out),
+            vec![notice(Notice::Rejected { peer: PEER, code })]
+        );
+        assert_eq!(r.focus(), FocusState::Remote);
+        assert_eq!(r.lease().source().unwrap().lease_id, id(1));
+    }
+}
 #[test]
 fn s12_owner_prepare_waits_for_agent_before_ack_and_challenge() {
     let mut r = router(PEER);
     assert_eq!(
         r.handle(10, net(prepare(L, 1))),
-        vec![Output::Agent(AgentCommand::PrepareInject { lease_id: L })]
+        vec![
+            Output::Agent(AgentCommand::PrepareInject { lease_id: L }),
+            arm(Timer::PrepareTimeout, 210)
+        ]
     );
     assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Prepared);
     assert_eq!(
@@ -442,6 +582,73 @@ fn s12_owner_prepare_waits_for_agent_before_ack_and_challenge() {
             arm(Timer::PrepareTimeout, 211)
         ]
     );
+}
+
+#[test]
+fn receiver_missing_ready_or_commit_has_bounded_cleanup() {
+    for ready in [false, true] {
+        for released in [false, true] {
+            let mut r = router(PEER);
+            let out = r.handle(10, net(prepare(L, 1)));
+            assert!(out.contains(&arm(Timer::PrepareTimeout, 210)));
+            if ready {
+                let out = r.handle(11, Input::Agent(AgentEvent::Ready { lease_id: L }));
+                assert!(out.contains(&arm(Timer::PrepareTimeout, 211)));
+            }
+            let out = r.handle(211, Input::TimerExpired(Timer::PrepareTimeout));
+            assert!(out.contains(&release(L)));
+            assert!(out.contains(&arm(Timer::ReleaseGuard, 811)));
+            assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Expired);
+            let out = r.handle(212, Input::Agent(AgentEvent::Ready { lease_id: L }));
+            assert!(effects(&out).is_empty());
+            if released {
+                r.handle(213, Input::Agent(AgentEvent::Released { lease_id: L }));
+            } else {
+                r.handle(811, Input::TimerExpired(Timer::ReleaseGuard));
+            }
+            assert!(r.lease().is_idle());
+            let out = r.handle(812, net(prepare(id(2), 1)));
+            assert!(out.contains(&Output::Agent(AgentCommand::PrepareInject {
+                lease_id: id(2),
+            })));
+        }
+    }
+}
+
+#[test]
+fn receiver_invalid_frame_aborts_only_matching_pending_preparation() {
+    let mut r = router(PEER);
+    r.handle(10, net(prepare(L, 1)));
+    let error = |lease_id| {
+        Input::Agent(AgentEvent::Error {
+            lease_id,
+            code: ErrorCode::InvalidFrame,
+        })
+    };
+    for lease_id in [None, Some(id(2))] {
+        let out = r.handle(11, error(lease_id));
+        assert!(!out.contains(&release(L)));
+        assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Prepared);
+    }
+    let out = r.handle(12, error(Some(L)));
+    assert!(out.contains(&release(L)));
+    assert!(out.contains(&Output::CancelTimer(Timer::PrepareTimeout)));
+    assert!(out.contains(&arm(Timer::ReleaseGuard, 612)));
+    assert_eq!(
+        r.lease().receiver().unwrap().state,
+        ReceiverState::Releasing
+    );
+    r.handle(612, Input::TimerExpired(Timer::ReleaseGuard));
+    assert!(r.lease().is_idle());
+    let out = r.handle(613, net(prepare(id(2), 1)));
+    assert!(out.contains(&Output::Agent(AgentCommand::PrepareInject {
+        lease_id: id(2),
+    })));
+
+    let mut r = active();
+    let out = r.handle(20, error(Some(L)));
+    assert!(!out.contains(&release(L)));
+    assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Active);
 }
 #[test]
 fn s13_prepare_rejects_nonowner_stale_serial_and_revision() {
@@ -699,6 +906,66 @@ fn s23_leave_ack_waits_for_agent_released() {
         vec![send(Message::LeaveAck { lease_id: L })]
     );
     assert!(r.lease().is_idle());
+}
+
+#[test]
+fn receiver_duplicate_and_crossed_leave_wait_for_local_release() {
+    for takeover in [false, true] {
+        for guard_expires in [false, true] {
+            let mut r = active();
+            let initial = if takeover {
+                Input::Agent(AgentEvent::LocalInputDetected { lease_id: L })
+            } else {
+                net(Message::Leave {
+                    lease_id: L,
+                    reason: LeaveReason::ReturnEdge,
+                })
+            };
+            let out = r.handle(20, initial);
+            assert!(out.contains(&release(L)));
+            assert!(out.contains(&arm(Timer::ReleaseGuard, 620)));
+            assert_eq!(r.focus(), FocusState::Releasing);
+
+            for message in [
+                Message::Leave {
+                    lease_id: L,
+                    reason: LeaveReason::ReturnEdge,
+                },
+                Message::Leave {
+                    lease_id: L,
+                    reason: LeaveReason::ReturnEdge,
+                },
+                Message::LeaveAck { lease_id: L },
+            ] {
+                let out = r.handle(21, net(message));
+                assert!(effects(&out).is_empty(), "{out:?}");
+                assert!(!out.contains(&Output::CancelTimer(Timer::ReleaseGuard)));
+                assert_eq!(r.focus(), FocusState::Releasing);
+                assert_eq!(r.lease().receiver().unwrap().lease_id, L);
+            }
+
+            let out = r.handle(22, net(prepare(id(2), 1)));
+            assert!(!out.contains(&Output::Agent(AgentCommand::PrepareInject {
+                lease_id: id(2),
+            })));
+            assert_eq!(r.lease().receiver().unwrap().lease_id, L);
+
+            let out = if guard_expires {
+                r.handle(620, Input::TimerExpired(Timer::ReleaseGuard))
+            } else {
+                r.handle(23, Input::Agent(AgentEvent::Released { lease_id: L }))
+            };
+            if guard_expires {
+                assert!(effects(&out).is_empty());
+            } else {
+                assert_eq!(effects(&out), vec![send(Message::LeaveAck { lease_id: L })]);
+            }
+            assert!(r.lease().is_idle());
+            assert_eq!(r.focus(), FocusState::Local);
+            let out = r.handle(621, Input::Agent(AgentEvent::Released { lease_id: L }));
+            assert!(effects(&out).is_empty());
+        }
+    }
 }
 #[test]
 fn s24_silence_fires_repeat_guard_once() {

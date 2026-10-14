@@ -69,6 +69,7 @@ pub fn status_with(focus: &str) -> ipc::Status {
         portal_state: String::new(),
         agent_degraded_reason: String::new(),
         agent_restart_circuit_open: false,
+        transition_disabled_reason: String::new(),
         is_owner: true,
         owner_node_id: SELF_NODE.to_owned(),
         owner_serial: 7,

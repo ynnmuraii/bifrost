@@ -38,6 +38,7 @@ use ipc::clock::{Clock, SuspendDetector, SystemClock};
 mod gui;
 /// The pairing window and its ceremonies (ALPN `pair/1` on the link listener).
 mod pairing;
+mod transition_retry;
 
 /// How long the loop sleeps when nothing else has a deadline.
 ///
@@ -312,6 +313,8 @@ pub struct Session {
     edge_hysteresis_px: f64,
     /// The edge a return came back through, until the pointer leaves its band.
     edge_guard: Option<crate::topology::ReturnGuard>,
+    transition_retry: transition_retry::TransitionRetry,
+    pending_edge_guard: Option<crate::topology::ReturnGuard>,
     /// The last non-empty agent display report; empty reports never replace it.
     agent_displays: Vec<protocol::ipc::DisplayInfo>,
     /// The last captured local position: the input of an edge crossing in `Local`.
@@ -468,6 +471,8 @@ impl Session {
             pointer_gain,
             edge_hysteresis_px,
             edge_guard: None,
+            transition_retry: transition_retry::TransitionRetry::default(),
+            pending_edge_guard: None,
             agent_displays: Vec::new(),
             local_hello,
             peer_displays: BTreeMap::new(),
@@ -981,9 +986,47 @@ impl Session {
     /// Feeds the FSM and performs what it decided.
     async fn feed(&mut self, input: fr::Input) {
         let now = self.now_ms();
+        let preparing_peer =
+            self.router.lease().source().and_then(|lease| {
+                (lease.state == fr::SourceState::Preparing).then_some(lease.peer)
+            });
+        let reason = preparing_peer.map(|_| match &input {
+            fr::Input::Net {
+                message: fr::Message::ProtocolError { code, .. },
+                ..
+            }
+            | fr::Input::Agent(fr::AgentEvent::Error { code, .. }) => format!("{code:?}"),
+            _ => "переход не завершён".to_owned(),
+        });
         let outputs = self.router.handle(now, input);
+        if let Some(peer) = preparing_peer {
+            if self.router.focus() == fr::FocusState::Remote {
+                self.transition_retry.success(&peer);
+                self.pending_edge_guard = None;
+            } else if self.router.focus() != fr::FocusState::Preparing {
+                self.edge_guard = self.pending_edge_guard.take().or(self.edge_guard);
+                let reason = reason.unwrap_or_default();
+                if let Some(delay_ms) = self.transition_retry.fail(peer, now, reason.clone()) {
+                    tracing::warn!(%peer, delay_ms, %reason, "transition retry backoff advanced");
+                }
+            }
+        }
         // Boxed: `apply` reaches `feed` again through the agent-loss path.
         Box::pin(self.apply(outputs)).await;
+    }
+
+    fn transition_disabled_reason(&self) -> String {
+        self.transition_retry
+            .reasons()
+            .map(|(peer, reason)| {
+                let name = self
+                    .trust
+                    .get(peer)
+                    .map_or_else(|| peer.to_string(), |record| record.display_name.clone());
+                format!("Переход на {name} временно отключён: {reason}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// Adds the dev-only capture permission only to a source owner's BeginCapture.
@@ -2038,7 +2081,14 @@ impl Session {
                 tracing::warn!(?trigger, ?reason, "switch refused")
             }
             fr::Notice::Rejected { peer, code } => {
-                tracing::warn!(peer = %peer, ?code, "peer refused")
+                if self.transition_retry.reasons().any(|(failed_peer, _)| {
+                    failed_peer == peer
+                        || (*peer == self.node_id && *code == fr::ErrorCode::CaptureFailed)
+                }) {
+                    tracing::debug!(peer = %peer, ?code, "peer refused during transition backoff");
+                } else {
+                    tracing::warn!(peer = %peer, ?code, "peer refused");
+                }
             }
             fr::Notice::LeaseMismatch {
                 peer,
@@ -2194,6 +2244,22 @@ impl Session {
                             message = routing::message_name(&message),
                             "peer -> core"
                         );
+                    }
+                    // Dry fault injection only: a live link whose receiver refuses
+                    // every prepare, without touching desktop input.
+                    if self.agent.is_dry()
+                        && std::env::var_os("LWS_DRY_REFUSE_PREPARE").is_some()
+                        && matches!(message, fr::Message::EnterPrepare { .. })
+                    {
+                        self.send_to(
+                            peer,
+                            fr::Message::ProtocolError {
+                                code: fr::ErrorCode::CaptureFailed,
+                                related_seq: 0,
+                            },
+                        )
+                        .await;
+                        return;
                     }
                     self.feed(fr::Input::Net {
                         from: peer,
@@ -2584,6 +2650,18 @@ impl Session {
             activation,
         ) {
             Ok((position, transition)) => {
+                if self.manager.handle(&transition.target.node).await.is_none()
+                    || self
+                        .transition_retry
+                        .blocked(&transition.target.node, self.now_ms())
+                {
+                    self.release_portal_capture(protocol::ipc::EndCapture {
+                        lease_id: Vec::new(),
+                        replay_buffered_locally: true,
+                    })
+                    .await;
+                    return;
+                }
                 self.local_pointer = Some(position);
                 self.remote_pointer = Some(transition.target_position.clone());
                 self.remote_node = Some(transition.target.node);
@@ -2720,6 +2798,19 @@ impl Session {
         if target == self.node_id {
             return;
         }
+        if self.manager.handle(&target).await.is_none()
+            || self.transition_retry.blocked(&target, self.now_ms())
+        {
+            return;
+        }
+        let inward = geometry::Point::new(-motion.x, -motion.y);
+        let armed_at = if motion.x.abs() >= motion.y.abs() {
+            position.x
+        } else {
+            position.y
+        };
+        self.pending_edge_guard =
+            crate::topology::ReturnGuard::after_return(inward, armed_at, self.edge_hysteresis_px);
         let entry_position = transition.target_position;
         let topology_revision = self.router.topology_revision();
         tracing::info!(
@@ -2737,6 +2828,9 @@ impl Session {
             topology_revision,
         }))
         .await;
+        if self.router.focus() != fr::FocusState::Preparing {
+            self.edge_guard = self.pending_edge_guard.take().or(self.edge_guard);
+        }
     }
 
     /// Remote: the virtual position follows the captured deltas inside the peer's display
@@ -3349,6 +3443,7 @@ impl Session {
         let node_id = crate::command::node_id_hex(&self.node_id);
         let owner_hex = owner.map(|owner| crate::command::node_id_hex(&owner));
         let peer_hex = lease_peer.map(|peer| crate::command::node_id_hex(&peer));
+        let disabled = self.transition_disabled_reason();
         ctl::status_line(&ctl::StatusInput {
             focus: focus.as_str(),
             role: if self.router.is_owner() {
@@ -3365,7 +3460,11 @@ impl Session {
             serial: self.router.serial(),
             // The mirror of the agent's ledger: what the FSM refuses a normal transition on.
             pressed: self.router.pressed().keys().count() + self.router.pressed().buttons().count(),
-            refusal: self.refusal.as_deref().unwrap_or(""),
+            refusal: if disabled.is_empty() {
+                self.refusal.as_deref().unwrap_or("")
+            } else {
+                disabled.as_str()
+            },
         })
     }
 }

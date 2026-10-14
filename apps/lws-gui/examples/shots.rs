@@ -292,6 +292,7 @@ fn status(focus: &str) -> protocol::ipc::Status {
         },
         agent_degraded_reason: String::new(),
         agent_restart_circuit_open: false,
+        transition_disabled_reason: String::new(),
     }
 }
 

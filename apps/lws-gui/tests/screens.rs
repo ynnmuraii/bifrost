@@ -176,6 +176,25 @@ fn a_connected_pair_shows_where_input_goes() {
 }
 
 #[test]
+fn disabled_transition_reason_is_rendered_verbatim_and_clears_on_success() {
+    let mut state = view();
+    state.on_connected("endpoint");
+    let sentence = "Переход на linux-box временно отключён: получатель не отвечает";
+    let mut status = status_with("LOCAL");
+    status.transition_disabled_reason = sentence.to_owned();
+    state.apply(event(Msg::Status(status)));
+    assert!(draw(&state, Screen::Status)
+        .iter()
+        .any(|text| text == sentence));
+    expect_on(&state, Screen::Status, &["Ввод здесь"]);
+
+    state.apply(event(Msg::Status(status_with("REMOTE"))));
+    assert!(!draw(&state, Screen::Status)
+        .iter()
+        .any(|text| text == sentence));
+}
+
+#[test]
 fn a_degraded_agent_shows_the_core_reason_and_manual_retry() {
     let mut state = view();
     state.on_connected("endpoint");

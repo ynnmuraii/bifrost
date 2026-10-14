@@ -9,10 +9,9 @@
 //! Known gaps of this slice, stated rather than hidden:
 //!
 //! * `EndCapture` drops the capture object, which uninstalls the hooks; re-arming
-//!   creates them again. There is no local replay of a buffer held during
-//!   `TEMPORARY`, because this agent forwards events as it captures them and never
-//!   keeps one (the «не потерять нажатие в Preparing» path needs the buffer that
-//!   KVM-013/026 adds).
+//!   creates them again. Temporary capture passes all input to the local desktop
+//!   and does not queue keys/buttons/scroll, so no local replay is necessary and
+//!   committing cannot duplicate those edges on the peer.
 //! * `ReleaseKeys` injects key/button ups for exactly the entries core sends. The
 //!   `GetAsyncKeyState` pre-check the documents ask for at spike KVM-011 is not
 //!   called here; the injector's own ledger decides what it still holds.

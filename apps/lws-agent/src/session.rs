@@ -996,6 +996,10 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         }
         Event::Emergency => {
+            // Never flush pre-emergency input after returning control locally.
+            batch.clear();
+            *at_edge = false;
+            *pending_activation = None;
             // Rule 3: agent restores local control itself, then tells core.
             tracing::warn!("emergency combination: releasing local capture");
             let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
@@ -2305,27 +2309,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_emergency_releases_the_capture_and_reports_the_held_lease() {
-        let mut harness = Harness::new().await;
-        harness
-            .send(Msg::BeginCapture(ipc::BeginCapture {
-                kind: ::protocol::ipc::CaptureKind::Remote as i32,
-                lease_id: lease(5),
-                self_timeout_ms: 0,
-                dev_capture_injected: false,
-            }))
-            .await;
-        harness.recv().await;
+    async fn an_emergency_releases_every_capture_mode_and_discards_pending_input() {
+        for kind in [
+            ipc::CaptureKind::Observe,
+            ipc::CaptureKind::Temporary,
+            ipc::CaptureKind::Remote,
+        ] {
+            let mut harness = Harness::new().await;
+            harness
+                .send(Msg::BeginCapture(ipc::BeginCapture {
+                    kind: kind as i32,
+                    lease_id: lease(5),
+                    self_timeout_ms: 500,
+                    dev_capture_injected: false,
+                }))
+                .await;
+            harness.recv().await;
+            harness
+                .event(Event::Input(input_model::InputEvent::Button {
+                    button: input_model::MouseButton::Left,
+                    state: input_model::KeyState::Down,
+                }))
+                .await;
+            harness.at_edge = true;
+            harness.activation = Some(ipc::PortalActivation::default());
 
-        harness.event(Event::Emergency).await;
-        match harness.recv().await {
-            Msg::Emergency(fired) => assert_eq!(fired.lease_id, lease(5)),
-            other => panic!("expected EmergencyFired, got {other:?}"),
+            harness.event(Event::Emergency).await;
+            match harness.recv().await {
+                Msg::Emergency(fired) => assert_eq!(fired.lease_id, lease(5)),
+                other => panic!("expected EmergencyFired, got {other:?}"),
+            }
+            assert!(harness.held.is_none(), "local control is restored first");
+            assert!(harness.self_timeout.is_none());
+            assert!(harness.batch.is_empty());
+            assert!(!harness.at_edge);
+            assert!(harness.activation.is_none());
         }
-        assert!(
-            harness.held.is_none(),
-            "local control is restored first (rule 3)"
-        );
     }
 
     #[tokio::test]
