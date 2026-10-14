@@ -36,6 +36,8 @@ use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
 
+pub mod layout;
+
 /// How long a request may stay unanswered before the window says «Служба не отвечает».
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -56,35 +58,79 @@ const INFLIGHT_LIMIT: usize = 32;
 
 // ---------------------------------------------------------------- small types
 
-/// One of the four screens of the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    /// «Статус» — the default screen.
-    Status,
-    /// «Сопряжение».
-    Pairing,
-    /// «Экраны» — the layout editor (KVM-077).
+/// A window over the map: the six sections of the left rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Modal {
+    /// «Раскладка».
     Layout,
+    /// «Пары».
+    Pairs,
+    /// «Клавиши».
+    Keys,
+    /// «Буфер обмена».
+    Clip,
+    /// «Диагностика».
+    Diag,
     /// «Настройки».
     Settings,
 }
 
-impl Screen {
-    /// Every screen, in the order the tab bar shows them.
-    pub const ALL: [Screen; 4] = [
-        Screen::Status,
-        Screen::Pairing,
-        Screen::Layout,
-        Screen::Settings,
+impl Modal {
+    /// Every section, in the order of the rail.
+    pub const ALL: [Modal; 6] = [
+        Modal::Layout,
+        Modal::Pairs,
+        Modal::Keys,
+        Modal::Clip,
+        Modal::Diag,
+        Modal::Settings,
     ];
 
-    /// The tab title.
+    /// The two-digit number of the section.
+    pub const fn num(self) -> &'static str {
+        match self {
+            Modal::Layout => "01",
+            Modal::Pairs => "02",
+            Modal::Keys => "03",
+            Modal::Clip => "04",
+            Modal::Diag => "05",
+            Modal::Settings => "06",
+        }
+    }
+
+    /// The title of the section.
     pub const fn title(self) -> &'static str {
         match self {
-            Screen::Status => "Статус",
-            Screen::Pairing => "Сопряжение",
-            Screen::Layout => "Экраны",
-            Screen::Settings => "Настройки",
+            Modal::Layout => "Раскладка",
+            Modal::Pairs => "Пары",
+            Modal::Keys => "Клавиши",
+            Modal::Clip => "Буфер обмена",
+            Modal::Diag => "Диагностика",
+            Modal::Settings => "Настройки",
+        }
+    }
+
+    /// The «command» of the terminal-style header line.
+    pub const fn command(self) -> &'static str {
+        match self {
+            Modal::Layout => "mdf layout",
+            Modal::Pairs => "mdf peers",
+            Modal::Keys => "mdf keys",
+            Modal::Clip => "mdf clip",
+            Modal::Diag => "mdf diag",
+            Modal::Settings => "mdf config",
+        }
+    }
+
+    /// The caption after the progress bar.
+    pub const fn subtitle(self) -> &'static str {
+        match self {
+            Modal::Layout => "края и положение компьютеров",
+            Modal::Pairs => "кому доверяет этот компьютер",
+            Modal::Keys => "горячие клавиши службы ввода",
+            Modal::Clip => "скопировать здесь — вставить там",
+            Modal::Diag => "отчёт для разбора проблем",
+            Modal::Settings => "адрес, служба, оформление",
         }
     }
 }
@@ -224,6 +270,8 @@ pub enum Request {
     ApplyPendingEdit,
     /// `DiscardPendingEdit`.
     DiscardPendingEdit,
+    /// `SwitchTo`: «Передать ввод».
+    Switch,
 }
 
 impl Request {
@@ -248,6 +296,7 @@ impl Request {
             Request::ListPendingEdits => "список непринятых правок",
             Request::ApplyPendingEdit => "применить непринятую правку",
             Request::DiscardPendingEdit => "отбросить непринятую правку",
+            Request::Switch => "передать ввод",
         }
     }
 }
@@ -312,6 +361,10 @@ pub struct LocalConfig {
     pub switch_hotkey: String,
     /// `[workspace].claim_hotkey`.
     pub claim_hotkey: String,
+    /// `[input].emergency_hotkey`.
+    pub emergency_hotkey: String,
+    /// `[network].port_input` — the port the other computer dials.
+    pub port_input: u16,
     /// `[network].listen_address` — «Адрес этого компьютера в локальной сети».
     pub listen_address: String,
     /// `Paths::config_file()`, so a user can be told which file is being shown.
@@ -339,6 +392,8 @@ impl Default for LocalConfig {
             display_name: "Workstation".to_owned(),
             switch_hotkey: "Ctrl+Alt+Shift+Right".to_owned(),
             claim_hotkey: "Ctrl+Alt+Shift+F11".to_owned(),
+            emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
+            port_input: 47901,
             listen_address: String::new(),
             config_file: PathBuf::new(),
             state_dir: PathBuf::new(),
@@ -365,6 +420,8 @@ impl LocalConfig {
                 config.display_name = loaded.node.display_name.clone();
                 config.switch_hotkey = loaded.input.switch_hotkey.clone();
                 config.claim_hotkey = loaded.workspace.claim_hotkey.clone();
+                config.emergency_hotkey = loaded.input.emergency_hotkey.clone();
+                config.port_input = loaded.network.port_input;
                 config.listen_address = loaded.network.listen_address.clone();
             }
             Err(error) => {
@@ -407,6 +464,8 @@ pub struct EditorDisplay {
     pub primary: bool,
     /// `false` on Wayland portals: the size is a good guess, not a measurement.
     pub native_known: bool,
+    /// Rotation in degrees (0, 90, 180, 270).
+    pub rotation: u32,
 }
 
 impl EditorDisplay {
@@ -420,13 +479,8 @@ impl EditorDisplay {
             h: finite(view.logical_h, 0.0),
             primary: view.primary,
             native_known: view.native_known,
+            rotation: view.rotation_degrees,
         }
-    }
-
-    /// Move the display by a delta in its own node's logical units.
-    fn shift(&mut self, dx: f64, dy: f64) {
-        self.x = finite(self.x + dx, self.x);
-        self.y = finite(self.y + dy, self.y);
     }
 }
 
@@ -452,36 +506,6 @@ impl EditorNode {
             self.display_name.clone()
         }
     }
-
-    /// The display the editor links through: the primary one, else the first.
-    fn main_display(&self) -> Option<&EditorDisplay> {
-        self.displays
-            .iter()
-            .find(|display| display.primary)
-            .or_else(|| self.displays.first())
-    }
-
-    /// The bounding box of every display, `None` when there is none.
-    fn bounds(&self) -> Option<(f64, f64, f64, f64)> {
-        let mut bounds: Option<(f64, f64, f64, f64)> = None;
-        for display in &self.displays {
-            bounds = Some(match bounds {
-                None => (
-                    display.x,
-                    display.y,
-                    display.x + display.w,
-                    display.y + display.h,
-                ),
-                Some((min_x, min_y, max_x, max_y)) => (
-                    min_x.min(display.x),
-                    min_y.min(display.y),
-                    max_x.max(display.x + display.w),
-                    max_y.max(display.y + display.h),
-                ),
-            });
-        }
-        bounds
-    }
 }
 
 /// The layout editor's model: the applied document, plus what the user has done to it.
@@ -502,18 +526,31 @@ pub struct LayoutEditor {
     pub nodes: Vec<EditorNode>,
     /// The applied links, still in wire form: they are rewritten as `[topology]` rows.
     pub links: Vec<ipc::LinkView>,
-    /// Which side of this computer the other one is on.
+    /// The side the form of «Раскладка» shows for the pair.
     pub side: Side,
     /// The node id the user named as «этот компьютер», when the window cannot tell.
     pub self_choice: Option<String>,
     /// The node id the user named as «другой компьютер».
     pub other_choice: Option<String>,
+    /// The drawn shape of every member, parallel to `nodes`.
+    pub shapes: Vec<crate::map::Shape>,
+    /// Where the user has put every member on the stage, parallel to `nodes`.
+    pub placement: Vec<crate::map::Pt>,
+    /// Where the applied document puts them: what `placement` is compared with.
+    pub baseline: Vec<crate::map::Pt>,
+    /// Stage units per logical unit the shapes were drawn at.
+    pub scale: f64,
 }
 
 impl LayoutEditor {
     /// `true` once a document has been received.
     pub fn has_document(&self) -> bool {
         !self.nodes.is_empty()
+    }
+
+    /// `true` while the map differs from the applied document (the «черновик»).
+    pub fn dirty(&self) -> bool {
+        self.placement != self.baseline
     }
 }
 
@@ -541,6 +578,13 @@ pub struct Pairing {
     pub address: String,
     /// `true` once «Подробнее» was opened (ADR-010: the full fingerprints live there).
     pub details: bool,
+    /// When the open window runs out, by this window's clock (the core pushes the seconds
+    /// left only when the window opens, so the countdown is counted here).
+    pub window_deadline: Option<Instant>,
+    /// The computer that was just paired, until «Готово».
+    pub paired: Option<String>,
+    /// `true` from «Подключиться» until the core answers or shows the code.
+    pub dialing: bool,
 }
 
 impl Pairing {
@@ -685,8 +729,10 @@ pub struct ViewModel {
     pub core: Option<StartedCore>,
     /// The settings read from `config.toml`.
     pub config: LocalConfig,
-    /// The screen being drawn.
-    pub screen: Screen,
+    /// The window over the map, when one is open.
+    pub modal: Option<Modal>,
+    /// The look of the window, kept in the GUI's own settings file.
+    pub look: crate::gui_settings::Look,
     /// The last `Status`, kept across a disconnect so the window is not blank.
     pub status: Option<ipc::Status>,
     /// The editor's model.
@@ -721,7 +767,8 @@ impl ViewModel {
             },
             core: None,
             config,
-            screen: Screen::Status,
+            modal: None,
+            look: crate::gui_settings::Look::default(),
             status: None,
             editor: LayoutEditor::default(),
             pairing: Pairing::default(),
@@ -886,6 +933,28 @@ impl ViewModel {
             )));
             self.push_log(format!("Не удалось принудительно остановить службу: {why}"));
         }
+    }
+
+    /// How long until something the window is waiting on runs out, so the app can schedule
+    /// exactly one frame for it instead of polling: an unanswered request, a stop that must
+    /// give up. `None` when nothing is pending.
+    pub fn next_wakeup(&self, now: Instant) -> Option<Duration> {
+        let mut at: Option<Instant> = None;
+        let mut consider = |when: Instant| {
+            if when > now {
+                at = Some(at.map_or(when, |best| best.min(when)));
+            }
+        };
+        for inflight in &self.inflight {
+            consider(inflight.deadline);
+        }
+        if let Some(since) = self.settings.service.stopping {
+            consider(since + SERVICE_STOP_TIMEOUT);
+        }
+        if let Some(Restart::Stopping { since }) = &self.settings.service.restart {
+            consider(*since + SERVICE_STOP_TIMEOUT);
+        }
+        at.map(|when| when - now)
     }
 
     /// Ages the deadlines; called once per frame.
@@ -1073,15 +1142,12 @@ impl ViewModel {
                     .collect(),
             })
             .collect();
-        // A dragged display belongs to a node and a display id; a new document replaces the
-        // positions wholesale, because the applied revision is the truth about them.
         self.editor.nodes = nodes;
         self.editor.self_choice = None;
         self.editor.other_choice = None;
-        // The applied document places both computers at their own origins, which draws one on
-        // top of the other. The window's own arrangement is the pair at the chosen edge, so
-        // the preview equals what «Применить» would send from the first frame on.
-        self.place_other(self.editor.side);
+        // The map is rebuilt from the applied links; the placement the user had is dropped
+        // with the revision it was a draft of.
+        self.rebuild_layout();
         self.push_log(format!(
             "Раскладка получена: ревизия {} от {}, участников {}",
             doc.revision,
@@ -1097,11 +1163,31 @@ impl ViewModel {
                 "Окно сопряжения открыто: {} ({} с)",
                 window.address, window.seconds_remaining
             ));
+            self.pairing.window_deadline =
+                Some(Instant::now() + Duration::from_secs(u64::from(window.seconds_remaining)));
             self.pairing.window = Some(window);
         } else {
             self.push_log("Окно сопряжения закрыто");
             self.pairing.window = None;
+            self.pairing.window_deadline = None;
             self.pairing.prompt = None;
+        }
+    }
+
+    /// A ceremony ended: the code and the dialling state are over, and a success stays on
+    /// screen until «Готово».
+    fn finish_pairing(&mut self, paired: bool) {
+        let name = self
+            .pairing
+            .prompt
+            .take()
+            .map(|prompt| prompt.peer_name)
+            .filter(|name| !name.is_empty());
+        self.pairing.dialing = false;
+        if paired {
+            self.pairing.paired = Some(name.unwrap_or_else(|| "Компьютер".to_owned()));
+            self.pairing.window = None;
+            self.pairing.window_deadline = None;
         }
     }
 
@@ -1119,6 +1205,13 @@ impl ViewModel {
             self.outcome = Some(Outcome::done(text.clone()));
             if request == Request::Shutdown {
                 self.settings.service.line = Some(Outcome::done("Служба останавливается"));
+            }
+            match request {
+                Request::ExportDiagnostics => {
+                    self.settings.export = Some(Outcome::done(text.clone()));
+                }
+                Request::PairWith | Request::PairingAnswer => self.finish_pairing(true),
+                _ => {}
             }
             self.push_log(format!("{}: готово ({text})", request.label()));
             return;
@@ -1142,6 +1235,9 @@ impl ViewModel {
         }
         if request == Request::ExportDiagnostics {
             self.settings.export = Some(Outcome::failed(failure.clone()));
+        }
+        if matches!(request, Request::PairWith | Request::PairingAnswer) {
+            self.finish_pairing(false);
         }
         self.outcome = Some(Outcome::failed(failure));
     }
@@ -1580,39 +1676,6 @@ impl ViewModel {
             .find(|node_id| *node_id != this)
     }
 
-    /// The stretch of edge the link between this computer and the other one uses, as
-    /// `(my display, my edge, their display, their edge, end)` in logical units, with
-    /// `start` always `0.0` — the same span [`ViewModel::pair_link`] writes into the
-    /// document, so the picture cannot disagree with what «Применить» sends.
-    pub fn linked_span(&self) -> Option<(String, config::Edge, String, config::Edge, f64)> {
-        let (this, other) = (self.self_node()?, self.other_node()?);
-        let mine = self
-            .editor
-            .nodes
-            .iter()
-            .find(|node| node.node_id == this)?
-            .main_display()?;
-        let theirs = self
-            .editor
-            .nodes
-            .iter()
-            .find(|node| node.node_id == other)?
-            .main_display()?;
-        let (my_edge, their_edge) = self.editor.side.edges();
-        let (my_extent, their_extent) = if self.editor.side.horizontal() {
-            (mine.h, theirs.h)
-        } else {
-            (mine.w, theirs.w)
-        };
-        let end = edge_span(my_extent, their_extent);
-        Some((
-            mine.id.clone(),
-            my_edge,
-            theirs.id.clone(),
-            their_edge,
-            if end > 0.0 { end } else { 1.0 },
-        ))
-    }
 
     /// The edited document as `[topology]` TOML — what `UpdateTopology` carries.
     ///
@@ -1655,87 +1718,6 @@ impl ViewModel {
         topology
     }
 
-    /// The links of the edited document: the applied ones, plus the one the user is making.
-    fn editor_links(&self) -> Vec<config::LinkConfig> {
-        let mut links: Vec<config::LinkConfig> = Vec::new();
-        let (Some(this), Some(other)) = (self.self_node(), self.other_node()) else {
-            // Without a pair to place there is nothing to derive; the applied links stay as
-            // they are rather than being dropped from a document that is about to be applied.
-            return self.applied_links(None);
-        };
-        let pair = [this.to_owned(), other.to_owned()];
-        links.extend(self.applied_links(Some(&pair)));
-        if let Some(link) = self.pair_link(this, other) {
-            if !links.iter().any(|existing| existing.id == link.id) {
-                links.push(link);
-            }
-        }
-        links
-    }
-
-    /// The applied links, minus the ones the edited pair replaces.
-    fn applied_links(&self, pair: Option<&[String; 2]>) -> Vec<config::LinkConfig> {
-        self.editor
-            .links
-            .iter()
-            .enumerate()
-            .filter_map(|(index, link)| {
-                let from = link.from.as_ref()?;
-                let to = link.to.as_ref()?;
-                if let Some(pair) = pair {
-                    let touches = |node_id: &str| pair.iter().any(|member| member == node_id);
-                    if touches(&from.node_id) || touches(&to.node_id) {
-                        return None;
-                    }
-                }
-                Some(config::LinkConfig {
-                    id: if link.id.is_empty() {
-                        format!("link-{index}")
-                    } else {
-                        link.id.clone()
-                    },
-                    from: endpoint_config(from)?,
-                    to: endpoint_config(to)?,
-                    bidirectional: link.bidirectional,
-                })
-            })
-            .collect()
-    }
-
-    /// The link between this computer and the other one, as the user placed them.
-    ///
-    /// Choosing a side («ноутбук справа») is a statement about the two *desktops*, so both
-    /// endpoints are desktop anchors (`display = "auto"`): the link then follows the monitors —
-    /// one switched off, one added back, a rotation — with no further edit, which is the whole
-    /// point of not pinning displays in a document. The segment is not written for an anchor:
-    /// the core derives it from the live manifests.
-    fn pair_link(&self, this: &str, other: &str) -> Option<config::LinkConfig> {
-        self.editor.nodes.iter().find(|node| node.node_id == this)?;
-        self.editor
-            .nodes
-            .iter()
-            .find(|node| node.node_id == other)?;
-        let side = self.editor.side;
-        let (my_edge, their_edge) = side.edges();
-        Some(config::LinkConfig {
-            id: format!("gui-{}-{}", short_key(this), short_key(other)),
-            from: config::EndpointConfig {
-                node: node_reference(this),
-                display: config::AUTO_DISPLAY.to_owned(),
-                edge: my_edge,
-                start: 0.0,
-                end: 0.0,
-            },
-            to: config::EndpointConfig {
-                node: node_reference(other),
-                display: config::AUTO_DISPLAY.to_owned(),
-                edge: their_edge,
-                start: 0.0,
-                end: 0.0,
-            },
-            bidirectional: true,
-        })
-    }
 
     // ------------------------------------------------------------ local actions
 
@@ -1746,27 +1728,41 @@ impl ViewModel {
     /// typing, where they dragged a rectangle.
     pub fn local(&mut self, action: &Action) {
         match action {
-            Action::ShowScreen(screen) => self.screen = *screen,
+            Action::ToggleModal(modal) => {
+                self.modal = if self.modal == Some(*modal) {
+                    None
+                } else {
+                    Some(*modal)
+                };
+                self.settings.revoke = None;
+                self.settings.revoke_confirmed = false;
+            }
+            Action::CloseModal => {
+                self.modal = None;
+                self.settings.revoke = None;
+                self.settings.revoke_confirmed = false;
+            }
+            Action::SetLook(look) => self.look = *look,
+            Action::DonePairing => self.pairing.paired = None,
+            Action::PairWith(_) => {
+                self.pairing.dialing = true;
+                self.pairing.paired = None;
+            }
             Action::DismissOutcome => self.outcome = None,
             Action::SetAddress(address) => self.pairing.address = address.clone(),
             Action::ToggleDetails(open) => self.pairing.details = *open,
-            Action::ClosePairingWindow => {
-                self.pairing.window = None;
-                self.pairing.prompt = None;
-                self.push_log("Окно сопряжения закрыто в окне (служба закроет его по таймауту)");
+            Action::LayoutAuto => self.discard_draft(),
+            Action::SetSide(side) => self.set_side(*side),
+            Action::MoveNode { node_id, x, y } => self.move_node(node_id, *x, *y),
+            Action::NudgeNode { node_id, dx, dy } => self.nudge_node(node_id, *dx, *dy),
+            Action::ChooseSelf(node_id) => {
+                self.editor.self_choice = node_id.clone();
+                self.rebuild_layout();
             }
-            Action::SetSide(side) => {
-                self.editor.side = *side;
-                self.place_other(*side);
+            Action::ChooseOther(node_id) => {
+                self.editor.other_choice = node_id.clone();
+                self.rebuild_layout();
             }
-            Action::MoveDisplay {
-                node_id,
-                display_id,
-                dx,
-                dy,
-            } => self.move_display(node_id, display_id, *dx, *dy),
-            Action::ChooseSelf(node_id) => self.editor.self_choice = node_id.clone(),
-            Action::ChooseOther(node_id) => self.editor.other_choice = node_id.clone(),
             Action::SelectRevoke(node_id) => {
                 self.settings.revoke = node_id.clone();
                 self.settings.revoke_confirmed = false;
@@ -1870,99 +1866,6 @@ impl ViewModel {
         }
     }
 
-    /// Puts the other computer's displays on the side the user picked.
-    ///
-    /// Choosing a side is a placement, not a permission: it moves the other node's
-    /// rectangles next to this node's, and the user may then drag them. Both write the same
-    /// `logical_*` the document carries.
-    fn place_other(&mut self, side: Side) {
-        let (Some(this), Some(other)) = (
-            self.self_node().map(str::to_owned),
-            self.other_node().map(str::to_owned),
-        ) else {
-            return;
-        };
-        let Some(my_bounds) = self
-            .editor
-            .nodes
-            .iter()
-            .find(|node| node.node_id == this)
-            .and_then(EditorNode::bounds)
-        else {
-            return;
-        };
-        let Some(their_bounds) = self
-            .editor
-            .nodes
-            .iter()
-            .find(|node| node.node_id == other)
-            .and_then(EditorNode::bounds)
-        else {
-            return;
-        };
-        let (dx, dy) = match side {
-            Side::Left => (my_bounds.0 - (their_bounds.2 - their_bounds.0), my_bounds.1),
-            Side::Right => (my_bounds.2, my_bounds.1),
-            Side::Top => (my_bounds.0, my_bounds.1 - (their_bounds.3 - their_bounds.1)),
-            Side::Bottom => (my_bounds.0, my_bounds.3),
-        };
-        let Some(node) = self
-            .editor
-            .nodes
-            .iter_mut()
-            .find(|node| node.node_id == other)
-        else {
-            return;
-        };
-        for display in &mut node.displays {
-            display.shift(dx - their_bounds.0, dy - their_bounds.1);
-        }
-    }
-
-    /// Moves one display by a delta in its own node's logical units.
-    ///
-    /// The peer's block has one position — next to the edge the radio names — so a drag is a
-    /// gesture that *chooses* that edge: the display follows the pointer, the nearest side to
-    /// where it ended up becomes the side, and the block snaps onto it. Nothing the user can
-    /// drag can leave the two computers overlapping, which is what makes the preview and
-    /// «Применить» the same picture.
-    fn move_display(&mut self, node_id: &str, display_id: &str, dx: f64, dy: f64) {
-        let Some(moved) = self
-            .editor
-            .nodes
-            .iter_mut()
-            .find(|node| node.node_id == node_id)
-            .and_then(|node| {
-                node.displays
-                    .iter_mut()
-                    .find(|display| display.id == display_id)
-            })
-        else {
-            return;
-        };
-        moved.shift(dx, dy);
-        let Some(other_bounds) = self
-            .editor
-            .nodes
-            .iter()
-            .find(|node| node.node_id == node_id)
-            .and_then(EditorNode::bounds)
-        else {
-            return;
-        };
-        let Some(mine) = self
-            .self_node()
-            .and_then(|this| self.editor.nodes.iter().find(|node| node.node_id == this))
-            .and_then(EditorNode::bounds)
-        else {
-            return;
-        };
-        let side = nearest_side(mine, other_bounds);
-        if side != self.editor.side {
-            self.editor.side = side;
-        }
-        self.place_other(side);
-    }
 }
 
 // ---------------------------------------------------------------- actions
@@ -2024,27 +1927,42 @@ pub enum Action {
     StartCore,
     /// Try the core again right now instead of waiting for the 2 s retry.
     ConnectAgain,
-    /// Show a screen.
-    ShowScreen(Screen),
+    /// Open the window of a rail section, or close it when it is the one already open.
+    ToggleModal(Modal),
+    /// Close the window over the map.
+    CloseModal,
+    /// Change the look (theme, field, clouds); the app writes it to the GUI's settings file.
+    SetLook(crate::gui_settings::Look),
+    /// Leave the «Пара создана» message.
+    DonePairing,
+    /// «Передать ввод»: the `switch <peer>` verb of the core. A second call while the input
+    /// is on the other computer returns it.
+    SwitchTo(String),
     /// Forget the last finished operation.
     DismissOutcome,
     /// The text of «Подключиться по адресу».
     SetAddress(String),
     /// Open or close the fingerprints under the code (ADR-010).
     ToggleDetails(bool),
-    /// Drop the local pairing state; the core closes its own window by timeout.
-    ClosePairingWindow,
     /// Which side of this computer the other one is on.
     SetSide(Side),
-    /// Drag a display by `dx`/`dy` logical units of its own node.
-    MoveDisplay {
-        /// The node the display belongs to.
+    /// Drag a computer of the map: its top-left corner is wanted at `(x, y)` stage units
+    /// (the map snaps it to a neighbour's edge).
+    MoveNode {
+        /// The member.
         node_id: String,
-        /// The display's id.
-        display_id: String,
-        /// Horizontal drag in logical units.
+        /// Wanted left, in stage units.
+        x: f64,
+        /// Wanted top, in stage units.
+        y: f64,
+    },
+    /// Move a computer of the map by a keyboard step.
+    NudgeNode {
+        /// The member.
+        node_id: String,
+        /// Horizontal step, stage units.
         dx: f64,
-        /// Vertical drag in logical units.
+        /// Vertical step, stage units.
         dy: f64,
     },
     /// Name the member that is this computer.
@@ -2150,6 +2068,10 @@ impl Action {
                 }),
             ),
             Action::StopCore => (Request::Shutdown, Msg::Shutdown(ipc::Shutdown {})),
+            Action::SwitchTo(peer) => (
+                Request::Switch,
+                Msg::SwitchTo(ipc::SwitchTo { peer: peer.clone() }),
+            ),
             _ => return None,
         };
         Some(wire)
@@ -2361,6 +2283,35 @@ pub struct GuiClient {
     events: tokio::sync::mpsc::UnboundedReceiver<GuiEvent>,
     /// The thread running the runtime; kept so the channel is not the only thing alive.
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Called from the client thread after every event, so the window repaints on an IPC
+    /// event and at no other time.
+    wake: std::sync::Arc<std::sync::OnceLock<Wake>>,
+}
+
+/// What wakes the window: `egui::Context::request_repaint`, as a plain closure so the client
+/// does not know the toolkit.
+type Wake = Box<dyn Fn() + Send + Sync>;
+
+/// The sending half of the event channel, with the wake-up that goes with every event.
+#[derive(Clone)]
+struct Events {
+    tx: tokio::sync::mpsc::UnboundedSender<GuiEvent>,
+    wake: std::sync::Arc<std::sync::OnceLock<Wake>>,
+}
+
+impl Events {
+    fn send(
+        &self,
+        event: GuiEvent,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<GuiEvent>> {
+        let sent = self.tx.send(event);
+        if sent.is_ok() {
+            if let Some(wake) = self.wake.get() {
+                wake();
+            }
+        }
+        sent
+    }
 }
 
 impl GuiClient {
@@ -2371,6 +2322,11 @@ impl GuiClient {
     pub fn start(endpoint: Option<Endpoint>, launch: Launch) -> Self {
         let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let wake = std::sync::Arc::new(std::sync::OnceLock::new());
+        let event_tx = Events {
+            tx: event_tx,
+            wake: std::sync::Arc::clone(&wake),
+        };
         let thread = std::thread::Builder::new()
             .name("lws-gui-ipc".to_owned())
             .spawn(move || {
@@ -2393,7 +2349,13 @@ impl GuiClient {
             commands: Some(commands),
             events,
             thread,
+            wake,
         }
+    }
+
+    /// Sets what the client calls after every event (once; a second call is ignored).
+    pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let _ = self.wake.set(Box::new(wake));
     }
 
     /// Hands one request to the connection thread.
@@ -2449,7 +2411,7 @@ async fn worker(
     endpoint: Option<Endpoint>,
     launch: Launch,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
-    events: tokio::sync::mpsc::UnboundedSender<GuiEvent>,
+    events: Events,
 ) {
     let Some(endpoint) = endpoint else {
         // Nothing to connect to: the host has no resolvable endpoint at all. The window
@@ -2459,9 +2421,13 @@ async fn worker(
         }
         return;
     };
+    // A core that stays down fails the same way every 2 s; the window is told once, not on
+    // every try, so an idle window with no service is not woken every 2 s.
+    let mut last_failure: Option<String> = None;
     loop {
         match ::ipc::transport::connect(&endpoint).await {
             Ok(stream) => {
+                last_failure = None;
                 let _ = events.send(GuiEvent::Connected {
                     endpoint: endpoint.describe(),
                 });
@@ -2474,9 +2440,11 @@ async fn worker(
                 }
             }
             Err(error) => {
-                let _ = events.send(GuiEvent::Disconnected {
-                    why: error.to_string(),
-                });
+                let why = error.to_string();
+                if last_failure.as_deref() != Some(why.as_str()) {
+                    last_failure = Some(why.clone());
+                    let _ = events.send(GuiEvent::Disconnected { why });
+                }
             }
         }
         // The retry wait, which also serves the buttons: a request can only be reported as
@@ -2516,7 +2484,7 @@ async fn worker(
 async fn serve<S>(
     link: &mut ::ipc::GuiLink<S>,
     commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
-    events: &tokio::sync::mpsc::UnboundedSender<GuiEvent>,
+    events: &Events,
 ) -> Option<String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2566,7 +2534,7 @@ where
 fn answer_offline(
     command: Command,
     launch: &Launch,
-    events: &tokio::sync::mpsc::UnboundedSender<GuiEvent>,
+    events: &Events,
 ) {
     match command {
         Command::Send { id, .. } => {
@@ -2859,39 +2827,6 @@ fn finite(value: f64, fallback: f64) -> f64 {
     }
 }
 
-/// The length of the edge two displays share, in logical units.
-fn edge_span(mine: f64, theirs: f64) -> f64 {
-    let span = mine.min(theirs);
-    if span.is_finite() && span > 0.0 {
-        span
-    } else {
-        0.0
-    }
-}
-
-/// Which side of `mine` the block `theirs` was dragged to.
-///
-/// The centres are compared, so a block dragged past a corner snaps to the edge it is
-/// *nearest* to and not to whichever direction an `if`-chain tests first — which is what makes
-/// a diagonal drag feel predictable.
-fn nearest_side(mine: (f64, f64, f64, f64), theirs: (f64, f64, f64, f64)) -> Side {
-    let (dx, dy) = (
-        (theirs.0 + theirs.2) - (mine.0 + mine.2),
-        (theirs.1 + theirs.3) - (mine.1 + mine.3),
-    );
-    if dx.abs() >= dy.abs() {
-        if dx < 0.0 {
-            Side::Left
-        } else {
-            Side::Right
-        }
-    } else if dy < 0.0 {
-        Side::Top
-    } else {
-        Side::Bottom
-    }
-}
-
 /// A display's `EndpointView` in the configuration schema; `None` when it names nothing.
 fn endpoint_config(view: &ipc::EndpointView) -> Option<config::EndpointConfig> {
     if view.node_id.is_empty() || view.display_id.is_empty() {
@@ -3026,6 +2961,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::ResetPortalGrants(_) => "ResetPortalGrants",
         Msg::RetryAgent(_) => "RetryAgent",
         Msg::LayoutAuto(_) => "LayoutAuto",
+        Msg::SwitchTo(_) => "SwitchTo",
         Msg::Shutdown(_) => "Shutdown",
         Msg::ClaimOwnership(_) => "ClaimOwnership",
         Msg::AbandonOwnership(_) => "AbandonOwnership",
@@ -3086,6 +3022,7 @@ fn success_text(request: Request) -> String {
         // The window's own wording is the `ViewModel::success_text` one (it can name the
         // computer and the side); this is the plain fall-back.
         Request::LayoutAuto => "расположено автоматически".to_owned(),
+        Request::Switch => "ввод передан".to_owned(),
         Request::SetClipboard => "буфер обмена переключён".to_owned(),
         Request::RevokePeer => "компьютер удалён из пары".to_owned(),
         Request::ResetPortalGrants => "разрешения порталов забыты".to_owned(),

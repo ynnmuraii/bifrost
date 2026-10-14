@@ -365,6 +365,13 @@ impl Session {
                 let handled = self.layout_edit_document(text, expected).await;
                 self.reply_handled(request_id, out, handled).await;
             }
+            Msg::SwitchTo(switch) => {
+                // The same path as `lws-core switch <peer>`: one FSM transition, one verdict.
+                let response = self
+                    .switch_to(&crate::command::PeerRef::new(switch.peer))
+                    .await;
+                answer(&out, request_id, Msg::OpResult(op_result(&response))).await;
+            }
             Msg::LayoutAuto(_) => {
                 // The same path the `layout auto` control command takes: the GUI button and
                 // the CLI cannot disagree about what "automatic" means.
