@@ -156,12 +156,44 @@ mod platform {
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
+    /// `$XDG_RUNTIME_DIR` (or its systemd default `/run/user/<uid>`) when it is there; `/tmp`
+    /// only as the fallback. The runtime dir is private to the user and cleared at logout, so a
+    /// stale lock or socket cannot outlive the session and nobody else can pre-create the name.
     fn directory(namespace: &str) -> io::Result<PathBuf> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                // SAFETY: geteuid has no preconditions.
+                let uid = unsafe { libc::geteuid() };
+                Some(PathBuf::from(format!("/run/user/{uid}")))
+            });
+        directory_in(runtime.as_deref(), Path::new("/tmp"), namespace)
+    }
+
+    /// A runtime directory is trusted only when it is an absolute, real directory that this
+    /// user owns and nobody else can enter; it is never created here.
+    fn trusted_runtime_dir(path: &Path, uid: u32) -> bool {
+        path.is_absolute()
+            && fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && metadata.uid() == uid
+                    && metadata.permissions().mode() & 0o077 == 0
+            })
+    }
+
+    pub(super) fn directory_in(
+        runtime: Option<&Path>,
+        fallback: &Path,
+        namespace: &str,
+    ) -> io::Result<PathBuf> {
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
-        let path = PathBuf::from("/tmp").join(format!("{namespace}-{uid}"));
+        let path = match runtime.filter(|runtime| trusted_runtime_dir(runtime, uid)) {
+            Some(runtime) => runtime.join(namespace),
+            None => fallback.join(format!("{namespace}-{uid}")),
+        };
         match fs::DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -434,6 +466,57 @@ mod windows_tests {
         let text = String::from_utf16(&name[..name.len() - 1]).unwrap();
         assert!(text.starts_with("Local\\multideskflow-"), "{text}");
         assert!(text.ends_with("-gui-show"), "{text}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("lws-dir-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn the_instance_directory_lives_in_the_private_runtime_dir() {
+        let runtime = scratch("runtime");
+        let fallback = scratch("fallback-a");
+        let dir = platform::directory_in(Some(&runtime), &fallback, "ns").unwrap();
+        assert_eq!(dir, runtime.join("ns"));
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(std::fs::read_dir(&fallback).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_missing_or_untrusted_runtime_dir_falls_back_to_the_per_uid_tmp_directory() {
+        let fallback = scratch("fallback-b");
+        let missing = fallback.join("does-not-exist");
+        let dir = platform::directory_in(Some(&missing), &fallback, "ns").unwrap();
+        assert!(dir.starts_with(&fallback) && dir.file_name().unwrap() != "ns");
+        assert!(!missing.exists(), "the runtime dir must never be created");
+
+        let shared = scratch("shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = platform::directory_in(Some(&shared), &fallback, "ns").unwrap();
+        assert!(
+            dir.starts_with(&fallback),
+            "a group/world-accessible dir is not trusted"
+        );
+        assert!(!shared.join("ns").exists());
+
+        let none = platform::directory_in(None, Path::new(&fallback), "ns").unwrap();
+        assert_eq!(none, dir);
     }
 }
 
