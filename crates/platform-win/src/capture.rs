@@ -131,6 +131,8 @@ impl Default for CaptureConfig {
 pub struct CaptureStats {
     /// Events queued to the agent.
     pub captured: u64,
+    /// Mapped discrete edges offered to the capture queue (including dropped edges).
+    pub edges: input_model::EdgeCounters,
     /// Events dropped because the queue was full or the consumer was gone.
     pub dropped: u64,
     /// Keyboard events whose scancode has no HID usage in the table, including scan code 0.
@@ -236,6 +238,10 @@ struct Shared {
     keyboard_filtered: AtomicU64,
     keyboard_mapped: AtomicU64,
     keyboard_suppressed: AtomicU64,
+    keys_down: AtomicU64,
+    keys_up: AtomicU64,
+    buttons_down: AtomicU64,
+    buttons_up: AtomicU64,
 }
 
 // Windows invokes low-level hooks on their installing thread; the Raw Input
@@ -274,6 +280,10 @@ impl Capture {
             keyboard_filtered: AtomicU64::new(0),
             keyboard_mapped: AtomicU64::new(0),
             keyboard_suppressed: AtomicU64::new(0),
+            keys_down: AtomicU64::new(0),
+            keys_up: AtomicU64::new(0),
+            buttons_down: AtomicU64::new(0),
+            buttons_up: AtomicU64::new(0),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             unmapped_keys: AtomicU64::new(0),
@@ -393,6 +403,12 @@ impl Capture {
             keyboard_filtered: load(&self.shared.keyboard_filtered),
             keyboard_mapped: load(&self.shared.keyboard_mapped),
             keyboard_suppressed: load(&self.shared.keyboard_suppressed),
+            edges: input_model::EdgeCounters {
+                keys_down: load(&self.shared.keys_down),
+                keys_up: load(&self.shared.keys_up),
+                buttons_down: load(&self.shared.buttons_down),
+                buttons_up: load(&self.shared.buttons_up),
+            },
             capture_injected: self.shared.capture_injected.load(Ordering::Relaxed),
             mode: capture_kind(&self.shared),
             captured: load(&self.shared.captured),
@@ -613,6 +629,28 @@ fn with_shared<R>(f: impl FnOnce(&Shared) -> R) -> Option<R> {
 
 fn push(shared: &Shared, event: InputEvent) {
     shared.captured.fetch_add(1, Ordering::Relaxed);
+    let edge = match &event {
+        InputEvent::Key {
+            state: KeyState::Down,
+            ..
+        } => Some(&shared.keys_down),
+        InputEvent::Key {
+            state: KeyState::Up,
+            ..
+        } => Some(&shared.keys_up),
+        InputEvent::Button {
+            state: KeyState::Down,
+            ..
+        } => Some(&shared.buttons_down),
+        InputEvent::Button {
+            state: KeyState::Up,
+            ..
+        } => Some(&shared.buttons_up),
+        _ => None,
+    };
+    if let Some(counter) = edge {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
     match shared.tx.try_send(CaptureEvent::Input(event)) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
@@ -1087,6 +1125,10 @@ mod tests {
             keyboard_filtered: AtomicU64::new(0),
             keyboard_mapped: AtomicU64::new(0),
             keyboard_suppressed: AtomicU64::new(0),
+            keys_down: AtomicU64::new(0),
+            keys_up: AtomicU64::new(0),
+            buttons_down: AtomicU64::new(0),
+            buttons_up: AtomicU64::new(0),
         };
         (shared, rx)
     }
@@ -1165,6 +1207,37 @@ mod tests {
             rx.try_recv(),
             Ok(CaptureEvent::Input(InputEvent::PointerAbsolute(_)))
         ));
+    }
+
+    #[test]
+    fn remote_click_suppresses_and_queues_both_button_edges() {
+        use super::*;
+        let (shared, rx) = hook_state(CaptureKind::Remote);
+        let ms = MSLLHOOKSTRUCT::default();
+        for (message, state) in [
+            (WM_LBUTTONDOWN, KeyState::Down),
+            (WM_LBUTTONUP, KeyState::Up),
+        ] {
+            assert_eq!(
+                handle_mouse(
+                    &shared,
+                    WPARAM(message as usize),
+                    LPARAM(&ms as *const _ as isize)
+                ),
+                Some(true)
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(CaptureEvent::Input(InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: actual,
+                })) if actual == state
+            ));
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(shared.buttons_down.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.buttons_up.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]

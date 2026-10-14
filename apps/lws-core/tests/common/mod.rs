@@ -449,6 +449,14 @@ impl Node {
             .expect("write the synthetic click");
     }
 
+    pub fn dry_injected_buttons(&self) -> Vec<String> {
+        match std::fs::read_to_string(self.dry_control_dir().join("injected-buttons.txt")) {
+            Ok(value) => value.lines().map(str::to_owned).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read dry injected buttons: {error}"),
+        }
+    }
+
     pub fn dry_local_passthrough(&self) -> u64 {
         match std::fs::read_to_string(self.dry_control_dir().join("local-passthrough.txt")) {
             Ok(value) => value.trim().parse().expect("dry local passthrough counter"),
@@ -1433,6 +1441,7 @@ fn spawn_node(
     );
     if dry_control_dir.is_dir() {
         command.env("LWS_DRY_CONTROL_DIR", dry_control_dir);
+        command.env("LWS_LOG", "debug");
     }
     if root.join("run/refuse-prepare-dry").is_file() {
         command.env("LWS_DRY_REFUSE_PREPARE", "1");

@@ -102,6 +102,7 @@ pub struct Win {
     applied_sequence: Option<u32>,
     last_capture_report: Option<Instant>,
     last_capture_stats: CaptureStats,
+    remote_hook_baseline: input_model::EdgeCounters,
     /// Captured events that arrived with no source-motion baseline (audit F11).
     ///
     /// `next_event` used to `?`-return on a missing baseline, which read exactly like "no
@@ -156,6 +157,7 @@ impl Win {
             applied_sequence: None,
             last_capture_report: None,
             last_capture_stats: CaptureStats::default(),
+            remote_hook_baseline: input_model::EdgeCounters::default(),
             motion_without_baseline: 0,
         })
     }
@@ -254,6 +256,18 @@ impl Win {
         kind: CaptureKind,
         capture_injected: bool,
     ) -> Result<(), String> {
+        if kind == CaptureKind::Remote
+            && self
+                .capture
+                .as_ref()
+                .is_none_or(|capture| capture.mode() != CaptureKind::Remote)
+        {
+            self.remote_hook_baseline = self
+                .capture
+                .as_ref()
+                .map(|capture| capture.stats().edges)
+                .unwrap_or_default();
+        }
         match &self.capture {
             Some(capture) => {
                 capture.set_capture_injected(capture_injected);
@@ -381,6 +395,12 @@ impl Win {
             // cursor position; the source keeps its own virtual position.
             actual: None,
         }
+    }
+
+    pub fn hook_edges(&self) -> Option<input_model::EdgeCounters> {
+        self.capture
+            .as_ref()
+            .map(|capture| capture.stats().edges.since(self.remote_hook_baseline))
     }
 
     pub fn release_session(&mut self) -> Released {

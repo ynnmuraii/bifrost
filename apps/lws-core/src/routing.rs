@@ -911,6 +911,7 @@ mod tests {
                 applied_count: applied,
                 os_error: os_error.to_owned(),
                 actual: None,
+                applied_edges: None,
             })
         };
 
@@ -951,6 +952,7 @@ mod tests {
                 applied_count: 1,
                 os_error: String::new(),
                 actual: None,
+                applied_edges: None,
             })
         };
 
@@ -1042,6 +1044,7 @@ mod tests {
             }],
             at_edge: true,
             activation: None,
+            hook_edges: None,
         });
         match agent_signal(&batch, &mut context) {
             // The wire form is kept on purpose: the display id is what the edge trigger
@@ -1086,6 +1089,7 @@ mod tests {
             }],
             at_edge: false,
             activation: None,
+            hook_edges: None,
         });
         let mut context = AgentContext::default();
         match agent_signal(&batch, &mut context) {
@@ -1113,6 +1117,7 @@ mod tests {
                 edge: ipc::PortalEdge::Left as i32,
             }),
             events: Vec::new(),
+            hook_edges: None,
         };
         let signal = agent_signal(
             &ipc::agent_frame::Msg::Captured(batch.clone()),

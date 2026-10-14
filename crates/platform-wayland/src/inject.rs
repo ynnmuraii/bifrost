@@ -241,6 +241,7 @@ pub struct WaylandInjector {
     started: Instant,
     ei_error: Option<reis::Error>,
     last_inject_report: Option<Instant>,
+    applied_edges: input_model::EdgeCounters,
 }
 
 impl WaylandInjector {
@@ -460,6 +461,7 @@ impl WaylandInjector {
             started: Instant::now(),
             ei_error: None,
             last_inject_report: None,
+            applied_edges: input_model::EdgeCounters::default(),
         };
         injector.refresh_selection();
         injector.log_selection();
@@ -491,6 +493,15 @@ impl WaylandInjector {
         processed
     }
 
+    /// Edges encoded into EIS frames for the current injection lease.
+    pub fn applied_edges(&self) -> input_model::EdgeCounters {
+        self.applied_edges
+    }
+
+    pub fn reset_applied_edges(&mut self) {
+        self.applied_edges = input_model::EdgeCounters::default();
+    }
+
     /// Emulates a batch of events, each committed in its own `ei_device.frame`.
     ///
     /// One frame per event keeps the events in order and satisfies the protocol's
@@ -513,6 +524,7 @@ impl WaylandInjector {
             match self.apply(*event) {
                 Ok(actual) => {
                     outcome.applied_count += 1;
+                    self.applied_edges.record(event);
                     if actual.is_some() {
                         outcome.actual = actual;
                     }
@@ -1108,6 +1120,118 @@ mod tests {
 
     use super::{route_event, select_devices, split_detents, DeviceOffer, DeviceSelection};
     use input_model::{HidKey, InputEvent, KeyState, MouseButton, Position};
+
+    #[tokio::test]
+    async fn eis_click_frames_and_lease_end_release_every_held_button() {
+        use super::{InjectSource, PortalVersions, UnixStream, WaylandInjector};
+        use reis::request::{EisRequest, EisRequestConverter};
+        use reis::{eis, handshake::EisHandshaker};
+
+        // An in-process EIS server, never a desktop or portal connection.
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let server = tokio::spawn(async move {
+            let context = eis::Context::new(server).expect("server context");
+            let mut handshake = EisHandshaker::new(&context, 1);
+            let mut converter: Option<EisRequestConverter> = None;
+            let mut buttons = Vec::new();
+            let mut frames = 0;
+            while frames < 8 {
+                context.read().expect("read client requests");
+                while let Some(request) = context.pending_request() {
+                    let reis::PendingRequestResult::Request(request) = request else {
+                        panic!("invalid EIS request");
+                    };
+                    if let Some(converter) = converter.as_mut() {
+                        converter.handle_request(request).expect("convert request");
+                        while let Some(request) = converter.next_request() {
+                            match request {
+                                EisRequest::Bind(bind) => {
+                                    let device = bind.seat.add_device(
+                                        Some("test buttons"),
+                                        eis::device::DeviceType::Virtual,
+                                        reis::request::DeviceCapability::Button.into(),
+                                        |_| {},
+                                    );
+                                    device.resumed();
+                                }
+                                EisRequest::Ready(ready) => ready.device.resumed(),
+                                EisRequest::Button(button) => {
+                                    buttons.push((button.button, button.state));
+                                }
+                                EisRequest::Frame(_) => frames += 1,
+                                _ => {}
+                            }
+                        }
+                    } else if let Some(response) =
+                        handshake.handle_request(request).expect("handshake")
+                    {
+                        let requests = EisRequestConverter::new(&context, response, 1);
+                        let _ = requests.handle().add_seat(
+                            Some("test seat"),
+                            reis::request::DeviceCapability::Button.into(),
+                        );
+                        converter = Some(requests);
+                    }
+                }
+                context.flush().expect("flush server");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            buttons
+        });
+        let mut injector = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            WaylandInjector::attach(
+                reis::ei::Context::new(client).expect("client context"),
+                InjectSource::Direct,
+                None,
+                PortalVersions::default(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("bounded handshake")
+        .expect("attach test injector");
+        let edge = |button, state| InputEvent::Button { button, state };
+        let click = [
+            edge(MouseButton::Left, KeyState::Down),
+            edge(MouseButton::Left, KeyState::Up),
+        ];
+        let outcome = injector.inject(&click);
+        assert!(outcome.os_error.is_none());
+        assert_eq!(outcome.applied_count, 2);
+        assert_eq!(injector.applied_edges().buttons_down, 1);
+        assert_eq!(injector.applied_edges().buttons_up, 1);
+        let outcome = injector.inject(&[
+            edge(MouseButton::Left, KeyState::Down),
+            edge(MouseButton::Right, KeyState::Down),
+            edge(MouseButton::Middle, KeyState::Down),
+        ]);
+        assert!(outcome.os_error.is_none());
+        assert_eq!(outcome.applied_count, 3);
+        let released = injector.release_all();
+        assert!(released.os_error.is_none());
+        assert_eq!(released.applied_count, 3);
+        assert_eq!(injector.release_all().applied_count, 0);
+        let buttons = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("bounded server observation")
+            .expect("server task");
+        use eis::button::ButtonState::{Press, Released};
+        assert_eq!(
+            buttons,
+            [
+                (272, Press),
+                (272, Released),
+                (272, Press),
+                (273, Press),
+                (274, Press),
+                (272, Released),
+                (273, Released),
+                (274, Released)
+            ]
+        );
+    }
 
     #[test]
     fn selects_absolute_pointer_over_relative_and_keeps_keyboard() {

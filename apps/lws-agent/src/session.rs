@@ -368,6 +368,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             &mut activation,
             &mut last_capture_batch_log,
             now_ms(started),
+            backend.hook_edges(),
         )
         .await?;
     }
@@ -606,6 +607,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                     x: position.x,
                     y: position.y,
                 }),
+                applied_edges: backend.applied_edges(),
             }))
             .await?;
         }
@@ -898,6 +900,7 @@ async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
     activation: &mut Option<ipc::PortalActivation>,
     last_log: &mut Option<u64>,
     now: u64,
+    hook_edges: Option<ipc::EdgeCounters>,
 ) -> anyhow::Result<()> {
     if batch.is_empty() && !*at_edge {
         return Ok(());
@@ -936,6 +939,7 @@ async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
         events,
         at_edge: edge,
         activation: activation.take(),
+        hook_edges,
     }))
     .await?;
     Ok(())
@@ -1260,6 +1264,7 @@ mod tests {
             &mut harness.activation,
             &mut last_log,
             0,
+            None,
         )
         .await
         .unwrap();
@@ -1489,6 +1494,7 @@ mod tests {
             &mut harness.activation,
             &mut last_log,
             0,
+            None,
         )
         .await
         .expect("production capture flush");
@@ -1526,6 +1532,7 @@ mod tests {
             &mut harness.activation,
             &mut last_log,
             1_000,
+            None,
         )
         .await
         .expect("production capture flush after new seed");
