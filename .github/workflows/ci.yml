@@ -69,7 +69,15 @@ jobs:
       - name: Linux free space guard
         if: runner.os == 'Linux'
         run: |
-          available=$(df -Pk --output=avail "$GITHUB_WORKSPACE" | tail -1)
+          set -euo pipefail
+          # `-P` prints the POSIX one-line-per-filesystem form, so the second
+          # line is the workspace and its fourth field the available KiB. (GNU
+          # df refuses `-P` together with `--output`, and a guard that reads
+          # nothing must not be read as "nothing free".)
+          available=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')
+          case "$available" in
+            ''|*[!0-9]*) echo "cannot read the free space of $GITHUB_WORKSPACE: '$available'" >&2; exit 1 ;;
+          esac
           echo "$((available / 1024)) MiB free in the workspace filesystem"
           if [ "$available" -lt 6291456 ]; then
             echo "less than 6 GiB free: dropping the restored target cache"
