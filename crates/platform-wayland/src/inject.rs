@@ -1284,10 +1284,9 @@ mod tests {
                                     let pointer = bind.seat.add_device(
                                         Some("test pointer"),
                                         eis::device::DeviceType::Virtual,
-                                        (DeviceCapability::Pointer
+                                        DeviceCapability::Pointer
                                             | DeviceCapability::Button
-                                            | DeviceCapability::Scroll)
-                                            .into(),
+                                            | DeviceCapability::Scroll,
                                         |_| {},
                                     );
                                     scroll_device = Some(pointer.clone());
@@ -1319,11 +1318,10 @@ mod tests {
                         let requests = EisRequestConverter::new(&context, response, 1);
                         let _ = requests.handle().add_seat(
                             Some("test seat"),
-                            (DeviceCapability::Pointer
+                            DeviceCapability::Pointer
                                 | DeviceCapability::Keyboard
                                 | DeviceCapability::Button
-                                | DeviceCapability::Scroll)
-                                .into(),
+                                | DeviceCapability::Scroll,
                         );
                         converter = Some(requests);
                     }
