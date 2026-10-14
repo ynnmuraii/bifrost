@@ -34,7 +34,7 @@ jobs:
       # only so they exist before cargo runs.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy, llvm-tools
+          components: rustfmt, clippy
           targets: x86_64-unknown-linux-gnu
 
       - name: Cache cargo and target
@@ -98,67 +98,33 @@ jobs:
       - name: Licences
         run: cargo deny --all-features check licenses
 
-      # `cargo test` builds a package's *test* targets; it does not produce the plain
-      # `lws-agent` binary. `lws-core run` spawns that binary at startup and exits with
-      # «cannot spawn …: No such file or directory» when it is missing, and every test
-      # that starts a core — the control channel under load, the fault-injection harness —
-      # then fails on a clean checkout. Build the workspace first.
+      # `cargo test` builds a package's *test* targets, and the two-core harnesses in
+      # `apps/multideskflow/tests` get the binary from `CARGO_BIN_EXE_multideskflow`. The
+      # window's own two-core test (`apps/lws-gui/tests/cores.rs`) is a test of another package
+      # and looks for `multideskflow` in target/debug, as does the core when it spawns its
+      # agent (`multideskflow agent …` from its own executable). Build the workspace first.
       - name: Build
         run: cargo build --workspace
 
-      # The two symbol checks come before `Test` on purpose: they need nothing
-      # but the binaries `Build` just produced, and GitHub skips every later step
-      # once one fails. While the test suite is red the agent invariant would
-      # otherwise never be checked at all.
-
-      # docs/03-architecture.md, rule 1: «Нет сетевых сокетов. В Windows-сборке не
-      # линкуется winsock; на Linux — проверка в CI по списку символов.»
+      # docs/03-architecture.md, agent rule 1: the agent owns no network sockets.
       #
-      # Windows states it exactly: the import table of the agent must not name
-      # winsock at all. `SendInput` from user32 is expected and is why the pattern
-      # matches DLL names and unambiguous winsock entry points by name rather than
-      # the substrings "send" or "connect".
-      - name: Agent links no winsock
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo build -p lws-agent
-          $host_triple = (rustc -vV | Select-String '^host: ') -replace '.*host: ', ''
-          $readobj = Join-Path (rustc --print sysroot) "lib\rustlib\$host_triple\bin\llvm-readobj.exe"
-          if (-not (Test-Path $readobj)) { throw "llvm-readobj is missing; install the llvm-tools component" }
-          $forbidden = & $readobj --coff-imports target\debug\lws-agent.exe |
-            Select-String -Pattern 'ws2_32|wsock32|mswsock|WSAStartup|WSACleanup|WSAGetLastError|closesocket|ioctlsocket|WSAPoll|WSARecv|WSASend|__WSAFDIsSet'
-          if ($forbidden) {
-            $forbidden | ForEach-Object { Write-Host $_ }
-            throw 'lws-agent links winsock; rule 1 forbids network sockets in the agent'
-          }
-          Write-Host 'agent import table contains no winsock entry point'
+      # The agent used to be a separate executable, so the Windows build could prove it at
+      # link time (no winsock import) and the Linux build by a symbol list. The one
+      # `multideskflow` executable links winsock for the core, and a symbol list over it says
+      # nothing about the agent, so both link-time checks are gone. What replaces them runs
+      # on both runners, before `Test` so that a red suite cannot hide it:
+      #
+      #  * `cargo tree -p lws-agent -e normal` must not contain the transport/TLS/identity
+      #    crates, the window or the core, nor the usual network clients (a denylist);
+      #  * no source file of `apps/lws-agent` may name a TCP/UDP socket type;
+      #  * the agent's run-time guard (`lws_agent::netguard`, which also runs in every real
+      #    agent process, at start and every two seconds) must report a TCP/UDP socket of
+      #    this process when there is one and none when there is not.
+      #
+      # All three live in `apps/lws-agent/tests/no_network.rs`.
+      - name: Agent owns no network sockets
+        run: cargo test --locked -p lws-agent --test no_network
 
-      # Linux needs nuance, and this step records it instead of pretending a
-      # symbol list can separate AF_UNIX from AF_INET: `socket`, `connect`,
-      # `socketpair` and the message calls are the documented local transports
-      # (the core<->agent socketpair, the GUI Unix socket), and `getaddrinfo`,
-      # `freeaddrinfo` and `getsockopt` arrive with the X11 and EIS clients that
-      # must dial their compositor. Every symbol the agent may legitimately have
-      # is listed below, so the check is an approval gate: a new network symbol
-      # fails the build and has to be added here on purpose. What it cannot catch
-      # is a TCP client reusing `socket`/`connect` — see the note in the report.
-      - name: Agent links only the documented local-transport symbols
-        if: runner.os == 'Linux'
-        run: |
-          cargo build -p lws-agent
-          printf '%s\n' connect freeaddrinfo getaddrinfo getsockopt recv recvmsg send sendmsg shutdown socket socketpair | sort > /tmp/allowed-network-symbols
-          nm -u target/debug/lws-agent | awk '{print $NF}' \
-            | grep -E '(socket|connect|bind|listen|accept|send|recv|shutdown|addrinfo|gethostby|inet_|if_name|sockopt|nameinfo|servby)' \
-            | sort -u > /tmp/agent-network-symbols
-          echo "network symbols in lws-agent:"; sed 's/^/  /' /tmp/agent-network-symbols
-          unexpected=$(comm -13 /tmp/allowed-network-symbols /tmp/agent-network-symbols)
-          if [ -n "$unexpected" ]; then
-            echo "::error::lws-agent gained network symbols that are not on the documented list:"
-            echo "$unexpected"
-            echo "If a new symbol is legitimate for a local transport, add it to the list in this step and say why."
-            exit 1
-          fi
 
       # `LWS_KEEP_ROOTS=1` stops the harness from deleting its per-test root
       # (`unique_dir`), and the roots are then uploaded as an artifact below: a

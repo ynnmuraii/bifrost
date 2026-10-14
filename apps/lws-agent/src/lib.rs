@@ -1,6 +1,9 @@
 //! `lws-agent` — the input agent: capture, suppression, injection, the pressed
-//! ledger and the watchdog. It has no network sockets (`docs/03-architecture.md`,
-//! agent rule 1) and is spawned only by `lws-core`.
+//! ledger and the watchdog. It creates no network sockets (`docs/03-architecture.md`,
+//! agent rule 1: no TCP/UDP, enforced by [`netguard`] at run time and by
+//! `tests/no_network.rs` in CI) and is spawned only by the core, as the separate process
+//! `multideskflow agent …` (the executable is `apps/multideskflow`; this crate is its
+//! `agent` role, [`run_agent`]).
 //!
 //! # How core finds it
 //!
@@ -24,6 +27,7 @@ mod clipboard_wire;
 mod displays;
 mod events;
 mod launch;
+pub mod netguard;
 mod repeat;
 mod session;
 mod takeover;
@@ -74,11 +78,11 @@ struct Args {
 }
 
 const USAGE: &str = "\
-lws-agent — LAN Workspace input agent (spawned by lws-core)
+multideskflow agent — LAN Workspace input agent (internal; spawned by `multideskflow run`)
 
 USAGE:
-    lws-agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
-              [--dev-capture-injected] [--dry-displays]
+    multideskflow agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
+                        [--dev-capture-injected] [--dry-displays]
 
 OPTIONS:
     --ipc-endpoint <spec>    local IPC endpoint core created for this launch
@@ -92,7 +96,7 @@ OPTIONS:
     --dev-capture-injected  development-only: capture externally injected input
 ";
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut ipc_endpoint = None;
     let mut token_file = None;
     let mut dry_inject = false;
@@ -102,7 +106,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dry_clipboard_dir = None;
     let mut logs_dir = None;
     let mut dev_capture_injected = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -181,13 +185,15 @@ fn init_logging(logs_dir: Option<&std::path::Path>) {
     );
 }
 
-fn main() -> ExitCode {
+/// Runs the agent role. `args` is argv after `multideskflow agent`; the returned code is the
+/// process exit code (0 clean stop, 1 failure, 2 usage, 70 the no-network guard fired).
+pub fn run_agent(args: Vec<String>) -> ExitCode {
     // Arguments first: `--logs-dir` is part of what the logger needs, and a bad argument is
     // reported on stderr whether or not a file is open.
-    let args = match parse_args() {
+    let args = match parse_args(args) {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("lws-agent: {message}");
+            eprintln!("multideskflow agent: {message}");
             return ExitCode::from(2);
         }
     };
@@ -195,11 +201,22 @@ fn main() -> ExitCode {
     if args.dev_capture_injected {
         tracing::warn!("dev: capturing externally injected input");
     }
+    // Every process of the one executable has the same file name in a task list; the first
+    // line of each role's log says which one this is.
     tracing::info!(
+        role = "agent",
+        pid = std::process::id(),
         endpoint = args.ipc_endpoint.as_str(),
         dry_inject = args.dry_inject,
-        "agent starting"
+        "multideskflow agent starting"
     );
+    // Rule 1 (no network sockets), checked now — which catches anything inherited from the
+    // parent — and then every few seconds for as long as the agent lives.
+    if let Err(violation) = netguard::start() {
+        tracing::error!(%violation, "agent network guard failed");
+        eprintln!("multideskflow agent: {violation}");
+        return ExitCode::from(netguard::EXIT_CODE);
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -207,7 +224,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("lws-agent: cannot start the runtime: {error}");
+            eprintln!("multideskflow agent: cannot start the runtime: {error}");
             return ExitCode::FAILURE;
         }
     };

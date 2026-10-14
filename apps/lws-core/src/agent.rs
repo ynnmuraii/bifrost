@@ -1,4 +1,4 @@
-//! Core's supervision of `lws-agent`: the per-launch channel, the launch token and
+//! Core's supervision of the agent (`multideskflow agent …`): the per-launch channel, the launch token and
 //! the `RECOVERY` restart.
 //!
 //! `docs/03-architecture.md` («Кто кого запускает»): «`lws-agent` — Только core
@@ -352,6 +352,7 @@ impl Supervisor {
 
         let mut command = tokio::process::Command::new(&self.program);
         command
+            .arg("agent")
             .arg("--ipc-endpoint")
             .arg(endpoint_spec(&endpoint))
             .arg("--token-file")
@@ -363,8 +364,8 @@ impl Supervisor {
             // The agent explains itself on stderr; stdout stays quiet.
             .stdout(std::process::Stdio::null());
         // A console window flashing once per agent launch is what a core started by the GUI
-        // would otherwise show: the agent is a console program, and a parent with no console
-        // gives its child a new one unless it says not to.
+        // would otherwise show: a parent with no console gives its child a new one unless it
+        // says not to.
         #[cfg(windows)]
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         if self.dev_capture_injected {
@@ -720,18 +721,13 @@ fn write_token_file(path: &Path, token: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The default agent program: `lws-agent` next to `lws-core`.
-pub fn default_agent_program() -> Result<PathBuf, String> {
-    let current = std::env::current_exe().map_err(|error| error.to_string())?;
-    let directory = current
-        .parent()
-        .ok_or_else(|| format!("{} has no directory", current.display()))?;
-    let name = if cfg!(windows) {
-        "lws-agent.exe"
-    } else {
-        "lws-agent"
-    };
-    Ok(directory.join(name))
+/// The agent program: this very executable, started in its `agent` role.
+///
+/// One binary serves every role (`apps/multideskflow`), and the agent is still a process of
+/// its own — crash isolation, the watchdog and the no-network rule all depend on that — so
+/// the supervisor spawns `current_exe() agent …` rather than a second file.
+pub fn agent_program() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -818,21 +814,9 @@ mod launch_tests {
     }
 
     #[test]
-    fn the_default_agent_program_sits_next_to_core() {
-        let program = default_agent_program().expect("path");
-        let name = program
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        assert_eq!(
-            name,
-            if cfg!(windows) {
-                "lws-agent.exe"
-            } else {
-                "lws-agent"
-            }
-        );
-        assert!(program.parent().is_some());
+    fn the_agent_program_is_this_executable() {
+        let program = agent_program().expect("path");
+        assert_eq!(program, std::env::current_exe().expect("own path"));
     }
 
     #[test]

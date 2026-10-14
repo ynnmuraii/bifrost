@@ -44,11 +44,5 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 
-[dev-dependencies]
-# The fault-injection harness forces an RST (`SO_LINGER 0`) to simulate an abrupt link
-# loss. `std`'s `TcpStream::set_linger` is still unstable, and `socket2` is already in
-# the tree through tokio (`Cargo.lock`), so this adds no new crate to the graph.
-socket2 = "0.6"
-
 [lints]
 workspace = true

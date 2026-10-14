@@ -57,9 +57,10 @@ jobs:
 
       # `cargo build --release` is deliberately the only build: no
       # cross-compilation, no extra toolchains, nothing staged through cargo.
-      # The three binaries land in target/release next to each other, which
-      # is the one layout they can start from - lws-gui finds lws-core beside
-      # its own executable, and the core finds lws-agent the same way.
+      # One binary: `multideskflow` is the window, the command line and the
+      # agent (the core starts its agent as `multideskflow agent …`, and the
+      # window starts the core as `multideskflow run`), so there is no layout
+      # to keep and nothing to find beside it.
       - name: Build
         run: cargo build --release
 
@@ -67,8 +68,8 @@ jobs:
       # сборок генерируются в CI, а не хранятся вручную: version, OS/arch,
       # checksums, известные ограничения и manual matrix». SHA256SUMS.txt is
       # the checksum half of that manifest, and the archive is flat on
-      # purpose: the user unpacks three binaries and three text files into
-      # one directory, which is the layout the GUI needs. The texts are
+      # purpose: the user unpacks one binary and three text files into one
+      # directory. The texts are
       # packaging/README_RU.txt (the in-archive instructions),
       # licenses/THIRD_PARTY_NOTICES.md (MIT redistributability, ADR-009) and
       # crates/config/examples-data/config.example.toml - the core requires
@@ -82,9 +83,7 @@ jobs:
           $archive = Join-Path $env:RUNNER_TEMP "$name.zip"
           $stage = Join-Path $env:RUNNER_TEMP "stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target/release/lws-core.exe $stage
-          Copy-Item target/release/lws-agent.exe $stage
-          Copy-Item target/release/lws-gui.exe $stage
+          Copy-Item target/release/multideskflow.exe $stage
           Copy-Item packaging/README_RU.txt $stage
           Copy-Item licenses/THIRD_PARTY_NOTICES.md $stage
           Copy-Item crates/config/examples-data/config.example.toml $stage
@@ -101,10 +100,10 @@ jobs:
           name="lan-workspace-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
           stage="$RUNNER_TEMP/stage"
           mkdir -p "$stage"
-          install -m 0755 target/release/lws-core target/release/lws-agent target/release/lws-gui "$stage/"
+          install -m 0755 target/release/multideskflow "$stage/"
           cp packaging/README_RU.txt licenses/THIRD_PARTY_NOTICES.md "$stage/"
           cp crates/config/examples-data/config.example.toml "$stage/"
-          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" lws-core lws-agent lws-gui README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml
+          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" multideskflow README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml
           # shasum prints `<hex>  <file>` (two spaces), the same format and
           # file name as the Windows step writes. The subshell makes <file>
           # the archive's own name rather than its path, so a user who

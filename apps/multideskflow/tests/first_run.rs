@@ -11,28 +11,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// The `lws-core` binary under test.
+/// The `multideskflow` binary under test (the agent is the same executable).
 fn core_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_lws-core"))
-}
-
-/// The agent binary, which `lws-core` spawns for every launch.
-///
-/// `--agent` names it explicitly, so this test does not depend on the default lookup
-/// being right in a test profile (the same reason the fault-injection harness names it).
-fn agent_exe() -> PathBuf {
-    let name = if cfg!(windows) {
-        "lws-agent.exe"
-    } else {
-        "lws-agent"
-    };
-    let path = core_exe().with_file_name(name);
-    assert!(
-        path.is_file(),
-        "{} is missing: run `cargo build --workspace` first",
-        path.display()
-    );
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_multideskflow"))
 }
 
 /// A directory no other test shares.
@@ -80,8 +61,7 @@ impl Core {
         let child = Command::new(core_exe())
             .arg("--root")
             .arg(root)
-            .args(["run", "--dry-inject", "--dry-input-events", "4", "--agent"])
-            .arg(agent_exe())
+            .args(["run", "--dry-inject", "--dry-input-events", "4"])
             .stdin(Stdio::null())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))

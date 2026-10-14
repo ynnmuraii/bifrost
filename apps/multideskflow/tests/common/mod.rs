@@ -37,29 +37,10 @@ pub const AC_02_BUDGET_MS: u64 = LEASE_TTL_MS + 100;
 /// reported either way, so a real regression is visible even when the assert passes.
 pub const HOST_SLACK_MS: u64 = 100;
 
-/// The `lws-core` binary under test.
+/// The `multideskflow` binary under test: every role of it — the daemon, and the agent the
+/// daemon spawns as `multideskflow agent …` from its own executable.
 fn core_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_lws-core"))
-}
-
-/// The agent binary, which `lws-core` spawns for every launch.
-///
-/// `--agent` names it explicitly, so the harness does not depend on the default lookup
-/// (`the_default_agent_program_sits_next_to_core`) being right in a test profile.
-fn agent_exe() -> PathBuf {
-    let name = if cfg!(windows) {
-        "lws-agent.exe"
-    } else {
-        "lws-agent"
-    };
-    let path = core_exe().with_file_name(name);
-    assert!(
-        path.is_file(),
-        "{} is missing: `cargo test` does not build the plain agent binary, so run \
-         `cargo build --workspace` (or `cargo build -p lws-agent`) first",
-        path.display()
-    );
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_multideskflow"))
 }
 
 /// Milliseconds since the Unix epoch, from the harness's own clock.
@@ -517,7 +498,7 @@ impl Node {
         #[cfg(windows)]
         {
             let script = format!(
-                "(Get-CimInstance Win32_Process -Filter \"Name='lws-agent.exe'\" | \
+                "(Get-CimInstance Win32_Process -Filter \"Name='multideskflow.exe'\" | \
                  Where-Object {{$_.ParentProcessId -eq {}}}).ProcessId",
                 self.pid
             );
@@ -1421,8 +1402,7 @@ fn spawn_node(
     command
         .arg("--root")
         .arg(&root)
-        .args(["run", "--dry-inject", "--dry-input-events", "4", "--agent"])
-        .arg(agent_exe())
+        .args(["run", "--dry-inject", "--dry-input-events", "4"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err));

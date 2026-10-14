@@ -2164,6 +2164,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2182,7 +2183,6 @@ dependencies = [
  "platform-probe",
  "protocol",
  "serde",
- "socket2",
  "tokio",
  "toml",
  "tracing",
@@ -2307,6 +2307,21 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "multideskflow"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "ipc",
+ "lws-agent",
+ "lws-core",
+ "lws-gui",
+ "protocol",
+ "socket2",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
