@@ -11,8 +11,10 @@ mod support;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use lws_gui::map::GAP;
+use lws_gui::view_model::layout::LinkState;
 use lws_gui::view_model::{
-    Action, Bridge, GuiClient, Launch, Request, Restart, RestartStep, Side, ViewModel,
+    Action, Bridge, GuiClient, Launch, Modal, Request, Restart, RestartStep, Side, ViewModel,
     SERVICE_STOP_TIMEOUT,
 };
 use protocol::ipc::gui_frame::Msg;
@@ -144,9 +146,16 @@ fn a_pairing_window_tells_the_user_what_to_type() {
     assert_eq!(window.address, "192.168.1.10:47901");
     assert_eq!(window.seconds_remaining, 118);
 
-    // The user closes it in the window; the core closes its own by timeout.
-    vm.local(&Action::ClosePairingWindow);
-    assert!(vm.pairing.window.is_none());
+    // The core says how long is left once; the window counts the rest down by its own clock.
+    let left = vm
+        .pairing
+        .window_deadline
+        .expect("a countdown")
+        .saturating_duration_since(Instant::now());
+    assert!(
+        left > Duration::from_secs(116) && left <= Duration::from_secs(118),
+        "{left:?}"
+    );
 
     // A closed window clears what it opened, too.
     vm.apply(event(Msg::PairingWindow(protocol::ipc::PairingWindow {
@@ -300,24 +309,85 @@ fn a_layout_conflict_says_what_to_do_about_it() {
     assert!(vm.conflict.is_none());
 }
 
+/// The editor's index of a member, for reading `placement` and `shapes`.
+fn index_of(vm: &ViewModel, node: &str) -> usize {
+    vm.editor
+        .nodes
+        .iter()
+        .position(|candidate| candidate.node_id == node)
+        .expect("the node is in the document")
+}
+
+/// A document with an `auto` link between the two computers: this one's right edge to the
+/// other's left edge.
+fn linked_doc(revision: u64) -> protocol::ipc::TopologyDoc {
+    let end = |node: &str, edge: &str| {
+        Some(protocol::ipc::EndpointView {
+            node_id: node.to_owned(),
+            display_id: "auto".to_owned(),
+            edge: edge.to_owned(),
+            segment_start: 0.0,
+            segment_end: 0.0,
+        })
+    };
+    let mut doc = two_node_doc(revision);
+    doc.links = vec![protocol::ipc::LinkView {
+        id: "link-0".to_owned(),
+        from: end(SELF_NODE, "RIGHT"),
+        to: end(PEER_NODE, "LEFT"),
+        bidirectional: true,
+        active: true,
+        inactive_reason: String::new(),
+        auto_displays: vec!["\\\\.\\DISPLAY1".to_owned(), "eDP-1".to_owned()],
+    }];
+    doc
+}
+
 #[test]
-fn the_editors_document_round_trips_through_the_configuration_schema() {
+fn a_dragged_computer_becomes_a_document_only_on_apply() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    assert!(!vm.editor.dirty());
+    assert!(vm.layout_action().is_none(), "nothing to apply yet");
+    assert!(
+        vm.map_model().links.is_empty(),
+        "the document links nothing: the two are drawn apart"
+    );
 
-    // The user says the other computer stands to the right, then nudges its rectangle: a drag
-    // is a gesture that *chooses* the edge, so the peer snaps onto it and the document carries
-    // the snapped position — the picture and «Применить» are the same arrangement.
-    vm.local(&Action::SetSide(Side::Right));
-    vm.local(&Action::MoveDisplay {
+    // Drag the other computer to just right of this one, a little off.
+    let (this, peer) = (index_of(&vm, SELF_NODE), index_of(&vm, PEER_NODE));
+    let me = vm.editor.placement[this];
+    let width = vm.editor.shapes[this].w;
+    vm.local(&Action::MoveNode {
         node_id: PEER_NODE.to_owned(),
-        display_id: "eDP-1".to_owned(),
-        dx: 120.0,
-        dy: -30.0,
+        x: me.x + width + GAP + 5.0,
+        y: me.y + 1.0,
     });
+    assert!(vm.editor.dirty());
+    assert_eq!(vm.editor.placement[peer].x, (me.x + width + GAP).round());
+    assert_eq!(vm.editor.placement[peer].y, me.y, "and the tops line up");
+    assert_eq!(vm.editor.side, Side::Right, "the drag chose the edge");
+    assert_eq!(vm.revision_text(), "черновик · не применён");
+    assert_eq!(vm.map_model().links.len(), 1, "the preview shows the link");
+    assert_eq!(vm.editor.revision, 7, "and nothing was applied");
 
-    let document = vm.layout_toml();
+    // «Применить»: one `UpdateTopology` against the revision the draft was made from.
+    let Some(Action::UpdateTopology {
+        layout_toml,
+        expected_revision,
+        expected_author,
+    }) = vm.layout_action()
+    else {
+        panic!("a draft is applied through UpdateTopology");
+    };
+    assert_eq!(expected_revision, 7);
+    assert_eq!(
+        expected_author,
+        lws_gui::view_model::node_id_bytes(SELF_NODE)
+    );
+    let document = String::from_utf8(layout_toml).expect("text");
+    assert_eq!(document, vm.layout_toml());
 
     // 1. What the core does with it: `validate_layout_toml` parses the bare document.
     let topology: config::TopologyConfig =
@@ -330,12 +400,9 @@ fn the_editors_document_round_trips_through_the_configuration_schema() {
     assert_eq!(link.to.node, format!("peer:{PEER_NODE}"));
     assert_eq!(link.from.edge.to_string(), "right");
     assert_eq!(link.to.edge.to_string(), "left");
-    // Choosing a side is a statement about the desktops, so neither end pins a display: the
+    // A snapped edge is a statement about the desktops, so neither end pins a display: the
     // core derives the segment from the live manifests and the edge follows the monitors.
-    assert!(
-        link.from.is_auto() && link.to.is_auto(),
-        "a picked side writes desktop anchors, not display ids"
-    );
+    assert!(link.from.is_auto() && link.to.is_auto());
     let moved = topology
         .displays
         .iter()
@@ -343,10 +410,8 @@ fn the_editors_document_round_trips_through_the_configuration_schema() {
         .expect("the other computer's display is in the document");
     assert_eq!(
         moved.logical,
-        [1920.0, 0.0, 1600.0, 900.0],
-        "the peer sits at this computer's right edge (1920) and lines up with it: the drag \
-         +120/-30 pointed right, so the radio still says «Справа» and the block snaps back onto \
-         that edge instead of overlapping"
+        [0.0, 0.0, 1600.0, 900.0],
+        "the displays keep their own coordinates: a drag edits links, not monitors"
     );
 
     // 2. The acceptance test: the same text is a valid `[topology]` section of a config file.
@@ -354,6 +419,51 @@ fn the_editors_document_round_trips_through_the_configuration_schema() {
         .expect("the editor emits a valid section");
     config.validate().expect("and a valid document");
     assert_eq!(config.topology.links.len(), 1);
+
+    // «Авто» throws the draft away until the core answers with its own document.
+    vm.local(&Action::LayoutAuto);
+    assert!(!vm.editor.dirty());
+    assert!(vm.layout_action().is_none());
+}
+
+#[test]
+fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.apply(event(Msg::TopologyDoc(linked_doc(7))));
+    let model = vm.map_model();
+    assert_eq!(model.links.len(), 1, "{model:?}");
+    assert!(model.links[0].whole_desktop, "an `auto` link is the whole desktop");
+    assert_eq!(model.links[0].label, "весь стол");
+    assert_eq!(model.links[0].state, LinkState::Idle);
+    assert!(!model.dirty);
+    assert_eq!(vm.editor.side, Side::Right, "read off the document");
+    // No draft: the document is sent back exactly as it was, link id included.
+    let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
+    assert_eq!(topology.links.len(), 1);
+    assert_eq!(topology.links[0].id, "link-0");
+
+    // Dragging the peer away unlinks the pair; putting it back restores the draft to clean.
+    let before = vm.editor.placement.clone();
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: 700.0,
+        y: 400.0,
+    });
+    assert!(vm.editor.dirty());
+    assert!(vm.map_model().links.is_empty());
+    let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
+    assert!(topology.links.is_empty(), "a pair that no longer faces loses its link");
+    vm.discard_draft();
+    assert_eq!(vm.editor.placement, before);
+    assert!(vm.layout_action().is_none());
+
+    // A link whose display is not reported stays in the document and is drawn as inactive.
+    let mut doc = linked_doc(8);
+    doc.links[0].active = false;
+    doc.links[0].inactive_reason = "eDP-1".to_owned();
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    assert_eq!(vm.map_model().links[0].state, LinkState::Inactive);
 }
 
 /// The document as a whole config file, the way `config.example.toml` holds it.
@@ -566,6 +676,10 @@ fn every_wire_request_is_the_message_it_names() {
             Action::ExportDiagnostics(String::new()),
             Request::ExportDiagnostics,
         ),
+        (
+            Action::SwitchTo(PEER_NODE.to_owned()),
+            Request::Switch,
+        ),
     ];
     for (action, expected) in cases {
         let (request, _) = action
@@ -581,94 +695,207 @@ fn every_wire_request_is_the_message_it_names() {
     // The local ones never reach the core.
     assert!(Action::StartCore.wire().is_none());
     assert!(Action::ConnectAgain.wire().is_none());
-    assert!(Action::ShowScreen(lws_gui::view_model::Screen::Layout)
-        .wire()
-        .is_none());
+    assert!(Action::ToggleModal(Modal::Layout).wire().is_none());
+    assert!(Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: 0.0,
+        y: 0.0
+    }
+    .wire()
+    .is_none());
 }
 
-/// The preview is the arrangement «Применить» would send: the peer next to the chosen edge,
-/// never on top of this computer, and the radio follows a drag.
+/// The side buttons of «Раскладка» and a drag on the map are two ways to the same arrangement.
 #[test]
-fn the_editor_places_the_peer_at_the_chosen_edge_and_never_over_it() {
+fn the_side_buttons_and_the_drag_choose_the_same_edge() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    let (this, peer) = (index_of(&vm, SELF_NODE), index_of(&vm, PEER_NODE));
 
-    // The document places both computers at their own origins; the window cannot draw that as
-    // one picture, so it places the peer itself, on the default side, from the first frame.
-    let bounds = |vm: &ViewModel, node: &str| {
-        let node = vm
-            .editor
-            .nodes
-            .iter()
-            .find(|candidate| candidate.node_id == node)
-            .expect("the node is in the document");
-        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        for display in &node.displays {
-            b = (
-                b.0.min(display.x),
-                b.1.min(display.y),
-                b.2.max(display.x + display.w),
-                b.3.max(display.y + display.h),
-            );
-        }
-        b
-    };
-    let overlap = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
-        a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
-    };
-
-    assert_eq!(vm.editor.side, Side::Right, "the default side");
-    assert_eq!(
-        bounds(&vm, PEER_NODE),
-        (1920.0, 0.0, 3520.0, 900.0),
-        "«Справа»: the peer starts where this computer's screen ends"
-    );
-    assert!(!overlap(bounds(&vm, SELF_NODE), bounds(&vm, PEER_NODE)));
-
-    // Every side moves the picture, and none of them overlaps.
-    let expected = [
-        (Side::Left, (-1600.0, 0.0)),
-        (Side::Top, (0.0, -900.0)),
-        (Side::Bottom, (0.0, 1080.0)),
-        (Side::Right, (1920.0, 0.0)),
-    ];
-    for (side, (x, y)) in expected {
+    for side in Side::ALL {
         vm.local(&Action::SetSide(side));
-        let peer = bounds(&vm, PEER_NODE);
-        assert_eq!((peer.0, peer.1), (x, y), "{}", side.label());
-        assert!(
-            !overlap(bounds(&vm, SELF_NODE), peer),
-            "{} must not overlap",
-            side.label()
+        assert_eq!(vm.editor.side, side);
+        let links = vm.map_model().links;
+        assert_eq!(links.len(), 1, "{}", side.label());
+        assert!(vm.editor.dirty(), "{}", side.label());
+        // The peer never lies over this computer.
+        let (a, b) = (
+            (vm.editor.placement[this], &vm.editor.shapes[this]),
+            (vm.editor.placement[peer], &vm.editor.shapes[peer]),
         );
+        let overlap =
+            a.0.x < b.0.x + b.1.w && b.0.x < a.0.x + a.1.w && a.0.y < b.0.y + b.1.h && b.0.y < a.0.y + a.1.h;
+        assert!(!overlap, "{} must not overlap", side.label());
     }
 
-    // A drag is a way of choosing the edge: dragging the peer up-left from the right side
-    // moves it to the left of this computer, and the radio says so.
-    vm.local(&Action::SetSide(Side::Right));
-    vm.local(&Action::MoveDisplay {
+    // Dragging the peer to this computer's left chooses «Слева», and the document then leaves
+    // through the peer's right edge into this computer's left edge.
+    let me = vm.editor.placement[this];
+    let peer_width = vm.editor.shapes[peer].w;
+    vm.local(&Action::MoveNode {
         node_id: PEER_NODE.to_owned(),
-        display_id: "eDP-1".to_owned(),
-        dx: -2000.0,
-        dy: 0.0,
+        x: me.x - GAP - peer_width - 4.0,
+        y: me.y + 2.0,
     });
     assert_eq!(vm.editor.side, Side::Left, "the drag chose the edge");
-    assert_eq!(bounds(&vm, PEER_NODE), (-1600.0, 0.0, 0.0, 900.0));
+    let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
+    let link = &topology.links[0];
+    assert_eq!(link.from.node, format!("peer:{PEER_NODE}"));
+    assert_eq!(link.from.edge.to_string(), "right");
+    assert_eq!(link.to.node, format!("peer:{SELF_NODE}"));
+    assert_eq!(link.to.edge.to_string(), "left");
 
-    // And the edge the link crosses is the one the document names, on both sides.
-    vm.local(&Action::SetSide(Side::Right));
-    let (my_display, my_edge, their_display, their_edge, end) =
-        vm.linked_span().expect("two placed computers have a link");
-    assert_eq!(my_display, "\\\\.\\DISPLAY1");
-    assert_eq!(their_display, "eDP-1");
+    // A keyboard step moves the computer exactly as far as asked, without snapping.
+    let before = vm.editor.placement[peer];
+    vm.local(&Action::NudgeNode {
+        node_id: PEER_NODE.to_owned(),
+        dx: 8.0,
+        dy: -8.0,
+    });
+    assert_eq!(vm.editor.placement[peer].x, before.x + 8.0);
+    assert_eq!(vm.editor.placement[peer].y, before.y - 8.0);
+}
+
+#[test]
+fn the_route_and_the_transfer_button_follow_the_core() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.apply(event(Msg::TopologyDoc(linked_doc(7))));
+    vm.on_connected("endpoint");
+    assert_eq!(vm.route_text(), "этот компьютер");
+    let transfer = vm.transfer();
+    assert_eq!(transfer.target, "linux-box");
+    assert_eq!(transfer.peer.as_deref(), Some(PEER_NODE));
+    assert!(transfer.enabled && transfer.why.is_none());
+    let (request, message) = Action::SwitchTo(PEER_NODE.to_owned())
+        .wire()
+        .expect("a request");
+    assert_eq!(request, Request::Switch);
+    assert!(matches!(&message, Msg::SwitchTo(switch) if switch.peer == PEER_NODE));
+    let map = vm.map_model();
+    let peer = index_of(&vm, PEER_NODE);
+    assert!(!map.nodes[peer].target);
+    assert_eq!(map.links[0].state, LinkState::Idle);
+
+    // Input is on the other computer: the route says so, the link carries it, and the button
+    // brings it back (a second `switch` while Remote is the return edge).
+    vm.apply(event(Msg::Status(status_with("REMOTE"))));
+    assert_eq!(vm.route_text(), "Workstation → linux-box");
+    let map = vm.map_model();
+    assert!(map.nodes[peer].target);
+    assert_eq!(map.nodes[peer].focus, "● клавиатура и мышь здесь");
+    assert_eq!(map.links[0].state, LinkState::Active);
+    assert_eq!(map.links[0].label, "ввод →");
+    assert_eq!(map.nodes[peer].mons[0].tag, "ввод");
+    let transfer = vm.transfer();
+    assert_eq!(transfer.target, "Workstation");
+    assert_eq!(transfer.peer.as_deref(), Some(PEER_NODE));
+
+    // The core's own reason for refusing is shown, not guessed.
+    let mut status = status_with("LOCAL");
+    status.transition_disabled_reason = "Другой компьютер ещё не готов".to_owned();
+    vm.apply(event(Msg::Status(status)));
+    let transfer = vm.transfer();
+    assert!(!transfer.enabled);
+    assert_eq!(transfer.why.as_deref(), Some("Другой компьютер ещё не готов"));
+
+    // An offline peer: nothing to switch to, and its link is drawn offline.
+    let mut status = status_with("LOCAL");
+    status.members[1].online = false;
+    vm.apply(event(Msg::Status(status)));
+    let mut doc = linked_doc(8);
+    doc.members[1].online = false;
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    assert!(!vm.transfer().enabled);
+    assert_eq!(vm.map_model().links[0].state, LinkState::Offline);
+    assert_eq!(vm.map_model().links[0].label, "офлайн");
+    assert_eq!(vm.map_model().nodes[peer].mons[0].tag, "офлайн");
+}
+
+#[test]
+fn the_headings_count_what_the_document_holds() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.apply(event(Msg::TopologyDoc(linked_doc(14))));
+    assert_eq!(vm.map_title(), "2 компьютера · 2 экрана");
+    assert_eq!(vm.revision_text(), "ревизия 14 · координатор Workstation");
+    let peers = vm.peers();
+    assert_eq!(peers.len(), 1, "this computer is not its own peer");
+    assert_eq!(peers[0].name, "linux-box");
+    assert_eq!(peers[0].initials, "LI");
+    assert_eq!(peers[0].meta, "BB22·BB22");
+    assert!(peers[0].online);
+    let map = vm.map_model();
+    assert_eq!(map.screens, 2);
+    assert_eq!(map.nodes[0].mons[0].num, "01");
+    assert_eq!(map.nodes[0].mons[0].res, "1920×1080");
+    assert_eq!(map.nodes[1].mons[0].num, "02");
     assert_eq!(
-        (my_edge, their_edge),
-        (config::Edge::Right, config::Edge::Left)
+        map.nodes[1].mons[0].res, "≈ 1600×900",
+        "a display whose size is a guess says so"
     );
+}
+
+#[test]
+fn the_rail_opens_one_window_at_a_time_and_a_pair_is_removed_only_after_asking() {
+    let mut vm = view();
+    assert_eq!(vm.modal, None);
+    vm.local(&Action::ToggleModal(Modal::Pairs));
+    assert_eq!(vm.modal, Some(Modal::Pairs));
+    vm.local(&Action::SelectRevoke(Some(PEER_NODE.to_owned())));
+    assert_eq!(vm.settings.revoke.as_deref(), Some(PEER_NODE));
+    vm.local(&Action::ToggleModal(Modal::Keys));
+    assert_eq!(vm.modal, Some(Modal::Keys));
+    assert_eq!(vm.settings.revoke, None, "a question does not outlive its window");
+    vm.local(&Action::ToggleModal(Modal::Keys));
+    assert_eq!(vm.modal, None, "the same button closes it");
+    vm.local(&Action::ToggleModal(Modal::Settings));
+    vm.local(&Action::CloseModal);
+    assert_eq!(vm.modal, None);
+}
+
+#[test]
+fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
+    let mut vm = view();
+    vm.on_connected("endpoint");
+    let now = Instant::now();
+    vm.local(&Action::PairWith("192.168.1.10:47901".to_owned()));
+    assert!(vm.pairing.dialing);
+    let id = vm.begin_request(Request::PairWith, now);
+    vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
+    assert_eq!(vm.pairing.code().as_deref(), Some("482 913"));
+    vm.apply(answer(id, Msg::OpResult(protocol::ipc::OpResult { ok: true, error_code: String::new() })));
+    assert!(!vm.pairing.dialing);
+    assert!(vm.pairing.prompt.is_none(), "the code is gone once it was used");
+    assert_eq!(vm.pairing.paired.as_deref(), Some("linux-box"));
+    vm.local(&Action::DonePairing);
+    assert_eq!(vm.pairing.paired, None);
+
+    // A refused ceremony leaves no «Пара создана» behind.
+    vm.local(&Action::PairWith("192.168.1.10:47901".to_owned()));
+    let id = vm.begin_request(Request::PairWith, now);
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult { ok: false, error_code: "PAIRING_FAILED".to_owned() }),
+    ));
+    assert!(!vm.pairing.dialing);
+    assert_eq!(vm.pairing.paired, None);
+}
+
+#[test]
+fn a_request_that_runs_out_is_scheduled_exactly_once() {
+    let mut vm = view();
+    let now = Instant::now();
+    assert_eq!(vm.next_wakeup(now), None, "an idle window waits for nothing");
+    vm.on_connected("endpoint");
+    vm.begin_request(Request::GetStatus, now);
+    let due = vm.next_wakeup(now).expect("a deadline");
+    assert!(due <= Duration::from_secs(3));
     assert_eq!(
-        end, 900.0,
-        "the shorter of the two screens is the shared edge"
+        vm.next_wakeup(now + Duration::from_secs(4)),
+        None,
+        "a deadline that has passed is not scheduled again"
     );
 }
 

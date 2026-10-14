@@ -3,10 +3,12 @@
 //! # Why eframe/egui with glow
 //!
 //! Pure Rust, one binary, no webview and no web runtime: the window is the same kind of
-//! program as `lws-core`, built by the same toolchain for Windows, X11 and Wayland, and it
-//! draws immediately — which is what a status window needs, since every pixel of it is a
-//! reading of the current `Status`. The renderer is `glow`, whose libraries are loaded at
-//! runtime, so the build needs no system `-dev` packages on Linux.
+//! program as `lws-core`, built by the same toolchain for Windows, X11 and Wayland. The
+//! renderer is `glow` (OpenGL, libraries loaded at runtime, no system `-dev` packages on
+//! Linux) and not `wgpu`, because this window is open all day and mostly idle: glow creates no
+//! GPU device, no pipeline or shader caches and no staging belts, so its resident size is a
+//! fraction of wgpu's, and with eframe's reactive loop an idle frame costs nothing at all
+//! (`docs/design` of the UI and the measurements in the build report).
 //!
 //! # Responsibility
 //!
@@ -20,14 +22,19 @@
 //! # Layout of the crate
 //!
 //! * [`view_model`] — all state and all decisions, with no `egui` type in sight, so
-//!   `cargo test -p lws-gui` never needs a display or a GPU.
-//! * [`screens`] — one module per screen: widgets in, [`view_model::Action`]s out.
-//! * [`app`] — the `eframe::App` that glues the two together and talks to the core.
+//!   `cargo test -p lws-gui` never needs a display or a GPU; [`view_model::layout`] is the
+//!   map's model on top of [`map`].
+//! * [`map`] — the geometry of «Карта мониторов»: placement, snapping, links; pure functions.
+//! * [`gui_settings`] — the theme and background, in the GUI's own `gui.toml`.
+//! * [`ui`] — the window of the mockup: widgets in, [`view_model::Action`]s out.
+//! * [`app`] — the `eframe::App` that glues the two together and decides when to repaint.
 
 #![forbid(unsafe_code)]
 
 pub mod app;
-pub mod screens;
+pub mod gui_settings;
+pub mod map;
+pub mod ui;
 pub mod view_model;
 
 // The tests draw the screens with the very same `egui` the window uses, so the version is
@@ -47,13 +54,7 @@ pub const TITLE: &str = "LAN Workspace";
 pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
     // `--help` is answered by the dispatcher; a window has no other arguments of its own.
     let _ = args;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1024.0, 760.0])
-            .with_min_inner_size([720.0, 480.0])
-            .with_title(TITLE),
-        ..Default::default()
-    };
+    let options = app::native_options();
     let result = eframe::run_native(
         TITLE,
         options,

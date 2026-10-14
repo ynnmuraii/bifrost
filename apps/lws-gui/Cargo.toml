@@ -13,11 +13,11 @@ config = { path = "../../crates/config" }
 # what the CI runners provide; wgpu would add a whole shader/backend stack for one status
 # window. The feature list is what makes the one binary run on Windows, X11 and Wayland:
 # `x11`/`wayland` reach winit through egui-winit/glutin, `accesskit` is the screen reader,
-# `links` opens the URLs in the docs, `default_fonts` is the embedded font (the UI is
-# Russian, so no system font may be assumed).
+# `links` opens the URLs in the docs. There is no `default_fonts`: the window embeds the six
+# faces of the design (Geist, Geist Mono, Silkscreen; Cyrillic included), and egui's own
+# fallback fonts would only add weight to the binary.
 eframe = { version = "0.36.2", default-features = false, features = [
     "accesskit",
-    "default_fonts",
     "glow",
     "links",
     "wayland",
