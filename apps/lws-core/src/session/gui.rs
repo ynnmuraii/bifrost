@@ -752,7 +752,6 @@ impl Session {
             peer = crate::command::node_id_hex(&node).as_str(),
             "peer revoked"
         );
-        self.manager.kill_all().await;
         ok()
     }
 
