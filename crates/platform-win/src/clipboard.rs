@@ -14,6 +14,10 @@
 //! window, `WM_CLIPBOARDUPDATE`); [`Clipboard::sequence`] is the cheap second way to notice
 //! a change (`GetClipboardSequenceNumber`), which is what a caller that already runs a timer
 //! can poll instead.
+//!
+//! Reads are bounded by the locked block's `GlobalSize`, including the NUL terminator.
+//! UTF-8 payloads over `clipboard::MAX_BYTES` are refused before text allocation; the
+//! agent reports the existing `CLIPBOARD_TOO_LARGE` error rather than dropping the change.
 
 use clipboard::Marker;
 
@@ -56,6 +60,28 @@ pub fn to_utf16(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Decodes a bounded clipboard block, checking UTF-8 size before allocating text.
+pub fn decode_text(units: &[u16]) -> Result<String, clipboard::ClipboardError> {
+    let mut end = 0;
+    while end < units.len() && units[end] != 0 {
+        end += 1;
+        if end as u64 > clipboard::MAX_BYTES {
+            return Err(clipboard::ClipboardError::TooLarge);
+        }
+    }
+    if end == units.len() {
+        return Err(clipboard::ClipboardError::Invalid);
+    }
+    let mut bytes = 0;
+    for decoded in char::decode_utf16(units[..end].iter().copied()) {
+        bytes += decoded.unwrap_or(char::REPLACEMENT_CHARACTER).len_utf8();
+        if bytes as u64 > clipboard::MAX_BYTES {
+            return Err(clipboard::ClipboardError::TooLarge);
+        }
+    }
+    Ok(String::from_utf16_lossy(&units[..end]))
+}
+
 /// Classifies the *names* of the registered formats an item carries.
 ///
 /// Pure, so the mapping is unit-testable without a clipboard: the adapter passes the
@@ -82,7 +108,8 @@ pub use windows_impl::{read_clipboard, write_clipboard, Change, Clipboard, Clipb
 #[cfg(windows)]
 mod windows_impl {
     use super::{
-        classify_names, Snapshot, CAN_INCLUDE_IN_HISTORY, EXCLUDE_FROM_MONITOR, VIEWER_IGNORE,
+        classify_names, decode_text, Snapshot, CAN_INCLUDE_IN_HISTORY, EXCLUDE_FROM_MONITOR,
+        VIEWER_IGNORE,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -97,7 +124,9 @@ mod windows_impl {
         GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
         RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    };
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -118,6 +147,8 @@ mod windows_impl {
         Formats,
         /// The listener's window class or window could not be created.
         Window,
+        /// The text block is malformed or exceeds the protocol payload limit.
+        Content(clipboard::ClipboardError),
     }
 
     impl std::fmt::Display for ClipboardError {
@@ -127,6 +158,7 @@ mod windows_impl {
                 ClipboardError::Gone => "the clipboard changed while it was being read",
                 ClipboardError::Formats => "the clipboard format list could not be read",
                 ClipboardError::Window => "the clipboard listener window could not be created",
+                ClipboardError::Content(error) => error.code(),
             };
             f.write_str(text)
         }
@@ -483,17 +515,20 @@ mod windows_impl {
         if pointer.is_null() {
             return Err(ClipboardError::Gone);
         }
-        let mut units: Vec<u16> = Vec::new();
-        // SAFETY: a `CF_UNICODETEXT` block is NUL-terminated UTF-16.
+        // SAFETY: the locked allocation contains at most GlobalSize / 2 UTF-16 units.
+        // The helper must find a terminator inside this slice, never beyond the block.
+        let size = unsafe { GlobalSize(HGLOBAL(handle.0)) };
+        let result = if size / 2 > isize::MAX as usize / 2 {
+            Err(clipboard::ClipboardError::Invalid)
+        } else {
+            let units = unsafe { std::slice::from_raw_parts(pointer.cast::<u16>(), size / 2) };
+            decode_text(units)
+        };
+        // SAFETY: this thread successfully locked the handle above.
         unsafe {
-            let mut cursor = pointer as *const u16;
-            while *cursor != 0 {
-                units.push(*cursor);
-                cursor = cursor.add(1);
-            }
             let _ = GlobalUnlock(HGLOBAL(handle.0));
         }
-        Ok(String::from_utf16_lossy(&units))
+        result.map_err(ClipboardError::Content)
     }
 
     /// Reads a `DWORD` payload, as the history flag format carries.
@@ -574,6 +609,27 @@ mod tests {
         );
         // A text that already contains a NUL keeps it and gains no other terminator.
         assert_eq!(to_utf16("a\u{0}"), vec![0x0061, 0, 0]);
+    }
+
+    #[test]
+    fn bounded_text_checks_termination_and_utf8_size() {
+        use clipboard::ClipboardError::{Invalid, TooLarge};
+        assert_eq!(decode_text(&[]), Err(Invalid));
+        assert_eq!(decode_text(&[0]), Ok(String::new()));
+        assert_eq!(decode_text(&[65]), Err(Invalid));
+        assert_eq!(decode_text(&[65, 0]), Ok("A".to_owned()));
+        assert_eq!(decode_text(&[65, 0, 66]), Ok("A".to_owned()));
+        let max = clipboard::MAX_BYTES as usize;
+        let mut units = vec![65; max];
+        units.push(0);
+        assert_eq!(decode_text(&units).unwrap().len(), max);
+        units.insert(0, 65);
+        assert_eq!(decode_text(&units), Err(TooLarge));
+        let mut wide = vec![0x0800; max / 3 + 1];
+        wide.push(0);
+        assert_eq!(decode_text(&wide), Err(TooLarge));
+        assert_eq!(decode_text(&[0xD800, 0]), Ok("\u{fffd}".to_owned()));
+        assert_eq!(decode_text(&[0xD83E, 0xDD80, 0]), Ok("🦀".to_owned()));
     }
 
     #[test]

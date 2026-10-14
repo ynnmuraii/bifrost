@@ -299,9 +299,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             // deadline and the core-silence watchdog keep running on their own tick
             // while this branch asks the platform whether the user copied something.
             _ = clipboard_tick.tick() => {
-                if let Some(change) = backend.clipboard_change().await {
-                    send_clipboard_change(link, &mut clipboard, change).await?;
-                }
+                report_clipboard_change(link, &mut clipboard, backend.clipboard_change().await).await?;
             }
             event = backend.next_event() => {
                 let now = now_ms(started);
@@ -854,6 +852,18 @@ async fn handle_set_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn report_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentLink<S>,
+    state: &mut ClipboardState,
+    change: Result<Option<ClipboardChange>, clipboard::ClipboardError>,
+) -> anyhow::Result<()> {
+    match change {
+        Ok(Some(change)) => send_clipboard_change(link, state, change).await,
+        Ok(None) => Ok(()),
+        Err(error) => send_error(link, error.code(), "the local clipboard text was refused").await,
+    }
+}
+
 /// Reports one local clipboard change to core, in frames that fit an IPC frame.
 ///
 /// `size_bytes` and the markers travel on every chunk and the `sha256` on the last one, which
@@ -1234,6 +1244,23 @@ mod tests {
     use tokio::io::duplex;
 
     const HOTKEY: &str = "Ctrl+Alt+Shift+F12";
+
+    #[tokio::test]
+    async fn oversized_local_clipboard_reports_existing_refusal() {
+        let mut harness = Harness::new().await;
+        report_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            Err(clipboard::ClipboardError::TooLarge),
+        )
+        .await
+        .expect("refusal is reported");
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_TOO_LARGE"),
+            other => panic!("expected clipboard refusal, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn activation_metadata_and_seed_precede_remote_motion_on_wire() {
         let mut harness = Harness::new().await;
@@ -1614,7 +1641,12 @@ mod tests {
         std::fs::write(&in_path, "from core").expect("in.txt is writable");
         clipboard_tick().await;
         assert!(
-            harness.backend.clipboard_change().await.is_none(),
+            harness
+                .backend
+                .clipboard_change()
+                .await
+                .expect("clipboard read")
+                .is_none(),
             "the payload core applied is not a local change"
         );
         assert_eq!(harness.clipboard.applied_version, 41);
@@ -1626,6 +1658,7 @@ mod tests {
             .backend
             .clipboard_change()
             .await
+            .expect("clipboard read")
             .expect("a local copy surfaces");
         assert_eq!(change.text, "copied by the user");
         assert!(change.markers.is_empty(), "dry mode reports no marker");
@@ -1792,7 +1825,12 @@ mod tests {
             "no clipboard, no capability: {:?}",
             harness.ready.capabilities
         );
-        assert!(harness.backend.clipboard_change().await.is_none());
+        assert!(harness
+            .backend
+            .clipboard_change()
+            .await
+            .expect("clipboard read")
+            .is_none());
         assert!(harness.backend.set_clipboard(Some("x")).await.is_err());
 
         harness.send(set_text(1, "x")).await;
