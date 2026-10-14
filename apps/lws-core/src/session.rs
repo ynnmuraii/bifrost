@@ -738,7 +738,10 @@ impl Session {
             expected_revision = expected.revision,
             "rewriting the layout's display ids to the ids the agent reports"
         );
-        match self.layout_edit_document(text, expected, LayoutSource::AUTO).await {
+        match self
+            .layout_edit_document(text, expected, LayoutSource::AUTO)
+            .await
+        {
             Handled::Reply(ctl::Response::Error { code, detail }) => {
                 tracing::warn!(%code, %detail, "the display-id rewrite was refused")
             }
@@ -770,7 +773,10 @@ impl Session {
             .map_or_else(|| "-".to_owned(), |peer| identity::fingerprint(&peer));
         tracing::info!("default layout published: {peer} to the right");
         let expected = self.layout_state.applied();
-        match self.layout_edit_document(text, expected, LayoutSource::AUTO).await {
+        match self
+            .layout_edit_document(text, expected, LayoutSource::AUTO)
+            .await
+        {
             Handled::Reply(ctl::Response::Error { code, detail }) => {
                 tracing::warn!(%code, %detail, "the default layout was refused")
             }
@@ -2055,7 +2061,8 @@ impl Session {
             }
         };
         let applied = self.layout_state.applied();
-        self.layout_edit_document(document_text, applied, source).await
+        self.layout_edit_document(document_text, applied, source)
+            .await
     }
 
     /// The whole-document CAS itself, for both front-ends.
@@ -3231,7 +3238,9 @@ impl Session {
                 return;
             }
         };
-        let response = self.handle_request(&line, LayoutSource::local("ctl", connection_id)).await;
+        let response = self
+            .handle_request(&line, LayoutSource::local("ctl", connection_id))
+            .await;
         match response {
             Handled::Reply(response) => {
                 let reply = response.render();
