@@ -172,7 +172,7 @@ impl Pairing {
         self.window.as_ref()
     }
 
-    /// The oldest unanswered ceremony a newly connected GUI can confirm.
+    /// An unanswered ceremony a newly connected GUI can confirm.
     pub fn pending_prompt(&self) -> Option<&Prompt> {
         self.ceremonies
             .values()

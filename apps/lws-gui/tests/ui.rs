@@ -779,6 +779,8 @@ fn layout_modal_has_no_second_layout_editor_and_pairing_close_is_disabled() {
     let mut vm = connected();
     vm.modal = Some(Modal::Layout);
     let mut harness = Harness::new();
+    harness.frame(&vm, false, SIZE, Vec::new());
+    harness.now += Duration::from_millis(500);
     let frame = harness.settle(&vm, false);
     expect(
         &frame,

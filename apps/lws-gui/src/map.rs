@@ -474,7 +474,10 @@ mod tests {
             assert_eq!(landed, Pt::new(300.0, expected));
             let found = links(&shapes, &[pos[0], landed]);
             assert_eq!(found.len(), 1);
-            assert_eq!((found[0].a, found[0].b, found[0].dir), (first, second, Dir::Vertical));
+            assert_eq!(
+                (found[0].a, found[0].b, found[0].dir),
+                (first, second, Dir::Vertical)
+            );
             assert_eq!(found[0].gap, GAP);
             assert_eq!(found[0].side_of_b(), Side::Bottom);
         }

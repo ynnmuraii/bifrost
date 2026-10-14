@@ -220,7 +220,8 @@ fn zoom_controls(
             ))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    if widgets::button(&mut controls, pal, "−", Kind::Ghost, current > 70).clicked() {
+    let enabled = vm.modal.is_none() && st.drag.is_none();
+    if widgets::button(&mut controls, pal, "−", Kind::Ghost, enabled && current > 70).clicked() {
         wanted = current.saturating_sub(5).max(70);
     }
     widgets::text(
@@ -230,10 +231,10 @@ fn zoom_controls(
         fam::mono(),
         pal.ink2,
     );
-    if widgets::button(&mut controls, pal, "+", Kind::Ghost, current < 150).clicked() {
+    if widgets::button(&mut controls, pal, "+", Kind::Ghost, enabled && current < 150).clicked() {
         wanted = (current + 5).min(150);
     }
-    if vm.modal.is_none() && st.drag.is_none() {
+    if enabled {
         let wheel = ui.input(|input| {
             input
                 .pointer
