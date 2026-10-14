@@ -708,20 +708,59 @@ fn every_wire_request_is_the_message_it_names() {
     .is_none());
 }
 
-/// The side buttons of «Раскладка» and a drag on the map are two ways to the same arrangement.
+/// Dragging onto each facing edge previews and serialises the same desktop link.
 #[test]
-fn the_side_buttons_and_the_drag_choose_the_same_edge() {
+fn dragging_chooses_all_four_edges() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
     let (this, peer) = (index_of(&vm, SELF_NODE), index_of(&vm, PEER_NODE));
 
     for side in Side::ALL {
-        vm.local(&Action::SetSide(side));
+        let target = lws_gui::map::adjacent(
+            &vm.editor.shapes[this],
+            vm.editor.placement[this],
+            &vm.editor.shapes[peer],
+            side,
+        );
+        vm.local(&Action::MoveNode {
+            node_id: PEER_NODE.to_owned(),
+            x: target.x + 3.0,
+            y: target.y + 3.0,
+        });
+        assert_eq!(vm.editor.placement[peer].x, target.x.round());
+        assert_eq!(vm.editor.placement[peer].y, target.y.round());
         assert_eq!(vm.editor.side, side);
         let links = vm.map_model().links;
         assert_eq!(links.len(), 1, "{}", side.label());
+        let expected_dir = match side {
+            Side::Top | Side::Bottom => lws_gui::map::Dir::Vertical,
+            Side::Left | Side::Right => lws_gui::map::Dir::Horizontal,
+        };
+        assert_eq!(links[0].dir, expected_dir);
         assert!(vm.editor.dirty(), "{}", side.label());
+        let Some(Action::UpdateTopology { layout_toml, .. }) = vm.layout_action() else {
+            panic!("a snapped drag must be applicable");
+        };
+        let document = String::from_utf8(layout_toml).expect("text");
+        let topology: config::TopologyConfig = toml::from_str(&document).expect("parse");
+        assert_eq!(topology.links.len(), 1);
+        let link = &topology.links[0];
+        assert!(link.from.is_auto() && link.to.is_auto());
+        let (from, to, from_edge, to_edge) = match side {
+            Side::Left => (PEER_NODE, SELF_NODE, "right", "left"),
+            Side::Right => (SELF_NODE, PEER_NODE, "right", "left"),
+            Side::Top => (PEER_NODE, SELF_NODE, "bottom", "top"),
+            Side::Bottom => (SELF_NODE, PEER_NODE, "bottom", "top"),
+        };
+        assert_eq!(link.from.node, format!("peer:{from}"));
+        assert_eq!(link.to.node, format!("peer:{to}"));
+        assert_eq!(link.from.edge.to_string(), from_edge);
+        assert_eq!(link.to.edge.to_string(), to_edge);
+        config::Config::from_str(&as_config_file(&document))
+            .expect("valid config")
+            .validate()
+            .expect("valid topology");
         // The peer never lies over this computer.
         let (a, b) = (
             (vm.editor.placement[this], &vm.editor.shapes[this]),

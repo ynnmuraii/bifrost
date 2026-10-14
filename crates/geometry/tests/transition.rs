@@ -446,6 +446,38 @@ fn bidirectional_link_resolves_forward_with_authored_endpoints() {
 }
 
 #[test]
+fn bottom_edge_transition_maps_to_the_targets_top_edge() {
+    let mut topology = fixture(true);
+    topology.links[0].source =
+        Endpoint::new(node(1), "a", Edge::Bottom, Segment::new(200.0, 1000.0));
+    topology.links[0].target =
+        Endpoint::new(node(2), "b", Edge::Top, Segment::new(100.0, 900.0));
+    assert_eq!(validate_topology(&topology), Ok(()));
+    let transition =
+        resolve_transition(&topology, &node(1), &Position::new("a", 600.0, 1000.0))
+            .expect("the bottom edge joins the peer's top edge");
+    assert_eq!(transition.direction, LinkDirection::Forward);
+    assert_eq!(transition.source.edge, Edge::Bottom);
+    assert_eq!(transition.target.edge, Edge::Top);
+    assert_eq!(transition.t, 0.5);
+    assert_eq!(transition.target_position, Position::new("b", 500.0, 2.0));
+    assert_eq!(
+        resolve_motion(
+            &topology,
+            &node(1),
+            &Position::new("a", 600.0, 990.0),
+            Point::new(0.0, 20.0),
+        ),
+        Some(transition),
+    );
+    let reverse =
+        resolve_transition(&topology, &node(2), &Position::new("b", 500.0, 0.0))
+            .expect("the link remains bidirectional");
+    assert_eq!(reverse.direction, LinkDirection::Reverse);
+    assert_eq!(reverse.target_position, Position::new("a", 600.0, 998.0));
+}
+
+#[test]
 fn bidirectional_link_resolves_reverse_with_swapped_endpoints() {
     let topology = fixture(true);
     let transition =

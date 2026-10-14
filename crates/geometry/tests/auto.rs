@@ -42,6 +42,44 @@ fn document(local: NodeDisplays, peer: NodeDisplays, links: Vec<TransitionLink>)
     )
 }
 
+#[test]
+fn auto_bottom_to_top_uses_only_the_outer_desktop_boundaries() {
+    let local = member(
+        1,
+        vec![
+            display("upper", Rect::new(-200.0, -600.0, 1200.0, 600.0)),
+            display("lower", Rect::new(-200.0, 0.0, 1200.0, 800.0)),
+        ],
+    );
+    let peer = member(
+        2,
+        vec![
+            display("upper", Rect::new(100.0, -400.0, 1000.0, 400.0)),
+            display("lower", Rect::new(100.0, 0.0, 1000.0, 600.0)),
+        ],
+    );
+    for (source_edge, target_edge, source_display, target_display) in [
+        (Edge::Bottom, Edge::Top, "lower", "upper"),
+        (Edge::Top, Edge::Bottom, "upper", "lower"),
+    ] {
+        let topology = document(
+            local.clone(),
+            peer.clone(),
+            vec![auto_link(1, source_edge, 2, target_edge)],
+        );
+        let resolved = resolve_auto_links(&topology);
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(resolved.links.len(), 1);
+        let link = &resolved.links[0];
+        assert_eq!(link.source.display.as_str(), source_display);
+        assert_eq!(link.target.display.as_str(), target_display);
+        assert_eq!(link.source.edge, source_edge);
+        assert_eq!(link.target.edge, target_edge);
+        assert_eq!(link.source.segment, geometry::Segment::new(0.0, 1200.0));
+        assert_eq!(link.target.segment, geometry::Segment::new(0.0, 1000.0));
+    }
+}
+
 /// (a) Two monitors side by side: the `right` edge is the right-most monitor only.
 #[test]
 fn a_right_edge_of_a_row_is_the_right_most_monitor() {
