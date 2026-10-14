@@ -145,6 +145,14 @@ jobs:
         if: runner.os == 'Linux'
         run: mkdir -p "$RUNNER_TEMP/lws-roots"
 
+      - name: Linux resources before test linking
+        if: runner.os == 'Linux'
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          free -h
+          du -sh target
+
+
       # Windows runners have a session; Linux ones need Xvfb (above). The fault
       # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
       # matter: it spawns two cores and waits for real transitions.
@@ -164,6 +172,14 @@ jobs:
         # Keep the server alive between short-lived probe clients. Xvfb otherwise resets
         # when its last client disconnects, racing the next core's capability probe.
         run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" cargo test --workspace
+
+      - name: Linux resources after link failure
+        if: failure() && runner.os == 'Linux'
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          free -h
+          du -sh target
+
 
       # The kept roots are the point of `LWS_KEEP_ROOTS` above: one directory per
       # harness (`lws-<label>-<pid>-<n>`) with each core's log, config and state.
