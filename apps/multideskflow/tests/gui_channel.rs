@@ -511,7 +511,15 @@ fn the_pairing_wizard_links_two_cores_without_restarting_them() {
         "the code is digits: {:?}",
         left.sas_code
     );
-    assert_eq!(left.attempt_id, right.attempt_id);
+    assert_eq!(
+        left.attempt_id.len(),
+        16,
+        "each side's prompt names its own ceremony by a 16-byte id"
+    );
+    assert_eq!(right.attempt_id.len(), 16);
+    // The two ids are per-connection ceremony keys (R4), not the window's shared protocol
+    // `attempt_id`: the opener and the dialer each own their ceremony, and their `PairingAnswer`
+    // names it back below.
     // `Unpaired` names the two nodes "left" and "right" (`common::write_config`), and each
     // prompt shows the *other* computer's configured name — not a constant.
     assert_eq!(left.peer_name, "right");
