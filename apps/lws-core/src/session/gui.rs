@@ -314,18 +314,19 @@ impl Session {
                 answer(&out, request_id, Msg::Status(status)).await;
                 // Broadcast events are not history: a second/reconnected GUI needs the
                 // current window and unanswered ceremony as well as the workspace status.
-                let window = self.pairing.window();
-                answer(
-                    &out,
-                    0,
-                    Msg::PairingWindow(ipc::PairingWindow {
-                        open: window.is_some(),
-                        address: window.map_or_else(String::new, |window| window.address.clone()),
-                        seconds_remaining: window.map_or(0, |window| window.remaining_s(self.now_ms())),
-                        attempt_id: window.map_or_else(Vec::new, |window| window.attempt_id.to_vec()),
-                    }),
-                )
-                .await;
+                if let Some(window) = self.pairing.window() {
+                    answer(
+                        &out,
+                        0,
+                        Msg::PairingWindow(ipc::PairingWindow {
+                            open: true,
+                            address: window.address.clone(),
+                            seconds_remaining: window.remaining_s(self.now_ms()),
+                            attempt_id: window.attempt_id.to_vec(),
+                        }),
+                    )
+                    .await;
+                }
                 if let Some(prompt) = self.pairing.pending_prompt() {
                     answer(
                         &out,

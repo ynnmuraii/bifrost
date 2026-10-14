@@ -615,3 +615,91 @@ fn the_pairing_wizard_links_two_cores_without_restarting_them() {
         "the dialer recorded the opener's address:\n{trust}"
     );
 }
+
+#[test]
+fn offline_trusted_peers_remain_in_status_and_the_applied_map() {
+    let _guard = common::serial();
+    let mut harness = Harness::start_with_displays();
+    harness.wait_linked();
+    let peer_id = harness.b.id.clone();
+    let mut window = Window::open(&gui_endpoint_of(&harness.a.root));
+    assert!(window.status().members.iter().any(|peer| peer.node_id == peer_id && peer.online));
+    let before = window.wait_event("both live display manifests", |event| match event {
+        gui_frame::Msg::TopologyDoc(doc)
+            if doc.members.len() == 2 && doc.members.iter().all(|member| !member.displays.is_empty()) =>
+        {
+            Some(doc.clone())
+        }
+        _ => None,
+    });
+    harness.b.stop();
+    let offline = window.wait_event("offline trusted peer status", |event| match event {
+        gui_frame::Msg::Status(status)
+            if status.members.iter().any(|peer| peer.node_id == peer_id && !peer.online) =>
+        {
+            Some(status.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(offline.members.iter().find(|peer| peer.node_id == peer_id).expect("trusted peer").link_state, "OFFLINE");
+    let after = window.wait_event("offline applied map member", |event| match event {
+        gui_frame::Msg::TopologyDoc(doc)
+            if doc.members.iter().any(|peer| peer.node_id == peer_id && !peer.online) =>
+        {
+            Some(doc.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(after.revision, before.revision, "going offline is not a layout edit");
+    let peer = after.members.iter().find(|peer| peer.node_id == peer_id).expect("known displays stay visible");
+    assert!(!peer.displays.is_empty());
+}
+
+#[test]
+fn a_second_gui_replays_the_live_pairing_window_and_unanswered_code() {
+    let _guard = common::serial();
+    let two = Unpaired::start("gui-pairing-replay");
+    two.wait_ready();
+    let mut opener = Window::open(&gui_endpoint_of(&two.a.root));
+    let result = opener.request(gui_frame::Msg::StartPairing(protocol::ipc::StartPairing { window_s: 120 }));
+    assert!(matches!(result, gui_frame::Msg::OpResult(result) if result.ok));
+    let original_window = opener.wait_event("opened pairing window", |event| match event {
+        gui_frame::Msg::PairingWindow(window) if window.open => Some(window.clone()),
+        _ => None,
+    });
+    drop(opener);
+    let mut reconnected = Window::open(&gui_endpoint_of(&two.a.root));
+    reconnected.status();
+    let replayed_window = reconnected.wait_event("pairing window snapshot", |event| match event {
+        gui_frame::Msg::PairingWindow(window) if window.open => Some(window.clone()),
+        _ => None,
+    });
+    assert_eq!(replayed_window.attempt_id, original_window.attempt_id);
+    assert_eq!(replayed_window.address, original_window.address);
+    assert!(replayed_window.seconds_remaining > 0 && replayed_window.seconds_remaining <= original_window.seconds_remaining);
+
+    let mut dialer = Window::open(&gui_endpoint_of(&two.b.root));
+    let result = dialer.request(gui_frame::Msg::PairWith(protocol::ipc::PairWith { address: original_window.address }));
+    assert!(matches!(result, gui_frame::Msg::OpResult(result) if result.ok));
+    let code = reconnected.wait_event("real opener SAS prompt", |event| match event {
+        gui_frame::Msg::PairingPrompt(prompt) => Some(prompt.clone()),
+        _ => None,
+    });
+    let other = dialer.wait_event("real dialer SAS prompt", |event| match event {
+        gui_frame::Msg::PairingPrompt(prompt) => Some(prompt.clone()),
+        _ => None,
+    });
+    assert_eq!(code.sas_code, other.sas_code);
+    drop(reconnected);
+    let mut second = Window::open(&gui_endpoint_of(&two.a.root));
+    second.status();
+    let replayed = second.wait_event("unanswered SAS snapshot", |event| match event {
+        gui_frame::Msg::PairingPrompt(prompt) => Some(prompt.clone()),
+        _ => None,
+    });
+    assert_eq!(replayed, code);
+    second.send(gui_frame::Msg::PairingAnswer(protocol::ipc::PairingAnswer {
+        attempt_id: replayed.attempt_id,
+        approve: false,
+    }));
+}

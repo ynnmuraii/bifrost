@@ -12,7 +12,7 @@ use super::theme::{fam, font, Palette};
 use super::widgets::{self, Icon, Kind, Run};
 use super::{act, UiState};
 use crate::gui_settings::{FieldMode, Look, Pace, Theme};
-use crate::view_model::{Action, Modal, Side, ViewModel};
+use crate::view_model::{Action, Modal, ViewModel};
 
 /// The reveal time of a dialog, seconds.
 const OPEN_FOR: f32 = 0.32;
@@ -376,39 +376,6 @@ fn layout_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut V
             });
         });
     }
-    let names: Vec<String> = editor.nodes.iter().map(|n| n.label()).collect();
-    let this = vm.self_node().map(str::to_owned);
-    let other = vm.other_node().map(str::to_owned);
-    let name_of = |id: &Option<String>| {
-        id.as_deref()
-            .and_then(|id| editor.nodes.iter().find(|n| n.node_id == id))
-            .map_or_else(|| "—".to_owned(), |n| n.label())
-    };
-    row(ui, pal, "Этот компьютер", false, |ui| {
-        if let Some(i) = widgets::select(ui, pal, "lay-this", &name_of(&this), &names) {
-            actions.push(Action::ChooseSelf(Some(editor.nodes[i].node_id.clone())));
-        }
-    });
-    row(ui, pal, "Соединить с", false, |ui| {
-        if let Some(i) = widgets::select(ui, pal, "lay-peer", &name_of(&other), &names) {
-            actions.push(Action::ChooseOther(Some(editor.nodes[i].node_id.clone())));
-        }
-    });
-    row(ui, pal, "Сторона", true, |ui| {
-        let labels: Vec<&str> = Side::ALL.iter().map(|s| s.label()).collect();
-        let on = Side::ALL
-            .iter()
-            .position(|s| *s == editor.side)
-            .unwrap_or(1);
-        if let Some(i) = widgets::seg(ui, pal, &labels, on) {
-            actions.push(Action::SetSide(Side::ALL[i]));
-        }
-        widgets::hint(
-            ui,
-            pal,
-            "Проще перетащить компьютер на карте — края свяжутся сами",
-        );
-    });
     footer(ui, pal, |ui| {
         let apply = vm.layout_action();
         let can = apply.is_some() && editor.editable && vm.connection.is_connected();

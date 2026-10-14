@@ -12,7 +12,7 @@ use super::field::{Flow, Frame};
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
 use super::{act, Env, UiState, FIELD_FRAME};
-use crate::gui_settings::FieldMode;
+use crate::gui_settings::{FieldMode, Look};
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
@@ -28,6 +28,24 @@ struct Xf {
 }
 
 impl Xf {
+    fn new(rect: Rect, zoom_percent: u16) -> Self {
+        let base = (((rect.width() - 48.0) / STAGE_W as f32)
+            .min((rect.height() - 190.0) / STAGE_H as f32))
+        .clamp(0.45, 1.0);
+        let s = base * f32::from(zoom_percent.clamp(70, 150)) / 100.0;
+        Self {
+            origin: rect.center() - Vec2::new(STAGE_W as f32, STAGE_H as f32) * (s / 2.0),
+            s,
+        }
+    }
+
+    fn stage_delta(self, delta: Vec2) -> crate::map::Point {
+        crate::map::Point {
+            x: f64::from(delta.x / self.s),
+            y: f64::from(delta.y / self.s),
+        }
+    }
+
     fn p(&self, x: f64, y: f64) -> Pos2 {
         Pos2::new(
             self.origin.x + x as f32 * self.s,
@@ -51,16 +69,8 @@ pub fn draw(
     let painter = ui.painter().with_clip_rect(rect);
     let model = vm.map_model();
     let animate = env.animate && vm.look.field != FieldMode::Off && vm.modal.is_none();
-    let s = (((rect.width() - 48.0) / STAGE_W as f32)
-        .min((rect.height() - 190.0) / STAGE_H as f32))
-    .clamp(0.45, 1.0);
-    let xf = Xf {
-        origin: Pos2::new(
-            rect.center().x - STAGE_W as f32 * s / 2.0,
-            rect.center().y - STAGE_H as f32 * s / 2.0,
-        ),
-        s,
-    };
+    let xf = Xf::new(rect, vm.look.zoom_percent);
+    let s = xf.s;
 
     // Where each computer is drawn now: animated towards the model unless it is being dragged.
     let shown: Vec<Pos2> = model
@@ -132,6 +142,7 @@ pub fn draw(
     );
 
     header(&painter, pal, vm, rect);
+    zoom_controls(ui, pal, vm, st, rect, actions);
 
     for link in &model.links {
         draw_link(&painter, pal, &model, link, &shown, xf);
@@ -188,6 +199,54 @@ pub fn draw(
 
     let ribbon_live = st.ribbon.is_some() && (st.ribbon_hover || t < st.ribbon_until) && animate;
     (animate || ribbon_live).then_some(FIELD_FRAME)
+}
+
+fn zoom_controls(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    st: &UiState,
+    rect: Rect,
+    actions: &mut Vec<Action>,
+) {
+    let current = vm.look.zoom_percent.clamp(70, 150);
+    let mut wanted = current;
+    let mut controls = ui.new_child(
+        UiBuilder::new()
+            .id_salt("map-zoom")
+            .max_rect(Rect::from_min_size(
+                rect.min + Vec2::new(24.0, 94.0),
+                Vec2::new(180.0, 36.0),
+            ))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    if widgets::button(&mut controls, pal, "−", Kind::Ghost, current > 70).clicked() {
+        wanted = current.saturating_sub(5).max(70);
+    }
+    widgets::text(&mut controls, &format!("{current}%"), 12.0, fam::mono(), pal.ink2);
+    if widgets::button(&mut controls, pal, "+", Kind::Ghost, current < 150).clicked() {
+        wanted = (current + 5).min(150);
+    }
+    if vm.modal.is_none() && st.drag.is_none() {
+        let wheel = ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .filter(|point| rect.contains(*point))
+                .map_or(0.0, |_| input.raw_scroll_delta.y)
+        });
+        if wheel > 0.0 {
+            wanted = (current + 5).min(150);
+        } else if wheel < 0.0 {
+            wanted = current.saturating_sub(5).max(70);
+        }
+    }
+    if wanted != current {
+        actions.push(Action::SetLook(Look {
+            zoom_percent: wanted,
+            ..vm.look
+        }));
+    }
 }
 
 /// The heading: «01 — Карта мониторов», «3 компьютера · 4 экрана» and the revision.
@@ -420,10 +479,11 @@ fn node_ui(
         if response.dragged() {
             if let (Some(drag), Some(p)) = (&st.drag, response.interact_pointer_pos()) {
                 if drag.node_id == node.node_id {
+                    let delta = xf.stage_delta(p - drag.grab);
                     actions.push(Action::MoveNode {
                         node_id: node.node_id.clone(),
-                        x: drag.start.x + f64::from((p.x - drag.grab.x) / s),
-                        y: drag.start.y + f64::from((p.y - drag.grab.y) / s),
+                        x: drag.start.x + delta.x,
+                        y: drag.start.y + delta.y,
                     });
                 }
             }
@@ -811,4 +871,25 @@ fn legend_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, mark: LegendMark) 
         galley,
         pal.ink2,
     ));
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    #[test]
+    fn zoomed_drag_deltas_round_trip_without_changing_stage_coordinates() {
+        for size in [Vec2::new(1200.0, 520.0), Vec2::new(900.0, 360.0)] {
+            let rect = Rect::from_min_size(Pos2::new(40.0, 70.0), size);
+            for zoom in [70, 100, 125, 150] {
+                let xf = Xf::new(rect, zoom);
+                let from = xf.p(120.0, -20.0);
+                let to = xf.p(215.0, 140.0);
+                let delta = xf.stage_delta(to - from);
+                assert!((delta.x - 95.0).abs() < 0.001, "{zoom}%");
+                assert!((delta.y - 160.0).abs() < 0.001, "{zoom}%");
+                assert!(xf.p(STAGE_W / 2.0, STAGE_H / 2.0).distance(rect.center()) < 0.001);
+            }
+        }
+    }
 }
