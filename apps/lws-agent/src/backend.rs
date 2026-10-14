@@ -652,9 +652,9 @@ impl Dry {
                     // Outside Remote the local desktop would have scrolled; this is the same
                     // "the edge stayed local" observation the click makes.
                     self.local_passthrough += 1;
-                    if let Err(error) = std::fs::write(
-                        dir.join("local-passthrough.txt"),
-                        self.local_passthrough.to_string(),
+                    if let Err(error) = write_control(
+                        &dir.join("local-passthrough.txt"),
+                        &self.local_passthrough.to_string(),
                     ) {
                         tracing::warn!(%error, "cannot write dry local passthrough count");
                     }
