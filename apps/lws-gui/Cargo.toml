@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 config = { path = "../../crates/config" }
+lws-desktop = { path = "../lws-desktop" }
 # `default-features = false` + `glow`: the smallest dependency set that still draws a window.
 # glow (OpenGL) loads its libraries at runtime and needs no -dev packages on Linux, which is
 # what the CI runners provide; wgpu would add a whole shader/backend stack for one status

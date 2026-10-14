@@ -1,0 +1,289 @@
+use protocol::ipc::{MemberStatus, Status, TopologyDoc};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    Open,
+    Switch(String),
+    Stop,
+    Exit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Item {
+    pub label: String,
+    pub action: Option<Action>,
+}
+
+fn name(member: &MemberStatus) -> String {
+    if member.display_name.is_empty() {
+        format!(
+            "компьютер {}",
+            member.node_id.chars().take(8).collect::<String>()
+        )
+    } else {
+        member.display_name.clone()
+    }
+}
+
+// Mirrors the GUI's transfer decision: remote returns via its active peer; local
+// prefers an online topology neighbour, preserving Status member order on ties.
+fn transfer(status: &Status, topology: Option<&TopologyDoc>) -> Option<(String, String)> {
+    if !status.transition_disabled_reason.is_empty() {
+        return None;
+    }
+    let this = topology.and_then(|doc| {
+        if status.is_owner
+            && doc
+                .members
+                .iter()
+                .any(|m| m.node_id == status.owner_node_id)
+        {
+            Some(status.owner_node_id.as_str())
+        } else if doc.members.len() == 2 {
+            let owner = doc.members.iter().find(|m| {
+                status
+                    .members
+                    .iter()
+                    .any(|s| s.node_id == m.node_id && s.is_owner)
+            })?;
+            doc.members
+                .iter()
+                .find(|m| m.node_id != owner.node_id)
+                .map(|m| m.node_id.as_str())
+        } else {
+            None
+        }
+    });
+    let peers: Vec<_> = status
+        .members
+        .iter()
+        .filter(|m| {
+            this.map_or(
+                !(status.is_owner
+                    && !status.owner_node_id.is_empty()
+                    && m.node_id == status.owner_node_id),
+                |id| m.node_id != id,
+            )
+        })
+        .collect();
+    if status.focus == "REMOTE" {
+        let peer = peers
+            .iter()
+            .find(|m| name(m) == status.active_peer)
+            .or_else(|| peers.first())?;
+        let local = this
+            .and_then(|id| topology?.members.iter().find(|m| m.node_id == id))
+            .map(|m| m.display_name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("этот компьютер");
+        return Some((format!("Передать ввод → {local}"), peer.node_id.clone()));
+    }
+    if status.focus != "LOCAL" {
+        return None;
+    }
+    let neighbours = topology
+        .zip(this)
+        .map(|(doc, this)| crate::geometry::neighbours(doc, this))
+        .unwrap_or_default();
+    let peer = peers
+        .iter()
+        .filter(|m| m.online)
+        .min_by_key(|m| !neighbours.contains(&m.node_id))?;
+    Some((
+        format!("Передать ввод → {}", name(peer)),
+        peer.node_id.clone(),
+    ))
+}
+
+pub(crate) fn items(status: Option<&Status>, topology: Option<&TopologyDoc>) -> Vec<Item> {
+    let mut items = vec![Item {
+        label: "Открыть MultiDeskFlow".into(),
+        action: Some(Action::Open),
+    }];
+    let label = match status {
+        Some(s) if s.focus == "REMOTE" => format!(
+            "Ввод → {}",
+            if s.active_peer.is_empty() {
+                "другой компьютер"
+            } else {
+                &s.active_peer
+            }
+        ),
+        Some(_) => "Служба работает".into(),
+        None => "Служба остановлена".into(),
+    };
+    items.push(Item {
+        label,
+        action: None,
+    });
+    if let Some((label, peer)) = status.and_then(|s| transfer(s, topology)) {
+        items.push(Item {
+            label,
+            action: Some(Action::Switch(peer)),
+        });
+    }
+    items.push(Item {
+        label: "Остановить службу".into(),
+        action: status.map(|_| Action::Stop),
+    });
+    items.push(Item {
+        label: "Выход (служба продолжит работать)".into(),
+        action: Some(Action::Exit),
+    });
+    items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn status() -> Status {
+        Status {
+            focus: "LOCAL".into(),
+            is_owner: true,
+            owner_node_id: "self".into(),
+            members: vec![
+                MemberStatus {
+                    node_id: "self".into(),
+                    is_owner: true,
+                    online: true,
+                    ..Default::default()
+                },
+                MemberStatus {
+                    node_id: "peer".into(),
+                    display_name: "Ноутбук".into(),
+                    online: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn offline_has_no_service_actions() {
+        let menu = items(None, None);
+        assert!(!menu
+            .iter()
+            .any(|i| matches!(i.action, Some(Action::Switch(_) | Action::Stop))));
+        assert_eq!(menu.last().unwrap().action, Some(Action::Exit));
+    }
+    #[test]
+    fn local_and_remote_use_same_peer() {
+        let mut s = status();
+        assert_eq!(
+            transfer(&s, None),
+            Some(("Передать ввод → Ноутбук".into(), "peer".into()))
+        );
+        s.focus = "REMOTE".into();
+        s.active_peer = "Ноутбук".into();
+        assert_eq!(
+            transfer(&s, None),
+            Some(("Передать ввод → этот компьютер".into(), "peer".into()))
+        );
+        s.transition_disabled_reason = "Нет разрешения".into();
+        assert_eq!(transfer(&s, None), None);
+    }
+    #[test]
+    fn impossible_transitions_are_hidden() {
+        let mut s = status();
+        for focus in ["PREPARING", "BLOCKED"] {
+            s.focus = focus.into();
+            assert_eq!(transfer(&s, None), None);
+        }
+        s.focus = "LOCAL".into();
+        s.members[1].online = false;
+        assert_eq!(transfer(&s, None), None);
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::*;
+    use protocol::ipc::{EndpointView, LinkView, MemberTopology};
+
+    #[test]
+    fn neighbour_precedes_first_online_member() {
+        let s = Status {
+            focus: "LOCAL".into(),
+            is_owner: true,
+            owner_node_id: "self".into(),
+            members: ["self", "distant", "neighbour"]
+                .into_iter()
+                .map(|id| MemberStatus {
+                    node_id: id.into(),
+                    display_name: id.into(),
+                    online: true,
+                    is_owner: id == "self",
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let doc = TopologyDoc {
+            members: ["self", "distant", "neighbour"]
+                .into_iter()
+                .map(|id| MemberTopology {
+                    node_id: id.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            links: vec![LinkView {
+                from: Some(EndpointView {
+                    node_id: "self".into(),
+                    edge: "RIGHT".into(),
+                    ..Default::default()
+                }),
+                to: Some(EndpointView {
+                    node_id: "neighbour".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            transfer(&s, Some(&doc)).map(|(_, id)| id),
+            Some("neighbour".into())
+        );
+    }
+
+    #[test]
+    fn remote_return_does_not_require_online_member() {
+        let s = Status {
+            focus: "REMOTE".into(),
+            active_peer: "peer".into(),
+            members: vec![MemberStatus {
+                node_id: "peer-id".into(),
+                display_name: "peer".into(),
+                online: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(transfer(&s, None).map(|(_, id)| id), Some("peer-id".into()));
+    }
+}
+
+#[cfg(test)]
+mod labels {
+    use super::*;
+    #[test]
+    fn owner_menu_labels_are_stable() {
+        let offline = items(None, None);
+        assert_eq!(offline[0].label, "Открыть MultiDeskFlow");
+        assert_eq!(offline[1].label, "Служба остановлена");
+        assert_eq!(
+            offline.last().unwrap().label,
+            "Выход (служба продолжит работать)"
+        );
+        assert_eq!(
+            offline.iter().filter(|item| item.action.is_none()).count(),
+            2
+        );
+        let remote = Status {
+            focus: "REMOTE".into(),
+            active_peer: "Ноутбук".into(),
+            ..Default::default()
+        };
+        assert_eq!(items(Some(&remote), None)[1].label, "Ввод → Ноутбук");
+    }
+}

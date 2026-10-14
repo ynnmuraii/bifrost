@@ -6,6 +6,7 @@
 //! |---------------------------------|---------------------------------------------------|
 //! | *(none)* or `gui [GLOBAL]`      | the window (`lws_gui::run_gui`)                   |
 //! | `agent …`                       | the input agent (`lws_agent::run_agent`), internal|
+//! | `tray [GLOBAL]`                 | the lightweight system tray (`lws_tray::run_tray`) |
 //! | anything else                   | the core CLI (`lws_core::run_core`): `run`, `status`, `switch`, `claim`, `peers`, `pair`, `revoke`, `layout …`, `--help` … |
 //!
 //! The agent stays a *process of its own*: the core starts `current_exe() agent …`, which is
@@ -30,6 +31,10 @@ fn main() -> ExitCode {
         Some("gui") => {
             args.remove(0);
             lws_gui::run_gui(args)
+        }
+        Some("tray") => {
+            args.remove(0);
+            lws_tray::run_tray(args)
         }
         Some("agent") => {
             console::attach_parent();

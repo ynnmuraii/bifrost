@@ -52,16 +52,38 @@ pub const TITLE: &str = "LAN Workspace";
 /// Everything the window needs before its first frame — the directories, the endpoint,
 /// `config.toml`, the client thread — is resolved by [`app::GuiApp::new`].
 pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
-    // `--help` is answered by the dispatcher; a window has no other arguments of its own.
-    let _ = args;
+    let instance = match lws_desktop::acquire(lws_desktop::Role::Gui) {
+        Ok(lws_desktop::InstanceOutcome::Started(instance)) => instance,
+        Ok(lws_desktop::InstanceOutcome::Existing) => return std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("multideskflow gui: single instance: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let options = app::native_options();
     let result = eframe::run_native(
         TITLE,
         options,
-        Box::new(|cc| Ok(Box::new(app::GuiApp::new(cc)))),
+        Box::new(|cc| {
+            let ctx = cc.egui_ctx.clone();
+            instance.set_show_handler(move || {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            })?;
+            Ok(Box::new(app::GuiApp::new(cc)))
+        }),
     );
     match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => {
+            let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+            if let Err(error) = lws_desktop::spawn_role(lws_desktop::Role::Tray, &args) {
+                eprintln!("multideskflow gui: tray: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+            std::process::ExitCode::SUCCESS
+        }
         Err(error) => {
             // No console in this role on Windows; the message is for a terminal launch.
             eprintln!("multideskflow gui: {error}");
