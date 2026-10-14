@@ -24,6 +24,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use geometry::NodeId;
 use protocol::frame::{decode_message, encode_message, Channel};
@@ -31,6 +32,7 @@ use protocol::seq::SeqValidator;
 use protocol::{limits, wire};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::convert::ConvertError;
@@ -762,10 +764,22 @@ pub async fn dial_clipboard(
 /// frame (which MUST be a `Bind`, else the connection is dropped and `accept()` keeps
 /// waiting), and returns the connection together with that `Bind`. Validation against
 /// [`Grants`] belongs to the caller (core), so the listener stays policy-free.
+///
+/// Each accepted socket is handshaked in a task of its own with a deadline ([`ACCEPT_TIMEOUT`]),
+/// so a peer that connects and then stalls — a claim on the TLS handshake, or a connection
+/// that never sends its `Bind` — cannot hold up the connections behind it (head-of-line DoS).
 pub struct ClipboardListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    /// The connections currently being handshaked, one task each.
+    pending: JoinSet<Option<(ClipboardConnection, ClipboardMessage)>>,
 }
+
+/// How long one clipboard TLS handshake (or its first `Bind`) may take.
+///
+/// A remote peer that opens the socket and then says nothing must not pin the listener: past
+/// this window the connection is dropped and the loop keeps serving.
+pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ClipboardListener {
     /// Binds `listen` and builds the pinned clipboard TLS acceptor.
@@ -777,7 +791,11 @@ impl ClipboardListener {
         let config = identity::clipboard_server_config(&identity, trust)?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = crate::manager::bind_listener(listen).await?;
-        Ok(Self { listener, acceptor })
+        Ok(Self {
+            listener,
+            acceptor,
+            pending: JoinSet::new(),
+        })
     }
 
     /// The address the listener is bound to.
@@ -789,49 +807,72 @@ impl ClipboardListener {
 
     /// Accepts the next clipboard connection whose first frame is a `Bind`.
     ///
-    /// A handshake on another ALPN, an unpinned peer, a `Bind`-less first frame or a frame
-    /// that fails validation drops the connection; the loop keeps waiting.
+    /// A handshake on another ALPN, an unpinned peer, a `Bind`-less first frame, a frame that
+    /// fails validation, or a peer that misses [`ACCEPT_TIMEOUT`] drops that connection; the
+    /// loop keeps waiting. The handshakes run concurrently, so a stalled peer never delays a
+    /// valid one.
     pub async fn accept(
         &mut self,
     ) -> Result<(ClipboardConnection, ClipboardMessage), TransportError> {
         loop {
-            let (tcp, _address) = self.listener.accept().await?;
-            tcp.set_nodelay(true)?;
-            let Ok(stream) = self.acceptor.accept(tcp).await else {
-                continue;
-            };
-            if stream.get_ref().1.alpn_protocol() != Some(limits::ALPN_CLIPBOARD.as_bytes()) {
-                continue;
-            }
-            let Some(certificate) = stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|certificates| certificates.first().cloned())
-            else {
-                continue;
-            };
-            let Ok(peer) = identity::peer_node_id(std::slice::from_ref(&certificate)) else {
-                continue;
-            };
-            let mut connection = ClipboardConnection {
-                peer,
-                channel_id: [0u8; 16],
-                stream: Stream::Server(Box::new(stream)),
-                connection_id: None,
-                out_seq: 0,
-                in_seq: 0,
-                inbound: SeqValidator::new(),
-            };
-            match connection.recv().await {
-                Ok(bind @ ClipboardMessage::Bind { channel_id, .. }) => {
-                    connection.channel_id = channel_id;
-                    return Ok((connection, bind));
+            tokio::select! {
+                accepted = self.listener.accept() => {
+                    let (tcp, _address) = accepted?;
+                    tcp.set_nodelay(true)?;
+                    let acceptor = self.acceptor.clone();
+                    self.pending
+                        .spawn(async move { handshake_clipboard(acceptor, tcp).await });
                 }
-                // Not a `Bind` (or a malformed frame): drop it and keep waiting.
-                _ => continue,
+                joined = self.pending.join_next(), if !self.pending.is_empty() => {
+                    match joined {
+                        Some(Ok(Some(pair))) => return Ok(pair),
+                        // A refused handshake, a missing `Bind`, a timeout, or a panic: the
+                        // connection is gone, the loop keeps serving.
+                        Some(Ok(None)) | Some(Err(_)) | None => continue,
+                    }
+                }
             }
         }
+    }
+}
+
+/// TLS-accepts one clipboard connection and reads its first `Bind`, with a deadline on both.
+///
+/// `None` is any refusal: the handshake failed or timed out, another ALPN was negotiated, the
+/// certificate was unpinned, or the first frame was not a `Bind`.
+async fn handshake_clipboard(
+    acceptor: TlsAcceptor,
+    tcp: TcpStream,
+) -> Option<(ClipboardConnection, ClipboardMessage)> {
+    let stream = match tokio::time::timeout(ACCEPT_TIMEOUT, acceptor.accept(tcp)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return None,
+    };
+    if stream.get_ref().1.alpn_protocol() != Some(limits::ALPN_CLIPBOARD.as_bytes()) {
+        return None;
+    }
+    let certificate = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certificates| certificates.first().cloned())?;
+    let peer = identity::peer_node_id(std::slice::from_ref(&certificate)).ok()?;
+    let mut connection = ClipboardConnection {
+        peer,
+        channel_id: [0u8; 16],
+        stream: Stream::Server(Box::new(stream)),
+        connection_id: None,
+        out_seq: 0,
+        in_seq: 0,
+        inbound: SeqValidator::new(),
+    };
+    match tokio::time::timeout(ACCEPT_TIMEOUT, connection.recv()).await {
+        Ok(Ok(bind @ ClipboardMessage::Bind { channel_id, .. })) => {
+            connection.channel_id = channel_id;
+            Some((connection, bind))
+        }
+        // Not a `Bind` (or a malformed frame), or no first frame in time: drop it.
+        _ => None,
     }
 }
 
