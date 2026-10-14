@@ -60,9 +60,10 @@ impl PairingGate {
 
     /// Admits one dialer (`pending += 1`) and returns the window it belongs to.
     ///
-    /// Refuses when no window is open, when it has expired, when it already has
-    /// [`identity::MAX_PENDING_PEERS`] pending peers, or when its attempts are spent — the
-    /// [`identity::PairingWindow::admit`] rules, reported as a short reason string.
+    /// Refuses when no window is open, when it has expired, or when the handshake budget
+    /// (`pending + attempts`, «не более 3 ожидающих peers, rate limit handshakes» and «3
+    /// попытки на 120 s») is spent — the [`identity::PairingWindow::admit`] rules, reported
+    /// as a short reason string.
     pub fn admit(&self, now_ms: u64) -> Result<identity::PairingWindow, String> {
         let mut guard = self.lock();
         let Some(window) = guard.as_mut() else {
@@ -72,6 +73,26 @@ impl PairingGate {
             .admit(now_ms)
             .map_err(|reason| format!("{reason:?}"))?;
         Ok(window.clone())
+    }
+
+    /// The RAII slot for one admitted handshake: dropping it releases `pending` unless the
+    /// connection was handed to the application, which then owns the slot until `finish`.
+    ///
+    /// This is what keeps a leaked slot from pinning a pairing window: a TLS accept that
+    /// fails, a `Pairing` event whose receiver is gone, or any early return between `admit`
+    /// and the hand-off releases the slot instead of counting against the three handshakes.
+    pub fn admit_guard(&self) -> PendingGuard {
+        PendingGuard {
+            gate: self.clone(),
+            armed: true,
+        }
+    }
+
+    /// `pending -= 1` without counting an attempt: the handshake never became a ceremony.
+    fn release(&self) {
+        if let Some(window) = self.lock().as_mut() {
+            window.release_pending();
+        }
     }
 
     /// `pending -= 1`, `attempts += 1`; closes a window that is spent or expired.
@@ -89,6 +110,29 @@ impl PairingGate {
     /// half-updated invariant).
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<identity::PairingWindow>> {
         self.window.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One admitted pairing handshake's slot, released on drop until it is disarmed.
+#[derive(Debug)]
+pub struct PendingGuard {
+    gate: PairingGate,
+    armed: bool,
+}
+
+impl PendingGuard {
+    /// The connection reached the application: the ceremony now owns the slot and will call
+    /// [`PairingGate::finish`].
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate.release();
+        }
     }
 }
 
@@ -144,6 +188,34 @@ mod tests {
         let refused = gate.admit(0);
         assert!(refused.is_err(), "a fourth pending peer must be refused");
         assert_eq!(gate.window(0).map(|w| w.pending()), Some(MAX_PENDING_PEERS));
+    }
+
+    #[test]
+    fn a_dropped_admit_guard_releases_the_slot_without_counting_an_attempt() {
+        let gate = PairingGate::closed();
+        gate.open(window_at([3u8; 16]));
+        // Three abandoned handshakes must not pin the window: each drops its guard.
+        for _ in 0..MAX_ATTEMPTS {
+            gate.admit(0).expect("admitted");
+            let guard = gate.admit_guard();
+            drop(guard);
+        }
+        let window = gate.window(0).expect("the window must stay open");
+        assert_eq!(window.pending(), 0, "a dropped guard releases its slot");
+        assert_eq!(window.attempts(), 0, "an abandoned handshake is not an attempt");
+        // The budget is whole again.
+        assert!(gate.admit(0).is_ok());
+    }
+
+    #[test]
+    fn a_disarmed_guard_leaves_the_slot_to_finish() {
+        let gate = PairingGate::closed();
+        gate.open(window_at([4u8; 16]));
+        gate.admit(0).expect("admitted");
+        gate.admit_guard().disarm();
+        assert_eq!(gate.window(0).map(|w| w.pending()), Some(1));
+        gate.finish(0);
+        assert_eq!(gate.window(0).map(|w| w.pending()), Some(0));
     }
 
     #[test]

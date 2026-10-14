@@ -349,3 +349,104 @@ async fn a_pinned_input_link_still_forms_while_a_window_is_open() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// R3: an abandoned `pair/1` handshake must release its admission slot.
+///
+/// `PairingGate::admit` runs before the TLS handshake, so a connection that sends a
+/// ClientHello and then disappears used to leave `pending` incremented for ever: three of
+/// them pinned the window and the fourth, honest dialer was refused. The `PendingGuard` in
+/// `serve_connection` releases the slot whenever the connection never reaches the
+/// application (failed handshake, dropped event), so the window still admits the fourth and
+/// the peer is handed over as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_pair_handshakes_do_not_pin_the_window() {
+    use tokio::io::AsyncWriteExt;
+
+    let root = temp_root("pair-abandoned");
+    let a = identity_at(&root, "a");
+    let b = identity_at(&root, "b");
+    let attempt_id = [0x33u8; 16];
+
+    let gate = PairingGate::closed();
+    gate.open(PairingWindow::open(0, attempt_id));
+    let address = free_address().await;
+    let mut node = spawn_node("a", Arc::new(a), address, &[], &[], gate.clone()).await;
+
+    // A real ClientHello for the pair ALPN, built once and replayed.
+    let config = identity::pairing_client_config(&b).expect("pairing client config");
+    let mut hello = Vec::new();
+    tokio_rustls::rustls::ClientConnection::new(
+        Arc::new(config.clone()),
+        identity::server_name(address.ip()),
+    )
+    .expect("client connection")
+    .write_tls(&mut hello)
+    .expect("client hello");
+    assert!(!hello.is_empty(), "the ClientHello must be non-empty");
+
+    for attempt in 0..3 {
+        let mut tcp = connect_when_listening(address).await;
+        tcp.write_all(&hello).await.expect("send the ClientHello");
+        tcp.shutdown().await.expect("close the connection");
+        // Give the server time to parse the hello, admit, and fail the handshake.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = attempt;
+    }
+
+    assert_eq!(
+        gate.window(0).map(|window| window.pending()),
+        Some(0),
+        "an abandoned handshake must release its slot"
+    );
+
+    // The fourth dialer is a real one and must still be admitted and handed over.
+    let connector = TlsConnector::from(Arc::new(config));
+    let tcp = connect_when_listening(address).await;
+    let _stream = tokio::time::timeout(
+        TIMEOUT,
+        connector.connect(identity::server_name(address.ip()), tcp),
+    )
+    .await
+    .expect("the fourth handshake must not hang")
+    .expect("the fourth pair/1 handshake completes");
+    let event = wait_for_event(
+        &mut node.events,
+        |event| matches!(event, LinkEvent::Pairing(_)),
+        TIMEOUT,
+    )
+    .await
+    .expect("the manager hands the fourth connection to the application");
+    match event {
+        LinkEvent::Pairing(connection) => assert_eq!(connection.window.attempt_id(), &attempt_id),
+        other => panic!("unexpected event {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// R3: a TCP connection that never sends a ClientHello is closed after the handshake
+/// timeout instead of pinning a task for the life of the manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_client_hello_is_closed_after_the_timeout() {
+    use tokio::io::AsyncReadExt;
+
+    let root = temp_root("pair-silent");
+    let a = identity_at(&root, "a");
+
+    let gate = PairingGate::closed();
+    gate.open(PairingWindow::open(0, [0x44u8; 16]));
+    let address = free_address().await;
+    let _node = spawn_node("a", Arc::new(a), address, &[], &[], gate).await;
+
+    let mut tcp = connect_when_listening(address).await;
+    // `LIVENESS.offline_ms` is the listener's handshake timeout; the socket must be closed
+    // shortly after it, well before this generous bound.
+    let mut buffer = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(8), tcp.read(&mut buffer)).await;
+    assert!(
+        matches!(read, Ok(Ok(0))),
+        "the manager must close a silent connection after the handshake timeout, got {read:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

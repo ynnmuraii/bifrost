@@ -549,6 +549,33 @@ fn the_window_allows_three_attempts_then_closes() {
 }
 
 #[test]
+fn the_window_never_admits_more_than_three_handshakes() {
+    // `pending + attempts` is the handshake budget: a concluded attempt and a live pending
+    // peer draw on the same three («rate limit handshakes»).
+    let mut window = PairingWindow::open(0, ATTEMPT);
+    window.admit(0).expect("the first handshake");
+    window.finish();
+    window.admit(0).expect("the second handshake");
+    window.finish();
+    window.admit(0).expect("the third handshake");
+    assert_eq!(
+        window.admit(0),
+        Err(RejectionReason::TooManyAttempts),
+        "three handshakes — concluded or pending — exhaust the window"
+    );
+}
+
+#[test]
+fn releasing_a_pending_handshake_does_not_spend_an_attempt() {
+    let mut window = PairingWindow::open(0, ATTEMPT);
+    window.admit(0).expect("the first handshake");
+    window.release_pending();
+    assert_eq!(window.pending(), 0);
+    assert_eq!(window.attempts(), 0, "an abandoned handshake is not an attempt");
+    assert!(window.is_open(0));
+}
+
+#[test]
 fn the_window_closes_at_its_deadline() {
     let mut window = PairingWindow::open(1_000, ATTEMPT);
     assert!(window.is_open(1_000 + WINDOW_MS - 1));
