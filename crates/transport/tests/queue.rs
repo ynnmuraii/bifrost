@@ -247,6 +247,52 @@ fn outbound_of_routes_motion_to_the_droppable_path() {
     assert_eq!(outbound.motion_events(), None);
 }
 
+/// A wheel turn is the input whose loss leaves no trace on either side, so it may be neither
+/// dropped nor merged: every detent the source scrolled must reach the receiver as its own
+/// event, on the guaranteed path.
+#[test]
+fn a_wheel_batch_travels_guaranteed_and_keeps_every_detent() {
+    let events = vec![
+        scroll(120),
+        scroll(120),
+        InputEvent::Scroll {
+            h120: -120,
+            v120: 0,
+        },
+        scroll(-120),
+    ];
+    let message = batch(events.clone());
+    assert_eq!(
+        classify(&message),
+        MessageClass::Edge,
+        "a wheel-only batch must never ride the droppable motion path"
+    );
+    let outbound = transport::queue::outbound_of(message);
+    match &outbound {
+        Outbound::Guaranteed(Message::InputBatch { events: kept, .. }) => {
+            assert_eq!(
+                kept, &events,
+                "every detent travels, in order, and none is merged away"
+            );
+        }
+        other => panic!("a wheel batch must travel guaranteed, got {other:?}"),
+    }
+    assert_eq!(
+        outbound.motion_events(),
+        None,
+        "the droppable path must never see a wheel"
+    );
+
+    // The coalescer is the only place that could merge them, and it must not: two detents in
+    // a row are two rotations, not one position that the newest supersedes.
+    assert_eq!(coalesce_motion(events.clone()), events);
+    assert_eq!(
+        coalesce_motion(vec![abs(1.0, 1.0), scroll(120), scroll(120), abs(2.0, 2.0)]),
+        vec![abs(1.0, 1.0), scroll(120), scroll(120), abs(2.0, 2.0)],
+        "a wheel run splits the motion runs and is never merged across"
+    );
+}
+
 /// A motion-only `InputBatch` travels on the droppable path and is rebuilt for the wire with
 /// the very lease it carried. The receiver validates that lease on every batch, so rebuilding
 /// it with the empty id turned every coalesced pointer frame into a `LeaseMismatch` while the

@@ -1359,12 +1359,18 @@ mod tests {
             InputEvent::Scroll { h120: 0, v120: 60 },
             InputEvent::Scroll { h120: 0, v120: 60 },
             InputEvent::Scroll { h120: 120, v120: 0 },
-            InputEvent::Scroll { h120: 0, v120: -120 },
+            InputEvent::Scroll {
+                h120: 0,
+                v120: -120,
+            },
         ] {
             let outcome = injector.inject(&[event]);
             assert!(outcome.os_error.is_none(), "{outcome:?}");
             assert_eq!(outcome.applied_count, 1);
         }
+        // The last stage of the counter chain: the wheel the injector actually applied.
+        assert_eq!(injector.applied_edges().wheel_v, 4);
+        assert_eq!(injector.applied_edges().wheel_h, 1);
         let (scrolls, frames) = tokio::time::timeout(std::time::Duration::from_secs(3), server)
             .await
             .expect("bounded server observation")
@@ -1382,6 +1388,54 @@ mod tests {
             ]
         );
         assert_eq!(frames, 4, "one frame per emulated scroll request");
+    }
+
+    /// One detent in, one detent out: the whole unit chain this backend owns, with the wire's
+    /// 120 per detent as the only unit in the middle.
+    ///
+    /// The chain is: a Windows hook reports one physical notch as `WHEEL_DELTA` = 120 in
+    /// `Scroll.v120` (positive is up), the agent, the core, the router and the transport copy
+    /// that field unchanged (`transport/tests/convert.rs` round-trips it, and the two-core
+    /// harness sees one event per detent), and this crate turns it into
+    /// `ei_scroll.scroll_discrete`, which counts 120 per detent too. So exactly one division by
+    /// 120 and one multiplication by 120 may exist on this path, and for a whole detent they
+    /// are the identity: `1` (a detent count) or `14400` (a double multiply) at the EIS socket
+    /// are both bugs, and the first one is the one the owner saw (browsers rounded 1 * 15/120
+    /// degrees away to nothing, smooth surfaces scrolled a sliver).
+    #[test]
+    fn a_detent_is_120_at_the_eis_output_and_120_on_the_wire_back() {
+        // The value the hook produces for one physical notch, and the wire value for it.
+        const WHEEL_DELTA: i32 = 120;
+        let mut remainder = 0;
+        assert_eq!(
+            discrete_units(WHEEL_DELTA, &mut remainder),
+            WHEEL_DELTA,
+            "one detent down the wire is one detent at the EIS socket"
+        );
+        assert_eq!(remainder, 0, "a whole detent leaves no remainder");
+        assert_eq!(discrete_units(-WHEEL_DELTA, &mut remainder), -WHEEL_DELTA);
+        assert_eq!(remainder, 0);
+
+        // The other direction, through the same two units: the compositor's own detent reaches
+        // EIS as one detent again (down, down, in EIS' sign on both ends of this backend).
+        for detent in [-1_i32, 1] {
+            let (h120, v120) = crate::capture::discrete_scroll(0, detent);
+            assert_eq!(
+                eis_units_of(v120),
+                detent * WHEEL_DELTA,
+                "the same detent must come back out, not a fraction of it"
+            );
+            assert_eq!(h120, 0);
+        }
+    }
+
+    /// The value the injector puts on the EIS socket for a wire `v120`: the 120ths the wire
+    /// carries, with the EIS vertical sign applied.
+    fn eis_units_of(v120: i32) -> i32 {
+        let mut remainder = 0;
+        let units = discrete_units(v120, &mut remainder);
+        assert_eq!(remainder, 0);
+        units.saturating_neg()
     }
 
     #[test]
@@ -1533,10 +1587,9 @@ mod tests {
         // `|value + remainder|` is at most `2 * i32::MAX`, which does not fit the 120ths
         // `scroll_discrete` takes; the excess is clamped, and the remainder keeps the
         // sub-detent part so the stream stays signed.
-        for (input, previous, units, leftover) in [
-            (i32::MAX, 119, i32::MAX, 6),
-            (i32::MIN, -119, i32::MIN, -7),
-        ] {
+        for (input, previous, units, leftover) in
+            [(i32::MAX, 119, i32::MAX, 6), (i32::MIN, -119, i32::MIN, -7)]
+        {
             let mut remainder = previous;
             assert_eq!(discrete_units(input, &mut remainder), units);
             assert_eq!(remainder, leftover);

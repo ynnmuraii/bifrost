@@ -327,6 +327,67 @@ fn remote_clicks_deliver_both_edges_immediately_and_after_settling() {
     }
 }
 
+/// The wheel is the one input whose loss leaves no trace on either side, so it gets the
+/// statement the clicks get: every detent the source scrolls arrives at the receiver as its
+/// own event, in order, at 120 units each, and the motion path never merges a run of them
+/// away.
+#[test]
+fn remote_wheel_detents_reach_the_receiver_one_by_one() {
+    let _serial = common::serial();
+    let harness = Harness::start_fault_controls(false, false);
+    harness.wait_linked();
+    harness.a.switch(&harness.b.id).expect("start remote lease");
+    harness
+        .a
+        .wait_for("A is Remote", Duration::from_secs(10), |status| {
+            status.focus == "Remote"
+        })
+        .expect("source must enter Remote");
+    // Down, down, up, down: the first two share a direction — the run a coalescer would be
+    // tempted to merge — and the third reverses it.
+    for (index, detents) in [1, 1, -1, 1].into_iter().enumerate() {
+        harness.a.trigger_dry_wheel(detents);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let actual = harness.b.dry_injected_wheel();
+            if actual.len() > index {
+                assert_eq!(actual.len(), index + 1, "one event per detent: {actual:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "remote wheel lost: {actual:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    harness.return_to_local();
+    assert_eq!(
+        harness.b.dry_injected_wheel(),
+        ["0 120", "0 120", "0 -120", "0 120"],
+        "every detent must arrive exactly once, in order, at 120 units"
+    );
+    // The liveness line carries the wheel at every stage it prints, so a live run can tell
+    // "the source never scrolled" from "the receiver never got it".
+    for (node, stage) in [(&harness.a, "captured_edges"), (&harness.b, "inject_edges")] {
+        let log = node.log();
+        let snapshot = log
+            .lines()
+            .find(|line| {
+                line.contains("lease liveness diagnostics") && line.contains("final_snapshot=true")
+            })
+            .expect("lease end must retain its final input counters");
+        let edges = snapshot
+            .split_once(&format!("{stage}="))
+            .expect("stage counters in final snapshot")
+            .1
+            .split('}')
+            .next()
+            .expect("counter fields");
+        assert!(
+            edges.contains("wheel_v: 4, wheel_h: 0"),
+            "all four detents must remain counted after summary throttling: {snapshot}"
+        );
+    }
+}
+
 /// A stale topology link cannot arm suppression when its transport is absent.
 #[test]
 fn a_held_edge_without_a_live_link_never_enters_preparing() {
