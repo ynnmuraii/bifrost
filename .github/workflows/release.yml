@@ -109,7 +109,7 @@ jobs:
           install -m 0644 packaging/multideskflow.desktop "$stage/"
           mkdir -p "$stage/share/applications" "$stage/share/icons/hicolor/scalable/apps"
           install -m 0644 packaging/multideskflow.desktop "$stage/share/applications/"
-          install -m 0644 apps/multideskflow/assets/icon.svg "$stage/share/icons/hicolor/scalable/apps/multideskflow.svg"
+          install -m 0644 packaging/multideskflow.svg "$stage/share/icons/hicolor/scalable/apps/multideskflow.svg"
           for size in 16 20 24 32 40 48 64 256; do
             mkdir -p "$stage/share/icons/hicolor/${size}x${size}/apps"
             install -m 0644 "apps/multideskflow/assets/icon-${size}.png" "$stage/share/icons/hicolor/${size}x${size}/apps/multideskflow.png"
