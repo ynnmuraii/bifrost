@@ -1415,16 +1415,25 @@ mod tests {
         assert_eq!(remainder, 0);
 
         // The other direction, through the same two units: the compositor's own detent reaches
-        // EIS as one detent again (down, down, in EIS' sign on both ends of this backend).
+        // EIS as `ei_scroll.scroll_discrete` = 120 per detent (`ei-scroll.xml`), and must come
+        // back out as one detent, not 120 of them (down, down, in EIS' sign on both ends).
         for detent in [-1_i32, 1] {
-            let (h120, v120) = crate::capture::discrete_scroll(0, detent);
+            let (h120, v120) = crate::capture::discrete_scroll(0, detent * WHEEL_DELTA);
+            assert_eq!(
+                v120,
+                -detent * WHEEL_DELTA,
+                "the wire sign flips, the unit stays"
+            );
             assert_eq!(
                 eis_units_of(v120),
                 detent * WHEEL_DELTA,
-                "the same detent must come back out, not a fraction of it"
+                "the same detent must come back out, not a multiple of it"
             );
             assert_eq!(h120, 0);
         }
+        // A high-resolution compositor fraction stays a fraction on the wire.
+        assert_eq!(crate::capture::discrete_scroll(0, 30), (0, -30));
+        assert_eq!(crate::capture::discrete_scroll(120, 0), (120, 0));
     }
 
     /// The value the injector puts on the EIS socket for a wire `v120`: the 120ths the wire
