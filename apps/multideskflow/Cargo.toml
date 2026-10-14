@@ -6,9 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# The one executable: `multideskflow` is a dispatcher over three library crates (see
-# `src/main.rs`). Everything that used to be `lws-core`, `lws-agent` and `lws-gui` is still a
-# separate crate with its own dependency graph — which is what the agent's no-network check
+# The one executable dispatches over independent role library crates (see
+# `src/main.rs`). Core, agent, GUI and tray retain separate dependency graphs,
+# which is what the agent's no-network check
 # (`apps/lws-agent/tests/no_network.rs`) relies on.
 [[bin]]
 name = "multideskflow"
@@ -18,11 +18,15 @@ path = "src/main.rs"
 lws-agent = { path = "../lws-agent" }
 lws-core = { path = "../lws-core" }
 lws-gui = { path = "../lws-gui" }
+lws-tray = { path = "../lws-tray" }
 
 [target.'cfg(windows)'.dependencies]
 # `AttachConsole` / `SetStdHandle`: the binary is a Windows-subsystem program (no console for
 # the window), and the command-line roles bind the parent terminal back (`src/console.rs`).
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [dev-dependencies]
 # The harnesses under `tests/` are integration tests of this package because only the package

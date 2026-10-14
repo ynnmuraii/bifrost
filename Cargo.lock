@@ -715,7 +715,7 @@ checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -764,7 +764,7 @@ dependencies = [
  "libc",
  "protocol",
  "serde",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "windows-sys 0.61.2",
 ]
 
@@ -1134,7 +1134,7 @@ dependencies = [
  "pollster",
  "serde",
  "tempfile",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "wgpu",
 ]
 
@@ -1792,7 +1792,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "windows",
  "x509-cert",
 ]
@@ -2002,6 +2002,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksni"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "814b44c24cd2cb236c3b8a41c7f08237b452a8e76ecaa81f1cec40b5b678215b"
+dependencies = [
+ "futures-util",
+ "pastey",
+ "serde",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2177,10 +2190,18 @@ dependencies = [
  "protocol",
  "serde",
  "tokio",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "transport",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "lws-desktop"
+version = "0.1.0"
+dependencies = [
+ "libc",
  "windows-sys 0.61.2",
 ]
 
@@ -2192,12 +2213,26 @@ dependencies = [
  "eframe",
  "egui_kittest",
  "ipc",
+ "lws-desktop",
  "protocol",
  "serde",
  "tokio",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "windows-sys 0.61.2",
  "winit",
+]
+
+[[package]]
+name = "lws-tray"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "ipc",
+ "ksni",
+ "lws-desktop",
+ "protocol",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2311,10 +2346,12 @@ dependencies = [
  "lws-agent",
  "lws-core",
  "lws-gui",
+ "lws-tray",
  "protocol",
  "socket2",
  "tokio",
  "windows-sys 0.61.2",
+ "winres",
 ]
 
 [[package]]
@@ -2876,6 +2913,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pem"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3035,7 +3078,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "tokio",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
 ]
 
@@ -4167,6 +4210,15 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml"
 version = "1.1.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
@@ -5135,6 +5187,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.11",
 ]
 
 [[package]]

@@ -29,11 +29,17 @@ use crate::view_model::{self, Bridge};
 
 /// The window's options: the size the mockup was drawn for, and the smallest it stays usable at.
 pub fn native_options() -> eframe::NativeOptions {
+    let (width, height, rgba) = lws_desktop::assets::icon_rgba();
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 720.0])
-            .with_title(crate::TITLE),
+            .with_title(crate::TITLE)
+            .with_icon(egui::IconData {
+                rgba: rgba.to_vec(),
+                width,
+                height,
+            }),
         ..Default::default()
     }
 }
