@@ -248,24 +248,6 @@ impl ViewModel {
         }
     }
 
-    /// «Сторона»: the other computer goes to that side of this one, `GAP` away.
-    pub fn set_side(&mut self, side: Side) {
-        self.editor.side = side;
-        let Some((this, other)) = self.pair() else {
-            return;
-        };
-        if self.editor.shapes.len() != self.editor.nodes.len() {
-            return;
-        }
-        let at = map::adjacent(
-            &self.editor.shapes[this],
-            self.editor.placement[this],
-            &self.editor.shapes[other],
-            side,
-        );
-        self.editor.placement[other] = Pt::new(at.x.round(), at.y.round());
-    }
-
     /// A drag: the computer follows the pointer and snaps to the edge it comes near.
     pub fn move_node(&mut self, node_id: &str, x: f64, y: f64) {
         let Some(i) = self.index_of(node_id) else {
@@ -328,7 +310,8 @@ impl ViewModel {
     /// two computers it joins still face each other the way they did (or neither moved); a pair
     /// that now faces differently, or newly, gets one `auto` link — the whole desktop's edge,
     /// which then follows the monitors with no further edit — and a pair that no longer faces
-    /// loses its link.
+    /// loses its link. Stacked desktops write Bottom ↔ Top; side-by-side desktops write
+    /// Right ↔ Left, with the upper/left desktop first.
     pub(crate) fn editor_links(&self) -> Vec<config::LinkConfig> {
         let applied = self.applied_links();
         if !self.editor.dirty() || self.editor.placement.len() != self.editor.nodes.len() {

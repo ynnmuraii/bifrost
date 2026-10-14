@@ -17,6 +17,8 @@
 //! each other within [`LINK_MAX_GAP`] with at least [`MIN_OVERLAP`] of shared edge — the rule of
 //! the mockup, taken at the granularity the document is written in: «Применить» writes one
 //! `auto` (whole desktop) link per facing pair, so a drag and a document cannot disagree.
+//! Vertically stacked desktops overlap horizontally and join Bottom ↔ Top; side-by-side
+//! desktops overlap vertically and join Right ↔ Left.
 
 use crate::view_model::Side;
 
@@ -290,7 +292,8 @@ pub fn arrange(nodes: &[Vec<Rect>], doc_links: &[DocLink], anchor: usize) -> Arr
 
 /// Where a dragged computer lands: the pointer position `(x, y)` pulled onto the nearest edge
 /// of another computer (side by side at [`GAP`], stacked at [`GAP`], or aligned) when one is
-/// within [`SNAP`], and kept near the stage.
+/// within [`SNAP`]. Unsnapped coordinates are kept near the stage; a snapped edge can extend
+/// beyond it, otherwise the stage boundary would break top/bottom adjacency.
 pub fn snap(shapes: &[Shape], pos: &[Pt], me: usize, x: f64, y: f64) -> Pt {
     let Some(mine) = shapes.get(me) else {
         return Pt::new(x, y);
@@ -332,8 +335,12 @@ pub fn snap(shapes: &[Shape], pos: &[Pt], me: usize, x: f64, y: f64) -> Pt {
     Pt::new(
         bx.clamp(-60.0, (STAGE_W - mine.w + 60.0).max(-60.0))
             .round(),
-        by.clamp(-70.0, (STAGE_H - mine.h + 40.0).max(-70.0))
-            .round(),
+        if dy < SNAP {
+            by.round()
+        } else {
+            by.clamp(-70.0, (STAGE_H - mine.h + 40.0).max(-70.0))
+                .round()
+        },
     )
 }
 
@@ -453,6 +460,24 @@ mod tests {
         let pos = [Pt::new(300.0, 10.0), Pt::new(0.0, 0.0)];
         let landed = snap(&shapes, &pos, 1, 305.0, 10.0 + 90.0 + GAP - 6.0);
         assert_eq!(landed, Pt::new(300.0, 172.0));
+    }
+
+    #[test]
+    fn vertical_snaps_survive_the_stage_boundary_in_both_directions() {
+        let shapes = [boxed(144.0, 150.0), boxed(192.0, 150.0)];
+        let pos = [Pt::new(300.0, 60.0), Pt::default()];
+        for (y, expected, first, second) in [
+            (60.0 + 150.0 + GAP - 6.0, 282.0, 0, 1),
+            (60.0 - GAP - 150.0 + 6.0, -162.0, 1, 0),
+        ] {
+            let landed = snap(&shapes, &pos, 1, 305.0, y);
+            assert_eq!(landed, Pt::new(300.0, expected));
+            let found = links(&shapes, &[pos[0], landed]);
+            assert_eq!(found.len(), 1);
+            assert_eq!((found[0].a, found[0].b, found[0].dir), (first, second, Dir::Vertical));
+            assert_eq!(found[0].gap, GAP);
+            assert_eq!(found[0].side_of_b(), Side::Bottom);
+        }
     }
 
     #[test]
