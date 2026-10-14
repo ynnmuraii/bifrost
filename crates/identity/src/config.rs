@@ -113,11 +113,7 @@ pub fn clipboard_client_config(
     identity: &NodeIdentity,
     trust: impl Into<TrustPolicy>,
 ) -> Result<ClientConfig, IdentityError> {
-    client_config(
-        identity,
-        trust.into(),
-        &[protocol::limits::ALPN_CLIPBOARD],
-    )
+    client_config(identity, trust.into(), &[protocol::limits::ALPN_CLIPBOARD])
 }
 
 /// Server config for the **clipboard channel only**. See [`clipboard_client_config`].
@@ -125,11 +121,7 @@ pub fn clipboard_server_config(
     identity: &NodeIdentity,
     trust: impl Into<TrustPolicy>,
 ) -> Result<ServerConfig, IdentityError> {
-    server_config(
-        identity,
-        trust.into(),
-        &[protocol::limits::ALPN_CLIPBOARD],
-    )
+    server_config(identity, trust.into(), &[protocol::limits::ALPN_CLIPBOARD])
 }
 
 /// Client config for the pairing channel: the server is unknown by definition, and the

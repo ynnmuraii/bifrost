@@ -550,6 +550,9 @@ mod tests {
             pairing.window().is_some(),
             "one rejected attempt must not close the window"
         );
-        assert!(pairing.gate.window(1).is_some(), "the gate window stays open too");
+        assert!(
+            pairing.gate.window(1).is_some(),
+            "the gate window stays open too"
+        );
     }
 }

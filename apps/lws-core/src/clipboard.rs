@@ -865,13 +865,10 @@ impl Handle {
         queue_capacity: usize,
     ) -> Result<(Self, mpsc::Receiver<Inbound>), String> {
         let (events, receiver) = mpsc::channel(256);
-        let listener = ClipboardListener::bind(
-            Arc::clone(&identity),
-            Arc::clone(&trusted_peers),
-            listen,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let listener =
+            ClipboardListener::bind(Arc::clone(&identity), Arc::clone(&trusted_peers), listen)
+                .await
+                .map_err(|error| error.to_string())?;
         let local_addr = listener.local_addr();
         tracing::info!(address = %local_addr, "clipboard channel listening");
         let handle = Handle {
@@ -1376,7 +1373,10 @@ mod tests {
             clipboard.payload, local,
             "the newer local copy must not be overwritten"
         );
-        assert!(clipboard.incoming.is_empty(), "the incoming transfer is gone");
+        assert!(
+            clipboard.incoming.is_empty(),
+            "the incoming transfer is gone"
+        );
         assert!(clipboard.pending_request.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }

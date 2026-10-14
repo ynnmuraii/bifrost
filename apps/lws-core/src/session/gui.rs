@@ -438,11 +438,13 @@ impl Session {
                 spawn_op_result(request_id, out, wait).await;
             }
             Msg::PairingAnswer(peer_answer) => {
-                let ceremony: pairing::CeremonyId = match peer_answer.attempt_id.as_slice().try_into()
-                {
-                    Ok(ceremony) => ceremony,
-                    Err(_) => return answer(&out, request_id, Msg::OpResult(bad_request())).await,
-                };
+                let ceremony: pairing::CeremonyId =
+                    match peer_answer.attempt_id.as_slice().try_into() {
+                        Ok(ceremony) => ceremony,
+                        Err(_) => {
+                            return answer(&out, request_id, Msg::OpResult(bad_request())).await
+                        }
+                    };
                 match self.pairing.answer(&ceremony, peer_answer.approve) {
                     Ok(wait) => spawn_op_result(request_id, out, wait).await,
                     Err((code, _detail)) => {
@@ -631,8 +633,11 @@ impl Session {
         let parsed: std::net::SocketAddr = match address.parse() {
             Ok(address) => address,
             Err(error) => {
-                self.pairing
-                    .dial_failed(&ceremony_id, "BAD_ADDRESS", format!("{address:?}: {error}"));
+                self.pairing.dial_failed(
+                    &ceremony_id,
+                    "BAD_ADDRESS",
+                    format!("{address:?}: {error}"),
+                );
                 return;
             }
         };
@@ -655,8 +660,15 @@ impl Session {
             .await
             {
                 Ok(driver) => {
-                    pairing::run(driver, ceremony_id, answer, false, local_fingerprint, events)
-                        .await;
+                    pairing::run(
+                        driver,
+                        ceremony_id,
+                        answer,
+                        false,
+                        local_fingerprint,
+                        events,
+                    )
+                    .await;
                 }
                 Err(error) => {
                     // The dial never reached a ceremony: the loop drops the registered
