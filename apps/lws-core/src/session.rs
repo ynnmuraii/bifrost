@@ -41,6 +41,9 @@ mod pairing;
 mod transition_retry;
 
 /// Attribution belongs to the operation, never to mutable "last requester" state.
+/// GUI/control edits (including their Auto buttons) retain the requesting connection.
+/// Default publication, display-id writeback, and coordinator republishing are automatic.
+/// Peer edits carry the identity negotiated by the currently established transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LayoutSource {
     source: &'static str,
@@ -49,10 +52,58 @@ struct LayoutSource {
 }
 
 impl LayoutSource {
-    const AUTO: Self = Self { source: "auto", connection_id: None, peer: None };
+    const AUTO: Self = Self {
+        source: "auto",
+        connection_id: None,
+        peer: None,
+    };
 
     fn local(source: &'static str, connection_id: [u8; 16]) -> Self {
-        Self { source, connection_id: Some(connection_id), peer: None }
+        Self {
+            source,
+            connection_id: Some(connection_id),
+            peer: None,
+        }
+    }
+
+    fn remote(peer: NodeId, connection_id: [u8; 16]) -> Self {
+        Self {
+            source: "peer",
+            connection_id: Some(connection_id),
+            peer: Some(peer),
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_source_tests {
+    use super::LayoutSource;
+    use geometry::NodeId;
+
+    #[test]
+    fn provenance_is_request_specific_and_connection_stable() {
+        let gui = LayoutSource::local("gui", [1; 16]);
+        let ctl = LayoutSource::local("ctl", [2; 16]);
+        let another_gui_request = LayoutSource::local("gui", [1; 16]);
+        assert_eq!(gui.source, "gui");
+        assert_eq!(gui.connection_id, Some([1; 16]));
+        assert_eq!(gui.peer, None);
+        assert_eq!(ctl.source, "ctl");
+        assert_eq!(ctl.connection_id, Some([2; 16]));
+        assert_eq!(gui, another_gui_request);
+        assert_ne!(gui, ctl);
+    }
+
+    #[test]
+    fn remote_and_automatic_revisions_have_distinct_provenance() {
+        let peer = NodeId::new([3; 32]);
+        let remote = LayoutSource::remote(peer, [4; 16]);
+        assert_eq!(remote.source, "peer");
+        assert_eq!(remote.peer, Some(peer));
+        assert_eq!(remote.connection_id, Some([4; 16]));
+        assert_eq!(LayoutSource::AUTO.source, "auto");
+        assert_eq!(LayoutSource::AUTO.peer, None);
+        assert_eq!(LayoutSource::AUTO.connection_id, None);
     }
 }
 
@@ -1326,11 +1377,11 @@ impl Session {
     /// applies.
     async fn on_layout(&mut self, from: NodeId, message: transport::convert::LayoutMessage) {
         use transport::convert::LayoutMessage;
-        let source = LayoutSource {
-            source: "peer",
-            connection_id: self.layout_connections.get(&from).copied(),
-            peer: Some(from),
+        let Some(connection_id) = self.layout_connections.get(&from).copied() else {
+            tracing::warn!(peer = %from, "ignoring layout message without an established connection");
+            return;
         };
+        let source = LayoutSource::remote(from, connection_id);
 
         match message {
             LayoutMessage::DisplaysChanged { revision, displays } => {
@@ -3158,7 +3209,13 @@ impl Session {
     /// single line, so it never reads again after answering (that second read is what used
     /// to race the client's close and log every answer as a failure).
     async fn on_control(&mut self, mut stream: ctl::ClientStream) {
-        let connection_id = identity::random16().expect("system entropy source");
+        let connection_id = match identity::random16() {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(%error, "cannot assign a control connection identity");
+                return;
+            }
+        };
         let line = match ctl::read_line(&mut stream).await {
             Ok(Some(line)) => line,
             Ok(None) => {

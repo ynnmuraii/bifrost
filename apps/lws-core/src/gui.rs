@@ -103,8 +103,17 @@ impl Server {
         stream: ClientStream,
         requests: mpsc::Sender<Request>,
     ) -> tokio::task::JoinHandle<()> {
-        let connection_id = identity::random16().expect("system entropy source");
-        tokio::spawn(serve(stream, requests, self.events.subscribe(), connection_id))
+        let events = self.events.subscribe();
+        tokio::spawn(async move {
+            let connection_id = match identity::random16() {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot assign a GUI connection identity");
+                    return;
+                }
+            };
+            serve(stream, requests, events, connection_id).await;
+        })
     }
 }
 

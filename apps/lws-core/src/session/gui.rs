@@ -23,7 +23,7 @@ use focus_router as fr;
 use protocol::ipc::{self as ipc, gui_frame::Msg};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{ctl, pairing, Handled, Session, LAYOUT_VERDICT_TIMEOUT};
+use super::{ctl, pairing, Handled, LayoutSource, Session, LAYOUT_VERDICT_TIMEOUT};
 use crate::gui::Outgoing;
 
 /// How long the loop waits for one GUI connection to take a frame.
@@ -302,9 +302,11 @@ impl Session {
     pub(crate) async fn on_gui_request(&mut self, request: crate::gui::Request) {
         let crate::gui::Request {
             request_id,
+            connection_id,
             message,
             out,
         } = request;
+        let source = LayoutSource::local("gui", connection_id);
         match message {
             Msg::GetStatus(_) => {
                 let status = self.gui_status().await;
@@ -389,7 +391,7 @@ impl Session {
                     }
                 };
                 let expected = layout_base(update.expected_revision, &update.expected_author);
-                let handled = self.layout_edit_document(text, expected).await;
+                let handled = self.layout_edit_document(text, expected, source).await;
                 self.reply_handled(request_id, out, handled).await;
             }
             Msg::SwitchTo(switch) => {
@@ -402,7 +404,7 @@ impl Session {
             Msg::LayoutAuto(_) => {
                 // The same path the `layout auto` control command takes: the GUI button and
                 // the CLI cannot disagree about what "automatic" means.
-                let handled = self.layout_auto().await;
+                let handled = self.layout_auto(source).await;
                 self.reply_handled(request_id, out, handled).await;
             }
             Msg::ApplyPendingEdit(apply) => {
@@ -421,7 +423,7 @@ impl Session {
                     )
                     .await;
                 }
-                let handled = self.layout_apply().await;
+                let handled = self.layout_apply(source).await;
                 self.reply_handled(request_id, out, handled).await;
             }
             Msg::DiscardPendingEdit(discard) => {
