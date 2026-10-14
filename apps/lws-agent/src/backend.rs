@@ -19,7 +19,7 @@ use clipboard::Marker;
 use input_model::{CaptureKind, HidKey, InputEvent, MouseButton, Position};
 use platform_probe::{BackendOverride, EnvSnapshot, SessionInfo};
 use protocol::ipc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(target_os = "linux")]
@@ -543,6 +543,18 @@ impl DryClipboard {
     }
 }
 
+/// Replaces one dry control file that a test polls from another process.
+///
+/// `fs::write` truncates before it writes, so a reader polling every couple of
+/// milliseconds can catch the empty window — and a counter caught that way is not even a
+/// number. The replacement is atomic instead: a reader sees the previous text or the new
+/// one, never a half-written file.
+fn write_control(path: &Path, text: &str) -> std::io::Result<()> {
+    let staging = path.with_extension("writing");
+    std::fs::write(&staging, text)?;
+    std::fs::rename(&staging, path)
+}
+
 impl Dry {
     fn new(
         ready: Ready,
@@ -590,7 +602,7 @@ impl Dry {
 
     fn write_capture_mode(&self, kind: CaptureKind) {
         if let Some(dir) = &self.control_dir {
-            if let Err(error) = std::fs::write(dir.join("capture-mode.txt"), format!("{kind:?}")) {
+            if let Err(error) = write_control(&dir.join("capture-mode.txt"), &format!("{kind:?}")) {
                 tracing::warn!(%error, "cannot write dry capture mode");
             }
         }
@@ -610,9 +622,9 @@ impl Dry {
                 });
             }
             self.local_passthrough += 2;
-            if let Err(error) = std::fs::write(
-                dir.join("local-passthrough.txt"),
-                self.local_passthrough.to_string(),
+            if let Err(error) = write_control(
+                &dir.join("local-passthrough.txt"),
+                &self.local_passthrough.to_string(),
             ) {
                 tracing::warn!(%error, "cannot write dry local passthrough count");
             }
@@ -631,7 +643,7 @@ impl Dry {
         } else {
             0.0
         };
-        if let Err(error) = std::fs::write(dir.join("pointer-observed.txt"), &text) {
+        if let Err(error) = write_control(&dir.join("pointer-observed.txt"), &text) {
             tracing::warn!(%error, "cannot acknowledge dry pointer sample");
         }
         tokio::time::sleep(POLL_TICK).await;
