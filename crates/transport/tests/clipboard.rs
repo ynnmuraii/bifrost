@@ -715,6 +715,21 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Proves a dial was refused: either the TLS handshake failed, or the server dropped the
+/// connection instead of serving it (the client may finish TLS 1.3 before the alert arrives).
+async fn assert_refused(dial: Result<transport::ClipboardConnection, transport::TransportError>) {
+    match dial {
+        Err(_) => {}
+        Ok(mut connection) => {
+            let closed = tokio::time::timeout(Duration::from_secs(2), connection.recv()).await;
+            assert!(
+                matches!(closed, Ok(Err(_))),
+                "a refused dial must close the connection, got {closed:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() {
     let root = temp_root("clipboard-pins");
@@ -728,16 +743,33 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
     let b_pins = Arc::new(std::sync::RwLock::new([id_a].into_iter().collect()));
 
     let address_a = free_address().await;
-    let mut listener = ClipboardListener::bind(
-        Arc::clone(&identity_a),
-        Arc::clone(&a_pins),
-        address_a,
-    )
-    .await
-    .expect("bind listener");
+    let listener = ClipboardListener::bind(Arc::clone(&identity_a), Arc::clone(&a_pins), address_a)
+        .await
+        .expect("bind listener");
+    let address_a = listener.local_addr();
 
-    // Before pairing: B dials A. Handshake MUST fail because A has not pinned B.
-    let fail_dial = dial_clipboard(
+    // `accept()` must be driven for any handshake to make progress (it hands each accepted
+    // socket to its own task), so the test runs it in a task and collects the connections it
+    // yields.
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(4);
+    let acceptor = tokio::spawn(async move {
+        let mut listener = listener;
+        loop {
+            match listener.accept().await {
+                Ok(pair) => {
+                    if accepted_tx.send(pair).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    // Before pairing: B dials A. A pins nobody, so its verifier refuses the handshake. TLS 1.3
+    // lets the client finish its half before the server's rejection lands, so the proof is on
+    // the server side: the connection is closed, never handed to the application.
+    let before = dial_clipboard(
         &identity_b,
         Arc::clone(&b_pins),
         id_a,
@@ -747,41 +779,40 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
         [3; 32],
     )
     .await;
-    assert!(fail_dial.is_err(), "dial before pairing must be refused");
+    assert_refused(before).await;
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "a refused handshake must not be handed over"
+    );
 
     // Runtime pairing: A adds B to its shared pins WITHOUT restarting the listener.
     a_pins.write().unwrap().insert(id_b);
 
-    // Now B dials A again. Handshake MUST succeed with no restart!
-    let identity_b_clone = Arc::clone(&identity_b);
-    let b_pins_clone = Arc::clone(&b_pins);
-    let dial_task = tokio::spawn(async move {
-        dial_clipboard(
-            &identity_b_clone,
-            b_pins_clone,
-            id_a,
-            address_a,
-            [1; 16],
-            [2; 16],
-            [3; 32],
-        )
-        .await
-    });
-
-    let (conn_a, bind_msg) = listener.accept().await.expect("accept");
-    assert_eq!(conn_a.peer, id_b);
-    let conn_b = dial_task.await.expect("join").expect("dial succeeds");
+    let conn_b = dial_clipboard(
+        &identity_b,
+        Arc::clone(&b_pins),
+        id_a,
+        address_a,
+        [1; 16],
+        [2; 16],
+        [3; 32],
+    )
+    .await
+    .expect("the dial must succeed once B is pinned");
     assert_eq!(conn_b.peer, id_a);
+
+    let (conn_a, bind_msg) = tokio::time::timeout(Duration::from_secs(5), accepted_rx.recv())
+        .await
+        .expect("the paired connection must be accepted without a restart")
+        .expect("the accept task is alive");
+    assert_eq!(conn_a.peer, id_b);
     assert!(matches!(bind_msg, ClipboardMessage::Bind { .. }));
 
-    // Revoke: A removes B from its shared pins.
+    // Revoke: A removes B from its shared pins, and the handshake is refused again.
     a_pins.write().unwrap().remove(&id_b);
-
-    // B tries to dial A again. Handshake MUST be refused!
-    let b_pins_2 = Arc::new(std::sync::RwLock::new([id_a].into_iter().collect()));
-    let fail_revoked = dial_clipboard(
+    let after = dial_clipboard(
         &identity_b,
-        b_pins_2,
+        Arc::new(std::sync::RwLock::new([id_a].into_iter().collect())),
         id_a,
         address_a,
         [4; 16],
@@ -789,5 +820,57 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
         [6; 32],
     )
     .await;
-    assert!(fail_revoked.is_err(), "dial after revocation must be refused");
+    assert_refused(after).await;
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "a revoked peer's handshake must not be handed over"
+    );
+
+    acceptor.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// R6: a connection that stalls its handshake must not block the ones behind it.
+///
+/// `ClipboardListener::accept` used to TLS-accept and read the `Bind` inline, so one peer that
+/// connected and said nothing held the listener until its socket died — a head-of-line DoS.
+/// Each connection is handshaked in its own task now, so the valid dialer queued behind the
+/// silent one is accepted at once.
+#[tokio::test]
+async fn a_silent_connection_does_not_block_a_valid_one() {
+    let root = temp_root("clipboard-hol");
+    let identity_a = Arc::new(identity_at(&root, "a"));
+    let identity_b = identity_at(&root, "b");
+    let id_a = identity_a.node_id();
+    let id_b = identity_b.node_id();
+    let address = free_address().await;
+
+    let a_pins = Arc::new(std::sync::RwLock::new([id_b].into_iter().collect()));
+    let b_pins = Arc::new(std::sync::RwLock::new([id_a].into_iter().collect()));
+    let mut listener =
+        ClipboardListener::bind(Arc::clone(&identity_a), Arc::clone(&a_pins), address)
+            .await
+            .expect("bind listener");
+
+    // A socket that is accepted and then says nothing.
+    let silent = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("the silent connection");
+
+    // A real dialer, queued behind it.
+    let dial = tokio::spawn(async move {
+        dial_clipboard(&identity_b, b_pins, id_a, address, [1; 16], [2; 16], [3; 32]).await
+    });
+
+    let accepted = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
+    let (connection, message) = accepted
+        .expect("the valid dial must be accepted while a silent peer stalls")
+        .expect("accept");
+    assert_eq!(connection.peer, id_b);
+    assert!(matches!(message, ClipboardMessage::Bind { .. }));
+
+    let dialed = dial.await.expect("join").expect("dial");
+    assert_eq!(dialed.peer, id_a);
+    drop(silent);
+    let _ = std::fs::remove_dir_all(&root);
 }
