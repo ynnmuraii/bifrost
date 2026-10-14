@@ -26,6 +26,12 @@ challenge/renew/status на границе FSM, принятые/отклонё�
 соединения: успешные записи в сокет и декодированные lease-кадры. Эти записи не
 продлевают lease и не меняют TTL или правила watchdog.
 
+Heartbeat core↔agent учитывает задержку собственного цикла: если он проснулся позже
+планового срока хотя бы на половину `core_silence_ms`, watchdog молчания переармируется,
+а DEBUG сообщает `core loop stalled …; not blaming the agent` (у агента — обратное).
+Это не продлевает lease/deadline: задержка самого процесса не доказывает отказ пира,
+но освобождение ввода по сроку lease сохраняется.
+
 Windows capture хранит callback-контекст на собственном потоке: после EndCapture →
 BeginCapture события идут в новую очередь. В Preparing повторные edge/hotkey-триггеры
 не меняют выбранный переход и не перезапускают capture; timeout, отказ и аварийный
@@ -91,7 +97,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 Собранные бинарники: `target/debug/lws-core` и `target/debug/lws-agent` (у агента нет
 сетевых сокетов и вручную он не запускается — его поднимает и контролирует core).
 Часть тестов Linux-бэкендов требует графической сессии; в CI для этого используется
-`xvfb-run` (см. `.github/workflows/ci.yml`).
+`xvfb-run -a -s "-screen 0 1280x1024x24 -noreset"` (см. `.github/workflows/ci.yml`):
+`-noreset` предотвращает сброс X-сервера между короткими probe-подключениями.
+Fault harness ожидает `agent=ready` перед переключением и восстановление наблюдения
+после каждого возврата в Local; завершение FSM не означает, что следующий tick уже прошёл.
 
 ## Структура workspace
 

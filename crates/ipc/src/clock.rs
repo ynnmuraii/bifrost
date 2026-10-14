@@ -140,6 +140,16 @@ impl SuspendDetector {
         }
     }
 
+    /// Reports how late a loop woke relative to its planned monotonic deadline.
+    ///
+    /// Unlike suspend, scheduler stalls advance both clocks. A peer's silence during
+    /// our own stall is not evidence of peer failure; callers re-arm only their silence
+    /// watchdog, leaving lease deadlines unchanged.
+    pub fn wake_lateness(planned_ms: u64, actual_ms: u64, threshold_ms: u64) -> Option<u64> {
+        let late_ms = actual_ms.saturating_sub(planned_ms);
+        (late_ms >= threshold_ms).then_some(late_ms)
+    }
+
     /// Samples both clocks and returns the wall time the monotonic clock did not account
     /// for, when that is at least the threshold.
     ///
@@ -207,5 +217,38 @@ mod tests {
     fn a_backwards_step_of_the_wall_clock_is_not_a_suspend() {
         let mut detector = SuspendDetector::new(1_000, 1_000, 2_000);
         assert_eq!(detector.observe(1_050, 500), None);
+    }
+
+    #[test]
+    fn a_late_loop_wake_is_not_peer_silence() {
+        let mut clock = ManualClock::new();
+        let mut watchdog = crate::Watchdog::for_core_silence_ms(300, clock.monotonic_ms())
+            .expect("valid silence limit");
+        let planned = clock.monotonic_ms() + watchdog.heartbeat_ms();
+        clock.advance(675);
+        let late = SuspendDetector::wake_lateness(planned, clock.monotonic_ms(), 150);
+        assert_eq!(late, Some(600));
+        assert!(watchdog.silence_exceeded(clock.monotonic_ms()));
+        if late.is_some() {
+            watchdog.on_frame(clock.monotonic_ms());
+        }
+        assert!(!watchdog.silence_exceeded(clock.monotonic_ms()));
+        // A peer that remains silent while we run on time must still fail.
+        for _ in 0..5 {
+            let planned = clock.monotonic_ms() + watchdog.heartbeat_ms();
+            clock.advance(watchdog.heartbeat_ms());
+            assert_eq!(
+                SuspendDetector::wake_lateness(planned, clock.monotonic_ms(), 150),
+                None
+            );
+        }
+        assert!(watchdog.silence_exceeded(clock.monotonic_ms()));
+    }
+
+    #[test]
+    fn loop_lateness_uses_the_half_window_boundary_and_ignores_early_wakes() {
+        assert_eq!(SuspendDetector::wake_lateness(100, 99, 150), None);
+        assert_eq!(SuspendDetector::wake_lateness(100, 249, 150), None);
+        assert_eq!(SuspendDetector::wake_lateness(100, 250, 150), Some(150));
     }
 }

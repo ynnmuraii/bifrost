@@ -247,8 +247,14 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
     // A slow tick must not queue up: the clipboard is polled, not scheduled.
     clipboard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let poll_ms = backend::POLL_TICK.as_millis() as u64;
+    let mut planned_wake_ms = now_ms(started).saturating_add(poll_ms);
 
     loop {
+        // Timer service and batch flushing in the preceding turn can stall too.
+        let now = now_ms(started);
+        rearm_after_loop_stall(watchdog, planned_wake_ms, now);
+        planned_wake_ms = now.saturating_add(poll_ms);
         tokio::select! {
             // The IPC arm first: a `Ping` that is already in the link's buffer is
             // answered before this turn services any deadline, and a turn that woke on
@@ -333,6 +339,11 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
         }
+        // Every select arm is bounded by next_event's POLL_TICK. Include slow
+        // arm handling, but only rearm peer silence: lease deadlines still run.
+        let now = now_ms(started);
+        rearm_after_loop_stall(watchdog, planned_wake_ms, now);
+        planned_wake_ms = now.saturating_add(poll_ms);
 
         service_timers(
             link,
@@ -343,7 +354,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             &mut held_lease,
             &mut released_after_silence,
             watchdog,
-            now_ms(started),
+            now,
         )
         .await?;
 
@@ -359,6 +370,18 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             now_ms(started),
         )
         .await?;
+    }
+}
+
+/// A late local turn cannot distinguish core silence from its own inability to poll.
+fn rearm_after_loop_stall(watchdog: &mut Watchdog, planned_ms: u64, now: u64) {
+    if let Some(lateness_ms) = ::ipc::clock::SuspendDetector::wake_lateness(
+        planned_ms,
+        now,
+        watchdog.silence_limit_ms() / 2,
+    ) {
+        watchdog.on_frame(now);
+        tracing::debug!("agent loop stalled {lateness_ms} ms; not blaming the core");
     }
 }
 
@@ -1127,7 +1150,7 @@ fn watchdog_at_ready(core_silence_ms: u32, now_ms: u64) -> Watchdog {
 
 #[cfg(test)]
 mod watchdog_start_tests {
-    use super::watchdog_at_ready;
+    use super::{rearm_after_loop_stall, watchdog_at_ready};
 
     /// The CI-38220074904 failure, in integers: the backend probe takes longer than the
     /// whole silence limit, and that must not read as core silence.
@@ -1162,6 +1185,26 @@ mod watchdog_start_tests {
         assert_eq!(watchdog.silence_ms(500), 0);
         assert!(!watchdog.silence_exceeded(800));
         assert!(watchdog.silence_exceeded(801));
+    }
+
+    #[test]
+    fn a_late_local_turn_rearms_only_at_half_the_silence_window() {
+        let mut watchdog = watchdog_at_ready(300, 0);
+        rearm_after_loop_stall(&mut watchdog, 5, 154);
+        assert_eq!(watchdog.silence_ms(154), 154);
+        rearm_after_loop_stall(&mut watchdog, 5, 155);
+        assert_eq!(watchdog.silence_ms(155), 0);
+        assert!(!watchdog.silence_exceeded(455));
+        assert!(watchdog.silence_exceeded(456));
+    }
+
+    #[test]
+    fn timely_turns_do_not_excuse_a_silent_core() {
+        let mut watchdog = watchdog_at_ready(300, 0);
+        for now in (5..=305).step_by(5) {
+            rearm_after_loop_stall(&mut watchdog, now, now);
+        }
+        assert!(watchdog.silence_exceeded(305));
     }
 }
 
