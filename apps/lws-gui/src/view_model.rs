@@ -1,8 +1,8 @@
 //! Everything the window decides, and nothing about how it looks.
 //!
 //! The split this crate is built around (see the crate docs): [the view model](ViewModel)
-//! is plain data with no `egui` type anywhere near it, [the screens](crate::screens) turn it
-//! into widgets and report what the user asked for as [`Action`]s, and [`Bridge`] is the only
+//! is plain data with no `egui` type anywhere near it, [the UI](crate::ui) turns it
+//! into widgets and reports what the user asked for as [`Action`]s, and [`Bridge`] is the only
 //! place that connects the two. That is what makes `cargo test -p lws-gui` runnable on a host
 //! with no display: a [`ViewModel`] is a struct literal, and `apply` is a pure fold.
 //!
@@ -20,7 +20,7 @@
 /// [`Action`] is the whole vocabulary: the wire requests of `ipc.proto`
 /// (`GetStatus`, `ClaimOwnership`, `StartPairing`, …), the two things the client does by
 /// itself (`StartCore`, `ConnectAgain`), and the local edits the window applies to its own
-/// state (`ShowScreen`, `SetSide`, `MoveDisplay`, …). Only the first group is a `GuiFrame`;
+/// state (`ToggleModal`, `MoveNode`, …). Only the first group is a `GuiFrame`;
 /// the app sends those to the client and folds the rest into the view model, so no decision
 /// ever happens in drawing code. `StopCore` asks the core to stop itself, so it also works for
 /// a service started elsewhere; only a timed-out request may use the pid this window started.
@@ -526,12 +526,8 @@ pub struct LayoutEditor {
     pub nodes: Vec<EditorNode>,
     /// The applied links, still in wire form: they are rewritten as `[topology]` rows.
     pub links: Vec<ipc::LinkView>,
-    /// The side the form of «Раскладка» shows for the pair.
+    /// The pair's side inferred from the map, for automatic-layout outcome text.
     pub side: Side,
-    /// The node id the user named as «этот компьютер», when the window cannot tell.
-    pub self_choice: Option<String>,
-    /// The node id the user named as «другой компьютер».
-    pub other_choice: Option<String>,
     /// The drawn shape of every member, parallel to `nodes`.
     pub shapes: Vec<crate::map::Shape>,
     /// Where the user has put every member on the stage, parallel to `nodes`.
@@ -611,8 +607,6 @@ pub struct Settings {
     pub clipboard_note: Option<String>,
     /// The member «Удалить компьютер из пары» is aimed at.
     pub revoke: Option<String>,
-    /// `true` once the user pressed the button and the window asks again.
-    pub revoke_confirmed: bool,
     /// What `ExportDiagnostics` answered.
     pub export: Option<Outcome>,
     /// «Адрес в локальной сети»: what the file names, and what may be picked.
@@ -1143,8 +1137,6 @@ impl ViewModel {
             })
             .collect();
         self.editor.nodes = nodes;
-        self.editor.self_choice = None;
-        self.editor.other_choice = None;
         // The map is rebuilt from the applied links; the placement the user had is dropped
         // with the revision it was a draft of.
         self.rebuild_layout();
@@ -1629,12 +1621,8 @@ impl ViewModel {
     /// `Status` carries no «this node» field, so the window uses what it does carry: while
     /// this node is the owner, `owner_node_id` is itself; otherwise, with two members and
     /// exactly one of them marked as the owner, the other one is this computer. Anything
-    /// else — three members, no owner known — leaves the question to the user, who picks
-    /// with [`Action::ChooseSelf`].
+    /// else — three members, no owner known — is left unknown rather than guessing.
     pub fn self_node(&self) -> Option<&str> {
-        if let Some(choice) = self.editor.self_choice.as_deref() {
-            return Some(choice);
-        }
         let status = self.status.as_ref()?;
         let known = |node_id: &str| self.editor.nodes.iter().any(|node| node.node_id == node_id);
         if status.is_owner && known(&status.owner_node_id) {
@@ -1666,9 +1654,6 @@ impl ViewModel {
 
     /// The other member the editor links this computer to.
     pub fn other_node(&self) -> Option<&str> {
-        if let Some(choice) = self.editor.other_choice.as_deref() {
-            return Some(choice);
-        }
         let this = self.self_node()?;
         self.editor
             .nodes
@@ -1734,12 +1719,10 @@ impl ViewModel {
                     Some(*modal)
                 };
                 self.settings.revoke = None;
-                self.settings.revoke_confirmed = false;
             }
             Action::CloseModal => {
                 self.modal = None;
                 self.settings.revoke = None;
-                self.settings.revoke_confirmed = false;
             }
             Action::SetLook(look) => self.look = *look,
             Action::DonePairing => self.pairing.paired = None,
@@ -1751,22 +1734,11 @@ impl ViewModel {
             Action::SetAddress(address) => self.pairing.address = address.clone(),
             Action::ToggleDetails(open) => self.pairing.details = *open,
             Action::LayoutAuto => self.discard_draft(),
-            Action::SetSide(side) => self.set_side(*side),
             Action::MoveNode { node_id, x, y } => self.move_node(node_id, *x, *y),
             Action::NudgeNode { node_id, dx, dy } => self.nudge_node(node_id, *dx, *dy),
-            Action::ChooseSelf(node_id) => {
-                self.editor.self_choice = node_id.clone();
-                self.rebuild_layout();
-            }
-            Action::ChooseOther(node_id) => {
-                self.editor.other_choice = node_id.clone();
-                self.rebuild_layout();
-            }
             Action::SelectRevoke(node_id) => {
                 self.settings.revoke = node_id.clone();
-                self.settings.revoke_confirmed = false;
             }
-            Action::ConfirmRevoke(confirmed) => self.settings.revoke_confirmed = *confirmed,
             Action::SelectLanAddress(address) => self.settings.lan.choice = Some(address.clone()),
             Action::ApplyLanAddress => self.apply_lan_address(),
             // «Перезапустить службу» is not a fold: it decides against the pid the window
@@ -1942,8 +1914,6 @@ pub enum Action {
     SetAddress(String),
     /// Open or close the fingerprints under the code (ADR-010).
     ToggleDetails(bool),
-    /// Which side of this computer the other one is on.
-    SetSide(Side),
     /// Drag a computer of the map: its top-left corner is wanted at `(x, y)` stage units
     /// (the map snaps it to a neighbour's edge).
     MoveNode {
@@ -1963,14 +1933,8 @@ pub enum Action {
         /// Vertical step, stage units.
         dy: f64,
     },
-    /// Name the member that is this computer.
-    ChooseSelf(Option<String>),
-    /// Name the member the layout links to.
-    ChooseOther(Option<String>),
     /// Choose the member to revoke.
     SelectRevoke(Option<String>),
-    /// Answer the revoke confirmation.
-    ConfirmRevoke(bool),
     /// Pick the LAN address the dropdown shows.
     SelectLanAddress(String),
     /// Write `network.listen_address` and restart the service behind it.

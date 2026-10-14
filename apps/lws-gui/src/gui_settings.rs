@@ -69,6 +69,8 @@ pub struct Look {
     pub pace: Pace,
     /// «ASCII-облака».
     pub clouds: bool,
+    /// Map scale relative to its fitted base, stored as a percentage (70..=150).
+    pub zoom_percent: u16,
 }
 
 impl Default for Look {
@@ -78,6 +80,7 @@ impl Default for Look {
             field: FieldMode::default(),
             pace: Pace::default(),
             clouds: true,
+            zoom_percent: 100,
         }
     }
 }
@@ -92,6 +95,10 @@ pub fn load(path: &Path) -> Look {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| toml::from_str(&text).ok())
+        .map(|mut look: Look| {
+            look.zoom_percent = look.zoom_percent.clamp(70, 150);
+            look
+        })
         .unwrap_or_default()
 }
 
@@ -134,6 +141,7 @@ mod tests {
             field: FieldMode::Attract,
             pace: Pace::Live,
             clouds: false,
+            zoom_percent: 125,
         };
         save(&path, &look).expect("the directory is created");
         assert_eq!(load(&path), look);
@@ -153,6 +161,7 @@ mod tests {
         let partial = load(&path);
         assert_eq!(partial.theme, Theme::Dark);
         assert_eq!(partial.field, FieldMode::Off);
+        assert_eq!(partial.zoom_percent, 100);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -160,5 +169,18 @@ mod tests {
     fn the_core_config_is_not_the_place() {
         assert_eq!(FILE_NAME, "gui.toml");
         assert_ne!(FILE_NAME, "config.toml");
+    }
+
+    #[test]
+    fn persisted_zoom_is_bounded_without_touching_core_config() {
+        let dir = dir("zoom");
+        let path = path_in(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (stored, expected) in [(0, 70), (105, 105), (65535, 150)] {
+            std::fs::write(&path, format!("zoom_percent = {stored}\n")).expect("write");
+            assert_eq!(load(&path).zoom_percent, expected);
+        }
+        assert!(!dir.join("config.toml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

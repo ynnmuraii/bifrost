@@ -741,11 +741,20 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
         }
     };
 
-    // This is the request the window dispatches for «Применить»: the user puts the other
-    // computer at this one's right edge (the «Сторона» button does what a drag does), and the
-    // draft becomes a document against the revision and author the editor shows.
+    // Only a map drag changes this draft; the document is sent on explicit Apply.
+    let target = {
+        let editor = &owner.view().editor;
+        let this = editor.nodes.iter().position(|node| node.node_id == lab.a_id).expect("local node");
+        let peer = editor.nodes.iter().position(|node| node.node_id == lab.b_id).expect("peer node");
+        lws_gui::map::adjacent(
+            &editor.shapes[this],
+            editor.placement[this],
+            &editor.shapes[peer],
+            lws_gui::view_model::Side::Right,
+        )
+    };
     owner.dispatch(
-        Action::SetSide(lws_gui::view_model::Side::Right),
+        Action::MoveNode { node_id: lab.b_id.clone(), x: target.x, y: target.y },
         Instant::now(),
     );
     let (request, expected_author) = {

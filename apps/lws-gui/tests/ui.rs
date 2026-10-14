@@ -192,8 +192,6 @@ fn every_modal_shows_its_own_real_data() {
                 "Раскладка",
                 "mdf layout",
                 "ПРИМЕНЕНО",
-                "СТОРОНА",
-                "Слева",
                 "Расположить автоматически",
             ],
         ),
@@ -258,6 +256,7 @@ fn the_pairing_dock_shows_the_real_window_countdown_and_the_real_code() {
         &[
             "192.168.1.24:47901",
             "Ждём, пока другой компьютер подключится…",
+            "Закрыть окно · скоро",
         ],
     );
     assert!(
@@ -603,7 +602,7 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
 
     // Restore a connected draft after the deliberately endpoint-free client reports offline.
     bridge.view_mut().on_connected("endpoint");
-    bridge.dispatch(Action::SetSide(lws_gui::view_model::Side::Left), harness.now);
+    bridge.dispatch(Action::NudgeNode { node_id: PEER_NODE.to_owned(), dx: 16.0, dy: 0.0 }, harness.now);
     harness.settle(bridge.view(), false);
     let at = text_position(&mut harness, bridge.view(), "Применить");
     let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
@@ -624,7 +623,7 @@ fn enter_in_the_dial_field_only_pairs_even_with_a_dirty_layout() {
     let mut bridge = dry_bridge();
     let address = "192.168.1.10:47901";
     bridge.view_mut().pairing.address = address.to_owned();
-    bridge.dispatch(Action::SetSide(lws_gui::view_model::Side::Left), Instant::now());
+    bridge.dispatch(Action::NudgeNode { node_id: PEER_NODE.to_owned(), dx: 16.0, dy: 0.0 }, Instant::now());
     let mut harness = Harness::new();
     harness.settle(bridge.view(), false);
     let at = text_position(&mut harness, bridge.view(), address);
