@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(pairing.ceremonies.len(), 2, "both ceremonies are tracked");
 
         // Answering the first leaves the second untouched.
-        let _ = pairing
+        let _first_reply = pairing
             .answer(&first, true)
             .expect("the first ceremony is answerable");
         assert!(
