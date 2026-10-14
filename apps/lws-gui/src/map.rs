@@ -188,7 +188,12 @@ pub fn adjacent(me: &Shape, me_at: Pt, other: &Shape, side: Side) -> Pt {
 
 /// The corners of the box around every computer: `(min_x, min_y, max_x, max_y)`.
 pub fn bounds(shapes: &[Shape], pos: &[Pt]) -> (f64, f64, f64, f64) {
-    let mut b = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut b = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
     for (shape, at) in shapes.iter().zip(pos) {
         b = (
             b.0.min(at.x),
@@ -325,8 +330,10 @@ pub fn snap(shapes: &[Shape], pos: &[Pt], me: usize, x: f64, y: f64) -> Pt {
         }
     }
     Pt::new(
-        bx.clamp(-60.0, (STAGE_W - mine.w + 60.0).max(-60.0)).round(),
-        by.clamp(-70.0, (STAGE_H - mine.h + 40.0).max(-70.0)).round(),
+        bx.clamp(-60.0, (STAGE_W - mine.w + 60.0).max(-60.0))
+            .round(),
+        by.clamp(-70.0, (STAGE_H - mine.h + 40.0).max(-70.0))
+            .round(),
     )
 }
 
@@ -404,13 +411,19 @@ mod tests {
     use super::*;
 
     fn boxed(w: f64, h: f64) -> Shape {
-        Shape::new(&[Rect::new(0.0, 0.0, w / BASE_SCALE, h / BASE_SCALE)], BASE_SCALE)
+        Shape::new(
+            &[Rect::new(0.0, 0.0, w / BASE_SCALE, h / BASE_SCALE)],
+            BASE_SCALE,
+        )
     }
 
     #[test]
     fn a_shape_is_normalised_to_its_own_corner() {
         let shape = Shape::new(
-            &[Rect::new(-1920.0, 100.0, 1920.0, 1080.0), Rect::new(0.0, 0.0, 2560.0, 1440.0)],
+            &[
+                Rect::new(-1920.0, 100.0, 1920.0, 1080.0),
+                Rect::new(0.0, 0.0, 2560.0, 1440.0),
+            ],
             0.1,
         );
         assert!((shape.mons[0].y - 10.0).abs() < 1e-9 && shape.mons[0].x.abs() < 1e-9);
@@ -471,7 +484,10 @@ mod tests {
         let shapes = [boxed(144.0, 90.0), boxed(144.0, 90.0)];
         let pos = [Pt::new(0.0, 100.0), Pt::new(20.0, 0.0)];
         let found = links(&shapes, &pos);
-        assert_eq!((found[0].a, found[0].b, found[0].dir), (1, 0, Dir::Vertical));
+        assert_eq!(
+            (found[0].a, found[0].b, found[0].dir),
+            (1, 0, Dir::Vertical)
+        );
         assert_eq!(found[0].side_of_b(), Side::Bottom);
     }
 
@@ -487,13 +503,24 @@ mod tests {
     fn the_first_placement_follows_the_applied_links_and_reproduces_them() {
         let nodes = vec![
             vec![Rect::new(0.0, 0.0, 1920.0, 1200.0)],
-            vec![Rect::new(0.0, 0.0, 1920.0, 1080.0), Rect::new(1920.0, 0.0, 2560.0, 1440.0)],
+            vec![
+                Rect::new(0.0, 0.0, 1920.0, 1080.0),
+                Rect::new(1920.0, 0.0, 2560.0, 1440.0),
+            ],
             vec![Rect::new(0.0, 0.0, 3840.0, 2160.0)],
         ];
         // Node 1 is this computer: node 0 on its left, node 2 on its right.
         let doc = [
-            DocLink { a: 1, side: Side::Left, b: 0 },
-            DocLink { a: 1, side: Side::Right, b: 2 },
+            DocLink {
+                a: 1,
+                side: Side::Left,
+                b: 0,
+            },
+            DocLink {
+                a: 1,
+                side: Side::Right,
+                b: 2,
+            },
         ];
         let arrangement = arrange(&nodes, &doc, 1);
         let found = links(&arrangement.shapes, &arrangement.pos);
@@ -511,7 +538,11 @@ mod tests {
             vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)],
             vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)],
         ];
-        let doc = [DocLink { a: 0, side: Side::Right, b: 1 }];
+        let doc = [DocLink {
+            a: 0,
+            side: Side::Right,
+            b: 1,
+        }];
         let arrangement = arrange(&nodes, &doc, 0);
         let found = links(&arrangement.shapes, &arrangement.pos);
         assert_eq!(found.len(), 1);
@@ -524,7 +555,11 @@ mod tests {
             vec![Rect::new(0.0, 0.0, 7680.0, 4320.0)],
             vec![Rect::new(0.0, 0.0, 7680.0, 4320.0)],
         ];
-        let doc = [DocLink { a: 0, side: Side::Right, b: 1 }];
+        let doc = [DocLink {
+            a: 0,
+            side: Side::Right,
+            b: 1,
+        }];
         let arrangement = arrange(&nodes, &doc, 0);
         assert!(arrangement.scale < BASE_SCALE);
         let (min_x, min_y, max_x, max_y) = bounds(&arrangement.shapes, &arrangement.pos);
@@ -544,7 +579,11 @@ mod tests {
         assert!(near(adjacent(&me, at, &other, Side::Top), 222.0, -22.0));
         for side in Side::ALL {
             let pos = [at, adjacent(&me, at, &other, side)];
-            assert_eq!(links(&[me.clone(), other.clone()], &pos).len(), 1, "{side:?}");
+            assert_eq!(
+                links(&[me.clone(), other.clone()], &pos).len(),
+                1,
+                "{side:?}"
+            );
         }
     }
 }

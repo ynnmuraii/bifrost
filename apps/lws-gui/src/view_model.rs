@@ -1676,7 +1676,6 @@ impl ViewModel {
             .find(|node_id| *node_id != this)
     }
 
-
     /// The edited document as `[topology]` TOML — what `UpdateTopology` carries.
     ///
     /// The schema is the one `crates/config` defines for `[topology]`
@@ -1717,7 +1716,6 @@ impl ViewModel {
         topology.links = self.editor_links();
         topology
     }
-
 
     // ------------------------------------------------------------ local actions
 
@@ -1865,7 +1863,6 @@ impl ViewModel {
             )));
         }
     }
-
 }
 
 // ---------------------------------------------------------------- actions
@@ -2300,10 +2297,7 @@ struct Events {
 }
 
 impl Events {
-    fn send(
-        &self,
-        event: GuiEvent,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<GuiEvent>> {
+    fn send(&self, event: GuiEvent) -> Result<(), tokio::sync::mpsc::error::SendError<GuiEvent>> {
         let sent = self.tx.send(event);
         if sent.is_ok() {
             if let Some(wake) = self.wake.get() {
@@ -2531,11 +2525,7 @@ where
 }
 
 /// Answers a command while no link exists.
-fn answer_offline(
-    command: Command,
-    launch: &Launch,
-    events: &Events,
-) {
+fn answer_offline(command: Command, launch: &Launch, events: &Events) {
     match command {
         Command::Send { id, .. } => {
             let _ = events.send(GuiEvent::NotSent { id });

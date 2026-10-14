@@ -190,7 +190,10 @@ impl Field {
         self.parts.reserve(n);
         for _ in 0..n {
             let (hx, hy) = (self.rand() * w, self.rand() * h);
-            let (ph, sp) = (self.rand() * std::f32::consts::TAU, 0.25 + self.rand() * 0.6);
+            let (ph, sp) = (
+                self.rand() * std::f32::consts::TAU,
+                0.25 + self.rand() * 0.6,
+            );
             self.parts.push(Particle {
                 hx,
                 hy,
@@ -226,7 +229,13 @@ impl Field {
         if self.parts.is_empty() {
             return;
         }
-        let (x, y, w, h, step) = (r.min.x - 14.0, r.min.y - 14.0, r.width() + 28.0, r.height() + 28.0, 9.0);
+        let (x, y, w, h, step) = (
+            r.min.x - 14.0,
+            r.min.y - 14.0,
+            r.width() + 28.0,
+            r.height() + 28.0,
+            9.0,
+        );
         let assign = |field: &mut Field, px: f32, py: f32, g: char| {
             let mut best: Option<usize> = None;
             let mut best_d = f32::INFINITY;
@@ -374,7 +383,12 @@ impl Field {
                 }
                 let len = ramp.len();
                 if dark && lvl > 0.7 {
-                    self.cells.push(Cell { x: px, y: py, ch: '\0', on_solid: false });
+                    self.cells.push(Cell {
+                        x: px,
+                        y: py,
+                        ch: '\0',
+                        on_solid: false,
+                    });
                     let inv = ((1.0 - lvl) * 3.4 * len as f32).floor() as usize;
                     if inv > 0 {
                         self.cells.push(Cell {
@@ -386,7 +400,12 @@ impl Field {
                     }
                 } else {
                     let idx = ((lvl * len as f32).floor() as usize).clamp(1, len - 1);
-                    self.cells.push(Cell { x: px, y: py, ch: ramp[idx], on_solid: false });
+                    self.cells.push(Cell {
+                        x: px,
+                        y: py,
+                        ch: ramp[idx],
+                        on_solid: false,
+                    });
                 }
             }
         }
@@ -397,7 +416,11 @@ impl Field {
         let dark = pal.theme == Theme::Dark;
         // The mockup paints the dark solids at 0.92; at that strength they swallow the title
         // and the captions, so the window keeps them at half strength.
-        let (base, alpha) = if dark { (pal.ink, 0.5) } else { (pal.ink2, 0.34) };
+        let (base, alpha) = if dark {
+            (pal.ink, 0.5)
+        } else {
+            (pal.ink2, 0.34)
+        };
         let ink = with_alpha(base, alpha);
         let origin = frame.map.min;
         for cell in &self.cells {
@@ -417,7 +440,11 @@ impl Field {
 
     fn step(&mut self, frame: &Frame<'_>, dt: f32) {
         let live = frame.look.pace == Pace::Live;
-        let (k, max, amp) = if live { (0.075, 5.5, 6.0) } else { (0.042, 3.0, 4.0) };
+        let (k, max, amp) = if live {
+            (0.075, 5.5, 6.0)
+        } else {
+            (0.042, 3.0, 4.0)
+        };
         let f = (dt * 60.0).clamp(0.5, 3.0);
         let t = frame.t;
         let mode = frame.look.field;
@@ -507,10 +534,7 @@ impl Field {
                 continue;
             };
             let size = galley.size();
-            let at = Pos2::new(
-                origin.x + p.x - size.x / 2.0,
-                origin.y + p.y - size.y / 2.0,
-            );
+            let at = Pos2::new(origin.x + p.x - size.x / 2.0, origin.y + p.y - size.y / 2.0);
             let color = if p.heat > 0.28 { hot } else { calm };
             painter.add(TextShape::new(at, Arc::clone(galley), color));
         }
@@ -529,13 +553,21 @@ impl Field {
                 };
                 let x = flow.from.x + (flow.to.x - flow.from.x) * u;
                 let y = flow.from.y + (flow.to.y - flow.from.y) * u;
-                let wob = if animate { (u * std::f32::consts::TAU + t * 2.0).sin() * 3.0 } else { 0.0 };
+                let wob = if animate {
+                    (u * std::f32::consts::TAU + t * 2.0).sin() * 3.0
+                } else {
+                    0.0
+                };
                 let c = if u > 0.35 && u < 0.65 { '•' } else { '·' };
                 let Some(galley) = self.glyphs11.get(c) else {
                     continue;
                 };
                 let size = galley.size();
-                let (px, py) = if flow.horizontal { (x, y + wob) } else { (x + wob, y) };
+                let (px, py) = if flow.horizontal {
+                    (x, y + wob)
+                } else {
+                    (x + wob, y)
+                };
                 let alpha = (u * std::f32::consts::PI).sin();
                 painter.add(TextShape::new(
                     Pos2::new(px - size.x / 2.0, py - size.y / 2.0),
@@ -558,7 +590,12 @@ impl Field {
 }
 
 fn with_alpha(c: Color32, a: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0).round() as u8)
+    Color32::from_rgba_unmultiplied(
+        c.r(),
+        c.g(),
+        c.b(),
+        (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
 }
 
 fn hash(i: i32, j: i32) -> f32 {
@@ -617,7 +654,10 @@ mod tests {
     fn a_shape_takes_particles_and_releasing_frees_them() {
         let mut field = Field::new();
         field.resize(800.0, 400.0);
-        field.form(Rect::from_min_size(Pos2::new(100.0, 100.0), egui::vec2(140.0, 80.0)));
+        field.form(Rect::from_min_size(
+            Pos2::new(100.0, 100.0),
+            egui::vec2(140.0, 80.0),
+        ));
         let held = field.parts.iter().filter(|p| p.g != '\0').count();
         assert!(held > 20, "{held}");
         field.release();

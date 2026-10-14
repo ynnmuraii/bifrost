@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Color32, CursorIcon, Galley, Pos2, Rect, Response, Sense, Shape, Stroke,
-    StrokeKind, Ui, Vec2,
+    self, Color32, CursorIcon, Galley, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui,
+    Vec2,
 };
 
 use super::theme::{fam, font, Palette};
@@ -28,11 +28,19 @@ pub struct Run<'a> {
 impl<'a> Run<'a> {
     /// Plain text.
     pub fn plain(text: &'a str, color: Color32) -> Self {
-        Run { text, color, strong: false }
+        Run {
+            text,
+            color,
+            strong: false,
+        }
     }
     /// Emphasised text.
     pub fn strong(text: &'a str, color: Color32) -> Self {
-        Run { text, color, strong: true }
+        Run {
+            text,
+            color,
+            strong: true,
+        }
     }
 }
 
@@ -45,7 +53,14 @@ pub fn mono_runs(ui: &Ui, runs: &[Run<'_>], size: f32, wrap: f32) -> Arc<Galley>
             run.text,
             0.0,
             TextFormat {
-                font_id: font(size, if run.strong { fam::mono_medium() } else { fam::mono() }),
+                font_id: font(
+                    size,
+                    if run.strong {
+                        fam::mono_medium()
+                    } else {
+                        fam::mono()
+                    },
+                ),
                 color: run.color,
                 ..TextFormat::default()
             },
@@ -63,7 +78,14 @@ pub fn sans_runs(ui: &Ui, runs: &[Run<'_>], size: f32, wrap: f32) -> Arc<Galley>
             run.text,
             0.0,
             TextFormat {
-                font_id: font(size, if run.strong { fam::sans_semibold() } else { fam::sans() }),
+                font_id: font(
+                    size,
+                    if run.strong {
+                        fam::sans_semibold()
+                    } else {
+                        fam::sans()
+                    },
+                ),
                 color: run.color,
                 ..TextFormat::default()
             },
@@ -76,14 +98,23 @@ pub fn sans_runs(ui: &Ui, runs: &[Run<'_>], size: f32, wrap: f32) -> Arc<Galley>
 pub fn show_galley(ui: &mut Ui, galley: Arc<Galley>) -> Response {
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
     if ui.is_rect_visible(rect) {
-        ui.painter()
-            .add(egui::epaint::TextShape::new(rect.min, galley, Color32::PLACEHOLDER));
+        ui.painter().add(egui::epaint::TextShape::new(
+            rect.min,
+            galley,
+            Color32::PLACEHOLDER,
+        ));
     }
     response
 }
 
 /// One line of text.
-pub fn text(ui: &mut Ui, text: &str, size: f32, family: egui::FontFamily, color: Color32) -> Response {
+pub fn text(
+    ui: &mut Ui,
+    text: &str,
+    size: f32,
+    family: egui::FontFamily,
+    color: Color32,
+) -> Response {
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_owned(), font(size, family), color);
@@ -91,7 +122,13 @@ pub fn text(ui: &mut Ui, text: &str, size: f32, family: egui::FontFamily, color:
 }
 
 /// Wrapping text across the available width.
-pub fn wrapped(ui: &mut Ui, text: &str, size: f32, family: egui::FontFamily, color: Color32) -> Response {
+pub fn wrapped(
+    ui: &mut Ui,
+    text: &str,
+    size: f32,
+    family: egui::FontFamily,
+    color: Color32,
+) -> Response {
     let galley = ui.painter().layout(
         text.to_owned(),
         font(size, family),
@@ -172,7 +209,11 @@ pub fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: Kind, enabled: bool
     } else {
         (galley.size().x + 36.0, 44.0)
     };
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), sense);
     if enabled {
         response.clone().on_hover_cursor(CursorIcon::PointingHand);
@@ -218,16 +259,33 @@ pub fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: Kind, enabled: bool
                 .as_shape(rect, rounding),
             );
         }
-        painter.rect(rect, rounding, fill, Stroke::new(1.0, border), StrokeKind::Inside);
+        painter.rect(
+            rect,
+            rounding,
+            fill,
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
     }
-    let at = Pos2::new(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0);
+    let at = Pos2::new(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
     painter.add(egui::epaint::TextShape::new(at, Arc::clone(&galley), ink));
     if kind == Kind::Link {
         let y = rect.max.y + 1.0;
-        painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], Stroke::new(1.0, ink));
+        painter.line_segment(
+            [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
+            Stroke::new(1.0, ink),
+        );
     }
     if response.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), pal.rad_btn(rect.height() + 4.0), Stroke::new(2.0, pal.accent), StrokeKind::Outside);
+        painter.rect_stroke(
+            rect.expand(2.0),
+            pal.rad_btn(rect.height() + 4.0),
+            Stroke::new(2.0, pal.accent),
+            StrokeKind::Outside,
+        );
     }
     response
 }
@@ -240,7 +298,14 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
         .map(|(i, label)| {
             ui.painter().layout_no_wrap(
                 (*label).to_owned(),
-                font(13.0, if i == on { fam::sans_medium() } else { fam::sans() }),
+                font(
+                    13.0,
+                    if i == on {
+                        fam::sans_medium()
+                    } else {
+                        fam::sans()
+                    },
+                ),
                 Color32::PLACEHOLDER,
             )
         })
@@ -271,7 +336,10 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
         } else {
             pal.ink2
         };
-        let at = Pos2::new(cell.center().x - galley.size().x / 2.0, cell.center().y - galley.size().y / 2.0);
+        let at = Pos2::new(
+            cell.center().x - galley.size().x / 2.0,
+            cell.center().y - galley.size().y / 2.0,
+        );
         painter.add(egui::epaint::TextShape::new(at, Arc::clone(galley), ink));
     }
     clicked
@@ -313,7 +381,13 @@ pub fn pill(ui: &mut Ui, pal: &Palette, dot: Option<Dot>, runs: &[Run<'_>]) -> R
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect(rect, CornerRadius999::of(30.0), pal.bg2, pal.hairline(), StrokeKind::Inside);
+        painter.rect(
+            rect,
+            CornerRadius999::of(30.0),
+            pal.bg2,
+            pal.hairline(),
+            StrokeKind::Inside,
+        );
         let mut x = rect.min.x + 12.0;
         if let Some(dot) = dot {
             paint_dot(painter, pal, Pos2::new(x + 3.5, rect.center().y), dot);
@@ -377,19 +451,26 @@ pub fn key_label(key: &str) -> String {
 
 /// One `kbd` cap.
 pub fn kbd(ui: &mut Ui, pal: &Palette, label: &str) -> Response {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        font(12.0, fam::mono()),
-        pal.ink,
-    );
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font(12.0, fam::mono()), pal.ink);
     let size = Vec2::new(galley.size().x + 18.0, galley.size().y + 12.0 + 2.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         // `border-bottom-width: 3px`: the cap is a 1 px frame with a thicker bottom edge.
-        painter.rect(rect, egui::CornerRadius::same(7), pal.bg2, Stroke::new(1.0, pal.line), StrokeKind::Inside);
+        painter.rect(
+            rect,
+            egui::CornerRadius::same(7),
+            pal.bg2,
+            Stroke::new(1.0, pal.line),
+            StrokeKind::Inside,
+        );
         painter.line_segment(
-            [Pos2::new(rect.min.x + 4.0, rect.max.y - 1.0), Pos2::new(rect.max.x - 4.0, rect.max.y - 1.0)],
+            [
+                Pos2::new(rect.min.x + 4.0, rect.max.y - 1.0),
+                Pos2::new(rect.max.x - 4.0, rect.max.y - 1.0),
+            ],
             Stroke::new(2.0, pal.line),
         );
         painter.add(egui::epaint::TextShape::new(
@@ -499,7 +580,10 @@ fn prims(icon: Icon) -> &'static [Prim] {
             R(12.75, 4.25, 4.5, 4.5, 1.0),
             R(5.75, 13.25, 4.5, 4.5, 1.0),
         ],
-        Icon::Close => &[Line(&[(4.0, 4.0), (14.0, 14.0)]), Line(&[(14.0, 4.0), (4.0, 14.0)])],
+        Icon::Close => &[
+            Line(&[(4.0, 4.0), (14.0, 14.0)]),
+            Line(&[(14.0, 4.0), (4.0, 14.0)]),
+        ],
         Icon::Theme => &[],
     }
 }
@@ -514,7 +598,10 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, c: Pos2, size: f32, color
         let mut points = Vec::with_capacity(n + 1);
         for k in 0..=n {
             let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * k as f32 / n as f32;
-            points.push(Pos2::new(c.x + 6.75 * s * a.cos(), c.y + 6.75 * s * a.sin()));
+            points.push(Pos2::new(
+                c.x + 6.75 * s * a.cos(),
+                c.y + 6.75 * s * a.sin(),
+            ));
         }
         painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
         return;
@@ -543,7 +630,13 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, c: Pos2, size: f32, color
 }
 
 /// A styled drop-down; returns the index the user picked.
-pub fn select(ui: &mut Ui, pal: &Palette, id: &str, shown: &str, options: &[String]) -> Option<usize> {
+pub fn select(
+    ui: &mut Ui,
+    pal: &Palette,
+    id: &str,
+    shown: &str,
+    options: &[String],
+) -> Option<usize> {
     let mut picked = None;
     ui.scope(|ui| {
         ui.spacing_mut().interact_size.y = 44.0;

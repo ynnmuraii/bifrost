@@ -29,7 +29,10 @@ struct Xf {
 
 impl Xf {
     fn p(&self, x: f64, y: f64) -> Pos2 {
-        Pos2::new(self.origin.x + x as f32 * self.s, self.origin.y + y as f32 * self.s)
+        Pos2::new(
+            self.origin.x + x as f32 * self.s,
+            self.origin.y + y as f32 * self.s,
+        )
     }
 }
 
@@ -48,8 +51,9 @@ pub fn draw(
     let painter = ui.painter().with_clip_rect(rect);
     let model = vm.map_model();
     let animate = env.animate && vm.look.field != FieldMode::Off && vm.modal.is_none();
-    let s = (((rect.width() - 48.0) / STAGE_W as f32).min((rect.height() - 190.0) / STAGE_H as f32))
-        .clamp(0.45, 1.0);
+    let s = (((rect.width() - 48.0) / STAGE_W as f32)
+        .min((rect.height() - 190.0) / STAGE_H as f32))
+    .clamp(0.45, 1.0);
     let xf = Xf {
         origin: Pos2::new(
             rect.center().x - STAGE_W as f32 * s / 2.0,
@@ -66,8 +70,16 @@ pub fn draw(
         .map(|(i, node)| {
             let dragging = st.drag.as_ref().is_some_and(|d| d.node_id == node.node_id);
             let time = if dragging { 0.0 } else { 0.45 };
-            let x = ui.ctx().animate_value_with_time(egui::Id::new(("node-x", i)), node.at.x as f32, time);
-            let y = ui.ctx().animate_value_with_time(egui::Id::new(("node-y", i)), node.at.y as f32, time);
+            let x = ui.ctx().animate_value_with_time(
+                egui::Id::new(("node-x", i)),
+                node.at.x as f32,
+                time,
+            );
+            let y = ui.ctx().animate_value_with_time(
+                egui::Id::new(("node-y", i)),
+                node.at.y as f32,
+                time,
+            );
             xf.p(f64::from(x), f64::from(y))
         })
         .collect();
@@ -80,7 +92,11 @@ pub fn draw(
         .map(|l| {
             let (a, b) = link_ends(&model, l, &shown, xf);
             let (from, to) = if l.forward { (a, b) } else { (b, a) };
-            Flow { from, to, horizontal: l.dir == Dir::Horizontal }
+            Flow {
+                from,
+                to,
+                horizontal: l.dir == Dir::Horizontal,
+            }
         })
         .collect();
 
@@ -88,11 +104,10 @@ pub fn draw(
     let ribbon = match &st.ribbon {
         Some((from, to)) if animate && (st.ribbon_hover || t < st.ribbon_until) => {
             let center = |id: &str| {
-                model
-                    .nodes
-                    .iter()
-                    .position(|n| n.node_id == id)
-                    .map(|i| shown[i] + Vec2::new(model.nodes[i].w as f32, model.nodes[i].h as f32) * (s / 2.0))
+                model.nodes.iter().position(|n| n.node_id == id).map(|i| {
+                    shown[i]
+                        + Vec2::new(model.nodes[i].w as f32, model.nodes[i].h as f32) * (s / 2.0)
+                })
             };
             center(from).zip(center(to))
         }
@@ -123,7 +138,18 @@ pub fn draw(
     }
     let mut hovered: Option<(usize, usize)> = None;
     for (i, node) in model.nodes.iter().enumerate() {
-        node_ui(ui, &painter, pal, st, node, i, shown[i], xf, &mut hovered, actions);
+        node_ui(
+            ui,
+            &painter,
+            pal,
+            st,
+            node,
+            i,
+            shown[i],
+            xf,
+            &mut hovered,
+            actions,
+        );
     }
     if hovered != st.hover {
         match hovered {
@@ -131,7 +157,10 @@ pub fn draw(
                 let node = &model.nodes[n];
                 let r = node.mons[m].rect;
                 let local = Rect::from_min_size(
-                    Pos2::new(shown[n].x - rect.min.x + r.x as f32 * s, shown[n].y - rect.min.y + r.y as f32 * s),
+                    Pos2::new(
+                        shown[n].x - rect.min.x + r.x as f32 * s,
+                        shown[n].y - rect.min.y + r.y as f32 * s,
+                    ),
                     Vec2::new(r.w as f32 * s, r.h as f32 * s),
                 );
                 st.field.form(local);
@@ -142,7 +171,11 @@ pub fn draw(
     }
     if model.nodes.is_empty() {
         let galley = painter.layout_no_wrap(
-            if vm.connection.is_connected() { "Раскладка ещё не получена".to_owned() } else { "Нет данных от службы".to_owned() },
+            if vm.connection.is_connected() {
+                "Раскладка ещё не получена".to_owned()
+            } else {
+                "Нет данных от службы".to_owned()
+            },
             font(14.0, fam::sans()),
             pal.ink2,
         );
@@ -224,7 +257,14 @@ fn link_ends(model: &MapModel, link: &MapLink, shown: &[Pos2], xf: Xf) -> (Pos2,
     (carried(link.a, link.from), carried(link.b, link.to))
 }
 
-fn draw_link(painter: &egui::Painter, pal: &Palette, model: &MapModel, link: &MapLink, shown: &[Pos2], xf: Xf) {
+fn draw_link(
+    painter: &egui::Painter,
+    pal: &Palette,
+    model: &MapModel,
+    link: &MapLink,
+    shown: &[Pos2],
+    xf: Xf,
+) {
     let (a, b) = link_ends(model, link, shown, xf);
     let carry_a = shown[link.a] - xf.p(model.nodes[link.a].at.x, model.nodes[link.a].at.y);
     let carry_b = shown[link.b] - xf.p(model.nodes[link.b].at.x, model.nodes[link.b].at.y);
@@ -236,17 +276,42 @@ fn draw_link(painter: &egui::Painter, pal: &Palette, model: &MapModel, link: &Ma
         LinkState::Idle => {}
     }
     let color = fade(color, alpha);
-    painter.add(Shape::dashed_line(&[a, b], Stroke::new(1.5, color), 5.0, 3.5));
+    painter.add(Shape::dashed_line(
+        &[a, b],
+        Stroke::new(1.5, color),
+        5.0,
+        3.5,
+    ));
     if link.whole_desktop {
         // The whole desktop's edge: a short rail along the shared stretch at both ends.
         let (s0, s1) = (link.span.0, link.span.1);
         let (p0, p1, q0, q1) = if horizontal {
-            (xf.p(link.from.x - 4.0, s0), xf.p(link.from.x - 4.0, s1), xf.p(link.to.x + 4.0, s0), xf.p(link.to.x + 4.0, s1))
+            (
+                xf.p(link.from.x - 4.0, s0),
+                xf.p(link.from.x - 4.0, s1),
+                xf.p(link.to.x + 4.0, s0),
+                xf.p(link.to.x + 4.0, s1),
+            )
         } else {
-            (xf.p(s0, link.from.y - 4.0), xf.p(s1, link.from.y - 4.0), xf.p(s0, link.to.y + 4.0), xf.p(s1, link.to.y + 4.0))
+            (
+                xf.p(s0, link.from.y - 4.0),
+                xf.p(s1, link.from.y - 4.0),
+                xf.p(s0, link.to.y + 4.0),
+                xf.p(s1, link.to.y + 4.0),
+            )
         };
         let (p0, p1, q0, q1) = (p0 + carry_a, p1 + carry_a, q0 + carry_b, q1 + carry_b);
-        let rail = Stroke::new(3.0, fade(if link.state == LinkState::Active { pal.accent } else { pal.line }, alpha * 0.6));
+        let rail = Stroke::new(
+            3.0,
+            fade(
+                if link.state == LinkState::Active {
+                    pal.accent
+                } else {
+                    pal.line
+                },
+                alpha * 0.6,
+            ),
+        );
         painter.line_segment([p0, p1], rail);
         painter.line_segment([q0, q1], rail);
     }
@@ -324,17 +389,31 @@ fn node_ui(
                 let step = if i.modifiers.shift { 32.0 } else { 8.0 };
                 (
                     step,
-                    f64::from(i.key_pressed(egui::Key::ArrowRight) as i8 - i.key_pressed(egui::Key::ArrowLeft) as i8),
-                    f64::from(i.key_pressed(egui::Key::ArrowDown) as i8 - i.key_pressed(egui::Key::ArrowUp) as i8),
+                    f64::from(
+                        i.key_pressed(egui::Key::ArrowRight) as i8
+                            - i.key_pressed(egui::Key::ArrowLeft) as i8,
+                    ),
+                    f64::from(
+                        i.key_pressed(egui::Key::ArrowDown) as i8
+                            - i.key_pressed(egui::Key::ArrowUp) as i8,
+                    ),
                 )
             });
             if dx != 0.0 || dy != 0.0 {
-                actions.push(Action::NudgeNode { node_id: node.node_id.clone(), dx: dx * step, dy: dy * step });
+                actions.push(Action::NudgeNode {
+                    node_id: node.node_id.clone(),
+                    dx: dx * step,
+                    dy: dy * step,
+                });
             }
         }
         if response.drag_started() {
             if let Some(grab) = response.interact_pointer_pos() {
-                st.drag = Some(super::Drag { node_id: node.node_id.clone(), start: node.at, grab });
+                st.drag = Some(super::Drag {
+                    node_id: node.node_id.clone(),
+                    start: node.at,
+                    grab,
+                });
                 st.field.release();
             }
         }
@@ -362,23 +441,47 @@ fn node_ui(
         let hot = response.hovered() || response.dragged() || response.has_focus();
         let dragging = response.dragged();
         let shadow = if dragging {
-            egui::epaint::Shadow { offset: [0, 30], blur: 80, spread: 0, color: shadow_color(pal, 0.16) }
+            egui::epaint::Shadow {
+                offset: [0, 30],
+                blur: 80,
+                spread: 0,
+                color: shadow_color(pal, 0.16),
+            }
         } else {
-            egui::epaint::Shadow { offset: [0, 10], blur: 30, spread: 0, color: shadow_color(pal, 0.07) }
+            egui::epaint::Shadow {
+                offset: [0, 10],
+                blur: 30,
+                spread: 0,
+                color: shadow_color(pal, 0.07),
+            }
         };
         let radius = pal.rad_sm();
         if node.target {
             painter.add(
-                egui::epaint::Shadow { offset: [0, 16], blur: 44, spread: 0, color: pal.glow }
-                    .as_shape(rect, radius),
+                egui::epaint::Shadow {
+                    offset: [0, 16],
+                    blur: 44,
+                    spread: 0,
+                    color: pal.glow,
+                }
+                .as_shape(rect, radius),
             );
         } else {
             painter.add(shadow.as_shape(rect, radius));
         }
-        let border = if node.target || hot { pal.accent } else { pal.line };
+        let border = if node.target || hot {
+            pal.accent
+        } else {
+            pal.line
+        };
         painter.rect_filled(rect, radius, fade(pal.card, k));
         if node.target {
-            painter.rect_stroke(rect.expand(1.5), radius, Stroke::new(2.0, fade(pal.accent, k)), StrokeKind::Outside);
+            painter.rect_stroke(
+                rect.expand(1.5),
+                radius,
+                Stroke::new(2.0, fade(pal.accent, k)),
+                StrokeKind::Outside,
+            );
         }
         let stroke = Stroke::new(1.5, fade(border, k));
         if node.approx {
@@ -399,17 +502,34 @@ fn node_ui(
             };
             let tag = clipped.layout_no_wrap(mon.tag.to_owned(), font(9.5 * fs, fam::mono()), ink);
             let size = tag.size() + Vec2::new(14.0 * fs, 2.0);
-            let tag_rect = Rect::from_min_size(Pos2::new(rect.max.x - 9.0 * fs - size.x, rect.min.y + 7.0 * fs), size);
-            clipped.rect(tag_rect, egui::CornerRadius::same((size.y / 2.0) as u8), fill, Stroke::new(1.0, edge), StrokeKind::Inside);
+            let tag_rect = Rect::from_min_size(
+                Pos2::new(rect.max.x - 9.0 * fs - size.x, rect.min.y + 7.0 * fs),
+                size,
+            );
+            clipped.rect(
+                tag_rect,
+                egui::CornerRadius::same((size.y / 2.0) as u8),
+                fill,
+                Stroke::new(1.0, edge),
+                StrokeKind::Inside,
+            );
             clipped.galley(tag_rect.min + Vec2::new(7.0 * fs, 1.0), tag, ink);
         }
         let res = clipped.layout_no_wrap(mon.res.clone(), font(10.5 * fs, fam::mono()), pal.ink);
-        clipped.galley(Pos2::new(rect.min.x + 9.0 * fs, rect.max.y - 7.0 * fs - res.size().y), res, pal.ink);
+        clipped.galley(
+            Pos2::new(rect.min.x + 9.0 * fs, rect.max.y - 7.0 * fs - res.size().y),
+            res,
+            pal.ink,
+        );
     }
 
     // The caption: name, system line, who has the keyboard.
     let top = at.y + node.h as f32 * s + 10.0 * fs;
-    let name = painter.layout_no_wrap(node.name.clone(), font(13.0 * fs, fam::sans_semibold()), fade(pal.ink, k));
+    let name = painter.layout_no_wrap(
+        node.name.clone(),
+        font(13.0 * fs, fam::sans_semibold()),
+        fade(pal.ink, k),
+    );
     let mut y = top;
     let h = name.size().y;
     painter.galley(Pos2::new(at.x, y), name, pal.ink);
@@ -421,7 +541,8 @@ fn node_ui(
         if text.is_empty() {
             continue;
         }
-        let galley = painter.layout_no_wrap(text.to_owned(), font(10.5 * fs, family), fade(color, k));
+        let galley =
+            painter.layout_no_wrap(text.to_owned(), font(10.5 * fs, family), fade(color, k));
         let h = galley.size().y;
         painter.galley(Pos2::new(at.x, y), galley, color);
         y += h + 1.0;
@@ -438,7 +559,13 @@ fn shadow_color(pal: &Palette, a: f32) -> Color32 {
 
 /// A dashed rectangle outline (`.mon.is-approx`: the size is a guess).
 fn dashed_rect(painter: &egui::Painter, r: Rect, stroke: Stroke) {
-    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+    let pts = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+        r.left_top(),
+    ];
     painter.add(Shape::dashed_line(&pts, stroke, 4.0, 3.0));
 }
 
@@ -455,28 +582,66 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
                 .max_rect(area)
                 .layout(Layout::left_to_right(Align::Center)),
         );
-        child.painter().rect(area, egui::CornerRadius::same(22), pal.card, Stroke::new(1.0, pal.accent), StrokeKind::Inside);
+        child.painter().rect(
+            area,
+            egui::CornerRadius::same(22),
+            pal.card,
+            Stroke::new(1.0, pal.accent),
+            StrokeKind::Inside,
+        );
         child.add_space(16.0);
-        widgets::text(&mut child, "Служба не запущена", 13.0, fam::sans_medium(), pal.ink);
+        widgets::text(
+            &mut child,
+            "Служба не запущена",
+            13.0,
+            fam::sans_medium(),
+            pal.ink,
+        );
         child.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(4.0);
             ui.spacing_mut().item_spacing.x = 4.0;
             let starting = vm.settings.service.restart.is_some();
-            act(ui, pal, "Запустить", Kind::Hot, !starting, actions, || Action::StartCore);
-            act(ui, pal, "Ещё раз", Kind::Ghost, true, actions, || Action::ConnectAgain);
+            act(
+                ui,
+                pal,
+                "Запустить",
+                Kind::Hot,
+                !starting,
+                actions,
+                || Action::StartCore,
+            );
+            act(ui, pal, "Ещё раз", Kind::Ghost, true, actions, || {
+                Action::ConnectAgain
+            });
         });
         y += 54.0;
     }
     if let Some(outcome) = &vm.outcome {
-        let galley = ui.painter().layout_no_wrap(outcome.line(), font(12.0, fam::sans_medium()), pal.ink);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(outcome.line(), font(12.0, fam::sans_medium()), pal.ink);
         let size = galley.size() + Vec2::new(44.0, 16.0);
         let pill = Rect::from_min_size(Pos2::new(center - size.x / 2.0, y), size);
         let edge = if outcome.ok { pal.ok } else { pal.accent };
-        let response = ui.interact(pill, egui::Id::new("outcome"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let response = ui
+            .interact(pill, egui::Id::new("outcome"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         let painter = ui.painter();
-        painter.rect(pill, egui::CornerRadius::same((size.y / 2.0) as u8), pal.card, Stroke::new(1.0, edge), StrokeKind::Inside);
+        painter.rect(
+            pill,
+            egui::CornerRadius::same((size.y / 2.0) as u8),
+            pal.card,
+            Stroke::new(1.0, edge),
+            StrokeKind::Inside,
+        );
         painter.galley(pill.min + Vec2::new(16.0, 8.0), galley, pal.ink);
-        widgets::paint_icon(painter, widgets::Icon::Close, Pos2::new(pill.max.x - 14.0, pill.center().y), 9.0, pal.ink2);
+        widgets::paint_icon(
+            painter,
+            widgets::Icon::Close,
+            Pos2::new(pill.max.x - 14.0, pill.center().y),
+            9.0,
+            pal.ink2,
+        );
         if response.clicked() {
             actions.push(Action::DismissOutcome);
         }
@@ -515,12 +680,19 @@ fn footer(
         .stroke(pal.hairline())
         .corner_radius(pal.rad_btn(52.0))
         .inner_margin(egui::Margin::same(4))
-        .shadow(egui::epaint::Shadow { offset: [0, 10], blur: 30, spread: 0, color: shadow_color(pal, 0.07) })
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 10],
+            blur: 30,
+            spread: 0,
+            color: shadow_color(pal, 0.07),
+        })
         .show(bar, |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.horizontal(|ui| {
                 let can_auto = vm.connection.is_connected();
-                act(ui, pal, "Авто", Kind::Ghost, can_auto, actions, || Action::LayoutAuto);
+                act(ui, pal, "Авто", Kind::Ghost, can_auto, actions, || {
+                    Action::LayoutAuto
+                });
                 let apply = widgets::button(
                     ui,
                     pal,
@@ -542,7 +714,11 @@ fn footer(
                 if let Some(why) = &transfer.why {
                     go.clone().on_hover_text(why);
                 }
-                let from = vm.status.as_ref().map(|_| vm.route_node_id()).unwrap_or_default();
+                let from = vm
+                    .status
+                    .as_ref()
+                    .map(|_| vm.route_node_id())
+                    .unwrap_or_default();
                 if go.hovered() {
                     if let (Some(peer), true) = (&transfer.peer, transfer.enabled) {
                         st.ribbon = Some((from.clone(), peer.clone()));
@@ -584,7 +760,9 @@ enum LegendMark {
 
 /// `.lg`: 28 px high, a small sample of what it explains, then the words.
 fn legend_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, mark: LegendMark) {
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font(10.5, fam::mono()), pal.ink2);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font(10.5, fam::mono()), pal.ink2);
     let sample = match mark {
         LegendMark::None => 0.0,
         LegendMark::Link => 16.0 + 8.0,
@@ -593,7 +771,13 @@ fn legend_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, mark: LegendMark) 
     let size = Vec2::new(galley.size().x + sample + 22.0, 28.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
-    painter.rect(rect, egui::CornerRadius::same(14), pal.card_glass, pal.hairline(), StrokeKind::Inside);
+    painter.rect(
+        rect,
+        egui::CornerRadius::same(14),
+        pal.card_glass,
+        pal.hairline(),
+        StrokeKind::Inside,
+    );
     let mut x = rect.min.x + 11.0;
     let cy = rect.center().y;
     match mark {
@@ -608,7 +792,12 @@ fn legend_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, mark: LegendMark) 
         }
         LegendMark::Target => {
             let r = Rect::from_center_size(Pos2::new(x + 6.0, cy), Vec2::new(12.0, 9.0));
-            painter.rect_stroke(r.expand(1.5), 4.0, Stroke::new(1.5, pal.accent_soft), StrokeKind::Outside);
+            painter.rect_stroke(
+                r.expand(1.5),
+                4.0,
+                Stroke::new(1.5, pal.accent_soft),
+                StrokeKind::Outside,
+            );
             painter.rect_stroke(r, 3.0, Stroke::new(1.5, pal.accent), StrokeKind::Inside);
         }
         LegendMark::Approx => {
@@ -617,5 +806,9 @@ fn legend_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, mark: LegendMark) 
         }
     }
     x += sample;
-    painter.add(TextShape::new(Pos2::new(x, cy - galley.size().y / 2.0), galley, pal.ink2));
+    painter.add(TextShape::new(
+        Pos2::new(x, cy - galley.size().y / 2.0),
+        galley,
+        pal.ink2,
+    ));
 }

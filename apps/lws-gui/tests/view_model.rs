@@ -433,7 +433,10 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
     vm.apply(event(Msg::TopologyDoc(linked_doc(7))));
     let model = vm.map_model();
     assert_eq!(model.links.len(), 1, "{model:?}");
-    assert!(model.links[0].whole_desktop, "an `auto` link is the whole desktop");
+    assert!(
+        model.links[0].whole_desktop,
+        "an `auto` link is the whole desktop"
+    );
     assert_eq!(model.links[0].label, "весь стол");
     assert_eq!(model.links[0].state, LinkState::Idle);
     assert!(!model.dirty);
@@ -453,7 +456,10 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
     assert!(vm.editor.dirty());
     assert!(vm.map_model().links.is_empty());
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
-    assert!(topology.links.is_empty(), "a pair that no longer faces loses its link");
+    assert!(
+        topology.links.is_empty(),
+        "a pair that no longer faces loses its link"
+    );
     vm.discard_draft();
     assert_eq!(vm.editor.placement, before);
     assert!(vm.layout_action().is_none());
@@ -676,10 +682,7 @@ fn every_wire_request_is_the_message_it_names() {
             Action::ExportDiagnostics(String::new()),
             Request::ExportDiagnostics,
         ),
-        (
-            Action::SwitchTo(PEER_NODE.to_owned()),
-            Request::Switch,
-        ),
+        (Action::SwitchTo(PEER_NODE.to_owned()), Request::Switch),
     ];
     for (action, expected) in cases {
         let (request, _) = action
@@ -724,8 +727,10 @@ fn the_side_buttons_and_the_drag_choose_the_same_edge() {
             (vm.editor.placement[this], &vm.editor.shapes[this]),
             (vm.editor.placement[peer], &vm.editor.shapes[peer]),
         );
-        let overlap =
-            a.0.x < b.0.x + b.1.w && b.0.x < a.0.x + a.1.w && a.0.y < b.0.y + b.1.h && b.0.y < a.0.y + a.1.h;
+        let overlap = a.0.x < b.0.x + b.1.w
+            && b.0.x < a.0.x + a.1.w
+            && a.0.y < b.0.y + b.1.h
+            && b.0.y < a.0.y + a.1.h;
         assert!(!overlap, "{} must not overlap", side.label());
     }
 
@@ -798,7 +803,10 @@ fn the_route_and_the_transfer_button_follow_the_core() {
     vm.apply(event(Msg::Status(status)));
     let transfer = vm.transfer();
     assert!(!transfer.enabled);
-    assert_eq!(transfer.why.as_deref(), Some("Другой компьютер ещё не готов"));
+    assert_eq!(
+        transfer.why.as_deref(),
+        Some("Другой компьютер ещё не готов")
+    );
 
     // An offline peer: nothing to switch to, and its link is drawn offline.
     let mut status = status_with("LOCAL");
@@ -847,7 +855,10 @@ fn the_rail_opens_one_window_at_a_time_and_a_pair_is_removed_only_after_asking()
     assert_eq!(vm.settings.revoke.as_deref(), Some(PEER_NODE));
     vm.local(&Action::ToggleModal(Modal::Keys));
     assert_eq!(vm.modal, Some(Modal::Keys));
-    assert_eq!(vm.settings.revoke, None, "a question does not outlive its window");
+    assert_eq!(
+        vm.settings.revoke, None,
+        "a question does not outlive its window"
+    );
     vm.local(&Action::ToggleModal(Modal::Keys));
     assert_eq!(vm.modal, None, "the same button closes it");
     vm.local(&Action::ToggleModal(Modal::Settings));
@@ -865,9 +876,18 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
     let id = vm.begin_request(Request::PairWith, now);
     vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
     assert_eq!(vm.pairing.code().as_deref(), Some("482 913"));
-    vm.apply(answer(id, Msg::OpResult(protocol::ipc::OpResult { ok: true, error_code: String::new() })));
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
     assert!(!vm.pairing.dialing);
-    assert!(vm.pairing.prompt.is_none(), "the code is gone once it was used");
+    assert!(
+        vm.pairing.prompt.is_none(),
+        "the code is gone once it was used"
+    );
     assert_eq!(vm.pairing.paired.as_deref(), Some("linux-box"));
     vm.local(&Action::DonePairing);
     assert_eq!(vm.pairing.paired, None);
@@ -877,7 +897,10 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
     let id = vm.begin_request(Request::PairWith, now);
     vm.apply(answer(
         id,
-        Msg::OpResult(protocol::ipc::OpResult { ok: false, error_code: "PAIRING_FAILED".to_owned() }),
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: false,
+            error_code: "PAIRING_FAILED".to_owned(),
+        }),
     ));
     assert!(!vm.pairing.dialing);
     assert_eq!(vm.pairing.paired, None);
@@ -887,7 +910,11 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
 fn a_request_that_runs_out_is_scheduled_exactly_once() {
     let mut vm = view();
     let now = Instant::now();
-    assert_eq!(vm.next_wakeup(now), None, "an idle window waits for nothing");
+    assert_eq!(
+        vm.next_wakeup(now),
+        None,
+        "an idle window waits for nothing"
+    );
     vm.on_connected("endpoint");
     vm.begin_request(Request::GetStatus, now);
     let due = vm.next_wakeup(now).expect("a deadline");

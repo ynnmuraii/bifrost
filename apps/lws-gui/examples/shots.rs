@@ -40,13 +40,23 @@ fn main() -> std::process::ExitCode {
     }
     let mut written = 0usize;
     for theme in [Theme::Light, Theme::Dark] {
-        let tag = if theme == Theme::Light { "light" } else { "dark" };
+        let tag = if theme == Theme::Light {
+            "light"
+        } else {
+            "dark"
+        };
         let mut states: Vec<(String, ViewModel)> = vec![
             (format!("main-{tag}"), mockup(theme, None)),
-            (format!("main-window-{tag}"), with_window(mockup(theme, None))),
+            (
+                format!("main-window-{tag}"),
+                with_window(mockup(theme, None)),
+            ),
         ];
         for modal in Modal::ALL {
-            states.push((format!("modal-{}-{tag}", modal_name(modal)), mockup(theme, Some(modal))));
+            states.push((
+                format!("modal-{}-{tag}", modal_name(modal)),
+                mockup(theme, Some(modal)),
+            ));
         }
         for (name, state) in states {
             let file = dir.join(format!("{name}.png"));
@@ -84,7 +94,10 @@ fn shoot(state: ViewModel, file: &Path) -> Result<(), String> {
             .with_size(egui::vec2(CANVAS[0], CANVAS[1]))
             .wgpu()
             .build_ui(move |ui| {
-                let env = Env { now: Instant::now(), animate: false };
+                let env = Env {
+                    now: Instant::now(),
+                    animate: false,
+                };
                 let _ = ui::draw(ui, &state, &mut ui_state, env);
             });
         ui::install_fonts(&harness.ctx);
@@ -112,10 +125,22 @@ fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn event(msg: Msg) -> GuiFrame {
-    GuiFrame { seq: 1, request_id: 0, msg: Some(msg) }
+    GuiFrame {
+        seq: 1,
+        request_id: 0,
+        msg: Some(msg),
+    }
 }
 
-fn display(id: &str, x: f64, y: f64, w: f64, h: f64, primary: bool, known: bool) -> ipc::DisplayView {
+fn display(
+    id: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    primary: bool,
+    known: bool,
+) -> ipc::DisplayView {
     ipc::DisplayView {
         id: id.to_owned(),
         logical_x: x,
@@ -143,14 +168,19 @@ fn auto(node: &str, edge: &str) -> Option<ipc::EndpointView> {
 /// is off; input is on the laptop.
 fn mockup(theme: Theme, modal: Option<Modal>) -> ViewModel {
     let mut vm = ViewModel::new(
-        CoreEndpoint::Ready { description: "pipe".to_owned() },
+        CoreEndpoint::Ready {
+            description: "pipe".to_owned(),
+        },
         LocalConfig {
             display_name: "WORKSTATION".to_owned(),
             listen_address: "192.168.1.24".to_owned(),
             ..LocalConfig::default()
         },
     );
-    vm.look = Look { theme, ..Look::default() };
+    vm.look = Look {
+        theme,
+        ..Look::default()
+    };
     vm.on_connected("pipe");
     vm.settings.lan.candidates = vec!["192.168.1.24".to_owned(), "10.0.0.5".to_owned()];
     let member = |id: &str, name: &str, online: bool, owner: bool| ipc::MemberStatus {
