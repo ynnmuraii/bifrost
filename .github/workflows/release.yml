@@ -87,6 +87,9 @@ jobs:
           Copy-Item packaging/README_RU.txt $stage
           Copy-Item licenses/THIRD_PARTY_NOTICES.md $stage
           Copy-Item crates/config/examples-data/config.example.toml $stage
+          Copy-Item apps/multideskflow/assets/icon.ico $stage
+          Copy-Item apps/multideskflow/assets/icon.svg $stage
+          Copy-Item apps/multideskflow/assets/icon-256.png $stage
           Compress-Archive -Path "$stage/*" -DestinationPath $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
           # `<hex>  <file>` with two spaces, the sha256sum convention: the
@@ -103,7 +106,15 @@ jobs:
           install -m 0755 target/release/multideskflow "$stage/"
           cp packaging/README_RU.txt licenses/THIRD_PARTY_NOTICES.md "$stage/"
           cp crates/config/examples-data/config.example.toml "$stage/"
-          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" multideskflow README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml
+          install -m 0644 packaging/multideskflow.desktop "$stage/"
+          mkdir -p "$stage/share/applications" "$stage/share/icons/hicolor/scalable/apps"
+          install -m 0644 packaging/multideskflow.desktop "$stage/share/applications/"
+          install -m 0644 apps/multideskflow/assets/icon.svg "$stage/share/icons/hicolor/scalable/apps/multideskflow.svg"
+          for size in 16 20 24 32 40 48 64 256; do
+            mkdir -p "$stage/share/icons/hicolor/${size}x${size}/apps"
+            install -m 0644 "apps/multideskflow/assets/icon-${size}.png" "$stage/share/icons/hicolor/${size}x${size}/apps/multideskflow.png"
+          done
+          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" multideskflow README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml multideskflow.desktop share
           # shasum prints `<hex>  <file>` (two spaces), the same format and
           # file name as the Windows step writes. The subshell makes <file>
           # the archive's own name rather than its path, so a user who
