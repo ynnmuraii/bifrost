@@ -21,7 +21,7 @@
 //! quit                   -> OK stopping
 //! ping                   -> OK pong
 //! pair-open [seconds]    -> OK address=<ip:port> attempt=<32-hex> seconds=<n>
-//! pair-prompt            -> OK sas=482913 peer=<name> attempt=<32-hex> address=<ip:port>
+//! pair-prompt            -> OK sas=482913 peer=<name> ceremony=<32-hex> address=<ip:port>
 //! pair-answer <hex> yes  -> OK paired <name> | ERR <code> <detail>
 //! pair-answer <hex> no   -> OK rejected
 //! pair-with <address>    -> OK dialing
