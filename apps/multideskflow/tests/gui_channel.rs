@@ -757,18 +757,22 @@ fn live_hotkey_rebinds_are_serialized_validated_and_persisted_without_desktop_in
     let _guard = common::serial();
     let (harness, ()) = Harness::start_with(false, true, |a, b| {
         for root in [a, b] {
-            std::fs::create_dir_all(root.join("run/control-dry")).expect("disable scheduled motion");
-            std::fs::write(root.join("run/hotkey-enabled-dry"), "").expect("enable synthetic hotkeys");
+            std::fs::create_dir_all(root.join("run/control-dry"))
+                .expect("disable scheduled motion");
+            std::fs::write(root.join("run/hotkey-enabled-dry"), "")
+                .expect("enable synthetic hotkeys");
         }
     });
     harness.wait_linked();
     let mut window = Window::open(&gui_endpoint_of(&harness.a.root));
     let action = protocol::ipc::HotkeyAction::SwitchNext as i32;
     let first = window.send(gui_frame::Msg::SetHotkey(protocol::ipc::SetHotkey {
-        action, chord: "Ctrl+Alt+Shift+F8".to_owned(),
+        action,
+        chord: "Ctrl+Alt+Shift+F8".to_owned(),
     }));
     let second = window.send(gui_frame::Msg::SetHotkey(protocol::ipc::SetHotkey {
-        action, chord: "Ctrl+Alt+Shift+F9".to_owned(),
+        action,
+        chord: "Ctrl+Alt+Shift+F9".to_owned(),
     }));
     for request in [first, second] {
         match window.await_answer(request) {
@@ -777,52 +781,105 @@ fn live_hotkey_rebinds_are_serialized_validated_and_persisted_without_desktop_in
         }
     }
     let before = window.status().hotkeys;
-    assert_eq!(before.iter().find(|binding| binding.action == action).unwrap().chord, "Ctrl+Alt+Shift+F9");
+    assert_eq!(
+        before
+            .iter()
+            .find(|binding| binding.action == action)
+            .unwrap()
+            .chord,
+        "Ctrl+Alt+Shift+F9"
+    );
     let invalid = window.request(gui_frame::Msg::SetHotkey(protocol::ipc::SetHotkey {
-        action, chord: "Ctrl+Alt+Shift+F12".to_owned(),
+        action,
+        chord: "Ctrl+Alt+Shift+F12".to_owned(),
     }));
     assert!(matches!(invalid, gui_frame::Msg::HotkeysResult(result) if !result.success));
     assert_eq!(window.status().hotkeys, before);
-    let saved = std::fs::read_to_string(harness.a.root.join("config/config.toml")).expect("saved configuration");
+    let saved = std::fs::read_to_string(harness.a.root.join("config/config.toml"))
+        .expect("saved configuration");
     assert!(saved.contains("Ctrl+Alt+Shift+F9"), "{saved}");
     assert!(!saved.contains("Ctrl+Alt+Shift+F8"), "{saved}");
     let mut other = Window::open(&gui_endpoint_of(&harness.b.root));
-    assert_ne!(other.status().hotkeys, before, "binding ownership is local to each core");
+    assert_ne!(
+        other.status().hotkeys,
+        before,
+        "binding ownership is local to each core"
+    );
     let config_path = harness.a.root.join("config/config.toml");
     let saved_path = harness.a.root.join("config/config.saved");
     std::fs::rename(&config_path, &saved_path).expect("hold saved configuration");
     std::fs::create_dir(&config_path).expect("force config write failure");
     let failed = window.request(gui_frame::Msg::SetHotkey(protocol::ipc::SetHotkey {
-        action, chord: "Ctrl+Alt+Shift+F10".to_owned(),
+        action,
+        chord: "Ctrl+Alt+Shift+F10".to_owned(),
     }));
     std::fs::remove_dir(&config_path).expect("remove write fault");
     std::fs::rename(&saved_path, &config_path).expect("restore configuration");
     assert!(matches!(failed, gui_frame::Msg::HotkeysResult(result) if !result.success));
-    assert_eq!(window.status().hotkeys, before, "persistence failure rolls registration back");
+    assert_eq!(
+        window.status().hotkeys,
+        before,
+        "persistence failure rolls registration back"
+    );
     let marker = harness.a.root.join("run/hotkey-dry");
     let trigger = |action: protocol::ipc::HotkeyAction| {
         std::fs::write(&marker, (action as i32).to_string()).expect("synthetic hotkey");
     };
     trigger(protocol::ipc::HotkeyAction::SwitchNext);
-    harness.a.wait_for("hotkey switches source remote", DEADLINE, |status| status.focus == "Remote" && !marker.exists()).expect("remote");
+    harness
+        .a
+        .wait_for("hotkey switches source remote", DEADLINE, |status| {
+            status.focus == "Remote" && !marker.exists()
+        })
+        .expect("remote");
     trigger(protocol::ipc::HotkeyAction::SwitchNext);
-    harness.a.wait_for("second switch-next is not a toggle", DEADLINE, |status| status.focus == "Remote" && !marker.exists()).expect("still remote");
+    harness
+        .a
+        .wait_for("second switch-next is not a toggle", DEADLINE, |status| {
+            status.focus == "Remote" && !marker.exists()
+        })
+        .expect("still remote");
     trigger(protocol::ipc::HotkeyAction::ReturnLocal);
-    harness.a.wait_for("orderly hotkey return", DEADLINE, |status| status.focus == "Local" && !marker.exists()).expect("local");
+    harness
+        .a
+        .wait_for("orderly hotkey return", DEADLINE, |status| {
+            status.focus == "Local" && !marker.exists()
+        })
+        .expect("local");
     trigger(protocol::ipc::HotkeyAction::ReturnLocal);
-    harness.a.wait_for("return-local is idempotent", DEADLINE, |status| status.focus == "Local" && !marker.exists()).expect("still local");
-    std::fs::write(harness.b.root.join("run/hotkey-dry"), (protocol::ipc::HotkeyAction::ClaimOwnership as i32).to_string()).expect("claim hotkey");
-    harness.b.wait_for("hotkey ownership claim", DEADLINE, |status| status.owner == harness.b.id).expect("claimed");
+    harness
+        .a
+        .wait_for("return-local is idempotent", DEADLINE, |status| {
+            status.focus == "Local" && !marker.exists()
+        })
+        .expect("still local");
+    std::fs::write(
+        harness.b.root.join("run/hotkey-dry"),
+        (protocol::ipc::HotkeyAction::ClaimOwnership as i32).to_string(),
+    )
+    .expect("claim hotkey");
+    harness
+        .b
+        .wait_for("hotkey ownership claim", DEADLINE, |status| {
+            status.owner == harness.b.id
+        })
+        .expect("claimed");
     let old_agent = harness.a.agent_pid().expect("agent pid");
     common::Node::kill_pid(old_agent).expect("restart agent");
-    harness.a.wait_for("replacement agent", DEADLINE, |_| {
-        harness.a.agent_pid().is_ok_and(|pid| pid != old_agent)
-    }).expect("agent restarted");
+    harness
+        .a
+        .wait_for("replacement agent", DEADLINE, |_| {
+            harness.a.agent_pid().is_ok_and(|pid| pid != old_agent)
+        })
+        .expect("agent restarted");
     let mut restarted = Window::open(&gui_endpoint_of(&harness.a.root));
     if restarted.status().hotkeys != before {
-        restarted.wait_event("saved bindings registered after restart", |event| match event {
-            gui_frame::Msg::Status(status) if status.hotkeys == before => Some(()),
-            _ => None,
-        });
+        restarted.wait_event(
+            "saved bindings registered after restart",
+            |event| match event {
+                gui_frame::Msg::Status(status) if status.hotkeys == before => Some(()),
+                _ => None,
+            },
+        );
     }
 }

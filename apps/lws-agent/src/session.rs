@@ -468,7 +468,10 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn install_hotkeys(backend: &mut Backend, bindings: &[ipc::HotkeyBinding]) -> Option<ipc::HotkeysResult> {
+async fn install_hotkeys(
+    backend: &mut Backend,
+    bindings: &[ipc::HotkeyBinding],
+) -> Option<ipc::HotkeysResult> {
     match backend::hotkeys_from_wire(bindings) {
         Ok(parsed) => backend.request_hotkeys(parsed).await,
         Err(detail) => Some(ipc::HotkeysResult {
@@ -1105,7 +1108,8 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
         Event::HotkeyPressed(action) => {
             link.send(Msg::HotkeyPressed(ipc::HotkeyPressed {
                 action: backend::wire_hotkey_action(action) as i32,
-            })).await?;
+            }))
+            .await?;
         }
         Event::Emergency => {
             // Never flush pre-emergency input after returning control locally.

@@ -64,7 +64,10 @@ fn a_bare_version_line_fills_every_section_with_its_defaults() {
     assert_eq!(minimal.timing.challenge_interval_ms(), 100);
     assert_eq!(minimal.timing.ipc_heartbeat_ms(), 75);
 
-    assert_eq!(minimal.input.hotkeys.emergency_release, "Ctrl+Alt+Shift+F12");
+    assert_eq!(
+        minimal.input.hotkeys.emergency_release,
+        "Ctrl+Alt+Shift+F12"
+    );
     assert_eq!(minimal.input.hotkeys.switch_next, "Ctrl+Alt+Shift+Right");
     assert_eq!(minimal.input.hotkeys.return_local, "Ctrl+Alt+Shift+Left");
     assert_eq!(minimal.input.pointer_gain, 1.0);

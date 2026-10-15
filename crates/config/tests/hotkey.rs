@@ -124,9 +124,25 @@ fn a_hotkey_renders_back_to_a_parseable_string() {
 #[test]
 fn supported_keys_and_modifier_requirement() {
     for key in [
-        "A", "0", "F1", "F24", "Left", "Right", "Up", "Down", "Home", "End",
-        "PageUp", "PageDown", "Insert", "Delete", "Backspace", "Tab", "Enter",
-        "Escape", "Space",
+        "A",
+        "0",
+        "F1",
+        "F24",
+        "Left",
+        "Right",
+        "Up",
+        "Down",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Insert",
+        "Delete",
+        "Backspace",
+        "Tab",
+        "Enter",
+        "Escape",
+        "Space",
     ] {
         let hotkey = parse(&format!("Ctrl+{key}"));
         assert_eq!(parse(&hotkey.to_string()), hotkey);
@@ -134,7 +150,10 @@ fn supported_keys_and_modifier_requirement() {
     assert_eq!(parse("f24").to_string(), "F24");
     assert_eq!(Hotkey::parse("Right"), Err(HotkeyError::MissingModifier));
     for text in ["Ctrl+F0", "Ctrl+F25", "Ctrl+Unknown", "Ctrl+é"] {
-        assert!(matches!(Hotkey::parse(text), Err(HotkeyError::UnsupportedKey(_))));
+        assert!(matches!(
+            Hotkey::parse(text),
+            Err(HotkeyError::UnsupportedKey(_))
+        ));
     }
 }
 

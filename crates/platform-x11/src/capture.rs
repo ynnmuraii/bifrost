@@ -164,37 +164,67 @@ impl X11Capture {
     /// Resolves a keysym against the current server keyboard map.
     pub fn hotkey_keycode(&self, keysym: u32) -> Result<u8, X11Error> {
         let setup = self.conn.setup();
-        let mapping = self.conn.get_keyboard_mapping(setup.min_keycode,
-            setup.max_keycode - setup.min_keycode + 1)?.reply()?;
-        mapping.keysyms.chunks(usize::from(mapping.keysyms_per_keycode))
+        let mapping = self
+            .conn
+            .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)?
+            .reply()?;
+        mapping
+            .keysyms
+            .chunks(usize::from(mapping.keysyms_per_keycode))
             .position(|symbols| symbols.contains(&keysym))
             .and_then(|index| u8::try_from(index).ok())
             .map(|index| setup.min_keycode + index)
-            .ok_or_else(|| X11Error::Unsupported(format!("hotkey keysym {keysym:#x} is absent from the keyboard map")))
+            .ok_or_else(|| {
+                X11Error::Unsupported(format!(
+                    "hotkey keysym {keysym:#x} is absent from the keyboard map"
+                ))
+            })
     }
 
     /// Acquires every new passive grab before retiring the old set. On refusal, rolls back additions.
-    pub fn set_hotkeys(&mut self, bindings: [Option<crate::hotkeys::Hotkey>; 4]) -> Result<(), X11Error> {
+    pub fn set_hotkeys(
+        &mut self,
+        bindings: [Option<crate::hotkeys::Hotkey>; 4],
+    ) -> Result<(), X11Error> {
         let physical = self.conn.query_keymap()?.reply()?.keys;
         let mut wanted = Vec::new();
-        for binding in bindings.iter().flatten().copied().chain(std::iter::once(crate::hotkeys::Hotkey {
-            keycode: EMERGENCY_F12_X11_KEYCODE, modifiers: 1 | 4 | 8,
-        })) {
+        for binding in
+            bindings
+                .iter()
+                .flatten()
+                .copied()
+                .chain(std::iter::once(crate::hotkeys::Hotkey {
+                    keycode: EMERGENCY_F12_X11_KEYCODE,
+                    modifiers: 1 | 4 | 8,
+                }))
+        {
             for locks in [0, 2, 16, 2 | 16] {
                 let grab = (binding.keycode, binding.modifiers | locks);
-                if !wanted.contains(&grab) { wanted.push(grab); }
+                if !wanted.contains(&grab) {
+                    wanted.push(grab);
+                }
             }
         }
         let installed = crate::hotkeys::replace_grabs(
             &self.shortcut_grabs,
             &wanted,
             |(keycode, modifiers)| -> Result<(), X11Error> {
-                self.conn.grab_key(false, self.root, modifiers.into(), keycode,
-                    xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)?.check()?;
+                self.conn
+                    .grab_key(
+                        false,
+                        self.root,
+                        modifiers.into(),
+                        keycode,
+                        xproto::GrabMode::ASYNC,
+                        xproto::GrabMode::ASYNC,
+                    )?
+                    .check()?;
                 Ok(())
             },
             |(keycode, modifiers)| {
-                let _ = self.conn.ungrab_key(keycode, self.root, xproto::ModMask::from(modifiers));
+                let _ = self
+                    .conn
+                    .ungrab_key(keycode, self.root, xproto::ModMask::from(modifiers));
             },
         );
         self.conn.flush()?;
@@ -465,7 +495,9 @@ impl X11Capture {
             }
             return Some(CapturedEvent::HotkeyPressed(action));
         }
-        if swallow { return None; }
+        if swallow {
+            return None;
+        }
         self.ledger.note_key(keycode, state);
         let key = x11_keycode_to_hid_key(keycode)?;
         Some(CapturedEvent::Input(InputEvent::Key { key, state }))

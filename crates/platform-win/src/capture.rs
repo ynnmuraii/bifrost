@@ -293,9 +293,9 @@ impl Capture {
             hold_valid: AtomicBool::new(false),
             emergency_fired: AtomicBool::new(false),
             modifiers: AtomicU32::new(0),
-            hotkeys: AtomicU64::new(crate::event::Hotkeys::new([
-                Some(config.emergency), None, None, None,
-            ]).0),
+            hotkeys: AtomicU64::new(
+                crate::event::Hotkeys::new([Some(config.emergency), None, None, None]).0,
+            ),
             swallowed_keys: std::array::from_fn(|_| AtomicU64::new(0)),
             keyboard_hook_events: AtomicU64::new(0),
             keyboard_injected_seen: AtomicU64::new(0),
@@ -765,8 +765,6 @@ fn update_modifiers(shared: &Shared, vk: u16, down: bool) {
     }
 }
 
-
-
 fn physical_modifiers() -> u32 {
     let down = |left, right| {
         // SAFETY: querying current key state has no input side effects.
@@ -850,7 +848,10 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
     if !injected && down && hotkeys.contains_key(vk) {
         let mask = shared.modifiers.load(Ordering::Relaxed) | physical_modifiers();
         let action = hotkeys.matching(
-            vk, mask & MOD_CTRL != 0, mask & MOD_ALT != 0, mask & MOD_SHIFT != 0,
+            vk,
+            mask & MOD_CTRL != 0,
+            mask & MOD_ALT != 0,
+            mask & MOD_SHIFT != 0,
             // SAFETY: these queries have no input side effects.
             unsafe { GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0 },
         );
@@ -1140,13 +1141,24 @@ mod tests {
         let (shared, _) = hook_state(CaptureKind::Observe);
         let old = shared.hotkeys.load(Ordering::SeqCst);
         shared.swallowed_keys[1].store(1 << 59, Ordering::Relaxed);
-        let replacement = crate::event::Hotkeys::new([Some(EmergencyCombo {
-            vk: 0x70, ctrl: false, alt: false, shift: false,
-        }), None, None, None]);
+        let replacement = crate::event::Hotkeys::new([
+            Some(EmergencyCombo {
+                vk: 0x70,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            }),
+            None,
+            None,
+            None,
+        ]);
         shared.hotkeys.store(replacement.0, Ordering::SeqCst);
         assert_ne!(old, shared.hotkeys.load(Ordering::SeqCst));
         assert_eq!(shared.swallowed_keys[1].load(Ordering::Relaxed), 1 << 59);
-        assert_eq!(replacement.matching(0x70, false, false, false, false), Some(0));
+        assert_eq!(
+            replacement.matching(0x70, false, false, false, false),
+            Some(0)
+        );
         assert_eq!(replacement.matching(0x7b, true, true, true, false), None);
     }
     fn hook_state(
@@ -1161,9 +1173,9 @@ mod tests {
             hold_valid: AtomicBool::new(true),
             emergency_fired: AtomicBool::new(false),
             modifiers: AtomicU32::new(MOD_CTRL | MOD_ALT | MOD_SHIFT),
-            hotkeys: AtomicU64::new(crate::event::Hotkeys::new([
-                Some(EmergencyCombo::default()), None, None, None,
-            ]).0),
+            hotkeys: AtomicU64::new(
+                crate::event::Hotkeys::new([Some(EmergencyCombo::default()), None, None, None]).0,
+            ),
             swallowed_keys: std::array::from_fn(|_| AtomicU64::new(0)),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),

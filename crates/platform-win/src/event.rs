@@ -68,7 +68,14 @@ impl Hotkeys {
         })
     }
 
-    pub fn matching(self, vk: u16, ctrl: bool, alt: bool, shift: bool, super_key: bool) -> Option<u8> {
+    pub fn matching(
+        self,
+        vk: u16,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        super_key: bool,
+    ) -> Option<u8> {
         let modifiers = (u64::from(ctrl) << 8)
             | (u64::from(alt) << 9)
             | (u64::from(shift) << 10)
@@ -100,9 +107,17 @@ mod hotkey_tests {
         let first = Hotkeys::new([Some(EmergencyCombo::default()), None, None, None]);
         assert_eq!(first.matching(0x7b, true, true, true, false), Some(0));
         assert_eq!(first.matching(0x7b, true, true, false, false), None);
-        let next = Hotkeys::new([Some(EmergencyCombo::default()), Some(EmergencyCombo {
-            vk: 0x27, ctrl: false, alt: false, shift: false,
-        }), None, None]);
+        let next = Hotkeys::new([
+            Some(EmergencyCombo::default()),
+            Some(EmergencyCombo {
+                vk: 0x27,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            }),
+            None,
+            None,
+        ]);
         assert_eq!(first.matching(0x27, false, false, false, false), None);
         assert_eq!(next.matching(0x27, false, false, false, false), Some(1));
         assert_eq!(next.matching(0x27, true, false, false, false), None);

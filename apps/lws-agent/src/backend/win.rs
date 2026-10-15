@@ -151,10 +151,13 @@ impl Win {
         ready.set_text_clipboard(clipboard.is_some());
         Ok(Win {
             ready,
-            capture: Some(Capture::start(CaptureConfig {
-                emergency,
-                ..CaptureConfig::default()
-            }).map_err(|error| capture_error(&error))?),
+            capture: Some(
+                Capture::start(CaptureConfig {
+                    emergency,
+                    ..CaptureConfig::default()
+                })
+                .map_err(|error| capture_error(&error))?,
+            ),
             source_motion: None,
             source_monitors: Vec::new(),
             pending_source_seed: false,
@@ -199,8 +202,12 @@ impl Win {
                 super_bits |= 1u64 << (index * 16 + 11);
             }
         }
-        self.capture.as_ref().ok_or("Windows hotkey hook is unavailable")?
-            .set_hotkeys(platform_win::event::Hotkeys(platform_win::event::Hotkeys::new(combinations).0 | super_bits));
+        self.capture
+            .as_ref()
+            .ok_or("Windows hotkey hook is unavailable")?
+            .set_hotkeys(platform_win::event::Hotkeys(
+                platform_win::event::Hotkeys::new(combinations).0 | super_bits,
+            ));
         Ok(())
     }
 
@@ -587,13 +594,16 @@ impl Win {
             // was seen made the session's `select!` call this again immediately, so a held key
             // — which the OS repeats at its own rate — spun the poll loop at full CPU instead
             // of its tick.
-            if let Some(event) = drain_capture(|| loop {
-                let event = capture.try_recv()?;
-                if mode == CaptureKind::Observe && matches!(event, CaptureEvent::Input(_)) {
-                    continue;
-                }
-                break Some(event);
-            }, &mut self.repeats) {
+            if let Some(event) = drain_capture(
+                || loop {
+                    let event = capture.try_recv()?;
+                    if mode == CaptureKind::Observe && matches!(event, CaptureEvent::Input(_)) {
+                        continue;
+                    }
+                    break Some(event);
+                },
+                &mut self.repeats,
+            ) {
                 let Event::Input(event) = event else {
                     return Some(event);
                 };
