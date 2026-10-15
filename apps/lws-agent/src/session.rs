@@ -717,7 +717,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             backend.set_effects(settings.edge_effects, settings.hide_cursor);
         }
         Msg::EdgeFx(frame) => {
-            if let Some(update) = decode_edge_fx(&frame) {
+            if let Some(update) = decode_edge_fx(frame) {
                 backend.edge_fx(&frame.display_id, update);
             }
         }
