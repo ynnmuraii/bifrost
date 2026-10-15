@@ -12,22 +12,35 @@ use menu::Action;
 use protocol::ipc::{self as wire, gui_frame::Msg};
 use std::{ffi::OsString, process::ExitCode, time::Duration};
 use tokio::sync::{mpsc, watch};
+use ui_text::{fill, text, Key, Lang};
+
+/// The language the window stored, or the system's own when the file says nothing.
+fn language_of(file: Option<&std::path::Path>) -> Lang {
+    file.and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| ui_text::language_in(&text))
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Default)]
 struct State {
     status: Option<wire::Status>,
     topology: Option<wire::TopologyDoc>,
     local_name: String,
+    /// The window's own `gui.toml`, read every time the menu is built.
+    look_file: Option<std::path::PathBuf>,
 }
 impl State {
     fn items(&self) -> Vec<menu::Item> {
-        let mut items = menu::items(self.status.as_ref(), self.topology.as_ref());
+        // The window's own language, read every time the menu is built: a choice made in the
+        // window shows up here without restarting the tray.
+        let lang = language_of(self.look_file.as_deref());
+        let mut items = menu::items(self.status.as_ref(), self.topology.as_ref(), lang);
         if !self.local_name.is_empty() {
             for item in &mut items {
                 if matches!(item.action, Some(Action::Switch(_)))
-                    && item.label == "Передать ввод → этот компьютер"
+                    && item.label == text(lang, Key::SendInputToThisComputer)
                 {
-                    item.label = format!("Передать ввод → {}", self.local_name);
+                    item.label = fill(lang, Key::SendInputTo, &[&self.local_name]);
                 }
             }
         }
@@ -54,6 +67,11 @@ pub fn run_tray(args: Vec<String>) -> ExitCode {
             .and_then(|paths| config::Config::load(paths.config_file()).ok())
             .map(|config| config.node.display_name)
             .unwrap_or_default();
+        // The window's own file, remembered so the menu can follow its language.
+        let look_file = paths
+            .as_ref()
+            .ok()
+            .map(|paths| paths.config_dir().join("gui.toml"));
         let endpoint =
             paths.and_then(|paths| ipc::transport::gui_endpoint(&paths).map_err(|e| e.to_string()));
         if let Err(error) = &endpoint {
@@ -63,6 +81,7 @@ pub fn run_tray(args: Vec<String>) -> ExitCode {
         let (commands, rx) = mpsc::unbounded_channel();
         let (state_tx, state) = watch::channel(State {
             local_name,
+            look_file,
             ..Default::default()
         });
         let thread = std::thread::Builder::new()

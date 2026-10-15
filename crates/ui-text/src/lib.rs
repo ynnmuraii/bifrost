@@ -217,7 +217,7 @@ pub enum Key {
     LinkIsInactiveDisplayWasNotFound,
     /// «экраны ещё не получены»
     TheDisplaysHaveNotArrivedYet,
-    /// «Связь {}: Весь рабочий стол (авто) — {screens}»
+    /// «Связь {link}: Весь рабочий стол (авто) — {screens}»
     LinkTheWholeDesktopAutoScreens,
     /// «Пока никого: откройте окно сопряжения»
     NobodyYetOpenThePairingWindow,
@@ -551,6 +551,18 @@ pub enum Key {
     TheTextIsCopied,
     /// «история буфера очищена»
     TheClipboardHistoryIsCleared,
+    /// «Открыть MultiDeskFlow»
+    OpenMultiDeskFlow,
+    /// «Передать ввод → {}»
+    SendInputTo,
+    /// «Ввод → {}»
+    Input2,
+    /// «Остановить службу»
+    StopTheService2,
+    /// «Выход (служба продолжит работать)»
+    QuitTheServiceKeepsRunning,
+    /// «Передать ввод → этот компьютер»
+    SendInputToThisComputer,
     /// «Язык»
     Language,
     /// «Сопряжение»
@@ -760,7 +772,7 @@ const fn ru(key: Key) -> &'static str {
         Key::LinkIsInactiveTheDisplayWasNotFound => "Связь {} неактивна: экран не найден",
         Key::LinkIsInactiveDisplayWasNotFound => "Связь {} неактивна: экран «{}» не найден",
         Key::TheDisplaysHaveNotArrivedYet => "экраны ещё не получены",
-        Key::LinkTheWholeDesktopAutoScreens => "Связь {}: Весь рабочий стол (авто) — {screens}",
+        Key::LinkTheWholeDesktopAutoScreens => "Связь {link}: Весь рабочий стол (авто) — {screens}",
         Key::NobodyYetOpenThePairingWindow => "Пока никого: откройте окно сопряжения",
         Key::Online => "в сети",
         Key::Offline => "не в сети",
@@ -927,6 +939,12 @@ const fn ru(key: Key) -> &'static str {
         Key::TheClipboardHistoryIsRefreshed => "история буфера обновлена",
         Key::TheTextIsCopied => "текст скопирован",
         Key::TheClipboardHistoryIsCleared => "история буфера очищена",
+        Key::OpenMultiDeskFlow => "Открыть MultiDeskFlow",
+        Key::SendInputTo => "Передать ввод → {}",
+        Key::Input2 => "Ввод → {}",
+        Key::StopTheService2 => "Остановить службу",
+        Key::QuitTheServiceKeepsRunning => "Выход (служба продолжит работать)",
+        Key::SendInputToThisComputer => "Передать ввод → этот компьютер",
         Key::Language => "Язык",
         Key::Pairing => "Сопряжение",
         Key::NextComputer => "Следующий компьютер",
@@ -1235,6 +1253,12 @@ const fn en(key: Key) -> &'static str {
         Key::TheClipboardHistoryIsRefreshed => "the clipboard history is refreshed",
         Key::TheTextIsCopied => "the text is copied",
         Key::TheClipboardHistoryIsCleared => "the clipboard history is cleared",
+        Key::OpenMultiDeskFlow => "Open MultiDeskFlow",
+        Key::SendInputTo => "Send input to {}",
+        Key::Input2 => "Input → {}",
+        Key::StopTheService2 => "Stop the service",
+        Key::QuitTheServiceKeepsRunning => "Quit (the service keeps running)",
+        Key::SendInputToThisComputer => "Send input to this computer",
         Key::Language => "Language",
         Key::Pairing => "Pairing",
         Key::NextComputer => "Next computer",
@@ -1297,6 +1321,20 @@ const fn en(key: Key) -> &'static str {
         Key::Start => "Start",
         Key::OnceMore => "Once more",
     }
+}
+
+/// The `language` a `gui.toml`'s text names, when it names one.
+///
+/// The window and the tray read the same file, so this is the one place that knows what
+/// its line looks like.
+pub fn language_in(text: &str) -> Option<Lang> {
+    #[derive(Deserialize)]
+    struct GuiToml {
+        language: Option<Lang>,
+    }
+    toml::from_str::<GuiToml>(text)
+        .ok()
+        .and_then(|gui| gui.language)
 }
 
 /// Fills the `{}` holes of `key`'s text, in order.
@@ -1380,7 +1418,7 @@ mod tests {
     use super::*;
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 302] = [
+    pub const EVERY: [Key; 308] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1622,6 +1660,12 @@ mod tests {
         Key::TheClipboardHistoryIsRefreshed,
         Key::TheTextIsCopied,
         Key::TheClipboardHistoryIsCleared,
+        Key::OpenMultiDeskFlow,
+        Key::SendInputTo,
+        Key::Input2,
+        Key::StopTheService2,
+        Key::QuitTheServiceKeepsRunning,
+        Key::SendInputToThisComputer,
         Key::Language,
         Key::Pairing,
         Key::NextComputer,

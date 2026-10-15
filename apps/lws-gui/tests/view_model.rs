@@ -547,7 +547,7 @@ fn a_clipboard_refusal_is_explained_where_the_switch_is() {
     ));
     let outcome = vm.outcome.as_ref().expect("a refusal is a toast");
     assert!(!outcome.ok);
-    assert!(outcome.line().contains("буфер"));
+    assert!(outcome.line(ui_text::Lang::Ru).contains("буфер"));
 }
 
 #[test]
@@ -564,7 +564,10 @@ fn a_successful_pairing_promises_what_actually_happens() {
     ));
     let outcome = vm.outcome.as_ref().expect("the result is shown");
     assert!(outcome.ok);
-    assert_eq!(outcome.line(), "Готово: linux-box сопряжён");
+    assert_eq!(
+        outcome.line(ui_text::Lang::Ru),
+        "Готово: linux-box сопряжён"
+    );
 }
 
 #[test]
@@ -878,13 +881,13 @@ fn dragging_chooses_all_four_edges() {
         assert_eq!(vm.editor.placement[peer].x, target.x.round());
         assert_eq!(vm.editor.placement[peer].y, target.y.round());
         let links = vm.map_model().links;
-        assert_eq!(links.len(), 1, "{}", side.label());
+        assert_eq!(links.len(), 1, "{}", side.label(ui_text::Lang::Ru));
         let expected_dir = match side {
             Side::Top | Side::Bottom => lws_gui::map::Dir::Vertical,
             Side::Left | Side::Right => lws_gui::map::Dir::Horizontal,
         };
         assert_eq!(links[0].dir, expected_dir);
-        assert!(vm.editor.dirty(), "{}", side.label());
+        assert!(vm.editor.dirty(), "{}", side.label(ui_text::Lang::Ru));
         let document = vm.layout_toml();
         let topology: config::TopologyConfig = toml::from_str(&document).expect("parse");
         assert_eq!(topology.links.len(), 1);
@@ -913,7 +916,11 @@ fn dragging_chooses_all_four_edges() {
             && b.0.x < a.0.x + a.1.w
             && a.0.y < b.0.y + b.1.h
             && b.0.y < a.0.y + a.1.h;
-        assert!(!overlap, "{} must not overlap", side.label());
+        assert!(
+            !overlap,
+            "{} must not overlap",
+            side.label(ui_text::Lang::Ru)
+        );
     }
 
     // Dragging the peer to this computer's left chooses «Слева», and the document then leaves
@@ -1288,7 +1295,7 @@ fn the_address_button_writes_the_file_and_says_so() {
         .applied
         .as_ref()
         .expect("«Применить» answers in words");
-    assert!(applied.ok, "{}", applied.line());
+    assert!(applied.ok, "{}", applied.line(ui_text::Lang::Ru));
     assert_eq!(applied.text, "Адрес сохранён");
     // What the screen shows is what the file now names, and the pick is spent.
     assert_eq!(vm.config.listen_address, "192.168.1.10");
@@ -1315,7 +1322,7 @@ fn an_address_that_cannot_be_written_is_said_in_words() {
         .applied
         .as_ref()
         .expect("a failure is a sentence, never a silence");
-    assert!(!applied.ok, "{}", applied.line());
+    assert!(!applied.ok, "{}", applied.line(ui_text::Lang::Ru));
     assert!(
         applied.text.starts_with("адрес не сохранён ("),
         "the sentence carries the reason: {}",

@@ -215,7 +215,6 @@ impl ViewModel {
     }
 
     fn drop_is_valid(&self, i: usize) -> bool {
-        let lang = self.look.language;
         if !self.connection.is_connected() || !self.editor.has_document() || !self.editor.editable {
             return false;
         }

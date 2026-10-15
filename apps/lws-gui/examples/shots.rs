@@ -28,6 +28,7 @@ use lws_gui::view_model::{
 use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
+use ui_text;
 
 const OUT_DIR: &str = "target/ui-shots";
 const SIZES: [[u32; 2]; 3] = [[1920, 1080], [1745, 1091], [1280, 720]];
@@ -48,6 +49,10 @@ fn main() -> std::process::ExitCode {
     let real = args.iter().any(|arg| arg == "--live" || arg == "--root");
     let prefix =
         option("--prefix").unwrap_or_else(|| if real { "real" } else { "polish" }.to_owned());
+    let lang = match option("--lang").as_deref() {
+        Some("en") => ui_text::Lang::En,
+        _ => ui_text::Lang::Ru,
+    };
     let zoom = option("--zoom")
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(150)
@@ -77,6 +82,7 @@ fn main() -> std::process::ExitCode {
         let mut states = Vec::new();
         if let Some(snapshot) = &snapshot {
             let mut view = snapshot.clone();
+            view.look.language = lang;
             view.look.theme = theme;
             view.modal = None;
             states.push((format!("{prefix}-main-{tag}"), view.clone()));
@@ -95,24 +101,24 @@ fn main() -> std::process::ExitCode {
                 ));
             }
         } else {
-            states.push((format!("{prefix}-main-{tag}"), mockup(theme, None)));
+            states.push((format!("{prefix}-main-{tag}"), mockup(theme, None, lang)));
             states.push((
                 format!("{prefix}-main-window-{tag}"),
-                with_window(mockup(theme, None)),
+                with_window(mockup(theme, None, lang)),
             ));
-            let mut appearance = mockup(theme, None);
+            let mut appearance = mockup(theme, None, lang);
             appearance.appearance_open = true;
             states.push((format!("{prefix}-appearance-{tag}"), appearance));
-            let mut collapsed = mockup(theme, None);
+            let mut collapsed = mockup(theme, None, lang);
             collapsed.look.dock_open = false;
             states.push((format!("{prefix}-collapsed-{tag}"), collapsed));
-            let mut offline = mockup(theme, None);
+            let mut offline = mockup(theme, None, lang);
             offline.on_disconnected("Служба недоступна — автономный снимок".to_owned());
             states.push((format!("{prefix}-offline-{tag}"), offline));
             for modal in Modal::ALL {
                 states.push((
                     format!("{prefix}-modal-{}-{tag}", modal_name(modal)),
-                    mockup(theme, Some(modal)),
+                    mockup(theme, Some(modal), lang),
                 ));
             }
         }
@@ -272,7 +278,7 @@ fn auto(node: &str, edge: &str) -> Option<ipc::EndpointView> {
 
 /// The three computers of the mockup: LAPTOP, this WORKSTATION with two displays, an HTPC that
 /// is off; input is on the laptop.
-fn mockup(theme: Theme, modal: Option<Modal>) -> ViewModel {
+fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel {
     let mut vm = ViewModel::new(
         CoreEndpoint::Ready {
             description: "pipe".to_owned(),
@@ -284,6 +290,7 @@ fn mockup(theme: Theme, modal: Option<Modal>) -> ViewModel {
         },
     );
     vm.look = Look {
+        language: lang,
         theme,
         ..Look::default()
     };

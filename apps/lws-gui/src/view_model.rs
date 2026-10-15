@@ -430,7 +430,6 @@ impl LocalConfig {
 
 /// The first line of an error, for a sentence that has to fit next to a widget.
 pub fn short_error(text: &str) -> String {
-    let lang = Lang::from_system();
     let line = text.lines().next().unwrap_or("").trim();
     if line.chars().count() > 120 {
         line.chars().take(120).collect::<String>() + "…"
@@ -703,7 +702,6 @@ impl Lan {
 
 /// Only a parsed, non-loopback IPv4 address can be offered as a LAN address.
 fn is_lan_address(address: &str) -> bool {
-    let lang = Lang::from_system();
     address
         .parse::<std::net::Ipv4Addr>()
         .is_ok_and(|address| !address.is_loopback())
@@ -1568,7 +1566,7 @@ impl ViewModel {
                 Some(fill_named(
                     lang,
                     Key::LinkTheWholeDesktopAutoScreens,
-                    &[("screens", &link.id)],
+                    &[("link", &link.id), ("screens", &screens)],
                 ))
             })
             .collect()
