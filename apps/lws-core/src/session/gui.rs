@@ -839,6 +839,9 @@ impl Session {
             };
         }
         if let Some((mut clipboard, events)) = started {
+            if let Some(source) = self.clipboard_source.take() {
+                clipboard.restore_source(source);
+            }
             let mut out = Vec::new();
             for (&peer, &(connection, supported, address)) in &self.clipboard_links {
                 out.extend(clipboard.on_link_up(peer, connection, supported, address).await);
@@ -848,7 +851,7 @@ impl Session {
             self.apply_clipboard(out).await;
         } else if !enabled {
             if let Some(clipboard) = self.clipboard.take() {
-                clipboard.stop().await;
+                self.clipboard_source = Some(clipboard.stop().await);
             }
             let (_, events) = mpsc::channel(1);
             self.clipboard_events = events;
