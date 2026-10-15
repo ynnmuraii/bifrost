@@ -804,6 +804,34 @@ fn removed_layout_controls_stay_absent_and_pairing_close_is_disabled() {
     );
 }
 
+/// The two appearance switches read the service's own answer: a core that has the effects on
+/// shows them on, and flipping one sends the other back exactly as the service reported it.
+#[test]
+fn the_appearance_switches_show_what_the_service_reports() {
+    let mut vm = connected();
+    assert!(
+        vm.status.as_ref().expect("status").edge_effects,
+        "the fixture's service has the edge effects on"
+    );
+    vm.appearance_open = true;
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    let at = text_position(
+        &mut harness,
+        &vm,
+        "Прятать курсор, пока ввод на другой машине",
+    );
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(
+        frame.output.actions.contains(&Action::SetAppearance {
+            edge_effects: true,
+            hide_remote_cursor: false,
+        }),
+        "{:?}",
+        frame.output.actions
+    );
+}
+
 /// A backend that cannot deliver the clipboard says so, and the window does not offer a switch
 /// that could not do anything.
 #[test]

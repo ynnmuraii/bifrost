@@ -304,6 +304,9 @@ fn mockup(theme: Theme, modal: Option<Modal>) -> ViewModel {
         clipboard_enabled: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
         backend: "platform-win".to_owned(),
+        // `[appearance]` as `config::AppearanceConfig` defaults it: both effects on.
+        edge_effects: true,
+        hide_remote_cursor: true,
         is_owner: true,
         owner_node_id: WORKSTATION.to_owned(),
         owner_serial: 14,
