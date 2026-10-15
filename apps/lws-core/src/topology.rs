@@ -555,10 +555,11 @@ pub enum Axis {
 /// pushed the same way, and the focus oscillated `Local`/`Remote` once per sample — the
 /// owner's cursor jumping back and forth at the boundary. The crossed endpoint, not
 /// the dominant motion axis, determines the band and its inward direction.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReturnGuard {
     axis: Axis,
     edge: geometry::Edge,
+    display_id: geometry::DisplayId,
     /// The inward normal along the crossed edge's axis.
     inward: f64,
     /// The coordinate the pointer came home at: the transition's own entry point.
@@ -583,15 +584,19 @@ impl ReturnGuard {
         ReturnGuard {
             axis,
             edge,
+            display_id: entry.display_id.clone(),
             inward,
             armed_at,
             hysteresis,
         }
     }
 
-    /// Whether `position` is still inside the band, i.e. the edge is still disarmed.
+    /// Whether `position` is still inside this display's band.
     #[must_use]
     pub fn holds(&self, position: &geometry::Position) -> bool {
+        if position.display_id != self.display_id {
+            return false;
+        }
         let coordinate = match self.axis {
             Axis::X => position.x,
             Axis::Y => position.y,
