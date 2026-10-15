@@ -966,12 +966,14 @@ mod transform_tests {
         let xf = Xf::new(map, vm.look.zoom_percent);
         // Remains inside the card throughout its 40-stage-unit glide.
         let pointer = xf.p(400.0, 150.0);
+        let card_id = egui::Id::new(("mon", &vm.editor.nodes[0].node_id, 0usize));
         let mut initial_outline = None;
         for frame in 0..12 {
             if frame == 4 {
                 vm.editor.placement[0].x += 40.0;
             }
             let t = frame as f32 / 30.0;
+            let mut painted = None;
             let output = ctx.run_ui(egui::RawInput {
                 screen_rect: Some(map),
                 time: Some(f64::from(t)),
@@ -979,19 +981,24 @@ mod transform_tests {
                 ..Default::default()
             }, |ui| {
                 let _ = draw(ui, &pal, &vm, &mut st, map, Env { now, animate: true }, t, &mut Vec::new());
+                // What the painter was handed this frame is the outline's ground truth; the
+                // animation itself cannot be asked for a value twice in one frame, and reading
+                // the response after the pass would hand back the frame before.
+                painted = ui
+                    .ctx()
+                    .read_response(card_id)
+                    .map(|response| response.rect.translate(-map.min.to_vec2()));
             });
             output.drop_without_applying_deltas();
             if frame >= 2 {
                 assert_eq!(st.hover, Some((0, 0)), "hover identity must not change");
-                let target = vm.editor.placement[0];
-                let x = ctx.animate_value_with_time(egui::Id::new(("node-x", 0usize)), target.x as f32, 0.45);
-                let y = ctx.animate_value_with_time(egui::Id::new(("node-y", 0usize)), target.y as f32, 0.45);
-                let expected = monitor_rect(xf.p(f64::from(x), f64::from(y)), mon, xf.s);
+                let painted = painted.expect("the hovered monitor is a widget");
                 let outline = st.field.outline_rect().expect("hover forms an outline");
-                assert!(outline.min.distance(expected.min) < 0.001, "frame {frame}: {outline:?} vs {expected:?}");
-                assert_eq!(outline.size(), expected.size());
+                assert!(outline.min.distance(painted.min) < 0.001, "frame {frame}: {outline:?} vs {painted:?}");
+                assert_eq!(outline.size(), painted.size());
                 if frame == 3 { initial_outline = Some(outline); }
                 if frame == 11 {
+                    let target = vm.editor.placement[0];
                     assert!(outline.min.x > initial_outline.unwrap().min.x + 1.0);
                     assert!(outline.min.x < monitor_rect(xf.p(target.x, target.y), mon, xf.s).min.x);
                 }
