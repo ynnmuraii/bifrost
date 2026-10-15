@@ -274,9 +274,16 @@ impl Clipboard {
 
     /// Closes the listener and joins every runtime task without changing the OS clipboard.
     ///
-    /// Offered and partially received payloads are discarded with this endpoint.
-    pub async fn stop(self) {
+    /// Offered and partially received payloads are discarded. The source is returned so the
+    /// session can preserve origin versions and echo suppression across opt-in restarts.
+    pub async fn stop(self) -> cb::Source {
         self.runtime.stop().await;
+        self.source
+    }
+
+    /// Restores the session's source state after restarting the clipboard runtime.
+    pub fn restore_source(&mut self, source: cb::Source) {
+        self.source = source;
     }
 
     /// Whether clipboard transfers are on, for `Status.clipboard_enabled`.
