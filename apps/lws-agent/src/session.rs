@@ -2656,6 +2656,8 @@ mod tests {
                 require_emergency_hotkey: true,
                 core_silence_ms: 300,
                 allow_portal_sessions: false,
+                edge_effects: true,
+                hide_cursor: true,
             }))
             .await;
         match harness.recv().await {
