@@ -45,6 +45,96 @@ fn two_nodes_with_clipboard() -> Harness {
     harness
 }
 
+/// Drive the real GUI command and require its unsolicited Status push.
+fn toggle_clipboard(node: &common::Node, enabled: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("GUI runtime");
+    runtime.block_on(async {
+        let connection = ipc::transport::connect(&common::gui_endpoint_of(&node.root))
+            .await
+            .expect("GUI connection");
+        let mut link = ipc::GuiLink::new(connection);
+        link.send(
+            1,
+            protocol::ipc::gui_frame::Msg::SetClipboard(protocol::ipc::SetClipboard { enabled }),
+        )
+        .await
+        .expect("send explicit opt-in");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut answered = false;
+            let mut pushed = false;
+            while !answered || !pushed {
+                let frame = link.recv().await.expect("GUI frame");
+                match frame.msg {
+                    Some(protocol::ipc::gui_frame::Msg::OpResult(result))
+                        if frame.request_id == 1 =>
+                    {
+                        assert!(result.ok, "toggle refused: {}", result.error_code);
+                        answered = true;
+                    }
+                    Some(protocol::ipc::gui_frame::Msg::Status(status))
+                        if frame.request_id == 0 && status.clipboard_enabled == enabled =>
+                    {
+                        pushed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("toggle answer and pushed Status");
+    });
+    let config = config::Config::load(&node.root.join("config/config.toml")).expect("saved config");
+    assert_eq!(config.clipboard.enabled, enabled, "opt-in must survive restart");
+}
+
+fn clipboard_address(node: &common::Node) -> std::net::SocketAddr {
+    let config = config::Config::load(&node.root.join("config/config.toml")).expect("config");
+    std::net::SocketAddr::from(([127, 0, 0, 1], config.network.port_clipboard))
+}
+
+#[test]
+fn gui_opt_in_starts_default_off_clipboards_and_off_closes_the_listener() {
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    let address = clipboard_address(&harness.b);
+    assert!(std::net::TcpStream::connect(address).is_err());
+    toggle_clipboard(&harness.a, true);
+    toggle_clipboard(&harness.b, true);
+    let text = payload("gui-opt-in", 64);
+    harness.a.copy_to_clipboard(&text);
+    harness.b.wait_for_clipboard(&text, SETTLE).expect("GUI opt-in copy reaches B");
+    toggle_clipboard(&harness.b, false);
+    assert!(std::net::TcpStream::connect(address).is_err(), "disabled listener is closed");
+    let listener = std::net::TcpListener::bind(address).expect("off releases the listening port");
+    drop(listener);
+    harness.a.copy_to_clipboard(&payload("while-off", 80));
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(harness.b.clipboard_text().as_deref(), Some(text.as_str()));
+}
+
+#[test]
+fn ten_gui_on_off_cycles_release_sockets_and_keep_peer_delivery_working() {
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    toggle_clipboard(&harness.a, true);
+    let address = clipboard_address(&harness.b);
+    for cycle in 0..10 {
+        toggle_clipboard(&harness.b, true);
+        let text = payload(&format!("cycle-{cycle}"), 64);
+        harness.a.copy_to_clipboard(&text);
+        harness.b.wait_for_clipboard(&text, SETTLE).expect("fresh runtime receives copy");
+        toggle_clipboard(&harness.b, false);
+        assert!(std::net::TcpStream::connect(address).is_err());
+        let listener = std::net::TcpListener::bind(address).expect("no leaked listener");
+        drop(listener);
+    }
+}
+
 /// Distinct payloads, so a later assertion cannot pass on an earlier copy.
 fn payload(tag: &str, len: usize) -> String {
     let mut text = format!("lws-{tag}-{}-", std::process::id());
@@ -139,9 +229,8 @@ fn one_mebibyte_travels_and_one_byte_more_is_refused() {
 }
 
 #[test]
-fn a_node_that_did_not_enable_the_clipboard_is_never_offered_anything() {
-    // «явное включение на обеих сторонах»: B does not claim the capability, so A's copy stays
-    // on A and the refusal is `CLIPBOARD_DISABLED`.
+fn a_node_that_did_not_enable_the_clipboard_never_applies_a_copy() {
+    // Capability advertises adapter support; opting out still forbids any payload application.
     let _serial = common::serial();
     let (harness, ()) = Harness::start_with(false, false, |a_root, _b_root| {
         enable_clipboard(a_root);
@@ -156,10 +245,6 @@ fn a_node_that_did_not_enable_the_clipboard_is_never_offered_anything() {
         .expect("A still holds its own copy");
     std::thread::sleep(Duration::from_secs(2));
 
-    assert!(
-        harness.a.log().contains("CLIPBOARD_DISABLED"),
-        "A must refuse to offer to a peer that did not claim the capability"
-    );
     assert_eq!(
         harness.b.clipboard_text().unwrap_or_default(),
         "",
