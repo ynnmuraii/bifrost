@@ -38,6 +38,7 @@ use protocol::ipc::GuiFrame;
 use ui_text::{fill, fill_named, text, Key, Lang};
 
 pub mod layout;
+pub mod hotkeys;
 
 /// How long a request may stay unanswered before the window says «Служба не отвечает».
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -269,6 +270,8 @@ pub enum Request {
     ClearClipboardHistory,
     /// `SetAppearance`.
     SetAppearance,
+    /// `SetHotkey`.
+    SetHotkey,
     /// `RevokePeer`.
     RevokePeer,
     /// `ExportDiagnostics`.
@@ -298,6 +301,7 @@ impl Request {
             Request::CopyClipboardHistory => text(lang, Key::CopyFromTheHistory),
             Request::ClearClipboardHistory => text(lang, Key::ClearTheClipboardHistory),
             Request::SetAppearance => text(lang, Key::TheEdgeEffects),
+            Request::SetHotkey => text(lang, Key::KeyboardShortcut),
             Request::RevokePeer => text(lang, Key::RemoveAComputerFromThePair),
             Request::ExportDiagnostics => text(lang, Key::SaveTheDiagnostics),
             Request::ResetPortalGrants => text(lang, Key::ForgetThePortalGrants),
@@ -357,18 +361,11 @@ impl Outcome {
 /// The settings the window shows, read from `config.toml`.
 ///
 /// Reading the file is what §5.4 of the build spec asks for and the only reason the GUI
-/// opens it: the hotkeys are shown, never written, and a missing or broken file falls back
-/// to the documented defaults with a line saying so.
+/// opens it. Service-owned settings, including hotkeys, come from IPC status instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalConfig {
     /// `[node].display_name`.
     pub display_name: String,
-    /// `[input].switch_hotkey`.
-    pub switch_hotkey: String,
-    /// `[workspace].claim_hotkey`.
-    pub claim_hotkey: String,
-    /// `[input].emergency_hotkey`.
-    pub emergency_hotkey: String,
     /// `[network].port_input` — the port the other computer dials.
     pub port_input: u16,
     /// `[network].listen_address` — «Адрес этого компьютера в локальной сети».
@@ -396,9 +393,6 @@ impl Default for LocalConfig {
     fn default() -> Self {
         LocalConfig {
             display_name: "Workstation".to_owned(),
-            switch_hotkey: "Ctrl+Alt+Shift+Right".to_owned(),
-            claim_hotkey: "Ctrl+Alt+Shift+F11".to_owned(),
-            emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
             port_input: 47901,
             listen_address: String::new(),
             config_file: PathBuf::new(),
@@ -425,9 +419,6 @@ impl LocalConfig {
         match config::Config::load(&file) {
             Ok(loaded) => {
                 config.display_name = loaded.node.display_name.clone();
-                config.switch_hotkey = loaded.input.switch_hotkey.clone();
-                config.claim_hotkey = loaded.workspace.claim_hotkey.clone();
-                config.emergency_hotkey = loaded.input.emergency_hotkey.clone();
                 config.port_input = loaded.network.port_input;
                 config.listen_address = loaded.network.listen_address.clone();
             }
@@ -818,6 +809,8 @@ pub struct ViewModel {
     pub look: crate::gui_settings::Look,
     /// The last `Status`, kept across a disconnect so the window is not blank.
     pub status: Option<ipc::Status>,
+    /// The latest shortcut validation or portal-registration feedback.
+    pub hotkeys_error: Option<String>,
     /// The editor's model.
     pub editor: LayoutEditor,
     /// The pairing screen's state.
@@ -866,6 +859,7 @@ impl ViewModel {
             modal: None,
             look: crate::gui_settings::Look::default(),
             status: None,
+            hotkeys_error: None,
             editor: LayoutEditor::default(),
             pairing: Pairing::default(),
             settings: Settings::default(),
@@ -1277,6 +1271,14 @@ impl ViewModel {
             // Copy requests are applied by the core; this GUI never needs full text.
             Msg::ClipboardHistoryItem(_) => {}
             Msg::OpResult(result) => self.apply_op_result(frame.request_id, result),
+            Msg::HotkeysResult(result) => {
+                self.hotkeys_error = (!result.detail.is_empty()).then_some(result.detail);
+                if result.success {
+                    if let Some(status) = self.status.as_mut() {
+                        status.hotkeys = result.bindings;
+                    }
+                }
+            }
             // The pushed half of the contract never arrives here; a GUI that gets one of its
             // own requests back is talking to something that is not a core.
             other => self.push_log(fill(
@@ -2261,6 +2263,13 @@ pub enum Action {
         /// Hide the source cursor during remote input.
         hide_remote_cursor: bool,
     },
+    /// Change a core-owned shortcut binding.
+    SetHotkey {
+        /// `ipc::HotkeyAction`.
+        action: i32,
+        /// Canonical chord text, or empty to disable an optional action.
+        chord: String,
+    },
     /// Apply the edited layout document.
     UpdateTopology {
         /// The document, in the `[topology]` schema.
@@ -2402,6 +2411,13 @@ impl Action {
                 Msg::SetAppearance(ipc::SetAppearance {
                     edge_effects: *edge_effects,
                     hide_remote_cursor: *hide_remote_cursor,
+                }),
+            ),
+            Action::SetHotkey { action, chord } => (
+                Request::SetHotkey,
+                Msg::SetHotkey(ipc::SetHotkey {
+                    action: *action,
+                    chord: chord.clone(),
                 }),
             ),
             Action::UpdateTopology {
@@ -3390,6 +3406,8 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::ClipboardHistory(_) => "ClipboardHistory",
         Msg::ClipboardHistoryItem(_) => "ClipboardHistoryItem",
         Msg::SetAppearance(_) => "SetAppearance",
+        Msg::SetHotkey(_) => "SetHotkey",
+        Msg::HotkeysResult(_) => "HotkeysResult",
         Msg::RevokePeer(_) => "RevokePeer",
         Msg::ExportDiagnostics(_) => "ExportDiagnostics",
         Msg::ResetPortalGrants(_) => "ResetPortalGrants",
@@ -3458,6 +3476,7 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::CopyClipboardHistory => text(lang, Key::TheTextIsCopied).to_owned(),
         Request::ClearClipboardHistory => text(lang, Key::TheClipboardHistoryIsCleared).to_owned(),
         Request::SetAppearance => text(lang, Key::TheEdgeEffectsWereSwitched).to_owned(),
+        Request::SetHotkey => text(lang, Key::KeyboardShortcutSaved).to_owned(),
         Request::RevokePeer => text(lang, Key::TheComputerWasRemovedFromThePair).to_owned(),
         Request::ResetPortalGrants => text(lang, Key::ThePortalGrantsWereForgotten).to_owned(),
         Request::RetryAgent => text(lang, Key::TheInputServiceIsStartingAgain).to_owned(),

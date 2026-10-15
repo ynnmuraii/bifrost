@@ -351,6 +351,15 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         connected: true,
         clipboard_enabled: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
+        hotkeys: lws_gui::view_model::hotkeys::ROWS
+            .iter()
+            .map(|(action, _, chord)| ipc::HotkeyBinding {
+                action: *action,
+                chord: (*chord).to_owned(),
+                available: true,
+                detail: String::new(),
+            })
+            .collect(),
         backend: "platform-win".to_owned(),
         // `[appearance]` as `config::AppearanceConfig` defaults it: both effects on.
         edge_effects: true,

@@ -63,6 +63,20 @@ pub fn status_with(focus: &str) -> ipc::Status {
         edge_effects: true,
         hide_remote_cursor: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
+        hotkeys: config::HotkeyBindings::default()
+            .iter()
+            .map(|(action, chord)| ipc::HotkeyBinding {
+                action: match action {
+                    config::HotkeyAction::EmergencyRelease => 1,
+                    config::HotkeyAction::SwitchNext => 2,
+                    config::HotkeyAction::ReturnLocal => 3,
+                    config::HotkeyAction::ClaimOwnership => 4,
+                },
+                chord: chord.to_owned(),
+                available: true,
+                detail: String::new(),
+            })
+            .collect(),
         rtt_p95_us: 0,
         rtt_jitter_us: 0,
         last_error_code: String::new(),
