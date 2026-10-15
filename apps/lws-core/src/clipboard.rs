@@ -102,6 +102,17 @@ pub enum Out {
     },
     /// Hand this frame to the agent.
     Agent(ipc::agent_frame::Msg),
+    /// A completed transfer, for the session-owned history ring.
+    History {
+        /// The transfer's remote peer.
+        peer: NodeId,
+        /// Which side sent the payload.
+        direction: ipc::ClipboardHistoryDirection,
+        /// Full verified UTF-8 text.
+        text: String,
+        /// Secret text must be discarded by history.
+        secret: bool,
+    },
     /// Tell the peer why a transfer is off (`ClipboardCancel` with the documented code).
     Cancel {
         /// The peer.
@@ -116,6 +127,15 @@ pub enum Out {
 /// What the runtime tells the session loop.
 #[derive(Debug)]
 pub enum Inbound {
+    /// A full outbound transfer successfully written to its channel.
+    Sent {
+        /// The receiving peer.
+        peer: NodeId,
+        /// The original payload, recovered without cloning.
+        text: String,
+        /// Secret classification captured with the request.
+        secret: bool,
+    },
     /// A peer's clipboard channel is accepted, bound and validated; its messages follow.
     Bound {
         /// Which peer.
@@ -164,6 +184,7 @@ pub struct Clipboard {
     local: Option<LocalAssembly>,
     /// The payload of the local clipboard, kept so a member that joins later still gets it.
     payload: Vec<u8>,
+    payload_secret: bool,
     /// The outbound queue capacity a channel runtime is given.
     queue_capacity: usize,
     /// `network.port_clipboard`: the port this node's own listener is bound to, which every
@@ -189,6 +210,7 @@ struct Incoming {
     /// Who is sending it: only that peer may complete it, and it ends with that peer's link.
     peer: NodeId,
     offer: cb::Offer,
+    secret: bool,
     assembler: cb::Assembler,
 }
 
@@ -230,6 +252,7 @@ impl Clipboard {
             down: BTreeSet::new(),
             local: None,
             payload: Vec::new(),
+            payload_secret: false,
             queue_capacity,
             clipboard_port: listen.port(),
         };
@@ -417,6 +440,7 @@ impl Clipboard {
             "clipboard offer"
         );
         self.payload = payload;
+        self.payload_secret = !markers.is_empty();
         // «Локальное копирование побеждает» — see the top of this function: the incoming side
         // was cancelled before the policy ran. The outgoing offers carry the payload this copy
         // replaced, so they go too.
@@ -443,6 +467,7 @@ impl Clipboard {
                 origin_version: offer.version,
                 mime: cb::MIME.to_owned(),
                 size_bytes: offer.size,
+                secret_marked: self.payload_secret,
             };
             if state.channel.is_some() {
                 // A bound channel still follows Offer → Request → Data. Retain this copy
@@ -549,6 +574,7 @@ impl Clipboard {
                 origin_version,
                 mime,
                 size_bytes,
+                secret_marked,
             } => {
                 self.on_offer(
                     peer,
@@ -557,6 +583,7 @@ impl Clipboard {
                     origin_version,
                     mime,
                     size_bytes,
+                    secret_marked,
                 )
                 .await
             }
@@ -566,10 +593,23 @@ impl Clipboard {
                     Some((offer, _)) if offer_id_of(offer) == Some(offer_id)
                 );
                 if asked {
-                    if let Some((_, payload)) = self.offered.remove(&peer) {
+                    if let Some((offer, payload)) = self.offered.remove(&peer) {
+                        let secret = matches!(
+                            offer,
+                            ClipboardMessage::Offer {
+                                secret_marked: true,
+                                ..
+                            }
+                        );
                         let _ = self
                             .runtime
-                            .send_transfer(peer, offer_id, payload, self.settings.rate_bytes_per_s)
+                            .send_transfer(
+                                peer,
+                                offer_id,
+                                payload,
+                                self.settings.rate_bytes_per_s,
+                                secret,
+                            )
                             .await;
                     }
                 }
@@ -621,7 +661,15 @@ impl Clipboard {
                             version = incoming.offer.version,
                             "clipboard payload applied"
                         );
-                        self.deliver_to_agent(text, incoming.offer.version)
+                        self.payload.clear();
+                        let mut out = agent_text_chunks(&text, incoming.offer.version);
+                        out.push(Out::History {
+                            peer,
+                            direction: ipc::ClipboardHistoryDirection::Received,
+                            text,
+                            secret: incoming.secret,
+                        });
+                        out
                     }
                     Err(error) => {
                         tracing::warn!(peer = %peer, ?error, "clipboard payload refused");
@@ -669,6 +717,7 @@ impl Clipboard {
         origin_version: u64,
         mime: String,
         size_bytes: u64,
+        secret: bool,
     ) -> Vec<Out> {
         if !self.settings.enabled {
             // `CLIPBOARD_DISABLED`: the receiver is off, so nothing is asked for or applied.
@@ -676,6 +725,13 @@ impl Clipboard {
                 peer,
                 offer_id,
                 reason: cb::ClipboardError::Disabled,
+            }];
+        }
+        if secret && self.settings.policy.skip_secret_marked {
+            return vec![Out::Cancel {
+                peer,
+                offer_id,
+                reason: cb::ClipboardError::Secret,
             }];
         }
         if mime != cb::MIME {
@@ -727,6 +783,7 @@ impl Clipboard {
             Incoming {
                 peer,
                 offer,
+                secret,
                 assembler,
             },
         );
@@ -761,31 +818,22 @@ impl Clipboard {
             .await;
     }
 
-    /// Hands verified text to the agent, in chunks that fit an IPC frame.
-    fn deliver_to_agent(&mut self, text: String, version: u64) -> Vec<Out> {
-        self.payload = Vec::new();
-        let bytes = text.into_bytes();
-        let count = chunks_of(bytes.len());
-        let hash = cb::sha256(&bytes);
-        (0..count)
-            .map(|index| {
-                let start = index as usize * IPC_CHUNK_BYTES;
-                let end = (start + IPC_CHUNK_BYTES).min(bytes.len());
-                Out::Agent(ipc::agent_frame::Msg::SetClipboardText(
-                    ipc::SetClipboardText {
-                        origin_version: version,
-                        chunk_index: index,
-                        chunk_count: count,
-                        data: bytes[start..end].to_vec(),
-                        sha256: if index + 1 == count {
-                            hash.clone()
-                        } else {
-                            Vec::new()
-                        },
-                    },
-                ))
+    /// Applies history locally without minting a network offer, even when sharing is disabled.
+    pub(crate) fn history_to_agent(&mut self, text: &str) -> Vec<Out> {
+        self.payload.clear();
+        self.offered.clear();
+        self.waiting.clear();
+        self.pending_request = None;
+        let mut out: Vec<_> = std::mem::take(&mut self.incoming)
+            .into_iter()
+            .map(|(offer_id, incoming)| Out::Cancel {
+                peer: incoming.peer,
+                offer_id,
+                reason: cb::ClipboardError::Superseded,
             })
-            .collect()
+            .collect();
+        out.extend(history_to_agent(&mut self.source, text));
+        out
     }
 
     /// A member's input link came up: remember its connection id and clipboard capability,
@@ -842,6 +890,49 @@ impl Clipboard {
             state.channel = None;
         }
     }
+}
+
+/// Chunks a history item for the local agent without offering it to any peer.
+pub(crate) fn history_to_agent(source: &mut cb::Source, text: &str) -> Vec<Out> {
+    let offer = source
+        .local_copy(
+            &cb::Content::text(text.len() as u64),
+            &[],
+            &cb::Policy {
+                enabled: true,
+                skip_secret_marked: true,
+                max_bytes: cb::MAX_BYTES,
+            },
+            [0; 16],
+        )
+        .expect("history text is bounded by the clipboard payload limit");
+    source.apply_from_peer(&offer);
+    agent_text_chunks(text, offer.version)
+}
+
+fn agent_text_chunks(text: &str, version: u64) -> Vec<Out> {
+    let bytes = text.as_bytes();
+    let count = chunks_of(bytes.len());
+    let hash = cb::sha256(bytes);
+    (0..count)
+        .map(|index| {
+            let start = index as usize * IPC_CHUNK_BYTES;
+            let end = (start + IPC_CHUNK_BYTES).min(bytes.len());
+            Out::Agent(ipc::agent_frame::Msg::SetClipboardText(
+                ipc::SetClipboardText {
+                    origin_version: version,
+                    chunk_index: index,
+                    chunk_count: count,
+                    data: bytes[start..end].to_vec(),
+                    sha256: if index + 1 == count {
+                        hash.clone()
+                    } else {
+                        Vec::new()
+                    },
+                },
+            ))
+        })
+        .collect()
 }
 
 /// `chunk_count` for an IPC payload: `1..=64` (`MAX_FRAME_IPC` is 64 KiB, so 64 frames reach
@@ -984,7 +1075,7 @@ struct Inner {
 
 struct Conn {
     generation: u64,
-    tx: mpsc::Sender<ClipboardMessage>,
+    tx: mpsc::Sender<QueuedMessage>,
     reader: tokio::task::AbortHandle,
     writer: tokio::task::AbortHandle,
     transfers: BTreeMap<[u8; 16], tokio::task::AbortHandle>,
@@ -1131,7 +1222,13 @@ impl Handle {
             .get(&peer)
             .map(|conn| conn.tx.clone());
         match channel {
-            Some(tx) => tx.send(message).await.map_err(|_| ()),
+            Some(tx) => tx
+                .send(QueuedMessage {
+                    message,
+                    written: None,
+                })
+                .await
+                .map_err(|_| ()),
             None => Err(()),
         }
     }
@@ -1143,6 +1240,7 @@ impl Handle {
         offer_id: [u8; 16],
         payload: Vec<u8>,
         rate_bytes_per_s: u64,
+        secret: bool,
     ) -> Result<(), ()> {
         let mut inner = self.inner.lock().await;
         let Some(conn) = inner.conns.get_mut(&peer) else {
@@ -1162,6 +1260,7 @@ impl Handle {
             Outgoing::new(offer_id, payload, rate_bytes_per_s, cb::MAX_BYTES, 0).map_err(|_| ())?;
         let size = outgoing.size_bytes();
         let started = Instant::now();
+        let events = self.events.clone();
         let task = tokio::spawn(async move {
             while let Some((message, delay_ms)) =
                 outgoing.next(started.elapsed().as_millis() as u64)
@@ -1169,11 +1268,25 @@ impl Handle {
                 if delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
-                if tx.send(message).await.is_err() {
+                let (written, completion) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(QueuedMessage {
+                        message,
+                        written: Some(written),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if !matches!(completion.await, Ok(true)) {
                     return;
                 }
             }
             tracing::info!(peer = %peer, bytes = size, "clipboard transfer sent");
+            if let Ok(text) = String::from_utf8(outgoing.into_payload()) {
+                let _ = events.send(Inbound::Sent { peer, text, secret }).await;
+            }
         });
         if let Some(old) = conn.transfers.insert(offer_id, task.abort_handle()) {
             old.abort();
@@ -1425,9 +1538,18 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Writes one channel's queue; the reader is a separate task so a blocked read never stalls a
 /// send (`KVM-042`).
-async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<ClipboardMessage>) {
-    while let Some(message) = outbound.recv().await {
-        if writer.send(message).await.is_err() {
+struct QueuedMessage {
+    message: ClipboardMessage,
+    written: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<QueuedMessage>) {
+    while let Some(queued) = outbound.recv().await {
+        let success = writer.send(queued.message).await.is_ok();
+        if let Some(written) = queued.written {
+            let _ = written.send(success);
+        }
+        if !success {
             return;
         }
     }
@@ -1436,6 +1558,134 @@ async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sent_history_requires_successful_final_write_and_keeps_secret_flag() {
+        for (secret, success) in [(false, true), (true, true), (true, false)] {
+            let (mut endpoint, root) = started_clipboard("history-sent").await;
+            let (events, mut received) = mpsc::channel(4);
+            endpoint.runtime.events = events;
+            let peer = [0x21; 32].into();
+            let (tx, mut rx) = mpsc::channel::<QueuedMessage>(4);
+            let reader = tokio::spawn(std::future::pending::<()>());
+            let writer = tokio::spawn(std::future::pending::<()>());
+            endpoint.runtime.inner.lock().await.conns.insert(
+                peer,
+                Conn {
+                    generation: 1,
+                    tx,
+                    reader: reader.abort_handle(),
+                    writer: writer.abort_handle(),
+                    transfers: BTreeMap::new(),
+                },
+            );
+            endpoint
+                .runtime
+                .send_transfer(peer, [0x41; 16], b"text".to_vec(), cb::MAX_BYTES, secret)
+                .await
+                .expect("sender");
+            let data = rx.recv().await.expect("data");
+            assert!(matches!(data.message, ClipboardMessage::Data { .. }));
+            data.written.expect("ack").send(true).expect("sender");
+            let complete = rx.recv().await.expect("complete");
+            assert!(matches!(
+                complete.message,
+                ClipboardMessage::Complete { .. }
+            ));
+            assert!(
+                received.try_recv().is_err(),
+                "enqueueing Complete is not completion"
+            );
+            complete
+                .written
+                .expect("ack")
+                .send(success)
+                .expect("sender");
+            let event = tokio::time::timeout(Duration::from_millis(100), received.recv()).await;
+            if success {
+                assert!(
+                    matches!(event, Ok(Some(Inbound::Sent { peer: sent_peer, text, secret: marked }))
+                    if sent_peer == peer && text == "text" && marked == secret)
+                );
+            } else {
+                assert!(event.is_err(), "a failed final write is never recorded");
+            }
+            endpoint.stop().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+    #[test]
+    fn history_copy_is_local_full_sized_and_monotonic() {
+        let mut source = cb::Source::new([1; 32]);
+        let text = "я".repeat(cb::MAX_BYTES as usize / 2);
+        for version in 1..=2 {
+            let out = history_to_agent(&mut source, &text);
+            assert_eq!(out.len(), 32);
+            let mut received = Vec::new();
+            for event in out {
+                let Out::Agent(ipc::agent_frame::Msg::SetClipboardText(chunk)) = event else {
+                    panic!("history copy must not offer to a peer");
+                };
+                assert_eq!(chunk.origin_version, version);
+                received.extend(chunk.data);
+                if chunk.chunk_index + 1 == chunk.chunk_count {
+                    assert_eq!(chunk.sha256, cb::sha256(&received));
+                }
+            }
+            assert_eq!(received, text.as_bytes());
+            assert!(
+                source.applied_from_peer(),
+                "history is never a network source"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_received_history_retains_offer_secret_classification() {
+        for secret in [false, true] {
+            let (mut endpoint, root) = started_clipboard("history-received").await;
+            endpoint.settings.policy.skip_secret_marked = false;
+            let peer = [0x21; 32].into();
+            let offer_id = [0x41; 16];
+            endpoint
+                .on_offer(
+                    peer,
+                    offer_id,
+                    &[0x31; 32],
+                    1,
+                    cb::MIME.to_owned(),
+                    4,
+                    secret,
+                )
+                .await;
+            endpoint
+                .on_peer_message(
+                    peer,
+                    ClipboardMessage::Data {
+                        offer_id,
+                        chunk_index: 0,
+                        chunk_count: 1,
+                        data: b"text".to_vec(),
+                    },
+                )
+                .await;
+            let out = endpoint
+                .on_peer_message(
+                    peer,
+                    ClipboardMessage::Complete {
+                        offer_id,
+                        sha256: cb::sha256(b"text"),
+                    },
+                )
+                .await;
+            assert!(out.iter().any(|event| matches!(event, Out::History {
+                peer: sender, direction: ipc::ClipboardHistoryDirection::Received,
+                text, secret: marked,
+            } if *sender == peer && text == "text" && *marked == secret)));
+            endpoint.stop().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
     #[tokio::test]
     async fn peer_cancel_stops_only_the_matching_paced_sender() {
@@ -1462,6 +1712,7 @@ mod tests {
             origin_version: 1,
             mime: cb::MIME.to_owned(),
             size_bytes: (cb::CHUNK_BYTES * 3) as u64,
+            secret_marked: false,
         };
         endpoint.offered.insert(peer, (offer.clone(), Vec::new()));
         endpoint.waiting.insert(peer, (offer, Vec::new()));
@@ -1472,6 +1723,7 @@ mod tests {
                 offer_id,
                 vec![b'x'; cb::CHUNK_BYTES * 3],
                 cb::CHUNK_BYTES as u64 * 4,
+                false,
             )
             .await
             .expect("sender starts");
@@ -1480,9 +1732,14 @@ mod tests {
             .expect("first chunk")
             .expect("channel");
         assert!(matches!(
-            first,
+            first.message,
             ClipboardMessage::Data { chunk_index: 0, .. }
         ));
+        first
+            .written
+            .expect("write acknowledgement")
+            .send(true)
+            .expect("sender alive");
         for (sender, id) in [(other, offer_id), (peer, [0x42; 16])] {
             endpoint
                 .on_peer_message(
@@ -1518,7 +1775,7 @@ mod tests {
         );
         endpoint
             .runtime
-            .send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3], 1)
+            .send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3], 1, false)
             .await
             .expect("another paced transfer");
         endpoint.runtime.close(peer).await;
@@ -1547,7 +1804,7 @@ mod tests {
             let second = [0x42; 16];
             offer_and_data(&mut endpoint, peer, first, b"old").await;
             assert!(endpoint
-                .on_offer(peer, second, &[0x31; 32], 10, cb::MIME.to_owned(), 5)
+                .on_offer(peer, second, &[0x31; 32], 10, cb::MIME.to_owned(), 5, false)
                 .await
                 .is_empty());
             assert_eq!(endpoint.incoming.len(), 2);
@@ -1881,6 +2138,7 @@ mod tests {
                     origin_version: 9,
                     mime: cb::MIME.to_owned(),
                     size_bytes: size,
+                    secret_marked: false,
                 },
             )
             .await;
@@ -1986,6 +2244,7 @@ mod tests {
                     origin_version: 9,
                     mime: cb::MIME.to_owned(),
                     size_bytes: text.len() as u64,
+                    secret_marked: false,
                 },
             )
             .await;

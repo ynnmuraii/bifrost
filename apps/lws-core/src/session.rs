@@ -454,6 +454,8 @@ pub struct Session {
     clipboard_source: Option<clipboard::Source>,
     /// Live input-link bindings replayed when clipboard sharing is enabled.
     clipboard_links: BTreeMap<NodeId, ([u8; 16], bool, std::net::IpAddr)>,
+    /// Session-only transferred texts; never persisted with configuration or diagnostics.
+    clipboard_history: crate::clipboard_history::History,
     /// The GUI's endpoint and the fan-out of pushed events.
     gui: crate::gui::Server,
     /// Requests from the connected GUIs, one per turn of the loop.
@@ -603,6 +605,7 @@ impl Session {
             clipboard_listen,
             clipboard_source: None,
             clipboard_links: BTreeMap::new(),
+            clipboard_history: crate::clipboard_history::History::default(),
             gui: gui_server,
             gui_requests,
             gui_requests_tx,
@@ -2565,21 +2568,27 @@ impl Session {
 
     /// One event from the clipboard runtime.
     async fn on_clipboard(&mut self, event: crate::clipboard::Inbound) {
-        let out = match self.clipboard.as_mut() {
-            Some(clipboard) => match event {
-                crate::clipboard::Inbound::Bound { peer, channel_id } => {
-                    tracing::info!(peer = %peer, "clipboard channel bound");
-                    clipboard.on_bound(peer, channel_id).await
-                }
-                crate::clipboard::Inbound::Message { peer, message } => {
-                    clipboard.on_peer_message(peer, message).await
-                }
-                crate::clipboard::Inbound::Down { peer } => {
-                    clipboard.on_channel_down(peer).await;
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
+        let out = match (self.clipboard.as_mut(), event) {
+            (_, crate::clipboard::Inbound::Sent { peer, text, secret }) => {
+                vec![crate::clipboard::Out::History {
+                    peer,
+                    direction: protocol::ipc::ClipboardHistoryDirection::Sent,
+                    text,
+                    secret,
+                }]
+            }
+            (Some(clipboard), crate::clipboard::Inbound::Bound { peer, channel_id }) => {
+                tracing::info!(peer = %peer, "clipboard channel bound");
+                clipboard.on_bound(peer, channel_id).await
+            }
+            (Some(clipboard), crate::clipboard::Inbound::Message { peer, message }) => {
+                clipboard.on_peer_message(peer, message).await
+            }
+            (Some(clipboard), crate::clipboard::Inbound::Down { peer }) => {
+                clipboard.on_channel_down(peer).await;
+                Vec::new()
+            }
+            (None, _) => Vec::new(),
         };
         self.apply_clipboard(out).await;
     }
@@ -2618,6 +2627,24 @@ impl Session {
                     if let Err(error) = self.agent.send(frame).await {
                         tracing::warn!(%error, "cannot reach the agent");
                         self.on_agent_lost().await;
+                    }
+                }
+                crate::clipboard::Out::History {
+                    peer,
+                    direction,
+                    text,
+                    secret,
+                } => {
+                    if !secret {
+                        let name = self
+                            .trust
+                            .get(&peer)
+                            .map(|record| record.display_name.clone())
+                            .unwrap_or_else(|| peer.to_string());
+                        self.clipboard_history.record(direction, name, text, false);
+                        self.publish(protocol::ipc::gui_frame::Msg::ClipboardHistory(
+                            self.clipboard_history.entries(),
+                        ));
                     }
                 }
                 crate::clipboard::Out::Cancel {

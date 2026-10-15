@@ -243,6 +243,7 @@ async fn a_transfer_round_trips_in_chunks() {
                 origin_version: 1,
                 mime: clipboard::MIME.to_owned(),
                 size_bytes: payload_len,
+                secret_marked: true,
             })
             .await
             .expect("offer");
@@ -270,10 +271,14 @@ async fn a_transfer_round_trips_in_chunks() {
         loop {
             match server_conn.recv().await.expect("clipboard recv") {
                 ClipboardMessage::Offer {
-                    size_bytes, mime, ..
+                    size_bytes,
+                    mime,
+                    secret_marked,
+                    ..
                 } => {
                     assert_eq!(size_bytes, payload_len);
                     assert_eq!(mime, clipboard::MIME);
+                    assert!(secret_marked, "secret classification survives the wire");
                     server_conn
                         .send(ClipboardMessage::Request { offer_id })
                         .await
@@ -339,6 +344,7 @@ fn every_limit_is_refused() {
         origin_version: 0,
         mime: clipboard::MIME.to_owned(),
         size_bytes: 1024 * 1024 + 1,
+        secret_marked: false,
     };
     assert_eq!(too_large.validate(), Err(ClipboardViolation::TooLarge));
 
@@ -370,6 +376,7 @@ fn every_limit_is_refused() {
         origin_version: 0,
         mime: "text/html".to_owned(),
         size_bytes: 10,
+        secret_marked: false,
     };
     assert_eq!(bad_mime.validate(), Err(ClipboardViolation::BadMime));
 
@@ -487,6 +494,7 @@ async fn the_first_frame_must_be_a_bind() {
         origin_version: 0,
         mime: clipboard::MIME.to_owned(),
         size_bytes: 10,
+        secret_marked: false,
     };
     let envelope = offer.to_envelope(1, &bad_parent).expect("envelope");
     let frame = encode_message(Channel::Clipboard, &envelope).expect("frame");

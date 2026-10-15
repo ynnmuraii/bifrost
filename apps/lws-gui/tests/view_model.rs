@@ -24,6 +24,142 @@ use support::{
 };
 
 #[test]
+fn clipboard_history_actions_map_to_metadata_core_copy_and_clear_requests() {
+    assert!(matches!(
+        Action::RefreshClipboardHistory.wire(),
+        Some((Request::GetClipboardHistory, Msg::GetClipboardHistory(_)))
+    ));
+    let Some((request, Msg::GetClipboardHistoryItem(item))) =
+        Action::CopyClipboardHistory(42).wire()
+    else {
+        panic!("copy must request a history item");
+    };
+    assert_eq!(request, Request::CopyClipboardHistory);
+    assert_eq!(item.id, 42);
+    assert!(item.copy_to_local, "the core must apply the text locally");
+    assert!(matches!(
+        Action::ClearClipboardHistory.wire(),
+        Some((
+            Request::ClearClipboardHistory,
+            Msg::ClearClipboardHistory(_)
+        ))
+    ));
+}
+
+#[test]
+fn clipboard_history_metadata_is_newest_first_and_full_text_is_not_retained() {
+    let mut vm = view();
+    vm.apply(event(Msg::ClipboardHistory(
+        protocol::ipc::ClipboardHistory {
+            items: vec![
+                protocol::ipc::ClipboardHistoryEntry {
+                    id: 1,
+                    direction: protocol::ipc::ClipboardHistoryDirection::Sent as i32,
+                    peer_name: "laptop".to_owned(),
+                    time_unix_ms: 100,
+                    size_bytes: 6,
+                    preview: "older".to_owned(),
+                },
+                protocol::ipc::ClipboardHistoryEntry {
+                    id: 2,
+                    direction: protocol::ipc::ClipboardHistoryDirection::Received as i32,
+                    peer_name: "desktop".to_owned(),
+                    time_unix_ms: 200,
+                    size_bytes: 1_048_576,
+                    preview: "newer".to_owned(),
+                },
+            ],
+        },
+    )));
+    assert_eq!(
+        vm.clipboard_history
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![2, 1],
+    );
+    let latest = vm.clipboard_history[0].clone();
+    assert_eq!(latest.peer_name, "desktop");
+    assert_eq!(latest.time_unix_ms, 200);
+    assert_eq!(latest.size_bytes, 1_048_576);
+    assert_eq!(
+        latest.direction,
+        protocol::ipc::ClipboardHistoryDirection::Received as i32
+    );
+    vm.apply(event(Msg::ClipboardHistoryItem(
+        protocol::ipc::ClipboardHistoryItem {
+            id: 2,
+            text: "not retained by the GUI".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+        },
+    )));
+    assert_eq!(vm.clipboard_history[0], latest);
+}
+
+#[test]
+fn opening_clipboard_history_and_clearing_it_refresh_metadata() {
+    let mut vm = view();
+    vm.local(&Action::ToggleModal(Modal::Clip));
+    let requests = vm.take_outgoing();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(&requests[0].1, Msg::GetClipboardHistory(_)));
+    vm.local(&Action::ToggleModal(Modal::Clip));
+    assert!(vm.take_outgoing().is_empty(), "closing does not refresh");
+
+    vm.clipboard_history
+        .push(protocol::ipc::ClipboardHistoryEntry {
+            id: 42,
+            ..Default::default()
+        });
+    let id = vm.begin_request(Request::ClearClipboardHistory, Instant::now());
+    verdict(&mut vm, id, None);
+    assert!(
+        vm.clipboard_history.is_empty(),
+        "clear acknowledgment removes stale metadata"
+    );
+    let requests = vm.take_outgoing();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(&requests[0].1, Msg::GetClipboardHistory(_)));
+}
+
+#[test]
+fn clipboard_history_is_session_scoped_and_failed_clear_keeps_metadata() {
+    let mut vm = view();
+    vm.clipboard_history
+        .push(protocol::ipc::ClipboardHistoryEntry {
+            id: 42,
+            ..Default::default()
+        });
+    let id = vm.begin_request(Request::ClearClipboardHistory, Instant::now());
+    verdict(&mut vm, id, Some("FAILED"));
+    assert_eq!(vm.clipboard_history.len(), 1);
+    assert!(vm.take_outgoing().is_empty());
+    vm.on_disconnected("core stopped".to_owned());
+    assert!(vm.clipboard_history.is_empty());
+}
+
+#[test]
+fn clipboard_history_copy_acknowledgment_is_local_and_localized() {
+    let mut vm = view();
+    vm.look.language = ui_text::Lang::En;
+    let id = vm.begin_request(Request::CopyClipboardHistory, Instant::now());
+    verdict(&mut vm, id, None);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "copy must not request a peer transfer"
+    );
+    assert_eq!(
+        Request::CopyClipboardHistory.label(vm.look.language),
+        ui_text::text(ui_text::Lang::En, ui_text::Key::CopyFromTheHistory),
+    );
+    assert_eq!(
+        vm.outcome.as_ref().unwrap().text,
+        ui_text::text(ui_text::Lang::En, ui_text::Key::TheTextIsCopied),
+    );
+}
+
+#[test]
 fn a_status_fills_the_screen_and_the_focus_says_where_input_goes() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));

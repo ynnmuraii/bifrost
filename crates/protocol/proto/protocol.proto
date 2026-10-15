@@ -333,6 +333,7 @@ message ClipboardOffer {
   string mime = 4;             // text/plain;charset=utf-8
   uint64 size_bytes = 5;       // <= 1048576
   reserved 6; reserved "sha256"; // hash moved to ClipboardComplete
+  bool secret_marked = 7;     // never retain this transfer in clipboard history
 }
 message ClipboardRequest { bytes offer_id = 1; }
 message ClipboardData {

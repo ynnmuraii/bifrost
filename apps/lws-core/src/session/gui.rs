@@ -36,6 +36,54 @@ use crate::gui::Outgoing;
 const ANSWER_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl Session {
+    /// Applies a retained item locally without offering it to another computer.
+    async fn copy_clipboard_history(&mut self, text: &str) -> ipc::OpResult {
+        if !self.capabilities.text_clipboard
+            || self.agent.state() != crate::command::AgentState::Ready
+        {
+            return ipc::OpResult {
+                ok: false,
+                error_code: "CLIPBOARD_DISABLED".to_owned(),
+            };
+        }
+        let actions = match self.clipboard.as_mut() {
+            Some(clipboard) => clipboard.history_to_agent(text),
+            None => {
+                let source = self
+                    .clipboard_source
+                    .get_or_insert_with(|| clipboard::Source::new(*self.node_id.as_bytes()));
+                crate::clipboard::history_to_agent(source, text)
+            }
+        };
+        for action in actions {
+            match action {
+                crate::clipboard::Out::Agent(frame) => {
+                    if let Err(error) = self.agent.send(frame).await {
+                        tracing::warn!(%error, "cannot apply clipboard history to the agent");
+                        self.on_agent_lost().await;
+                        return ipc::OpResult {
+                            ok: false,
+                            error_code: "AGENT_UNAVAILABLE".to_owned(),
+                        };
+                    }
+                }
+                crate::clipboard::Out::Cancel {
+                    peer,
+                    offer_id,
+                    reason,
+                } => {
+                    if let Some(clipboard) = self.clipboard.as_ref() {
+                        clipboard.cancel(peer, offer_id, reason).await;
+                    }
+                }
+                _ => unreachable!(
+                    "a history copy only cancels incoming transfers and sets the agent"
+                ),
+            }
+        }
+        ok()
+    }
+
     /// Publishes a frame to every connected GUI.
     pub(crate) fn publish(&self, message: Msg) {
         crate::gui::Server::publish(&self.gui_events, message);
@@ -402,6 +450,67 @@ impl Session {
             Msg::SetClipboard(set) => {
                 let result = self.set_clipboard(set.enabled).await;
                 answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::GetClipboardHistory(_) => {
+                answer(
+                    &out,
+                    request_id,
+                    Msg::ClipboardHistory(self.clipboard_history.entries()),
+                )
+                .await;
+            }
+            Msg::ClearClipboardHistory(_) => {
+                self.clipboard_history.clear();
+                self.publish(Msg::ClipboardHistory(self.clipboard_history.entries()));
+                answer(&out, request_id, Msg::OpResult(ok())).await;
+            }
+            Msg::GetClipboardHistoryItem(get) => {
+                let Some(text) = self.clipboard_history.text(get.id) else {
+                    answer(
+                        &out,
+                        request_id,
+                        Msg::OpResult(ipc::OpResult {
+                            ok: false,
+                            error_code: "HISTORY_NOT_FOUND".to_owned(),
+                        }),
+                    )
+                    .await;
+                    return;
+                };
+                if get.copy_to_local {
+                    let text = text.to_owned();
+                    let result = self.copy_clipboard_history(&text).await;
+                    answer(&out, request_id, Msg::OpResult(result)).await;
+                } else {
+                    let text = text.to_owned();
+                    // A slow full-text reader must not hold the core's input/session loop.
+                    tokio::spawn(async move {
+                        let mut ranges = Vec::new();
+                        let mut start = 0;
+                        while start < text.len() {
+                            let end = text.floor_char_boundary((start + 16 * 1024).min(text.len()));
+                            ranges.push(start..end);
+                            start = end;
+                        }
+                        if ranges.is_empty() {
+                            ranges.push(0..0);
+                        }
+                        let count = ranges.len() as u32;
+                        for (index, range) in ranges.into_iter().enumerate() {
+                            answer(
+                                &out,
+                                request_id,
+                                Msg::ClipboardHistoryItem(ipc::ClipboardHistoryItem {
+                                    id: get.id,
+                                    text: text[range].to_owned(),
+                                    chunk_index: index as u32,
+                                    chunk_count: count,
+                                }),
+                            )
+                            .await;
+                        }
+                    });
+                }
             }
             Msg::SetAppearance(set) => {
                 let result = self
@@ -856,6 +965,10 @@ impl Session {
         } else if !enabled {
             if let Some(clipboard) = self.clipboard.take() {
                 self.clipboard_source = Some(clipboard.stop().await);
+            }
+            // Completed send events queued before shutdown still describe real transfers.
+            while let Ok(event) = self.clipboard_events.try_recv() {
+                self.on_clipboard(event).await;
             }
             let (_, events) = mpsc::channel(1);
             self.clipboard_events = events;

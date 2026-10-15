@@ -285,6 +285,9 @@ message GuiFrame {
     Shutdown shutdown = 27;               // ask this core to shut down cleanly
     LayoutAuto layout_auto = 28;           // «Расположить автоматически»: rebuild the layout from this desktop
     SwitchTo switch_to = 29;               // «Передать ввод»: the `switch <peer>` control verb (a second call while Remote returns input)
+    GetClipboardHistory get_clipboard_history = 32;
+    GetClipboardHistoryItem get_clipboard_history_item = 33;
+    ClearClipboardHistory clear_clipboard_history = 34;
 
     Status status = 40;          // response and pushed event
     PairingPrompt pairing_prompt = 41;
@@ -292,6 +295,8 @@ message GuiFrame {
     TopologyDoc topology_doc = 43;   // response to GetTopology and pushed on every applied revision
     PendingEdits pending_edits = 44; // response to ListPendingEdits
     PairingWindow pairing_window = 45; // pushed when the pairing window opens, changes or closes
+    ClipboardHistory clipboard_history = 47;
+    ClipboardHistoryItem clipboard_history_item = 48;
   }
 }
 // Also replays the current open PairingWindow and unanswered PairingPrompt as events
@@ -425,3 +430,30 @@ message PendingEdit {
 message PendingEdits { repeated PendingEdit edits = 1; }
 message ApplyPendingEdit { bytes edit_id = 1; }
 message DiscardPendingEdit { bytes edit_id = 1; }
+
+// Session-only history: at most 30 transferred text items, never secret-marked or persisted.
+message GetClipboardHistory {}
+// copy_to_local applies locally and returns OpResult; otherwise returns chunked full text.
+message GetClipboardHistoryItem { uint64 id = 1; bool copy_to_local = 2; }
+// Returns OpResult; the GUI requests fresh history afterward.
+message ClearClipboardHistory {}
+enum ClipboardHistoryDirection {
+  CLIPBOARD_HISTORY_DIRECTION_UNSPECIFIED = 0;
+  CLIPBOARD_HISTORY_DIRECTION_SENT = 1;
+  CLIPBOARD_HISTORY_DIRECTION_RECEIVED = 2;
+}
+message ClipboardHistoryEntry {
+  uint64 id = 1;
+  ClipboardHistoryDirection direction = 2;
+  string peer_name = 3;
+  uint64 time_unix_ms = 4;
+  uint64 size_bytes = 5;
+  string preview = 6; // first 120 Unicode scalar values
+}
+message ClipboardHistory { repeated ClipboardHistoryEntry items = 1; } // newest first
+message ClipboardHistoryItem {
+  uint64 id = 1;
+  string text = 2;
+  uint32 chunk_index = 3; // zero-based; UTF-8 boundaries are preserved
+  uint32 chunk_count = 4;
+}

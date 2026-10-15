@@ -17,7 +17,7 @@ use super::widgets::{self, Icon, Kind};
 use super::{act, UiState};
 use crate::gui_settings::Theme;
 use crate::view_model::{Action, Modal, ViewModel};
-use ui_text::{fill, text, Key, Lang};
+use ui_text::{fill, fill_named, text, Key, Lang};
 
 /// The reveal time of a dialog, seconds.
 const OPEN_FOR: f32 = 0.32;
@@ -599,7 +599,7 @@ fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
             );
         }
     });
-    row(ui, pal, text(lang, Key::WhatIsCarried), true, |ui| {
+    row(ui, pal, text(lang, Key::WhatIsCarried), false, |ui| {
         widgets::wrapped(
             ui,
             text(lang, Key::TextOnlyNoFilesNoImages),
@@ -612,6 +612,87 @@ fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
             pal,
             text(lang, Key::TheClipboardNeverReachesTheDiagnosticsReports),
         );
+    });
+    row(ui, pal, text(lang, Key::History), true, |ui| {
+        let connected = vm.connection.is_connected();
+        ui.horizontal_wrapped(|ui| {
+            act(
+                ui,
+                pal,
+                text(lang, Key::Refresh),
+                Kind::Ghost,
+                connected,
+                actions,
+                || Action::RefreshClipboardHistory,
+            );
+            act(
+                ui,
+                pal,
+                text(lang, Key::ClearHistory),
+                Kind::Ghost,
+                connected && !vm.clipboard_history.is_empty(),
+                actions,
+                || Action::ClearClipboardHistory,
+            );
+        });
+        widgets::hint(
+            ui,
+            pal,
+            text(lang, Key::TheLast30TextsInMemoryOnlySecretsAreNotKept),
+        );
+        if vm.clipboard_history.is_empty() {
+            widgets::wrapped(
+                ui,
+                text(lang, Key::TheHistoryIsEmptyForNow),
+                13.0,
+                fam::sans(),
+                pal.ink,
+            );
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        for entry in &vm.clipboard_history {
+            ui.push_id(entry.id, |ui| {
+                ui.separator();
+                let direction =
+                    match protocol::ipc::ClipboardHistoryDirection::try_from(entry.direction) {
+                        Ok(protocol::ipc::ClipboardHistoryDirection::Sent) => text(lang, Key::Sent),
+                        Ok(protocol::ipc::ClipboardHistoryDirection::Received) => {
+                            text(lang, Key::Received)
+                        }
+                        _ => text(lang, Key::Transfer),
+                    };
+                let age_seconds = now_ms.saturating_sub(u128::from(entry.time_unix_ms)) / 1000;
+                widgets::wrapped(
+                    ui,
+                    &fill_named(
+                        lang,
+                        Key::DirectionPeerNameAgeSecondsSAgoSizeBytesBytes,
+                        &[
+                            ("direction", direction),
+                            ("peer_name", &entry.peer_name),
+                            ("age_seconds", &age_seconds.to_string()),
+                            ("size_bytes", &entry.size_bytes.to_string()),
+                        ],
+                    ),
+                    13.0,
+                    fam::sans(),
+                    pal.ink,
+                );
+                widgets::wrapped(ui, &entry.preview, 13.0, fam::sans(), pal.ink);
+                act(
+                    ui,
+                    pal,
+                    text(lang, Key::Copy),
+                    Kind::Ghost,
+                    connected,
+                    actions,
+                    || Action::CopyClipboardHistory(entry.id),
+                );
+            });
+        }
     });
 }
 

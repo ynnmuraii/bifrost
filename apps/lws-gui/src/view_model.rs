@@ -255,6 +255,12 @@ pub enum Request {
     UpdateTopology,
     /// `SetClipboard`.
     SetClipboard,
+    /// Read the in-memory clipboard history.
+    GetClipboardHistory,
+    /// Copy a history item through the core's local clipboard adapter.
+    CopyClipboardHistory,
+    /// Clear the core's in-memory clipboard history.
+    ClearClipboardHistory,
     /// `SetAppearance`.
     SetAppearance,
     /// `RevokePeer`.
@@ -282,6 +288,9 @@ impl Request {
             Request::PairingAnswer => text(lang, Key::AnswerThePairing),
             Request::UpdateTopology => text(lang, Key::SaveTheLayout),
             Request::SetClipboard => text(lang, Key::TheClipboard),
+            Request::GetClipboardHistory => text(lang, Key::TheClipboardHistory),
+            Request::CopyClipboardHistory => text(lang, Key::CopyFromTheHistory),
+            Request::ClearClipboardHistory => text(lang, Key::ClearTheClipboardHistory),
             Request::SetAppearance => text(lang, Key::TheEdgeEffects),
             Request::RevokePeer => text(lang, Key::RemoveAComputerFromThePair),
             Request::ExportDiagnostics => text(lang, Key::SaveTheDiagnostics),
@@ -765,6 +774,8 @@ pub struct ViewModel {
     pub pairing: Pairing,
     /// The settings screen's state.
     pub settings: Settings,
+    /// Metadata only; full clipboard text remains in the core.
+    pub clipboard_history: Vec<ipc::ClipboardHistoryEntry>,
     /// The last finished operation, shown as a toast until [`TOAST_FOR`] runs out.
     pub outcome: Option<Outcome>,
     /// The appearance panel at the right edge is open.
@@ -808,6 +819,7 @@ impl ViewModel {
             editor: LayoutEditor::default(),
             pairing: Pairing::default(),
             settings: Settings::default(),
+            clipboard_history: Vec::new(),
             outcome: None,
             appearance_open: false,
             flash: None,
@@ -863,6 +875,8 @@ impl ViewModel {
         self.push_log(format!("Связь со службой потеряна: {}", short_error(&why)));
         self.connection = Connection::Disconnected { why };
         self.inflight.clear();
+        // History belongs to the lost core session, not to the last known status.
+        self.clipboard_history.clear();
         self.silent = false;
         // The banner described what the *core we just lost* did («Готово: …»). Leaving it up
         // under a header that now says «Служба не запущена» is the window contradicting
@@ -1169,6 +1183,12 @@ impl ViewModel {
                 self.pairing.details = false;
                 self.pairing.prompt = Some(prompt);
             }
+            Msg::ClipboardHistory(history) => {
+                self.clipboard_history = history.items;
+                self.clipboard_history.sort_by(|a, b| b.id.cmp(&a.id));
+            }
+            // Copy requests are applied by the core; this GUI never needs full text.
+            Msg::ClipboardHistoryItem(_) => {}
             Msg::OpResult(result) => self.apply_op_result(frame.request_id, result),
             // The pushed half of the contract never arrives here; a GUI that gets one of its
             // own requests back is talking to something that is not a core.
@@ -1369,6 +1389,12 @@ impl ViewModel {
                 }
                 Request::PairWith => self.pairing.dialing = false,
                 Request::PairingAnswer => self.finish_pairing(true),
+                Request::ClearClipboardHistory => {
+                    self.clipboard_history.clear();
+                    let id = self.begin_request(Request::GetClipboardHistory, Instant::now());
+                    self.outgoing
+                        .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
+                }
                 Request::SetClipboard if self.settings.clipboard_pending.is_some() => {
                     // The core has not pushed the new state: ask for it.
                     let id = self.begin_request(Request::GetStatus, Instant::now());
@@ -1936,6 +1962,11 @@ impl ViewModel {
                 } else {
                     Some(*modal)
                 };
+                if self.modal == Some(Modal::Clip) {
+                    let id = self.begin_request(Request::GetClipboardHistory, Instant::now());
+                    self.outgoing
+                        .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
+                }
                 self.appearance_open = false;
                 self.settings.revoke = None;
             }
@@ -2130,6 +2161,12 @@ pub enum Action {
     },
     /// Turn the shared clipboard on or off.
     SetClipboard(bool),
+    /// Refresh metadata without fetching clipboard contents.
+    RefreshClipboardHistory,
+    /// Copy a stored item to this computer's clipboard through the core.
+    CopyClipboardHistory(u64),
+    /// Forget all stored clipboard contents.
+    ClearClipboardHistory,
     /// Change the service-owned edge effects and source cursor visibility.
     SetAppearance {
         /// Draw the linked-edge glyph strip.
@@ -2256,6 +2293,21 @@ impl Action {
             Action::SetClipboard(enabled) => (
                 Request::SetClipboard,
                 Msg::SetClipboard(ipc::SetClipboard { enabled: *enabled }),
+            ),
+            Action::RefreshClipboardHistory => (
+                Request::GetClipboardHistory,
+                Msg::GetClipboardHistory(ipc::GetClipboardHistory {}),
+            ),
+            Action::CopyClipboardHistory(id) => (
+                Request::CopyClipboardHistory,
+                Msg::GetClipboardHistoryItem(ipc::GetClipboardHistoryItem {
+                    id: *id,
+                    copy_to_local: true,
+                }),
+            ),
+            Action::ClearClipboardHistory => (
+                Request::ClearClipboardHistory,
+                Msg::ClearClipboardHistory(ipc::ClearClipboardHistory {}),
             ),
             Action::SetAppearance {
                 edge_effects,
@@ -3249,6 +3301,11 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::PairingAnswer(_) => "PairingAnswer",
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
+        Msg::GetClipboardHistory(_) => "GetClipboardHistory",
+        Msg::GetClipboardHistoryItem(_) => "GetClipboardHistoryItem",
+        Msg::ClearClipboardHistory(_) => "ClearClipboardHistory",
+        Msg::ClipboardHistory(_) => "ClipboardHistory",
+        Msg::ClipboardHistoryItem(_) => "ClipboardHistoryItem",
         Msg::SetAppearance(_) => "SetAppearance",
         Msg::RevokePeer(_) => "RevokePeer",
         Msg::ExportDiagnostics(_) => "ExportDiagnostics",
@@ -3314,6 +3371,9 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::PairingAnswer => text(lang, Key::TheAnswerWasSent).to_owned(),
         Request::UpdateTopology => text(lang, Key::TheLayoutIsSaved).to_owned(),
         Request::SetClipboard => text(lang, Key::TheClipboardWasSwitched).to_owned(),
+        Request::GetClipboardHistory => text(lang, Key::TheClipboardHistoryIsRefreshed).to_owned(),
+        Request::CopyClipboardHistory => text(lang, Key::TheTextIsCopied).to_owned(),
+        Request::ClearClipboardHistory => text(lang, Key::TheClipboardHistoryIsCleared).to_owned(),
         Request::SetAppearance => text(lang, Key::TheEdgeEffectsWereSwitched).to_owned(),
         Request::RevokePeer => text(lang, Key::TheComputerWasRemovedFromThePair).to_owned(),
         Request::ResetPortalGrants => text(lang, Key::ThePortalGrantsWereForgotten).to_owned(),

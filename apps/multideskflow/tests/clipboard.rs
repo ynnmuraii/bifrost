@@ -447,3 +447,274 @@ fn a_transition_during_a_mebibyte_transfer_is_not_delayed() {
         .wait_for_clipboard(&text, SETTLE)
         .expect("the paced transfer still completes after the transition");
 }
+
+/// Use the same authenticated GUI IPC endpoint as the desktop, ignoring status pushes.
+fn history_exchange(
+    node: &common::Node,
+    request: protocol::ipc::gui_frame::Msg,
+    mut complete: impl FnMut(&protocol::ipc::GuiFrame) -> bool,
+) -> Vec<protocol::ipc::GuiFrame> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("history GUI runtime");
+    runtime.block_on(async {
+        let connection = ipc::transport::connect(&common::gui_endpoint_of(&node.root))
+            .await
+            .expect("history GUI connection");
+        let mut link = ipc::GuiLink::new(connection);
+        link.send(1, request).await.expect("history request");
+        tokio::time::timeout(SETTLE, async {
+            let mut replies = Vec::new();
+            loop {
+                let frame = link.recv().await.expect("history response");
+                if frame.request_id != 1 {
+                    continue;
+                }
+                let done = complete(&frame);
+                replies.push(frame);
+                if done {
+                    return replies;
+                }
+            }
+        })
+        .await
+        .expect("history response deadline")
+    })
+}
+
+fn history(node: &common::Node) -> Vec<protocol::ipc::ClipboardHistoryEntry> {
+    use protocol::ipc::gui_frame::Msg;
+    let replies = history_exchange(
+        node,
+        Msg::GetClipboardHistory(protocol::ipc::GetClipboardHistory {}),
+        |frame| matches!(frame.msg, Some(Msg::ClipboardHistory(_))),
+    );
+    match replies.into_iter().last().expect("history reply").msg {
+        Some(Msg::ClipboardHistory(history)) => history.items,
+        other => panic!("unexpected history reply: {other:?}"),
+    }
+}
+
+fn wait_history(node: &common::Node, count: usize) -> Vec<protocol::ipc::ClipboardHistoryEntry> {
+    let deadline = std::time::Instant::now() + SETTLE;
+    loop {
+        let items = history(node);
+        if items.len() == count {
+            return items;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {count} history entries, got {items:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn history_text(node: &common::Node, id: u64) -> String {
+    use protocol::ipc::gui_frame::Msg;
+    let replies = history_exchange(
+        node,
+        Msg::GetClipboardHistoryItem(protocol::ipc::GetClipboardHistoryItem {
+            id,
+            copy_to_local: false,
+        }),
+        |frame| match &frame.msg {
+            Some(Msg::ClipboardHistoryItem(item)) => item.chunk_index + 1 == item.chunk_count,
+            _ => false,
+        },
+    );
+    let count = replies.len();
+    let mut text = String::new();
+    for (index, frame) in replies.into_iter().enumerate() {
+        let Some(Msg::ClipboardHistoryItem(item)) = frame.msg else {
+            panic!("expected full-text chunk");
+        };
+        assert_eq!(item.id, id);
+        assert_eq!(item.chunk_index as usize, index);
+        assert_eq!(item.chunk_count as usize, count);
+        text.push_str(&item.text);
+    }
+    if text.len() == 1024 * 1024 {
+        assert!(count > 1, "a full MiB must use bounded IPC chunks");
+    }
+    text
+}
+
+fn history_operation(node: &common::Node, request: protocol::ipc::gui_frame::Msg) {
+    use protocol::ipc::gui_frame::Msg;
+    let replies = history_exchange(node, request, |frame| {
+        matches!(frame.msg, Some(Msg::OpResult(_)))
+    });
+    let Some(Msg::OpResult(result)) = &replies.last().expect("operation reply").msg else {
+        panic!("expected operation result");
+    };
+    assert!(result.ok, "history operation failed: {}", result.error_code);
+}
+
+#[test]
+fn history_lists_both_directions_reassembles_unicode_mebibyte_and_clears() {
+    use protocol::ipc::{gui_frame::Msg, ClipboardHistoryDirection};
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+    // Seven UTF-8 bytes per repetition puts multibyte scalars across chunk boundaries.
+    let mut large = "界🙂".repeat((1024 * 1024) / 7);
+    large.push_str(&"x".repeat(1024 * 1024 - large.len()));
+    assert_eq!(large.len(), 1024 * 1024);
+    harness.a.copy_to_clipboard(&large);
+    harness
+        .b
+        .wait_for_clipboard(&large, SETTLE)
+        .expect("large transfer");
+    wait_history(&harness.a, 1);
+    wait_history(&harness.b, 1);
+    let reply = "Ответ обратно — café 🙂";
+    harness.b.copy_to_clipboard(reply);
+    harness
+        .a
+        .wait_for_clipboard(reply, SETTLE)
+        .expect("reverse transfer");
+    for (node, peer, directions) in [
+        (
+            &harness.a,
+            "receiver",
+            [
+                ClipboardHistoryDirection::Received,
+                ClipboardHistoryDirection::Sent,
+            ],
+        ),
+        (
+            &harness.b,
+            "source",
+            [
+                ClipboardHistoryDirection::Sent,
+                ClipboardHistoryDirection::Received,
+            ],
+        ),
+    ] {
+        let items = wait_history(node, 2);
+        for (item, direction) in items.iter().zip(directions) {
+            assert_eq!(item.direction, direction as i32);
+            assert_eq!(item.peer_name, peer);
+            assert!(item.time_unix_ms > 0);
+        }
+        assert_ne!(items[0].id, items[1].id);
+        assert_eq!(items[0].size_bytes, reply.len() as u64);
+        assert_eq!(items[0].preview, reply);
+        assert_eq!(items[1].size_bytes, large.len() as u64);
+        assert_eq!(
+            items[1].preview,
+            large.chars().take(120).collect::<String>()
+        );
+        assert_eq!(history_text(node, items[0].id), reply);
+        assert_eq!(history_text(node, items[1].id), large);
+    }
+    history_operation(
+        &harness.a,
+        Msg::ClearClipboardHistory(protocol::ipc::ClearClipboardHistory {}),
+    );
+    assert!(history(&harness.a).is_empty());
+    assert_eq!(history(&harness.b).len(), 2, "clear is node-local");
+    assert_eq!(harness.a.clipboard_text().as_deref(), Some(reply));
+}
+
+#[test]
+fn copying_history_is_local_only_with_sharing_enabled_or_disabled() {
+    use protocol::ipc::gui_frame::Msg;
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+    let old = "history local copy — старый 🙂";
+    harness.a.copy_to_clipboard(old);
+    harness
+        .b
+        .wait_for_clipboard(old, SETTLE)
+        .expect("first transfer");
+    let entry = wait_history(&harness.a, 1).remove(0);
+    let current = "peer must keep this newer text";
+    harness.b.copy_to_clipboard(current);
+    harness
+        .a
+        .wait_for_clipboard(current, SETTLE)
+        .expect("newer transfer");
+    wait_history(&harness.a, 2);
+    wait_history(&harness.b, 2);
+    for enabled in [true, false] {
+        if !enabled {
+            toggle_clipboard(&harness.a, false);
+            let disabled_local = "local text changed while sharing is disabled";
+            harness.a.copy_to_clipboard(disabled_local);
+            harness
+                .a
+                .wait_for_clipboard(disabled_local, SETTLE)
+                .expect("disabled sharing still observes the local clipboard");
+        }
+        let offers = [
+            harness.a.log().matches("clipboard offer").count(),
+            harness.b.log().matches("clipboard offer").count(),
+        ];
+        history_operation(
+            &harness.a,
+            Msg::GetClipboardHistoryItem(protocol::ipc::GetClipboardHistoryItem {
+                id: entry.id,
+                copy_to_local: true,
+            }),
+        );
+        harness
+            .a
+            .wait_for_clipboard(old, SETTLE)
+            .expect("local history copy");
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(harness.b.clipboard_text().as_deref(), Some(current));
+        assert_eq!(
+            harness.a.log().matches("clipboard offer").count(),
+            offers[0]
+        );
+        assert_eq!(
+            harness.b.log().matches("clipboard offer").count(),
+            offers[1]
+        );
+        assert_eq!(
+            history(&harness.a).len(),
+            2,
+            "local copy creates no transfer"
+        );
+        assert_eq!(history(&harness.b).len(), 2);
+    }
+}
+
+#[test]
+fn transferred_secrets_are_excluded_from_sent_and_received_history() {
+    let _serial = common::serial();
+    let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
+        for root in [a_root, b_root] {
+            common::append_config(
+                root,
+                "\n[clipboard]\nenabled = true\nskip_secret_marked = false\n",
+            );
+        }
+    });
+    harness.wait_linked();
+    for (sender, receiver, secret) in [
+        (&harness.a, &harness.b, "secret A → B"),
+        (&harness.b, &harness.a, "secret B → A"),
+    ] {
+        sender.copy_to_clipboard_marked(secret, &["kde_secret"]);
+        receiver
+            .wait_for_clipboard(secret, SETTLE)
+            .expect("configured secret transfer");
+        // A subsequent successful transfer is a barrier for the sender's completion event.
+        let ordinary = format!("public after {secret}");
+        sender.copy_to_clipboard(&ordinary);
+        receiver
+            .wait_for_clipboard(&ordinary, SETTLE)
+            .expect("public transfer");
+    }
+    for node in [&harness.a, &harness.b] {
+        let items = wait_history(node, 2);
+        assert_eq!(items[0].preview, "public after secret B → A");
+        assert_eq!(items[1].preview, "public after secret A → B");
+        for item in items {
+            assert!(history_text(node, item.id).starts_with("public after "));
+        }
+    }
+}

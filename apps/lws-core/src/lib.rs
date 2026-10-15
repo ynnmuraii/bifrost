@@ -24,6 +24,7 @@
 
 mod agent;
 mod clipboard;
+mod clipboard_history;
 mod command;
 mod ctl;
 mod edgefx;
