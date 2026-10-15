@@ -211,9 +211,8 @@ fn main() -> Result<(), String> {
             );
         }
         if label == "idle" {
-            // The pointer leaving the map costs the frame it arrives on and the one that puts
-            // the particles back: after that a window with nothing on the map is silent for
-            // the rest of the ten virtual seconds.
+            // Leaving freezes the last active frame; after the pointer event itself the
+            // window stays silent for the rest of the ten virtual seconds.
             assert_eq!(
                 late_frames, 0,
                 "an idle window must not repaint on a timer: {late_frames} frames after the                  first second"
