@@ -122,6 +122,8 @@ pub fn motion_batch(lease_id: [u8; 16], events: Vec<InputEvent>) -> fr::Message 
 pub enum Outbound {
     /// Must be delivered: control, or any batch with an edge in it.
     Guaranteed(fr::Message),
+    /// Replacement capability advertisement: guaranteed control, never coalesced.
+    CapabilitiesChanged(Vec<i32>),
     /// A layout-document message: always guaranteed, never coalesced (KVM-072).
     Layout(crate::convert::LayoutMessage),
     /// A clipboard message: always guaranteed, never coalesced, never dropped. The grant is the
@@ -148,7 +150,10 @@ impl Outbound {
     pub fn motion_events(&self) -> Option<&[InputEvent]> {
         match self {
             Outbound::Motion { events, .. } => Some(events),
-            Outbound::Guaranteed(_) | Outbound::Layout(_) | Outbound::Clipboard(_) => None,
+            Outbound::Guaranteed(_)
+            | Outbound::CapabilitiesChanged(_)
+            | Outbound::Layout(_)
+            | Outbound::Clipboard(_) => None,
         }
     }
 
@@ -156,7 +161,10 @@ impl Outbound {
     pub fn motion_lease(&self) -> Option<[u8; 16]> {
         match self {
             Outbound::Motion { lease_id, .. } => Some(*lease_id),
-            Outbound::Guaranteed(_) | Outbound::Layout(_) | Outbound::Clipboard(_) => None,
+            Outbound::Guaranteed(_)
+            | Outbound::CapabilitiesChanged(_)
+            | Outbound::Layout(_)
+            | Outbound::Clipboard(_) => None,
         }
     }
 }

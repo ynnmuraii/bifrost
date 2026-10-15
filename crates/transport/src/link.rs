@@ -520,7 +520,18 @@ impl LinkHandle {
             Outbound::Layout(message) => self.send_layout(message).await,
             // The same: a clipboard message is queued through `send_clipboard`, never here.
             Outbound::Clipboard(message) => self.send_clipboard(message).await,
+            Outbound::CapabilitiesChanged(capabilities) => {
+                self.send_capabilities(capabilities).await
+            }
         }
+    }
+
+    /// Sends the replacement capability set on the bounded, guaranteed control queue.
+    pub async fn send_capabilities(&self, capabilities: Vec<i32>) -> Result<(), TransportError> {
+        self.tx
+            .send(Outbound::CapabilitiesChanged(capabilities))
+            .await
+            .map_err(|_| TransportError::LinkClosed)
     }
 
     /// Sends one layout-document message (KVM-072).
@@ -1132,6 +1143,15 @@ impl LinkState {
         validate::envelope(envelope)
             .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
         match &envelope.payload {
+            Some(wire::envelope::Payload::CapabilitiesChanged(_))
+                if envelope.connection_id.as_slice() != self.connection_id
+                    || envelope.major != protocol::limits::PROTOCOL_MAJOR
+                    || !envelope.lease_id.is_empty() =>
+            {
+                return Err(LinkDownReason::Protocol(
+                    "capability update does not belong to this input connection".into(),
+                ));
+            }
             Some(wire::envelope::Payload::Shutdown(_)) => {
                 return Err(LinkDownReason::PeerShutdown);
             }
@@ -1261,6 +1281,15 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
             }
             Outbound::Clipboard(message) => {
                 write_clipboard_message(writer, state, message.clone()).await?;
+                index += 1;
+            }
+            Outbound::CapabilitiesChanged(capabilities) => {
+                let envelope = state.envelope(wire::envelope::Payload::CapabilitiesChanged(
+                    wire::CapabilitiesChanged {
+                        capabilities: capabilities.clone(),
+                    },
+                ));
+                write_frame(writer, &envelope).await.map_err(reason_from)?;
                 index += 1;
             }
             Outbound::Motion { .. } => {

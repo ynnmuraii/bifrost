@@ -2445,6 +2445,32 @@ impl Session {
                 transport::convert::Inbound::Layout(message) => {
                     self.on_layout(peer, message).await;
                 }
+                transport::convert::Inbound::CapabilitiesChanged(capabilities) => {
+                    let text_clipboard =
+                        capabilities.contains(&(protocol::wire::Capability::TextClipboard as i32));
+                    tracing::info!(peer = %peer, text_clipboard, "peer capabilities updated");
+                    if let Some((connection_id, previous, remote_ip)) =
+                        self.clipboard_links.get_mut(&peer)
+                    {
+                        if *previous != text_clipboard {
+                            *previous = text_clipboard;
+                            let out = match self.clipboard.as_mut() {
+                                Some(clipboard) => {
+                                    clipboard
+                                        .on_link_up(
+                                            peer,
+                                            *connection_id,
+                                            text_clipboard,
+                                            *remote_ip,
+                                        )
+                                        .await
+                                }
+                                None => Vec::new(),
+                            };
+                            self.apply_clipboard(out).await;
+                        }
+                    }
+                }
                 transport::convert::Inbound::Clipboard {
                     message,
                     connection_id,
@@ -2497,9 +2523,8 @@ impl Session {
     /// it is also what `Status.capabilities_unavailable` subtracts for the GUI. The probe can
     /// only answer for the session kind, and on Wayland the honest answer is "the adapter
     /// knows": a KWin session has the clipboard through `ext-data-control-v1`, a Mutter one has
-    /// none at all. The peers get the value the next time their link is established — the
-    /// transport reads the local `Hello` per connection — which in practice precedes the first
-    /// link (the agent reports ~9 s before the first peer link came up on the live pair).
+    /// none at all. Publish the answer on live links too: a fast peer can complete its
+    /// handshake before this adapter has finished opening its portal or clipboard.
     async fn adopt_agent_capabilities(&mut self, capabilities: &[String]) {
         let has_clipboard = capabilities.iter().any(|name| name == "TEXT_CLIPBOARD");
         if has_clipboard == self.capabilities.text_clipboard {

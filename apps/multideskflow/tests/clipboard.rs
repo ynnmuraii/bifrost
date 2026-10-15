@@ -45,6 +45,38 @@ fn two_nodes_with_clipboard() -> Harness {
     harness
 }
 
+#[test]
+fn a_clipboard_capability_reported_after_link_up_reaches_the_peer() {
+    let _serial = common::serial();
+    let (harness, gate) = Harness::start_with(false, false, |a_root, b_root| {
+        enable_clipboard(a_root);
+        enable_clipboard(b_root);
+        let gate = b_root.join("run/agent-ready-gate");
+        std::fs::create_dir_all(gate.parent().expect("gate directory")).expect("run directory");
+        std::fs::write(&gate, b"hold AgentReady").expect("hold B's actual agent report");
+        gate
+    });
+    for node in [&harness.a, &harness.b] {
+        node.wait_for(
+            "input link before B's AgentReady",
+            Duration::from_secs(20),
+            |s| s.members == 1,
+        )
+        .expect("the real input link forms while B's agent is starting");
+    }
+    assert_ne!(harness.b.status().expect("B status").agent, "ready");
+    std::fs::remove_file(gate).expect("release the actual AgentReady");
+    harness.wait_linked();
+    let text = payload("late-agent-capability", 64);
+    harness.a.copy_to_clipboard(&text);
+    harness
+        .b
+        .wait_for_clipboard(&text, Duration::from_secs(10))
+        .expect("late TEXT_CLIPBOARD reaches A without replacing the input link");
+    assert_eq!(harness.a.log().matches("link up").count(), 1);
+    assert_eq!(harness.b.log().matches("link up").count(), 1);
+}
+
 /// Drive the real GUI command and require its unsolicited Status push.
 fn toggle_clipboard(node: &common::Node, enabled: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()

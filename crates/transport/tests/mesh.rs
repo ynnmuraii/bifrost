@@ -170,6 +170,100 @@ async fn spawn_node(
     }
 }
 
+#[tokio::test]
+async fn capability_refresh_reaches_live_link_without_replacing_it() {
+    let root = temp_root("capability-refresh");
+    let a = Arc::new(identity_at(&root, "a"));
+    let b = Arc::new(identity_at(&root, "b"));
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_addr = free_address().await;
+    let b_addr = free_address().await;
+    let mut a = spawn_node("a", a, a_addr, &[(b_id, b_addr)], &[], 4).await;
+    let mut b = spawn_node("b", b, b_addr, &[(a_id, a_addr)], &[a_addr], 4).await;
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+    settle(&mut a, Duration::from_millis(100)).await;
+    settle(&mut b, Duration::from_millis(100)).await;
+
+    let mut hello = hello_for(a_id, "a");
+    hello.capabilities = vec![wire::Capability::TextClipboard as i32, 12345];
+    a.manager.update_local_hello(hello.clone()).await;
+    let expected = hello.capabilities;
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            match b.events.recv().await.expect("manager event") {
+                LinkEvent::Message {
+                    peer,
+                    message: Inbound::CapabilitiesChanged(capabilities),
+                } if peer == a_id => {
+                    assert_eq!(capabilities, expected);
+                    break;
+                }
+                LinkEvent::Up { .. } | LinkEvent::Down { .. } => {
+                    panic!("a capability refresh replaced the established link");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("capability refresh");
+    assert_eq!(a.manager.member_count().await, 1);
+    assert_eq!(b.manager.member_count().await, 1);
+    a.kill().await;
+    b.kill().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn capability_refresh_during_formation_converges_to_latest_set() {
+    let root = temp_root("capability-formation");
+    let a = Arc::new(identity_at(&root, "a"));
+    let b = Arc::new(identity_at(&root, "b"));
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_addr = free_address().await;
+    let b_addr = free_address().await;
+    let a = spawn_node("a", a, a_addr, &[(b_id, b_addr)], &[], 4).await;
+    let mut b = spawn_node("b", b, b_addr, &[(a_id, a_addr)], &[a_addr], 4).await;
+    // Race cache changes against TLS/Hello/registration. The final set must arrive
+    // whether Hello captured it, Up caught it up, or an established-link push sent it.
+    let final_capabilities = vec![wire::Capability::TextClipboard as i32];
+    for capabilities in [
+        vec![],
+        vec![wire::Capability::Capture as i32],
+        final_capabilities.clone(),
+    ] {
+        let mut hello = hello_for(a_id, "a");
+        hello.capabilities = capabilities;
+        a.manager.update_local_hello(hello).await;
+        tokio::task::yield_now().await;
+    }
+    let observed = wait_for_event(
+        &mut b.events,
+        |event| match event {
+            LinkEvent::Up { peer, hello, .. } => *peer == a_id && hello.text_clipboard,
+            LinkEvent::Message {
+                peer,
+                message: Inbound::CapabilitiesChanged(capabilities),
+            } => *peer == a_id && capabilities == &final_capabilities,
+            _ => false,
+        },
+        FORM_TIMEOUT,
+    )
+    .await;
+    assert!(
+        observed.is_some(),
+        "latest capabilities were lost during formation"
+    );
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+    a.kill().await;
+    b.kill().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
 async fn wait_for_members(node: &TestNode, wanted: usize, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {

@@ -94,6 +94,19 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
             .unwrap_or(ipc::TakeoverDetection::Unspecified),
         attach.takeover_threshold_px,
     );
+    let backend_selection = async {
+        let selected = backend_selection.await;
+        // A dry harness can hold AgentReady until its real input link is established.
+        // Startup still answers heartbeats through complete_backend_startup below.
+        if args.dry_inject {
+            if let Some(gate) = std::env::var_os("LWS_DRY_READY_GATE") {
+                while std::path::Path::new(&gate).exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        selected
+    };
     let selected = complete_backend_startup(&mut link, &mut progress_rx, backend_selection).await?;
     let Some((mut backend, ready, refusals)) = selected else {
         return Ok(());

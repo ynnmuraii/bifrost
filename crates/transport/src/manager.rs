@@ -172,7 +172,7 @@ pub struct LinkManager {
     identity: Arc<NodeIdentity>,
     /// The shared pins are read by rustls synchronously during every handshake.
     trusted_peers: Arc<StdRwLock<BTreeSet<NodeId>>>,
-    /// Replaced by display updates; every future link uses the latest Hello.
+    /// Cached Hello; capability updates also reach established links.
     local_hello: Arc<RwLock<wire::Hello>>,
     listen: SocketAddr,
     peers: Vec<SocketAddr>,
@@ -347,9 +347,22 @@ impl LinkManager {
         Arc::clone(&self.trusted_peers)
     }
 
-    /// Replaces the Hello carried by links formed from now on.
+    /// Replaces the cached Hello and publishes changed capabilities on established links.
     pub async fn update_local_hello(&self, hello: wire::Hello) {
-        *self.local_hello.write().await = hello;
+        // Keep this guard through enqueueing: Up catch-up takes the same lock first,
+        // so an older snapshot can never be queued after a newer update.
+        let mut current = self.local_hello.write().await;
+        let changed = current.capabilities != hello.capabilities;
+        *current = hello;
+        if changed {
+            let inner = self.inner.lock().await;
+            for link in inner.links.values() {
+                let _ = link
+                    .handle
+                    .send_capabilities(current.capabilities.clone())
+                    .await;
+            }
+        }
     }
 
     /// The handle to `peer`, when a link to it is up.
@@ -753,7 +766,14 @@ impl LinkManager {
 
         let up_at_ns = self.clock.now_ns();
         {
+            // A handshake may have captured Hello before the latest AgentReady update.
+            // Serialize catch-up and insertion with later updates, including their enqueues.
+            let current = self.local_hello.read().await;
             let mut inner = self.inner.lock().await;
+            let _ = pending
+                .handle
+                .send_capabilities(current.capabilities.clone())
+                .await;
             inner
                 .last_lease_diagnostics
                 .insert(peer, pending.handle.lease_diagnostics_counters());

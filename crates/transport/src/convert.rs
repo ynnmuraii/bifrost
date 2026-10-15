@@ -308,6 +308,8 @@ pub fn from_envelope(envelope: &wire::Envelope) -> Result<fr::Message, ConvertEr
 /// mirror instead of being forced into it. Core is the only consumer of both.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inbound {
+    /// Replacement advertised capability set; unknown optional enum values remain raw.
+    CapabilitiesChanged(Vec<i32>),
     /// A focus/lease message, already in the FSM's vocabulary.
     Focus(fr::Message),
     /// A layout-document message, in the wire types core works with.
@@ -411,6 +413,9 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
     use wire::envelope::Payload;
 
     match envelope.payload.as_ref() {
+        Some(Payload::CapabilitiesChanged(changed)) => {
+            Ok(Inbound::CapabilitiesChanged(changed.capabilities.clone()))
+        }
         Some(Payload::Topology(topology)) => {
             Ok(Inbound::Layout(LayoutMessage::Topology(topology.clone())))
         }
