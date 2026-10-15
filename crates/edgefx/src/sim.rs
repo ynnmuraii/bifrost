@@ -85,7 +85,15 @@ impl Sim {
 
     /// One step of the approach / source fade: homes pulled toward `point` by `pull`
     /// (`0..=1`), visibility by `intensity`, everything scaled by `envelope`.
-    pub fn gather(&mut self, dt: f32, len: f32, point: f32, intensity: f32, pull: f32, envelope: f32) {
+    pub fn gather(
+        &mut self,
+        dt: f32,
+        len: f32,
+        point: f32,
+        intensity: f32,
+        pull: f32,
+        envelope: f32,
+    ) {
         let k = 1.0 - (-8.0 * dt).exp();
         for p in &mut self.particles {
             p.home_u = (p.home_u + (self.rng.unit() - 0.5) * 24.0 * dt).clamp(0.0, len);
@@ -164,9 +172,20 @@ mod tests {
             let mut sim = Sim::new(3);
             sim.scatter(800.0);
             for _ in 0..60 {
-                sim.gather(0.033, 800.0, 400.0, intensity, 0.85 * intensity.powf(1.5), 1.0);
+                sim.gather(
+                    0.033,
+                    800.0,
+                    400.0,
+                    intensity,
+                    0.85 * intensity.powf(1.5),
+                    1.0,
+                );
             }
-            sim.particles.iter().map(|p| (p.u - 400.0).abs()).sum::<f32>() / N as f32
+            sim.particles
+                .iter()
+                .map(|p| (p.u - 400.0).abs())
+                .sum::<f32>()
+                / N as f32
         };
         assert!(spread(1.0) < spread(0.5));
         assert!(spread(0.5) < spread(0.1));
@@ -193,11 +212,19 @@ mod tests {
         let mut sim = Sim::new(5);
         sim.scatter(600.0);
         sim.release(300.0);
-        let before: f32 = sim.particles.iter().map(|p| (p.u - 300.0).abs() + p.v).sum();
+        let before: f32 = sim
+            .particles
+            .iter()
+            .map(|p| (p.u - 300.0).abs() + p.v)
+            .sum();
         for _ in 0..10 {
             sim.disperse(0.033, 1.0);
         }
-        let after: f32 = sim.particles.iter().map(|p| (p.u - 300.0).abs() + p.v).sum();
+        let after: f32 = sim
+            .particles
+            .iter()
+            .map(|p| (p.u - 300.0).abs() + p.v)
+            .sum();
         assert!(after > before + 100.0);
     }
 }
