@@ -127,7 +127,7 @@ pub fn draw(
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             match modal {
                 Modal::Pairs => pairs_body(ui, pal, vm, actions),
-                Modal::Keys => keys_body(ui, pal, vm, actions),
+                Modal::Keys => keys_body(ui, pal, vm),
                 Modal::Clip => clip_body(ui, pal, vm, actions),
                 Modal::Diag => diag_body(ui, pal, vm, actions),
                 Modal::Settings => settings_body(ui, pal, vm, actions),
@@ -498,7 +498,7 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
     }
 }
 
-fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
+fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
     let emergency = vm
         .status
         .as_ref()
@@ -510,7 +510,7 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
             .iter()
             .any(|c| c == "EMERGENCY_HOTKEY")
     });
-    row(ui, pal, "Аварийная", false, |ui| {
+    row(ui, pal, "Аварийная", true, |ui| {
         widgets::chord(ui, pal, emergency);
         if missing {
             widgets::warn(ui, pal, |ui| {
@@ -533,23 +533,6 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
                 );
             });
         }
-    });
-    row(ui, pal, "Взять управление", true, |ui| {
-        widgets::hint(ui, pal, "Сделать этот компьютер координатором");
-        let owner = vm.status.as_ref().is_some_and(|s| s.is_owner);
-        act(
-            ui,
-            pal,
-            if owner {
-                "Этот компьютер уже координатор"
-            } else {
-                "Взять управление"
-            },
-            Kind::Plain,
-            vm.connection.is_connected() && !owner,
-            actions,
-            || Action::Claim,
-        );
     });
 }
 
