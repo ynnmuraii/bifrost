@@ -50,6 +50,7 @@ message Envelope {
     Ping ping = 38;                          // link liveness
     Pong pong = 39;
     ActiveLayout active_layout = 40;         // receiver -> owner: receiver's active keyboard layout
+    CapabilitiesChanged capabilities_changed = 41; // member -> all established input links
   }
 }
 
@@ -141,6 +142,9 @@ message Hello {
   uint64 topology_revision = 12;           // applied layout revision
   bytes topology_author = 13;              // author node_id of the applied revision
 }
+
+// Replaces only the sender's advertised capability set, not its identity or Hello.
+message CapabilitiesChanged { repeated Capability capabilities = 1; }
 
 message Rect { double x = 1; double y = 2; double width = 3; double height = 4; }
 

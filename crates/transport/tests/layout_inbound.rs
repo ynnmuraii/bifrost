@@ -24,6 +24,9 @@ fn round_trip(message: &LayoutMessage) -> LayoutMessage {
         Inbound::Clipboard { message, .. } => {
             panic!("expected a layout message, got a clipboard one: {message:?}")
         }
+        Inbound::CapabilitiesChanged(other) => {
+            panic!("expected a layout message, got capabilities: {other:?}")
+        }
     }
 }
 

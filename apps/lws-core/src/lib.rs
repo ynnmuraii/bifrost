@@ -714,15 +714,10 @@ fn decide_session(config: &config::Config) -> LocalSession {
                 // Capability describes adapter support, not the user's opt-in. A GUI toggle
                 // must work on an existing input link without reconnecting it.
                 //
-                // This is the *pre-attach* answer: the probe can only reason about the session
-                // kind. The agent then reports what its adapter really holds and
-                // `Session::adopt_agent_capabilities` replaces this value — a Wayland node
-                // says "no clipboard" until its compositor answers for `ext-data-control-v1`
-                // (KVM-044), because the probe has no way to ask.
-                text_clipboard: matches!(
-                    session.session_kind,
-                    platform_probe::SessionKind::Windows | platform_probe::SessionKind::X11
-                ),
+                // Only the attached adapter knows whether its clipboard connection opened.
+                // Start conservatively on every platform; AgentReady publishes the real
+                // capability to already-connected peers as well as future handshakes.
+                text_clipboard: false,
                 ..session.capabilities
             },
             fsm: focus_router::Capabilities {

@@ -1469,6 +1469,10 @@ fn spawn_node(
     if root.join("run/refuse-prepare-dry").is_file() {
         command.env("LWS_DRY_REFUSE_PREPARE", "1");
     }
+    let ready_gate = root.join("run/agent-ready-gate");
+    if ready_gate.is_file() {
+        command.env("LWS_DRY_READY_GATE", ready_gate);
+    }
     let child = command.spawn().expect("the core starts");
     let pid = child.id();
     Node {

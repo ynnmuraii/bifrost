@@ -1,6 +1,22 @@
 use protocol::{ipc, validate, wire, *};
 
 #[test]
+fn capability_refresh_is_append_only_and_preserves_optional_enum_numbers() {
+    use prost::Message;
+    let envelope = wire::Envelope {
+        payload: Some(wire::envelope::Payload::CapabilitiesChanged(
+            wire::CapabilitiesChanged {
+                capabilities: vec![wire::Capability::TextClipboard as i32, 12345],
+            },
+        )),
+        ..Default::default()
+    };
+    // Envelope field 41, wire type 2: the append-only payload number is contractual.
+    assert_eq!(&envelope.encode_to_vec()[..2], &[0xca, 0x02]);
+    round_trip(Channel::InputControl, envelope);
+}
+
+#[test]
 fn framing_prefix_boundaries_on_every_channel() {
     for (channel, max) in [
         (Channel::InputControl, 65536),
