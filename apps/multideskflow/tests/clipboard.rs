@@ -87,7 +87,10 @@ fn toggle_clipboard(node: &common::Node, enabled: bool) {
         .expect("toggle answer and pushed Status");
     });
     let config = config::Config::load(&node.root.join("config/config.toml")).expect("saved config");
-    assert_eq!(config.clipboard.enabled, enabled, "opt-in must survive restart");
+    assert_eq!(
+        config.clipboard.enabled, enabled,
+        "opt-in must survive restart"
+    );
 }
 
 fn clipboard_address(node: &common::Node) -> std::net::SocketAddr {
@@ -106,9 +109,15 @@ fn gui_opt_in_starts_default_off_clipboards_and_off_closes_the_listener() {
     toggle_clipboard(&harness.b, true);
     let text = payload("gui-opt-in", 64);
     harness.a.copy_to_clipboard(&text);
-    harness.b.wait_for_clipboard(&text, SETTLE).expect("GUI opt-in copy reaches B");
+    harness
+        .b
+        .wait_for_clipboard(&text, SETTLE)
+        .expect("GUI opt-in copy reaches B");
     toggle_clipboard(&harness.b, false);
-    assert!(std::net::TcpStream::connect(address).is_err(), "disabled listener is closed");
+    assert!(
+        std::net::TcpStream::connect(address).is_err(),
+        "disabled listener is closed"
+    );
     let listener = std::net::TcpListener::bind(address).expect("off releases the listening port");
     drop(listener);
     harness.a.copy_to_clipboard(&payload("while-off", 80));
@@ -127,7 +136,10 @@ fn ten_gui_on_off_cycles_release_sockets_and_keep_peer_delivery_working() {
         toggle_clipboard(&harness.b, true);
         let text = payload(&format!("cycle-{cycle}"), 64);
         harness.a.copy_to_clipboard(&text);
-        harness.b.wait_for_clipboard(&text, SETTLE).expect("fresh runtime receives copy");
+        harness
+            .b
+            .wait_for_clipboard(&text, SETTLE)
+            .expect("fresh runtime receives copy");
         toggle_clipboard(&harness.b, false);
         assert!(std::net::TcpStream::connect(address).is_err());
         let listener = std::net::TcpListener::bind(address).expect("no leaked listener");
@@ -141,12 +153,17 @@ fn toggling_the_sender_preserves_origin_versions_for_a_live_receiver() {
     let harness = two_nodes_with_clipboard();
     let first = payload("before-sender-toggle", 64);
     harness.a.copy_to_clipboard(&first);
-    harness.b.wait_for_clipboard(&first, SETTLE).expect("initial copy");
+    harness
+        .b
+        .wait_for_clipboard(&first, SETTLE)
+        .expect("initial copy");
     toggle_clipboard(&harness.a, false);
     toggle_clipboard(&harness.a, true);
     let second = payload("after-sender-toggle", 64);
     harness.a.copy_to_clipboard(&second);
-    harness.b.wait_for_clipboard(&second, Duration::from_secs(10))
+    harness
+        .b
+        .wait_for_clipboard(&second, Duration::from_secs(10))
         .expect("new local copy must not reuse a version suppressed by the live receiver");
 }
 

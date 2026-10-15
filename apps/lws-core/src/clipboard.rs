@@ -372,10 +372,16 @@ impl Clipboard {
             })
             .collect();
         if let Some((peer, offer_id)) = self.pending_request.take() {
-            if !out.iter().any(|event| matches!(event,
-                Out::Cancel { peer: p, offer_id: id, .. } if *p == peer && *id == offer_id
-            )) {
-                out.push(Out::Cancel { peer, offer_id, reason: cb::ClipboardError::Superseded });
+            if !out.iter().any(|event| {
+                matches!(event,
+                    Out::Cancel { peer: p, offer_id: id, .. } if *p == peer && *id == offer_id
+                )
+            }) {
+                out.push(Out::Cancel {
+                    peer,
+                    offer_id,
+                    reason: cb::ClipboardError::Superseded,
+                });
             }
         }
         if !self.settings.enabled {
@@ -625,14 +631,21 @@ impl Clipboard {
             }
             ClipboardMessage::Cancel { offer_id, reason } => {
                 tracing::info!(peer = %peer, reason = ?reason, "clipboard transfer cancelled by the peer");
-                if self.incoming.get(&offer_id).is_some_and(|incoming| incoming.peer == peer) {
+                if self
+                    .incoming
+                    .get(&offer_id)
+                    .is_some_and(|incoming| incoming.peer == peer)
+                {
                     self.incoming.remove(&offer_id);
                 }
                 if self.pending_request == Some((peer, offer_id)) {
                     self.pending_request = None;
                 }
                 for offers in [&mut self.offered, &mut self.waiting] {
-                    if offers.get(&peer).is_some_and(|(offer, _)| offer_id_of(offer) == Some(offer_id)) {
+                    if offers
+                        .get(&peer)
+                        .is_some_and(|(offer, _)| offer_id_of(offer) == Some(offer_id))
+                    {
                         offers.remove(&peer);
                     }
                 }
@@ -1020,7 +1033,9 @@ impl Handle {
             let mut state = tasks.state.lock().expect("task registry");
             state.shutdown = Some(shutdown);
             state.acceptor = Some(tokio::spawn(async move {
-                acceptor.accept_loop(listener, queue_capacity, stopping).await;
+                acceptor
+                    .accept_loop(listener, queue_capacity, stopping)
+                    .await;
             }));
         }
         Ok((handle, receiver))
@@ -1165,7 +1180,9 @@ impl Handle {
 
     async fn cancel_transfer(&self, peer: NodeId, offer_id: [u8; 16]) {
         let mut inner = self.inner.lock().await;
-        if let Some(task) = inner.conns.get_mut(&peer)
+        if let Some(task) = inner
+            .conns
+            .get_mut(&peer)
             .and_then(|conn| conn.transfers.remove(&offer_id))
         {
             task.abort();
@@ -1268,50 +1285,50 @@ impl Handle {
         // Registered under the lock the reader's cleanup also takes, so a connection that
         // closes at once cannot clean up before it is registered and leave a dead entry.
         let replaced = {
-        let mut inner = self.inner.lock().await;
-        let Some(tasks) = self.tasks.upgrade() else {
-            return;
-        };
-        let mut task_state = tasks.state.lock().expect("task registry");
-        if task_state.closed {
-            return;
-        }
-        task_state.prune();
-        inner.generation += 1;
-        let generation = inner.generation;
-        let reader_task = tokio::spawn(async move {
-            handle.read_task(peer, reader, reader_events.clone()).await;
-            let mut inner = handle.inner.lock().await;
-            // Only the connection that is still the peer's current one unregisters itself and
-            // reports the channel down: an older one that was replaced is not the peer's.
-            let current = inner
-                .conns
-                .get(&peer)
-                .is_some_and(|conn| conn.generation == generation);
-            if current {
-                inner.conns.remove(&peer);
+            let mut inner = self.inner.lock().await;
+            let Some(tasks) = self.tasks.upgrade() else {
+                return;
+            };
+            let mut task_state = tasks.state.lock().expect("task registry");
+            if task_state.closed {
+                return;
             }
-            drop(inner);
-            if current {
-                let _ = reader_events.send(Inbound::Down { peer }).await;
-            }
-        });
-        let reader_abort = reader_task.abort_handle();
-        task_state.tasks.push(reader_task);
-        let writer_task = tokio::spawn(async move { write_task(writer, rx).await });
-        let writer_abort = writer_task.abort_handle();
-        task_state.tasks.push(writer_task);
-        drop(task_state);
-        inner.conns.insert(
-            peer,
-            Conn {
-                generation,
-                tx,
-                reader: reader_abort,
-                writer: writer_abort,
-                transfers: BTreeMap::new(),
-            },
-        )
+            task_state.prune();
+            inner.generation += 1;
+            let generation = inner.generation;
+            let reader_task = tokio::spawn(async move {
+                handle.read_task(peer, reader, reader_events.clone()).await;
+                let mut inner = handle.inner.lock().await;
+                // Only the connection that is still the peer's current one unregisters itself and
+                // reports the channel down: an older one that was replaced is not the peer's.
+                let current = inner
+                    .conns
+                    .get(&peer)
+                    .is_some_and(|conn| conn.generation == generation);
+                if current {
+                    inner.conns.remove(&peer);
+                }
+                drop(inner);
+                if current {
+                    let _ = reader_events.send(Inbound::Down { peer }).await;
+                }
+            });
+            let reader_abort = reader_task.abort_handle();
+            task_state.tasks.push(reader_task);
+            let writer_task = tokio::spawn(async move { write_task(writer, rx).await });
+            let writer_abort = writer_task.abort_handle();
+            task_state.tasks.push(writer_task);
+            drop(task_state);
+            inner.conns.insert(
+                peer,
+                Conn {
+                    generation,
+                    tx,
+                    reader: reader_abort,
+                    writer: writer_abort,
+                    transfers: BTreeMap::new(),
+                },
+            )
         };
         if let Some(old) = replaced {
             // Both sides dialled at once: the older connection (and its sender) goes, instead of
@@ -1425,13 +1442,16 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let reader = tokio::spawn(std::future::pending::<()>());
         let writer = tokio::spawn(std::future::pending::<()>());
-        endpoint.runtime.inner.lock().await.conns.insert(peer, Conn {
-            generation: 1,
-            tx,
-            reader: reader.abort_handle(),
-            writer: writer.abort_handle(),
-            transfers: BTreeMap::new(),
-        });
+        endpoint.runtime.inner.lock().await.conns.insert(
+            peer,
+            Conn {
+                generation: 1,
+                tx,
+                reader: reader.abort_handle(),
+                writer: writer.abort_handle(),
+                transfers: BTreeMap::new(),
+            },
+        );
         let offer = ClipboardMessage::Offer {
             offer_id,
             origin_node_id: [0x31; 32],
@@ -1441,35 +1461,76 @@ mod tests {
         };
         endpoint.offered.insert(peer, (offer.clone(), Vec::new()));
         endpoint.waiting.insert(peer, (offer, Vec::new()));
-        endpoint.runtime.send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3],
-            cb::CHUNK_BYTES as u64 * 4).await.expect("sender starts");
+        endpoint
+            .runtime
+            .send_transfer(
+                peer,
+                offer_id,
+                vec![b'x'; cb::CHUNK_BYTES * 3],
+                cb::CHUNK_BYTES as u64 * 4,
+            )
+            .await
+            .expect("sender starts");
         let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await.expect("first chunk").expect("channel");
-        assert!(matches!(first, ClipboardMessage::Data { chunk_index: 0, .. }));
+            .await
+            .expect("first chunk")
+            .expect("channel");
+        assert!(matches!(
+            first,
+            ClipboardMessage::Data { chunk_index: 0, .. }
+        ));
         for (sender, id) in [(other, offer_id), (peer, [0x42; 16])] {
-            endpoint.on_peer_message(sender, ClipboardMessage::Cancel {
-                offer_id: id, reason: protocol::wire::ErrorCode::ClipboardSuperseded,
-            }).await;
+            endpoint
+                .on_peer_message(
+                    sender,
+                    ClipboardMessage::Cancel {
+                        offer_id: id,
+                        reason: protocol::wire::ErrorCode::ClipboardSuperseded,
+                    },
+                )
+                .await;
             assert!(endpoint.offered.contains_key(&peer));
             assert!(endpoint.waiting.contains_key(&peer));
             assert!(endpoint.runtime.inner.lock().await.conns[&peer]
-                .transfers.contains_key(&offer_id));
+                .transfers
+                .contains_key(&offer_id));
         }
-        endpoint.on_peer_message(peer, ClipboardMessage::Cancel {
-            offer_id, reason: protocol::wire::ErrorCode::ClipboardSuperseded,
-        }).await;
+        endpoint
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Cancel {
+                    offer_id,
+                    reason: protocol::wire::ErrorCode::ClipboardSuperseded,
+                },
+            )
+            .await;
         assert!(!endpoint.offered.contains_key(&peer));
         assert!(!endpoint.waiting.contains_key(&peer));
-        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.is_err(),
-            "cancelled sender must not enqueue another chunk or Complete");
-        endpoint.runtime.send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3], 1)
-            .await.expect("another paced transfer");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .is_err(),
+            "cancelled sender must not enqueue another chunk or Complete"
+        );
+        endpoint
+            .runtime
+            .send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3], 1)
+            .await
+            .expect("another paced transfer");
         endpoint.runtime.close(peer).await;
         assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await.expect("revocation aborts the paced sender").is_none());
+            .await
+            .expect("revocation aborts the paced sender")
+            .is_none());
         endpoint.stop().await;
-        assert!(reader.await.expect_err("reader aborted on revoke").is_cancelled());
-        assert!(writer.await.expect_err("writer aborted on revoke").is_cancelled());
+        assert!(reader
+            .await
+            .expect_err("reader aborted on revoke")
+            .is_cancelled());
+        assert!(writer
+            .await
+            .expect_err("writer aborted on revoke")
+            .is_cancelled());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1481,8 +1542,10 @@ mod tests {
             let first = [0x41; 16];
             let second = [0x42; 16];
             offer_and_data(&mut endpoint, peer, first, b"old").await;
-            assert!(endpoint.on_offer(peer, second, &[0x31; 32], 10, cb::MIME.to_owned(), 5)
-                .await.is_empty());
+            assert!(endpoint
+                .on_offer(peer, second, &[0x31; 32], 10, cb::MIME.to_owned(), 5)
+                .await
+                .is_empty());
             assert_eq!(endpoint.incoming.len(), 2);
             if mode == 2 {
                 endpoint.settings.enabled = false;
@@ -1496,7 +1559,9 @@ mod tests {
             } else {
                 Vec::new()
             };
-            let out = endpoint.on_local_copy(b"new local copy".to_vec(), markers).await;
+            let out = endpoint
+                .on_local_copy(b"new local copy".to_vec(), markers)
+                .await;
             for id in [first, second] {
                 assert_eq!(out.iter().filter(|event| matches!(event,
                     Out::Cancel { peer: p, offer_id, reason: cb::ClipboardError::Superseded }
@@ -1540,17 +1605,23 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let (endpoint, root) = started_clipboard("silent-accept-stop").await;
         let address = endpoint.runtime.listen_address;
-        let mut silent = tokio::net::TcpStream::connect(address).await.expect("connect");
+        let mut silent = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
         // Let the accept task spawn its TLS handshake; transport's own regression explicitly
         // asserts that pending handshakes exist before exercising the same shutdown method.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::time::timeout(Duration::from_secs(1), endpoint.stop()).await
+        tokio::time::timeout(Duration::from_secs(1), endpoint.stop())
+            .await
             .expect("stop must not wait for the TLS handshake deadline");
         let mut byte = [0];
         let read = tokio::time::timeout(Duration::from_secs(1), silent.read(&mut byte))
-            .await.expect("silent accepted socket closes");
+            .await
+            .expect("silent accepted socket closes");
         assert!(matches!(read, Ok(0) | Err(_)));
-        let rebound = tokio::net::TcpListener::bind(address).await.expect("listener port released");
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("listener port released");
         drop(rebound);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1558,24 +1629,34 @@ mod tests {
     #[tokio::test]
     async fn stopping_aborts_a_silent_dial_and_refuses_late_registration() {
         let (endpoint, root) = started_clipboard("silent-stop").await;
-        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
         let address = silent.local_addr().expect("address");
         let worker = endpoint.runtime.clone();
-        worker.dial([0x21; 32].into(), address, [1; 16], [2; 16], [3; 32], 4).await;
+        worker
+            .dial([0x21; 32].into(), address, [1; 16], [2; 16], [3; 32], 4)
+            .await;
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), silent.accept())
-            .await.expect("dial starts").expect("accept");
+            .await
+            .expect("dial starts")
+            .expect("accept");
         // Read the ClientHello first: EOF must come from stop, not the dial timeout.
         use tokio::io::AsyncReadExt;
         let mut bytes = [0; 4096];
         assert!(stream.read(&mut bytes).await.expect("client hello") > 0);
         tokio::time::timeout(Duration::from_secs(1), endpoint.stop())
-            .await.expect("stop does not wait for the dial timeout");
+            .await
+            .expect("stop does not wait for the dial timeout");
         let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut bytes))
-            .await.expect("dial socket closes");
+            .await
+            .expect("dial socket closes");
         assert!(matches!(read, Ok(0) | Err(_)), "dial socket survived stop");
         let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&registered);
-        worker.spawn(async move { flag.store(true, std::sync::atomic::Ordering::SeqCst); });
+        worker.spawn(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
         tokio::task::yield_now().await;
         assert!(!registered.load(std::sync::atomic::Ordering::SeqCst));
         let _ = std::fs::remove_dir_all(root);
