@@ -500,6 +500,9 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
         // The token itself is a secret: it is stored, never logged, so this signal
         // carries the message rather than a description of it.
         Msg::PortalGrant(changed) => AgentSignal::Grant(changed.clone()),
+        // A refused clipboard copy (too large, secret, disabled) is the clipboard's business:
+        // fed to the FSM it would cancel a prepared lease as an `InvalidFrame`.
+        Msg::Error(error) if error.code.starts_with("CLIPBOARD_") => AgentSignal::Ignored,
         Msg::Error(error) => AgentSignal::Fsm(fr::AgentEvent::Error {
             lease_id: context.prepared.take(),
             code: error_code(&error.code),
@@ -1216,6 +1219,27 @@ mod contract_tests {
             }
         ));
         assert!(matches!(effects[6], Effect::Notice(_)));
+    }
+
+    /// Review R6': a refused clipboard copy is not a focus-state-machine failure, and it must
+    /// not take the lease id a pending `PrepareInject` is waiting to answer.
+    #[test]
+    fn a_clipboard_refusal_does_not_reach_the_focus_fsm() {
+        let mut context = AgentContext::default();
+        context.on_command(&fr::AgentCommand::PrepareInject { lease_id: lease(4) });
+        let refusal = ipc::agent_frame::Msg::Error(ipc::AgentError {
+            code: "CLIPBOARD_TOO_LARGE".to_owned(),
+            detail: "2 MiB".to_owned(),
+        });
+        assert_eq!(agent_signal(&refusal, &mut context), AgentSignal::Ignored);
+        // The prepared lease is still outstanding: its `Ready` is the answer to it.
+        assert_eq!(
+            agent_signal(
+                &ipc::agent_frame::Msg::Ready(ipc::AgentReady::default()),
+                &mut context
+            ),
+            AgentSignal::Fsm(fr::AgentEvent::Ready { lease_id: lease(4) })
+        );
     }
 
     #[test]
