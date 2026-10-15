@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 input-model = { path = "../input-model" }
+edgefx = { path = "../edgefx" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # ashpd: XDG desktop portal client (pure Rust, MIT). Chosen runtime: tokio, because
@@ -29,3 +30,8 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 tracing = "0.1"
+# Edge-effect overlay (`overlay`): own Wayland connection, wlr-layer-shell surface, wl_shm
+# buffers from a memfd. wayland-client's default backend is pure Rust (no libwayland).
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+rustix = { version = "1", features = ["event", "fs"] }

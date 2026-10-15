@@ -126,7 +126,7 @@ impl Strip {
 /// NaN and negative reach give 0.
 #[must_use]
 pub fn intensity(distance: f32, reach: f32) -> f32 {
-    if !(distance < reach) || reach <= 0.0 {
+    if distance.is_nan() || distance >= reach || reach <= 0.0 {
         return 0.0;
     }
     let t = 1.0 - distance.max(0.0) / reach;
