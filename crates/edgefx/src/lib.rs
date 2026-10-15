@@ -11,6 +11,7 @@
 //! same numbers the core already computes for the edge geometry. [`veil`] is the cursor-hide
 //! lifecycle, kept here so every release path can be tested against a fake host.
 
+pub mod coalesce;
 pub mod effect;
 pub mod raster;
 pub mod sim;
@@ -99,7 +100,8 @@ impl Strip {
                 len: full,
             };
         }
-        let start = (target.along - MAX_STRIP_PX / 2.0).clamp(target.start, target.end - MAX_STRIP_PX);
+        let start =
+            (target.along - MAX_STRIP_PX / 2.0).clamp(target.start, target.end - MAX_STRIP_PX);
         Self {
             edge: target.edge,
             start,
@@ -168,8 +170,16 @@ mod tests {
 
     #[test]
     fn strip_size_swaps_with_the_edge_orientation() {
-        let top = Strip { edge: Edge::Top, start: 0.0, len: 500.0 };
-        let left = Strip { edge: Edge::Left, start: 0.0, len: 500.0 };
+        let top = Strip {
+            edge: Edge::Top,
+            start: 0.0,
+            len: 500.0,
+        };
+        let left = Strip {
+            edge: Edge::Left,
+            start: 0.0,
+            len: 500.0,
+        };
         assert_eq!(top.size_px(1.0), (500, 36));
         assert_eq!(left.size_px(2.0), (72, 1000));
     }

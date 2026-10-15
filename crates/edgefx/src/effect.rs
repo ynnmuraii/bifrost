@@ -152,7 +152,8 @@ impl Effect {
                 } else {
                     self.intensity += (self.goal - self.intensity) * (1.0 - (-10.0 * dt).exp());
                     let pull = 0.85 * self.intensity.powf(1.5);
-                    self.sim.gather(dt, strip.len, self.point, self.intensity, pull, 1.0);
+                    self.sim
+                        .gather(dt, strip.len, self.point, self.intensity, pull, 1.0);
                 }
             }
             Phase::Fading { t } => {
@@ -260,7 +261,10 @@ mod tests {
     fn source_goes_idle_approach_fading_idle() {
         let mut fx = Effect::new(1);
         assert_eq!(fx.phase(), Phase::Idle);
-        fx.update(Update::Proximity { target: target(500.0), distance: 40.0 });
+        fx.update(Update::Proximity {
+            target: target(500.0),
+            distance: 40.0,
+        });
         assert_eq!(fx.phase(), Phase::Approach);
         run(&mut fx, 0.2);
         assert!(fx.visible_glyphs() > 0);
@@ -286,7 +290,10 @@ mod tests {
     #[test]
     fn an_approach_with_no_updates_fades_by_itself() {
         let mut fx = Effect::new(1);
-        fx.update(Update::Proximity { target: target(500.0), distance: 10.0 });
+        fx.update(Update::Proximity {
+            target: target(500.0),
+            distance: 10.0,
+        });
         run(&mut fx, STALE_S + FADE_OUT_S + 0.2);
         assert_eq!(fx.phase(), Phase::Idle);
     }
@@ -294,7 +301,10 @@ mod tests {
     #[test]
     fn leaving_the_reach_fades_and_clear_stops_at_once() {
         let mut fx = Effect::new(1);
-        fx.update(Update::Proximity { target: target(500.0), distance: 10.0 });
+        fx.update(Update::Proximity {
+            target: target(500.0),
+            distance: 10.0,
+        });
         fx.update(Update::Left);
         assert!(matches!(fx.phase(), Phase::Fading { .. }));
         fx.update(Update::Clear);
@@ -304,12 +314,18 @@ mod tests {
     #[test]
     fn a_fading_effect_that_the_pointer_comes_back_to_steers_without_a_restart() {
         let mut fx = Effect::new(1);
-        fx.update(Update::Proximity { target: target(500.0), distance: 5.0 });
+        fx.update(Update::Proximity {
+            target: target(500.0),
+            distance: 5.0,
+        });
         run(&mut fx, 0.3);
         fx.update(Update::Crossed(None));
         run(&mut fx, 0.1);
         let before = fx.sim.particles[3].u;
-        fx.update(Update::Proximity { target: target(500.0), distance: 100.0 });
+        fx.update(Update::Proximity {
+            target: target(500.0),
+            distance: 100.0,
+        });
         assert_eq!(fx.phase(), Phase::Approach);
         // Same strip: the particles were reused, not re-scattered.
         assert!((fx.sim.particles[3].u - before).abs() < 1e-3);
