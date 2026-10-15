@@ -1013,7 +1013,6 @@ impl Session {
                     tracing::warn!("the clipboard channel stopped");
                 }
                 Step::Tick => {
-                    self.hotkeys_tick().await;
                     self.arm_observation().await;
                     self.clipboard_on_focus().await;
                     self.expire_pairing_window();
