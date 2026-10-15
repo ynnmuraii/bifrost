@@ -1443,6 +1443,21 @@ mod tests {
     }
 
     #[test]
+    fn a_return_band_does_not_follow_the_pointer_to_another_display() {
+        let guard = ReturnGuard::after_return(
+            geometry::Edge::Bottom,
+            &geometry::Position::new("L", 960.0, 1078.0),
+            8.0,
+        );
+        assert!(guard.holds(&geometry::Position::new("L", 960.0, 1078.0)));
+        assert!(!guard.holds(&geometry::Position::new("R", 960.0, 1500.0)));
+        assert!(!guard.holds_crossing(
+            &geometry::Position::new("R", 960.0, 1500.0),
+            geometry::Edge::Bottom,
+        ));
+    }
+
+    #[test]
     fn a_diagonal_bottom_return_uses_the_crossed_edge_not_the_dominant_delta() {
         // A (-30, -20) step returns through Bottom, even though X dominates.
         let entry = geometry::Position::new("eDP-1", 960.0, 1078.0);
