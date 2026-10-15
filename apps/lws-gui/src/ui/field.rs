@@ -17,7 +17,7 @@ use eframe::egui::{self, Color32, Galley, Painter, Pos2, Rect, Shape};
 use eframe::epaint::TextShape;
 
 use super::theme::{fam, font, Palette};
-use crate::gui_settings::{FieldMode, Look, Pace, Theme};
+use crate::gui_settings::{FieldMode, LinkStyle, Look, Pace, Theme};
 
 /// A particle per this many square points of the map.
 const POINTS_PER_PARTICLE: f32 = 1000.0;
@@ -28,8 +28,6 @@ const CLOUD_EVERY: f32 = 0.08;
 /// Cloud cell size.
 const CELL_W: f32 = 7.0;
 const CELL_H: f32 = 11.0;
-/// Particles of the transfer ribbon, at most.
-const RIBBON_MAX: usize = 260;
 
 const BAYER: [f32; 16] = [
     0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0,
@@ -137,8 +135,6 @@ pub struct Frame<'a> {
     pub pointer: Option<Pos2>,
     /// The links input flows through.
     pub flows: &'a [Flow],
-    /// A ribbon of particles from one computer to another (screen points).
-    pub ribbon: Option<(Pos2, Pos2)>,
 }
 
 /// The field: particles, clouds and the glyphs they are drawn with.
@@ -158,6 +154,8 @@ pub struct Field {
     moved: bool,
     was_animating: bool,
     shaped: bool,
+    pointer_at: Option<Pos2>,
+    last_motion: Option<f32>,
 }
 
 impl Field {
@@ -167,6 +165,38 @@ impl Field {
             rng: 0x9E37_79B9,
             last_cloud: -1.0,
             ..Field::default()
+        }
+    }
+
+    /// Animation is event-driven and stops after the pointer has been still for 1.5 seconds.
+    pub fn active(&mut self, pointer: Option<Pos2>, t: f32, enabled: bool) -> bool {
+        if enabled && pointer.is_some() && pointer != self.pointer_at {
+            self.last_motion = Some(t);
+        }
+        self.pointer_at = pointer;
+        if !enabled || pointer.is_none() {
+            self.last_motion = None;
+        }
+        enabled && self.last_motion.is_some_and(|last| t - last < 1.5)
+    }
+
+    /// A cached-glyph ASCII isoline, without per-link strings or layout allocations.
+    pub fn link(&mut self, painter: &Painter, from: Pos2, to: Pos2, color: Color32) {
+        self.glyphs11.ensure(painter, 11.0);
+        let delta = to - from;
+        let count = (delta.length() / 9.0).ceil().max(1.0) as usize;
+        for i in 0..=count {
+            let ch = if i == 0 || i == count {
+                '+'
+            } else if delta.x.abs() >= delta.y.abs() {
+                '-'
+            } else {
+                '|'
+            };
+            if let Some(galley) = self.glyphs11.get(ch) {
+                let at = from + delta * (i as f32 / count as f32) - galley.size() / 2.0;
+                painter.add(TextShape::new(at, Arc::clone(galley), color));
+            }
         }
     }
 
@@ -342,7 +372,9 @@ impl Field {
             self.step(frame, dt);
         }
         self.draw_particles(painter, frame, animate);
-        self.draw_flows(painter, frame, animate);
+        if frame.look.link_style != LinkStyle::Ascii {
+            self.draw_flows(painter, frame, animate);
+        }
     }
 
     fn build_clouds(&mut self, frame: &Frame<'_>, t: f32) {
@@ -450,37 +482,22 @@ impl Field {
         let mode = frame.look.field;
         let m = self.mouse;
         let radius = 140.0f32;
-        let rib = frame.ribbon.map(|(a, b)| {
-            let a = Pos2::new(a.x - frame.map.min.x, a.y - frame.map.min.y);
-            let b = Pos2::new(b.x - frame.map.min.x, b.y - frame.map.min.y);
-            (a, b, Pos2::new((a.x + b.x) / 2.0, a.y.min(b.y) - 110.0))
-        });
-        let rib_n = ((self.parts.len() as f32 * 0.4) as usize).min(RIBBON_MAX);
-        for (i, p) in self.parts.iter_mut().enumerate() {
+        let strength = self
+            .last_motion
+            .map_or(0.0, |last| ((1.5 - (frame.t - last)) / 0.6).clamp(0.0, 1.0));
+        for p in &mut self.parts {
             let mut tx: f32;
             let mut ty: f32;
             let mut want = 0.0f32;
-            let mut ribbon = false;
             if p.g != '\0' {
                 tx = p.tx;
                 ty = p.ty;
                 want = 1.0;
-            } else if let (Some((a, b, c)), true) = (rib, i < rib_n) {
-                let u = ((i as f32 / rib_n as f32) + t * 0.12).fract();
-                let w = 1.0 - u;
-                tx = w * w * a.x + 2.0 * w * u * c.x + u * u * b.x;
-                ty = w * w * a.y
-                    + 2.0 * w * u * c.y
-                    + u * u * b.y
-                    + ((i % 7) as f32 - 3.0) * 5.0
-                    + (u * 9.4 + t * 1.6).sin() * 6.0;
-                want = 1.0;
-                ribbon = true;
             } else {
                 tx = p.hx + (t * p.sp + p.ph).cos() * amp;
                 ty = p.hy + (t * p.sp * 0.8 + p.ph).sin() * amp;
             }
-            if m.on && p.g == '\0' && !ribbon {
+            if m.on && p.g == '\0' {
                 let (dx, dy) = (p.x - m.sx, p.y - m.sy);
                 let d2 = dx * dx + dy * dy;
                 if d2 < radius * radius && d2 > 1.0 {
@@ -496,6 +513,9 @@ impl Field {
                     want = want.max(fall);
                 }
             }
+            tx = p.hx + (tx - p.hx) * strength;
+            ty = p.hy + (ty - p.hy) * strength;
+            want *= strength;
             let (mut sx, mut sy) = ((tx - p.x) * k * f, (ty - p.y) * k * f);
             let len = sx.hypot(sy);
             let cap = max * f;
@@ -627,6 +647,21 @@ fn fbm(x: f32, y: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_stops_after_settling_and_does_not_restart_on_plain_repaints() {
+        let mut field = Field::new();
+        let p = Some(Pos2::new(80.0, 90.0));
+        assert!(!field.active(None, 0.0, true));
+        assert!(field.active(p, 1.0, true));
+        assert!(field.active(p, 2.49, true));
+        assert!(!field.active(p, 2.5, true));
+        assert!(!field.active(p, 9.0, true));
+        assert!(field.active(Some(Pos2::new(81.0, 90.0)), 9.1, true));
+        assert!(!field.active(p, 9.2, false));
+        assert!(!field.active(p, 9.3, true));
+        assert!(!field.active(None, 9.4, true));
+    }
 
     #[test]
     fn the_noise_is_deterministic_and_in_range() {

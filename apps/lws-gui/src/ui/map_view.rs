@@ -1,24 +1,19 @@
-//! «Карта мониторов»: the field behind, the computers you drag, the links, the legend and the
-//! three buttons.
+//! The monitor map, draggable computers, links and quiet placement feedback.
 
 use std::time::Duration;
 
 use eframe::egui::{
     self, Align, Color32, Layout, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, UiBuilder, Vec2,
 };
-use eframe::epaint::TextShape;
 
 use super::field::{Flow, Frame};
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
 use super::{act, Env, UiState, FIELD_FRAME};
-use crate::gui_settings::{FieldMode, Look};
+use crate::gui_settings::{FieldMode, LinkStyle, Look, PAN_MAX};
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
-
-/// How long the particle ribbon of «Передать ввод» lasts, seconds.
-const RIBBON_FOR: f32 = 1.8;
 
 /// Stage → screen.
 #[derive(Clone, Copy)]
@@ -68,8 +63,16 @@ pub fn draw(
 ) -> Option<Duration> {
     let painter = ui.painter().with_clip_rect(rect);
     let model = vm.map_model();
-    let animate = env.animate && vm.look.field != FieldMode::Off && vm.modal.is_none();
-    let xf = Xf::new(rect, vm.look.zoom_percent);
+    let pointer = ui
+        .input(|i| i.pointer.hover_pos())
+        .filter(|p| rect.contains(*p) && vm.modal.is_none() && !vm.appearance_open);
+    let animate = st.field.active(
+        pointer,
+        t,
+        env.animate && vm.modal.is_none() && !vm.appearance_open && vm.look.field != FieldMode::Off,
+    );
+    let mut xf = Xf::new(rect, vm.look.zoom_percent);
+    xf.origin += pan(ui, vm, rect, actions);
     let s = xf.s;
 
     // Where each computer is drawn now: animated towards the model unless it is being dragged.
@@ -110,23 +113,6 @@ pub fn draw(
         })
         .collect();
 
-    // The ribbon of «Передать ввод»: from the computer that had the input to the next one.
-    let ribbon = match &st.ribbon {
-        Some((from, to)) if animate && (st.ribbon_hover || t < st.ribbon_until) => {
-            let center = |id: &str| {
-                model.nodes.iter().position(|n| n.node_id == id).map(|i| {
-                    shown[i]
-                        + Vec2::new(model.nodes[i].w as f32, model.nodes[i].h as f32) * (s / 2.0)
-                })
-            };
-            center(from).zip(center(to))
-        }
-        _ => None,
-    };
-
-    let pointer = ui
-        .input(|i| i.pointer.hover_pos())
-        .filter(|p| rect.contains(*p) && vm.modal.is_none());
     st.field.paint(
         &painter,
         &Frame {
@@ -137,7 +123,6 @@ pub fn draw(
             t,
             pointer,
             flows: &flows,
-            ribbon,
         },
     );
 
@@ -145,7 +130,16 @@ pub fn draw(
     zoom_controls(ui, pal, vm, st, rect, actions);
 
     for link in &model.links {
-        draw_link(&painter, pal, &model, link, &shown, xf);
+        draw_link(
+            &painter,
+            pal,
+            &model,
+            link,
+            &shown,
+            xf,
+            vm.look.link_style,
+            &mut st.field,
+        );
     }
     let mut hovered: Option<(usize, usize)> = None;
     for (i, node) in model.nodes.iter().enumerate() {
@@ -158,6 +152,7 @@ pub fn draw(
             i,
             shown[i],
             xf,
+            vm.modal.is_none() && !vm.appearance_open,
             &mut hovered,
             actions,
         );
@@ -194,11 +189,82 @@ pub fn draw(
         painter.galley(at, galley, pal.ink2);
     }
 
+    if st.drag.is_some() {
+        let (released, down, focused) = ui.input(|i| {
+            (
+                i.pointer.button_released(egui::PointerButton::Primary),
+                i.pointer.button_down(egui::PointerButton::Primary),
+                i.focused,
+            )
+        });
+        if released && focused && vm.modal.is_none() && !vm.appearance_open {
+            if let Some(drag) = st.drag.take() {
+                actions.push(Action::DropNode(drag.node_id));
+            }
+        } else if !down || !focused || vm.modal.is_some() || vm.appearance_open {
+            st.drag = None;
+            actions.push(Action::CancelDrag);
+        }
+    }
     banner(ui, pal, vm, rect, actions);
-    footer(ui, pal, vm, st, &model, rect, t, actions);
+    footer(ui, pal, rect);
+    animate.then_some(FIELD_FRAME)
+}
 
-    let ribbon_live = st.ribbon.is_some() && (st.ribbon_hover || t < st.ribbon_until) && animate;
-    (animate || ribbon_live).then_some(FIELD_FRAME)
+fn pan(ui: &egui::Ui, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) -> Vec2 {
+    let id = egui::Id::new("map-pan");
+    let mut drag = ui.ctx().data_mut(|d| d.get_temp::<(Pos2, Vec2)>(id));
+    let (pressed, down, released, pointer, focused) = ui.input(|i| {
+        (
+            i.pointer.button_pressed(egui::PointerButton::Secondary),
+            i.pointer.button_down(egui::PointerButton::Secondary),
+            i.pointer.button_released(egui::PointerButton::Secondary),
+            i.pointer.interact_pos(),
+            i.focused,
+        )
+    });
+    let saved = Vec2::new(f32::from(vm.look.pan_x), f32::from(vm.look.pan_y));
+    let enabled = vm.modal.is_none() && !vm.appearance_open && focused;
+    if pressed && enabled {
+        if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+            drag = Some((p, saved));
+        }
+    }
+    let mut offset = saved;
+    if let Some((start, origin)) = drag {
+        if let Some(p) = pointer {
+            offset = (origin + (p - start)).clamp(
+                Vec2::splat(-f32::from(PAN_MAX)),
+                Vec2::splat(f32::from(PAN_MAX)),
+            );
+        }
+        if released && enabled {
+            let look = Look {
+                pan_x: offset.x.round() as i16,
+                pan_y: offset.y.round() as i16,
+                ..vm.look
+            };
+            if look != vm.look {
+                actions.push(Action::SetLook(look));
+            }
+        }
+        if !down || !enabled {
+            drag = None;
+            if !released || !enabled {
+                offset = saved;
+            }
+        } else {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+    }
+    ui.ctx().data_mut(|d| {
+        if let Some(drag) = drag {
+            d.insert_temp(id, drag);
+        } else {
+            d.remove::<(Pos2, Vec2)>(id);
+        }
+    });
+    offset
 }
 
 fn zoom_controls(
@@ -220,7 +286,7 @@ fn zoom_controls(
             ))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    let enabled = vm.modal.is_none() && st.drag.is_none();
+    let enabled = vm.modal.is_none() && !vm.appearance_open && st.drag.is_none();
     if widgets::button(
         &mut controls,
         pal,
@@ -282,7 +348,7 @@ fn zoom_controls(
     }
 }
 
-/// The heading: «01 — Карта мониторов», «3 компьютера · 4 экрана» and the revision.
+/// The map heading and monitor count.
 fn header(painter: &egui::Painter, pal: &Palette, vm: &ViewModel, rect: Rect) {
     let left = rect.min + Vec2::new(24.0, 20.0);
     let mut job = egui::text::LayoutJob::default();
@@ -312,31 +378,6 @@ fn header(painter: &egui::Painter, pal: &Palette, vm: &ViewModel, rect: Rect) {
     );
     let title = painter.layout_job(job);
     painter.galley(Pos2::new(left.x, left.y + cap_h + 8.0), title, pal.ink);
-
-    // The revision, right-aligned.
-    let right = rect.max.x - 24.0;
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        "РАСКЛАДКА",
-        0.0,
-        egui::text::TextFormat {
-            font_id: font(11.0, fam::mono()),
-            color: pal.ink2,
-            extra_letter_spacing: 0.77,
-            ..Default::default()
-        },
-    );
-    let cap = painter.layout_job(job);
-    let w = cap.size().x;
-    painter.galley(Pos2::new(right - w, left.y), cap, pal.ink2);
-    let dirty = vm.editor.dirty();
-    let rev = painter.layout_no_wrap(
-        vm.revision_text(),
-        font(12.0, fam::mono_medium()),
-        if dirty { pal.accent } else { pal.ink },
-    );
-    let w = rev.size().x;
-    painter.galley(Pos2::new(right - w, left.y + cap_h + 6.0), rev, pal.ink);
 }
 
 /// Where a link is drawn: its model points, carried along with the computers at its two ends
@@ -349,6 +390,7 @@ fn link_ends(model: &MapModel, link: &MapLink, shown: &[Pos2], xf: Xf) -> (Pos2,
     (carried(link.a, link.from), carried(link.b, link.to))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_link(
     painter: &egui::Painter,
     pal: &Palette,
@@ -356,6 +398,8 @@ fn draw_link(
     link: &MapLink,
     shown: &[Pos2],
     xf: Xf,
+    style: LinkStyle,
+    field: &mut super::field::Field,
 ) {
     let (a, b) = link_ends(model, link, shown, xf);
     let carry_a = shown[link.a] - xf.p(model.nodes[link.a].at.x, model.nodes[link.a].at.y);
@@ -368,12 +412,16 @@ fn draw_link(
         LinkState::Idle => {}
     }
     let color = fade(color, alpha);
-    painter.add(Shape::dashed_line(
-        &[a, b],
-        Stroke::new(1.5, color),
-        5.0,
-        3.5,
-    ));
+    if style == LinkStyle::Ascii {
+        field.link(painter, a, b, color);
+    } else {
+        painter.add(Shape::dashed_line(
+            &[a, b],
+            Stroke::new(1.5, color),
+            5.0,
+            3.5,
+        ));
+    }
     if link.whole_desktop {
         // The whole desktop's edge: a short rail along the shared stretch at both ends.
         let (s0, s1) = (link.span.0, link.span.1);
@@ -467,6 +515,7 @@ fn node_ui(
     index: usize,
     at: Pos2,
     xf: Xf,
+    enabled: bool,
     hovered: &mut Option<(usize, usize)>,
     actions: &mut Vec<Action>,
 ) {
@@ -479,15 +528,23 @@ fn node_ui(
             Vec2::new(mon.rect.w as f32 * s, mon.rect.h as f32 * s),
         );
         let id = egui::Id::new(("mon", &node.node_id, m));
-        let response = ui.interact(rect, id, Sense::click_and_drag());
-        if response.hovered() || response.dragged() {
+        let response = ui.interact(
+            rect,
+            id,
+            if enabled {
+                Sense::click_and_drag()
+            } else {
+                Sense::hover()
+            },
+        );
+        if enabled && (response.hovered() || response.dragged()) {
             ui.ctx().set_cursor_icon(if response.dragged() {
                 egui::CursorIcon::Grabbing
             } else {
                 egui::CursorIcon::Grab
             });
         }
-        if response.has_focus() {
+        if enabled && response.has_focus() {
             ui.memory_mut(|mem| {
                 mem.set_focus_lock_filter(
                     id,
@@ -520,7 +577,7 @@ fn node_ui(
                 });
             }
         }
-        if response.drag_started() {
+        if enabled && response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(grab) = response.interact_pointer_pos() {
                 st.drag = Some(super::Drag {
                     node_id: node.node_id.clone(),
@@ -530,7 +587,7 @@ fn node_ui(
                 st.field.release();
             }
         }
-        if response.dragged() {
+        if enabled && response.dragged_by(egui::PointerButton::Primary) {
             if let (Some(drag), Some(p)) = (&st.drag, response.interact_pointer_pos()) {
                 if drag.node_id == node.node_id {
                     let delta = xf.stage_delta(p - drag.grab);
@@ -542,10 +599,7 @@ fn node_ui(
                 }
             }
         }
-        if response.drag_stopped() {
-            st.drag = None;
-        }
-        if response.hovered() && st.drag.is_none() {
+        if enabled && response.hovered() && st.drag.is_none() {
             *hovered = Some((index, m));
         }
         if !painter.clip_rect().intersects(rect) {
@@ -646,7 +700,12 @@ fn node_ui(
     );
     let mut y = top;
     let h = name.size().y;
-    painter.galley(Pos2::new(at.x, y), name, pal.ink);
+    painter.circle_filled(
+        Pos2::new(at.x + 3.0 * fs, y + h / 2.0),
+        3.0 * fs,
+        if node.online { pal.ok } else { pal.ink2 },
+    );
+    painter.galley(Pos2::new(at.x + 12.0 * fs, y), name, pal.ink);
     y += h + 1.0;
     for (text, color, family) in [
         (node.os.as_str(), pal.ink2, fam::mono()),
@@ -731,10 +790,13 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
         y += 54.0;
     }
     if let Some(outcome) = &vm.outcome {
-        let galley =
-            ui.painter()
-                .layout_no_wrap(outcome.line(), font(12.0, fam::sans_medium()), pal.ink);
-        let size = galley.size() + Vec2::new(44.0, 16.0);
+        let galley = ui.painter().layout(
+            outcome.line(),
+            font(14.0, fam::sans_medium()),
+            pal.ink,
+            (rect.width() - 92.0).max(40.0),
+        );
+        let size = galley.size() + Vec2::new(52.0, 24.0);
         let pill = Rect::from_min_size(Pos2::new(center - size.x / 2.0, y), size);
         let edge = if outcome.ok { pal.ok } else { pal.accent };
         let response = ui
@@ -743,12 +805,12 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
         let painter = ui.painter();
         painter.rect(
             pill,
-            egui::CornerRadius::same((size.y / 2.0) as u8),
+            egui::CornerRadius::same(12),
             pal.card,
             Stroke::new(1.0, edge),
             StrokeKind::Inside,
         );
-        painter.galley(pill.min + Vec2::new(16.0, 8.0), galley, pal.ink);
+        painter.galley(pill.min + Vec2::new(16.0, 12.0), galley, pal.ink);
         widgets::paint_icon(
             painter,
             widgets::Icon::Close,
@@ -756,176 +818,66 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
             9.0,
             pal.ink2,
         );
+        let id = egui::Id::new("toast-held");
+        let held = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<bool>(id).unwrap_or(false));
+        if held != response.hovered() {
+            actions.push(Action::HoldToast(response.hovered()));
+            ui.ctx().data_mut(|d| d.insert_temp(id, response.hovered()));
+        }
         if response.clicked() {
             actions.push(Action::DismissOutcome);
         }
-    }
-}
-
-/// The legend on the left and the three actions on the right.
-#[allow(clippy::too_many_arguments)]
-fn footer(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    vm: &ViewModel,
-    st: &mut UiState,
-    model: &MapModel,
-    rect: Rect,
-    t: f32,
-    actions: &mut Vec<Action>,
-) {
-    let area = Rect::from_min_max(
-        Pos2::new(rect.min.x + 24.0, rect.max.y - 16.0 - 52.0),
-        Pos2::new(rect.max.x - 24.0, rect.max.y - 16.0),
-    );
-    let mut bar = ui.new_child(
-        UiBuilder::new()
-            .id_salt("map-foot")
-            .max_rect(area)
-            .layout(Layout::right_to_left(Align::Center)),
-    );
-    let bar = &mut bar;
-    bar.set_clip_rect(area.expand2(Vec2::new(0.0, 40.0)));
-    let transfer = vm.transfer();
-    let dirty = model.dirty;
-    let editable = vm.editor.editable && vm.connection.is_connected();
-    egui::Frame::NONE
-        .fill(pal.card)
-        .stroke(pal.hairline())
-        .corner_radius(pal.rad_btn(52.0))
-        .inner_margin(egui::Margin::same(4))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 10],
-            blur: 30,
-            spread: 0,
-            color: shadow_color(pal, 0.07),
-        })
-        .show(bar, |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.horizontal(|ui| {
-                let can_auto = vm.connection.is_connected();
-                act(ui, pal, "Авто", Kind::Ghost, can_auto, actions, || {
-                    Action::LayoutAuto
-                });
-                let apply = widgets::button(
-                    ui,
-                    pal,
-                    "Применить",
-                    if dirty { Kind::Solid } else { Kind::Ghost },
-                    dirty && editable,
-                );
-                if apply.clicked() {
-                    if let Some(action) = vm.layout_action() {
-                        actions.push(action);
-                    }
-                }
-                // The embedded Geist faces support ↔, not the mockup's ⇄; no OS font fallback.
-                let label = if transfer.target.is_empty() {
-                    "↔ Передать ввод".to_owned()
-                } else {
-                    format!("↔ Передать ввод → {}", transfer.target)
-                };
-                let go = widgets::button(ui, pal, &label, Kind::Hot, transfer.enabled);
-                if let Some(why) = &transfer.why {
-                    go.clone().on_hover_text(why);
-                }
-                let from = vm
-                    .status
-                    .as_ref()
-                    .map(|_| vm.route_node_id())
-                    .unwrap_or_default();
-                if go.hovered() {
-                    if let (Some(peer), true) = (&transfer.peer, transfer.enabled) {
-                        st.ribbon = Some((from.clone(), peer.clone()));
-                        st.ribbon_hover = true;
-                    }
-                } else {
-                    st.ribbon_hover = false;
-                }
-                if go.clicked() {
-                    if let Some(peer) = &transfer.peer {
-                        st.ribbon = Some((from, peer.clone()));
-                        st.ribbon_until = t + RIBBON_FOR;
-                        actions.push(Action::SwitchTo(peer.clone()));
-                    }
-                }
-            });
-        });
-    bar.add_space(12.0);
-    // The legend, right to left, so it reads in order from the left edge.
-    bar.spacing_mut().item_spacing.x = 6.0;
-    let items: [(&str, LegendMark); 4] = [
-        ("Тяните компьютер — края примагнитятся", LegendMark::None),
-        ("Размер приблизительный", LegendMark::Approx),
-        ("Сюда идёт ввод", LegendMark::Target),
-        ("Связь краёв", LegendMark::Link),
-    ];
-    for (label, mark) in items {
-        legend_pill(bar, pal, label, mark);
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LegendMark {
-    None,
-    Link,
-    Target,
-    Approx,
-}
-
-/// `.lg`: 28 px high, a small sample of what it explains, then the words.
-fn legend_pill(ui: &mut egui::Ui, pal: &Palette, label: &str, mark: LegendMark) {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font(10.5, fam::mono()), pal.ink2);
-    let sample = match mark {
-        LegendMark::None => 0.0,
-        LegendMark::Link => 16.0 + 8.0,
-        LegendMark::Target | LegendMark::Approx => 12.0 + 8.0,
-    };
-    let size = Vec2::new(galley.size().x + sample + 22.0, 28.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let painter = ui.painter();
-    painter.rect(
-        rect,
-        egui::CornerRadius::same(14),
-        pal.card_glass,
-        pal.hairline(),
-        StrokeKind::Inside,
-    );
-    let mut x = rect.min.x + 11.0;
-    let cy = rect.center().y;
-    match mark {
-        LegendMark::None => {}
-        LegendMark::Link => {
-            painter.add(Shape::dashed_line(
-                &[Pos2::new(x, cy), Pos2::new(x + 16.0, cy)],
-                Stroke::new(1.5, pal.accent),
-                4.0,
-                3.0,
-            ));
+    } else {
+        let id = egui::Id::new("toast-held");
+        if ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<bool>(id).unwrap_or(false))
+        {
+            actions.push(Action::HoldToast(false));
         }
-        LegendMark::Target => {
-            let r = Rect::from_center_size(Pos2::new(x + 6.0, cy), Vec2::new(12.0, 9.0));
-            painter.rect_stroke(
-                r.expand(1.5),
-                4.0,
-                Stroke::new(1.5, pal.accent_soft),
-                StrokeKind::Outside,
+        ui.ctx().data_mut(|d| d.remove::<bool>(id));
+        if let Some(flash) = &vm.flash {
+            let galley = ui.painter().layout(
+                flash.text.clone(),
+                font(12.0, fam::sans_medium()),
+                pal.ink2,
+                (rect.width() - 48.0).max(40.0),
             );
-            painter.rect_stroke(r, 3.0, Stroke::new(1.5, pal.accent), StrokeKind::Inside);
-        }
-        LegendMark::Approx => {
-            let r = Rect::from_center_size(Pos2::new(x + 6.0, cy), Vec2::new(12.0, 9.0));
-            dashed_rect(painter, r, Stroke::new(1.5, pal.ink2));
+            ui.painter().galley(
+                Pos2::new(center - galley.size().x / 2.0, y),
+                galley,
+                pal.ink2,
+            );
         }
     }
-    x += sample;
-    painter.add(TextShape::new(
-        Pos2::new(x, cy - galley.size().y / 2.0),
-        galley,
-        pal.ink2,
-    ));
+}
+
+/// Text-only legend; placement is saved on a valid drop.
+fn footer(ui: &mut egui::Ui, pal: &Palette, rect: Rect) {
+    let area = Rect::from_min_max(
+        Pos2::new(rect.min.x + 24.0, rect.max.y - 48.0),
+        Pos2::new(rect.max.x - 24.0, rect.max.y - 12.0),
+    );
+    let mut bar = ui.new_child(UiBuilder::new().id_salt("map-foot").max_rect(area));
+    bar.horizontal_wrapped(|ui| {
+        for label in [
+            "Связь краёв",
+            "Сюда идёт ввод",
+            "Размер приблизительный",
+            "Тяните компьютер — края примагнитятся",
+        ] {
+            egui::Frame::NONE
+                .fill(pal.card_glass)
+                .stroke(pal.hairline())
+                .corner_radius(14)
+                .inner_margin(egui::Margin::symmetric(11, 6))
+                .show(ui, |ui| {
+                    widgets::text(ui, label, 10.5, fam::mono(), pal.ink2);
+                });
+        }
+    });
 }
 
 #[cfg(test)]

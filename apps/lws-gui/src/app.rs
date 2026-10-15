@@ -117,9 +117,8 @@ impl eframe::App for GuiApp {
         let minimized = minimized == Some(true);
         let env = Env {
             now,
-            // Unknown counts as visible and focused: a platform that does not report it must
-            // not lose its animation, and the window's own events still end it on blur.
-            animate: !minimized && focused != Some(false),
+            // Animate only when the viewport positively reports focus and is not minimized.
+            animate: !minimized && focused == Some(true),
         };
         let output = ui::draw(ui, self.bridge.view(), &mut self.ui, env);
 
