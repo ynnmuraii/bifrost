@@ -86,7 +86,7 @@ fn toggle_clipboard(node: &common::Node, enabled: bool) {
         .await
         .expect("toggle answer and pushed Status");
     });
-    let config = config::Config::load(&node.root.join("config/config.toml")).expect("saved config");
+    let config = config::Config::load(node.root.join("config/config.toml")).expect("saved config");
     assert_eq!(
         config.clipboard.enabled, enabled,
         "opt-in must survive restart"
@@ -94,7 +94,7 @@ fn toggle_clipboard(node: &common::Node, enabled: bool) {
 }
 
 fn clipboard_address(node: &common::Node) -> std::net::SocketAddr {
-    let config = config::Config::load(&node.root.join("config/config.toml")).expect("config");
+    let config = config::Config::load(node.root.join("config/config.toml")).expect("config");
     std::net::SocketAddr::from(([127, 0, 0, 1], config.network.port_clipboard))
 }
 
@@ -106,6 +106,7 @@ fn gui_opt_in_starts_default_off_clipboards_and_off_closes_the_listener() {
     let address = clipboard_address(&harness.b);
     assert!(std::net::TcpStream::connect(address).is_err());
     toggle_clipboard(&harness.a, true);
+    toggle_clipboard(&harness.a, true);
     toggle_clipboard(&harness.b, true);
     let text = payload("gui-opt-in", 64);
     harness.a.copy_to_clipboard(&text);
@@ -113,6 +114,7 @@ fn gui_opt_in_starts_default_off_clipboards_and_off_closes_the_listener() {
         .b
         .wait_for_clipboard(&text, SETTLE)
         .expect("GUI opt-in copy reaches B");
+    toggle_clipboard(&harness.b, false);
     toggle_clipboard(&harness.b, false);
     assert!(
         std::net::TcpStream::connect(address).is_err(),
