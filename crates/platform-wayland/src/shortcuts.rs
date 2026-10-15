@@ -23,6 +23,12 @@ pub const EMERGENCY_TRIGGER: &str = "CTRL+ALT+SHIFT+F12";
 const EMERGENCY_DESCRIPTION: &str =
     "LAN Workspace: release remote input and return the keyboard to this machine";
 
+/// The desktop portal's well-known bus name: sessions live at an object path it chooses.
+const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
+
+/// The session object's interface, per the XDG desktop portal specification.
+const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
+
 type ActivationStream = Pin<Box<dyn Stream<Item = Activated> + Send>>;
 
 /// A registered emergency hotkey.
@@ -74,7 +80,7 @@ impl EmergencyShortcuts {
         };
         // Subscribe before binding so an activation cannot fall between the two calls.
         let activated = shortcuts.receive_activated().await.map_err(classify)?;
-        let closed = session.receive_closed().await.map_err(classify)?;
+        let closed = closed_stream(&session_path).await?;
         let requested: Vec<_> = bindings
             .iter()
             .map(|(id, description, trigger)| {
@@ -176,6 +182,32 @@ impl EmergencyShortcuts {
     pub async fn close(&self) -> Result<(), WaylandError> {
         self.session.close().await.map_err(classify)
     }
+}
+
+/// Subscribe to the session's `Closed` signal through a proxy of our own.
+///
+/// ashpd 0.13's `Session::receive_closed()` returns an `impl Stream` that captures the borrow of
+/// the session it was called on (no precise-capturing bound on the `impl Trait`), so the stream
+/// cannot be stored in a value that also moves that session in. `zbus::Proxy::receive_signal` has
+/// no such capture - the stream owns a clone of its proxy - and ashpd re-exports zbus, so this
+/// needs no dependency of its own.
+async fn closed_stream(
+    session_path: &str,
+) -> Result<Pin<Box<dyn Stream<Item = ()> + Send>>, WaylandError> {
+    let zbus_error = |error| WaylandError::Portal(ashpd::Error::Zbus(error));
+    let connection = ashpd::zbus::Connection::session()
+        .await
+        .map_err(zbus_error)?;
+    let proxy = ashpd::zbus::Proxy::new(
+        &connection,
+        PORTAL_DESTINATION,
+        session_path,
+        SESSION_INTERFACE,
+    )
+    .await
+    .map_err(zbus_error)?;
+    let closed = proxy.receive_signal("Closed").await.map_err(zbus_error)?;
+    Ok(Box::pin(closed.map(|_| ())))
 }
 
 fn all_bindings_granted(requested: &[(&str, &str, &str)], returned: &[(&str, &str)]) -> bool {
