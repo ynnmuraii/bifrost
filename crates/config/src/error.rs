@@ -21,7 +21,7 @@ pub enum ErrorCode {
     Listen,
     /// `network.max_members`: `1..4` (`N_max = 4`).
     Members,
-    /// `workspace.claim_hotkey` / `input.emergency_hotkey`: modifier count,
+    /// `[input.hotkeys]`: supported chords, required emergency binding,
     /// distinctness, and the Linux VT rule.
     Hotkey,
     /// `workspace.owner_claim_serial` / `owner_node_id`: the pair must be

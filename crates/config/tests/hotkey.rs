@@ -54,10 +54,10 @@ fn modifier_aliases_are_accepted() {
 }
 
 #[test]
-fn the_key_token_is_preserved_verbatim() {
-    // The key is what the configuration wrote; only modifiers are normalised.
-    assert_eq!(parse("Ctrl+Alt+right").key(), "right");
-    assert_eq!(parse("Ctrl+Alt+Right").key(), "Right");
+fn key_names_are_canonical() {
+    assert_eq!(parse("Ctrl+Alt+right").key(), "Right");
+    assert_eq!(parse("Ctrl+Alt+r").key(), "R");
+    assert_eq!(parse("Ctrl+esc").key(), "Escape");
     assert_eq!(parse("Ctrl+Alt+Right").to_string(), "Ctrl+Alt+Right");
 }
 
@@ -97,8 +97,6 @@ fn the_linux_virtual_terminal_rule_is_a_property_of_the_parsed_hotkey() {
     for safe in [
         "Ctrl+Alt+Shift+F1", // Shift makes it safe
         "Ctrl+Alt+F13",      // outside F1..F12
-        "Ctrl+Alt+F0",
-        "Ctrl+Alt+FB",
         "Ctrl+Shift+F1",     // no Alt
         "Alt+Shift+F1",      // no Ctrl
         "Ctrl+Alt+Super+F1", // super changes the combination
@@ -121,4 +119,42 @@ fn a_hotkey_renders_back_to_a_parseable_string() {
             "`{text}` must round trip"
         );
     }
+}
+
+#[test]
+fn supported_keys_and_modifier_requirement() {
+    for key in [
+        "A", "0", "F1", "F24", "Left", "Right", "Up", "Down", "Home", "End",
+        "PageUp", "PageDown", "Insert", "Delete", "Backspace", "Tab", "Enter",
+        "Escape", "Space",
+    ] {
+        let hotkey = parse(&format!("Ctrl+{key}"));
+        assert_eq!(parse(&hotkey.to_string()), hotkey);
+    }
+    assert_eq!(parse("f24").to_string(), "F24");
+    assert_eq!(Hotkey::parse("Right"), Err(HotkeyError::MissingModifier));
+    for text in ["Ctrl+F0", "Ctrl+F25", "Ctrl+Unknown", "Ctrl+é"] {
+        assert!(matches!(Hotkey::parse(text), Err(HotkeyError::UnsupportedKey(_))));
+    }
+}
+
+#[test]
+fn bindings_round_trip_and_action_access() {
+    use config::{HotkeyAction, HotkeyBindings};
+
+    let mut bindings = HotkeyBindings::default();
+    bindings.set(HotkeyAction::ReturnLocal, "Alt+Left".to_owned());
+    assert_eq!(bindings.get(HotkeyAction::ReturnLocal), "Alt+Left");
+    assert_eq!(bindings.iter().count(), 4);
+    bindings.validate().unwrap();
+    let text = toml::to_string(&bindings).unwrap();
+    assert_eq!(toml::from_str::<HotkeyBindings>(&text).unwrap(), bindings);
+    bindings.set(HotkeyAction::ClaimOwnership, "left+alt".to_owned());
+    assert!(bindings.validate().is_err());
+    bindings.set(HotkeyAction::ClaimOwnership, "alt+left".to_owned());
+    assert!(bindings.validate().is_err());
+    bindings.set(HotkeyAction::ClaimOwnership, String::new());
+    bindings.validate().unwrap();
+    bindings.set(HotkeyAction::EmergencyRelease, "   ".to_owned());
+    assert!(bindings.validate().is_err());
 }

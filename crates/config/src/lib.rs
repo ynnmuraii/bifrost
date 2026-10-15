@@ -63,7 +63,7 @@ pub mod topology;
 
 pub use error::{ConfigError, ErrorCode};
 pub use first_run::{choose, ensure_config, lan_addresses, set_listen_address, Candidate};
-pub use hotkey::{Hotkey, HotkeyError, Modifier};
+pub use hotkey::{Hotkey, HotkeyAction, HotkeyBindings, HotkeyError, Modifier};
 pub use lock::{update_locked, FileLock};
 pub use paths::{default_paths, Paths};
 pub use save::save_atomic;

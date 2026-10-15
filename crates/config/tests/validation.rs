@@ -280,46 +280,33 @@ fn workspace_link_and_claim_timing_bounds() {
 }
 
 #[test]
-fn claim_hotkey_is_optional_but_must_not_collide() {
-    // Empty = GUI button only, which is explicitly allowed.
-    accept("[workspace]\nclaim_hotkey = \"\"\n");
-    accept("[workspace]\nclaim_hotkey = \"Ctrl+Alt+F11\"\n");
-
-    // One modifier is not enough for a claim hotkey.
-    let error = reject("[workspace]\nclaim_hotkey = \"Ctrl+F11\"\n");
-    assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
-    assert_eq!(key_of(&error), "workspace.claim_hotkey");
-
-    // Reusing the switch or the emergency combination is refused.
-    let error = reject("[workspace]\nclaim_hotkey = \"Ctrl+Alt+Shift+Right\"\n");
-    assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
-    let error = reject("[workspace]\nclaim_hotkey = \"Ctrl+Alt+Shift+F12\"\n");
-    assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
-
-    // A hotkey that does not parse is reported against its own key.
-    let error = reject("[workspace]\nclaim_hotkey = \"Ctrl++F11\"\n");
-    assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
-    assert_eq!(key_of(&error), "workspace.claim_hotkey");
+fn hotkey_bindings_validate_supported_distinct_chords() {
+    accept("[input.hotkeys]\nclaim_ownership = \"\"\n");
+    accept("[input.hotkeys]\nclaim_ownership = \"Ctrl+F11\"\n");
+    accept("[input.hotkeys]\nemergency_release = \"F24\"\n");
+    accept("[input.hotkeys]\nswitch_next = \"Ctrl+Right\"\n");
+    for (field, chord) in [
+        ("emergency_release", ""),
+        ("emergency_release", "Right"),
+        ("switch_next", "Ctrl+Unknown"),
+        ("return_local", "shift+alt+control+right"),
+        ("claim_ownership", "Ctrl++F11"),
+    ] {
+        let error = reject(&format!("[input.hotkeys]\n{field} = \"{chord}\"\n"));
+        assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
+        assert_eq!(key_of(&error), format!("input.hotkeys.{field}"));
+    }
 }
 
 #[test]
-fn emergency_and_switch_hotkeys_need_three_modifiers_and_must_differ() {
-    accept("[input]\nemergency_hotkey = \"Ctrl+Alt+Super+F12\"\n");
-
-    let error = reject("[input]\nemergency_hotkey = \"Ctrl+Alt+F12\"\n");
-    assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
-    assert_eq!(key_of(&error), "input.emergency_hotkey");
-
-    let error = reject("[input]\nemergency_hotkey = \"Ctrl+Alt+Shift+Right\"\n");
-    assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
-    assert_eq!(key_of(&error), "input.emergency_hotkey");
-
-    let error = reject("[input]\nswitch_hotkey = \"\"\n");
-    assert_eq!(code_of(&error), Some(ErrorCode::Hotkey));
-    assert_eq!(key_of(&error), "input.switch_hotkey");
-
-    // The switch hotkey has no documented modifier minimum beyond "parses".
-    accept("[input]\nswitch_hotkey = \"Ctrl+Right\"\n");
+fn legacy_hotkey_fields_are_not_silently_accepted() {
+    for field in [
+        "[input]\nemergency_hotkey = \"Ctrl+F12\"\n",
+        "[input]\nswitch_hotkey = \"Ctrl+Right\"\n",
+        "[workspace]\nclaim_hotkey = \"Ctrl+Home\"\n",
+    ] {
+        assert!(toml::from_str::<config::Config>(&format!("{VALID}{field}")).is_err());
+    }
 }
 
 #[test]

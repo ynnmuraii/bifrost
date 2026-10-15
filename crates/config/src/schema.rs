@@ -11,7 +11,7 @@ use core::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{ConfigError, ErrorCode};
-use crate::hotkey::Hotkey;
+use crate::hotkey::{Hotkey, HotkeyBindings};
 use crate::paths;
 use crate::{N_MAX, SUPPORTED_CONFIG_VERSION};
 
@@ -290,9 +290,9 @@ impl Config {
     /// Run every documented load-validation rule.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.network.validate()?;
-        self.workspace.validate(&self.input)?;
+        self.workspace.validate()?;
         self.timing.validate()?;
-        self.input.validate(&self.workspace)?;
+        self.input.validate()?;
         self.clipboard.validate()?;
         self.log.validate()?;
         self.topology.validate()?;
@@ -506,10 +506,6 @@ impl NetworkConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
-    /// Optional GUI-less "drive from here" hotkey; empty means the GUI button
-    /// only.
-    #[serde(default = "default_claim_hotkey")]
-    pub claim_hotkey: String,
     /// Persisted last known ownership claim serial (Lamport counter).
     #[serde(default)]
     pub owner_claim_serial: u64,
@@ -530,7 +526,6 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         WorkspaceConfig {
-            claim_hotkey: default_claim_hotkey(),
             owner_claim_serial: 0,
             owner_node_id: String::new(),
             link_ping_ms: default_link_ping_ms(),
@@ -538,10 +533,6 @@ impl Default for WorkspaceConfig {
             claim_grant_timeout_ms: default_claim_grant_timeout_ms(),
         }
     }
-}
-
-fn default_claim_hotkey() -> String {
-    "Ctrl+Alt+Shift+F11".to_owned()
 }
 
 fn default_link_ping_ms() -> u32 {
@@ -557,7 +548,7 @@ fn default_claim_grant_timeout_ms() -> u32 {
 }
 
 impl WorkspaceConfig {
-    fn validate(&self, input: &InputConfig) -> Result<(), ConfigError> {
+    fn validate(&self) -> Result<(), ConfigError> {
         if (self.owner_claim_serial > 0) != !self.owner_node_id.is_empty() {
             return Err(ConfigError::coded(
                 ErrorCode::Owner,
@@ -567,43 +558,6 @@ impl WorkspaceConfig {
                     self.owner_claim_serial, self.owner_node_id
                 ),
                 "a consistent pair: serial > 0 requires a non-empty node_id and vice versa",
-            ));
-        }
-        if self.claim_hotkey.is_empty() {
-            return Ok(());
-        }
-        let hotkey = Hotkey::parse(&self.claim_hotkey).map_err(|error| {
-            ConfigError::coded(
-                ErrorCode::Hotkey,
-                "workspace.claim_hotkey",
-                &self.claim_hotkey,
-                format!("a hotkey of the form Ctrl+Alt+Shift+F11 ({error})"),
-            )
-        })?;
-        let emergency = Hotkey::parse(&input.emergency_hotkey).ok();
-        let switch = Hotkey::parse(&input.switch_hotkey).ok();
-        if hotkey.modifier_count() < 2 {
-            return Err(ConfigError::coded(
-                ErrorCode::Hotkey,
-                "workspace.claim_hotkey",
-                &self.claim_hotkey,
-                ">=2 modifiers plus a key",
-            ));
-        }
-        if switch.as_ref() == Some(&hotkey) {
-            return Err(ConfigError::coded(
-                ErrorCode::Hotkey,
-                "workspace.claim_hotkey",
-                &self.claim_hotkey,
-                "a combination different from input.switch_hotkey",
-            ));
-        }
-        if emergency.as_ref() == Some(&hotkey) {
-            return Err(ConfigError::coded(
-                ErrorCode::Hotkey,
-                "workspace.claim_hotkey",
-                &self.claim_hotkey,
-                "a combination different from input.emergency_hotkey",
             ));
         }
         if self.link_ping_ms == 0
@@ -729,14 +683,9 @@ impl TimingConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
-    /// `>=3` modifiers plus a key; default `Ctrl+Alt+Shift+F12`. Never equal to
-    /// `switch_hotkey`, and on Linux never `Ctrl+Alt+F1..F12` without Shift.
-    #[serde(default = "default_emergency_hotkey")]
-    pub emergency_hotkey: String,
-    /// Requesting a transition from the source; a Wayland source does not
-    /// support it (the compositor owns the capture).
-    #[serde(default = "default_switch_hotkey")]
-    pub switch_hotkey: String,
+    /// Configurable global shortcuts, including the mandatory emergency release.
+    #[serde(default)]
+    pub hotkeys: HotkeyBindings,
     /// Pointer gain applied to deltas; a positive finite factor.
     #[serde(default = "default_pointer_gain")]
     pub pointer_gain: f64,
@@ -764,8 +713,7 @@ pub struct InputConfig {
 impl Default for InputConfig {
     fn default() -> Self {
         InputConfig {
-            emergency_hotkey: default_emergency_hotkey(),
-            switch_hotkey: default_switch_hotkey(),
+            hotkeys: HotkeyBindings::default(),
             pointer_gain: default_pointer_gain(),
             edge_dwell_ms: 0,
             edge_hysteresis_px: default_edge_hysteresis_px(),
@@ -775,14 +723,6 @@ impl Default for InputConfig {
             takeover_detection: TakeoverDetection::default(),
         }
     }
-}
-
-fn default_emergency_hotkey() -> String {
-    "Ctrl+Alt+Shift+F12".to_owned()
-}
-
-fn default_switch_hotkey() -> String {
-    "Ctrl+Alt+Shift+Right".to_owned()
 }
 
 fn default_pointer_gain() -> f64 {
@@ -800,61 +740,11 @@ fn default_takeover_threshold_px() -> u32 {
 impl InputConfig {
     /// The parsed emergency hotkey, if it parses.
     pub fn emergency(&self) -> Option<Hotkey> {
-        Hotkey::parse(&self.emergency_hotkey).ok()
+        Hotkey::parse(&self.hotkeys.emergency_release).ok()
     }
 
-    fn validate(&self, workspace: &WorkspaceConfig) -> Result<(), ConfigError> {
-        for (key, text, minimum) in [
-            ("input.emergency_hotkey", &self.emergency_hotkey, 3usize),
-            ("input.switch_hotkey", &self.switch_hotkey, 1usize),
-        ] {
-            let hotkey = Hotkey::parse(text).map_err(|error| {
-                ConfigError::coded(
-                    ErrorCode::Hotkey,
-                    key,
-                    text,
-                    format!("a hotkey with >={minimum} modifiers plus a key ({error})"),
-                )
-            })?;
-            if hotkey.modifier_count() < minimum {
-                return Err(ConfigError::coded(
-                    ErrorCode::Hotkey,
-                    key,
-                    text,
-                    format!(">={minimum} modifiers plus a key"),
-                ));
-            }
-        }
-        if self.emergency_hotkey == self.switch_hotkey {
-            return Err(ConfigError::coded(
-                ErrorCode::Hotkey,
-                "input.emergency_hotkey",
-                &self.emergency_hotkey,
-                "a combination different from input.switch_hotkey",
-            ));
-        }
-        if !workspace.claim_hotkey.is_empty() && self.emergency_hotkey == workspace.claim_hotkey {
-            return Err(ConfigError::coded(
-                ErrorCode::Hotkey,
-                "input.emergency_hotkey",
-                &self.emergency_hotkey,
-                "a combination different from workspace.claim_hotkey",
-            ));
-        }
-        // The VT rule is a property of Linux sources; on other targets the same
-        // combination is harmless, so it is only enforced where it applies.
-        if cfg!(target_os = "linux") {
-            if let Some(hotkey) = self.emergency() {
-                if hotkey.is_linux_vt_switch() {
-                    return Err(ConfigError::coded(
-                        ErrorCode::Hotkey,
-                        "input.emergency_hotkey",
-                        &self.emergency_hotkey,
-                        "the same combination with Shift: Ctrl+Alt+F1..F12 switches VT on Linux",
-                    ));
-                }
-            }
-        }
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.hotkeys.validate()?;
         if !self.pointer_gain.is_finite() || self.pointer_gain <= 0.0 {
             return Err(ConfigError::invalid(
                 "input.pointer_gain",

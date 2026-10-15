@@ -21,7 +21,7 @@ fn shipped_example_parses_and_validates() {
     assert_eq!(config.config_version, SUPPORTED_CONFIG_VERSION);
     assert_eq!(config.network.port_input, 47901);
     assert_eq!(config.network.port_clipboard, 47902);
-    assert_eq!(config.input.emergency_hotkey, "Ctrl+Alt+Shift+F12");
+    assert_eq!(config.input.hotkeys.emergency_release, "Ctrl+Alt+Shift+F12");
     assert_eq!(config.timing.prepare_timeout_ms, 200);
     assert_eq!(config.timing.lease_ttl_ms, 500);
     assert!(
@@ -49,7 +49,7 @@ fn a_bare_version_line_fills_every_section_with_its_defaults() {
     assert!(!minimal.network.allow_any_interface);
     assert!(minimal.network.peers.is_empty());
 
-    assert_eq!(minimal.workspace.claim_hotkey, "Ctrl+Alt+Shift+F11");
+    assert_eq!(minimal.input.hotkeys.claim_ownership, "Ctrl+Alt+Shift+Home");
     assert_eq!(minimal.workspace.owner_claim_serial, 0);
     assert_eq!(minimal.workspace.owner_node_id, "");
     assert_eq!(minimal.workspace.link_ping_ms, 1000);
@@ -64,8 +64,9 @@ fn a_bare_version_line_fills_every_section_with_its_defaults() {
     assert_eq!(minimal.timing.challenge_interval_ms(), 100);
     assert_eq!(minimal.timing.ipc_heartbeat_ms(), 75);
 
-    assert_eq!(minimal.input.emergency_hotkey, "Ctrl+Alt+Shift+F12");
-    assert_eq!(minimal.input.switch_hotkey, "Ctrl+Alt+Shift+Right");
+    assert_eq!(minimal.input.hotkeys.emergency_release, "Ctrl+Alt+Shift+F12");
+    assert_eq!(minimal.input.hotkeys.switch_next, "Ctrl+Alt+Shift+Right");
+    assert_eq!(minimal.input.hotkeys.return_local, "Ctrl+Alt+Shift+Left");
     assert_eq!(minimal.input.pointer_gain, 1.0);
     assert_eq!(minimal.input.edge_dwell_ms, 0);
     assert_eq!(minimal.input.edge_hysteresis_px, 8);
