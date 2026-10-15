@@ -1185,7 +1185,8 @@ impl ViewModel {
             }
             Msg::ClipboardHistory(history) => {
                 self.clipboard_history = history.items;
-                self.clipboard_history.sort_by(|a, b| b.id.cmp(&a.id));
+                self.clipboard_history
+                    .sort_by_key(|entry| std::cmp::Reverse(entry.id));
             }
             // Copy requests are applied by the core; this GUI never needs full text.
             Msg::ClipboardHistoryItem(_) => {}

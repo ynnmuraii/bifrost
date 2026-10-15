@@ -671,7 +671,7 @@ fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
                         lang,
                         Key::DirectionPeerNameAgeSecondsSAgoSizeBytesBytes,
                         &[
-                            ("direction", direction),
+                            ("direction", &direction),
                             ("peer_name", &entry.peer_name),
                             ("age_seconds", &age_seconds.to_string()),
                             ("size_bytes", &entry.size_bytes.to_string()),
