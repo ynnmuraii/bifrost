@@ -186,6 +186,7 @@ pub enum Event {
     /// control (rule 3).
     Emergency,
     HotkeyPressed(config::HotkeyAction),
+    #[cfg(target_os = "linux")]
     HotkeysResult(ipc::HotkeysResult),
     /// The pointer reached the edge of this node and the compositor handed input over.
     ///
