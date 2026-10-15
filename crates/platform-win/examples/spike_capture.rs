@@ -198,6 +198,9 @@ mod win {
                     outcome.emergency = true;
                     break;
                 }
+                Ok(CaptureEvent::HotkeyPressed(action)) => {
+                    println!("hotkey action {action}");
+                }
                 Ok(CaptureEvent::QueueOverflow) => {
                     println!("QUEUE OVERFLOW: agent must end the remote session");
                 }

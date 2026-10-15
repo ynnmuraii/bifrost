@@ -76,8 +76,8 @@
 //! maintains itself. On detection the shared mode is switched to `Observe`
 //! directly — the flag is a plain atomic in this process, so no `lws-core`, no
 //! IPC and no network is on that path — and a [`capture::CaptureEvent::Emergency`]
-//! is queued for the agent. The key event itself is passed through so the
-//! freshly-restored local desktop receives it. AC-03's ≤100 ms budget is met by
+//! is queued for the agent. The triggering key down, repeats, and key up are swallowed,
+//! including across a live binding replacement. AC-03's ≤100 ms budget is met by
 //! construction: the mode flip is one store.
 //!
 //! ## Injected-event loop prevention

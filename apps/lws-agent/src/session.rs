@@ -122,6 +122,11 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         );
     }
     link.send(Msg::Ready(ready.to_ipc())).await?;
+    if !attach.hotkeys.is_empty() {
+        if let Some(result) = install_hotkeys(&mut backend, &attach.hotkeys).await {
+            link.send(Msg::HotkeysResult(result)).await?;
+        }
+    }
     // A backend that is usable but incomplete (a missing portal, a dismissed dialog)
     // says so explicitly: `AgentError` is how `docs/ipc.proto` carries
     // `PORTAL_DENIED`/`PORTAL_UNAVAILABLE` and the interface they name.
@@ -463,6 +468,17 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn install_hotkeys(backend: &mut Backend, bindings: &[ipc::HotkeyBinding]) -> Option<ipc::HotkeysResult> {
+    match backend::hotkeys_from_wire(bindings) {
+        Ok(parsed) => backend.request_hotkeys(parsed).await,
+        Err(detail) => Some(ipc::HotkeysResult {
+            success: false,
+            detail,
+            bindings: Vec::new(),
+        }),
+    }
+}
+
 /// Handles one core → agent frame. `Some(stop)` ends the loop.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
@@ -487,6 +503,11 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         }
         Msg::Ping(ping) => {
             link.send(Msg::Pong(Pong { nonce: ping.nonce })).await?;
+        }
+        Msg::SetHotkeys(set) => {
+            if let Some(result) = install_hotkeys(backend, &set.bindings).await {
+                link.send(Msg::HotkeysResult(result)).await?;
+            }
         }
         Msg::BeginCapture(begin) => {
             let kind = match backend::capture_kind_from_i32(begin.kind) {
@@ -1077,6 +1098,14 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
                 revoked: false,
             }))
             .await?;
+        }
+        Event::HotkeysResult(result) => {
+            link.send(Msg::HotkeysResult(result)).await?;
+        }
+        Event::HotkeyPressed(action) => {
+            link.send(Msg::HotkeyPressed(ipc::HotkeyPressed {
+                action: backend::wire_hotkey_action(action) as i32,
+            })).await?;
         }
         Event::Emergency => {
             // Never flush pre-emergency input after returning control locally.
@@ -2671,6 +2700,7 @@ mod tests {
                 allow_portal_sessions: false,
                 edge_effects: true,
                 hide_cursor: true,
+                hotkeys: Vec::new(),
             }))
             .await;
         match harness.recv().await {
