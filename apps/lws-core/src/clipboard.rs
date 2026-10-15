@@ -886,22 +886,8 @@ impl TaskState {
         if self.tasks.len() < 64 {
             return;
         }
-        let mut finished = Vec::new();
-        let mut index = 0;
-        while index < self.tasks.len() && finished.len() < 64 {
-            if self.tasks[index].is_finished() {
-                finished.push(self.tasks.swap_remove(index));
-            } else {
-                index += 1;
-            }
-        }
-        if !finished.is_empty() {
-            self.tasks.push(tokio::spawn(async move {
-                for task in finished {
-                    let _ = task.await;
-                }
-            }));
-        }
+        // Finished tasks own no running work; retain every live handle for shutdown to join.
+        self.tasks.retain(|task| !task.is_finished());
     }
 }
 
