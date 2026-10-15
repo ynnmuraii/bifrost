@@ -218,7 +218,7 @@ pub enum Key {
     /// «экраны ещё не получены»
     TheDisplaysHaveNotArrivedYet,
     /// «Связь {link}: Весь рабочий стол (авто) — {screens}»
-    LinkTheWholeDesktopAutoScreens,
+    LinkLinkTheWholeDesktopAutoScreens,
     /// «Пока никого: откройте окно сопряжения»
     NobodyYetOpenThePairingWindow,
     /// «в сети»
@@ -772,7 +772,7 @@ const fn ru(key: Key) -> &'static str {
         Key::LinkIsInactiveTheDisplayWasNotFound => "Связь {} неактивна: экран не найден",
         Key::LinkIsInactiveDisplayWasNotFound => "Связь {} неактивна: экран «{}» не найден",
         Key::TheDisplaysHaveNotArrivedYet => "экраны ещё не получены",
-        Key::LinkTheWholeDesktopAutoScreens => "Связь {link}: Весь рабочий стол (авто) — {screens}",
+        Key::LinkLinkTheWholeDesktopAutoScreens => "Связь {link}: Весь рабочий стол (авто) — {screens}",
         Key::NobodyYetOpenThePairingWindow => "Пока никого: откройте окно сопряжения",
         Key::Online => "в сети",
         Key::Offline => "не в сети",
@@ -1086,7 +1086,7 @@ const fn en(key: Key) -> &'static str {
         Key::LinkIsInactiveTheDisplayWasNotFound => "Link {} is inactive: the display was not found",
         Key::LinkIsInactiveDisplayWasNotFound => "Link {} is inactive: display «{}» was not found",
         Key::TheDisplaysHaveNotArrivedYet => "the displays have not arrived yet",
-        Key::LinkTheWholeDesktopAutoScreens => "Link {}: the whole desktop (auto) — {screens}",
+        Key::LinkLinkTheWholeDesktopAutoScreens => "Link {link}: the whole desktop (auto) — {screens}",
         Key::NobodyYetOpenThePairingWindow => "Nobody yet: open the pairing window",
         Key::Online => "online",
         Key::Offline => "offline",
@@ -1493,7 +1493,7 @@ mod tests {
         Key::LinkIsInactiveTheDisplayWasNotFound,
         Key::LinkIsInactiveDisplayWasNotFound,
         Key::TheDisplaysHaveNotArrivedYet,
-        Key::LinkTheWholeDesktopAutoScreens,
+        Key::LinkLinkTheWholeDesktopAutoScreens,
         Key::NobodyYetOpenThePairingWindow,
         Key::Online,
         Key::Offline,

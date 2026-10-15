@@ -1565,7 +1565,7 @@ impl ViewModel {
                 };
                 Some(fill_named(
                     lang,
-                    Key::LinkTheWholeDesktopAutoScreens,
+                    Key::LinkLinkTheWholeDesktopAutoScreens,
                     &[("link", &link.id), ("screens", &screens)],
                 ))
             })
