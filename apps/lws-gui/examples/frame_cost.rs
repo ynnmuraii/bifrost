@@ -1,36 +1,37 @@
-//! What one frame of the window costs on the CPU, with the field off and with it moving.
-//!
-//! ```text
-//! cargo run --release -p lws-gui --example frame_cost
-//! ```
-//!
-//! No window and no GPU: a frame is `ui::draw` plus egui's tessellation, which is everything the
-//! CPU does per frame short of the driver. It also counts the heap allocations of a frame (a
-//! counting global allocator), which is the «allocation-free per frame» check of the field.
+//! Headless release CPU/allocation report, using virtual time (no sleeps or GPU).
+//! cargo run --release -p lws-gui --example frame_cost -- --root DIR
+//! --root/--live uses a read-only real core snapshot, otherwise an offline fixture.
+//! CPU means wall time spent drawing/tessellating, not process-wide CPU accounting.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use lws_gui::egui;
-use lws_gui::gui_settings::{FieldMode, Look, Pace};
-use lws_gui::ui::{self, Env, UiState};
-use lws_gui::view_model::{CoreEndpoint, LocalConfig, ViewModel};
+use lws_gui::gui_settings::Look;
+use lws_gui::ui::{self, Env, Field, FieldFrame, Palette, UiState};
+use lws_gui::view_model::{self, Bridge, CliArgs, CoreEndpoint, LocalConfig, ViewModel};
 use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
 
 struct Counting;
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
-// SAFETY: forwards to the system allocator unchanged; only counts.
+// SAFETY: all operations forward the caller's allocator contract unchanged.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: the caller's contract is passed through.
         unsafe { System.alloc(layout) }
     }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, size) }
+    }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: the caller's contract is passed through.
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -38,73 +39,181 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
-fn main() {
-    let ctx = egui::Context::default();
-    ui::install_fonts(&ctx);
-    let mut vm = ViewModel::new(
+fn snapshot() -> Result<ViewModel, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--root" || arg == "--live") {
+        let (view, client) = view_model::boot(CliArgs::parse(args));
+        let mut bridge = Bridge::new(view, client);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            bridge.pump();
+            let view = bridge.view();
+            if view.connection.is_connected()
+                && view.status.is_some()
+                && view.editor.has_document()
+                && view.inflight.is_empty()
+            {
+                println!("data_source=IPC topology_revision={}", view.editor.revision);
+                return Ok(view.clone());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("no complete core snapshot: {:?}", view.connection));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let mut view = ViewModel::new(
         CoreEndpoint::Ready {
-            description: "pipe".to_owned(),
+            description: "offline fixture".to_owned(),
         },
         LocalConfig::default(),
     );
-    vm.on_connected("pipe");
-    vm.apply(GuiFrame {
+    view.on_connected("offline fixture");
+    view.apply(GuiFrame {
         seq: 1,
         request_id: 0,
         msg: Some(Msg::Status(protocol::ipc::Status::default())),
     });
-    for (label, field, pace, clouds) in [
-        ("field off          ", FieldMode::Off, Pace::Calm, true),
-        ("repel calm, clouds ", FieldMode::Repel, Pace::Calm, true),
-        ("repel live, clouds ", FieldMode::Repel, Pace::Live, true),
-        ("repel calm, none   ", FieldMode::Repel, Pace::Calm, false),
-    ] {
-        vm.look = Look {
-            field,
-            pace,
-            clouds,
-            ..Look::default()
-        };
-        let mut state = UiState::new(Instant::now());
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
-        let mut frame = |n: u32| {
-            let input = egui::RawInput {
-                screen_rect: Some(rect),
-                time: Some(f64::from(n) / 30.0),
-                events: vec![egui::Event::PointerMoved(egui::pos2(
-                    300.0 + (n % 400) as f32,
-                    300.0,
-                ))],
-                ..Default::default()
-            };
-            let env = Env {
-                now: Instant::now(),
-                animate: true,
-            };
-            let output = ctx.run_ui(input, |ui| {
-                let _ = ui::draw(ui, &vm, &mut state, env);
-            });
-            let meshes = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
-            std::hint::black_box(&meshes);
-            output.drop_without_applying_deltas();
-        };
-        for n in 0..60 {
-            frame(n);
-        }
-        let allocs = ALLOCS.load(Ordering::Relaxed);
-        let start = Instant::now();
-        let frames = 600;
-        for n in 0..frames {
-            frame(60 + n);
-        }
-        let elapsed = start.elapsed();
-        let allocs = ALLOCS.load(Ordering::Relaxed) - allocs;
-        println!(
-            "{label} {:>7.1} µs/frame  {:>7} allocs/frame  (particles {}, cloud cells {})",
-            elapsed.as_secs_f64() * 1e6 / f64::from(frames),
-            allocs / u64::from(frames),
-            state.field.particles(),
-            state.field.cloud_cells(),
-        );
+    println!("data_source=offline_fixture");
+    Ok(view)
+}
+
+fn input(t: Duration, pointer: Option<egui::Pos2>) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1920.0, 1080.0),
+        )),
+        time: Some(t.as_secs_f64()),
+        events: pointer
+            .map(|p| vec![egui::Event::PointerMoved(p)])
+            .unwrap_or_default(),
+        ..Default::default()
     }
+}
+
+fn main() -> Result<(), String> {
+    let mut vm = snapshot()?;
+    // Measure the shipped default, independent of a user's saved appearance.
+    vm.look = Look::default();
+    vm.modal = None;
+    vm.appearance_open = false;
+    vm.pairing = Default::default();
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    let epoch = Instant::now();
+    let mut state = UiState::new(epoch);
+    let mut due = Duration::ZERO;
+    let mut total = 0u64;
+    let mut idle_frames = 0;
+    for (label, start, end, moving) in [
+        ("warmup", 0, 3, true),
+        ("active", 3, 8, true),
+        ("settling", 8, 11, false),
+        ("idle", 11, 21, false),
+    ] {
+        let begin = Duration::from_secs(start);
+        let end = Duration::from_secs(end);
+        let mut event = if moving { begin } else { Duration::MAX };
+        let mut frames = 0u64;
+        let mut repaint_frames = 0u64;
+        let mut cpu = Duration::ZERO;
+        let mut allocations = 0u64;
+        loop {
+            let t = due.min(event);
+            if t >= end {
+                break;
+            }
+            let is_event = event <= due;
+            let pointer = if is_event {
+                event += Duration::from_millis(50);
+                Some(egui::pos2(300.0 + (t.as_secs_f32() * 120.0) % 600.0, 250.0))
+            } else {
+                None
+            };
+            let raw = input(t, pointer);
+            let before = ALLOCS.load(Ordering::Relaxed);
+            let began = Instant::now();
+            let mut output = ctx.run_ui(raw, |ui| {
+                let now = epoch + t;
+                vm.tick(now);
+                let drawn = ui::draw(ui, &vm, &mut state, Env { now, animate: true });
+                let pending = vm.next_wakeup(now);
+                if let Some(after) = drawn.repaint_after.into_iter().chain(pending).min() {
+                    ui.ctx().request_repaint_after(after);
+                }
+            });
+            let delay = output
+                .viewport_output
+                .values()
+                .map(|v| v.repaint_delay)
+                .min()
+                .unwrap_or(Duration::MAX);
+            let meshes =
+                ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+            output.drop_without_applying_deltas();
+            std::hint::black_box(&meshes);
+            cpu += began.elapsed();
+            allocations += ALLOCS.load(Ordering::Relaxed) - before;
+            due = if delay == Duration::MAX {
+                Duration::MAX
+            } else {
+                t + delay.max(Duration::from_millis(1))
+            };
+            frames += 1;
+            repaint_frames += u64::from(!is_event);
+            total += 1;
+            assert!(total < 100_000, "reactive loop failed to advance");
+        }
+        if label == "idle" {
+            idle_frames = frames;
+        }
+        let seconds = (end - begin).as_secs_f64();
+        println!("{label}: virtual_s={seconds:.1} frames={frames} timed_repaints={repaint_frames} cpu_ms={:.3} cpu_us/frame={:.2} allocs={allocations} allocs/frame={:.2} cpu_ms/virtual_s={:.3}",
+            cpu.as_secs_f64() * 1e3,
+            cpu.as_secs_f64() * 1e6 / frames.max(1) as f64,
+            allocations as f64 / frames.max(1) as f64,
+            cpu.as_secs_f64() * 1e3 / seconds);
+    }
+    direct_field();
+    assert_eq!(
+        idle_frames, 0,
+        "settled default field must stop requesting repaints"
+    );
+    Ok(())
+}
+
+fn direct_field() {
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    let look = Look::default();
+    let pal = Palette::of(look.theme);
+    let mut field = Field::new();
+    let mut allocations = 0;
+    let mut cpu = Duration::ZERO;
+    for n in 0..660 {
+        let t = Duration::from_secs_f64(f64::from(n) / 30.0);
+        let output = ctx.run_ui(input(t, None), |ui| {
+            let frame = FieldFrame {
+                map: ui.ctx().content_rect(),
+                pal: &pal,
+                look,
+                animate: true,
+                t: t.as_secs_f32(),
+                pointer: Some(egui::pos2(300.0 + (n % 400) as f32, 250.0)),
+                flows: &[],
+            };
+            let before = ALLOCS.load(Ordering::Relaxed);
+            let began = Instant::now();
+            field.paint(ui.painter(), &frame);
+            if n >= 60 {
+                cpu += began.elapsed();
+                allocations += ALLOCS.load(Ordering::Relaxed) - before;
+            }
+        });
+        // Keep egui's reused shape buffers, but exclude its work from the direct check.
+        output.drop_without_applying_deltas();
+    }
+    println!("direct Field::paint: frames=600 cpu_us/frame={:.2} allocs={allocations} allocs/frame={:.3} particles={} cloud_cells={} (excludes egui run/tessellation)",
+        cpu.as_secs_f64() * 1e6 / 600.0, allocations as f64 / 600.0, field.particles(), field.cloud_cells());
 }
