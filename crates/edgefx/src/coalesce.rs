@@ -122,7 +122,7 @@ mod tests {
                 10
             )
             .is_none());
-        assert_eq!(gate.due_at(), Some(33));
+        assert_eq!(gate.due_at(), Some(MIN_GAP_MS));
         assert_eq!(gate.due(40), Some((Update::Crossed(None), 1)));
         assert!(gate.push(Update::Entered(target()), 3, 41).is_none());
         assert_eq!(gate.due(80), Some((Update::Entered(target()), 3)));
