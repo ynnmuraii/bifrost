@@ -2960,6 +2960,11 @@ impl Session {
     /// The edge effects a command to the agent implies: `Crossed` when this node starts
     /// sending input away, `Entered` at the first pointer position of a receiver lease,
     /// `Left` when either lease ends.
+    ///
+    /// While a lease injects input here, the injected positions are the only pointer this
+    /// node has, and the peer samples them on the other machine. Sampling them *here* is what
+    /// gives the receiver the approach to its own linked edges (the exit it would be left
+    /// through on the way back), which is the one gesture it never sees: it is not capturing.
     async fn edgefx_for_command(&mut self, command: &fr::AgentCommand) {
         let now = self.now_ms();
         let update = match command {
@@ -2972,26 +2977,38 @@ impl Session {
                 None
             }
             fr::AgentCommand::Inject { events, .. } => {
-                if !events
-                    .iter()
-                    .any(|event| matches!(event, InputEvent::PointerAbsolute(_)))
-                    || !self.edgefx.take_entry_wanted()
-                {
-                    return;
-                }
-                let first = events.iter().find_map(|event| match event {
-                    InputEvent::PointerAbsolute(position) => Some(position),
+                let last = events.iter().rev().find_map(|event| match event {
+                    InputEvent::PointerAbsolute(position) => Some(*position),
                     _ => None,
                 });
-                match (first, self.topology.as_ref()) {
-                    (Some(position), Some(topology)) => crate::edgefx::entry_in_desktop(
-                        topology,
-                        &self.node_id,
-                        position.x,
-                        position.y,
-                    ),
-                    _ => None,
+                let Some(last) = last else {
+                    return;
+                };
+                if self.edgefx.take_entry_wanted() {
+                    // Input arrived: the bloom plays here while the peer shows the exit on
+                    // its side. A later sample of this same position must not cut it short,
+                    // which is what `own_*` are for.
+                    let entry = self.topology.as_ref().and_then(|topology| {
+                        crate::edgefx::entry_in_desktop(topology, &self.node_id, last.x, last.y)
+                    });
+                    if let Some((update, display)) = entry {
+                        let frame = self.edgefx.push(update, &display, now);
+                        self.send_edgefx(frame).await;
+                    }
+                    return;
                 }
+                if !self.edgefx.wants_sample(now) {
+                    return;
+                }
+                let near = self.topology.as_ref().and_then(|topology| {
+                    crate::edgefx::proximity_in_desktop(topology, &self.node_id, last.x, last.y)
+                });
+                let frame = match near {
+                    Some((update, display)) => self.edgefx.own_near(update, &display, now),
+                    None => self.edgefx.own_away(now),
+                };
+                self.send_edgefx(frame).await;
+                return;
             }
             fr::AgentCommand::EndCapture { .. } | fr::AgentCommand::ReleaseSession { .. } => {
                 self.edgefx.cancel_entry();
