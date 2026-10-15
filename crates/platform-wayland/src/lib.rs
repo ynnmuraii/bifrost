@@ -17,6 +17,9 @@
 //! the portal-version signature, restore-token storage (KVM-017) and the
 //! `org.freedesktop.portal.GlobalShortcuts` emergency hotkey (KVM-018).
 //!
+//! `overlay` is unrelated to input: the optional edge-effect strip, a wlr-layer-shell
+//! surface on its own thread and connection (`edgefx` owns the animation).
+//!
 //! # Runtime
 //!
 //! The async runtime is **tokio**, because `reis`'s `tokio` feature hands us the EIS
@@ -77,6 +80,8 @@ mod compositor;
 mod grant;
 #[cfg(target_os = "linux")]
 mod inject;
+#[cfg(target_os = "linux")]
+pub mod overlay;
 #[cfg(target_os = "linux")]
 mod relative;
 #[cfg(target_os = "linux")]

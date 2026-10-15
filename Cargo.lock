@@ -3076,14 +3076,18 @@ name = "platform-wayland"
 version = "0.0.0"
 dependencies = [
  "ashpd",
+ "edgefx",
  "futures-util",
  "input-model",
  "reis",
+ "rustix 1.1.5",
  "serde",
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "wayland-client",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]
