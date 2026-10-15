@@ -418,6 +418,8 @@ pub struct Session {
     local_pointer: Option<geometry::Position>,
     /// While a source lease is remote: the virtual position on the peer's display.
     remote_pointer: Option<geometry::Position>,
+    /// The lease whose missing receiver estimate has already been investigated.
+    remote_seed_lease: Option<(NodeId, fr::LeaseId)>,
     /// The node that virtual position lives on (the lease peer, or the peer of a chain).
     remote_node: Option<NodeId>,
     /// A link the pointer left through *while remote*; applied once the lease is
@@ -590,6 +592,7 @@ impl Session {
             peer_displays: BTreeMap::new(),
             local_pointer: None,
             remote_pointer: None,
+            remote_seed_lease: None,
             remote_node: None,
             pending_target: None,
             observe_armed: false,
@@ -3196,7 +3199,11 @@ impl Session {
         // chained link, a layout that became unusable) still has to send positions the
         // receiver can use: seed the estimate on its primary display and integrate the
         // captured deltas from there (batch-2 audit).
-        if self.remote_pointer.is_none() {
+        if remote_seed_needed(
+            self.remote_pointer.as_ref(),
+            &mut self.remote_seed_lease,
+            lease,
+        ) {
             self.remote_pointer = self.receiver_start_position(peer);
             self.remote_node = Some(peer);
             match self.remote_pointer.as_ref() {
@@ -3958,6 +3965,44 @@ fn split_agent_tail(
         }
     }
     (grants, rest)
+}
+
+/// Whether this batch needs the receiver-manifest fallback and its diagnostic.
+fn remote_seed_needed(
+    pointer: Option<&geometry::Position>,
+    _attempted: &mut Option<(NodeId, fr::LeaseId)>,
+    _lease: (NodeId, fr::LeaseId),
+) -> bool {
+    pointer.is_none()
+}
+
+#[cfg(test)]
+mod remote_seed_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_receiver_manifest_is_looked_up_and_warned_once_per_lease() {
+        let peer = NodeId::new([2; 32]);
+        let lease = (peer, [3; 16]);
+        let mut attempted = None;
+        let mut manifest_lookups = 0;
+        let mut warnings = 0;
+        for _ in 0..100 {
+            if remote_seed_needed(None, &mut attempted, lease) {
+                // The production branch performs both operations even when lookup fails.
+                manifest_lookups += 1;
+                warnings += 1;
+            }
+        }
+        assert_eq!(manifest_lookups, 1);
+        assert_eq!(warnings, 1);
+        assert!(remote_seed_needed(None, &mut attempted, (peer, [4; 16])));
+        assert!(!remote_seed_needed(None, &mut attempted, (peer, [4; 16])));
+        attempted = None; // A fresh display report permits one more lookup.
+        assert!(remote_seed_needed(None, &mut attempted, (peer, [4; 16])));
+        let pointer = geometry::Position::new("DP-1", 960.0, 540.0);
+        assert!(!remote_seed_needed(Some(&pointer), &mut attempted, lease));
+    }
 }
 
 /// Revalidates an edited layout document (KVM-072: the coordinator validates the whole
