@@ -60,6 +60,8 @@ pub fn status_with(focus: &str) -> ipc::Status {
         },
         connected: true,
         clipboard_enabled: true,
+        edge_effects: true,
+        hide_remote_cursor: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
         rtt_p95_us: 0,
         rtt_jitter_us: 0,
