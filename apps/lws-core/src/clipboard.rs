@@ -361,15 +361,14 @@ impl Clipboard {
             .map(|(offer_id, incoming)| Out::Cancel {
                 peer: incoming.peer,
                 offer_id,
-                // Superseded input is no longer valid: use the existing INVALID_FRAME code.
-                reason: cb::ClipboardError::Invalid,
+                reason: cb::ClipboardError::Superseded,
             })
             .collect();
         if let Some((peer, offer_id)) = self.pending_request.take() {
             if !out.iter().any(|event| matches!(event,
                 Out::Cancel { peer: p, offer_id: id, .. } if *p == peer && *id == offer_id
             )) {
-                out.push(Out::Cancel { peer, offer_id, reason: cb::ClipboardError::Invalid });
+                out.push(Out::Cancel { peer, offer_id, reason: cb::ClipboardError::Superseded });
             }
         }
         if !self.settings.enabled {
@@ -841,6 +840,7 @@ fn wire_error(reason: cb::ClipboardError) -> protocol::wire::ErrorCode {
     match reason {
         cb::ClipboardError::Disabled => ErrorCode::ClipboardDisabled,
         cb::ClipboardError::TooLarge => ErrorCode::ClipboardTooLarge,
+        cb::ClipboardError::Superseded => ErrorCode::ClipboardSuperseded,
         cb::ClipboardError::HashMismatch
         | cb::ClipboardError::Invalid
         | cb::ClipboardError::Secret => ErrorCode::InvalidFrame,
@@ -1357,7 +1357,7 @@ mod tests {
             let out = endpoint.on_local_copy(b"new local copy".to_vec(), markers).await;
             for id in [first, second] {
                 assert_eq!(out.iter().filter(|event| matches!(event,
-                    Out::Cancel { peer: p, offer_id, reason: cb::ClipboardError::Invalid }
+                    Out::Cancel { peer: p, offer_id, reason: cb::ClipboardError::Superseded }
                         if *p == peer && *offer_id == id
                 )).count(), 1, "mode {mode} must cancel each incoming offer once");
             }
@@ -1974,6 +1974,11 @@ mod tests {
             wire_error(cb::ClipboardError::TooLarge),
             ErrorCode::ClipboardTooLarge
         );
+        assert_eq!(
+            wire_error(cb::ClipboardError::Superseded),
+            ErrorCode::ClipboardSuperseded
+        );
+        assert_eq!(ErrorCode::ClipboardSuperseded as i32, 26);
         for reason in [
             cb::ClipboardError::HashMismatch,
             cb::ClipboardError::Invalid,
