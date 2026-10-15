@@ -253,6 +253,20 @@ thread_local! {
     static CTX: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
 }
 
+/// What the cursor veil polls (see `crate::veil`): lock-free, no hook-thread involvement.
+#[derive(Clone)]
+pub struct CursorProbe {
+    shared: Arc<Shared>,
+}
+
+impl CursorProbe {
+    /// The held cursor point, `Some` only while a Remote capture holds it.
+    #[must_use]
+    pub fn hold_point(&self) -> Option<(i32, i32)> {
+        remote_hold(&self.shared)
+    }
+}
+
 /// A running capture.
 pub struct Capture {
     rx: Receiver<CaptureEvent>,
@@ -394,6 +408,14 @@ impl Capture {
             Some(unpack(self.shared.hold.load(Ordering::SeqCst)))
         } else {
             None
+        }
+    }
+
+    /// A read-only view of the hold for the cursor veil's own thread.
+    #[must_use]
+    pub fn cursor_probe(&self) -> CursorProbe {
+        CursorProbe {
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -701,6 +723,17 @@ fn capture_kind(shared: &Shared) -> CaptureKind {
 /// Only a committed Remote capture suppresses local input.
 fn remote(shared: &Shared) -> bool {
     capture_kind(shared).is_suppressed()
+}
+
+/// Where the cursor is held, only while a committed Remote capture holds it. The cursor veil
+/// follows exactly this: `None` in Local (`Observe`), Preparing (`Temporary`), after an
+/// emergency / expiry / stop. It is plain atomic loads, safe from any thread.
+fn remote_hold(shared: &Shared) -> Option<(i32, i32)> {
+    if remote(shared) && shared.hold_valid.load(Ordering::SeqCst) {
+        Some(unpack(shared.hold.load(Ordering::SeqCst)))
+    } else {
+        None
+    }
 }
 
 fn update_modifiers(shared: &Shared, vk: u16, down: bool) {
@@ -1177,6 +1210,26 @@ mod tests {
             assert!(matches!(rx.try_recv(), Ok(CaptureEvent::Emergency)));
             assert!(!remote(&shared));
         }
+    }
+
+    /// The cursor-veil invariant: the probe reports a point only for a committed Remote
+    /// capture with a valid hold - never in Local (Observe) or Preparing (Temporary) mode,
+    /// and not after an emergency, whatever `hold_valid` says.
+    #[test]
+    fn the_veil_probe_is_none_unless_the_capture_is_remote_with_a_hold() {
+        use super::*;
+        for mode in [CaptureKind::Observe, CaptureKind::Temporary] {
+            let (shared, _rx) = hook_state(mode);
+            assert_eq!(remote_hold(&shared), None, "{mode:?}");
+        }
+        let (shared, _rx) = hook_state(CaptureKind::Remote);
+        shared.hold.store(pack(1919, -40), Ordering::SeqCst);
+        assert_eq!(remote_hold(&shared), Some((1919, -40)));
+        shared.hold_valid.store(false, Ordering::SeqCst);
+        assert_eq!(remote_hold(&shared), None);
+        shared.hold_valid.store(true, Ordering::SeqCst);
+        fire_emergency(&shared);
+        assert_eq!(remote_hold(&shared), None, "an emergency releases the veil");
     }
 
     #[test]

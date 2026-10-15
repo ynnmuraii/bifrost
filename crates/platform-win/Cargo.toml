@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 clipboard = { path = "../clipboard" }
+edgefx = { path = "../edgefx" }
 input-model = { path = "../input-model" }
 
 # The Windows bindings are only needed for the real Windows targets; on any other
