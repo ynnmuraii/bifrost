@@ -618,7 +618,18 @@ impl Clipboard {
             }
             ClipboardMessage::Cancel { offer_id, reason } => {
                 tracing::info!(peer = %peer, reason = ?reason, "clipboard transfer cancelled by the peer");
-                self.incoming.remove(&offer_id);
+                if self.incoming.get(&offer_id).is_some_and(|incoming| incoming.peer == peer) {
+                    self.incoming.remove(&offer_id);
+                }
+                if self.pending_request == Some((peer, offer_id)) {
+                    self.pending_request = None;
+                }
+                for offers in [&mut self.offered, &mut self.waiting] {
+                    if offers.get(&peer).is_some_and(|(offer, _)| offer_id_of(offer) == Some(offer_id)) {
+                        offers.remove(&peer);
+                    }
+                }
+                self.runtime.cancel_transfer(peer, offer_id).await;
                 Vec::new()
             }
             ClipboardMessage::Grant { .. } | ClipboardMessage::Bind { .. } => Vec::new(),
@@ -945,6 +956,18 @@ struct Conn {
     generation: u64,
     tx: mpsc::Sender<ClipboardMessage>,
     reader: tokio::task::AbortHandle,
+    writer: tokio::task::AbortHandle,
+    transfers: BTreeMap<[u8; 16], tokio::task::AbortHandle>,
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+        for transfer in self.transfers.values() {
+            transfer.abort();
+        }
+    }
 }
 
 impl Handle {
@@ -1075,21 +1098,25 @@ impl Handle {
         payload: Vec<u8>,
         rate_bytes_per_s: u64,
     ) -> Result<(), ()> {
-        let channel = self
-            .inner
-            .lock()
-            .await
-            .conns
-            .get(&peer)
-            .map(|conn| conn.tx.clone());
-        let Some(tx) = channel else {
+        let mut inner = self.inner.lock().await;
+        let Some(conn) = inner.conns.get_mut(&peer) else {
             return Err(());
         };
+        let tx = conn.tx.clone();
+        let Some(tasks) = self.tasks.upgrade() else {
+            return Err(());
+        };
+        let mut state = tasks.state.lock().expect("task registry");
+        if state.closed {
+            return Err(());
+        }
+        state.prune();
+        conn.transfers.retain(|_, task| !task.is_finished());
         let mut outgoing =
             Outgoing::new(offer_id, payload, rate_bytes_per_s, cb::MAX_BYTES, 0).map_err(|_| ())?;
         let size = outgoing.size_bytes();
         let started = Instant::now();
-        self.spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some((message, delay_ms)) =
                 outgoing.next(started.elapsed().as_millis() as u64)
             {
@@ -1102,7 +1129,20 @@ impl Handle {
             }
             tracing::info!(peer = %peer, bytes = size, "clipboard transfer sent");
         });
+        if let Some(old) = conn.transfers.insert(offer_id, task.abort_handle()) {
+            old.abort();
+        }
+        state.tasks.push(task);
         Ok(())
+    }
+
+    async fn cancel_transfer(&self, peer: NodeId, offer_id: [u8; 16]) {
+        let mut inner = self.inner.lock().await;
+        if let Some(task) = inner.conns.get_mut(&peer)
+            .and_then(|conn| conn.transfers.remove(&offer_id))
+        {
+            task.abort();
+        }
     }
 
     /// Drops the channel to `peer` and closes its connection.
@@ -1217,7 +1257,9 @@ impl Handle {
         });
         let reader_abort = reader_task.abort_handle();
         task_state.tasks.push(reader_task);
-        task_state.tasks.push(tokio::spawn(async move { write_task(writer, rx).await }));
+        let writer_task = tokio::spawn(async move { write_task(writer, rx).await });
+        let writer_abort = writer_task.abort_handle();
+        task_state.tasks.push(writer_task);
         drop(task_state);
         inner.conns.insert(
             peer,
@@ -1225,6 +1267,8 @@ impl Handle {
                 generation,
                 tx,
                 reader: reader_abort,
+                writer: writer_abort,
+                transfers: BTreeMap::new(),
             },
         )
         };
@@ -1330,6 +1374,63 @@ async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_cancel_stops_only_the_matching_paced_sender() {
+        let (mut endpoint, root) = started_clipboard("paced-cancel").await;
+        let peer: NodeId = [0x21; 32].into();
+        let other: NodeId = [0x22; 32].into();
+        let offer_id = [0x41; 16];
+        let (tx, mut rx) = mpsc::channel(1);
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let writer = tokio::spawn(std::future::pending::<()>());
+        endpoint.runtime.inner.lock().await.conns.insert(peer, Conn {
+            generation: 1,
+            tx,
+            reader: reader.abort_handle(),
+            writer: writer.abort_handle(),
+            transfers: BTreeMap::new(),
+        });
+        let offer = ClipboardMessage::Offer {
+            offer_id,
+            origin_node_id: [0x31; 32],
+            origin_version: 1,
+            mime: cb::MIME.to_owned(),
+            size_bytes: (cb::CHUNK_BYTES * 3) as u64,
+        };
+        endpoint.offered.insert(peer, (offer.clone(), Vec::new()));
+        endpoint.waiting.insert(peer, (offer, Vec::new()));
+        endpoint.runtime.send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3],
+            cb::CHUNK_BYTES as u64 * 4).await.expect("sender starts");
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await.expect("first chunk").expect("channel");
+        assert!(matches!(first, ClipboardMessage::Data { chunk_index: 0, .. }));
+        for (sender, id) in [(other, offer_id), (peer, [0x42; 16])] {
+            endpoint.on_peer_message(sender, ClipboardMessage::Cancel {
+                offer_id: id, reason: protocol::wire::ErrorCode::ClipboardSuperseded,
+            }).await;
+            assert!(endpoint.offered.contains_key(&peer));
+            assert!(endpoint.waiting.contains_key(&peer));
+            assert!(endpoint.runtime.inner.lock().await.conns[&peer]
+                .transfers.contains_key(&offer_id));
+        }
+        endpoint.on_peer_message(peer, ClipboardMessage::Cancel {
+            offer_id, reason: protocol::wire::ErrorCode::ClipboardSuperseded,
+        }).await;
+        assert!(!endpoint.offered.contains_key(&peer));
+        assert!(!endpoint.waiting.contains_key(&peer));
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.is_err(),
+            "cancelled sender must not enqueue another chunk or Complete");
+        endpoint.runtime.send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3], 1)
+            .await.expect("another paced transfer");
+        endpoint.runtime.close(peer).await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await.expect("revocation aborts the paced sender").is_none());
+        endpoint.stop().await;
+        assert!(reader.await.expect_err("reader aborted on revoke").is_cancelled());
+        assert!(writer.await.expect_err("writer aborted on revoke").is_cancelled());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn every_local_copy_cancels_each_incoming_offer_even_when_refused() {
