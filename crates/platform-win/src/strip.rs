@@ -9,6 +9,9 @@
 //! Resource rule: while the [`edgefx::Effect`] is idle there is no timer, no DIB and the window
 //! is hidden; the thread sleeps in `GetMessageW`. While active a 33 ms timer drives
 //! `step` + `draw` into the same buffer (allocation-free frames).
+//!
+//! Live disable clears the effect; re-enable is forwarded to the existing worker.
+//! A placement change invalidates the backing store, including changes of monitor DPI.
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -112,10 +115,8 @@ impl EdgeStrip {
     /// Live `[appearance].edge_effects`; off clears at once.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
-        if !enabled {
-            if let Some(worker) = &self.worker {
-                worker.send(Command::Enabled(false));
-            }
+        if let Some(worker) = &self.worker {
+            worker.send(Command::Enabled(enabled));
         }
     }
 }
@@ -234,6 +235,9 @@ impl Overlay {
         if !self.enabled {
             return;
         }
+        if self.placement != Some(placement) {
+            self.surface = None;
+        }
         self.placement = Some(placement);
         self.effect.update(update);
         self.refresh();
@@ -262,10 +266,10 @@ impl Overlay {
                 let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_ID) };
                 self.timer = false;
             }
-            if self.surface.take().is_some() {
-                // SAFETY: our own window.
-                let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
-            }
+            self.surface = None;
+            // SAFETY: our own window. Hide even if replacing the backing store failed;
+            // the old layered pixels can remain visible without a Surface.
+            let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
             self.strip = None;
             return;
         }
@@ -283,6 +287,10 @@ impl Overlay {
     }
 
     fn tick(&mut self) {
+        // KillTimer does not remove a WM_TIMER already queued before we went idle.
+        if !self.timer {
+            return;
+        }
         let now = Instant::now();
         let dt = now
             .duration_since(self.last)
@@ -428,5 +436,47 @@ fn run(rx: &Receiver<Command>, ready: &Sender<u32>) {
                 DispatchMessageW(&message);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reenabling_reaches_the_existing_worker() {
+        let (tx, rx) = mpsc::channel();
+        let mut strip = EdgeStrip {
+            enabled: true,
+            worker: Some(Worker {
+                tx,
+                thread_id: 0,
+                join: None,
+            }),
+        };
+        strip.set_enabled(false);
+        strip.set_enabled(true);
+        assert!(matches!(rx.try_recv(), Ok(Command::Enabled(false))));
+        assert!(matches!(rx.try_recv(), Ok(Command::Enabled(true))));
+    }
+
+    #[test]
+    fn queued_timer_does_not_restart_idle_work() {
+        let last = Instant::now();
+        let mut overlay = Overlay {
+            hwnd: HWND::default(),
+            effect: Effect::new(1),
+            placement: None,
+            surface: None,
+            strip: None,
+            timer: false,
+            last,
+            enabled: true,
+        };
+        overlay.tick();
+        assert_eq!(overlay.last, last);
+        assert!(!overlay.timer);
+        assert!(overlay.surface.is_none());
+        assert!(!overlay.effect.is_active());
     }
 }
