@@ -123,6 +123,30 @@ fn opening_clipboard_history_and_clearing_it_refresh_metadata() {
     assert!(matches!(&requests[0].1, Msg::GetClipboardHistory(_)));
 }
 
+/// The window never asks for a refresh: the core pushes the new entry.
+#[test]
+fn a_new_transfer_reaches_the_history_without_a_refresh_request() {
+    let mut vm = view();
+    vm.apply(event(Msg::ClipboardHistory(
+        protocol::ipc::ClipboardHistory {
+            items: vec![protocol::ipc::ClipboardHistoryEntry {
+                id: 3,
+                direction: protocol::ipc::ClipboardHistoryDirection::Sent as i32,
+                peer_name: "laptop".to_owned(),
+                time_unix_ms: 300,
+                size_bytes: 86,
+                preview: "fresh".to_owned(),
+            }],
+        },
+    )));
+    assert_eq!(vm.clipboard_history.len(), 1);
+    assert_eq!(vm.clipboard_history[0].id, 3);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "the pushed entry needs no request of its own"
+    );
+}
+
 #[test]
 fn clipboard_history_is_session_scoped_and_failed_clear_keeps_metadata() {
     let mut vm = view();

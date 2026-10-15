@@ -89,6 +89,7 @@ pub struct UiState {
     hover: Option<(usize, usize)>,
     applied: Option<Theme>,
     modal_open: Option<(Modal, f32)>,
+    confirm_clear_history: bool,
 }
 
 impl UiState {
@@ -101,6 +102,7 @@ impl UiState {
             hover: None,
             applied: None,
             modal_open: None,
+            confirm_clear_history: false,
         }
     }
 

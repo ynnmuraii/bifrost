@@ -199,15 +199,33 @@ fn dim(c: Color32) -> Color32 {
 
 /// `.btn`: 44 px high, 18 px padding, 13 px medium text.
 pub fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: Kind, enabled: bool) -> Response {
+    button_sized(ui, pal, label, kind, enabled, 44.0, 18.0, 13.0)
+}
+
+/// A compact framed control, sharing the standard button's paint and interaction.
+pub fn small_button(ui: &mut Ui, pal: &Palette, label: &str, enabled: bool) -> Response {
+    button_sized(ui, pal, label, Kind::Plain, enabled, 26.0, 10.0, 12.0)
+}
+
+fn button_sized(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    kind: Kind,
+    enabled: bool,
+    height: f32,
+    padding: f32,
+    text_size: f32,
+) -> Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
-        font(13.0, fam::sans_medium()),
+        font(text_size, fam::sans_medium()),
         Color32::PLACEHOLDER,
     );
     let (w, h) = if kind == Kind::Link {
         (galley.size().x, galley.size().y)
     } else {
-        (galley.size().x + 36.0, 44.0)
+        (galley.size().x + padding * 2.0, height)
     };
     let sense = if enabled {
         Sense::click()

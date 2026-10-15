@@ -537,8 +537,16 @@ pub enum Key {
     TheHistoryIsEmptyForNow,
     /// «Передача»
     Transfer,
-    /// «{direction} · {peer_name} · {age_seconds} с назад · {size_bytes} байт»
-    DirectionPeerNameAgeSecondsSAgoSizeBytesBytes,
+    /// Direction, peer, age and a localized human-readable size.
+    HistoryEntryMetadata,
+    /// «Очистить историю на этом компьютере?»
+    ConfirmClearHistory,
+    /// «Б»
+    BytesAbbreviation,
+    /// «КиБ»
+    KibibytesAbbreviation,
+    /// «МиБ»
+    MebibytesAbbreviation,
     /// «история буфера обмена»
     TheClipboardHistory,
     /// «скопировать из истории»
@@ -932,7 +940,11 @@ const fn ru(key: Key) -> &'static str {
         Key::TheLast30TextsInMemoryOnlySecretsAreNotKept => "Последние 30 передач текста. Только в памяти; секреты не сохраняются.",
         Key::TheHistoryIsEmptyForNow => "История пока пуста",
         Key::Transfer => "Передача",
-        Key::DirectionPeerNameAgeSecondsSAgoSizeBytesBytes => "{direction} · {peer_name} · {age_seconds} с назад · {size_bytes} байт",
+        Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age_seconds} с назад · {size}",
+        Key::ConfirmClearHistory => "Очистить историю на этом компьютере?",
+        Key::BytesAbbreviation => "Б",
+        Key::KibibytesAbbreviation => "КиБ",
+        Key::MebibytesAbbreviation => "МиБ",
         Key::TheClipboardHistory => "история буфера обмена",
         Key::CopyFromTheHistory => "скопировать из истории",
         Key::ClearTheClipboardHistory => "очистить историю буфера",
@@ -1246,7 +1258,11 @@ const fn en(key: Key) -> &'static str {
         Key::TheLast30TextsInMemoryOnlySecretsAreNotKept => "The last 30 texts. In memory only; secrets are not kept.",
         Key::TheHistoryIsEmptyForNow => "The history is empty for now",
         Key::Transfer => "Transfer",
-        Key::DirectionPeerNameAgeSecondsSAgoSizeBytesBytes => "{direction} · {peer_name} · {age_seconds} s ago · {size_bytes} bytes",
+        Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age_seconds} s ago · {size}",
+        Key::ConfirmClearHistory => "Clear history on this computer?",
+        Key::BytesAbbreviation => "B",
+        Key::KibibytesAbbreviation => "KiB",
+        Key::MebibytesAbbreviation => "MiB",
         Key::TheClipboardHistory => "the clipboard history",
         Key::CopyFromTheHistory => "copy from the history",
         Key::ClearTheClipboardHistory => "clear the clipboard history",
@@ -1368,6 +1384,25 @@ pub fn fill_named(lang: Lang, key: Key, args: &[(&str, &dyn std::fmt::Display)])
     out
 }
 
+/// A compact binary clipboard size, with at most one fractional digit.
+pub fn clipboard_size(lang: Lang, bytes: u64) -> String {
+    let (unit, key) = if bytes >= 1_048_576 {
+        (1_048_576, Key::MebibytesAbbreviation)
+    } else if bytes >= 1024 {
+        (1024, Key::KibibytesAbbreviation)
+    } else {
+        (1, Key::BytesAbbreviation)
+    };
+    let whole = bytes / unit;
+    let fraction = (bytes % unit) * 10 / unit;
+    let suffix = text(lang, key);
+    if fraction == 0 {
+        format!("{whole} {suffix}")
+    } else {
+        let separator = if lang == Lang::Ru { ',' } else { '.' };
+        format!("{whole}{separator}{fraction} {suffix}")
+    }
+}
 /// `1 computer`, `2 computers`, `5 computers`: the count with its noun.
 pub fn computers(lang: Lang, n: u64) -> String {
     let noun = match lang {
@@ -1417,8 +1452,19 @@ pub fn displays(lang: Lang, n: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn clipboard_sizes_are_compact_and_localized() {
+        assert_eq!(clipboard_size(Lang::Ru, 86), "86 Б");
+        assert_eq!(clipboard_size(Lang::En, 86), "86 B");
+        assert_eq!(clipboard_size(Lang::Ru, 1_048_576), "1 МиБ");
+        assert_eq!(clipboard_size(Lang::En, 1_048_576), "1 MiB");
+        assert_eq!(clipboard_size(Lang::Ru, 1536), "1,5 КиБ");
+        assert_eq!(clipboard_size(Lang::En, 1536), "1.5 KiB");
+        assert_eq!(clipboard_size(Lang::En, 0), "0 B");
+    }
+
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 308] = [
+    pub const EVERY: [Key; 312] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1653,7 +1699,11 @@ mod tests {
         Key::TheLast30TextsInMemoryOnlySecretsAreNotKept,
         Key::TheHistoryIsEmptyForNow,
         Key::Transfer,
-        Key::DirectionPeerNameAgeSecondsSAgoSizeBytesBytes,
+        Key::HistoryEntryMetadata,
+        Key::ConfirmClearHistory,
+        Key::BytesAbbreviation,
+        Key::KibibytesAbbreviation,
+        Key::MebibytesAbbreviation,
         Key::TheClipboardHistory,
         Key::CopyFromTheHistory,
         Key::ClearTheClipboardHistory,
