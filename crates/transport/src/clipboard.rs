@@ -76,6 +76,8 @@ pub enum ClipboardMessage {
         mime: String,
         /// Payload size in bytes, ≤ 1 MiB.
         size_bytes: u64,
+        /// Whether platform secret markers were present, independently of transfer policy.
+        secret_marked: bool,
     },
     /// `ClipboardRequest`: the sink asking for the payload.
     Request {
@@ -148,12 +150,14 @@ impl ClipboardMessage {
                 origin_version,
                 mime,
                 size_bytes,
+                secret_marked,
             } => Payload::ClipboardOffer(wire::ClipboardOffer {
                 offer_id: offer_id.to_vec(),
                 origin_node_id: origin_node_id.to_vec(),
                 origin_version: *origin_version,
                 mime: mime.clone(),
                 size_bytes: *size_bytes,
+                secret_marked: *secret_marked,
             }),
             ClipboardMessage::Request { offer_id } => {
                 Payload::ClipboardRequest(wire::ClipboardRequest {
@@ -361,6 +365,7 @@ fn classify(envelope: &wire::Envelope) -> Result<ClipboardMessage, DecodeError> 
             origin_version: offer.origin_version,
             mime: offer.mime.clone(),
             size_bytes: offer.size_bytes,
+            secret_marked: offer.secret_marked,
         }),
         Some(Payload::ClipboardRequest(request)) => Ok(ClipboardMessage::Request {
             offer_id: arr16(&request.offer_id).map_err(violation)?,
@@ -967,6 +972,11 @@ impl Outgoing {
     /// The payload size in bytes.
     pub fn size_bytes(&self) -> u64 {
         self.payload.len() as u64
+    }
+
+    /// Recovers the owned payload after the sender finishes, without copying it.
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
     }
 
     /// SHA-256 of the whole payload.

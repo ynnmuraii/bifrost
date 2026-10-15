@@ -145,8 +145,13 @@ fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
     let (view, client) = view_model::boot(args);
     let mut bridge = Bridge::new(view, client);
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut history_requested = false;
     loop {
         bridge.pump();
+        if !history_requested && bridge.view().connection.is_connected() {
+            bridge.dispatch(Action::RefreshClipboardHistory, Instant::now());
+            history_requested = true;
+        }
         let view = bridge.view();
         if view.connection.is_connected()
             && view.status.is_some()
@@ -180,7 +185,7 @@ fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "no complete status/topology snapshot: {:?}",
+                "no complete status/topology/history snapshot: {:?}",
                 bridge.view().connection
             ));
         }
@@ -325,6 +330,38 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         layout_author: WORKSTATION.to_owned(),
         layout_editable: true,
         ..ipc::Status::default()
+    })));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    vm.apply(event(Msg::ClipboardHistory(ipc::ClipboardHistory {
+        items: vec![
+            ipc::ClipboardHistoryEntry {
+                id: 3,
+                direction: ipc::ClipboardHistoryDirection::Received as i32,
+                peer_name: "LAPTOP".to_owned(),
+                time_unix_ms: now_ms.saturating_sub(12_000),
+                size_bytes: 86,
+                preview: "Release notes — готово ✓".to_owned(),
+            },
+            ipc::ClipboardHistoryEntry {
+                id: 2,
+                direction: ipc::ClipboardHistoryDirection::Sent as i32,
+                peer_name: "LAPTOP".to_owned(),
+                time_unix_ms: now_ms.saturating_sub(75_000),
+                size_bytes: 1_048_576,
+                preview: "SELECT name, display_id FROM workspace_displays;".to_owned(),
+            },
+            ipc::ClipboardHistoryEntry {
+                id: 1,
+                direction: ipc::ClipboardHistoryDirection::Received as i32,
+                peer_name: "HTPC".to_owned(),
+                time_unix_ms: now_ms.saturating_sub(240_000),
+                size_bytes: 43,
+                preview: "https://example.org/meeting/notes".to_owned(),
+            },
+        ],
     })));
     vm.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {
         revision: 14,
