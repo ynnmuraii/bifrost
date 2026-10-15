@@ -1,14 +1,5 @@
-//! Emergency hotkey: `org.freedesktop.portal.GlobalShortcuts` (KVM-018).
-//!
-//! The agent registers `Ctrl+Alt+Shift+F12` for its whole lifetime and handles it
-//! itself, so a stuck capture session can always be released without a second machine.
-//!
-//! GNOME 46 has no `GlobalShortcuts` portal at all (it arrived in
-//! `xdg-desktop-portal-gnome` 48), and this backend must not pretend otherwise:
-//! [`EmergencyShortcuts::register`] then fails with
-//! [`WaylandError::HotkeyUnavailable`], which names the missing portal interface. The
-//! caller is expected to fall back to a documented alternative instead of losing the
-//! emergency path silently.
+//! GlobalShortcuts portal bindings. Preferred triggers may open a compositor
+//! approval dialog; the compositor's returned trigger descriptions are authoritative.
 
 use std::pin::Pin;
 
@@ -37,7 +28,9 @@ type ActivationStream = Pin<Box<dyn Stream<Item = Activated> + Send>>;
 /// A registered emergency hotkey.
 pub struct EmergencyShortcuts {
     session: Session<GlobalShortcuts>,
+    session_path: String,
     activated: ActivationStream,
+    closed: Pin<Box<dyn Stream<Item = ()> + Send>>,
     trigger_description: Option<String>,
     portal_version: u32,
 }
@@ -56,37 +49,74 @@ impl EmergencyShortcuts {
     /// * [`WaylandError::Portal`] for any other D-Bus failure, which is a real error and
     ///   not "unsupported".
     pub async fn register(trigger: &str) -> Result<Self, WaylandError> {
+        Self::register_bindings(&[(EMERGENCY_SHORTCUT_ID, EMERGENCY_DESCRIPTION, trigger)]).await
+    }
+
+    /// Registers a complete candidate session without touching the active session.
+    /// Every requested action must be granted with a usable trigger before commit.
+    pub async fn register_bindings(bindings: &[(&str, &str, &str)]) -> Result<Self, WaylandError> {
         let shortcuts = GlobalShortcuts::new().await.map_err(classify)?;
         let portal_version = shortcuts.version();
         let session = shortcuts
             .create_session(CreateSessionOptions::default())
             .await
             .map_err(classify)?;
+        // Session's object path is exposed through its Serialize implementation.
+        let session_path = match toml::Value::try_from(&session) {
+            Ok(toml::Value::String(path)) => path,
+            _ => {
+                let _ = session.close().await;
+                return Err(WaylandError::Io(std::io::Error::other(
+                    "GlobalShortcuts session did not serialize as an object path",
+                )));
+            }
+        };
         // Subscribe before binding so an activation cannot fall between the two calls.
         let activated = shortcuts.receive_activated().await.map_err(classify)?;
-        let shortcut = NewShortcut::new(EMERGENCY_SHORTCUT_ID, EMERGENCY_DESCRIPTION)
-            .preferred_trigger(Some(trigger));
-        let bound = shortcuts
-            .bind_shortcuts(&session, &[shortcut], None, BindShortcutsOptions::default())
-            .await
-            .map_err(classify)?
-            .response()
-            .map_err(classify)?;
-        let Some(shortcut) = bound
-            .shortcuts()
+        let closed = session.receive_closed().await.map_err(classify)?;
+        let requested: Vec<_> = bindings
             .iter()
-            .find(|shortcut| shortcut.id() == EMERGENCY_SHORTCUT_ID)
-        else {
-            // The portal answered but did not bind our shortcut: without it there is no
-            // emergency path, so this cannot be reported as success.
-            return Err(WaylandError::HotkeyUnavailable {
-                portal_interface: GLOBAL_SHORTCUTS_INTERFACE,
-            });
+            .map(|(id, description, trigger)| {
+                NewShortcut::new(*id, *description).preferred_trigger(Some(*trigger))
+            })
+            .collect();
+        let bound = async {
+            shortcuts
+                .bind_shortcuts(&session, &requested, None, BindShortcutsOptions::default())
+                .await?
+                .response()
+        }.await;
+        let bound = match bound {
+            Ok(bound) => bound,
+            Err(error) => {
+                let _ = session.close().await;
+                return Err(classify(error));
+            }
         };
+        let returned: Vec<_> = bound.shortcuts().iter()
+            .map(|shortcut| (shortcut.id(), shortcut.trigger_description()))
+            .collect();
+        if !all_bindings_granted(bindings, &returned) {
+            let _ = session.close().await;
+            let missing: Vec<_> = bindings.iter()
+                .filter(|(id, _, _)| !returned.iter()
+                    .any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty()))
+                .map(|(id, _, chord)| format!("{id} ({chord})"))
+                .collect();
+            return Err(WaylandError::Io(std::io::Error::other(format!(
+                "GlobalShortcuts did not grant usable triggers for {}; existing bindings retained",
+                missing.join(", "),
+            ))));
+        }
+        let trigger_description = returned.iter()
+            .find(|(id, _)| *id == EMERGENCY_SHORTCUT_ID)
+            .map(|(_, trigger)| (*trigger).to_owned());
         Ok(Self {
             session,
+            session_path,
             activated: Box::pin(activated),
-            trigger_description: Some(shortcut.trigger_description().to_owned()),
+            closed: Box::pin(closed.map(|_| ())),
+            trigger_description,
             portal_version,
         })
     }
@@ -107,13 +137,40 @@ impl EmergencyShortcuts {
     ///
     /// `None` means the portal closed the session or the D-Bus connection went away.
     pub async fn next_activation(&mut self) -> Option<String> {
-        let activated = self.activated.next().await?;
-        Some(activated.shortcut_id().to_owned())
+        loop {
+            let activated = tokio::select! {
+                biased;
+                _ = self.closed.next() => return None,
+                activated = self.activated.next() => activated?,
+            };
+            if activated.session_handle().as_str() == self.session_path {
+                return Some(activated.shortcut_id().to_owned());
+            }
+        }
     }
 
     /// Closes the shortcut session.
     pub async fn close(&self) -> Result<(), WaylandError> {
         self.session.close().await.map_err(classify)
+    }
+}
+
+fn all_bindings_granted(requested: &[(&str, &str, &str)], returned: &[(&str, &str)]) -> bool {
+    requested.iter().all(|(id, _, _)| {
+        returned.iter().any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_bindings_granted;
+
+    #[test]
+    fn candidate_requires_every_action_and_nonempty_triggers() {
+        let requested = [("emergency", "release", "CTRL+F12"), ("next", "next", "CTRL+F11")];
+        assert!(all_bindings_granted(&requested, &[("emergency", "Ctrl+F12"), ("next", "Ctrl+F11")]));
+        assert!(!all_bindings_granted(&requested, &[("emergency", "Ctrl+F12")]));
+        assert!(!all_bindings_granted(&requested, &[("emergency", "Ctrl+F12"), ("next", " ")]));
     }
 }
 
