@@ -29,7 +29,16 @@ impl Editor {
     ) -> Option<(i32, String)> {
         let action = self.capturing?;
         for event in events {
-            let Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event else { continue };
+            let Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
             if *key == Key::Escape {
                 self.capturing = None;
                 self.error = None;
@@ -43,10 +52,18 @@ impl Editor {
                 _ => key.name(),
             };
             let mut chord = String::new();
-            if modifiers.ctrl { chord.push_str("Ctrl+"); }
-            if modifiers.alt { chord.push_str("Alt+"); }
-            if modifiers.shift { chord.push_str("Shift+"); }
-            if modifiers.mac_cmd { chord.push_str("Super+"); }
+            if modifiers.ctrl {
+                chord.push_str("Ctrl+");
+            }
+            if modifiers.alt {
+                chord.push_str("Alt+");
+            }
+            if modifiers.shift {
+                chord.push_str("Shift+");
+            }
+            if modifiers.mac_cmd {
+                chord.push_str("Super+");
+            }
             chord.push_str(name);
             match validate(lang, action, &chord, bindings) {
                 Ok(()) => {
@@ -75,8 +92,8 @@ pub fn validate(
             proposed.set(action, binding.chord.clone());
         }
     }
-    let action = config_action(action)
-        .ok_or_else(|| text(lang, TextKey::InvalidShortcut).to_owned())?;
+    let action =
+        config_action(action).ok_or_else(|| text(lang, TextKey::InvalidShortcut).to_owned())?;
     proposed.set(action, chord.to_owned());
     proposed.validate().map_err(|error| error.to_string())
 }
@@ -98,10 +115,16 @@ mod tests {
     #[test]
     fn conflicts_are_rejected_and_escape_cancels_without_a_request() {
         assert!(validate(Lang::Ru, 2, ROWS[0].2, &[]).is_err());
-        let mut editor = Editor { capturing: Some(1), error: Some("old".into()) };
+        let mut editor = Editor {
+            capturing: Some(1),
+            error: Some("old".into()),
+        };
         let event = Event::Key {
-            key: Key::Escape, physical_key: None, pressed: true,
-            repeat: false, modifiers: Default::default(),
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
         };
         assert_eq!(editor.capture(Lang::Ru, &[event], &[]), None);
         assert_eq!(editor.capturing, None);
@@ -110,14 +133,26 @@ mod tests {
 
     #[test]
     fn capture_normalizes_arrows_and_finishes_after_one_request() {
-        let mut editor = Editor { capturing: Some(2), error: None };
+        let mut editor = Editor {
+            capturing: Some(2),
+            error: None,
+        };
         let event = Event::Key {
-            key: Key::ArrowRight, physical_key: None, pressed: true, repeat: false,
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
             modifiers: eframe::egui::Modifiers {
-                ctrl: true, alt: true, shift: true, ..Default::default()
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
             },
         };
-        assert_eq!(editor.capture(Lang::Ru, &[event.clone()], &[]), Some((2, ROWS[1].2.to_owned())));
+        assert_eq!(
+            editor.capture(Lang::Ru, &[event.clone()], &[]),
+            Some((2, ROWS[1].2.to_owned()))
+        );
         assert_eq!(editor.capture(Lang::Ru, &[event], &[]), None);
         assert_eq!(editor.capturing, None);
     }
