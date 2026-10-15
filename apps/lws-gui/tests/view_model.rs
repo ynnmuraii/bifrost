@@ -494,6 +494,47 @@ fn a_request_with_no_core_is_reported_as_not_sent() {
 }
 
 #[test]
+fn appearance_toggles_send_both_values_and_follow_authoritative_status() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    let (request, message) = Action::SetAppearance {
+        edge_effects: false,
+        hide_remote_cursor: true,
+    }
+    .wire()
+    .expect("appearance is a service setting");
+    assert_eq!(request, Request::SetAppearance);
+    let Msg::SetAppearance(settings) = message else {
+        panic!("appearance action must send SetAppearance");
+    };
+    assert!(!settings.edge_effects);
+    assert!(settings.hide_remote_cursor);
+    let id = vm.begin_request(request, Instant::now());
+    assert!(!vm.can_set_appearance());
+    assert!(vm.status.as_ref().unwrap().edge_effects);
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+    let refresh = vm
+        .inflight
+        .iter()
+        .find(|r| r.request == Request::GetStatus)
+        .unwrap()
+        .id;
+    let mut status = status_with("LOCAL");
+    status.edge_effects = false;
+    status.hide_remote_cursor = true;
+    vm.apply(answer(refresh, Msg::Status(status)));
+    assert!(!vm.status.as_ref().unwrap().edge_effects);
+    assert!(vm.status.as_ref().unwrap().hide_remote_cursor);
+    assert!(vm.can_set_appearance());
+}
+
+#[test]
 fn a_clipboard_refusal_is_explained_where_the_switch_is() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
@@ -549,6 +590,13 @@ fn every_wire_request_is_the_message_it_names() {
             Request::PairingAnswer,
         ),
         (Action::SetClipboard(true), Request::SetClipboard),
+        (
+            Action::SetAppearance {
+                edge_effects: true,
+                hide_remote_cursor: false,
+            },
+            Request::SetAppearance,
+        ),
         (
             Action::UpdateTopology {
                 layout_toml: b"links = []".to_vec(),
