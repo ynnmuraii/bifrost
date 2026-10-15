@@ -1,14 +1,10 @@
 //! The map's model: the applied document turned into something draggable, and back.
 //!
-//! The geometry is [`crate::map`]; this is the part that knows the wire. A drag changes only
-//! [`LayoutEditor::placement`] (a draft, never sent); «Применить» is the one place a draft
-//! becomes a document ([`ViewModel::layout_action`] → `UpdateTopology`, the existing CAS path),
-//! and «Авто» is `LayoutAuto`. The functions of this file are pure in the view model, so the
-//! drag → document path is a unit test and not a click.
+//! Drags edit a local placement; only a valid drop queues a document through the CAS path.
 
 use super::{
     endpoint_config, node_id_bytes, node_reference, short_id, short_key, Action, EditorDisplay,
-    Side, ViewModel,
+    Request, Save, Sent, Side, ViewModel, HINT_FOR, SAVED_FOR,
 };
 use crate::map::{self, DocLink, Pt, Rect};
 
@@ -118,37 +114,6 @@ pub struct PeerRow {
     pub online: bool,
 }
 
-/// What «Передать ввод» does right now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Transfer {
-    /// The name after the arrow.
-    pub target: String,
-    /// The `switch` argument; `None` when there is nothing to switch to.
-    pub peer: Option<String>,
-    /// `false` while the core would refuse.
-    pub enabled: bool,
-    /// Why not, in a sentence.
-    pub why: Option<String>,
-}
-
-fn side_of_edge(edge: &str) -> Option<Side> {
-    Some(match config::Edge::parse(edge).ok()? {
-        config::Edge::Left => Side::Left,
-        config::Edge::Right => Side::Right,
-        config::Edge::Top => Side::Top,
-        config::Edge::Bottom => Side::Bottom,
-    })
-}
-
-fn opposite(side: Side) -> Side {
-    match side {
-        Side::Left => Side::Right,
-        Side::Right => Side::Left,
-        Side::Top => Side::Bottom,
-        Side::Bottom => Side::Top,
-    }
-}
-
 /// The singular/few/many form of a Russian noun for `n`.
 pub fn plural(n: usize, forms: [&'static str; 3]) -> &'static str {
     let (tens, ones) = (n % 100, n % 10);
@@ -171,18 +136,36 @@ impl ViewModel {
 
     /// The applied links as «b is on side s of a» between member indices.
     fn doc_links(&self) -> Vec<DocLink> {
-        self.editor
-            .links
+        self.doc_links_from(
+            &self
+                .applied_links()
+                .into_iter()
+                .map(|(_, link)| link)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn doc_links_from(&self, links: &[config::LinkConfig]) -> Vec<DocLink> {
+        links
             .iter()
             .filter_map(|link| {
-                let (from, to) = (link.from.as_ref()?, link.to.as_ref()?);
-                let (a, b) = (self.index_of(&from.node_id)?, self.index_of(&to.node_id)?);
-                (a != b).then_some(())?;
-                Some(DocLink {
-                    a,
-                    side: side_of_edge(&from.edge)?,
-                    b,
-                })
+                let a = self
+                    .editor
+                    .nodes
+                    .iter()
+                    .position(|n| node_reference(&n.node_id) == link.from.node)?;
+                let b = self
+                    .editor
+                    .nodes
+                    .iter()
+                    .position(|n| node_reference(&n.node_id) == link.to.node)?;
+                let side = match link.from.edge {
+                    config::Edge::Left => Side::Left,
+                    config::Edge::Right => Side::Right,
+                    config::Edge::Top => Side::Top,
+                    config::Edge::Bottom => Side::Bottom,
+                };
+                (a != b).then_some(DocLink { a, side, b })
             })
             .collect()
     }
@@ -215,37 +198,172 @@ impl ViewModel {
         self.editor.shapes = arrangement.shapes;
         self.editor.baseline = arrangement.pos.clone();
         self.editor.placement = arrangement.pos;
-        self.sync_side();
+        if let Some(wanted) = &self.editor.save.wanted {
+            self.editor.placement =
+                map::place(&self.editor.shapes, &self.doc_links_from(wanted), anchor);
+            self.editor.save.placement = Some(self.editor.placement.clone());
+        }
     }
 
-    /// Throws the draft away: the map goes back to the applied document.
-    pub fn discard_draft(&mut self) {
-        self.editor.placement = self.editor.baseline.clone();
-        self.sync_side();
+    pub(crate) fn restore_placement(&mut self) {
+        self.editor.placement.clone_from(
+            self.editor
+                .save
+                .placement
+                .as_ref()
+                .unwrap_or(&self.editor.baseline),
+        );
     }
 
-    /// The indices of this computer and the other one of the pair, when both are known.
-    fn pair(&self) -> Option<(usize, usize)> {
-        let this = self.index_of(self.self_node()?)?;
-        let other = self.index_of(self.other_node()?)?;
-        (this != other).then_some((this, other))
+    fn drop_is_valid(&self, i: usize) -> bool {
+        if !self.connection.is_connected() || !self.editor.has_document() || !self.editor.editable {
+            return false;
+        }
+        let pos = &self.editor.placement;
+        let shapes = &self.editor.shapes;
+        if pos.len() != shapes.len() || i >= pos.len() {
+            return false;
+        }
+        for a in 0..pos.len() {
+            for b in a + 1..pos.len() {
+                if pos[a].x < pos[b].x + shapes[b].w
+                    && pos[b].x < pos[a].x + shapes[a].w
+                    && pos[a].y < pos[b].y + shapes[b].h
+                    && pos[b].y < pos[a].y + shapes[a].h
+                {
+                    return false;
+                }
+            }
+        }
+        self.faced(pos)
+            .iter()
+            .any(|link| link.a == i || link.b == i)
     }
 
-    /// Reads the side of the pair off the map, when the two face each other.
-    fn sync_side(&mut self) {
-        let Some((this, other)) = self.pair() else {
+    pub(crate) fn drop_node(&mut self, node_id: &str) {
+        let Some(i) = self.index_of(node_id) else {
             return;
         };
-        let found = map::links(&self.editor.shapes, &self.editor.placement)
-            .into_iter()
-            .find(|l| (l.a, l.b) == (this, other) || (l.a, l.b) == (other, this));
-        if let Some(link) = found {
-            self.editor.side = if link.a == this {
-                link.side_of_b()
-            } else {
-                opposite(link.side_of_b())
-            };
+        if !self.editor.dirty() {
+            return;
         }
+        if !self.drop_is_valid(i) {
+            // Restore only the invalid move, retaining a previous accepted drop.
+            self.restore_placement();
+            self.flash(
+                "Поставьте компьютер рядом с соседом, без пересечений",
+                HINT_FOR,
+            );
+            return;
+        }
+        self.editor.save.wanted = Some(self.editor_links());
+        self.editor.save.placement = Some(self.editor.placement.clone());
+        self.apply_draft();
+    }
+
+    /// The single place a dropped draft becomes a wire request.
+    pub(crate) fn apply_draft(&mut self) {
+        if self.editor.save.sent.is_some()
+            || self.editor.save.reloading
+            || self.editor.save.awaiting.is_some()
+        {
+            return;
+        }
+        let Some(links) = self.editor.save.wanted.clone() else {
+            return;
+        };
+        let applied: Vec<_> = self
+            .applied_links()
+            .into_iter()
+            .map(|(_, link)| link)
+            .collect();
+        if same_links(&links, &applied) {
+            self.editor.save = Save::default();
+            self.restore_placement();
+            return;
+        }
+        let layout_toml = match toml::to_string(&self.topology_with(links.clone())) {
+            Ok(text) => text.into_bytes(),
+            Err(_) => {
+                self.editor.save = Save::default();
+                self.restore_placement();
+                return;
+            }
+        };
+        let action = Action::UpdateTopology {
+            layout_toml,
+            expected_revision: self.editor.revision,
+            expected_author: node_id_bytes(&self.editor.author),
+        };
+        let Some((request, message)) = action.wire() else {
+            return;
+        };
+        let request_id = self.begin_request(request, std::time::Instant::now());
+        self.editor.save.sent = Some(Sent {
+            request_id,
+            base_revision: self.editor.revision,
+            links,
+        });
+        self.outgoing.push((request_id, message));
+    }
+
+    pub(crate) fn on_layout_verdict(
+        &mut self,
+        request_id: u64,
+        result: &protocol::ipc::OpResult,
+    ) -> bool {
+        if !self
+            .editor
+            .save
+            .sent
+            .as_ref()
+            .is_some_and(|sent| sent.request_id == request_id)
+        {
+            return false;
+        }
+        let sent = self.editor.save.sent.take().expect("matched save");
+        if result.ok {
+            if self
+                .editor
+                .save
+                .wanted
+                .as_ref()
+                .is_some_and(|wanted| same_links(wanted, &sent.links))
+            {
+                self.editor.save.wanted = None;
+            }
+            self.editor.save.awaiting = Some(sent.base_revision);
+            self.flash("Сохранено", SAVED_FOR);
+            self.continue_save();
+            return false;
+        }
+        if result.error_code == "LAYOUT_CONFLICT" && !self.editor.save.retried {
+            self.editor.save.retried = true;
+            self.editor.save.reloading = true;
+            let id = self.begin_request(Request::GetTopology, std::time::Instant::now());
+            self.outgoing.push((
+                id,
+                protocol::ipc::gui_frame::Msg::GetTopology(protocol::ipc::GetTopology {}),
+            ));
+            return true;
+        }
+        self.editor.save = Save::default();
+        self.restore_placement();
+        false
+    }
+
+    pub(crate) fn continue_save(&mut self) {
+        if let Some(base) = self.editor.save.awaiting {
+            if self.editor.revision <= base {
+                return;
+            }
+            self.editor.save.awaiting = None;
+            if self.editor.save.wanted.is_none() {
+                self.editor.save = Save::default();
+                self.rebuild_layout();
+            }
+        }
+        self.apply_draft();
     }
 
     /// A drag: the computer follows the pointer and snaps to the edge it comes near.
@@ -257,7 +375,6 @@ impl ViewModel {
             return;
         }
         self.editor.placement[i] = map::snap(&self.editor.shapes, &self.editor.placement, i, x, y);
-        self.sync_side();
     }
 
     /// A keyboard step: no snapping, so a step is always the step that was asked for.
@@ -269,7 +386,6 @@ impl ViewModel {
             at.x = (at.x + dx).clamp(-60.0, map::STAGE_W + 60.0);
             at.y = (at.y + dy).clamp(-70.0, map::STAGE_H + 40.0);
         }
-        self.sync_side();
     }
 
     /// The pairs of members that face each other in `placement`, with how they face.
@@ -373,19 +489,6 @@ impl ViewModel {
         links
     }
 
-    /// «Применить»: the `UpdateTopology` of the edited document, against the revision it was
-    /// edited from. `None` while there is nothing to apply.
-    pub fn layout_action(&self) -> Option<Action> {
-        if !self.editor.has_document() || !self.editor.dirty() {
-            return None;
-        }
-        Some(Action::UpdateTopology {
-            layout_toml: self.layout_toml().into_bytes(),
-            expected_revision: self.editor.revision,
-            expected_author: node_id_bytes(&self.editor.author),
-        })
-    }
-
     /// The member the input goes to now, as an index: this computer when it is local.
     fn route_target(&self) -> Option<usize> {
         let status = self.status.as_ref()?;
@@ -440,30 +543,6 @@ impl ViewModel {
             plural(nodes, ["компьютер", "компьютера", "компьютеров"]),
             plural(screens, ["экран", "экрана", "экранов"]),
         )
-    }
-
-    /// «ревизия 14 · координатор WORKSTATION», or «черновик · не применён».
-    pub fn revision_text(&self) -> String {
-        if self.editor.dirty() {
-            return "черновик · не применён".to_owned();
-        }
-        let Some(status) = &self.status else {
-            return format!("ревизия {}", self.editor.revision);
-        };
-        let coordinator = if status.is_owner {
-            Some(self.this_name())
-        } else {
-            status
-                .members
-                .iter()
-                .find(|m| m.is_owner)
-                .map(|m| m.display_name.clone())
-                .filter(|n| !n.is_empty())
-        };
-        match coordinator {
-            Some(name) => format!("ревизия {} · координатор {name}", self.editor.revision),
-            None => format!("ревизия {}", self.editor.revision),
-        }
     }
 
     /// Everything the map draws, from the draft and the live state.
@@ -642,79 +721,6 @@ impl ViewModel {
             })
             .collect()
     }
-
-    /// What «Передать ввод» does now, and whether the core would let it.
-    pub fn transfer(&self) -> Transfer {
-        let none = |why: &str| Transfer {
-            target: String::new(),
-            peer: None,
-            enabled: false,
-            why: Some(why.to_owned()),
-        };
-        let Some(status) = &self.status else {
-            return none("нет данных от службы");
-        };
-        if !self.connection.is_connected() {
-            return none("служба не запущена");
-        }
-        let peers = self.peers();
-        if status.focus == "REMOTE" {
-            let back = peers
-                .iter()
-                .find(|p| p.name == status.active_peer)
-                .or_else(|| peers.first());
-            return Transfer {
-                target: self.this_name(),
-                peer: back.map(|p| p.node_id.clone()),
-                enabled: back.is_some() && status.transition_disabled_reason.is_empty(),
-                why: Some(status.transition_disabled_reason.clone()).filter(|w| !w.is_empty()),
-            };
-        }
-        // The neighbours on the map first, then anyone who is in the network.
-        let neighbours: Vec<String> = match self.self_node().and_then(|id| self.index_of(id)) {
-            Some(this) => self
-                .faced(&self.editor.baseline)
-                .iter()
-                .filter_map(|l| {
-                    let other = if l.a == this {
-                        l.b
-                    } else if l.b == this {
-                        l.a
-                    } else {
-                        return None;
-                    };
-                    self.editor.nodes.get(other).map(|n| n.node_id.clone())
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        let next = peers
-            .iter()
-            .filter(|p| p.online)
-            .min_by_key(|p| !neighbours.contains(&p.node_id));
-        let Some(next) = next else {
-            return none("нет компьютеров в сети");
-        };
-        let reason = if status.focus != "LOCAL" {
-            Some("переход уже идёт или остановлен".to_owned())
-        } else {
-            Some(status.transition_disabled_reason.clone()).filter(|w| !w.is_empty())
-        };
-        Transfer {
-            target: next.name.clone(),
-            peer: Some(next.node_id.clone()),
-            enabled: reason.is_none(),
-            why: reason,
-        }
-    }
-
-    /// The member input is with now, as its node id: this computer while it is local.
-    pub fn route_node_id(&self) -> String {
-        self.route_target()
-            .and_then(|i| self.editor.nodes.get(i))
-            .map(|n| n.node_id.clone())
-            .unwrap_or_default()
-    }
 }
 
 /// «1920×1080», «≈ 3840×2160», and «· 90°» for a rotated display.
@@ -726,4 +732,8 @@ fn resolution(display: &EditorDisplay) -> String {
         format!(" · {}°", display.rotation)
     };
     format!("{approx}{:.0}×{:.0}{rotation}", display.w, display.h)
+}
+
+fn same_links(a: &[config::LinkConfig], b: &[config::LinkConfig]) -> bool {
+    a.len() == b.len() && a.iter().all(|link| b.contains(link))
 }

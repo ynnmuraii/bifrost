@@ -769,13 +769,15 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
         },
         Instant::now(),
     );
-    let (request, expected_author) = {
+    let expected_author = {
         let view = owner.view();
-        let request = view
-            .layout_action()
-            .expect("a placed computer is a draft that can be applied");
+        let request = Action::UpdateTopology {
+            layout_toml: view.layout_toml().into_bytes(),
+            expected_revision: view.editor.revision,
+            expected_author: lws_gui::view_model::node_id_bytes(&view.editor.author),
+        };
         let Action::UpdateTopology { layout_toml, .. } = &request else {
-            panic!("a draft is applied through UpdateTopology");
+            unreachable!();
         };
         let parsed: config::TopologyConfig =
             toml::from_str(std::str::from_utf8(layout_toml).expect("text"))
@@ -785,13 +787,14 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
             1,
             "first Apply creates the GUI edge; self={:?}, other={:?}, displays={:?}",
             view.self_node(),
-            view.other_node(),
+            view.editor
+                .nodes
+                .iter()
+                .map(|node| &node.node_id)
+                .collect::<Vec<_>>(),
             parsed.displays
         );
-        (
-            request,
-            lws_gui::view_model::node_id_bytes(&view.editor.author),
-        )
+        lws_gui::view_model::node_id_bytes(&view.editor.author)
     };
     assert_eq!(
         expected_author,
@@ -799,14 +802,10 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
     );
 
     owner.view_mut().outcome = None;
-    owner.dispatch(request, Instant::now());
-    let outcome = wait_for(&mut owner, "the first owner Apply result", |view| {
-        view.outcome.clone()
+    owner.dispatch(Action::DropNode(lab.b_id.clone()), Instant::now());
+    wait_for(&mut owner, "the first owner drop to be saved", |view| {
+        (view.editor.revision == 2 && view.editor.save.sent.is_none()).then_some(())
     });
-    assert!(
-        outcome.ok,
-        "the owner applies against restored revision 1: {outcome:?}"
-    );
 
     let owner_status = wait_for(&mut owner, "the owner to apply revision 2", |view| {
         view.status
@@ -829,15 +828,10 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
                 .then(|| view.editor.clone())
         },
     );
-    owner.dispatch(Action::ListPendingEdits, Instant::now());
-    wait_for(&mut owner, "the pending-edit read to finish", |view| {
-        (!view
-            .inflight
-            .iter()
-            .any(|request| request.request == lws_gui::view_model::Request::ListPendingEdits))
-        .then_some(())
-    });
-    assert!(owner.view().pending_edits.is_empty());
+    assert!(
+        owner.view().editor.save.sent.is_none(),
+        "the accepted document leaves no layout save awaiting a verdict"
+    );
     assert_eq!(owner.view().editor.revision, 2);
     assert_eq!(owner.view().editor.links.len(), 1);
     for root in [lab.a_root(), lab.b_root()] {
@@ -847,14 +841,12 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
         assert_eq!(saved.topology.links.len(), 1);
     }
     follower.view_mut().outcome = None;
-    follower.view_mut().conflict = None;
     follower.dispatch(stale_follower_request, Instant::now());
-    let conflict = wait_for(
+    wait_for(
         &mut follower,
         "the owner to refuse the stale follower edit",
-        |view| view.conflict.clone(),
+        |view| view.outcome.as_ref().filter(|outcome| !outcome.ok).cloned(),
     );
-    assert!(!conflict.is_empty());
     let refusal = follower
         .view()
         .outcome
