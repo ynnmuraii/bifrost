@@ -72,6 +72,9 @@ pub const GLOBAL_SHORTCUTS_INTERFACE: &str = "org.freedesktop.portal.GlobalShort
 // and tests on any host; the portal stream itself is not driven yet, see the module.
 pub mod clipboard;
 
+// The adapter is Linux-only (it speaks `ext-data-control-v1` through wayland-client); gating
+// the whole module keeps its pure helpers from being dead code on Windows.
+#[cfg(target_os = "linux")]
 mod data_control;
 
 #[cfg(target_os = "linux")]
