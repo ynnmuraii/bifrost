@@ -73,9 +73,15 @@ impl Harness {
             collect(&clipped.shape, &mut texts);
         }
         assert!(
-            output.viewport_output.values().all(|viewport| viewport.commands.iter().all(|command|
-                !matches!(command, egui::ViewportCommand::Close | egui::ViewportCommand::Minimized(true) | egui::ViewportCommand::Visible(false))
-            )),
+            output
+                .viewport_output
+                .values()
+                .all(|viewport| viewport.commands.iter().all(|command| !matches!(
+                    command,
+                    egui::ViewportCommand::Close
+                        | egui::ViewportCommand::Minimized(true)
+                        | egui::ViewportCommand::Visible(false)
+                ))),
             "drawing widgets must not hide or close the native window"
         );
         output.drop_without_applying_deltas();
@@ -195,7 +201,10 @@ fn opening_pairing_from_modal_keeps_root_viewport_and_expands_dock() {
     harness.settle(&vm, false);
     let at = text_position(&mut harness, &vm, "Открыть окно сопряжения");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
-    assert!(frame.output.actions.contains(&Action::StartPairing { window_s: 120 }));
+    assert!(frame
+        .output
+        .actions
+        .contains(&Action::StartPairing { window_s: 120 }));
     for action in frame.output.actions {
         vm.local(&action);
     }
@@ -405,7 +414,10 @@ fn an_idle_window_asks_for_no_frame_and_an_animated_one_for_thirty_a_second() {
     vm.local(&Action::ToggleModal(Modal::Keys));
     let frame = harness.settle(&vm, true);
     assert_eq!(frame.output.repaint_after, None);
-    assert!(harness.state.field.displacement() > 20.0, "a covered map freezes");
+    assert!(
+        harness.state.field.displacement() > 20.0,
+        "a covered map freezes"
+    );
 }
 
 #[test]
