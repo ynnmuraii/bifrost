@@ -34,6 +34,8 @@ impl Emitter {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.near = false;
+        self.gate = Coalescer::default();
+        self.entry_wanted = false;
     }
 
     /// A receiver lease was prepared: the next pointer position is where input arrived.
@@ -328,6 +330,20 @@ mod tests {
 
     fn at(x: f64, y: f64) -> Position {
         Position::new("a", x, y)
+    }
+
+    #[test]
+    fn disabling_discards_pending_frames_and_entry_intent() {
+        let mut emitter = Emitter::new(true);
+        assert!(emitter.push(Update::Clear, "", 0).is_some());
+        assert!(emitter.push(Update::Crossed(None), "", 1).is_none());
+        emitter.await_entry();
+        emitter.set_enabled(false);
+        assert!(emitter.due(100).is_none());
+        assert!(emitter.due_at().is_none());
+        assert!(!emitter.take_entry_wanted());
+        emitter.set_enabled(true);
+        assert!(emitter.due(200).is_none());
     }
 
     #[test]
