@@ -62,7 +62,8 @@ impl<'a> Canvas<'a> {
 /// edge into the display. Deterministic: the same arguments paint the same pixels.
 pub fn glow(canvas: &mut Canvas<'_>, edge: Edge, point: f32, intensity: f32) {
     let peak = MAX_ALPHA * intensity.clamp(0.0, 1.0);
-    if !(peak > 0.0) || !point.is_finite() {
+    // NaN intensity or crossing point draws nothing (the canvas keeps whatever it had).
+    if !peak.is_finite() || peak <= 0.0 || !point.is_finite() {
         return;
     }
     let (along_len, depth_len) = if edge.is_horizontal() {
