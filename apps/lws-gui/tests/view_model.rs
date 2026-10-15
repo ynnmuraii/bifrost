@@ -703,6 +703,47 @@ fn a_request_with_no_core_is_reported_as_not_sent() {
 }
 
 #[test]
+fn shortcut_changes_wait_for_authoritative_registration_feedback() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    let (request, message) = Action::SetHotkey {
+        action: protocol::ipc::HotkeyAction::SwitchNext as i32,
+        chord: "Ctrl+F9".to_owned(),
+    }
+    .wire()
+    .expect("hotkeys are written only by the service");
+    assert_eq!(request, Request::SetHotkey);
+    assert!(matches!(message, Msg::SetHotkey(_)));
+    let id = vm.begin_request(request, Instant::now());
+    let bindings = vec![protocol::ipc::HotkeyBinding {
+        action: protocol::ipc::HotkeyAction::SwitchNext as i32,
+        chord: "Ctrl+F9".to_owned(),
+        available: true,
+        detail: String::new(),
+    }];
+    vm.apply(answer(
+        id,
+        Msg::HotkeysResult(protocol::ipc::HotkeysResult {
+            success: true,
+            detail: String::new(),
+            bindings: bindings.clone(),
+        }),
+    ));
+    assert!(vm.inflight.is_empty());
+    assert_eq!(vm.status.as_ref().unwrap().hotkeys, bindings);
+    vm.apply(event(Msg::HotkeysResult(protocol::ipc::HotkeysResult {
+        success: false,
+        detail: "The portal refused this shortcut".to_owned(),
+        bindings: Vec::new(),
+    })));
+    assert_eq!(vm.status.as_ref().unwrap().hotkeys, bindings);
+    assert_eq!(
+        vm.hotkeys_error.as_deref(),
+        Some("The portal refused this shortcut")
+    );
+}
+
+#[test]
 fn appearance_toggles_send_both_values_and_follow_authoritative_status() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));

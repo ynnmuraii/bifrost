@@ -5,8 +5,8 @@
 //! is done.
 //!
 //! Modal bodies scroll independently of their fixed header and footer. Every final row
-//! keeps 16 px below its contents; Keys lists the implemented emergency shortcut and
-//! retains the manual ownership control, without advertising unhandled config hotkeys.
+//! keeps 16 px below its contents. Keys edits service-owned bindings through IPC only,
+//! while preserving the autonomous emergency-release warning.
 
 use eframe::egui::{
     self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2,
@@ -40,6 +40,9 @@ pub fn draw(
     let Some(modal) = vm.modal else {
         st.modal_open = None;
         st.confirm_clear_history = false;
+        ui.ctx().data_mut(|d| {
+            d.remove::<crate::view_model::hotkeys::Editor>(egui::Id::new("hotkey-editor"));
+        });
         return;
     };
     let started = match st.modal_open {
@@ -60,7 +63,15 @@ pub fn draw(
     let painter = ui.painter().clone();
     painter.rect_filled(full, 0.0, pal.scrim);
     let scrim = ui.interact(full, egui::Id::new("scrim"), Sense::click());
-    if scrim.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    let capture_id = egui::Id::new("hotkey-editor");
+    let capturing = ui.ctx().data(|d| {
+        d.get_temp::<crate::view_model::hotkeys::Editor>(capture_id)
+            .is_some_and(|editor| editor.capturing.is_some())
+    });
+    if scrim.clicked()
+        || (!capturing && ui.input(|i| i.key_pressed(egui::Key::Escape)))
+    {
+        ui.ctx().data_mut(|d| d.remove::<crate::view_model::hotkeys::Editor>(capture_id));
         actions.push(Action::CloseModal);
     }
 
@@ -136,7 +147,7 @@ pub fn draw(
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             match modal {
                 Modal::Pairs => pairs_body(ui, pal, vm, actions),
-                Modal::Keys => keys_body(ui, pal, vm),
+                Modal::Keys => keys_body(ui, pal, vm, actions),
                 Modal::Clip => clip_body(ui, pal, vm, st, actions),
                 Modal::Diag => diag_body(ui, pal, vm, actions),
                 Modal::Settings => settings_body(ui, pal, vm, actions),
@@ -526,39 +537,82 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
     }
 }
 
-fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
+fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
+    use crate::view_model::hotkeys::{self, Editor, ROWS};
     let lang = vm.look.language;
-    let emergency = vm
-        .status
-        .as_ref()
-        .map(|s| s.emergency_hotkey.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(vm.config.emergency_hotkey.as_str());
-    let missing = vm.capability_missing("EMERGENCY_HOTKEY");
-    row(ui, pal, text(lang, Key::Emergency), true, |ui| {
-        widgets::chord(ui, pal, emergency);
-        if missing {
-            widgets::warn(ui, pal, |ui| {
-                widgets::wrapped(
-                    ui,
-                    text(lang, Key::TheEmergencyKeyIsUnavailableOnThisSystemTheKeyboardCanOnlyBeReleasedWithTheMouse),
-                    12.0,
-                    fam::sans(),
-                    pal.ink,
-                );
+    let id = egui::Id::new("hotkey-editor");
+    let mut editor = ui.ctx().data(|d| d.get_temp::<Editor>(id)).unwrap_or_default();
+    if !vm.connection.is_connected() {
+        editor.capturing = None;
+    }
+    let bindings = vm.status.as_ref().map(|s| s.hotkeys.as_slice()).unwrap_or_default();
+    if let Some((action, chord)) = editor.capture(lang, &ui.input(|i| i.events.clone()), bindings) {
+        actions.push(Action::SetHotkey { action, chord });
+    }
+    for (action, label, default) in ROWS {
+        let binding = bindings.iter().find(|binding| binding.action == action);
+        row(ui, pal, text(lang, label), action == 1, |ui| {
+            widgets::chord(ui, pal, binding.map(|binding| binding.chord.as_str()).unwrap_or(default));
+            ui.horizontal_wrapped(|ui| {
+                let connected = vm.connection.is_connected() && binding.is_some();
+                ui.add_enabled_ui(connected, |ui| {
+                    if widgets::button(ui, pal, text(lang, Key::Change), Kind::Solid, true).clicked() {
+                        editor.capturing = Some(action);
+                        editor.error = None;
+                    }
+                    if widgets::button(ui, pal, text(lang, Key::Reset), Kind::Solid, true).clicked() {
+                        match hotkeys::validate(lang, action, default, bindings) {
+                            Ok(()) => {
+                                editor.capturing = None;
+                                editor.error = None;
+                                actions.push(Action::SetHotkey { action, chord: default.to_owned() });
+                            }
+                            Err(error) => editor.error = Some(error),
+                        }
+                    }
+                });
             });
-        } else {
-            widgets::warn(ui, pal, |ui| {
-                widgets::wrapped(
-                    ui,
-                    text(lang, Key::AlwaysGivesTheMouseAndKeyboardBackToThisComputerEvenIfTheServiceIsStuck),
-                    12.0,
-                    fam::sans(),
-                    pal.ink,
-                );
-            });
-        }
-    });
+            if editor.capturing == Some(action) {
+                widgets::wrapped(ui, text(lang, Key::PressAShortcutEscCancels), 12.0, fam::sans(), pal.ink);
+            }
+            if let Some(binding) = binding {
+                if !binding.available {
+                    widgets::wrapped(ui, text(lang, Key::Unavailable), 12.0, fam::sans(), pal.ink);
+                }
+                if !binding.detail.is_empty() {
+                    widgets::wrapped(ui, &binding.detail, 12.0, fam::sans(), pal.ink);
+                }
+            } else {
+                widgets::wrapped(ui, text(lang, Key::WaitingForTheServiceStatus), 12.0, fam::sans(), pal.ink);
+            }
+            if action == 1 {
+                widgets::warn(ui, pal, |ui| {
+                    let warning = if binding.is_some_and(|binding| !binding.available)
+                        || vm.capability_missing("EMERGENCY_HOTKEY")
+                    {
+                        text(lang, Key::TheEmergencyKeyIsUnavailableOnThisSystemTheKeyboardCanOnlyBeReleasedWithTheMouse)
+                    } else {
+                        text(lang, Key::AlwaysGivesTheMouseAndKeyboardBackToThisComputerEvenIfTheServiceIsStuck)
+                    };
+                    widgets::wrapped(ui, warning, 12.0, fam::sans(), pal.ink);
+                });
+            }
+        });
+    }
+    // The local pre-check names a sentence from the catalogue and then the exact reason, the way
+    // an agent's own detail line is shown; the core's answer has no catalogue sentence of its own.
+    if let Some(error) = editor.error.as_ref() {
+        widgets::warn(ui, pal, |ui| {
+            widgets::wrapped(ui, text(lang, Key::InvalidShortcut), 12.0, fam::sans(), pal.ink);
+            widgets::wrapped(ui, error, 12.0, fam::sans(), pal.ink);
+        });
+    }
+    if let Some(error) = vm.hotkeys_error.as_ref() {
+        widgets::warn(ui, pal, |ui| {
+            widgets::wrapped(ui, error, 12.0, fam::sans(), pal.ink);
+        });
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(id, editor));
 }
 
 fn clip_body(
