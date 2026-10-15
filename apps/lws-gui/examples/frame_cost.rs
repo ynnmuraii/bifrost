@@ -2,6 +2,8 @@
 //! cargo run --release -p lws-gui --example frame_cost -- --root DIR
 //! --root/--live uses a read-only real core snapshot, otherwise an offline fixture.
 //! CPU means wall time spent drawing/tessellating, not process-wide CPU accounting.
+//! Allocation phases separate app drawing from egui orchestration and tessellation;
+//! the direct field probe below excludes all three surrounding framework costs.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,6 +121,8 @@ fn main() -> Result<(), String> {
         let mut repaint_frames = 0u64;
         let mut cpu = Duration::ZERO;
         let mut allocations = 0u64;
+        let mut draw_allocations = 0u64;
+        let mut tessellation_allocations = 0u64;
         loop {
             let t = due.min(event);
             if t >= end {
@@ -135,6 +139,7 @@ fn main() -> Result<(), String> {
             let before = ALLOCS.load(Ordering::Relaxed);
             let began = Instant::now();
             let mut output = ctx.run_ui(raw, |ui| {
+                let draw_before = ALLOCS.load(Ordering::Relaxed);
                 let now = epoch + t;
                 vm.tick(now);
                 let drawn = ui::draw(ui, &vm, &mut state, Env { now, animate: true });
@@ -142,6 +147,7 @@ fn main() -> Result<(), String> {
                 if let Some(after) = drawn.repaint_after.into_iter().chain(pending).min() {
                     ui.ctx().request_repaint_after(after);
                 }
+                draw_allocations += ALLOCS.load(Ordering::Relaxed) - draw_before;
             });
             let delay = output
                 .viewport_output
@@ -149,8 +155,10 @@ fn main() -> Result<(), String> {
                 .map(|v| v.repaint_delay)
                 .min()
                 .unwrap_or(Duration::MAX);
+            let tessellation_before = ALLOCS.load(Ordering::Relaxed);
             let meshes =
                 ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+            tessellation_allocations += ALLOCS.load(Ordering::Relaxed) - tessellation_before;
             output.drop_without_applying_deltas();
             std::hint::black_box(&meshes);
             cpu += began.elapsed();
@@ -174,6 +182,10 @@ fn main() -> Result<(), String> {
             cpu.as_secs_f64() * 1e6 / frames.max(1) as f64,
             allocations as f64 / frames.max(1) as f64,
             cpu.as_secs_f64() * 1e3 / seconds);
+        println!("{label} allocation phases: ui_draw/frame={:.2} tessellation/frame={:.2} egui_run_and_output/frame={:.2}",
+            draw_allocations as f64 / frames.max(1) as f64,
+            tessellation_allocations as f64 / frames.max(1) as f64,
+            allocations.saturating_sub(draw_allocations + tessellation_allocations) as f64 / frames.max(1) as f64);
     }
     direct_field();
     assert_eq!(
