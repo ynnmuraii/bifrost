@@ -1216,7 +1216,8 @@ mod tests {
         ] {
             let (shared, rx) = hook_state(mode);
             let kb = KBDLLHOOKSTRUCT {
-                vkCode: u32::from(shared.combo.vk),
+                // The emergency binding `hook_state` packed: Ctrl+Alt+Shift+F12.
+                vkCode: u32::from(EmergencyCombo::default().vk),
                 ..Default::default()
             };
             assert_eq!(

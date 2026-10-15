@@ -149,11 +149,12 @@ mod tests {
                 ..Default::default()
             },
         };
+        let events = std::slice::from_ref(&event);
         assert_eq!(
-            editor.capture(Lang::Ru, &[event.clone()], &[]),
+            editor.capture(Lang::Ru, events, &[]),
             Some((2, ROWS[1].2.to_owned()))
         );
-        assert_eq!(editor.capture(Lang::Ru, &[event], &[]), None);
+        assert_eq!(editor.capture(Lang::Ru, events, &[]), None);
         assert_eq!(editor.capturing, None);
     }
 }
