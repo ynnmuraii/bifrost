@@ -405,10 +405,9 @@ fn run(rx: &Receiver<Command>, ready: &Sender<u32>) {
     // SAFETY: the calling thread's id.
     let _ = ready.send(unsafe { GetCurrentThreadId() });
 
-    let seed = 0x5EED_1234;
     let mut overlay = Overlay {
         hwnd,
-        effect: Effect::new(seed),
+        effect: Effect::new(),
         placement: None,
         surface: None,
         strip: None,
@@ -465,7 +464,7 @@ mod tests {
         let last = Instant::now();
         let mut overlay = Overlay {
             hwnd: HWND::default(),
-            effect: Effect::new(1),
+            effect: Effect::new(),
             placement: None,
             surface: None,
             strip: None,

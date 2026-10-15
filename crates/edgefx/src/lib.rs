@@ -1,5 +1,5 @@
-//! Edge effects: the small ASCII strip that gathers toward the cursor at a linked edge, and
-//! the matching "release" on the machine the cursor arrives at.
+//! Edge effects: a soft glow strip that gathers toward the cursor at a linked edge, and the
+//! matching "release" bloom on the machine the cursor arrives at.
 //!
 //! This crate is *pure*: no OS calls, no clock, no allocation per frame. The platform
 //! crates own a window (Win32 layered window, wlr-layer-shell surface), feed [`Update`]s
@@ -14,22 +14,22 @@
 pub mod coalesce;
 pub mod effect;
 pub mod raster;
-pub mod sim;
 pub mod veil;
 
 pub use effect::{Effect, Phase};
-pub use raster::{Canvas, ACCENT, DIM};
+pub use raster::{Canvas, ACCENT, GLOW_REACH_PX, GLOW_SIGMA_PX, MAX_ALPHA};
 
-/// Distance (logical px) from a linked edge at which the strip starts to appear.
+/// Distance (logical px) from a linked edge at which the glow starts to appear.
 pub const REACH_PX: f32 = 160.0;
-/// How deep the strip reaches into the display (logical px).
+/// How deep the glow reaches into the display (logical px).
 pub const DEPTH_PX: f32 = 36.0;
-/// The longest strip the overlay window will cover (logical px).
-pub const MAX_STRIP_PX: f32 = 1600.0;
+/// The longest strip the overlay window will cover (logical px): the glow's own support, so
+/// the window is exactly as big as the effect can be.
+pub const MAX_STRIP_PX: f32 = 2.0 * GLOW_REACH_PX;
 /// Source side: fade-out once input has crossed.
 pub const FADE_OUT_S: f32 = 0.30;
-/// Receiver side: how long the release plays.
-pub const RELEASE_S: f32 = 0.50;
+/// Receiver side: how long the entry bloom plays.
+pub const RELEASE_S: f32 = 0.40;
 /// An approach with no update for this long fades out (core died, agent kept alone).
 pub const STALE_S: f32 = 0.25;
 /// Frame cap while an effect is alive.
@@ -178,10 +178,18 @@ mod tests {
         };
         let middle = Strip::of(&target(2000.0));
         assert_eq!(middle.len, MAX_STRIP_PX);
-        assert!((middle.start - 1200.0).abs() < 0.01);
+        assert!((middle.start - (2000.0 - MAX_STRIP_PX / 2.0)).abs() < 0.01);
         assert_eq!(Strip::of(&target(0.0)).start, 0.0);
         let far = Strip::of(&target(4000.0));
         assert_eq!(far.start + far.len, 4000.0);
+    }
+
+    /// The window is the glow's own support: a crossing point can sit anywhere in it and
+    /// nothing of the effect is cut off.
+    #[test]
+    fn the_strip_covers_the_whole_glow_around_the_crossing_point() {
+        assert_eq!(MAX_STRIP_PX, 2.0 * GLOW_REACH_PX);
+        assert!(MAX_STRIP_PX > 0.0);
     }
 
     #[test]
