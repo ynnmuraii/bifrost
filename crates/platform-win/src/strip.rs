@@ -41,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const TIMER_ID: usize = 0x4C59;
-const TIMER_MS: u32 = 33;
+const TIMER_MS: u32 = 34;
 const WM_WAKE: u32 = WM_APP + 2;
 
 /// Where the display of an update sits on the desktop, in physical pixels.
