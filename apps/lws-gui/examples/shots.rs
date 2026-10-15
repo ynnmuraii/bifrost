@@ -122,9 +122,12 @@ fn main() -> std::process::ExitCode {
             }
         }
         for (name, state) in states {
+            // The main screen is shot as a live window — the field simulating, the ribbon of
+            // «ASCII-изолиния» flowing — and the rest as they are when nothing moves.
+            let live = name.ends_with(&format!("main-{tag}"));
             for size in SIZES {
                 let file = dir.join(format!("{name}-{}x{}.png", size[0], size[1]));
-                match shoot(state.clone(), &file, size) {
+                match shoot(state.clone(), &file, size, live) {
                     Ok(()) => {
                         println!("{}", file.display());
                         written += 1;
@@ -203,7 +206,7 @@ fn modal_name(modal: Modal) -> &'static str {
     }
 }
 
-fn shoot(state: ViewModel, file: &Path, size: [u32; 2]) -> Result<(), String> {
+fn shoot(state: ViewModel, file: &Path, size: [u32; 2], live: bool) -> Result<(), String> {
     let drawn = AssertUnwindSafe(|| {
         let mut ui_state = UiState::new(Instant::now());
         let mut harness = Harness::builder()
@@ -212,11 +215,27 @@ fn shoot(state: ViewModel, file: &Path, size: [u32; 2]) -> Result<(), String> {
             .build_ui(move |ui| {
                 let env = Env {
                     now: Instant::now(),
-                    animate: false,
+                    animate: live,
                 };
                 let _ = ui::draw(ui, &state, &mut ui_state, env);
             });
         ui::install_fonts(&harness.ctx);
+        if live {
+            // A window showing a live field has the pointer over the map: that is what lets the
+            // field simulate, and «ASCII-изолиния» draws its ribbon of particles only then.
+            harness.event(egui::Event::PointerMoved(egui::pos2(
+                size[0] as f32 * 0.3,
+                size[1] as f32 * 0.45,
+            )));
+        }
+        if live {
+            // The field eases along the wall clock: the ribbon needs a few seconds of it to be
+            // the arc it draws rather than the marks still leaving their places.
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(100));
+                harness.run_steps(2);
+            }
+        }
         harness.run_steps(3);
         // The dialog is revealed over 0.32 s of the wall clock; let it finish.
         std::thread::sleep(Duration::from_millis(450));
