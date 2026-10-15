@@ -201,6 +201,24 @@ fn a_copy_on_one_node_arrives_on_the_other() {
 }
 
 #[test]
+fn repeated_copies_reuse_the_channel_in_both_directions() {
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+    for (sender, receiver, direction) in [
+        (&harness.a, &harness.b, "a-to-b"),
+        (&harness.b, &harness.a, "b-to-a"),
+    ] {
+        for copy in 0..5 {
+            let text = payload(&format!("{direction}-{copy}"), 64);
+            sender.copy_to_clipboard(&text);
+            receiver
+                .wait_for_clipboard(&text, Duration::from_secs(10))
+                .unwrap_or_else(|error| panic!("{direction} copy {copy}: {error}"));
+        }
+    }
+}
+
+#[test]
 fn a_copy_reaches_every_other_member_once() {
     // AC-28's shape: A copies, B and C each end up with it, and neither of them re-offers it.
     let _serial = common::serial();

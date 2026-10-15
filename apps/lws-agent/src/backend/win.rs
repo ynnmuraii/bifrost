@@ -100,13 +100,13 @@ pub struct Win {
     /// A set of the clipboard moves `GetClipboardSequenceNumber`, and the notification the
     /// OS delivers for that set is indistinguishable from a user's copy *except* by the
     /// counter. So the value right after this backend's own `SetClipboardData` is remembered
-    /// in `applied_sequence`, and the read that carries it is swallowed: exactly the payload
-    /// this node applied from core, never someone else's copy. (Core has its own echo history
-    /// on `(origin_node_id, origin_version)`; this is the same rule one hop earlier, at the
-    /// OS edge, where only the platform's signal exists.)
+    /// in `last_clipboard_sequence`, and every read that carries it is swallowed: exactly
+    /// this node's write or an already observed notification, never someone else's new copy.
+    /// Core separately tracks `(origin_node_id, origin_version)`; this is the same echo
+    /// rule at the OS edge, where only the platform's signal exists.
     clipboard: Option<platform_win::clipboard::Clipboard>,
-    /// `GetClipboardSequenceNumber` right after this backend's own write.
-    applied_sequence: Option<u32>,
+    /// `GetClipboardSequenceNumber` of the last observed item or our own write.
+    last_clipboard_sequence: Option<u32>,
     last_capture_report: Option<Instant>,
     last_capture_stats: CaptureStats,
     remote_hook_baseline: input_model::EdgeCounters,
@@ -164,7 +164,7 @@ impl Win {
             plan,
             repeats: RepeatFilter::new(),
             clipboard,
-            applied_sequence: None,
+            last_clipboard_sequence: None,
             last_capture_report: None,
             last_capture_stats: CaptureStats::default(),
             remote_hook_baseline: input_model::EdgeCounters::default(),
@@ -252,14 +252,11 @@ impl Win {
                     return Ok(None);
                 }
             };
-        if Some(snapshot.sequence) == self.applied_sequence {
-            // Our own write, arriving as a notification. The next one to be noticed carries a
-            // larger counter, so a stale value here can never swallow a later change.
-            self.applied_sequence = None;
+        if !new_clipboard_sequence(&mut self.last_clipboard_sequence, snapshot.sequence) {
             tracing::debug!(
                 sequence = snapshot.sequence,
                 bytes = snapshot.text.len(),
-                "swallowing the clipboard update this node applied"
+                "swallowing an already observed clipboard sequence"
             );
             return Ok(None);
         }
@@ -299,11 +296,11 @@ impl Win {
         })?
         .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: the clipboard was not taken: {error}"))?;
         // The counter after our own write is what the notification will carry.
-        self.applied_sequence = Some(clipboard.sequence());
+        self.last_clipboard_sequence = Some(clipboard.sequence());
         tracing::info!(
             bytes = text.map(str::len).unwrap_or(0),
             released = text.is_none(),
-            sequence = self.applied_sequence,
+            sequence = self.last_clipboard_sequence,
             "clipboard set"
         );
         Ok(())
@@ -860,9 +857,29 @@ const _: () = {
     assert!(POLL_TICK.as_millis() <= Duration::from_millis(10).as_millis());
 };
 
+/// Notifications can queue for the same OS item; equality (not ordering) also handles wrap.
+fn new_clipboard_sequence(last: &mut Option<u32>, sequence: u32) -> bool {
+    last.replace(sequence) != Some(sequence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_notifications_are_deduplicated_without_swallowing_new_copies() {
+        let mut last = None;
+        assert!(new_clipboard_sequence(&mut last, 3550));
+        assert!(!new_clipboard_sequence(&mut last, 3550));
+        assert!(!new_clipboard_sequence(&mut last, 3550));
+        // The set path remembers its own sequence before any queued notifications arrive.
+        last = Some(3551);
+        assert!(!new_clipboard_sequence(&mut last, 3551));
+        assert!(!new_clipboard_sequence(&mut last, 3551));
+        assert!(new_clipboard_sequence(&mut last, 3552));
+        assert!(new_clipboard_sequence(&mut last, u32::MAX));
+        assert!(new_clipboard_sequence(&mut last, 0));
+    }
 
     #[test]
     fn the_default_hotkey_maps_to_ctrl_alt_shift_f12() {

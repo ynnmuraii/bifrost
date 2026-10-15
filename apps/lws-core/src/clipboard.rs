@@ -445,6 +445,10 @@ impl Clipboard {
                 size_bytes: offer.size,
             };
             if state.channel.is_some() {
+                // A bound channel still follows Offer → Request → Data. Retain this copy
+                // just as on_bound does for the first offer, or its Request has no payload.
+                self.offered
+                    .insert(peer, (message.clone(), self.payload.clone()));
                 let _ = self.runtime.send(peer, message).await;
                 continue;
             }
