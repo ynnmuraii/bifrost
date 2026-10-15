@@ -303,16 +303,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What a file that says nothing about a field gives: the defaults, with the language of
+    /// the system the window runs on.
+    fn fresh() -> Look {
+        Look {
+            language: Lang::from_system(),
+            ..Look::default()
+        }
+    }
+
     #[test]
     fn a_missing_or_broken_file_is_the_defaults_and_a_partial_one_keeps_what_it_says() {
         let dir = dir("broken");
         let path = path_in(&dir);
-        assert_eq!(load(&path), Look::default());
+        assert_eq!(load(&path), fresh());
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(&path, "theme = [").expect("write");
-        assert_eq!(load(&path), Look::default());
+        assert_eq!(load(&path), fresh());
         std::fs::write(&path, "theme = \"dark\"\n").expect("write");
         let partial = load(&path);
+        assert_eq!(
+            partial.language,
+            Lang::from_system(),
+            "the system's language"
+        );
         assert_eq!(partial.theme, Theme::Dark);
         assert_eq!(partial.field, FieldMode::Attract);
         assert_eq!(partial.zoom_percent, 100);
