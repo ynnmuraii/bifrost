@@ -400,7 +400,7 @@ impl Session {
                 self.shutdown_agent().await;
             }
             Msg::SetClipboard(set) => {
-                let result = self.set_clipboard(set.enabled);
+                let result = self.set_clipboard(set.enabled).await;
                 answer(&out, request_id, Msg::OpResult(result)).await;
             }
             Msg::SetAppearance(set) => {
@@ -795,19 +795,69 @@ impl Session {
         });
     }
 
-    /// `SetClipboard`: the GUI's toggle, on the same policy the configuration seeds.
-    ///
-    /// Without `[clipboard].enabled` there is no runtime at all (ADR-008: the channel is
-    /// opt-in), and the honest answer is a refusal the GUI shows instead of a toggle it
-    /// pretends to move.
-    fn set_clipboard(&mut self, enabled: bool) -> ipc::OpResult {
-        let Some(clipboard) = self.clipboard.as_mut() else {
+    /// The GUI command is explicit opt-in; persist it through the shared config writer.
+    async fn set_clipboard(&mut self, enabled: bool) -> ipc::OpResult {
+        let mut started = if enabled && self.clipboard.is_none() {
+            let mut settings = self.clipboard_settings;
+            settings.enabled = true;
+            settings.policy.enabled = true;
+            match crate::clipboard::Clipboard::start(
+                self.node_id,
+                settings,
+                Arc::clone(&self.identity),
+                self.manager.shared_pins(),
+                self.clipboard_listen,
+                crate::QUEUE_CAPACITY,
+            )
+            .await
+            {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    tracing::warn!(%error, "cannot start clipboard sharing");
+                    return ipc::OpResult {
+                        ok: false,
+                        error_code: "CLIPBOARD_START".to_owned(),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let path = self.paths.config_file();
+        let saved = tokio::task::spawn_blocking(move || {
+            config::lock::update_locked(&path, |config| config.clipboard.enabled = enabled)
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            if let Some((clipboard, _)) = started.take() {
+                clipboard.stop().await;
+            }
+            tracing::warn!(?saved, "cannot persist clipboard opt-in");
             return ipc::OpResult {
                 ok: false,
-                error_code: "CLIPBOARD_DISABLED".to_owned(),
+                error_code: "CONFIG_WRITE".to_owned(),
             };
-        };
-        clipboard.set_enabled(enabled);
+        }
+        if let Some((mut clipboard, events)) = started {
+            let mut out = Vec::new();
+            for (&peer, &(connection, supported, address)) in &self.clipboard_links {
+                out.extend(clipboard.on_link_up(peer, connection, supported, address).await);
+            }
+            self.clipboard_events = events;
+            self.clipboard = Some(clipboard);
+            self.apply_clipboard(out).await;
+        } else if !enabled {
+            if let Some(clipboard) = self.clipboard.take() {
+                clipboard.stop().await;
+            }
+            let (_, events) = mpsc::channel(1);
+            self.clipboard_events = events;
+        }
+        self.clipboard_settings.enabled = enabled;
+        self.clipboard_settings.policy.enabled = enabled;
+        let status = self.gui_status().await;
+        self.gui_status = Some(status.clone());
+        self.publish(Msg::Status(status));
         tracing::info!(enabled, "clipboard toggled from the GUI");
         ok()
     }
@@ -882,6 +932,7 @@ impl Session {
         if let Err(error) = self.manager.remove_peer(&node).await {
             tracing::warn!(%error, "cannot remove the live peer pin");
         }
+        self.clipboard_links.remove(&node);
         if let Some(clipboard) = self.clipboard.as_mut() {
             clipboard.on_link_down(node).await;
         }
