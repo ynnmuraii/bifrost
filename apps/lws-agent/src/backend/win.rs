@@ -195,15 +195,19 @@ impl Win {
         ) {
             self.edge_placement
         } else {
-            platform_win::displays::enumerate().ok().and_then(|monitors| {
-                monitors
-                    .iter()
-                    .find(|monitor| monitor.id == display_id || monitor.device_name == display_id)
-                    .map(|monitor| platform_win::strip::Placement {
-                        native: monitor.native,
-                        scale: monitor.scale as f32,
-                    })
-            })
+            platform_win::displays::enumerate()
+                .ok()
+                .and_then(|monitors| {
+                    monitors
+                        .iter()
+                        .find(|monitor| {
+                            monitor.id == display_id || monitor.device_name == display_id
+                        })
+                        .map(|monitor| platform_win::strip::Placement {
+                            native: monitor.native,
+                            scale: monitor.scale as f32,
+                        })
+                })
         };
         if let Some(placement) = placement {
             self.edge_placement = Some(placement);
