@@ -3078,6 +3078,7 @@ name = "platform-wayland"
 version = "0.0.0"
 dependencies = [
  "ashpd",
+ "clipboard",
  "edgefx",
  "futures-util",
  "input-model",
@@ -3089,6 +3090,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-wlr",
 ]
 

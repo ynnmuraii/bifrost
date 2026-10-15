@@ -123,6 +123,11 @@ pub struct Wayland {
     /// Source-side autorepeat filter (KVM-036): EIS repeats a held key on the compositor's
     /// own schedule, and those repeats must not reach the wire.
     repeats: RepeatFilter,
+    /// The local selection through `ext-data-control-v1`.
+    ///
+    /// `None` when this compositor does not implement it (GNOME has no data-control at all),
+    /// in which case this backend has no clipboard and says so in `AgentReady` (ADR-008).
+    clipboard: Option<platform_wayland::Clipboard>,
 }
 
 impl Wayland {
@@ -249,11 +254,28 @@ impl Wayland {
             }));
         }
 
+        // The clipboard is the one part of this backend that is neither a portal session nor an
+        // EIS device: `ext-data-control-v1` is a privileged-client interface of the compositor
+        // itself (KWin), and it is the only route that works outside a capture activation. A
+        // compositor without it (GNOME) loses the clipboard and nothing else, so this is a
+        // capability, not a refusal.
+        let clipboard = match platform_wayland::Clipboard::connect() {
+            Some(clipboard) => Some(clipboard),
+            None => {
+                tracing::info!(
+                    "no clipboard: this compositor has no ext_data_control_manager_v1; this \
+                     session will not do the clipboard"
+                );
+                None
+            }
+        };
+
         let ready = refine_ready(
             session,
             capture.is_some(),
             &injector,
             shortcuts.is_some(),
+            clipboard.is_some(),
             &refusals,
         );
         let wayland = Wayland {
@@ -275,6 +297,7 @@ impl Wayland {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             repeats: RepeatFilter::new(),
+            clipboard,
         };
         Ok((wayland, ready, refusals))
     }
@@ -315,24 +338,48 @@ impl Wayland {
 
     /// Whether this backend can own and read the local CLIPBOARD selection.
     ///
-    /// It cannot, and it does not pretend to: `crates/platform-wayland/src/clipboard.rs` has no
-    /// portal clipboard in this build (the `Clipboard` interface of `RemoteDesktop` is not
-    /// wired), so `TEXT_CLIPBOARD` is not advertised (`refine_ready` strips it) and core never
-    /// hands this node a payload. ADR-008 wants the feature to be *off* on a node that cannot
-    /// honour it, not half-wired.
+    /// It can when the compositor implements `ext-data-control-v1` (KWin, and every compositor
+    /// that took the staging protocol): `platform_wayland::Clipboard` then holds a connection
+    /// that both reads the selection and takes it over. A compositor without it — Mutter
+    /// implements neither `ext-` nor `wlr-data-control` — leaves this `false`, `TEXT_CLIPBOARD`
+    /// is not advertised (`refine_ready` drops it) and core never hands this node a payload
+    /// (ADR-008: the capability is a promise, and a route that cannot honour it is not
+    /// announced as if it could).
     pub fn clipboard_available(&self) -> bool {
-        false
+        self.clipboard.is_some()
     }
 
-    /// Never: a Wayland session has no local selection this agent can watch.
+    /// The next clipboard change the *user* made.
+    ///
+    /// Never waits: the session polls this from its own tick, where the core-silence watchdog
+    /// lives too. The echo rule (a payload this node applied must not be reported back as the
+    /// user's copy) is the adapter's own, because a data-control device is told about every
+    /// selection including the one this node set; see `platform_wayland::data_control`.
     pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
-        None
+        let change = self.clipboard.as_mut()?.poll_change()?;
+        Some(ClipboardChange {
+            text: change.text,
+            markers: change.markers,
+        })
     }
 
-    /// Refused with `CLIPBOARD_DISABLED`: the portal clipboard is not implemented in this
-    /// build, and core is entitled to an answer rather than silence.
-    pub async fn set_clipboard(&mut self, _text: Option<&str>) -> Result<(), String> {
-        Err("CLIPBOARD_DISABLED: the portal clipboard is not implemented in this build".to_owned())
+    /// Owns the local selection with `text`; `None` gives it up.
+    ///
+    /// Refused with `CLIPBOARD_DISABLED` when there is no data-control connection: core is
+    /// entitled to an answer rather than silence.
+    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Err(
+                "CLIPBOARD_DISABLED: this compositor has no ext_data_control_manager_v1".to_owned(),
+            );
+        };
+        clipboard.set_text(text);
+        tracing::info!(
+            bytes = text.map_or(0, str::len),
+            released = text.is_none(),
+            "CLIPBOARD selection set"
+        );
+        Ok(())
     }
 
     /// Starts (or re-arms) capture for the requested kind.
@@ -950,31 +997,34 @@ async fn arm_capture(
 /// * `RECEIVER_TAKEOVER` never: «Портальный получатель не видит физический ввод …
 ///   Автоматический takeover поэтому не объявляется».
 /// * `CAPTURE` only while a capture session is armed.
+/// * `TEXT_CLIPBOARD` only while the clipboard adapter holds a live data-control connection —
+///   «capability объявляется только после `clipboard_enabled`» in ADR-008's words, and
+///   `platform_wayland::Clipboard` is what that connection is. A compositor without
+///   `ext-data-control-v1` therefore advertises no clipboard, and core never offers this node
+///   a payload it would have to refuse.
 fn refine_ready(
     session: &SessionInfo,
     has_capture: bool,
     injector: &WaylandInjector,
     has_hotkey: bool,
+    has_clipboard: bool,
     refusals: &[Refusal],
 ) -> Ready {
     let mut ready = Ready::from_session(session, String::new());
     let capabilities = injector.capabilities();
     let absolute = capabilities.has_absolute_injection;
-    ready.capabilities.retain(|name| match name.as_str() {
-        "CAPTURE" => has_capture,
-        "ABSOLUTE_POINTER" => absolute,
-        "EMERGENCY_HOTKEY" => has_hotkey,
-        "RECEIVER_TAKEOVER" => false,
-        _ => true,
-    });
-    // A clipboard capability is declared only once the portal says so (ADR-008); the
-    // capture session is the only place that answer exists, and clipboard is outside
-    // this slice, so it stays off.
-    ready.capabilities.retain(|name| name != "TEXT_CLIPBOARD");
+    ready.capabilities = refine_capabilities(
+        ready.capabilities,
+        has_capture,
+        absolute,
+        has_hotkey,
+        has_clipboard,
+    );
+    // `Ready::from_session` carries what the *probe* could know, and the probe is honest about
+    // the clipboard: it says `false` at probe time because only the adapter knows. So the
+    // capability is also *added* here, not merely kept.
+    ready.set_text_clipboard(has_clipboard);
 
-    if !absolute {
-        ready.capabilities.retain(|name| name != "ABSOLUTE_POINTER");
-    }
     ready.backend.has_absolute_injection = absolute;
     ready.backend.has_emergency_hotkey = has_hotkey;
     ready.backend.has_receiver_takeover = false;
@@ -988,6 +1038,32 @@ fn refine_ready(
     }
     ready.backend.degraded_reason = degraded.join("; ");
     ready
+}
+
+/// The capability names after the runtime answers, as a pure list.
+///
+/// Split out of [`refine_ready`] so the rules above are testable without a compositor: the
+/// portal answers arrive as plain `bool`s here.
+fn refine_capabilities(
+    capabilities: Vec<String>,
+    has_capture: bool,
+    absolute: bool,
+    has_hotkey: bool,
+    has_clipboard: bool,
+) -> Vec<String> {
+    let mut capabilities = capabilities;
+    capabilities.retain(|name| match name.as_str() {
+        "CAPTURE" => has_capture,
+        "ABSOLUTE_POINTER" => absolute,
+        "EMERGENCY_HOTKEY" => has_hotkey,
+        "RECEIVER_TAKEOVER" => false,
+        "TEXT_CLIPBOARD" => has_clipboard,
+        _ => true,
+    });
+    if has_clipboard && !capabilities.iter().any(|name| name == "TEXT_CLIPBOARD") {
+        capabilities.push("TEXT_CLIPBOARD".to_owned());
+    }
+    capabilities
 }
 
 /// The `AgentError.code` for a portal failure (`docs/ipc.proto`: `PORTAL_DENIED,
@@ -1064,5 +1140,87 @@ mod activation_tests {
                 protocol::ipc::PortalEdge::Unspecified as i32
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// The clipboard is the one capability the probe cannot decide: it reports `false` at probe
+    /// time because only the adapter knows whether this compositor has `ext-data-control-v1`
+    /// (ADR-008: «capability объявляется только после ...»). So the runtime answer has to be
+    /// able to *add* the name, not merely strip it — which is exactly what the old
+    /// unconditional `retain(|name| name != "TEXT_CLIPBOARD")` made impossible.
+    #[test]
+    fn the_clipboard_capability_follows_the_adapter() {
+        let live = refine_capabilities(
+            names(&["CAPTURE", "INJECT", "EMERGENCY_HOTKEY"]),
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(live.iter().any(|name| name == "TEXT_CLIPBOARD"));
+
+        // No data-control (GNOME): no clipboard, whichever way the probe answered.
+        let absent = refine_capabilities(
+            names(&["CAPTURE", "TEXT_CLIPBOARD"]),
+            true,
+            true,
+            true,
+            false,
+        );
+        assert!(!absent.iter().any(|name| name == "TEXT_CLIPBOARD"));
+        assert!(absent.iter().any(|name| name == "CAPTURE"));
+    }
+
+    #[test]
+    fn the_runtime_rules_keep_their_meaning() {
+        let refined = refine_capabilities(
+            names(&[
+                "CAPTURE",
+                "INJECT",
+                "ABSOLUTE_POINTER",
+                "EMERGENCY_HOTKEY",
+                "RECEIVER_TAKEOVER",
+                "DISPLAYS_CHANGED",
+            ]),
+            // No armed capture session, relative-only injection, no hotkey binding.
+            false,
+            false,
+            false,
+            false,
+        );
+        for gone in [
+            "CAPTURE",
+            "ABSOLUTE_POINTER",
+            "EMERGENCY_HOTKEY",
+            "RECEIVER_TAKEOVER",
+        ] {
+            assert!(
+                !refined.iter().any(|name| name == gone),
+                "{gone} must be gone"
+            );
+        }
+        for kept in ["INJECT", "DISPLAYS_CHANGED"] {
+            assert!(
+                refined.iter().any(|name| name == kept),
+                "{kept} must be kept"
+            );
+        }
+        // A clipboard that is live is never listed twice.
+        let doubled = refine_capabilities(names(&["TEXT_CLIPBOARD"]), true, true, true, true);
+        assert_eq!(
+            doubled
+                .iter()
+                .filter(|name| *name == "TEXT_CLIPBOARD")
+                .count(),
+            1
+        );
     }
 }

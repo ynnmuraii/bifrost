@@ -72,6 +72,8 @@ pub const GLOBAL_SHORTCUTS_INTERFACE: &str = "org.freedesktop.portal.GlobalShort
 // and tests on any host; the portal stream itself is not driven yet, see the module.
 pub mod clipboard;
 
+mod data_control;
+
 #[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
@@ -88,6 +90,9 @@ mod relative;
 mod shortcuts;
 
 pub use clipboard::{availability, Availability, Unavailable};
+
+#[cfg(target_os = "linux")]
+pub use data_control::Clipboard;
 
 #[cfg(target_os = "linux")]
 pub use capture::{portal_versions, CapturedEvent, EmergencyHandle, MotionCounts, WaylandCapture};

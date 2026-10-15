@@ -2490,6 +2490,37 @@ impl Session {
         }
     }
 
+    /// Takes `TEXT_CLIPBOARD` from the agent's report.
+    ///
+    /// The capability is not a preference: it is what a *peer* reads before offering this node
+    /// a payload (`clipboard::Peer::text_clipboard` in `apps/lws-core/src/clipboard.rs`), and
+    /// it is also what `Status.capabilities_unavailable` subtracts for the GUI. The probe can
+    /// only answer for the session kind, and on Wayland the honest answer is "the adapter
+    /// knows": a KWin session has the clipboard through `ext-data-control-v1`, a Mutter one has
+    /// none at all. The peers get the value the next time their link is established — the
+    /// transport reads the local `Hello` per connection — which in practice precedes the first
+    /// link (the agent reports ~9 s before the first peer link came up on the live pair).
+    async fn adopt_agent_capabilities(&mut self, capabilities: &[String]) {
+        let has_clipboard = capabilities.iter().any(|name| name == "TEXT_CLIPBOARD");
+        if has_clipboard == self.capabilities.text_clipboard {
+            return;
+        }
+        tracing::info!(
+            capability = "TEXT_CLIPBOARD",
+            available = has_clipboard,
+            "the agent's adapter decides the clipboard capability"
+        );
+        self.capabilities.text_clipboard = has_clipboard;
+        let bit = protocol::wire::Capability::TextClipboard as i32;
+        self.local_hello.capabilities.retain(|value| *value != bit);
+        if has_clipboard {
+            self.local_hello.capabilities.push(bit);
+        }
+        self.manager
+            .update_local_hello(self.local_hello.clone())
+            .await;
+    }
+
     /// Tells the clipboard endpoint that a member's input link came up.
     async fn on_clipboard_link_up(
         &mut self,
@@ -2640,6 +2671,15 @@ impl Session {
                     self.portal_state = "unavailable".to_owned();
                 }
             }
+        }
+        if let Msg::Ready(ready) = &message {
+            // The adapter is the only thing that can answer for the clipboard: ADR-008 puts
+            // the capability after the *platform's* answer, and the session probe cannot know
+            // one (on Wayland the clipboard exists only when the compositor implements
+            // `ext-data-control-v1`). The agent reports what its backend really holds, so this
+            // is where a node stops claiming a clipboard it does not have, and starts claiming
+            // one it does.
+            self.adopt_agent_capabilities(&ready.capabilities).await;
         }
         if let Msg::ClipboardChanged(changed) = &message {
             // The clipboard never drives the focus FSM: a copy is core's own business, so it is
