@@ -28,7 +28,6 @@ use lws_gui::view_model::{
 use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
-use ui_text;
 
 const OUT_DIR: &str = "target/ui-shots";
 const SIZES: [[u32; 2]; 3] = [[1920, 1080], [1745, 1091], [1280, 720]];
