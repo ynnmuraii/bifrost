@@ -352,7 +352,7 @@ impl Session {
                     )
                     .await;
                 }
-                if let Some(prompt) = self.pairing.pending_prompt() {
+                if let Some(prompt) = self.pairing.pending_prompt(self.now_ms()) {
                     answer(
                         &out,
                         0,
@@ -667,8 +667,10 @@ impl Session {
         }
     }
 
-    /// Closes the window when its deadline passes (checked once per loop turn).
+    /// Closes the window when its deadline passes, and ends the ceremonies whose code outlived
+    /// theirs (checked once per loop turn).
     pub(crate) fn expire_pairing_window(&mut self) {
+        self.pairing.expire_ceremonies(self.now_ms());
         if let Some(window) = self.pairing.expire(self.now_ms()) {
             tracing::info!(address = window.address.as_str(), "pairing window closed");
             self.publish(Msg::PairingWindow(ipc::PairingWindow {
