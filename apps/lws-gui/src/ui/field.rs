@@ -974,7 +974,7 @@ mod tests {
                 continue;
             }
             assert!(
-                held >= 100 && held <= RIBBON_MAX,
+                (100..=RIBBON_MAX).contains(&held),
                 "the ribbon is a share of the field, capped: {held}"
             );
             let at = |i: usize| {
