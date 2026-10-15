@@ -1,4 +1,4 @@
-//! The six windows of the rail, in the mockup's «terminal load» frame.
+//! The five windows of the rail, in the mockup's «terminal load» frame.
 //!
 //! The opening is the only animation here: the dialog is revealed top-down in eight steps over
 //! 0.32 s (the mockup's `steps(8)` clip-path), and the next frame is requested only until that
@@ -9,9 +9,9 @@ use eframe::egui::{
 };
 
 use super::theme::{fam, font, Palette};
-use super::widgets::{self, Icon, Kind, Run};
+use super::widgets::{self, Icon, Kind};
 use super::{act, UiState};
-use crate::gui_settings::{FieldMode, Look, Pace, Theme};
+use crate::gui_settings::Theme;
 use crate::view_model::{Action, Modal, ViewModel};
 
 /// The reveal time of a dialog, seconds.
@@ -39,9 +39,6 @@ pub fn draw(
         Some((open, at)) if open == modal => at,
         _ => {
             st.modal_open = Some((modal, t));
-            if modal == Modal::Layout && vm.connection.is_connected() {
-                actions.push(Action::ListPendingEdits);
-            }
             t
         }
     };
@@ -105,15 +102,26 @@ pub fn draw(
     dialog.spacing_mut().item_spacing = Vec2::ZERO;
 
     header(dialog, pal, modal, rect, progress, actions);
-    let body_h = max_h - HEAD_H;
+    const FOOT_H: f32 = 72.0;
+    let body_h = (height - HEAD_H - FOOT_H).max(0.0);
+    let body_rect = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.top() + HEAD_H),
+        Pos2::new(rect.right(), rect.bottom() - FOOT_H),
+    );
+    let mut body = dialog.new_child(
+        UiBuilder::new()
+            .id_salt(("modal-body", modal as u8))
+            .max_rect(body_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    body.set_clip_rect(body_rect.intersect(reveal).intersect(full));
     let used = egui::ScrollArea::vertical()
         .id_salt(("modal-scroll", modal as u8))
         .max_height(body_h)
         .auto_shrink([false, true])
-        .show(dialog, |ui| {
+        .show(&mut body, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             match modal {
-                Modal::Layout => layout_body(ui, pal, vm, actions),
                 Modal::Pairs => pairs_body(ui, pal, vm, actions),
                 Modal::Keys => keys_body(ui, pal, vm, actions),
                 Modal::Clip => clip_body(ui, pal, vm, actions),
@@ -121,7 +129,46 @@ pub fn draw(
                 Modal::Settings => settings_body(ui, pal, vm, actions),
             }
         });
-    let measured = HEAD_H + used.content_size.y;
+    let footer_rect = Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - FOOT_H), rect.max);
+    let mut foot = dialog.new_child(
+        UiBuilder::new()
+            .id_salt(("modal-footer", modal as u8))
+            .max_rect(footer_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    foot.set_clip_rect(footer_rect.intersect(reveal).intersect(full));
+    footer(&mut foot, pal, |ui| {
+        match modal {
+            Modal::Pairs => act(
+                ui,
+                pal,
+                "Открыть окно сопряжения",
+                Kind::Hot,
+                vm.connection.is_connected(),
+                actions,
+                || Action::StartPairing { window_s: 120 },
+            ),
+            Modal::Keys => act(
+                ui,
+                pal,
+                "Открыть файл настроек",
+                Kind::Solid,
+                true,
+                actions,
+                || Action::OpenConfigFile,
+            ),
+            _ => act(
+                ui,
+                pal,
+                "Закрыть",
+                Kind::Plain,
+                true,
+                actions,
+                || Action::CloseModal,
+            ),
+        };
+    });
+    let measured = HEAD_H + used.content_size.y + FOOT_H;
     if (known.unwrap_or(0.0) - measured).abs() > 0.5 {
         ui.ctx().data_mut(|d| d.insert_temp(height_id, measured));
         ui.ctx().request_repaint();
@@ -306,97 +353,6 @@ fn footer(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(14.0);
 }
 
-fn layout_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
-    let editor = &vm.editor;
-    row(ui, pal, "Применено", false, |ui| {
-        widgets::text(ui, &vm.revision_text(), 14.0, fam::mono(), pal.ink);
-        widgets::hint(
-            ui,
-            pal,
-            "Правки принимает координатор — компьютер, который владеет вводом",
-        );
-        if !editor.editable {
-            widgets::hint(
-                ui,
-                pal,
-                "Сейчас координатор недоступен: применить правку нельзя.",
-            );
-        }
-    });
-    if let Some(conflict) = &vm.conflict {
-        row(ui, pal, "Конфликт", false, |ui| {
-            widgets::wrapped(ui, conflict, 14.0, fam::sans(), pal.ink);
-            act(
-                ui,
-                pal,
-                "Обновить",
-                Kind::Plain,
-                true,
-                actions,
-                || Action::Refresh,
-            );
-        });
-    }
-    for edit in &vm.pending_edits {
-        row(ui, pal, "Непринятая правка", false, |ui| {
-            let author = if edit.author_node_id.is_empty() {
-                "неизвестного компьютера".to_owned()
-            } else {
-                crate::view_model::short_id(&edit.author_node_id)
-            };
-            widgets::wrapped(
-                ui,
-                &format!(
-                    "Правка от {author} на основе ревизии {}. Её сделали, пока связи не было.",
-                    edit.base_revision
-                ),
-                14.0,
-                fam::sans(),
-                pal.ink,
-            );
-            widgets::duo(ui, |ui| {
-                act(
-                    ui,
-                    pal,
-                    "Применить правку",
-                    Kind::Solid,
-                    true,
-                    actions,
-                    || Action::ApplyPendingEdit(edit.edit_id.clone()),
-                );
-                act(
-                    ui,
-                    pal,
-                    "Отбросить",
-                    Kind::Plain,
-                    true,
-                    actions,
-                    || Action::DiscardPendingEdit(edit.edit_id.clone()),
-                );
-            });
-        });
-    }
-    footer(ui, pal, |ui| {
-        let apply = vm.layout_action();
-        let can = apply.is_some() && editor.editable && vm.connection.is_connected();
-        if widgets::button(ui, pal, "Применить", Kind::Hot, can).clicked() {
-            if let Some(action) = apply {
-                actions.push(action);
-                actions.push(Action::CloseModal);
-            }
-        }
-        act(
-            ui,
-            pal,
-            "Расположить автоматически",
-            Kind::Plain,
-            vm.connection.is_connected(),
-            actions,
-            || Action::LayoutAuto,
-        );
-    });
-}
-
 fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let peers = vm.peers();
     for peer in &peers {
@@ -537,25 +493,6 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
             );
         });
     }
-    footer(ui, pal, |ui| {
-        act(
-            ui,
-            pal,
-            "Открыть окно сопряжения",
-            Kind::Hot,
-            vm.connection.is_connected(),
-            actions,
-            || Action::StartPairing { window_s: 120 },
-        );
-    });
-    // The dialog closes once the window is open: the dock shows the address.
-    if vm.pairing.window.is_some()
-        && actions
-            .iter()
-            .any(|a| matches!(a, Action::StartPairing { .. }))
-    {
-        actions.push(Action::CloseModal);
-    }
 }
 
 fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
@@ -634,17 +571,18 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 }
 
 fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
-    let on = vm.status.as_ref().is_some_and(|s| s.clipboard_enabled);
+    let pending = vm.settings.clipboard_pending;
+    let on = pending.unwrap_or_else(|| vm.status.as_ref().is_some_and(|s| s.clipboard_enabled));
     row(ui, pal, "Общий буфер", false, |ui| {
-        let connected = vm.connection.is_connected();
-        if let Some(i) = widgets::seg(ui, pal, &["Включён", "Выключен"], usize::from(!on))
-        {
-            if connected {
+        let enabled = vm.connection.is_connected() && pending.is_none();
+        ui.add_enabled_ui(enabled, |ui| {
+            if let Some(i) = widgets::seg(ui, pal, &["Включён", "Выключен"], usize::from(!on))
+            {
                 actions.push(Action::SetClipboard(i == 0));
             }
-        }
-        let text = if let Some(note) = &vm.settings.clipboard_note {
-            note.as_str()
+        });
+        let text = if pending.is_some() {
+            "Применяем…"
         } else if on {
             "Текст можно копировать на одном компьютере и вставлять на другом"
         } else {
@@ -817,7 +755,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             );
         }
     });
-    row(ui, pal, "Порталы", false, |ui| {
+    row(ui, pal, "Порталы", true, |ui| {
         let wayland = vm
             .status
             .as_ref()
@@ -840,54 +778,5 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
                 "Только Linux / Wayland: на этой системе порталов нет"
             },
         );
-    });
-    let look = vm.look;
-    row(ui, pal, "Тема", false, |ui| {
-        let on = usize::from(look.theme == Theme::Dark);
-        if let Some(i) = widgets::seg(ui, pal, &["Antigravity Light", "Overmind Dark"], on) {
-            actions.push(Action::SetLook(Look {
-                theme: if i == 0 { Theme::Light } else { Theme::Dark },
-                ..look
-            }));
-        }
-    });
-    row(ui, pal, "Фон", true, |ui| {
-        let field = match look.field {
-            FieldMode::Repel => 0,
-            FieldMode::Attract => 1,
-            FieldMode::Off => 2,
-        };
-        if let Some(i) = widgets::seg(
-            ui,
-            pal,
-            &["Разлетаются", "Собираются", "Без движения"],
-            field,
-        ) {
-            let field = [FieldMode::Repel, FieldMode::Attract, FieldMode::Off][i];
-            actions.push(Action::SetLook(Look { field, ..look }));
-        }
-        if let Some(i) = widgets::seg(
-            ui,
-            pal,
-            &["Спокойно", "Живо"],
-            usize::from(look.pace == Pace::Live),
-        ) {
-            actions.push(Action::SetLook(Look {
-                pace: if i == 0 { Pace::Calm } else { Pace::Live },
-                ..look
-            }));
-        }
-        if let Some(i) = widgets::seg(
-            ui,
-            pal,
-            &["ASCII-облака", "Без облаков"],
-            usize::from(!look.clouds),
-        ) {
-            actions.push(Action::SetLook(Look {
-                clouds: i == 0,
-                ..look
-            }));
-        }
-        let _ = Run::plain("", pal.ink);
     });
 }
