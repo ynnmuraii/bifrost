@@ -626,6 +626,9 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, c: Pos2, size: f32, color
                     StrokeKind::Middle,
                 );
             }
+            Prim::Line([a, b]) => {
+                painter.line_segment([at(a.0, a.1), at(b.0, b.1)], stroke);
+            }
             Prim::Line(points) => {
                 let pts: Vec<Pos2> = points.iter().map(|(x, y)| at(*x, *y)).collect();
                 painter.add(Shape::line(pts, stroke));
