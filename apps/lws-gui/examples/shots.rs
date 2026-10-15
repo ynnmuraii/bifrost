@@ -8,16 +8,10 @@
 //! starts a core, applies a layout or sends a pairing decision. Both modes render
 //! offscreen and never open a desktop window.
 //!
-//! `--prefix NAME` names the files (`foo-main-light.png`); `--zoom PCT` sets the scale of the
-//! dedicated zoomed-map picture (150 by default). Real mode also draws one picture of a
-//! vertical stack: the real snapshot plus one extra member placed below it, which is exactly
-//! what a drag onto the bottom edge produces.
-//!
-//! Each state is drawn into an `egui_kittest` harness with the wgpu renderer and written to
-//! `target/ui-shots/<name>.png`. This is an example and not a test on purpose: `cargo test`
-//! has to pass on a host with no display and no GPU. The states are hand-built `ViewModel`s from
-//! real `GuiFrame`s — the three computers of the mockup — so a picture can be laid next to
-//! `docs/design/mockup` and compared.
+//! Mock mode writes `polish-<state>-<theme>-<width>x<height>.png` at 1920×1080,
+//! 1745×1091 and 1280×720, including every modal, appearance and disconnected states.
+//! `--prefix NAME` overrides the prefix; `--zoom PCT` sets the real-mode zoom picture.
+//! Rendering is offscreen through egui_kittest/wgpu and requires a working GPU adapter.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -36,7 +30,7 @@ use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
 
 const OUT_DIR: &str = "target/ui-shots";
-const CANVAS: [f32; 2] = [1280.0, 800.0];
+const SIZES: [[u32; 2]; 3] = [[1920, 1080], [1745, 1091], [1280, 720]];
 
 /// Node ids are 64 hex digits; the mockup's names are given a recognisable prefix.
 static WORKSTATION: LazyLock<String> = LazyLock::new(|| format!("{:0<64}", "aa11aa11"));
@@ -52,7 +46,8 @@ fn main() -> std::process::ExitCode {
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
     let real = args.iter().any(|arg| arg == "--live" || arg == "--root");
-    let prefix = option("--prefix").unwrap_or_else(|| "real".to_owned());
+    let prefix =
+        option("--prefix").unwrap_or_else(|| if real { "real" } else { "polish" }.to_owned());
     let zoom = option("--zoom")
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(150)
@@ -100,28 +95,39 @@ fn main() -> std::process::ExitCode {
                 ));
             }
         } else {
-            states.push((format!("main-{tag}"), mockup(theme, None)));
+            states.push((format!("{prefix}-main-{tag}"), mockup(theme, None)));
             states.push((
-                format!("main-window-{tag}"),
+                format!("{prefix}-main-window-{tag}"),
                 with_window(mockup(theme, None)),
             ));
+            let mut appearance = mockup(theme, None);
+            appearance.appearance_open = true;
+            states.push((format!("{prefix}-appearance-{tag}"), appearance));
+            let mut collapsed = mockup(theme, None);
+            collapsed.look.dock_open = false;
+            states.push((format!("{prefix}-collapsed-{tag}"), collapsed));
+            let mut offline = mockup(theme, None);
+            offline.on_disconnected("Служба недоступна — автономный снимок".to_owned());
+            states.push((format!("{prefix}-offline-{tag}"), offline));
             for modal in Modal::ALL {
                 states.push((
-                    format!("modal-{}-{tag}", modal_name(modal)),
+                    format!("{prefix}-modal-{}-{tag}", modal_name(modal)),
                     mockup(theme, Some(modal)),
                 ));
             }
         }
         for (name, state) in states {
-            let file = dir.join(format!("{name}.png"));
-            match shoot(state, &file) {
-                Ok(()) => {
-                    println!("{}", file.display());
-                    written += 1;
-                }
-                Err(why) => {
-                    eprintln!("cannot render {}: {why}", file.display());
-                    return std::process::ExitCode::FAILURE;
+            for size in SIZES {
+                let file = dir.join(format!("{name}-{}x{}.png", size[0], size[1]));
+                match shoot(state.clone(), &file, size) {
+                    Ok(()) => {
+                        println!("{}", file.display());
+                        written += 1;
+                    }
+                    Err(why) => {
+                        eprintln!("cannot render {}: {why}", file.display());
+                        return std::process::ExitCode::FAILURE;
+                    }
                 }
             }
         }
@@ -134,40 +140,38 @@ fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
     let (view, client) = view_model::boot(args);
     let mut bridge = Bridge::new(view, client);
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut queried_edits = false;
     loop {
         bridge.pump();
         let view = bridge.view();
-        if view.connection.is_connected() && view.status.is_some() && view.editor.has_document() {
-            if !queried_edits {
-                bridge.dispatch(Action::ListPendingEdits, Instant::now());
-                queried_edits = true;
-            } else if view.inflight.is_empty() {
-                let mut snapshot = view.clone();
-                if let Some(paths) = &snapshot.config.paths {
-                    snapshot.look = lws_gui::gui_settings::load(&lws_gui::gui_settings::path_in(
-                        paths.config_dir(),
-                    ));
-                }
-                snapshot.pairing.details = snapshot.pairing.prompt.is_some();
-                println!(
-                    "data_source=IPC node_names={:?} topology_revision={} pairing_open={} sas={:?}",
-                    snapshot
-                        .editor
-                        .nodes
-                        .iter()
-                        .map(|node| &node.display_name)
-                        .collect::<Vec<_>>(),
-                    snapshot.editor.revision,
-                    snapshot.pairing.window.is_some(),
-                    snapshot
-                        .pairing
-                        .prompt
-                        .as_ref()
-                        .map(|prompt| &prompt.sas_code),
-                );
-                return Ok(snapshot);
+        if view.connection.is_connected()
+            && view.status.is_some()
+            && view.editor.has_document()
+            && view.inflight.is_empty()
+        {
+            let mut snapshot = view.clone();
+            if let Some(paths) = &snapshot.config.paths {
+                snapshot.look = lws_gui::gui_settings::load(&lws_gui::gui_settings::path_in(
+                    paths.config_dir(),
+                ));
             }
+            snapshot.pairing.details = snapshot.pairing.prompt.is_some();
+            println!(
+                "data_source=IPC node_names={:?} topology_revision={} pairing_open={} sas={:?}",
+                snapshot
+                    .editor
+                    .nodes
+                    .iter()
+                    .map(|node| &node.display_name)
+                    .collect::<Vec<_>>(),
+                snapshot.editor.revision,
+                snapshot.pairing.window.is_some(),
+                snapshot
+                    .pairing
+                    .prompt
+                    .as_ref()
+                    .map(|prompt| &prompt.sas_code),
+            );
+            return Ok(snapshot);
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -181,7 +185,6 @@ fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
 
 fn modal_name(modal: Modal) -> &'static str {
     match modal {
-        Modal::Layout => "layout",
         Modal::Pairs => "pairs",
         Modal::Keys => "keys",
         Modal::Clip => "clip",
@@ -190,11 +193,11 @@ fn modal_name(modal: Modal) -> &'static str {
     }
 }
 
-fn shoot(state: ViewModel, file: &Path) -> Result<(), String> {
+fn shoot(state: ViewModel, file: &Path, size: [u32; 2]) -> Result<(), String> {
     let drawn = AssertUnwindSafe(|| {
         let mut ui_state = UiState::new(Instant::now());
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(CANVAS[0], CANVAS[1]))
+            .with_size(egui::vec2(size[0] as f32, size[1] as f32))
             .wgpu()
             .build_ui(move |ui| {
                 let env = Env {
@@ -369,6 +372,7 @@ fn mockup(theme: Theme, modal: Option<Modal>) -> ViewModel {
         local_fingerprint: "2C19 E07B 5A3F 8D61 …".to_owned(),
         peer_fingerprint: "7F3A 91C2 0B6E D4A8 …".to_owned(),
     })));
+    vm.pairing.details = true;
     if let Some(modal) = modal {
         vm.local(&Action::ToggleModal(modal));
     }
