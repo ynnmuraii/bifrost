@@ -12,6 +12,7 @@ use lws_gui::egui::{self, Shape};
 use lws_gui::gui_settings::{FieldMode, Look, Theme};
 use lws_gui::ui::{self, Env, Output, UiState};
 use lws_gui::view_model::{Action, Modal, ViewModel};
+use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use support::{event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE, SELF_NODE};
 
@@ -915,6 +916,76 @@ fn a_backend_that_cannot_deliver_the_clipboard_offers_no_switch() {
             .actions
             .iter()
             .any(|action| matches!(action, Action::SetClipboard(_))),
+        "{:?}",
+        frame.output.actions
+    );
+}
+
+/// One history row is the metadata line (with a human size), the flat one-line
+/// preview and «Копировать»; «Обновить» is gone, and clearing asks first.
+#[test]
+fn a_history_row_is_compact_and_clearing_asks_first() {
+    let mut vm = connected();
+    vm.local(&Action::ToggleModal(Modal::Clip));
+    let age_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_millis()
+        .try_into()
+        .expect("the clock fits in u64 milliseconds");
+    vm.apply(event(Msg::ClipboardHistory(ipc::ClipboardHistory {
+        items: vec![ipc::ClipboardHistoryEntry {
+            id: 7,
+            direction: ipc::ClipboardHistoryDirection::Received as i32,
+            peer_name: "linux-box".to_owned(),
+            time_unix_ms: age_ms - 5_000,
+            size_bytes: 1_048_576,
+            preview: "первая строка\nвторая строка".to_owned(),
+        }],
+    })));
+    let mut harness = Harness::new();
+    // The reveal takes 0.32 s of the window's clock; step past it.
+    harness.frame(&vm, false, SIZE, Vec::new());
+    harness.now += Duration::from_millis(500);
+    let frame = harness.frame(&vm, false, SIZE, Vec::new());
+    expect(
+        &frame,
+        &[
+            "Получено",
+            "linux-box",
+            "· 1 МиБ",
+            "первая строка вторая строка",
+            "Копировать",
+            "Очистить историю",
+        ],
+    );
+    assert!(!shows(&frame, "Обновить"), "the history refreshes by itself");
+
+    // The first click only asks; the same spot now draws the confirmation.
+    let at = text_position(&mut harness, &vm, "Очистить историю");
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(
+        !frame.output.actions.contains(&Action::ClearClipboardHistory),
+        "{:?}",
+        frame.output.actions
+    );
+    let frame = harness.frame(&vm, false, SIZE, Vec::new());
+    expect(&frame, &["Очистить историю на этом компьютере?", "Отмена"]);
+
+    // «Отмена» puts the question away without clearing anything.
+    let at = text_position(&mut harness, &vm, "Отмена");
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(!frame.output.actions.contains(&Action::ClearClipboardHistory));
+    let frame = harness.frame(&vm, false, SIZE, Vec::new());
+    assert!(!shows(&frame, "Очистить историю на этом компьютере?"));
+
+    // Asking again and confirming is what sends the clear.
+    let at = text_position(&mut harness, &vm, "Очистить историю");
+    harness.frame(&vm, false, SIZE, click_at(at));
+    let at = text_position(&mut harness, &vm, "Очистить историю");
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(
+        frame.output.actions.contains(&Action::ClearClipboardHistory),
         "{:?}",
         frame.output.actions
     );

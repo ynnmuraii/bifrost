@@ -17,7 +17,7 @@ use super::widgets::{self, Icon, Kind};
 use super::{act, UiState};
 use crate::gui_settings::Theme;
 use crate::view_model::{Action, Modal, ViewModel};
-use ui_text::{fill, fill_named, text, Key, Lang};
+use ui_text::{clipboard_size, fill, fill_named, text, Key, Lang};
 
 /// The reveal time of a dialog, seconds.
 const OPEN_FOR: f32 = 0.32;
@@ -39,11 +39,13 @@ pub fn draw(
     let lang = vm.look.language;
     let Some(modal) = vm.modal else {
         st.modal_open = None;
+        st.confirm_clear_history = false;
         return;
     };
     let started = match st.modal_open {
         Some((open, at)) if open == modal => at,
         _ => {
+            st.confirm_clear_history = false;
             st.modal_open = Some((modal, t));
             t
         }
@@ -135,7 +137,7 @@ pub fn draw(
             match modal {
                 Modal::Pairs => pairs_body(ui, pal, vm, actions),
                 Modal::Keys => keys_body(ui, pal, vm),
-                Modal::Clip => clip_body(ui, pal, vm, actions),
+                Modal::Clip => clip_body(ui, pal, vm, st, actions),
                 Modal::Diag => diag_body(ui, pal, vm, actions),
                 Modal::Settings => settings_body(ui, pal, vm, actions),
             }
@@ -559,7 +561,13 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
     });
 }
 
-fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
+fn clip_body(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    st: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
     let lang = vm.look.language;
     let pending = vm.settings.clipboard_pending;
     let on = pending.unwrap_or_else(|| vm.status.as_ref().is_some_and(|s| s.clipboard_enabled));
@@ -615,26 +623,36 @@ fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
     });
     row(ui, pal, text(lang, Key::History), true, |ui| {
         let connected = vm.connection.is_connected();
-        ui.horizontal_wrapped(|ui| {
-            act(
+        if vm.clipboard_history.is_empty() {
+            st.confirm_clear_history = false;
+        }
+        if st.confirm_clear_history {
+            widgets::wrapped(
                 ui,
-                pal,
-                text(lang, Key::Refresh),
-                Kind::Ghost,
-                connected,
-                actions,
-                || Action::RefreshClipboardHistory,
+                text(lang, Key::ConfirmClearHistory),
+                13.0,
+                fam::sans(),
+                pal.ink,
             );
-            act(
-                ui,
-                pal,
-                text(lang, Key::ClearHistory),
-                Kind::Ghost,
-                connected && !vm.clipboard_history.is_empty(),
-                actions,
-                || Action::ClearClipboardHistory,
-            );
-        });
+            ui.horizontal(|ui| {
+                if widgets::small_button(ui, pal, text(lang, Key::Cancel), true).clicked() {
+                    st.confirm_clear_history = false;
+                }
+                if widgets::small_button(ui, pal, text(lang, Key::ClearHistory), connected).clicked() {
+                    actions.push(Action::ClearClipboardHistory);
+                    st.confirm_clear_history = false;
+                }
+            });
+        } else if widgets::small_button(
+            ui,
+            pal,
+            text(lang, Key::ClearHistory),
+            connected && !vm.clipboard_history.is_empty(),
+        )
+        .clicked()
+        {
+            st.confirm_clear_history = true;
+        }
         widgets::hint(
             ui,
             pal,
@@ -665,31 +683,50 @@ fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
                         _ => text(lang, Key::Transfer),
                     };
                 let age_seconds = now_ms.saturating_sub(u128::from(entry.time_unix_ms)) / 1000;
-                widgets::wrapped(
-                    ui,
-                    &fill_named(
-                        lang,
-                        Key::DirectionPeerNameAgeSecondsSAgoSizeBytesBytes,
-                        &[
-                            ("direction", &direction),
-                            ("peer_name", &entry.peer_name),
-                            ("age_seconds", &age_seconds.to_string()),
-                            ("size_bytes", &entry.size_bytes.to_string()),
-                        ],
-                    ),
-                    13.0,
-                    fam::sans(),
-                    pal.ink,
+                let metadata = fill_named(
+                    lang,
+                    Key::HistoryEntryMetadata,
+                    &[
+                        ("direction", &direction),
+                        ("peer_name", &entry.peer_name),
+                        ("age_seconds", &age_seconds.to_string()),
+                        ("size", &clipboard_size(lang, entry.size_bytes)),
+                    ],
                 );
-                widgets::wrapped(ui, &entry.preview, 13.0, fam::sans(), pal.ink);
-                act(
-                    ui,
-                    pal,
-                    text(lang, Key::Copy),
-                    Kind::Ghost,
-                    connected,
-                    actions,
-                    || Action::CopyClipboardHistory(entry.id),
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::small_button(ui, pal, text(lang, Key::Copy), connected).clicked() {
+                            actions.push(Action::CopyClipboardHistory(entry.id));
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(metadata)
+                                    .font(font(11.0, fam::sans()))
+                                    .color(pal.ink2),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
+                // Flatten only the displayed preview; Copy still uses the stored entry id.
+                let preview: String = entry
+                    .preview
+                    .chars()
+                    .map(|c| {
+                        if matches!(c, '\r' | '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(preview)
+                            .font(font(13.0, fam::sans()))
+                            .color(pal.ink),
+                    )
+                    .truncate(),
                 );
             });
         }
