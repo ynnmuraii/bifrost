@@ -598,9 +598,16 @@ impl Field {
                     want = want.max(fall);
                 }
             }
-            let (mut sx, mut sy) = ((tx - p.x) * k * f, (ty - p.y) * k * f);
+            // A ribbon is a shape being drawn, not a particle drifting: it takes its place three
+            // times as fast and the field's speed cap does not hold it back, so the arc is drawn
+            // within about a second instead of being left as a plume of strays.
+            let (chase, cap) = if on_arc {
+                (k * 3.0, f32::INFINITY)
+            } else {
+                (k, max * f)
+            };
+            let (mut sx, mut sy) = ((tx - p.x) * chase * f, (ty - p.y) * chase * f);
             let len = sx.hypot(sy);
-            let cap = max * f;
             if len > cap {
                 sx = sx / len * cap;
                 sy = sy / len * cap;
@@ -942,7 +949,7 @@ mod tests {
             };
             let mut field = Field::new();
             let flows = [flow];
-            for n in 0..=8 {
+            for n in 0..=30 {
                 let t = n as f32 / 30.0;
                 ctx.run_ui(map_input(t), |ui| {
                     map = ui.ctx().content_rect();
@@ -985,7 +992,21 @@ mod tests {
             );
             assert!(
                 (0..held).any(|i| at(i).distance(arc.b) < 30.0),
-                "the ribbon arrives at the centre of the other"
+                "the ribbon arrives at the other end of the arc"
+            );
+            // Three times the pace of the background particles: a second of the pointer being
+            // over the map draws the arc rather than leaving a plume of strays. A particle whose
+            // phase has just wrapped is flying back to the far end, so the whole ribbon is not
+            // asked for - nine in ten of it is.
+            let drawn = (0..held)
+                .filter(|&i| {
+                    let p = &field.parts[i];
+                    distance_to_arc(arc, Pos2::new(p.x + map.min.x, p.y + map.min.y)) < 30.0
+                })
+                .count();
+            assert!(
+                drawn * 10 >= held * 9,
+                "the ribbon is drawn within a second: {drawn} of {held} particles on the arc"
             );
             // A frozen frame: no repaint, and every particle stays exactly where it was.
             let held_targets: Vec<(f32, f32)> = (0..held).map(|i| field.target(i)).collect();
