@@ -7,6 +7,7 @@ use super::{
     Request, Save, Sent, Side, ViewModel, HINT_FOR, SAVED_FOR,
 };
 use crate::map::{self, DocLink, Pt, Rect};
+use ui_text::{fill, fill_named, text, Key};
 
 /// How a drawn link is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +215,7 @@ impl ViewModel {
     }
 
     fn drop_is_valid(&self, i: usize) -> bool {
+        let lang = self.look.language;
         if !self.connection.is_connected() || !self.editor.has_document() || !self.editor.editable {
             return false;
         }
@@ -239,6 +241,7 @@ impl ViewModel {
     }
 
     pub(crate) fn drop_node(&mut self, node_id: &str) {
+        let lang = self.look.language;
         let Some(i) = self.index_of(node_id) else {
             return;
         };
@@ -249,7 +252,7 @@ impl ViewModel {
             // Restore only the invalid move, retaining a previous accepted drop.
             self.restore_placement();
             self.flash(
-                "Поставьте компьютер рядом с соседом, без пересечений",
+                text(lang, Key::PutTheComputerNextToANeighbourWithoutOverlaps),
                 HINT_FOR,
             );
             return;
@@ -310,6 +313,7 @@ impl ViewModel {
         request_id: u64,
         result: &protocol::ipc::OpResult,
     ) -> bool {
+        let lang = self.look.language;
         if !self
             .editor
             .save
@@ -331,7 +335,7 @@ impl ViewModel {
                 self.editor.save.wanted = None;
             }
             self.editor.save.awaiting = Some(sent.base_revision);
-            self.flash("Сохранено", SAVED_FOR);
+            self.flash(text(lang, Key::Saved), SAVED_FOR);
             self.continue_save();
             return false;
         }
@@ -504,26 +508,43 @@ impl ViewModel {
 
     /// The name of this computer.
     pub fn this_name(&self) -> String {
+        let lang = self.look.language;
         self.self_node()
             .and_then(|id| self.editor.nodes.iter().find(|n| n.node_id == id))
-            .map(|n| n.label())
+            .map(|n| n.label(lang))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| self.config.display_name.clone())
     }
 
     /// The headline of the map: «3 компьютера · 4 экрана».
     pub fn map_title(&self) -> String {
+        let lang = self.look.language;
         let nodes = self.editor.nodes.len();
         let screens: usize = self.editor.nodes.iter().map(|n| n.displays.len()).sum();
         format!(
             "{nodes} {} · {screens} {}",
-            plural(nodes, ["компьютер", "компьютера", "компьютеров"]),
-            plural(screens, ["экран", "экрана", "экранов"]),
+            plural(
+                nodes,
+                [
+                    text(lang, Key::Computer),
+                    text(lang, Key::ComputersFew),
+                    text(lang, Key::ComputersMany)
+                ]
+            ),
+            plural(
+                screens,
+                [
+                    text(lang, Key::Display),
+                    text(lang, Key::DisplaysFew),
+                    text(lang, Key::DisplaysMany)
+                ]
+            ),
         )
     }
 
     /// Everything the map draws, from the draft and the live state.
     pub fn map_model(&self) -> MapModel {
+        let lang = self.look.language;
         let editor = &self.editor;
         let ready = editor.shapes.len() == editor.nodes.len()
             && editor.placement.len() == editor.nodes.len();
@@ -543,7 +564,7 @@ impl ViewModel {
                 number += 1;
                 let rect = editor.shapes[i].mons.get(k).copied().unwrap_or_default();
                 let tag = if is_target && (display.primary || single) {
-                    "ввод"
+                    text(lang, Key::Input)
                 } else {
                     ""
                 };
@@ -555,24 +576,24 @@ impl ViewModel {
                 });
             }
             let os = if this == Some(i) {
-                if backend == "неизвестно" {
-                    "этот компьютер".to_owned()
+                if backend == text(lang, Key::Unknown) {
+                    text(lang, Key::ThisComputer).to_owned()
                 } else {
-                    format!("этот компьютер · {backend}")
+                    fill_named(lang, Key::ThisComputerBackend, &[("backend", &backend)])
                 }
             } else {
                 String::new()
             };
             let focus = if is_target {
-                "ввод здесь".to_owned()
+                text(lang, Key::InputHere2).to_owned()
             } else if !node.online {
-                "офлайн".to_owned()
+                text(lang, Key::Offline2).to_owned()
             } else {
-                "в сети".to_owned()
+                text(lang, Key::Online).to_owned()
             };
             nodes.push(MapNode {
                 node_id: node.node_id.clone(),
-                name: node.label(),
+                name: node.label(lang),
                 os,
                 focus,
                 online: node.online,
@@ -640,6 +661,7 @@ impl ViewModel {
 
     /// The other computers: members of `Status` that are not this one.
     pub fn peers(&self) -> Vec<PeerRow> {
+        let lang = self.look.language;
         let Some(status) = &self.status else {
             return Vec::new();
         };
@@ -650,7 +672,7 @@ impl ViewModel {
             .filter(|m| !self.is_this_computer(m, this.as_deref()))
             .map(|m| {
                 let name = if m.display_name.is_empty() {
-                    format!("компьютер {}", short_id(&m.node_id))
+                    fill(lang, Key::ComputerNamed, &[&short_id(&m.node_id)])
                 } else {
                     m.display_name.clone()
                 };

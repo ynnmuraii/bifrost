@@ -10,6 +10,7 @@ publish = false
 config = { path = "../../crates/config" }
 ipc = { path = "../../crates/ipc" }
 protocol = { path = "../../crates/protocol" }
+ui-text = { path = "../../crates/ui-text" }
 lws-desktop = { path = "../lws-desktop" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 

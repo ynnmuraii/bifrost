@@ -34,6 +34,7 @@ use crate::gui_settings::Theme;
 use crate::map::Pt;
 use crate::view_model::{Action, Modal, ViewModel};
 use theme::{fam, font};
+use ui_text::{text, Key};
 use widgets::{Dot, Icon, Kind, Run};
 
 /// The top bar's height.
@@ -176,6 +177,7 @@ fn topbar(
     _narrow: bool,
     actions: &mut Vec<Action>,
 ) {
+    let lang = vm.look.language;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment(
@@ -220,11 +222,11 @@ fn topbar(
     let connected = vm.connection.is_connected() && !vm.silent;
     let address = vm.config.listen_address.as_str();
     let (dot, state) = if vm.silent {
-        (Dot::Off, "Служба не отвечает")
+        (Dot::Off, text(lang, Key::TheServiceIsNotAnswering))
     } else if vm.connection.is_connected() {
-        (Dot::Ok, "Служба работает")
+        (Dot::Ok, text(lang, Key::TheServiceIsRunning))
     } else {
-        (Dot::Off, "Служба не запущена")
+        (Dot::Off, text(lang, Key::TheServiceIsNotRunning))
     };
     let mut runs = vec![Run::plain(state, pal.ink2)];
     if connected && !address.is_empty() {
@@ -241,9 +243,9 @@ fn topbar(
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         let hover = response.hovered();
         let label = if pal.theme == Theme::Dark {
-            "Светлая тема"
+            text(lang, Key::LightTheme)
         } else {
-            "Тёмная тема"
+            text(lang, Key::DarkTheme)
         };
         let painter = ui.painter();
         painter.circle(
@@ -280,6 +282,7 @@ fn rail_draw(
     rect: Rect,
     actions: &mut Vec<Action>,
 ) -> Rect {
+    let lang = vm.look.language;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment(
@@ -310,7 +313,7 @@ fn rail_draw(
             modal.num(),
             on,
             &mut tip,
-            modal.title(),
+            modal.title(lang),
         ) {
             actions.push(Action::ToggleModal(*modal));
         }
@@ -324,7 +327,7 @@ fn rail_draw(
         APPEARANCE_NUM,
         vm.appearance_open,
         &mut tip,
-        "Оформление",
+        text(lang, Key::Appearance),
     ) {
         actions.push(Action::ToggleAppearance);
     }

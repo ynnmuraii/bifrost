@@ -11,6 +11,7 @@ use super::act;
 use super::theme::{fam, font, Palette};
 use super::widgets::{self, Kind, Run};
 use crate::view_model::{Action, ViewModel};
+use ui_text::{fill, fill_named, text, Key};
 
 /// The dock's usual height.
 const BASE_H: f32 = 220.0;
@@ -52,6 +53,7 @@ pub fn draw(
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
+    let lang = vm.look.language;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment([rect.left_top(), rect.right_top()], pal.hairline());
@@ -60,7 +62,7 @@ pub fn draw(
         .interact(handle, ui.id().with("dock-toggle"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     let label = painter.layout_no_wrap(
-        "Сопряжение".to_owned(),
+        text(lang, Key::Pairing).to_owned(),
         font(12.0, fam::sans_medium()),
         pal.ink2,
     );
@@ -151,12 +153,23 @@ fn cell_head(ui: &mut egui::Ui, pal: &Palette, letter: &str, caption: &str) {
 
 /// A: this computer and the address the other one types.
 fn this_computer(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
-    cell_head(ui, pal, "A", "Этот компьютер");
+    let lang = vm.look.language;
+    cell_head(ui, pal, "A", text(lang, Key::ThisComputerTitle));
     widgets::text(ui, &vm.this_name(), 24.0, fam::sans_semibold(), pal.ink);
     let address = vm.config.listen_address.as_str();
     if address.is_empty() {
-        widgets::text(ui, "адрес не выбран", 18.0, fam::mono(), pal.ink2);
-        widgets::hint(ui, pal, "Выберите адрес в локальной сети в настройках.");
+        widgets::text(
+            ui,
+            text(lang, Key::NoAddressIsSelected),
+            18.0,
+            fam::mono(),
+            pal.ink2,
+        );
+        widgets::hint(
+            ui,
+            pal,
+            text(lang, Key::PickAnAddressOnTheLocalNetworkInTheSettings),
+        );
     } else {
         let port = format!(":{}", vm.config.port_input);
         let galley = widgets::mono_runs(
@@ -169,7 +182,10 @@ fn this_computer(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
         widgets::hint(
             ui,
             pal,
-            "Этот адрес вводят на другом компьютере. Сменить — в настройках.",
+            text(
+                lang,
+                Key::ThisAddressIsTypedOnTheOtherComputerChangeItInTheSettings,
+            ),
         );
     }
 }
@@ -182,14 +198,15 @@ fn window(
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
-    cell_head(ui, pal, "B", "Окно сопряжения");
+    let lang = vm.look.language;
+    cell_head(ui, pal, "B", text(lang, Key::PairingWindow));
     match (&vm.pairing.window, vm.pairing.window_deadline) {
         (Some(window), Some(deadline)) => {
             widgets::text(ui, &window.address, 22.0, fam::mono_medium(), pal.ink);
             let left = deadline.saturating_duration_since(now).as_secs_f32().ceil() as u32;
             let filled = ((left.min(WINDOW_S) as f32 / WINDOW_S as f32) * 24.0).round() as usize;
             let (full, empty) = ("#".repeat(filled), ".".repeat(24 - filled.min(24)));
-            let tail = format!("] {left} с");
+            let tail = fill_named(lang, Key::LeftS, &[("left", &left)]);
             let galley = widgets::mono_runs(
                 ui,
                 &[
@@ -205,15 +222,27 @@ fn window(
             widgets::hint(
                 ui,
                 pal,
-                "Скажите этот адрес владельцу другого компьютера. Окно закроется само.",
+                text(
+                    lang,
+                    Key::TellThisAddressToTheOtherComputerSOwnerTheWindowClosesByItself,
+                ),
             );
-            widgets::button(ui, pal, "Закрыть окно · скоро", Kind::Plain, false)
-                .on_hover_text("Пока окно сопряжения закрывается автоматически.");
+            widgets::button(
+                ui,
+                pal,
+                text(lang, Key::CloseTheWindowSoon),
+                Kind::Plain,
+                false,
+            )
+            .on_hover_text(text(lang, Key::ForNowThePairingWindowClosesByItself));
         }
         _ => {
             widgets::wrapped(
                 ui,
-                "На одном компьютере откройте окно, на другом введите адрес.",
+                text(
+                    lang,
+                    Key::OpenTheWindowOnOneComputerAndTypeTheAddressOnTheOther,
+                ),
                 14.0,
                 fam::sans(),
                 pal.ink,
@@ -222,23 +251,28 @@ fn window(
             act(
                 ui,
                 pal,
-                "Открыть окно сопряжения",
+                text(lang, Key::OpenThePairingWindow2),
                 Kind::Solid,
                 connected,
                 actions,
                 || Action::StartPairing { window_s: WINDOW_S },
             );
-            widgets::hint(ui, pal, "Окно закроется само через 120 секунд");
+            widgets::hint(
+                ui,
+                pal,
+                text(lang, Key::TheWindowClosesByItselfIn120Seconds),
+            );
         }
     }
 }
 
 /// C: dial an address.
 fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
-    cell_head(ui, pal, "C", "Подключиться по адресу");
+    let lang = vm.look.language;
+    cell_head(ui, pal, "C", text(lang, Key::ConnectByAddress2));
     widgets::text(
         ui,
-        "Адрес с экрана другого компьютера",
+        text(lang, Key::TheAddressFromTheOtherComputerSScreen),
         12.0,
         fam::sans(),
         pal.ink2,
@@ -250,7 +284,7 @@ fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Acti
         let button_w = 18.0 * 2.0
             + ui.painter()
                 .layout_no_wrap(
-                    "Подключиться".to_owned(),
+                    text(lang, Key::Connect).to_owned(),
                     font(13.0, fam::sans_medium()),
                     Color32::WHITE,
                 )
@@ -284,9 +318,9 @@ fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Acti
         }
         let can = vm.connection.is_connected() && !address.trim().is_empty() && !vm.pairing.dialing;
         let label = if vm.pairing.dialing {
-            "Подключаемся…"
+            text(lang, Key::Connecting2)
         } else {
-            "Подключиться"
+            text(lang, Key::Connect)
         };
         if widgets::button(ui, pal, label, Kind::Solid, can).clicked() {
             submit = true;
@@ -304,7 +338,7 @@ fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Acti
     widgets::hint(
         ui,
         pal,
-        "Адрес показывает окно сопряжения на другом компьютере",
+        text(lang, Key::TheOtherComputerSPairingWindowShowsTheAddress),
     );
 }
 
@@ -362,10 +396,11 @@ fn code_row(ui: &mut egui::Ui, pal: &Palette, digits: [&str; 6], wait: bool, lit
 
 /// D: the code to compare, the wait for it, or the pair that was made.
 fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions: &mut Vec<Action>) {
-    cell_head(ui, pal, "D", "Код сопряжения");
+    let lang = vm.look.language;
+    cell_head(ui, pal, "D", text(lang, Key::PairingCode));
     if let Some(prompt) = &vm.pairing.prompt {
         let name = if prompt.peer_name.is_empty() {
-            "Компьютер"
+            text(lang, Key::ComputerTitle)
         } else {
             prompt.peer_name.as_str()
         };
@@ -373,7 +408,7 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
             ui,
             &[
                 Run::strong(name, pal.ink),
-                Run::plain(" подключается — коды совпадают?", pal.ink),
+                Run::plain(text(lang, Key::IsConnectingDoTheCodesMatch), pal.ink),
             ],
             14.0,
             ui.available_width(),
@@ -391,7 +426,7 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
         widgets::duo(ui, |ui| {
             let attempt = vm.pairing.attempt_id();
             let can = attempt.is_some();
-            if widgets::button(ui, pal, "Да, совпадают", Kind::Hot, can).clicked() {
+            if widgets::button(ui, pal, text(lang, Key::YesTheyMatch), Kind::Hot, can).clicked() {
                 if let Some(attempt_id) = attempt.clone() {
                     actions.push(Action::Answer {
                         attempt_id,
@@ -399,7 +434,7 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
                     });
                 }
             }
-            if widgets::button(ui, pal, "Нет", Kind::Plain, can).clicked() {
+            if widgets::button(ui, pal, text(lang, Key::No), Kind::Plain, can).clicked() {
                 if let Some(attempt_id) = attempt {
                     actions.push(Action::Answer {
                         attempt_id,
@@ -408,18 +443,18 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
                 }
             }
             let label = if vm.pairing.details {
-                "Свернуть"
+                text(lang, Key::Collapse)
             } else {
-                "Подробнее"
+                text(lang, Key::Details)
             };
             if widgets::button(ui, pal, label, Kind::Link, true).clicked() {
                 actions.push(Action::ToggleDetails(!vm.pairing.details));
             }
         });
         if vm.pairing.details {
-            let mono = |ui: &mut egui::Ui, text: String| {
+            let mono = |ui: &mut egui::Ui, line: String| {
                 let galley = ui.painter().layout(
-                    text,
+                    line,
                     font(11.0, fam::mono()),
                     pal.ink2,
                     ui.available_width(),
@@ -428,34 +463,53 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
             };
             ui.spacing_mut().item_spacing.y = 4.0;
             mono(ui, format!("{name} · SHA-256 {}", prompt.peer_fingerprint));
-            mono(ui, format!("ЭТОТ · SHA-256 {}", prompt.local_fingerprint));
             mono(
                 ui,
-                "Отпечатки совпадают, а коды нет — не соглашайтесь.".to_owned(),
+                fill(lang, Key::THISSHA256, &[&prompt.local_fingerprint]),
+            );
+            mono(
+                ui,
+                text(lang, Key::TheFingerprintsMatchButTheCodesDoNotDoNotAgree).to_owned(),
             );
         }
     } else if let Some(name) = &vm.pairing.paired {
-        widgets::text(ui, "Пара создана", 24.0, fam::sans_semibold(), pal.ink);
+        widgets::text(
+            ui,
+            text(lang, Key::ThePairIsMade),
+            24.0,
+            fam::sans_semibold(),
+            pal.ink,
+        );
         widgets::wrapped(
             ui,
-            &format!("{name} сопряжён. Доверие сохранено — повторять не нужно."),
+            &fill_named(
+                lang,
+                Key::NameIsPairedTheTrustIsSavedNoNeedToRepeatThis,
+                &[("name", &name)],
+            ),
             14.0,
             fam::sans(),
             pal.ink,
         );
-        act(ui, pal, "Готово", Kind::Plain, true, actions, || {
-            Action::DonePairing
-        });
+        act(
+            ui,
+            pal,
+            text(lang, Key::Done3),
+            Kind::Plain,
+            true,
+            actions,
+            || Action::DonePairing,
+        );
     } else {
         let window_open = vm.pairing.window.is_some();
-        let text = if vm.pairing.dialing {
-            "Подключаемся к другому компьютеру…"
+        let line = if vm.pairing.dialing {
+            text(lang, Key::ConnectingToTheOtherComputer)
         } else if window_open {
-            "Ждём, пока другой компьютер подключится…"
+            text(lang, Key::WaitingForTheOtherComputerToConnect)
         } else {
-            "Код появится после подключения"
+            text(lang, Key::TheCodeAppearsAfterTheConnection)
         };
-        widgets::wrapped(ui, text, 14.0, fam::sans(), pal.ink);
+        widgets::wrapped(ui, line, 14.0, fam::sans(), pal.ink);
         let waiting = window_open || vm.pairing.dialing;
         // The «waiting» highlight steps once a second, with the countdown's own repaint.
         let lit = waiting.then(|| {
@@ -466,7 +520,7 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
             (secs % 6) as usize
         });
         code_row(ui, pal, ["·"; 6], true, lit);
-        widgets::hint(ui, pal, "Шесть цифр появятся на обоих экранах одновременно");
+        widgets::hint(ui, pal, text(lang, Key::SixDigitsAppearOnBothScreensAtOnce));
     }
 }
 

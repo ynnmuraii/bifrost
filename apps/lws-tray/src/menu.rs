@@ -1,4 +1,5 @@
 use protocol::ipc::{MemberStatus, Status, TopologyDoc};
+use ui_text::{fill, text, Key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -16,9 +17,10 @@ pub(crate) struct Item {
 
 fn name(member: &MemberStatus) -> String {
     if member.display_name.is_empty() {
-        format!(
-            "компьютер {}",
-            member.node_id.chars().take(8).collect::<String>()
+        fill(
+            lang,
+            Key::ComputerNamed,
+            &[&member.node_id.chars().take(8).collect::<String>()],
         )
     } else {
         member.display_name.clone()
@@ -75,7 +77,7 @@ fn transfer(status: &Status, topology: Option<&TopologyDoc>) -> Option<(String, 
             .and_then(|id| topology?.members.iter().find(|m| m.node_id == id))
             .map(|m| m.display_name.as_str())
             .filter(|name| !name.is_empty())
-            .unwrap_or("этот компьютер");
+            .unwrap_or(text(lang, Key::ThisComputer));
         return Some((format!("Передать ввод → {local}"), peer.node_id.clone()));
     }
     if status.focus != "LOCAL" {
@@ -104,13 +106,13 @@ pub(crate) fn items(status: Option<&Status>, topology: Option<&TopologyDoc>) -> 
         Some(s) if s.focus == "REMOTE" => format!(
             "Ввод → {}",
             if s.active_peer.is_empty() {
-                "другой компьютер"
+                text(lang, Key::TheOtherComputer)
             } else {
                 &s.active_peer
             }
         ),
-        Some(_) => "Служба работает".into(),
-        None => "Служба остановлена".into(),
+        Some(_) => text(lang, Key::TheServiceIsRunning).into(),
+        None => text(lang, Key::TheServiceIsStopped).into(),
     };
     items.push(Item {
         label,

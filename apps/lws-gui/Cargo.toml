@@ -28,6 +28,7 @@ eframe = { version = "0.36.2", default-features = false, features = [
 ipc = { path = "../../crates/ipc" }
 protocol = { path = "../../crates/protocol" }
 serde = { version = "1", features = ["derive"] }
+ui-text = { path = "../../crates/ui-text" }
 # The async half of the GUI: one connection task on a dedicated thread, fed by a channel.
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 # The editor writes its document as TOML in the `[topology]` schema.

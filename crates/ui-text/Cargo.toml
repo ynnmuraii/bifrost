@@ -1,0 +1,17 @@
+[package]
+name = "ui-text"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Every string the owner reads, in the window and in the tray, in both languages. No OS code beyond the system language tag."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Globalization"] }
+
+[lints]
+workspace = true
