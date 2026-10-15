@@ -89,6 +89,8 @@ pub enum CaptureEvent {
     Input(InputEvent),
     /// The emergency combination fired; local mode has already been restored.
     Emergency,
+    /// Action index (one through three); the trigger and its release are swallowed.
+    HotkeyPressed(u8),
     /// The bounded queue overflowed; the agent must end the remote session.
     QueueOverflow,
 }
@@ -218,7 +220,8 @@ struct Shared {
     hold_valid: AtomicBool,
     emergency_fired: AtomicBool,
     modifiers: AtomicU32,
-    combo: EmergencyCombo,
+    hotkeys: AtomicU64,
+    swallowed_keys: [AtomicU64; 4],
     captured: AtomicU64,
     dropped: AtomicU64,
     unmapped_keys: AtomicU64,
@@ -290,7 +293,10 @@ impl Capture {
             hold_valid: AtomicBool::new(false),
             emergency_fired: AtomicBool::new(false),
             modifiers: AtomicU32::new(0),
-            combo: config.emergency,
+            hotkeys: AtomicU64::new(crate::event::Hotkeys::new([
+                Some(config.emergency), None, None, None,
+            ]).0),
+            swallowed_keys: std::array::from_fn(|_| AtomicU64::new(0)),
             keyboard_hook_events: AtomicU64::new(0),
             keyboard_injected_seen: AtomicU64::new(0),
             keyboard_filtered: AtomicU64::new(0),
@@ -372,6 +378,11 @@ impl Capture {
     #[must_use]
     pub fn mode(&self) -> CaptureKind {
         capture_kind(&self.shared)
+    }
+
+    /// Replaces all combinations atomically without interrupting capture or held-key swallowing.
+    pub fn set_hotkeys(&self, hotkeys: crate::event::Hotkeys) {
+        self.shared.hotkeys.store(hotkeys.0, Ordering::SeqCst);
     }
 
     /// Switch mode.
@@ -754,31 +765,7 @@ fn update_modifiers(shared: &Shared, vk: u16, down: bool) {
     }
 }
 
-fn is_emergency(shared: &Shared, vk: u16) -> bool {
-    emergency_matches(
-        shared.combo,
-        vk,
-        shared.modifiers.load(Ordering::Relaxed),
-        physical_modifiers,
-    )
-}
 
-fn emergency_matches(
-    combo: EmergencyCombo,
-    vk: u16,
-    mask: u32,
-    physical: impl FnOnce() -> u32,
-) -> bool {
-    if vk != combo.vk {
-        return false;
-    }
-    let required = (if combo.ctrl { MOD_CTRL } else { 0 })
-        | (if combo.alt { MOD_ALT } else { 0 })
-        | (if combo.shift { MOD_SHIFT } else { 0 });
-    // A restarted hook did not see modifiers pressed before it was installed.
-    // Query only for the emergency key, and only when its ledger is incomplete.
-    mask & required == required || (mask | physical()) & required == required
-}
 
 fn physical_modifiers() -> u32 {
     let down = |left, right| {
@@ -847,12 +834,35 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
     }
 
     let vk = kb.vkCode as u16;
-    update_modifiers(shared, vk, down);
+    if !injected {
+        update_modifiers(shared, vk, down);
+    }
 
-    if down && is_emergency(shared, vk) {
-        fire_emergency(shared);
-        // Pass the key through: the desktop we just restored gets it.
-        return None;
+    let bucket = &shared.swallowed_keys[usize::from(vk / 64).min(3)];
+    let bit = 1u64 << (vk % 64);
+    if !injected && bucket.load(Ordering::Relaxed) & bit != 0 {
+        if !crate::event::hotkey_transition(true, down, None).0 {
+            bucket.fetch_and(!bit, Ordering::Relaxed);
+        }
+        return Some(true);
+    }
+    let hotkeys = crate::event::Hotkeys(shared.hotkeys.load(Ordering::SeqCst));
+    if !injected && down && hotkeys.contains_key(vk) {
+        let mask = shared.modifiers.load(Ordering::Relaxed) | physical_modifiers();
+        let action = hotkeys.matching(
+            vk, mask & MOD_CTRL != 0, mask & MOD_ALT != 0, mask & MOD_SHIFT != 0,
+            // SAFETY: these queries have no input side effects.
+            unsafe { GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0 },
+        );
+        if let (_, Some(action)) = crate::event::hotkey_transition(false, down, action) {
+            bucket.fetch_or(bit, Ordering::Relaxed);
+            if action == 0 {
+                fire_emergency(shared);
+            } else {
+                let _ = shared.tx.try_send(CaptureEvent::HotkeyPressed(action));
+            }
+            return Some(true);
+        }
     }
 
     if capture_kind(shared) == CaptureKind::Temporary {
@@ -1125,22 +1135,19 @@ mod tests {
     use super::should_capture_event;
 
     #[test]
-    fn restarted_hook_recognizes_modifiers_pressed_before_installation() {
+    fn lifetime_hook_publishes_complete_set_without_resetting_swallowed_keys() {
         use super::*;
-        let combo = EmergencyCombo::default();
-        let held = MOD_CTRL | MOD_ALT | MOD_SHIFT;
-        assert!(emergency_matches(combo, combo.vk, 0, || held));
-        assert!(emergency_matches(combo, combo.vk, MOD_CTRL, || held));
-        assert!(!emergency_matches(combo, combo.vk, 0, || MOD_CTRL));
-        assert!(!emergency_matches(
-            combo,
-            combo.vk.wrapping_add(1),
-            0,
-            || { panic!("ordinary keys must not query physical state") }
-        ));
-        assert!(emergency_matches(combo, combo.vk, held, || {
-            panic!("complete hook ledger needs no physical query")
-        }));
+        let (shared, _) = hook_state(CaptureKind::Observe);
+        let old = shared.hotkeys.load(Ordering::SeqCst);
+        shared.swallowed_keys[1].store(1 << 59, Ordering::Relaxed);
+        let replacement = crate::event::Hotkeys::new([Some(EmergencyCombo {
+            vk: 0x70, ctrl: false, alt: false, shift: false,
+        }), None, None, None]);
+        shared.hotkeys.store(replacement.0, Ordering::SeqCst);
+        assert_ne!(old, shared.hotkeys.load(Ordering::SeqCst));
+        assert_eq!(shared.swallowed_keys[1].load(Ordering::Relaxed), 1 << 59);
+        assert_eq!(replacement.matching(0x70, false, false, false, false), Some(0));
+        assert_eq!(replacement.matching(0x7b, true, true, true, false), None);
     }
     fn hook_state(
         mode: super::CaptureKind,
@@ -1154,7 +1161,10 @@ mod tests {
             hold_valid: AtomicBool::new(true),
             emergency_fired: AtomicBool::new(false),
             modifiers: AtomicU32::new(MOD_CTRL | MOD_ALT | MOD_SHIFT),
-            combo: EmergencyCombo::default(),
+            hotkeys: AtomicU64::new(crate::event::Hotkeys::new([
+                Some(EmergencyCombo::default()), None, None, None,
+            ]).0),
+            swallowed_keys: std::array::from_fn(|_| AtomicU64::new(0)),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             unmapped_keys: AtomicU64::new(0),

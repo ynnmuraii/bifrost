@@ -90,6 +90,81 @@ pub struct ClipboardChange {
     pub markers: Vec<clipboard::Marker>,
 }
 
+pub fn wire_hotkey_action(action: config::HotkeyAction) -> ipc::HotkeyAction {
+    match action {
+        config::HotkeyAction::EmergencyRelease => ipc::HotkeyAction::EmergencyRelease,
+        config::HotkeyAction::SwitchNext => ipc::HotkeyAction::SwitchNext,
+        config::HotkeyAction::ReturnLocal => ipc::HotkeyAction::ReturnLocal,
+        config::HotkeyAction::ClaimOwnership => ipc::HotkeyAction::ClaimOwnership,
+    }
+}
+
+pub fn hotkeys_from_wire(bindings: &[ipc::HotkeyBinding]) -> Result<config::HotkeyBindings, String> {
+    let mut parsed = config::HotkeyBindings::default();
+    let mut seen = [false; 4];
+    for binding in bindings {
+        let (index, action) = match ipc::HotkeyAction::try_from(binding.action) {
+            Ok(ipc::HotkeyAction::EmergencyRelease) => (0, config::HotkeyAction::EmergencyRelease),
+            Ok(ipc::HotkeyAction::SwitchNext) => (1, config::HotkeyAction::SwitchNext),
+            Ok(ipc::HotkeyAction::ReturnLocal) => (2, config::HotkeyAction::ReturnLocal),
+            Ok(ipc::HotkeyAction::ClaimOwnership) => (3, config::HotkeyAction::ClaimOwnership),
+            _ => return Err("unknown hotkey action".to_owned()),
+        };
+        if std::mem::replace(&mut seen[index], true) {
+            return Err("duplicate hotkey action".to_owned());
+        }
+        parsed.set(action, binding.chord.clone());
+    }
+    if seen.iter().any(|present| !present) {
+        return Err("hotkey update must contain all four actions".to_owned());
+    }
+    parsed.validate().map_err(|error| error.to_string())?;
+    Ok(parsed)
+}
+
+pub fn hotkey_result(
+    bindings: &config::HotkeyBindings,
+    result: Result<(), String>,
+    success_detail: &str,
+) -> ipc::HotkeysResult {
+    let success = result.is_ok();
+    let detail = result.err().unwrap_or_else(|| success_detail.to_owned());
+    ipc::HotkeysResult {
+        success,
+        detail: detail.clone(),
+        bindings: bindings.iter().map(|(action, chord)| ipc::HotkeyBinding {
+            action: wire_hotkey_action(action) as i32,
+            chord: chord.to_owned(),
+            available: success && !chord.is_empty(),
+            detail: if chord.is_empty() { "Disabled".to_owned() } else { detail.clone() },
+        }).collect(),
+    }
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+
+    #[test]
+    fn complete_wire_set_roundtrips_and_rejects_partial_or_duplicate_updates() {
+        let expected = config::HotkeyBindings::default();
+        let mut wire: Vec<_> = expected.iter().map(|(action, chord)| ipc::HotkeyBinding {
+            action: wire_hotkey_action(action) as i32,
+            chord: chord.to_owned(),
+            available: false,
+            detail: String::new(),
+        }).collect();
+        let parsed = hotkeys_from_wire(&wire).expect("complete update");
+        for (action, chord) in expected.iter() {
+            assert_eq!(parsed.get(action), chord);
+        }
+        wire.pop();
+        assert!(hotkeys_from_wire(&wire).is_err());
+        wire.push(wire[0].clone());
+        assert!(hotkeys_from_wire(&wire).is_err());
+    }
+}
+
 /// One thing the backend produced while capturing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -98,6 +173,8 @@ pub enum Event {
     /// The emergency combination was recognised; the agent already restored local
     /// control (rule 3).
     Emergency,
+    HotkeyPressed(config::HotkeyAction),
+    HotkeysResult(ipc::HotkeysResult),
     /// The pointer reached the edge of this node and the compositor handed input over.
     ///
     /// `docs/05-protocol.md` opens a transition with «`CapturedBatch`, pointer reaches
@@ -396,6 +473,8 @@ pub struct Dry {
     /// names a path and that file appears, the dry backend reports the emergency
     /// combination once (and removes the file). `None` disables the aid.
     emergency_file: Option<std::path::PathBuf>,
+    hotkey_file: Option<PathBuf>,
+    hotkeys: config::HotkeyBindings,
     /// The clipboard, when `--dry-clipboard-dir` named one. `None` is a dry agent with no
     /// clipboard at all, which is what it reports.
     clipboard: Option<DryClipboard>,
@@ -637,6 +716,8 @@ impl Dry {
             control_pointer_jitter: false,
             emergency_file: std::env::var_os("LWS_DRY_EMERGENCY_FILE")
                 .map(std::path::PathBuf::from),
+            hotkey_file: std::env::var_os("LWS_DRY_HOTKEY_FILE").map(PathBuf::from),
+            hotkeys: config::HotkeyBindings::default(),
             clipboard,
             dry_displays,
         }
@@ -887,7 +968,10 @@ impl Backend {
                             }
                             match wayland::Wayland::connect(
                                 &session,
-                                emergency_hotkey,
+                                &config::HotkeyBindings {
+                                    emergency_release: emergency_hotkey.to_owned(),
+                                    ..config::HotkeyBindings::default()
+                                },
                                 restore_tokens,
                                 &portal_progress,
                             )
@@ -983,6 +1067,50 @@ impl Backend {
             #[cfg(target_os = "linux")]
             Backend::Wayland(backend) => backend.set_clipboard(text).await,
         }
+    }
+
+    /// Installs the complete validated set, preserving the old registration on failure.
+    pub async fn set_hotkeys(&mut self, bindings: &config::HotkeyBindings) -> ipc::HotkeysResult {
+        let result = match bindings.validate() {
+            Err(error) => Err(error.to_string()),
+            Ok(()) => match self {
+                Backend::Dry(dry) if dry.hotkey_file.is_some() => {
+                    dry.hotkeys = bindings.clone();
+                    Ok(())
+                }
+                Backend::Dry(_) => Err("global hotkeys are unavailable without a desktop backend".to_owned()),
+                #[cfg(windows)]
+                Backend::Win(backend) => backend.set_hotkeys(bindings),
+                #[cfg(target_os = "linux")]
+                Backend::X11(_) => Err("X11 has no global shortcut grab path; fixed Ctrl+Alt+Shift+F12 emergency remains armed".to_owned()),
+                #[cfg(target_os = "linux")]
+                Backend::Wayland(backend) => backend.set_hotkeys(bindings).await,
+            },
+        };
+        let mut detail = "";
+        if matches!(self, Backend::Dry(dry) if dry.hotkey_file.is_some()) {
+            detail = "Synthetic test binding (no OS registration)";
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(self, Backend::Wayland(_)) {
+            detail = "Registered preferred chords with GlobalShortcuts; the compositor may remap them and show an approval dialog";
+        }
+        hotkey_result(bindings, result, detail)
+    }
+
+    /// Queues portal approval without blocking heartbeats, deadlines, or capture polling.
+    pub async fn request_hotkeys(&mut self, bindings: config::HotkeyBindings) -> Option<ipc::HotkeysResult> {
+        if let Err(error) = bindings.validate() {
+            return Some(hotkey_result(&bindings, Err(error.to_string()), ""));
+        }
+        #[cfg(target_os = "linux")]
+        if let Backend::Wayland(backend) = self {
+            return match backend.request_hotkeys(bindings.clone()) {
+                Ok(()) => None,
+                Err(error) => Some(hotkey_result(&bindings, Err(error), "")),
+            };
+        }
+        Some(self.set_hotkeys(&bindings).await)
     }
 
     /// The `AgentReady` body to send after the attach.
@@ -1244,6 +1372,28 @@ impl Backend {
     pub async fn next_event(&mut self) -> Option<Event> {
         match self {
             Backend::Dry(dry) => {
+                if let Some(path) = &dry.hotkey_file {
+                    if let Ok(text) = std::fs::read_to_string(path) {
+                        if std::fs::remove_file(path).is_ok() {
+                            let action = match text.trim() {
+                                "1" => {
+                                    dry.capturing = false;
+                                    dry.write_capture_mode(CaptureKind::Observe);
+                                    return Some(Event::Emergency);
+                                }
+                                "2" => Some(config::HotkeyAction::SwitchNext),
+                                "3" => Some(config::HotkeyAction::ReturnLocal),
+                                "4" => Some(config::HotkeyAction::ClaimOwnership),
+                                _ => None,
+                            };
+                            if let Some(action) = action {
+                                if !dry.hotkeys.get(action).is_empty() {
+                                    return Some(Event::HotkeyPressed(action));
+                                }
+                            }
+                        }
+                    }
+                }
                 // The no-desktop emergency aid: when the harness drops the marker file,
                 // report the combination once (a real agent gets this from its capture
                 // hook, which no dry session has).
@@ -1619,6 +1769,35 @@ mod tests {
 
     fn write(path: &std::path::Path, text: &str) {
         std::fs::write(path, text).expect("the dry clipboard file must be writable");
+    }
+
+    #[tokio::test]
+    async fn synthetic_hotkeys_update_transactionally_and_consume_one_action() {
+        let dir = temp_dir("hotkey-updates");
+        let marker = dir.join("pressed");
+        let mut dry = Dry::new(
+            Ready::degraded("test", "platform-test", "windows"),
+            0, false, None, false,
+        );
+        dry.hotkey_file = Some(marker.clone());
+        let mut backend = Backend::Dry(Box::new(dry));
+        let mut bindings = config::HotkeyBindings::default();
+        bindings.switch_next.clear();
+        assert!(backend.set_hotkeys(&bindings).await.success);
+        write(&marker, "2");
+        assert_eq!(backend.next_event().await, None);
+        assert!(!marker.exists());
+        bindings.switch_next = "F2".to_owned();
+        assert!(backend.set_hotkeys(&bindings).await.success);
+        let mut invalid = bindings.clone();
+        invalid.emergency_release.clear();
+        assert!(!backend.set_hotkeys(&invalid).await.success);
+        write(&marker, "2");
+        assert_eq!(backend.next_event().await, Some(Event::HotkeyPressed(config::HotkeyAction::SwitchNext)));
+        assert!(!marker.exists());
+        let Backend::Dry(dry) = &backend else { panic!("dry backend") };
+        assert_eq!(dry.hotkeys.emergency_release, bindings.emergency_release);
+        std::fs::remove_dir_all(dir).expect("remove hotkey controls");
     }
 
     #[tokio::test]

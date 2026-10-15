@@ -118,8 +118,8 @@ pub struct Win {
 }
 
 impl Win {
-    /// Builds the Windows backend. Always succeeds; capture hooks are installed on
-    /// the first `BeginCapture`, so an agent that never captures never suppresses.
+    /// Builds the Windows backend and installs a lifetime observe hook for global actions.
+    /// Ordinary local input is never forwarded while observing.
     pub fn new(
         ready: &Ready,
         emergency_hotkey: &str,
@@ -151,7 +151,10 @@ impl Win {
         ready.set_text_clipboard(clipboard.is_some());
         Ok(Win {
             ready,
-            capture: None,
+            capture: Some(Capture::start(CaptureConfig {
+                emergency,
+                ..CaptureConfig::default()
+            }).map_err(|error| capture_error(&error))?),
             source_motion: None,
             source_monitors: Vec::new(),
             pending_source_seed: false,
@@ -174,6 +177,31 @@ impl Win {
 
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    pub fn set_hotkeys(&mut self, bindings: &config::HotkeyBindings) -> Result<(), String> {
+        let mut combinations = [None; 4];
+        let mut super_bits = 0;
+        for (index, (_, text)) in bindings.iter().enumerate() {
+            if text.is_empty() {
+                continue;
+            }
+            let chord = config::Hotkey::parse(text).map_err(|error| error.to_string())?;
+            let vk = virtual_key(&chord.key().to_ascii_lowercase())
+                .ok_or_else(|| format!("unsupported Windows hotkey key: {}", chord.key()))?;
+            combinations[index] = Some(EmergencyCombo {
+                vk,
+                ctrl: chord.modifiers().contains(&config::Modifier::Ctrl),
+                alt: chord.modifiers().contains(&config::Modifier::Alt),
+                shift: chord.modifiers().contains(&config::Modifier::Shift),
+            });
+            if chord.modifiers().contains(&config::Modifier::Super) {
+                super_bits |= 1u64 << (index * 16 + 11);
+            }
+        }
+        self.capture.as_ref().ok_or("Windows hotkey hook is unavailable")?
+            .set_hotkeys(platform_win::event::Hotkeys(platform_win::event::Hotkeys::new(combinations).0 | super_bits));
+        Ok(())
     }
 
     pub fn set_effects(&mut self, edge_effects: bool, hide_cursor: bool) {
@@ -377,10 +405,9 @@ impl Win {
     pub fn end_capture(&mut self) -> Result<Released, String> {
         self.report_capture_stats(true);
         self.cursor_veil.release();
-        // Dropping the capture stops its thread and uninstalls both hooks, so
-        // nothing of this session can keep suppressing input (S1/S2/S3).
-        if self.capture.take().is_none() {
-            tracing::debug!("EndCapture with no active capture");
+        // Keep the observe hook alive for global actions outside a lease.
+        if let Some(capture) = &self.capture {
+            capture.set_mode(CaptureKind::Observe);
         }
         self.source_motion = None;
         self.source_monitors.clear();
@@ -424,6 +451,7 @@ impl Win {
                 };
                 match Capture::start(config) {
                     Ok(capture) => {
+                        capture.set_hotkeys(platform_win::event::Hotkeys::new([None; 4]));
                         tracing::info!(
                             threshold_px = plan.threshold_px,
                             "receiver takeover detector armed (observe-only hooks)"
@@ -559,7 +587,13 @@ impl Win {
             // was seen made the session's `select!` call this again immediately, so a held key
             // — which the OS repeats at its own rate — spun the poll loop at full CPU instead
             // of its tick.
-            if let Some(event) = drain_capture(|| capture.try_recv(), &mut self.repeats) {
+            if let Some(event) = drain_capture(|| loop {
+                let event = capture.try_recv()?;
+                if mode == CaptureKind::Observe && matches!(event, CaptureEvent::Input(_)) {
+                    continue;
+                }
+                break Some(event);
+            }, &mut self.repeats) {
                 let Event::Input(event) = event else {
                     return Some(event);
                 };
@@ -600,6 +634,7 @@ impl Win {
                 // The emergency combination works on a receiver too (rule 4): this capture
                 // is the only place it can be seen while the source capture is not running.
                 Some(CaptureEvent::Emergency) => return Some(Event::Emergency),
+                Some(CaptureEvent::HotkeyPressed(action)) => return Some(hotkey_event(action)),
                 Some(CaptureEvent::QueueOverflow) => {
                     // The detector's queue is a counter, not a stream: a dropped batch can
                     // miss a takeover, but ending the session over it would be worse.
@@ -699,9 +734,19 @@ fn drain_capture(
                 return Some(Event::Input(event));
             }
             CaptureEvent::Emergency => return Some(Event::Emergency),
+            CaptureEvent::HotkeyPressed(action) => return Some(hotkey_event(action)),
             CaptureEvent::QueueOverflow => return Some(Event::QueueOverflow),
         }
     }
+}
+
+fn hotkey_event(action: u8) -> Event {
+    Event::HotkeyPressed(match action {
+        1 => config::HotkeyAction::SwitchNext,
+        2 => config::HotkeyAction::ReturnLocal,
+        3 => config::HotkeyAction::ClaimOwnership,
+        _ => config::HotkeyAction::EmergencyRelease,
+    })
 }
 
 /// The source-motion state and monitors a capture needs, from the current cursor.
@@ -847,6 +892,18 @@ fn virtual_key(name: &str) -> Option<u16> {
         "escape" | "esc" => Some(0x1B),
         "space" => Some(0x20),
         "tab" => Some(0x09),
+        "enter" | "return" => Some(0x0D),
+        "left" => Some(0x25),
+        "up" => Some(0x26),
+        "right" => Some(0x27),
+        "down" => Some(0x28),
+        "home" => Some(0x24),
+        "end" => Some(0x23),
+        "pageup" => Some(0x21),
+        "pagedown" => Some(0x22),
+        "insert" => Some(0x2D),
+        "delete" => Some(0x2E),
+        "backspace" => Some(0x08),
         _ => None,
     }
 }
