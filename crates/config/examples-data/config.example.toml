@@ -28,7 +28,6 @@ node_id = "9c1e…"                   # SHA-256(SPKI DER) доверенного
 address = "192.168.1.11"            # пусто = адрес ещё неизвестен
 
 [workspace]                         # владение вводом и координация layout
-claim_hotkey = "Ctrl+Alt+Shift+F11" # «управлять отсюда»; пусто = только кнопка в GUI
 owner_claim_serial = 0              # персистится: последний известный serial владения
 owner_node_id = ""                  # персистится: последний известный owner
 link_ping_ms = 1000                 # Ping по каждому линку в простое
@@ -42,8 +41,6 @@ agent_core_silence_ms = 300          # 200..500; порог тишины core д
 repeat_guard_ms = 150                # нет input/renew дольше — receiver прекращает автоповтор (гарантия по времени: лишние символы ~ rate × это значение)
 
 [input]
-emergency_hotkey = "Ctrl+Alt+Shift+F12"
-switch_hotkey = "Ctrl+Alt+Shift+Right"     # Wayland-источник: не поддерживается, захват активирует композитор
 pointer_gain = 1.0
 edge_dwell_ms = 0                    # задержка у края против случайного перехода
 edge_hysteresis_px = 8
@@ -51,6 +48,12 @@ takeover_threshold_px = 12           # receiver: физическое движе
 repeat_mode = "receiver_software"    # "receiver_native" | "receiver_software"
 require_emergency_hotkey = true      # Wayland-источник без портала GlobalShortcuts не входит в Remote
 takeover_detection = "auto"          # "auto" | "evdev" | "off"; "evdev" требует членства в группе input
+
+[input.hotkeys]                     # пусто отключает действие, кроме emergency_release
+emergency_release = "Ctrl+Alt+Shift+F12"
+switch_next = "Ctrl+Alt+Shift+Right"
+return_local = "Ctrl+Alt+Shift+Left"
+claim_ownership = "Ctrl+Alt+Shift+Home"
 
 [clipboard]
 enabled = false                      # opt-in на обеих сторонах; на Wayland доступен только пока жива портальная сессия
