@@ -36,6 +36,7 @@ use ipc::clock::{Clock, SuspendDetector, SystemClock};
 
 /// The GUI's half of the session: `GuiFrame` requests and the events pushed to the window.
 mod gui;
+pub(crate) mod hotkeys;
 /// The pairing window and its ceremonies (ALPN `pair/1` on the link listener).
 mod pairing;
 mod transition_retry;
@@ -335,6 +336,10 @@ pub struct Session {
     /// `[appearance]`: saved by `SetAppearance`, pushed live to the agent as `SetEffects`.
     appearance: config::AppearanceConfig,
     appearance_path: Option<std::path::PathBuf>,
+    hotkeys: config::HotkeyBindings,
+    hotkey_status: Vec<protocol::ipc::HotkeyBinding>,
+    hotkey_pending: Option<hotkeys::Pending>,
+    hotkey_queue: std::collections::VecDeque<crate::gui::Request>,
     /// The edge-effect frames for the agent's overlay (rate-limited, ~30 Hz).
     edgefx: crate::edgefx::Emitter,
     /// The layout document's revision discipline (KVM-072): CAS, floor, pending.
@@ -562,6 +567,10 @@ impl Session {
             ownership_store,
             appearance: config::AppearanceConfig::default(),
             appearance_path: None,
+            hotkeys: config::HotkeyBindings::default(),
+            hotkey_status: Vec::new(),
+            hotkey_pending: None,
+            hotkey_queue: std::collections::VecDeque::new(),
             edgefx: crate::edgefx::Emitter::new(true),
             layout_state,
             layout_store,
@@ -1004,6 +1013,7 @@ impl Session {
                     tracing::warn!("the clipboard channel stopped");
                 }
                 Step::Tick => {
+                    self.hotkeys_tick().await;
                     self.arm_observation().await;
                     self.clipboard_on_focus().await;
                     self.expire_pairing_window();
@@ -2669,6 +2679,17 @@ impl Session {
         let Some(message) = frame.msg else {
             return Ok(());
         };
+        match &message {
+            Msg::HotkeysResult(result) => {
+                self.on_hotkeys_result(result.clone()).await;
+                return Ok(());
+            }
+            Msg::HotkeyPressed(pressed) => {
+                self.dispatch_hotkey(pressed.action).await;
+                return Ok(());
+            }
+            _ => {}
+        }
         match (&message, self.router.lease().receiver()) {
             (Msg::InjectResult(result), Some(lease))
                 if result.lease_id.as_slice() == lease.lease_id.as_slice() =>
@@ -3352,6 +3373,7 @@ impl Session {
         if self.agent_lost_reported {
             return;
         }
+        self.hotkeys_agent_lost().await;
         self.edgefx.set_enabled(self.appearance.edge_effects);
         // The agent process is going away with whatever capture it held: a restarted agent
         // starts with none, so the observation must be armed again once it is back.

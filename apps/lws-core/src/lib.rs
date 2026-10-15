@@ -512,7 +512,7 @@ async fn run_async(
         options.dry_motion,
         options.dry_displays,
         options.dev_capture_injected,
-        config.input.emergency_hotkey.clone(),
+        config.input.hotkeys.emergency_release.clone(),
         backend_kind(&config),
         config.input.require_emergency_hotkey,
         config.timing.agent_core_silence_ms,
@@ -526,6 +526,7 @@ async fn run_async(
         repeat_mode(&config),
     )
     .with_appearance(config.appearance);
+    supervisor.set_hotkeys(config.input.hotkeys.clone());
     // The layout document is assembled by the session (`Session::rebuild_topology`), which
     // is also where it is rebuilt when the agent reports its displays; doing it here as well
     // would only produce a second, snapshot-only opinion of the same document.
@@ -565,12 +566,13 @@ async fn run_async(
         paths.clone(),
         listen,
         config.node.display_name.clone(),
-        config.input.emergency_hotkey.clone(),
+        config.input.hotkeys.emergency_release.clone(),
         session.capabilities,
         options.dev_capture_injected,
         pairing_gate,
     );
     session.set_appearance_source(paths.config_file(), config.appearance);
+    session.set_hotkeys_source(config.input.hotkeys);
     session.run().await.map_err(|error| error.to_string())
 }
 

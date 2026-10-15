@@ -1462,6 +1462,9 @@ fn spawn_node(
         "LWS_DRY_EMERGENCY_FILE",
         root.join("run").join("emergency-dry"),
     );
+    if root.join("run/hotkey-enabled-dry").is_file() {
+        command.env("LWS_DRY_HOTKEY_FILE", root.join("run/hotkey-dry"));
+    }
     if dry_control_dir.is_dir() {
         command.env("LWS_DRY_CONTROL_DIR", dry_control_dir);
         command.env("LWS_LOG", "debug");

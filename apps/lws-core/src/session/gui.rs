@@ -147,6 +147,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(crate::clipboard::Clipboard::is_enabled),
             emergency_hotkey: self.emergency_hotkey.clone(),
+            hotkeys: self.hotkey_status.clone(),
             rtt_p95_us: 0,
             rtt_jitter_us: 0,
             last_error_code: self
@@ -375,6 +376,10 @@ impl Session {
 
     /// One `GuiFrame` request, answered on the connection it came from.
     pub(crate) async fn on_gui_request(&mut self, request: crate::gui::Request) {
+        if matches!(request.message, Msg::SetHotkey(_)) {
+            self.queue_hotkey(request).await;
+            return;
+        }
         let crate::gui::Request {
             request_id,
             connection_id,

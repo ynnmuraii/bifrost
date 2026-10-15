@@ -196,6 +196,7 @@ pub fn attach(
         allow_portal_sessions: allow_portal_sessions && mode != ipc::AgentMode::Recovery,
         edge_effects: appearance.edge_effects,
         hide_cursor: appearance.hide_remote_cursor,
+        hotkeys: Vec::new(),
     }
 }
 
@@ -739,6 +740,9 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::ClipboardChanged(_) => "ClipboardChanged",
         Msg::EdgeFx(_) => "EdgeFx",
         Msg::SetEffects(_) => "SetEffects",
+        Msg::SetHotkeys(_) => "SetHotkeys",
+        Msg::HotkeysResult(_) => "HotkeysResult",
+        Msg::HotkeyPressed(_) => "HotkeyPressed",
     }
 }
 
