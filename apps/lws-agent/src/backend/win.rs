@@ -78,6 +78,7 @@ pub struct Win {
     emergency: EmergencyCombo,
     cursor_veil: platform_win::veil::CursorVeil,
     edge_strip: platform_win::strip::EdgeStrip,
+    edge_placement: Option<platform_win::strip::Placement>,
     /// The receiver-takeover detector, when `[input].takeover_detection` armed it.
     ///
     /// It is a *second*, observe-only capture: while this node is a receiver its own
@@ -158,6 +159,7 @@ impl Win {
             emergency,
             cursor_veil: platform_win::veil::CursorVeil::new(true),
             edge_strip: platform_win::strip::EdgeStrip::new(true),
+            edge_placement: None,
             detector: None,
             plan,
             repeats: RepeatFilter::new(),
@@ -187,20 +189,25 @@ impl Win {
     }
 
     pub fn edge_fx(&mut self, display_id: &str, update: edgefx::Update) {
-        let Ok(monitors) = platform_win::displays::enumerate() else {
-            return;
+        let placement = if matches!(
+            update,
+            edgefx::Update::Left | edgefx::Update::Clear | edgefx::Update::Crossed(None)
+        ) {
+            self.edge_placement
+        } else {
+            platform_win::displays::enumerate().ok().and_then(|monitors| {
+                monitors
+                    .iter()
+                    .find(|monitor| monitor.id == display_id || monitor.device_name == display_id)
+                    .map(|monitor| platform_win::strip::Placement {
+                        native: monitor.native,
+                        scale: monitor.scale as f32,
+                    })
+            })
         };
-        if let Some(monitor) = monitors
-            .iter()
-            .find(|monitor| monitor.id == display_id || monitor.device_name == display_id)
-        {
-            self.edge_strip.send(
-                update,
-                platform_win::strip::Placement {
-                    native: monitor.native,
-                    scale: monitor.scale as f32,
-                },
-            );
+        if let Some(placement) = placement {
+            self.edge_placement = Some(placement);
+            self.edge_strip.send(update, placement);
         }
     }
 
