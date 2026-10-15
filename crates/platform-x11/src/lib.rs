@@ -54,6 +54,7 @@
 // The clipboard's `INCR` bookkeeping is pure, so it builds and tests on any host; the
 // selection adapter below it is Linux-only (KVM-041).
 pub mod clipboard;
+pub mod hotkeys;
 
 #[cfg(target_os = "linux")]
 pub mod capture;

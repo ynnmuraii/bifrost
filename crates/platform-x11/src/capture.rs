@@ -50,7 +50,7 @@ use x11rb::rust_connection::RustConnection;
 
 use crate::inject::PressedLedger;
 use crate::keymap::{
-    wheel_from_x11_button, x11_button_to_mouse_button, x11_keycode_to_hid_key, ModifierState,
+    wheel_from_x11_button, x11_button_to_mouse_button, x11_keycode_to_hid_key,
     EMERGENCY_F12_X11_KEYCODE,
 };
 use crate::X11Error;
@@ -76,6 +76,7 @@ pub enum CapturedEvent {
     /// notifications / the control channel), not by the raw event stream, so they
     /// are not variants here.
     Emergency,
+    HotkeyPressed(u8),
 }
 
 /// XI2 raw capture, optionally holding the pointer+keyboard grab.
@@ -95,8 +96,9 @@ pub struct X11Capture {
     last_motion_delta: (f64, f64),
     integrated: Position,
     local: Position,
-    modifiers: ModifierState,
     ledger: PressedLedger,
+    hotkeys: crate::hotkeys::HotkeyState,
+    shortcut_grabs: Vec<(u8, u16)>,
 }
 
 impl X11Capture {
@@ -153,9 +155,54 @@ impl X11Capture {
             last_motion_delta: (0.0, 0.0),
             integrated: start,
             local: start,
-            modifiers: ModifierState::new(),
             ledger: PressedLedger::new(),
+            hotkeys: crate::hotkeys::HotkeyState::default(),
+            shortcut_grabs: Vec::new(),
         })
+    }
+
+    /// Resolves a keysym against the current server keyboard map.
+    pub fn hotkey_keycode(&self, keysym: u32) -> Result<u8, X11Error> {
+        let setup = self.conn.setup();
+        let mapping = self.conn.get_keyboard_mapping(setup.min_keycode,
+            setup.max_keycode - setup.min_keycode + 1)?.reply()?;
+        mapping.keysyms.chunks(usize::from(mapping.keysyms_per_keycode))
+            .position(|symbols| symbols.contains(&keysym))
+            .and_then(|index| u8::try_from(index).ok())
+            .map(|index| setup.min_keycode + index)
+            .ok_or_else(|| X11Error::Unsupported(format!("hotkey keysym {keysym:#x} is absent from the keyboard map")))
+    }
+
+    /// Acquires every new passive grab before retiring the old set. On refusal, rolls back additions.
+    pub fn set_hotkeys(&mut self, bindings: [Option<crate::hotkeys::Hotkey>; 4]) -> Result<(), X11Error> {
+        let physical = self.conn.query_keymap()?.reply()?.keys;
+        let mut wanted = Vec::new();
+        for binding in bindings.iter().flatten().copied().chain(std::iter::once(crate::hotkeys::Hotkey {
+            keycode: EMERGENCY_F12_X11_KEYCODE, modifiers: 1 | 4 | 8,
+        })) {
+            for locks in [0, 2, 16, 2 | 16] {
+                let grab = (binding.keycode, binding.modifiers | locks);
+                if !wanted.contains(&grab) { wanted.push(grab); }
+            }
+        }
+        let installed = crate::hotkeys::replace_grabs(
+            &self.shortcut_grabs,
+            &wanted,
+            |(keycode, modifiers)| -> Result<(), X11Error> {
+                self.conn.grab_key(false, self.root, modifiers.into(), keycode,
+                    xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)?.check()?;
+                Ok(())
+            },
+            |(keycode, modifiers)| {
+                let _ = self.conn.ungrab_key(keycode, self.root, xproto::ModMask::from(modifiers));
+            },
+        );
+        self.conn.flush()?;
+        installed?;
+        self.hotkeys.seed(&physical);
+        self.hotkeys.bindings = bindings;
+        self.shortcut_grabs = wanted;
+        Ok(())
     }
 
     /// The XI2 version negotiated with the server (`major`, `minor`).
@@ -256,7 +303,6 @@ impl X11Capture {
             return Err(err);
         }
         self.grab_active = true;
-        self.modifiers = ModifierState::new();
         let position = self
             .pointer_position()
             .unwrap_or_else(|_| screen_centre(self.root_width, self.root_height));
@@ -268,7 +314,6 @@ impl X11Capture {
     /// Releases both grabs if they are held. Safe to call more than once.
     pub fn ungrab(&mut self) {
         self.drop_grabs();
-        self.modifiers = ModifierState::new();
     }
 
     /// Waits for the next captured event.
@@ -411,17 +456,17 @@ impl X11Capture {
             return None;
         }
         let keycode = u8::try_from(raw.detail).ok()?;
-        self.modifiers.observe(keycode, state);
-        self.ledger.note_key(keycode, state);
-        if self.grab_active
-            && state.is_down()
-            && keycode == EMERGENCY_F12_X11_KEYCODE
-            && self.modifiers.emergency_chord()
-        {
-            self.emergencies += 1;
-            self.fire_emergency();
-            return Some(CapturedEvent::Emergency);
+        let (swallow, action) = self.hotkeys.edge(keycode, state.is_down());
+        if let Some(action) = action {
+            if action == 0 {
+                self.emergencies += 1;
+                self.fire_emergency();
+                return Some(CapturedEvent::Emergency);
+            }
+            return Some(CapturedEvent::HotkeyPressed(action));
         }
+        if swallow { return None; }
+        self.ledger.note_key(keycode, state);
         let key = x11_keycode_to_hid_key(keycode)?;
         Some(CapturedEvent::Input(InputEvent::Key { key, state }))
     }

@@ -128,6 +128,9 @@ fn main() -> std::process::ExitCode {
                 );
                 break;
             }
+            Ok(Some(CapturedEvent::HotkeyPressed(action))) => {
+                println!("hotkey action {action}");
+            }
             Ok(Some(CapturedEvent::Input(event))) => {
                 printed += 1;
                 print_event(&capture, event);
