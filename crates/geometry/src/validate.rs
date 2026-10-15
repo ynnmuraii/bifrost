@@ -676,18 +676,15 @@ fn shared_corner(first: &EdgeSegment, second: &EdgeSegment) -> Option<Corner> {
 ///
 /// A corner that does not lie on this edge's own side of the display (for example
 /// `Top` with `BottomLeft`) is not reached at all.
-fn touches_corner(edge: Edge, segment: Segment, edge_length: f64, corner: Corner) -> bool {
-    let far_end = match (edge, corner) {
-        (Edge::Left, Corner::TopLeft)
-        | (Edge::Right, Corner::TopRight)
-        | (Edge::Top, Corner::TopLeft)
-        | (Edge::Bottom, Corner::BottomLeft) => false,
-        (Edge::Left, Corner::BottomLeft)
-        | (Edge::Right, Corner::BottomRight)
-        | (Edge::Top, Corner::TopRight)
-        | (Edge::Bottom, Corner::BottomRight) => true,
+pub(crate) fn touches_corner(
+    edge: Edge,
+    segment: Segment,
+    edge_length: f64,
+    corner: Corner,
+) -> bool {
+    let Some(far_end) = corner_end(edge, corner) else {
         // The corner is off this edge's axis: the edge cannot reach it.
-        _ => return false,
+        return false;
     };
     if far_end {
         segment.end >= edge_length - GEOMETRY_EPSILON
@@ -695,3 +692,27 @@ fn touches_corner(edge: Edge, segment: Segment, edge_length: f64, corner: Corner
         segment.start <= GEOMETRY_EPSILON
     }
 }
+
+/// The end of `edge`'s parameterisation that sits at `corner` (`true` = the far end,
+/// `edge_length`), or `None` when the corner is not on this edge.
+pub(crate) fn corner_end(edge: Edge, corner: Corner) -> Option<bool> {
+    match (edge, corner) {
+        (Edge::Left, Corner::TopLeft)
+        | (Edge::Right, Corner::TopRight)
+        | (Edge::Top, Corner::TopLeft)
+        | (Edge::Bottom, Corner::BottomLeft) => Some(false),
+        (Edge::Left, Corner::BottomLeft)
+        | (Edge::Right, Corner::BottomRight)
+        | (Edge::Top, Corner::TopRight)
+        | (Edge::Bottom, Corner::BottomRight) => Some(true),
+        _ => None,
+    }
+}
+
+/// Every corner, in the order the validator reports them.
+pub(crate) const CORNERS: [Corner; 4] = [
+    Corner::TopLeft,
+    Corner::TopRight,
+    Corner::BottomRight,
+    Corner::BottomLeft,
+];

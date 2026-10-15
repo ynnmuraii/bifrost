@@ -452,10 +452,13 @@ fn map_axis(value: f64, from: (f64, f64), to: (f64, f64)) -> f64 {
 pub fn resolve_auto_links(topology: &Topology) -> AutoResolution {
     let mut links: Vec<TransitionLink> = Vec::with_capacity(topology.links.len());
     let mut unresolved: Vec<LinkId> = Vec::new();
+    // For every pushed link: which of its two endpoints came from an auto anchor.
+    let mut auto: Vec<(bool, bool)> = Vec::with_capacity(topology.links.len());
 
     for link in &topology.links {
         if !link.source.is_auto() && !link.target.is_auto() {
             links.push(link.clone());
+            auto.push((false, false));
             continue;
         }
         let (Some(source_member), Some(target_member)) = (
@@ -513,19 +516,123 @@ pub fn resolve_auto_links(topology: &Topology) -> AutoResolution {
             }
         }
 
+        let flags = (link.source.is_auto(), link.target.is_auto());
         match produced.len() {
             0 => unresolved.push(link.id.clone()),
-            1 => links.append(&mut produced),
+            1 => {
+                links.append(&mut produced);
+                auto.push(flags);
+            }
             _ => {
                 for (index, mut link) in produced.into_iter().enumerate() {
                     link.id = LinkId::new(format!("{}#{index}", link.id));
                     links.push(link);
+                    auto.push(flags);
                 }
             }
         }
     }
 
+    inset_shared_corners(topology, &mut links, &auto);
     AutoResolution { links, unresolved }
+}
+
+/// How far an auto segment backs off a corner another link on the same display already
+/// reaches, in logical pixels.
+const CORNER_INSET: f64 = 2.0;
+
+/// An auto endpoint spans its display's whole edge, so two auto links on adjacent sides of one
+/// desktop (the editor writes one per facing pair) would both reach the shared corner, and
+/// the validator refuses a corner with two destinations. The earlier link — and every concrete
+/// endpoint, which the user placed by hand — keeps the corner; a later auto endpoint backs off
+/// by [`CORNER_INSET`], and the other end of its link by the proportional amount, so the two
+/// segments stay affine images of one another (the invariant `map_endpoints` relies on).
+fn inset_shared_corners(topology: &Topology, links: &mut [TransitionLink], auto: &[(bool, bool)]) {
+    use crate::validate::{corner_end, touches_corner, CORNERS};
+
+    let is_auto = |index: usize, side: usize| {
+        if side == 0 {
+            auto[index].0
+        } else {
+            auto[index].1
+        }
+    };
+    let endpoint = |links: &[TransitionLink], index: usize, side: usize| -> Endpoint {
+        if side == 0 {
+            links[index].source.clone()
+        } else {
+            links[index].target.clone()
+        }
+    };
+    let length = |endpoint: &Endpoint| -> Option<f64> {
+        Some(
+            topology
+                .display(&endpoint.node, &endpoint.display)?
+                .edge_length(endpoint.edge),
+        )
+    };
+
+    for index in 0..links.len() {
+        for side in 0..2 {
+            if !is_auto(index, side) {
+                continue;
+            }
+            for corner in CORNERS {
+                let this = endpoint(links, index, side);
+                let Some(this_length) = length(&this) else {
+                    continue;
+                };
+                let Some(far) = corner_end(this.edge, corner) else {
+                    continue;
+                };
+                if !touches_corner(this.edge, this.segment, this_length, corner) {
+                    continue;
+                }
+                let blocked = (0..links.len()).any(|other_index| {
+                    (0..2).any(|other_side| {
+                        if other_index == index
+                            || (is_auto(other_index, other_side) && other_index > index)
+                        {
+                            return false;
+                        }
+                        let other = endpoint(links, other_index, other_side);
+                        other.node == this.node
+                            && other.display == this.display
+                            && other.edge != this.edge
+                            && length(&other).is_some_and(|other_length| {
+                                touches_corner(other.edge, other.segment, other_length, corner)
+                            })
+                    })
+                });
+                if !blocked {
+                    continue;
+                }
+                let own_span = this.segment.end - this.segment.start;
+                if own_span <= 4.0 * CORNER_INSET {
+                    continue;
+                }
+                let link = &mut links[index];
+                let (mine, theirs) = if side == 0 {
+                    (&mut link.source, &mut link.target)
+                } else {
+                    (&mut link.target, &mut link.source)
+                };
+                let their_inset =
+                    CORNER_INSET * (theirs.segment.end - theirs.segment.start) / own_span;
+                if far {
+                    mine.segment =
+                        Segment::new(mine.segment.start, mine.segment.end - CORNER_INSET);
+                    theirs.segment =
+                        Segment::new(theirs.segment.start, theirs.segment.end - their_inset);
+                } else {
+                    mine.segment =
+                        Segment::new(mine.segment.start + CORNER_INSET, mine.segment.end);
+                    theirs.segment =
+                        Segment::new(theirs.segment.start + their_inset, theirs.segment.end);
+                }
+            }
+        }
+    }
 }
 
 /// [`resolve_auto_links`]' result: the concrete links plus the authored links that could not
