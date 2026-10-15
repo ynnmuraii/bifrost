@@ -129,6 +129,9 @@ struct Ceremony {
     address: Option<String>,
     /// The unanswered code, retained so a newly connected GUI can show the real ceremony.
     prompt: Option<Prompt>,
+    /// When the unanswered code stops being a code anybody may confirm, on the loop's
+    /// millisecond scale: the ceremony deadline, [`DECISION_TIMEOUT`] after the prompt.
+    prompt_deadline_ms: u64,
 }
 
 /// Everything the loop knows about pairing.
@@ -172,11 +175,12 @@ impl Pairing {
         self.window.as_ref()
     }
 
-    /// An unanswered ceremony a newly connected GUI can confirm.
-    pub fn pending_prompt(&self) -> Option<&Prompt> {
+    /// An unanswered ceremony a newly connected GUI can confirm; a ceremony past its deadline
+    /// is not one, whatever its task is still waiting for.
+    pub fn pending_prompt(&self, now_ms: u64) -> Option<&Prompt> {
         self.ceremonies
             .values()
-            .filter(|ceremony| ceremony.answer.is_some())
+            .filter(|ceremony| ceremony.answer.is_some() && now_ms < ceremony.prompt_deadline_ms)
             .filter_map(|ceremony| ceremony.prompt.as_ref())
             .min_by_key(|prompt| prompt.ceremony_id)
     }
@@ -241,6 +245,22 @@ impl Pairing {
         }
     }
 
+    /// Ends every ceremony whose prompt outlived its deadline: the answer is a refusal, so the
+    /// task (a dialer whose peer died never gets a window close to do it) reports `Rejected`
+    /// and the prompt is not replayed to every `GetStatus` for ever. Returns how many ended.
+    pub fn expire_ceremonies(&mut self, now_ms: u64) -> usize {
+        let mut ended = 0;
+        for ceremony in self.ceremonies.values_mut() {
+            if ceremony.prompt.is_some() && now_ms >= ceremony.prompt_deadline_ms {
+                if let Some(answer) = ceremony.answer.take() {
+                    let _ = answer.send(false);
+                    ended += 1;
+                }
+            }
+        }
+        ended
+    }
+
     /// One ceremony is over: the window counts the attempt, and a spent window closes
     /// (`identity::PairingWindow::finish` — «3 попытки на 120 s»).
     pub fn finish(&self, now_ms: u64) {
@@ -264,6 +284,7 @@ impl Pairing {
                 reply: None,
                 address: None,
                 prompt: None,
+                prompt_deadline_ms: u64::MAX,
             },
         );
         (ceremony_id, receiver)
@@ -373,6 +394,9 @@ impl Pairing {
                 if let Some(ceremony) = self.ceremonies.get_mut(&prompt.ceremony_id) {
                     ceremony.address = prompt.address.clone();
                     ceremony.prompt = Some(prompt.clone());
+                    ceremony.prompt_deadline_ms = now_ms.saturating_add(
+                        u64::try_from(DECISION_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    );
                 }
                 // A waiter whose receiver is gone has nobody to tell; `send` consumes it.
                 for waiter in std::mem::take(&mut self.waiting) {
@@ -381,7 +405,6 @@ impl Pairing {
                 if let Some(dial) = self.dial.take() {
                     let _ = dial.send(Ok(()));
                 }
-                let _ = now_ms;
                 Some(PublishedEvent::Prompt(prompt))
             }
             Event::Finished {
@@ -567,5 +590,38 @@ mod tests {
             pairing.gate.window(1).is_some(),
             "the gate window stays open too"
         );
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    fn prompt(ceremony_id: CeremonyId) -> Event {
+        Event::Prompt(Box::new(Prompt {
+            ceremony_id,
+            peer_name: "dead".to_owned(),
+            sas_code: "123456".to_owned(),
+            local_fingerprint: String::new(),
+            peer_fingerprint: String::new(),
+            address: None,
+        }))
+    }
+
+    /// 18a: a dialer whose peer died has no window to close the ceremony, and its code was
+    /// replayed to every `GetStatus` for ever.
+    #[test]
+    fn a_prompt_expires_with_its_ceremony_and_is_not_replayed() {
+        let mut pairing = Pairing::default();
+        let (id, mut answer) = pairing.begin();
+        pairing.on_event(prompt(id), 1_000);
+        assert!(pairing.pending_prompt(1_001).is_some());
+        let deadline = 1_000 + u64::try_from(DECISION_TIMEOUT.as_millis()).expect("fits");
+        assert!(pairing.pending_prompt(deadline - 1).is_some());
+        assert!(pairing.pending_prompt(deadline).is_none(), "not replayed");
+        assert_eq!(pairing.expire_ceremonies(deadline - 1), 0);
+        assert_eq!(pairing.expire_ceremonies(deadline), 1);
+        assert_eq!(answer.try_recv(), Ok(false), "the task is told no");
+        assert_eq!(pairing.expire_ceremonies(deadline + 1), 0, "once");
     }
 }
