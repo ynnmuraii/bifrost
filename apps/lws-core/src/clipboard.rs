@@ -356,18 +356,32 @@ impl Clipboard {
         // refuses (a password) or a disabled node ignores — supersedes the transfer the wire was
         // about to deliver, otherwise a late `ClipboardComplete` would apply the peer's payload
         // over what the user just copied.
-        self.incoming.clear();
-        self.pending_request = None;
+        let mut out: Vec<_> = std::mem::take(&mut self.incoming)
+            .into_iter()
+            .map(|(offer_id, incoming)| Out::Cancel {
+                peer: incoming.peer,
+                offer_id,
+                // Superseded input is no longer valid: use the existing INVALID_FRAME code.
+                reason: cb::ClipboardError::Invalid,
+            })
+            .collect();
+        if let Some((peer, offer_id)) = self.pending_request.take() {
+            if !out.iter().any(|event| matches!(event,
+                Out::Cancel { peer: p, offer_id: id, .. } if *p == peer && *id == offer_id
+            )) {
+                out.push(Out::Cancel { peer, offer_id, reason: cb::ClipboardError::Invalid });
+            }
+        }
         if !self.settings.enabled {
             // `CLIPBOARD_DISABLED`: a disabled node never offers anything.
-            return Vec::new();
+            return out;
         }
         let content = cb::Content {
             bytes: payload.len() as u64,
             markers: markers.clone(),
         };
         let Ok(offer_id) = identity::random16() else {
-            return Vec::new();
+            return out;
         };
         let offer =
             match self
@@ -382,7 +396,7 @@ impl Clipboard {
                         bytes = payload.len(),
                         "clipboard copy not offered"
                     );
-                    return Vec::new();
+                    return out;
                 }
             };
         tracing::info!(
@@ -395,7 +409,8 @@ impl Clipboard {
         // was cancelled before the policy ran. The outgoing offers carry the payload this copy
         // replaced, so they go too.
         self.offered.clear();
-        self.fan_out(offer).await
+        out.extend(self.fan_out(offer).await);
+        out
     }
 
     /// Offers one copy to every member, opening a channel where there is none.
@@ -1329,6 +1344,44 @@ async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_local_copy_cancels_each_incoming_offer_even_when_refused() {
+        for mode in 0..4 {
+            let (mut endpoint, root) = started_clipboard("cancel-copy").await;
+            let peer: NodeId = [0x21; 32].into();
+            let first = [0x41; 16];
+            let second = [0x42; 16];
+            offer_and_data(&mut endpoint, peer, first, b"old").await;
+            assert!(endpoint.on_offer(peer, second, &[0x31; 32], 10, cb::MIME.to_owned(), 5)
+                .await.is_empty());
+            assert_eq!(endpoint.incoming.len(), 2);
+            if mode == 2 {
+                endpoint.settings.enabled = false;
+                endpoint.settings.policy.enabled = false;
+            }
+            if mode == 3 {
+                endpoint.settings.policy.max_bytes = 1;
+            }
+            let markers = if mode == 1 {
+                vec![cb::Marker::ExcludeFromMonitor]
+            } else {
+                Vec::new()
+            };
+            let out = endpoint.on_local_copy(b"new local copy".to_vec(), markers).await;
+            for id in [first, second] {
+                assert_eq!(out.iter().filter(|event| matches!(event,
+                    Out::Cancel { peer: p, offer_id, reason: cb::ClipboardError::Invalid }
+                        if *p == peer && *offer_id == id
+                )).count(), 1, "mode {mode} must cancel each incoming offer once");
+            }
+            assert!(endpoint.incoming.is_empty());
+            assert!(endpoint.pending_request.is_none());
+            assert!(!out.iter().any(|event| matches!(event, Out::Agent(_))));
+            endpoint.stop().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
     #[tokio::test]
     async fn ten_start_stop_cycles_rebind_the_exact_port() {
