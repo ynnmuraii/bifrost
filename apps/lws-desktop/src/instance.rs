@@ -86,6 +86,56 @@ impl Drop for InstanceGuard {
         }
     }
 }
+
+/// The tray's "my icon is on screen" flag, raised by the tray itself once the desktop really
+/// shows it (a StatusNotifierWatcher took the item, the taskbar accepted the icon) and lowered
+/// when the icon goes away. A running tray process alone proves nothing: on a desktop whose
+/// tray host is not up yet it runs and shows nothing.
+#[derive(Clone)]
+pub struct TrayReady(Arc<platform::Ready>);
+impl TrayReady {
+    pub fn set(&self, ready: bool) {
+        self.0.set(ready);
+    }
+}
+impl InstanceGuard {
+    /// The readiness flag of a tray guard; `None` for any other role.
+    pub fn tray_ready(&self) -> Option<TrayReady> {
+        self.platform.ready().map(TrayReady)
+    }
+}
+
+/// Whether a live tray of this user has its icon on screen right now.
+pub fn tray_is_ready() -> bool {
+    tray_is_ready_named("multideskflow")
+}
+fn tray_is_ready_named(namespace: &str) -> bool {
+    platform::tray_is_ready(namespace).unwrap_or(false)
+}
+
+/// How long a launcher waits for the tray's icon before it tells the user it is missing.
+pub const TRAY_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Makes sure the tray icon is on screen: starts the tray unless it is already showing, and
+/// waits up to `timeout` for the icon. `Err` means there is no icon, and the caller must not
+/// leave the user with nothing (keep its window, say why).
+pub fn start_tray(args: &[OsString], timeout: Duration) -> io::Result<()> {
+    if tray_is_ready() {
+        return Ok(());
+    }
+    spawn_role(Role::Tray, args)?;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if tray_is_ready() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the tray icon did not appear",
+    ))
+}
 pub fn signal_existing_gui() -> io::Result<()> {
     signal_named("multideskflow")
 }
@@ -161,7 +211,7 @@ mod platform {
     /// `$XDG_RUNTIME_DIR` (or its systemd default `/run/user/<uid>`) when it is there; `/tmp`
     /// only as the fallback. The runtime dir is private to the user and cleared at logout, so a
     /// stale lock or socket cannot outlive the session and nobody else can pre-create the name.
-    fn directory(namespace: &str) -> io::Result<PathBuf> {
+    pub(super) fn directory(namespace: &str) -> io::Result<PathBuf> {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .or_else(|| {
@@ -209,9 +259,23 @@ mod platform {
         }
         Ok(path)
     }
+    /// The tray's "icon is on screen" flag: a file holding the tray's pid.
+    pub struct Ready {
+        path: PathBuf,
+    }
+    impl Ready {
+        pub fn set(&self, ready: bool) {
+            if ready {
+                let _ = fs::write(&self.path, std::process::id().to_string());
+            } else {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
     pub struct Guard {
         _lock: File,
         socket: Option<(UnixListener, PathBuf)>,
+        ready: Option<Arc<Ready>>,
     }
     pub fn acquire(role: Role, namespace: &str) -> io::Result<Option<Guard>> {
         let directory = directory(namespace)?;
@@ -243,12 +307,26 @@ mod platform {
         } else {
             None
         };
+        let ready = if role == Role::Tray {
+            // Holding the lock, so whatever marker is here belongs to a dead tray.
+            let ready = Ready {
+                path: directory.join("tray.ready"),
+            };
+            ready.set(false);
+            Some(Arc::new(ready))
+        } else {
+            None
+        };
         Ok(Some(Guard {
             _lock: lock,
             socket,
+            ready,
         }))
     }
     impl Guard {
+        pub fn ready(&self) -> Option<Arc<Ready>> {
+            self.ready.clone()
+        }
         pub fn wake(&self) {
             if let Some((listener, _)) = &self.socket {
                 // SAFETY: the listener owns this live fd. Shutdown wakes blocking
@@ -295,10 +373,30 @@ mod platform {
     }
     impl Drop for Guard {
         fn drop(&mut self) {
+            if let Some(ready) = &self.ready {
+                ready.set(false);
+            }
             if let Some((_, path)) = &self.socket {
                 let _ = fs::remove_file(path);
             }
         }
+    }
+    /// The marker holds the tray's pid: a crash leaves the file behind, and a pid that is not
+    /// alive any more must not make a launcher believe an icon exists. (No lock probing: a
+    /// probe could make a tray that is starting at that moment see "already running".)
+    pub fn tray_is_ready(namespace: &str) -> io::Result<bool> {
+        let text = match fs::read_to_string(directory(namespace)?.join("tray.ready")) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let Ok(pid) = text.trim().parse::<libc::pid_t>() else {
+            return Ok(false);
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        Ok(alive && pid > 0)
     }
     pub fn signal(namespace: &str) -> io::Result<()> {
         UnixStream::connect(directory(namespace)?.join("gui.sock"))?.write_all(b"show\n")
@@ -313,8 +411,9 @@ mod platform {
         Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0},
         Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER},
         System::Threading::{
-            CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenProcessToken, SetEvent,
-            WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
+            CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenProcessToken,
+            ResetEvent, SetEvent, WaitForSingleObject, EVENT_ALL_ACCESS, EVENT_MODIFY_STATE,
+            INFINITE,
         },
         UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY},
     };
@@ -380,9 +479,24 @@ mod platform {
                 .collect(),
         )
     }
+    /// The tray's "icon is on screen" flag.
+    pub struct Ready(Handle);
+    impl Ready {
+        pub fn set(&self, ready: bool) {
+            // SAFETY: the handle is live for as long as the marker is.
+            unsafe {
+                if ready {
+                    SetEvent(self.0 .0);
+                } else {
+                    ResetEvent(self.0 .0);
+                }
+            }
+        }
+    }
     pub struct Guard {
         _mutex: Handle,
         event: Option<Arc<Handle>>,
+        ready: Option<Arc<Ready>>,
     }
     pub fn acquire(role: Role, namespace: &str) -> io::Result<Option<Guard>> {
         let mutex_name = name(namespace, role, "instance")?;
@@ -392,6 +506,16 @@ mod platform {
         if existing {
             return Ok(None);
         }
+        let ready = if role == Role::Tray {
+            // Manual reset: the tray raises it once its icon is on screen and lowers it when
+            // the icon goes away; a launcher only ever looks at it.
+            let ready_name = name(namespace, role, "ready")?;
+            Some(Arc::new(Ready(handle(unsafe {
+                CreateEventW(null(), 1, 0, ready_name.as_ptr())
+            })?)))
+        } else {
+            None
+        };
         let event = if role.has_show_signal() {
             let event_name = name(namespace, role, "show")?;
             Some(Arc::new(handle(unsafe {
@@ -403,9 +527,13 @@ mod platform {
         Ok(Some(Guard {
             _mutex: mutex,
             event,
+            ready,
         }))
     }
     impl Guard {
+        pub fn ready(&self) -> Option<Arc<Ready>> {
+            self.ready.clone()
+        }
         pub fn wake(&self) {
             if let Some(event) = &self.event {
                 // SAFETY: the guard keeps the event handle live.
@@ -436,6 +564,25 @@ mod platform {
                     }
                 })
         }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // Clones of the marker outlive the guard (the tray keeps one inside its icon
+            // service); the flag must not.
+            if let Some(ready) = &self.ready {
+                ready.set(false);
+            }
+        }
+    }
+    pub fn tray_is_ready(namespace: &str) -> io::Result<bool> {
+        let name = name(namespace, Role::Tray, "ready")?;
+        // The event dies with the tray process, so a crashed tray is never "ready".
+        let raw = unsafe { OpenEventW(EVENT_ALL_ACCESS, 0, name.as_ptr()) };
+        if raw.is_null() {
+            return Ok(false);
+        }
+        let event = Handle(raw);
+        Ok(unsafe { WaitForSingleObject(event.0, 0) } == WAIT_OBJECT_0)
     }
     pub fn signal(namespace: &str) -> io::Result<()> {
         let name = name(namespace, Role::Gui, "show")?;
@@ -496,6 +643,18 @@ mod unix_tests {
             0o700
         );
         assert!(std::fs::read_dir(&fallback).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_marker_left_by_a_dead_tray_is_not_readiness() {
+        let namespace = format!("lws-stale-test-{}", std::process::id());
+        let marker = platform::directory(&namespace).unwrap().join("tray.ready");
+        // A pid that cannot be alive: what a crashed tray leaves behind.
+        std::fs::write(&marker, i32::MAX.to_string()).unwrap();
+        assert!(!tray_is_ready_named(&namespace));
+        std::fs::write(&marker, std::process::id().to_string()).unwrap();
+        assert!(tray_is_ready_named(&namespace));
+        std::fs::remove_file(&marker).unwrap();
     }
 
     #[test]
@@ -560,5 +719,40 @@ mod tests {
             InstanceOutcome::Started(_)
         ));
         drop(tray);
+    }
+
+    #[test]
+    fn tray_readiness_means_an_icon_on_screen_and_dies_with_the_tray() {
+        let namespace = format!("lws-ready-test-{}", std::process::id());
+        assert!(!tray_is_ready_named(&namespace), "no tray, not ready");
+        let InstanceOutcome::Started(tray) = acquire_named(Role::Tray, &namespace, false).unwrap()
+        else {
+            panic!("the tray must start")
+        };
+        assert!(
+            !tray_is_ready_named(&namespace),
+            "a running tray without an icon (no watcher, no taskbar yet) is not ready"
+        );
+        let ready = tray.tray_ready().expect("a tray guard carries the marker");
+        ready.set(true);
+        assert!(tray_is_ready_named(&namespace));
+        ready.set(false);
+        assert!(!tray_is_ready_named(&namespace), "the watcher went away");
+        ready.set(true);
+        drop(tray);
+        assert!(
+            !tray_is_ready_named(&namespace),
+            "a stopped tray is not ready"
+        );
+    }
+
+    #[test]
+    fn only_the_tray_carries_a_readiness_marker() {
+        let namespace = format!("lws-ready-gui-test-{}", std::process::id());
+        let InstanceOutcome::Started(gui) = acquire_named(Role::Gui, &namespace, false).unwrap()
+        else {
+            panic!("the GUI must start")
+        };
+        assert!(gui.tray_ready().is_none());
     }
 }

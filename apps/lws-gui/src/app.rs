@@ -102,6 +102,13 @@ impl eframe::App for GuiApp {
         let now = Instant::now();
         let arrived = self.bridge.pump();
         self.bridge.view_mut().tick(now);
+        let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+        if close_requested && close_decision(lws_desktop::tray_is_ready()) == Close::Minimize {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
 
         let (focused, minimized) = ui.ctx().input(|input| {
             let viewport = input.viewport();
@@ -137,5 +144,34 @@ impl eframe::App for GuiApp {
         if let Some(after) = wanted {
             ui.ctx().request_repaint_after(after);
         }
+    }
+}
+
+/// What a close request of the window does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Close {
+    /// The window goes; the tray icon stays as the way back.
+    Quit,
+    /// There is no tray icon: closing would leave the user with no window and no icon, so the
+    /// window only goes to the taskbar.
+    Minimize,
+}
+
+pub(crate) fn close_decision(tray_ready: bool) -> Close {
+    if tray_ready {
+        Close::Quit
+    } else {
+        Close::Minimize
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn a_window_is_not_closed_into_nothing() {
+        assert_eq!(close_decision(true), Close::Quit);
+        assert_eq!(close_decision(false), Close::Minimize);
     }
 }

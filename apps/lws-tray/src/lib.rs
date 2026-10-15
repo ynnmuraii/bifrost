@@ -79,7 +79,10 @@ pub fn run_tray(args: Vec<String>) -> ExitCode {
         let Ok(thread) = thread else {
             return ExitCode::FAILURE;
         };
-        let result = platform::run(state, commands.clone());
+        let Some(ready) = _guard.tray_ready() else {
+            return ExitCode::FAILURE;
+        };
+        let result = platform::run(state, commands.clone(), ready);
         let _ = commands.send(Action::Exit);
         let _ = thread.join();
         match result {
