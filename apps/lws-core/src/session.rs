@@ -448,6 +448,8 @@ pub struct Session {
     /// Startup policy and bind address, retained while the opt-in runtime is absent.
     clipboard_settings: crate::clipboard::Settings,
     clipboard_listen: std::net::SocketAddr,
+    /// Preserve per-origin versions and echo history while the network runtime is off.
+    clipboard_source: Option<clipboard::Source>,
     /// Live input-link bindings replayed when clipboard sharing is enabled.
     clipboard_links: BTreeMap<NodeId, ([u8; 16], bool, std::net::IpAddr)>,
     /// The GUI's endpoint and the fan-out of pushed events.
@@ -596,6 +598,7 @@ impl Session {
             clipboard_events,
             clipboard_settings,
             clipboard_listen,
+            clipboard_source: None,
             clipboard_links: BTreeMap::new(),
             gui: gui_server,
             gui_requests,
