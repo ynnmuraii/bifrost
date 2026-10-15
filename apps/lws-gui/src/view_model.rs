@@ -25,7 +25,7 @@
 /// ever happens in drawing code. `StopCore` asks the core to stop itself, so it also works for
 /// a service started elsewhere; only a timed-out request may use the pid this window started.
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ::ipc::transport::Endpoint;
@@ -530,6 +530,8 @@ pub struct LayoutEditor {
 pub struct Save {
     /// The links of the latest drop the core has not applied yet: latest wins.
     pub wanted: Option<Vec<config::LinkConfig>>,
+    /// Exact placement of the last valid drop, for interrupted/invalid drag rollback.
+    pub placement: Option<Vec<crate::map::Pt>>,
     /// The one `UpdateTopology` in flight.
     pub sent: Option<Sent>,
     /// The retry after a `LAYOUT_CONFLICT` of this draft was spent.
@@ -769,6 +771,7 @@ pub struct ViewModel {
     outcome_since: Option<Instant>,
     /// The pointer is on the toast: its timer is paused.
     outcome_hold: bool,
+    outcome_hold_since: Option<Instant>,
     /// Requests the view model itself made (the automatic save, a status re-read): already
     /// recorded as in flight, to be put on the wire by [`Bridge`].
     outgoing: Vec<(u64, Msg)>,
@@ -804,6 +807,7 @@ impl ViewModel {
             outcome_seen: None,
             outcome_since: None,
             outcome_hold: false,
+            outcome_hold_since: None,
             outgoing: Vec::new(),
             log: VecDeque::new(),
             inflight: Vec::new(),
@@ -1024,7 +1028,11 @@ impl ViewModel {
         }
         // A save whose request is no longer anywhere is over: nothing will ever answer it.
         if let Some(sent) = &self.editor.save.sent {
-            if !self.inflight.iter().any(|inflight| inflight.id == sent.request_id) {
+            if !self
+                .inflight
+                .iter()
+                .any(|inflight| inflight.id == sent.request_id)
+            {
                 self.editor.save = Save::default();
                 self.restore_placement();
             }
@@ -1171,13 +1179,8 @@ impl ViewModel {
         {
             self.settings.clipboard_pending = None;
         }
-        // The editor follows the core: what it says is applied is what the editor holds, so
-        // a revision applied elsewhere moves the base the next «Применить» names.
-        if status.layout_revision > self.editor.revision {
-            self.editor.revision = status.layout_revision;
-            self.editor.author = status.layout_author.clone();
-            self.continue_save();
-        }
+        // A status announces a revision, not its links. Advance the CAS base only when its
+        // TopologyDoc arrives; otherwise a queued drop could race ahead on stale geometry.
         self.status = Some(status);
     }
 
@@ -1329,8 +1332,7 @@ impl ViewModel {
                 Request::SetClipboard if self.settings.clipboard_pending.is_some() => {
                     // The core has not pushed the new state: ask for it.
                     let id = self.begin_request(Request::GetStatus, Instant::now());
-                    self.outgoing
-                        .push((id, Msg::GetStatus(ipc::GetStatus {})));
+                    self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
                 }
                 _ => {}
             }
@@ -1769,16 +1771,6 @@ impl ViewModel {
         None
     }
 
-    /// The other member the editor links this computer to.
-    pub fn other_node(&self) -> Option<&str> {
-        let this = self.self_node()?;
-        self.editor
-            .nodes
-            .iter()
-            .map(|node| node.node_id.as_str())
-            .find(|node_id| *node_id != this)
-    }
-
     /// The edited document as `[topology]` TOML — what `UpdateTopology` carries.
     ///
     /// The schema is the one `crates/config` defines for `[topology]`
@@ -1788,7 +1780,7 @@ impl ViewModel {
     /// revision, a link id is unique, an endpoint is `"self"` or `"peer:<64 hex digits>"`,
     /// and every segment is finite with `0 <= start < end`.
     pub fn layout_toml(&self) -> String {
-        let topology = self.topology_config();
+        let topology = self.topology_with(self.editor_links());
         // Only a non-finite number can get here, and the fields are sanitised on the way in;
         // an empty document is refused by the core with a sentence the user can read, which
         // beats panicking in a status window.
@@ -1796,7 +1788,7 @@ impl ViewModel {
     }
 
     /// The editor's model in the configuration schema.
-    fn topology_config(&self) -> config::TopologyConfig {
+    fn topology_with(&self, links: Vec<config::LinkConfig>) -> config::TopologyConfig {
         let mut topology = config::TopologyConfig {
             revision: self.editor.revision,
             author: author_reference(&self.editor.author, self.editor.revision),
@@ -1816,7 +1808,7 @@ impl ViewModel {
                 });
             }
         }
-        topology.links = self.editor_links();
+        topology.links = links;
         topology
     }
 
@@ -1852,10 +1844,16 @@ impl ViewModel {
             }
             Action::SetClipboard(enabled) => self.settings.clipboard_pending = Some(*enabled),
             Action::HoldToast(hold) => {
-                self.outcome_hold = *hold;
-                if !hold {
-                    // The time starts over when the pointer leaves.
-                    self.outcome_seen = None;
+                if *hold != self.outcome_hold {
+                    let now = Instant::now();
+                    if *hold {
+                        self.outcome_hold_since = Some(now);
+                    } else if let (Some(start), Some(since)) =
+                        (self.outcome_hold_since.take(), self.outcome_since.as_mut())
+                    {
+                        *since += now.saturating_duration_since(start);
+                    }
+                    self.outcome_hold = *hold;
                 }
             }
             Action::DropNode(node_id) => self.drop_node(node_id),

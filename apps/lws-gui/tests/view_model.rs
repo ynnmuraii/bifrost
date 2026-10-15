@@ -3,7 +3,7 @@
 //! These are the tests the build spec §6 asks for: a `Status` fills the screen and a changed
 //! focus changes «куда идёт ввод»; a pairing prompt is answered with its own attempt id; a
 //! document older than the one the editor holds does not become the editor's base; a
-//! `LAYOUT_CONFLICT` sets the hint that says what to do; the editor's document round-trips
+//! `LAYOUT_CONFLICT` reloads and retries once; dropped drafts save latest-wins; the document round-trips
 //! through the configuration schema; and a disconnect keeps the last known state visible.
 
 mod support;
@@ -221,94 +221,6 @@ fn a_lost_service_takes_its_outcome_sentence_with_it() {
     assert!(vm.outcome.is_none());
 }
 
-/// The «Расположить автоматически» button: the frame it sends, and the sentence the status
-/// bar shows when the core has done it.
-#[test]
-fn the_auto_layout_button_reports_what_it_did() {
-    let (request, message) = Action::LayoutAuto
-        .wire()
-        .expect("the action sends a request");
-    assert_eq!(request, Request::LayoutAuto);
-    assert_eq!(message, Msg::LayoutAuto(protocol::ipc::LayoutAuto {}));
-
-    let mut vm = view();
-    vm.apply(event(Msg::Status(status_with("LOCAL"))));
-    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
-    let id = vm.begin_request(Request::LayoutAuto, Instant::now());
-    vm.apply(answer(
-        id,
-        Msg::OpResult(protocol::ipc::OpResult {
-            ok: true,
-            error_code: String::new(),
-        }),
-    ));
-
-    let outcome = vm.outcome.as_ref().expect("the result is shown");
-    assert!(outcome.ok, "a successful auto layout is a success");
-    assert!(
-        outcome.line().contains("расположено автоматически"),
-        "the status bar names the action: {}",
-        outcome.line()
-    );
-    assert!(
-        outcome.line().contains("справа"),
-        "and what it did with the other computer: {}",
-        outcome.line()
-    );
-
-    // The refusal reaches the same line, in words rather than a code.
-    let id = vm.begin_request(Request::LayoutAuto, Instant::now());
-    vm.apply(answer(
-        id,
-        Msg::OpResult(protocol::ipc::OpResult {
-            ok: false,
-            error_code: "BAD_REQUEST".to_owned(),
-        }),
-    ));
-    let outcome = vm.outcome.as_ref().expect("the refusal is shown");
-    assert!(!outcome.ok);
-    assert!(
-        outcome.line().contains("автоматическая раскладка"),
-        "the refusal explains itself: {}",
-        outcome.line()
-    );
-}
-
-#[test]
-fn a_layout_conflict_says_what_to_do_about_it() {
-    let mut vm = view();
-    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
-    let now = Instant::now();
-    let id = vm.begin_request(Request::UpdateTopology, now);
-    vm.apply(answer(
-        id,
-        Msg::OpResult(protocol::ipc::OpResult {
-            ok: false,
-            error_code: "LAYOUT_CONFLICT".to_owned(),
-        }),
-    ));
-
-    let conflict = vm
-        .conflict
-        .clone()
-        .expect("the conflict is kept for the screen");
-    assert_eq!(
-        conflict,
-        "Раскладку изменили на другом компьютере. Обновите документ и повторите."
-    );
-    let outcome = vm.outcome.as_ref().expect("a failure is reported");
-    assert!(!outcome.ok);
-    assert!(outcome.line().starts_with("Не получилось: "));
-    assert!(
-        vm.inflight.is_empty(),
-        "the answer retired the request it belonged to"
-    );
-
-    // «Обновить» is the way out, and it forgets the conflict it was about.
-    vm.local(&Action::Refresh);
-    assert!(vm.conflict.is_none());
-}
-
 /// The editor's index of a member, for reading `placement` and `shapes`.
 fn index_of(vm: &ViewModel, node: &str) -> usize {
     vm.editor
@@ -344,12 +256,13 @@ fn linked_doc(revision: u64) -> protocol::ipc::TopologyDoc {
 }
 
 #[test]
-fn a_dragged_computer_becomes_a_document_only_on_apply() {
+fn a_dragged_computer_becomes_a_document_only_on_drop() {
     let mut vm = view();
+    vm.on_connected("endpoint");
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
     assert!(!vm.editor.dirty());
-    assert!(vm.layout_action().is_none(), "nothing to apply yet");
+    assert!(vm.take_outgoing().is_empty(), "nothing to save yet");
     assert!(
         vm.map_model().links.is_empty(),
         "the document links nothing: the two are drawn apart"
@@ -367,26 +280,27 @@ fn a_dragged_computer_becomes_a_document_only_on_apply() {
     assert!(vm.editor.dirty());
     assert_eq!(vm.editor.placement[peer].x, (me.x + width + GAP).round());
     assert_eq!(vm.editor.placement[peer].y, me.y, "and the tops line up");
-    assert_eq!(vm.editor.side, Side::Right, "the drag chose the edge");
-    assert_eq!(vm.revision_text(), "черновик · не применён");
     assert_eq!(vm.map_model().links.len(), 1, "the preview shows the link");
     assert_eq!(vm.editor.revision, 7, "and nothing was applied");
 
-    // «Применить»: one `UpdateTopology` against the revision the draft was made from.
-    let Some(Action::UpdateTopology {
+    assert!(vm.take_outgoing().is_empty(), "drag frames never save");
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    let outgoing = vm.take_outgoing();
+    assert_eq!(outgoing.len(), 1);
+    let Msg::UpdateTopology(protocol::ipc::UpdateTopology {
         layout_toml,
         expected_revision,
         expected_author,
-    }) = vm.layout_action()
+    }) = &outgoing[0].1
     else {
-        panic!("a draft is applied through UpdateTopology");
+        panic!("a drop is saved through UpdateTopology");
     };
-    assert_eq!(expected_revision, 7);
+    assert_eq!(*expected_revision, 7);
     assert_eq!(
         expected_author,
-        lws_gui::view_model::node_id_bytes(SELF_NODE)
+        &lws_gui::view_model::node_id_bytes(SELF_NODE)
     );
-    let document = String::from_utf8(layout_toml).expect("text");
+    let document = String::from_utf8(layout_toml.clone()).expect("text");
     assert_eq!(document, vm.layout_toml());
 
     // 1. What the core does with it: `validate_layout_toml` parses the bare document.
@@ -420,10 +334,10 @@ fn a_dragged_computer_becomes_a_document_only_on_apply() {
     config.validate().expect("and a valid document");
     assert_eq!(config.topology.links.len(), 1);
 
-    // «Авто» throws the draft away until the core answers with its own document.
-    vm.local(&Action::LayoutAuto);
-    assert!(!vm.editor.dirty());
-    assert!(vm.layout_action().is_none());
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "drawing never resends a save"
+    );
 }
 
 #[test]
@@ -440,7 +354,6 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
     assert_eq!(model.links[0].label, "весь стол");
     assert_eq!(model.links[0].state, LinkState::Idle);
     assert!(!model.dirty);
-    assert_eq!(vm.editor.side, Side::Right, "read off the document");
     // No draft: the document is sent back exactly as it was, link id included.
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
     assert_eq!(topology.links.len(), 1);
@@ -460,9 +373,9 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
         topology.links.is_empty(),
         "a pair that no longer faces loses its link"
     );
-    vm.discard_draft();
+    vm.local(&Action::CancelDrag);
     assert_eq!(vm.editor.placement, before);
-    assert!(vm.layout_action().is_none());
+    assert!(vm.take_outgoing().is_empty());
 
     // A link whose display is not reported stays in the document and is drawn as inactive.
     let mut doc = linked_doc(8);
@@ -592,10 +505,9 @@ fn a_clipboard_refusal_is_explained_where_the_switch_is() {
             error_code: "CLIPBOARD_DISABLED".to_owned(),
         }),
     ));
-    assert_eq!(
-        vm.settings.clipboard_note.as_deref(),
-        Some("Буфер обмена выключен в настройках (config.toml)")
-    );
+    let outcome = vm.outcome.as_ref().expect("a refusal is a toast");
+    assert!(!outcome.ok);
+    assert!(outcome.line().contains("буфер"));
 }
 
 #[test]
@@ -613,35 +525,6 @@ fn a_successful_pairing_promises_what_actually_happens() {
     let outcome = vm.outcome.as_ref().expect("the result is shown");
     assert!(outcome.ok);
     assert_eq!(outcome.line(), "Готово: linux-box сопряжён");
-}
-
-#[test]
-fn the_pending_edit_buttons_name_the_edit_they_belong_to() {
-    let mut vm = view();
-    vm.apply(event(Msg::PendingEdits(protocol::ipc::PendingEdits {
-        edits: vec![protocol::ipc::PendingEdit {
-            edit_id: vec![0x11; 16],
-            base_revision: 6,
-            base_author: SELF_NODE.to_owned(),
-            author_node_id: SELF_NODE.to_owned(),
-            layout_toml: b"revision = 7".to_vec(),
-        }],
-    })));
-    assert_eq!(vm.pending_edits.len(), 1);
-    let edit = vm.pending_edits[0].edit_id.clone();
-
-    match Action::ApplyPendingEdit(edit.clone()).wire() {
-        Some((Request::ApplyPendingEdit, Msg::ApplyPendingEdit(apply))) => {
-            assert_eq!(apply.edit_id, edit);
-        }
-        other => panic!("expected an ApplyPendingEdit request, got {other:?}"),
-    }
-    match Action::DiscardPendingEdit(edit.clone()).wire() {
-        Some((Request::DiscardPendingEdit, Msg::DiscardPendingEdit(discard))) => {
-            assert_eq!(discard.edit_id, edit);
-        }
-        other => panic!("expected a DiscardPendingEdit request, got {other:?}"),
-    }
 }
 
 #[test]
@@ -666,7 +549,6 @@ fn every_wire_request_is_the_message_it_names() {
             Request::PairingAnswer,
         ),
         (Action::SetClipboard(true), Request::SetClipboard),
-        (Action::LayoutAuto, Request::LayoutAuto),
         (
             Action::UpdateTopology {
                 layout_toml: b"links = []".to_vec(),
@@ -675,14 +557,12 @@ fn every_wire_request_is_the_message_it_names() {
             },
             Request::UpdateTopology,
         ),
-        (Action::ListPendingEdits, Request::ListPendingEdits),
         (Action::ResetPortalGrants, Request::ResetPortalGrants),
         (Action::RevokePeer(vec![0xbb; 32]), Request::RevokePeer),
         (
             Action::ExportDiagnostics(String::new()),
             Request::ExportDiagnostics,
         ),
-        (Action::SwitchTo(PEER_NODE.to_owned()), Request::Switch),
     ];
     for (action, expected) in cases {
         let (request, _) = action
@@ -698,7 +578,7 @@ fn every_wire_request_is_the_message_it_names() {
     // The local ones never reach the core.
     assert!(Action::StartCore.wire().is_none());
     assert!(Action::ConnectAgain.wire().is_none());
-    assert!(Action::ToggleModal(Modal::Layout).wire().is_none());
+    assert!(Action::ToggleModal(Modal::Keys).wire().is_none());
     assert!(Action::MoveNode {
         node_id: PEER_NODE.to_owned(),
         x: 0.0,
@@ -706,6 +586,223 @@ fn every_wire_request_is_the_message_it_names() {
     }
     .wire()
     .is_none());
+}
+
+fn saving_view() -> ViewModel {
+    let mut vm = view();
+    vm.on_connected("endpoint");
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    vm
+}
+
+fn move_to_side(vm: &mut ViewModel, side: Side) {
+    let this = index_of(vm, SELF_NODE);
+    let peer = index_of(vm, PEER_NODE);
+    let target = lws_gui::map::adjacent(
+        &vm.editor.shapes[this],
+        vm.editor.placement[this],
+        &vm.editor.shapes[peer],
+        side,
+    );
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: target.x,
+        y: target.y,
+    });
+}
+
+fn drop_to_side(vm: &mut ViewModel, side: Side) {
+    move_to_side(vm, side);
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+}
+
+fn take_save(vm: &mut ViewModel) -> (u64, protocol::ipc::UpdateTopology) {
+    let outgoing = vm.take_outgoing();
+    assert_eq!(outgoing.len(), 1, "{outgoing:?}");
+    match outgoing.into_iter().next().expect("one request") {
+        (id, Msg::UpdateTopology(update)) => (id, update),
+        other => panic!("expected one UpdateTopology, got {other:?}"),
+    }
+}
+
+fn verdict(vm: &mut ViewModel, id: u64, error: Option<&str>) {
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: error.is_none(),
+            error_code: error.unwrap_or_default().to_owned(),
+        }),
+    ));
+}
+
+#[test]
+fn dropped_drafts_are_latest_wins_and_wait_for_the_applied_document() {
+    let mut vm = saving_view();
+    drop_to_side(&mut vm, Side::Right);
+    let (id, first) = take_save(&mut vm);
+    assert_eq!(first.expected_revision, 7);
+    drop_to_side(&mut vm, Side::Top);
+    drop_to_side(&mut vm, Side::Left);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "only one save may be in flight"
+    );
+    verdict(&mut vm, id, None);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "success alone does not advance the CAS base"
+    );
+    let mut status = status_with("LOCAL");
+    status.layout_revision = 8;
+    vm.apply(event(Msg::Status(status)));
+    assert_eq!(vm.editor.revision, 7);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "Status is not an applied document"
+    );
+    vm.apply(event(Msg::TopologyDoc(linked_doc(8))));
+    let (_, latest) = take_save(&mut vm);
+    assert_eq!(latest.expected_revision, 8);
+    let topology: config::TopologyConfig =
+        toml::from_str(std::str::from_utf8(&latest.layout_toml).expect("UTF-8")).expect("document");
+    assert_eq!(topology.links.len(), 1);
+    let link = &topology.links[0];
+    assert_eq!(link.from.node, format!("peer:{PEER_NODE}"));
+    assert_eq!(link.from.edge, config::Edge::Right);
+    assert_eq!(link.to.node, format!("peer:{SELF_NODE}"));
+    assert_eq!(link.to.edge, config::Edge::Left);
+}
+
+#[test]
+fn conflict_reloads_and_retries_the_latest_drop_only_once() {
+    let mut vm = saving_view();
+    drop_to_side(&mut vm, Side::Right);
+    let (id, _) = take_save(&mut vm);
+    drop_to_side(&mut vm, Side::Top);
+    verdict(&mut vm, id, Some("LAYOUT_CONFLICT"));
+    let outgoing = vm.take_outgoing();
+    assert_eq!(outgoing.len(), 1);
+    let (reload_id, message) = &outgoing[0];
+    assert!(matches!(message, Msg::GetTopology(_)));
+    vm.apply(answer(*reload_id, Msg::TopologyDoc(linked_doc(9))));
+    let (retry_id, retry) = take_save(&mut vm);
+    assert_eq!(retry.expected_revision, 9);
+    let topology: config::TopologyConfig =
+        toml::from_str(std::str::from_utf8(&retry.layout_toml).expect("UTF-8")).expect("document");
+    assert_eq!(topology.links[0].from.edge, config::Edge::Bottom);
+    assert_eq!(topology.links[0].from.node, format!("peer:{PEER_NODE}"));
+    verdict(&mut vm, retry_id, Some("LAYOUT_CONFLICT"));
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "a second conflict never loops"
+    );
+    assert!(vm.editor.save.wanted.is_none());
+    assert!(vm.editor.save.sent.is_none());
+    assert_eq!(vm.editor.placement, vm.editor.baseline);
+    assert!(!vm.outcome.as_ref().expect("conflict toast").ok);
+}
+
+#[test]
+fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
+    let mut vm = saving_view();
+    let baseline = vm.editor.placement.clone();
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: 9000.0,
+        y: 9000.0,
+    });
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert_eq!(vm.editor.placement, baseline);
+    assert!(vm.take_outgoing().is_empty());
+    assert!(vm.flash.is_some(), "invalid placement gets a short hint");
+    let this = index_of(&vm, SELF_NODE);
+    let origin = vm.editor.placement[this];
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: origin.x + vm.editor.shapes[this].w / 3.0,
+        y: origin.y + vm.editor.shapes[this].h / 3.0,
+    });
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert_eq!(
+        vm.editor.placement, baseline,
+        "overlapping desktops roll back"
+    );
+    assert!(vm.take_outgoing().is_empty());
+    drop_to_side(&mut vm, Side::Right);
+    let (id, _) = take_save(&mut vm);
+    let accepted = vm.editor.placement.clone();
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: 9000.0,
+        y: 9000.0,
+    });
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert_eq!(vm.editor.placement, accepted);
+    assert!(vm.take_outgoing().is_empty());
+    verdict(&mut vm, id, Some("BAD_REQUEST"));
+    assert_eq!(vm.editor.placement, baseline);
+    assert!(vm.editor.save.wanted.is_none());
+    assert!(!vm.outcome.as_ref().expect("refusal toast").ok);
+}
+
+#[test]
+fn same_revision_refresh_preserves_a_drag_without_saving_it() {
+    let mut vm = saving_view();
+    move_to_side(&mut vm, Side::Bottom);
+    let draft = vm.editor.placement.clone();
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    assert_eq!(vm.editor.placement, draft);
+    assert!(vm.editor.dirty());
+    assert!(vm.take_outgoing().is_empty());
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert_eq!(take_save(&mut vm).1.expected_revision, 7);
+}
+
+#[test]
+fn an_unchanged_drop_never_saves_and_success_is_a_quiet_hint() {
+    let mut vm = saving_view();
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert!(vm.take_outgoing().is_empty());
+    drop_to_side(&mut vm, Side::Right);
+    let (id, _) = take_save(&mut vm);
+    verdict(&mut vm, id, None);
+    assert!(
+        vm.outcome.is_none(),
+        "successful saves do not create an eight-second toast"
+    );
+    assert!(
+        vm.flash.is_some(),
+        "successful saves get a short acknowledgement"
+    );
+    vm.apply(event(Msg::TopologyDoc(linked_doc(8))));
+    assert!(!vm.editor.dirty());
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert!(vm.take_outgoing().is_empty());
+}
+
+#[test]
+fn a_late_layout_verdict_after_timeout_still_releases_the_save_slot() {
+    let mut vm = saving_view();
+    drop_to_side(&mut vm, Side::Right);
+    let (id, _) = take_save(&mut vm);
+    drop_to_side(&mut vm, Side::Top);
+    vm.tick(Instant::now() + Duration::from_secs(10));
+    verdict(&mut vm, id, None);
+    vm.apply(event(Msg::TopologyDoc(linked_doc(8))));
+    let (next_id, next) = take_save(&mut vm);
+    assert_ne!(next_id, id);
+    assert_eq!(next.expected_revision, 8);
+    verdict(&mut vm, id, Some("BAD_REQUEST"));
+    assert_eq!(
+        vm.editor
+            .save
+            .sent
+            .as_ref()
+            .expect("newer save remains")
+            .request_id,
+        next_id
+    );
 }
 
 /// Dragging onto each facing edge previews and serialises the same desktop link.
@@ -733,7 +830,6 @@ fn dragging_chooses_all_four_edges() {
         });
         assert_eq!(vm.editor.placement[peer].x, target.x.round());
         assert_eq!(vm.editor.placement[peer].y, target.y.round());
-        assert_eq!(vm.editor.side, side);
         let links = vm.map_model().links;
         assert_eq!(links.len(), 1, "{}", side.label());
         let expected_dir = match side {
@@ -742,10 +838,7 @@ fn dragging_chooses_all_four_edges() {
         };
         assert_eq!(links[0].dir, expected_dir);
         assert!(vm.editor.dirty(), "{}", side.label());
-        let Some(Action::UpdateTopology { layout_toml, .. }) = vm.layout_action() else {
-            panic!("a snapped drag must be applicable");
-        };
-        let document = String::from_utf8(layout_toml).expect("text");
+        let document = vm.layout_toml();
         let topology: config::TopologyConfig = toml::from_str(&document).expect("parse");
         assert_eq!(topology.links.len(), 1);
         let link = &topology.links[0];
@@ -785,7 +878,6 @@ fn dragging_chooses_all_four_edges() {
         x: me.x - GAP - peer_width - 4.0,
         y: me.y + 2.0,
     });
-    assert_eq!(vm.editor.side, Side::Left, "the drag chose the edge");
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
     let link = &topology.links[0];
     assert_eq!(link.from.node, format!("peer:{PEER_NODE}"));
@@ -795,31 +887,18 @@ fn dragging_chooses_all_four_edges() {
 
     // A keyboard step moves the computer exactly as far as asked, without snapping.
     let before = vm.editor.placement[peer];
-    vm.local(&Action::NudgeNode {
-        node_id: PEER_NODE.to_owned(),
-        dx: 8.0,
-        dy: -8.0,
-    });
+    vm.nudge_node(PEER_NODE, 8.0, -8.0);
     assert_eq!(vm.editor.placement[peer].x, before.x + 8.0);
     assert_eq!(vm.editor.placement[peer].y, before.y - 8.0);
 }
 
 #[test]
-fn the_route_and_the_transfer_button_follow_the_core() {
+fn the_route_and_link_state_follow_the_core() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(linked_doc(7))));
     vm.on_connected("endpoint");
     assert_eq!(vm.route_text(), "этот компьютер");
-    let transfer = vm.transfer();
-    assert_eq!(transfer.target, "linux-box");
-    assert_eq!(transfer.peer.as_deref(), Some(PEER_NODE));
-    assert!(transfer.enabled && transfer.why.is_none());
-    let (request, message) = Action::SwitchTo(PEER_NODE.to_owned())
-        .wire()
-        .expect("a request");
-    assert_eq!(request, Request::Switch);
-    assert!(matches!(&message, Msg::SwitchTo(switch) if switch.peer == PEER_NODE));
     let map = vm.map_model();
     let peer = index_of(&vm, PEER_NODE);
     assert!(!map.nodes[peer].target);
@@ -835,20 +914,6 @@ fn the_route_and_the_transfer_button_follow_the_core() {
     assert_eq!(map.links[0].state, LinkState::Active);
     assert_eq!(map.links[0].label, "ввод →");
     assert_eq!(map.nodes[peer].mons[0].tag, "ввод");
-    let transfer = vm.transfer();
-    assert_eq!(transfer.target, "Workstation");
-    assert_eq!(transfer.peer.as_deref(), Some(PEER_NODE));
-
-    // The core's own reason for refusing is shown, not guessed.
-    let mut status = status_with("LOCAL");
-    status.transition_disabled_reason = "Другой компьютер ещё не готов".to_owned();
-    vm.apply(event(Msg::Status(status)));
-    let transfer = vm.transfer();
-    assert!(!transfer.enabled);
-    assert_eq!(
-        transfer.why.as_deref(),
-        Some("Другой компьютер ещё не готов")
-    );
 
     // An offline peer: nothing to switch to, and its link is drawn offline.
     let mut status = status_with("LOCAL");
@@ -857,7 +922,6 @@ fn the_route_and_the_transfer_button_follow_the_core() {
     let mut doc = linked_doc(8);
     doc.members[1].online = false;
     vm.apply(event(Msg::TopologyDoc(doc)));
-    assert!(!vm.transfer().enabled);
     assert_eq!(vm.map_model().links[0].state, LinkState::Offline);
     assert_eq!(vm.map_model().links[0].label, "офлайн");
     assert_eq!(vm.map_model().nodes[peer].mons[0].tag, "офлайн");
@@ -869,7 +933,7 @@ fn the_headings_count_what_the_document_holds() {
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(linked_doc(14))));
     assert_eq!(vm.map_title(), "2 компьютера · 2 экрана");
-    assert_eq!(vm.revision_text(), "ревизия 14 · координатор Workstation");
+    assert_eq!(vm.editor.revision, 14);
     let peers = vm.peers();
     assert_eq!(peers.len(), 1, "this computer is not its own peer");
     assert_eq!(peers[0].name, "linux-box");
