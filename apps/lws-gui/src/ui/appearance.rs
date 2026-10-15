@@ -116,12 +116,32 @@ pub fn draw(
             // A drag is one decision, not sixty: the value is committed when the drag ends (or
             // on a keystroke), so a drag does not write `gui.toml` once a frame.
             let mut speed = look.speed;
-            ui.spacing_mut().slider_width = (ui.available_width() - 52.0).max(80.0);
-            let response = ui.add(
-                egui::Slider::new(&mut speed, SPEED_MIN..=SPEED_MAX)
-                    .fixed_decimals(1)
-                    .show_value(true),
-            );
+            let response = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().slider_width = (ui.available_width() - 46.0).max(80.0);
+                    let response = ui
+                        .scope(|ui| {
+                            // The one slider of the window, in the shared rounded style: a
+                            // visible rail, the part the pointer has passed in the accent, and
+                            // a round knob. Nothing else here uses these tokens.
+                            let visuals = ui.visuals_mut();
+                            visuals.widgets.inactive.bg_fill = pal.line;
+                            visuals.widgets.hovered.bg_fill = pal.line;
+                            visuals.widgets.active.bg_fill = pal.line;
+                            visuals.selection.bg_fill = pal.accent;
+                            visuals.slider_trailing_fill = true;
+                            visuals.handle_shape = egui::style::HandleShape::Circle;
+                            ui.add(
+                                egui::Slider::new(&mut speed, SPEED_MIN..=SPEED_MAX)
+                                    .fixed_decimals(1)
+                                    .show_value(false),
+                            )
+                        })
+                        .inner;
+                    widgets::text(ui, &format!("{speed:.1}"), 13.0, fam::mono(), pal.ink2);
+                    response
+                })
+                .inner;
             if response.drag_stopped() || (response.changed() && !response.dragged()) {
                 look.speed = speed;
             }
