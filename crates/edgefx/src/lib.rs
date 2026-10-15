@@ -120,6 +120,22 @@ impl Strip {
             (depth, along)
         }
     }
+
+    /// The window rectangle `(x, y, width, height)` in desktop pixels for a display whose
+    /// device-pixel bounds are `native = [x, y, w, h]`: flush with the strip's edge of that
+    /// display, `start` px (logical) along it.
+    #[must_use]
+    pub fn rect_in(&self, native: [i32; 4], scale: f32) -> (i32, i32, u32, u32) {
+        let (w, h) = self.size_px(scale);
+        let along = (self.start * scale).round() as i32;
+        let (x, y) = match self.edge {
+            Edge::Top => (native[0] + along, native[1]),
+            Edge::Bottom => (native[0] + along, native[1] + native[3] - h as i32),
+            Edge::Left => (native[0], native[1] + along),
+            Edge::Right => (native[0] + native[2] - w as i32, native[1] + along),
+        };
+        (x, y, w, h)
+    }
 }
 
 /// Proximity → intensity in `0..=1`: 0 at or beyond `reach`, 1 on the edge, smooth between.
@@ -166,6 +182,27 @@ mod tests {
         assert_eq!(Strip::of(&target(0.0)).start, 0.0);
         let far = Strip::of(&target(4000.0));
         assert_eq!(far.start + far.len, 4000.0);
+    }
+
+    #[test]
+    fn the_window_sits_flush_on_its_edge_of_the_display() {
+        // A 4K display at 150 % placed right of the primary one.
+        let native = [1920, -200, 3840, 2160];
+        let strip = |edge| Strip {
+            edge,
+            start: 100.0,
+            len: 400.0,
+        };
+        assert_eq!(strip(Edge::Top).rect_in(native, 1.5), (2070, -200, 600, 54));
+        assert_eq!(
+            strip(Edge::Bottom).rect_in(native, 1.5),
+            (2070, 1906, 600, 54)
+        );
+        assert_eq!(strip(Edge::Left).rect_in(native, 1.5), (1920, -50, 54, 600));
+        assert_eq!(
+            strip(Edge::Right).rect_in(native, 1.5),
+            (5706, -50, 54, 600)
+        );
     }
 
     #[test]

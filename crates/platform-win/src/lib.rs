@@ -145,6 +145,10 @@ pub mod displays;
 pub mod dpi;
 #[cfg(windows)]
 pub mod inject;
+#[cfg(windows)]
+pub mod strip;
+#[cfg(windows)]
+pub mod veil;
 
 /// `dwExtraInfo` marker written into every `INPUT` record this process injects.
 ///
