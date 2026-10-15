@@ -1147,7 +1147,7 @@ impl Session {
                 self.transition_retry.success(&peer);
                 self.pending_edge_guard = None;
             } else if self.router.focus() != fr::FocusState::Preparing {
-                self.edge_guard = self.pending_edge_guard.take().or(self.edge_guard);
+                self.edge_guard = self.pending_edge_guard.take().or(self.edge_guard.take());
                 let reason = reason.unwrap_or_default();
                 if let Some(delay_ms) = self.transition_retry.fail(peer, now, reason.clone()) {
                     tracing::warn!(%peer, delay_ms, %reason, "transition retry backoff advanced");
@@ -3017,18 +3017,22 @@ impl Session {
         let guard =
             crate::topology::ReturnGuard::after_return(edge, entry, self.edge_hysteresis_px);
         self.local_pointer = Some(guard.entry(entry));
-        self.edge_guard = Some(guard);
         tracing::debug!(
             axis = ?guard.axis(),
             hysteresis = guard.hysteresis(),
             "the edge stays disarmed until the pointer leaves its band"
         );
+        self.edge_guard = Some(guard);
     }
 
     /// `Local`: a step that leaves a display through a link endpoint opens the transition.
     async fn track_local(&mut self, position: &geometry::Position, motion: geometry::Point) {
         // Leaving the band re-arms its edge, even when this sample crosses no link.
-        if self.edge_guard.is_some_and(|guard| !guard.holds(position)) {
+        if self
+            .edge_guard
+            .as_ref()
+            .is_some_and(|guard| !guard.holds(position))
+        {
             self.edge_guard = None;
         }
         // Only the owner opens leases, so only the owner reacts to an edge; a follower
@@ -3046,6 +3050,7 @@ impl Session {
         };
         if self
             .edge_guard
+            .as_ref()
             .is_some_and(|guard| guard.holds_crossing(position, transition.source.edge))
         {
             return;
@@ -3082,7 +3087,7 @@ impl Session {
         }))
         .await;
         if self.router.focus() != fr::FocusState::Preparing {
-            self.edge_guard = self.pending_edge_guard.take().or(self.edge_guard);
+            self.edge_guard = self.pending_edge_guard.take().or(self.edge_guard.take());
         }
     }
 
