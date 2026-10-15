@@ -68,10 +68,9 @@ pub fn draw(
         d.get_temp::<crate::view_model::hotkeys::Editor>(capture_id)
             .is_some_and(|editor| editor.capturing.is_some())
     });
-    if scrim.clicked()
-        || (!capturing && ui.input(|i| i.key_pressed(egui::Key::Escape)))
-    {
-        ui.ctx().data_mut(|d| d.remove::<crate::view_model::hotkeys::Editor>(capture_id));
+    if scrim.clicked() || (!capturing && ui.input(|i| i.key_pressed(egui::Key::Escape))) {
+        ui.ctx()
+            .data_mut(|d| d.remove::<crate::view_model::hotkeys::Editor>(capture_id));
         actions.push(Action::CloseModal);
     }
 
@@ -541,31 +540,50 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
     use crate::view_model::hotkeys::{self, Editor, ROWS};
     let lang = vm.look.language;
     let id = egui::Id::new("hotkey-editor");
-    let mut editor = ui.ctx().data(|d| d.get_temp::<Editor>(id)).unwrap_or_default();
+    let mut editor = ui
+        .ctx()
+        .data(|d| d.get_temp::<Editor>(id))
+        .unwrap_or_default();
     if !vm.connection.is_connected() {
         editor.capturing = None;
     }
-    let bindings = vm.status.as_ref().map(|s| s.hotkeys.as_slice()).unwrap_or_default();
+    let bindings = vm
+        .status
+        .as_ref()
+        .map(|s| s.hotkeys.as_slice())
+        .unwrap_or_default();
     if let Some((action, chord)) = editor.capture(lang, &ui.input(|i| i.events.clone()), bindings) {
         actions.push(Action::SetHotkey { action, chord });
     }
     for (action, label, default) in ROWS {
         let binding = bindings.iter().find(|binding| binding.action == action);
         row(ui, pal, text(lang, label), action == 1, |ui| {
-            widgets::chord(ui, pal, binding.map(|binding| binding.chord.as_str()).unwrap_or(default));
+            widgets::chord(
+                ui,
+                pal,
+                binding
+                    .map(|binding| binding.chord.as_str())
+                    .unwrap_or(default),
+            );
             ui.horizontal_wrapped(|ui| {
                 let connected = vm.connection.is_connected() && binding.is_some();
                 ui.add_enabled_ui(connected, |ui| {
-                    if widgets::button(ui, pal, text(lang, Key::Change), Kind::Solid, true).clicked() {
+                    if widgets::button(ui, pal, text(lang, Key::Change), Kind::Solid, true)
+                        .clicked()
+                    {
                         editor.capturing = Some(action);
                         editor.error = None;
                     }
-                    if widgets::button(ui, pal, text(lang, Key::Reset), Kind::Solid, true).clicked() {
+                    if widgets::button(ui, pal, text(lang, Key::Reset), Kind::Solid, true).clicked()
+                    {
                         match hotkeys::validate(lang, action, default, bindings) {
                             Ok(()) => {
                                 editor.capturing = None;
                                 editor.error = None;
-                                actions.push(Action::SetHotkey { action, chord: default.to_owned() });
+                                actions.push(Action::SetHotkey {
+                                    action,
+                                    chord: default.to_owned(),
+                                });
                             }
                             Err(error) => editor.error = Some(error),
                         }
@@ -573,7 +591,13 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
                 });
             });
             if editor.capturing == Some(action) {
-                widgets::wrapped(ui, text(lang, Key::PressAShortcutEscCancels), 12.0, fam::sans(), pal.ink);
+                widgets::wrapped(
+                    ui,
+                    text(lang, Key::PressAShortcutEscCancels),
+                    12.0,
+                    fam::sans(),
+                    pal.ink,
+                );
             }
             if let Some(binding) = binding {
                 if !binding.available {
@@ -583,7 +607,13 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
                     widgets::wrapped(ui, &binding.detail, 12.0, fam::sans(), pal.ink);
                 }
             } else {
-                widgets::wrapped(ui, text(lang, Key::WaitingForTheServiceStatus), 12.0, fam::sans(), pal.ink);
+                widgets::wrapped(
+                    ui,
+                    text(lang, Key::WaitingForTheServiceStatus),
+                    12.0,
+                    fam::sans(),
+                    pal.ink,
+                );
             }
             if action == 1 {
                 widgets::warn(ui, pal, |ui| {
@@ -603,7 +633,13 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
     // an agent's own detail line is shown; the core's answer has no catalogue sentence of its own.
     if let Some(error) = editor.error.as_ref() {
         widgets::warn(ui, pal, |ui| {
-            widgets::wrapped(ui, text(lang, Key::InvalidShortcut), 12.0, fam::sans(), pal.ink);
+            widgets::wrapped(
+                ui,
+                text(lang, Key::InvalidShortcut),
+                12.0,
+                fam::sans(),
+                pal.ink,
+            );
             widgets::wrapped(ui, error, 12.0, fam::sans(), pal.ink);
         });
     }
