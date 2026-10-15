@@ -283,6 +283,35 @@ mod topology_tests {
 #[cfg(test)]
 mod labels {
     use super::*;
+
+    /// The same menu, in English: the language reaches every label of the tray's model.
+    #[test]
+    fn the_english_menu_is_the_same_menu_in_english() {
+        let offline = items(None, None, Lang::En);
+        assert_eq!(offline[0].label, "Open MultiDeskFlow");
+        assert_eq!(offline[1].label, "The service is stopped");
+        assert_eq!(
+            offline.last().unwrap().label,
+            "Quit (the service keeps running)"
+        );
+        let remote = Status {
+            focus: "REMOTE".into(),
+            active_peer: "LAPTOP".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            items(Some(&remote), None, Lang::En)[1].label,
+            "Input → LAPTOP"
+        );
+        assert!(
+            !offline[1]
+                .label
+                .chars()
+                .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)),
+            "no Russian is left in the English menu"
+        );
+    }
+
     #[test]
     fn owner_menu_labels_are_stable() {
         let offline = items(None, None, Lang::Ru);
