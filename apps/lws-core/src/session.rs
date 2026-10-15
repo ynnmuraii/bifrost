@@ -1457,6 +1457,9 @@ impl Session {
                     return;
                 }
                 self.peer_displays.insert(from, (revision, displays));
+                if self.remote_seed_lease.is_some_and(|(peer, _)| peer == from) {
+                    self.remote_seed_lease = None;
+                }
                 self.rebuild_topology();
             }
             LayoutMessage::Topology(document) => {
@@ -3521,7 +3524,8 @@ impl Session {
                 geometry::Position::new(String::new(), 0.0, 0.0)
             }
         };
-        if !entry_position.display_id.as_str().is_empty() {
+        let missing_display = entry_position.display_id.as_str().is_empty();
+        if !missing_display {
             // The captured deltas integrate from here for the whole lease.
             self.remote_pointer = Some(entry_position.clone());
             self.remote_node = Some(target);
@@ -3537,6 +3541,16 @@ impl Session {
                 topology_revision: revision,
             }),
         );
+        if missing_display {
+            // The manual-switch lookup and warning already covered this lease, including
+            // an empty manifest. Do not repeat either operation on every captured batch.
+            self.remote_seed_lease = self
+                .router
+                .lease()
+                .source()
+                .filter(|lease| lease.peer == target)
+                .map(|lease| (lease.peer, lease.lease_id));
+        }
         let refusal = outputs.iter().find_map(|output| match output {
             fr::Output::Notice(fr::Notice::SwitchRefused { reason, .. }) => {
                 Some(format!("{reason:?}"))
@@ -3970,10 +3984,33 @@ fn split_agent_tail(
 /// Whether this batch needs the receiver-manifest fallback and its diagnostic.
 fn remote_seed_needed(
     pointer: Option<&geometry::Position>,
-    _attempted: &mut Option<(NodeId, fr::LeaseId)>,
-    _lease: (NodeId, fr::LeaseId),
+    attempted: &mut Option<(NodeId, fr::LeaseId)>,
+    lease: (NodeId, fr::LeaseId),
 ) -> bool {
-    pointer.is_none()
+    if pointer.is_some() || *attempted == Some(lease) {
+        return false;
+    }
+    *attempted = Some(lease);
+    true
+}
+
+#[cfg(test)]
+mod manual_seed_tests {
+    use super::*;
+
+    #[test]
+    fn a_manual_switchs_failed_lookup_is_not_repeated_by_captured_batches() {
+        let lease = (NodeId::new([2; 32]), [3; 16]);
+        // switch_to has already queried the manifests and emitted its warning.
+        let mut attempted = Some(lease);
+        let mut lookups_and_warnings = 1;
+        for _ in 0..100 {
+            if remote_seed_needed(None, &mut attempted, lease) {
+                lookups_and_warnings += 1;
+            }
+        }
+        assert_eq!(lookups_and_warnings, 1);
+    }
 }
 
 #[cfg(test)]
