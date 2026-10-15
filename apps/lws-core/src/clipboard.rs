@@ -1636,7 +1636,7 @@ mod tests {
                     peer,
                     ClipboardMessage::Offer {
                         offer_id,
-                        origin_node_id: vec![0x31; 32],
+                        origin_node_id: [0x31; 32],
                         origin_version: 1,
                         mime: cb::MIME.to_owned(),
                         size_bytes: 4,
@@ -1794,7 +1794,7 @@ mod tests {
                     peer,
                     ClipboardMessage::Offer {
                         offer_id: second,
-                        origin_node_id: vec![0x31; 32],
+                        origin_node_id: [0x31; 32],
                         origin_version: 10,
                         mime: cb::MIME.to_owned(),
                         size_bytes: 5,
