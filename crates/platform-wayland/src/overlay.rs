@@ -101,7 +101,12 @@ impl Wake {
     fn notify(&self) {
         if !self.pending.swap(true, Ordering::SeqCst) {
             // EAGAIN means the counter is saturated: the thread is already due to wake up.
-            let _ = rustix::io::write(&self.fd, &1u64.to_ne_bytes());
+            loop {
+                match rustix::io::write(&self.fd, &1u64.to_ne_bytes()) {
+                    Err(Errno::INTR) => continue,
+                    _ => break,
+                }
+            }
         }
     }
 
@@ -239,6 +244,11 @@ impl Layout {
 /// How long `poll` may block: forever while idle, else what is left of the frame interval.
 fn poll_timeout(active: bool, since_step: Duration) -> Option<Duration> {
     active.then(|| FRAME.saturating_sub(since_step))
+}
+
+/// Configure events and margin updates must obey the same cap as animation steps.
+fn draw_ready(last_draw: Option<Instant>, now: Instant) -> bool {
+    last_draw.is_none_or(|last| now.saturating_duration_since(last) >= FRAME)
 }
 
 fn to_timespec(d: Duration) -> Timespec {
@@ -465,6 +475,8 @@ struct App {
     enabled: bool,
     /// When the effect was last stepped (or became active); `None` while idle.
     last_step: Option<Instant>,
+    /// Last submitted frame, retained across surface replacement to prevent bursts.
+    last_draw: Option<Instant>,
     /// No surface is created before this instant (after the compositor closed one).
     reopen_at: Option<Instant>,
 }
@@ -496,6 +508,7 @@ impl App {
             effect: Effect::new(std::process::id()),
             enabled: true,
             last_step: None,
+            last_draw: None,
             reopen_at: None,
         })
     }
@@ -579,9 +592,11 @@ impl App {
             return Ok(());
         };
         self.sync_surface(&strip, now)?;
-        if self.state.configured && (stepped || self.state.draw_due) {
+        self.state.draw_due |= stepped;
+        if self.state.configured && self.state.draw_due && draw_ready(self.last_draw, now) {
             if let Some(surface) = &mut self.surface {
                 if surface.draw(&mut self.state, &self.effect)? {
+                    self.last_draw = Some(now);
                     self.state.draw_due = false;
                 }
             }
@@ -744,6 +759,16 @@ mod tests {
     fn frame_interval_is_at_most_thirty_fps() {
         assert!(FRAME >= Duration::from_secs_f32(edgefx::FRAME_S));
         assert!(FRAME < Duration::from_millis(34));
+    }
+
+    #[test]
+    fn configure_and_margin_redraws_cannot_exceed_the_frame_cap() {
+        let now = Instant::now();
+        assert!(draw_ready(None, now));
+        assert!(!draw_ready(Some(now), now));
+        let just_before_frame = now + FRAME - Duration::from_nanos(1);
+        assert!(!draw_ready(Some(now), just_before_frame));
+        assert!(draw_ready(Some(now), now + FRAME));
     }
 
     #[test]
