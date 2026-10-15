@@ -445,6 +445,11 @@ pub struct Session {
     clipboard: Option<crate::clipboard::Clipboard>,
     /// Events from the clipboard runtime: a bound channel, a message, or a lost channel.
     clipboard_events: mpsc::Receiver<crate::clipboard::Inbound>,
+    /// Startup policy and bind address, retained while the opt-in runtime is absent.
+    clipboard_settings: crate::clipboard::Settings,
+    clipboard_listen: std::net::SocketAddr,
+    /// Live input-link bindings replayed when clipboard sharing is enabled.
+    clipboard_links: BTreeMap<NodeId, ([u8; 16], bool, std::net::IpAddr)>,
     /// The GUI's endpoint and the fan-out of pushed events.
     gui: crate::gui::Server,
     /// Requests from the connected GUIs, one per turn of the loop.
@@ -511,6 +516,8 @@ impl Session {
         layout_store: crate::layout_store::LayoutStore,
         clipboard: Option<crate::clipboard::Clipboard>,
         clipboard_events: mpsc::Receiver<crate::clipboard::Inbound>,
+        clipboard_settings: crate::clipboard::Settings,
+        clipboard_listen: std::net::SocketAddr,
         gui_server: crate::gui::Server,
         identity: Arc<identity::NodeIdentity>,
         paths: config::Paths,
@@ -587,6 +594,9 @@ impl Session {
             dev_capture_injected,
             clipboard,
             clipboard_events,
+            clipboard_settings,
+            clipboard_listen,
+            clipboard_links: BTreeMap::new(),
             gui: gui_server,
             gui_requests,
             gui_requests_tx,
@@ -2442,6 +2452,7 @@ impl Session {
             },
             LinkEvent::Down { peer, reason } => {
                 self.layout_connections.remove(&peer);
+                self.clipboard_links.remove(&peer);
                 tracing::warn!(peer = %peer, ?reason, "link down");
                 if let Some(clipboard) = self.clipboard.as_mut() {
                     clipboard.on_link_down(peer).await;
@@ -2478,6 +2489,8 @@ impl Session {
         text_clipboard: bool,
         remote: std::net::SocketAddr,
     ) {
+        self.clipboard_links
+            .insert(peer, (connection_id, text_clipboard, remote.ip()));
         let out = match self.clipboard.as_mut() {
             Some(clipboard) => {
                 clipboard

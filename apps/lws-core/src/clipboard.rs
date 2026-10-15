@@ -28,6 +28,7 @@
 //! this module does *inside* the session loop is bookkeeping.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -271,15 +272,11 @@ impl Clipboard {
             .await;
     }
 
-    /// `SetClipboard` from the GUI: transfer clipboard content, or stop transferring it.
+    /// Closes the listener and joins every runtime task without changing the OS clipboard.
     ///
-    /// This is the same gate `[clipboard].enabled` seeds ([`cb::Policy::enabled`]), flipped at
-    /// runtime: content that arrives while it is off is not offered, and a transfer already in
-    /// flight finishes rather than losing half a payload (`KVM-042`). The listener and the
-    /// bound channels stay up, so turning it back on needs no reconnect.
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.settings.enabled = enabled;
-        self.settings.policy.enabled = enabled;
+    /// Offered and partially received payloads are discarded with this endpoint.
+    pub async fn stop(self) {
+        self.runtime.stop().await;
     }
 
     /// Whether clipboard transfers are on, for `Status.clipboard_enabled`.
@@ -858,7 +855,8 @@ const MARKER_NAMES: [&str; 5] = [
 /// `docs/05-protocol.md` puts the dial on the *receiving* side («Пир устанавливает второй
 /// mTLS-канал к тому же узлу»), so a node that holds a payload only issues the grant and waits;
 /// the peer calls back. One connection serves the pair.
-#[derive(Clone)]
+// Only the endpoint owns the task registry. Worker clones hold a weak reference, so dropping
+// the endpoint aborts its tasks instead of leaving an Arc cycle around the listener.
 struct Handle {
     inner: Arc<Mutex<Inner>>,
     identity: Arc<identity::NodeIdentity>,
@@ -868,6 +866,67 @@ struct Handle {
     /// The listener's address, for the tests that dial in from a real peer.
     #[cfg(test)]
     listen_address: SocketAddr,
+    tasks: std::sync::Weak<TaskRegistry>,
+    _owner: Option<Arc<TaskRegistry>>,
+}
+
+#[derive(Default)]
+struct TaskRegistry {
+    state: std::sync::Mutex<TaskState>,
+}
+
+#[derive(Default)]
+struct TaskState {
+    closed: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl TaskState {
+    fn prune(&mut self) {
+        if self.tasks.len() < 64 {
+            return;
+        }
+        let mut finished = Vec::new();
+        let mut index = 0;
+        while index < self.tasks.len() && finished.len() < 64 {
+            if self.tasks[index].is_finished() {
+                finished.push(self.tasks.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        if !finished.is_empty() {
+            self.tasks.push(tokio::spawn(async move {
+                for task in finished {
+                    let _ = task.await;
+                }
+            }));
+        }
+    }
+}
+
+impl Drop for TaskRegistry {
+    fn drop(&mut self) {
+        for task in &self.state.get_mut().expect("task registry").tasks {
+            task.abort();
+        }
+    }
+}
+
+impl Clone for Handle {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            identity: Arc::clone(&self.identity),
+            trusted_peers: Arc::clone(&self.trusted_peers),
+            events: self.events.clone(),
+            epoch: self.epoch,
+            #[cfg(test)]
+            listen_address: self.listen_address,
+            tasks: self.tasks.clone(),
+            _owner: None,
+        }
+    }
 }
 
 struct Inner {
@@ -884,7 +943,7 @@ struct Inner {
 struct Conn {
     generation: u64,
     tx: mpsc::Sender<ClipboardMessage>,
-    reader: tokio::task::JoinHandle<()>,
+    reader: tokio::task::AbortHandle,
 }
 
 impl Handle {
@@ -901,6 +960,7 @@ impl Handle {
                 .map_err(|error| error.to_string())?;
         let local_addr = listener.local_addr();
         tracing::info!(address = %local_addr, "clipboard channel listening");
+        let tasks = Arc::new(TaskRegistry::default());
         let handle = Handle {
             inner: Arc::new(Mutex::new(Inner {
                 grants: Grants::default(),
@@ -913,10 +973,44 @@ impl Handle {
             epoch: Instant::now(),
             #[cfg(test)]
             listen_address: local_addr,
+            tasks: Arc::downgrade(&tasks),
+            _owner: Some(tasks),
         };
         let acceptor = handle.clone();
-        tokio::spawn(async move { acceptor.accept_loop(listener, queue_capacity).await });
+        handle.spawn(async move { acceptor.accept_loop(listener, queue_capacity).await });
         Ok((handle, receiver))
+    }
+
+    /// Registration and shutdown share one lock: no task can escape the shutdown snapshot.
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        let Some(tasks) = self.tasks.upgrade() else {
+            return;
+        };
+        let mut state = tasks.state.lock().expect("task registry");
+        if state.closed {
+            return;
+        }
+        state.prune();
+        state.tasks.push(tokio::spawn(future));
+    }
+
+    async fn stop(&self) {
+        let Some(tasks) = self.tasks.upgrade() else {
+            return;
+        };
+        let handles = {
+            let mut state = tasks.state.lock().expect("task registry");
+            state.closed = true;
+            let handles = std::mem::take(&mut state.tasks);
+            for task in &handles {
+                task.abort();
+            }
+            handles
+        };
+        for task in handles {
+            let _ = task.await;
+        }
+        self.inner.lock().await.conns.clear();
     }
 
     fn now_ms(&self) -> u64 {
@@ -994,7 +1088,7 @@ impl Handle {
             Outgoing::new(offer_id, payload, rate_bytes_per_s, cb::MAX_BYTES, 0).map_err(|_| ())?;
         let size = outgoing.size_bytes();
         let started = Instant::now();
-        tokio::spawn(async move {
+        self.spawn(async move {
             while let Some((message, delay_ms)) =
                 outgoing.next(started.elapsed().as_millis() as u64)
             {
@@ -1091,7 +1185,16 @@ impl Handle {
         let reader_events = events.clone();
         // Registered under the lock the reader's cleanup also takes, so a connection that
         // closes at once cannot clean up before it is registered and leave a dead entry.
+        let replaced = {
         let mut inner = self.inner.lock().await;
+        let Some(tasks) = self.tasks.upgrade() else {
+            return;
+        };
+        let mut task_state = tasks.state.lock().expect("task registry");
+        if task_state.closed {
+            return;
+        }
+        task_state.prune();
         inner.generation += 1;
         let generation = inner.generation;
         let reader_task = tokio::spawn(async move {
@@ -1111,22 +1214,26 @@ impl Handle {
                 let _ = reader_events.send(Inbound::Down { peer }).await;
             }
         });
-        let replaced = inner.conns.insert(
+        let reader_abort = reader_task.abort_handle();
+        task_state.tasks.push(reader_task);
+        task_state.tasks.push(tokio::spawn(async move { write_task(writer, rx).await }));
+        drop(task_state);
+        inner.conns.insert(
             peer,
             Conn {
                 generation,
                 tx,
-                reader: reader_task,
+                reader: reader_abort,
             },
-        );
-        drop(inner);
+        )
+        };
         if let Some(old) = replaced {
             // Both sides dialled at once: the older connection (and its sender) goes, instead of
             // lingering unregistered where a revoke could never reach it.
             old.reader.abort();
         }
         let _ = events.send(Inbound::Bound { peer, channel_id }).await;
-        tokio::spawn(async move { write_task(writer, rx).await });
+        // Both stream halves are already registered before publishing Bound.
     }
 
     /// The reader half of one channel.
@@ -1173,7 +1280,7 @@ impl Handle {
         queue_capacity: usize,
     ) {
         let handle = self.clone();
-        tokio::spawn(async move {
+        self.spawn(async move {
             let result = tokio::time::timeout(
                 DIAL_TIMEOUT,
                 dial_clipboard(
@@ -1222,6 +1329,56 @@ async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ten_start_stop_cycles_rebind_the_exact_port() {
+        let (mut endpoint, root) = started_clipboard("stop-rebind").await;
+        let address = endpoint.runtime.listen_address;
+        let identity = Arc::clone(&endpoint.runtime.identity);
+        let settings = endpoint.settings;
+        for cycle in 0..10 {
+            endpoint.stop().await;
+            let (next, _events) = Clipboard::start(
+                identity.node_id(),
+                settings,
+                Arc::clone(&identity),
+                Arc::new(std::sync::RwLock::new(BTreeSet::new())),
+                address,
+                4,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("cycle {cycle} failed to rebind: {error}"));
+            endpoint = next;
+        }
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stopping_aborts_a_silent_dial_and_refuses_late_registration() {
+        let (endpoint, root) = started_clipboard("silent-stop").await;
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = silent.local_addr().expect("address");
+        let worker = endpoint.runtime.clone();
+        worker.dial([0x21; 32].into(), address, [1; 16], [2; 16], [3; 32], 4).await;
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), silent.accept())
+            .await.expect("dial starts").expect("accept");
+        // Read the ClientHello first: EOF must come from stop, not the dial timeout.
+        use tokio::io::AsyncReadExt;
+        let mut bytes = [0; 4096];
+        assert!(stream.read(&mut bytes).await.expect("client hello") > 0);
+        tokio::time::timeout(Duration::from_secs(1), endpoint.stop())
+            .await.expect("stop does not wait for the dial timeout");
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut bytes))
+            .await.expect("dial socket closes");
+        assert!(matches!(read, Ok(0) | Err(_)), "dial socket survived stop");
+        let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&registered);
+        worker.spawn(async move { flag.store(true, std::sync::atomic::Ordering::SeqCst); });
+        tokio::task::yield_now().await;
+        assert!(!registered.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A runtime whose grants are checked on the clock they were issued on (audit F5).
     ///
@@ -1293,6 +1450,15 @@ mod tests {
     /// reader task is now aborted too, and the peer observes the connection close.
     #[tokio::test]
     async fn revoking_a_peer_closes_its_bound_channel() {
+        bound_peer_observes_close(false).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_closes_a_bound_peers_channel() {
+        bound_peer_observes_close(true).await;
+    }
+
+    async fn bound_peer_observes_close(stop: bool) {
         use std::collections::BTreeSet;
         use std::sync::RwLock;
 
@@ -1347,7 +1513,11 @@ mod tests {
         .await
         .expect("the peer's channel must bind");
 
-        handle.close(id_b).await;
+        if stop {
+            handle.stop().await;
+        } else {
+            handle.close(id_b).await;
+        }
 
         let connection = dialer
             .await

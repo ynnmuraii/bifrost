@@ -557,6 +557,8 @@ async fn run_async(
         LayoutStore::new(paths.config_file(), &config, node_id),
         clipboard,
         clipboard_events,
+        clipboard::Settings::from_config(&config.clipboard),
+        SocketAddr::new(listen.ip(), config.network.port_clipboard),
         gui_server,
         Arc::clone(&identity),
         paths.clone(),
@@ -709,15 +711,12 @@ fn decide_session(config: &config::Config) -> LocalSession {
             capabilities: platform_probe::Capabilities {
                 receiver_takeover: session.capabilities.receiver_takeover
                     && config.input.takeover_detection != config::TakeoverDetection::Off,
-                // ADR-008: `CAPABILITY_TEXT_CLIPBOARD` is claimed only when the clipboard is
-                // enabled *and* this session has an adapter the build can drive. Windows and
-                // X11 own the selection directly; the Wayland path is the clipboard portal,
-                // which is not implemented here, so a Wayland node does not claim it.
-                text_clipboard: config.clipboard.enabled
-                    && matches!(
-                        session.session_kind,
-                        platform_probe::SessionKind::Windows | platform_probe::SessionKind::X11
-                    ),
+                // Capability describes adapter support, not the user's opt-in. A GUI toggle
+                // must work on an existing input link without reconnecting it.
+                text_clipboard: matches!(
+                    session.session_kind,
+                    platform_probe::SessionKind::Windows | platform_probe::SessionKind::X11
+                ),
                 ..session.capabilities
             },
             fsm: focus_router::Capabilities {
