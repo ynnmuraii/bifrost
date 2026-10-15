@@ -129,10 +129,27 @@ pub fn draw(
             }
             ui.add_space(6.0);
             ui.separator();
-            // Service-owned edge controls are added here once their IPC fields land.
             ui.push_id("edge-effects", |ui| {
-                label(ui, pal, "Эффекты краёв экрана");
-                ui.add_space(44.0);
+                label(ui, pal, "Эффекты у краёв");
+                let mut edge_effects = vm.status.as_ref().is_some_and(|s| s.edge_effects);
+                let mut hide_remote_cursor =
+                    vm.status.as_ref().is_some_and(|s| s.hide_remote_cursor);
+                ui.add_enabled_ui(vm.can_set_appearance(), |ui| {
+                    let effects_changed =
+                        ui.checkbox(&mut edge_effects, "Эффекты у краёв").changed();
+                    let cursor_changed = ui
+                        .checkbox(
+                            &mut hide_remote_cursor,
+                            "Прятать курсор, пока ввод на другой машине",
+                        )
+                        .changed();
+                    if effects_changed || cursor_changed {
+                        actions.push(Action::SetAppearance {
+                            edge_effects,
+                            hide_remote_cursor,
+                        });
+                    }
+                });
             });
         });
 }

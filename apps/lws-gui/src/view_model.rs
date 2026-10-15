@@ -254,6 +254,8 @@ pub enum Request {
     UpdateTopology,
     /// `SetClipboard`.
     SetClipboard,
+    /// `SetAppearance`.
+    SetAppearance,
     /// `RevokePeer`.
     RevokePeer,
     /// `ExportDiagnostics`.
@@ -279,6 +281,7 @@ impl Request {
             Request::PairingAnswer => "ответ на сопряжение",
             Request::UpdateTopology => "сохранить раскладку",
             Request::SetClipboard => "буфер обмена",
+            Request::SetAppearance => "эффекты краёв",
             Request::RevokePeer => "удалить компьютер из пары",
             Request::ExportDiagnostics => "сохранить диагностику",
             Request::ResetPortalGrants => "забыть разрешения порталов",
@@ -896,6 +899,15 @@ impl ViewModel {
         true
     }
 
+    /// Appearance controls wait for the service's authoritative status.
+    pub fn can_set_appearance(&self) -> bool {
+        self.connection.is_connected()
+            && self.status.is_some()
+            && !self.inflight.iter().any(|request| {
+                matches!(request.request, Request::SetAppearance | Request::GetStatus)
+            })
+    }
+
     /// Records a request that was just handed to the client.
     pub fn begin_request(&mut self, request: Request, now: Instant) -> u64 {
         self.next_request_id += 1;
@@ -1317,7 +1329,7 @@ impl ViewModel {
         if result.ok {
             let text = self.success_text(request);
             // A toggle shows its own state; a sentence under it says nothing new.
-            if request != Request::SetClipboard {
+            if !matches!(request, Request::SetClipboard | Request::SetAppearance) {
                 self.set_outcome(Outcome::done(text.clone()));
             }
             if request == Request::Shutdown {
@@ -1331,6 +1343,10 @@ impl ViewModel {
                 Request::PairingAnswer => self.finish_pairing(true),
                 Request::SetClipboard if self.settings.clipboard_pending.is_some() => {
                     // The core has not pushed the new state: ask for it.
+                    let id = self.begin_request(Request::GetStatus, Instant::now());
+                    self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
+                }
+                Request::SetAppearance => {
                     let id = self.begin_request(Request::GetStatus, Instant::now());
                     self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
                 }
@@ -2011,6 +2027,13 @@ pub enum Action {
     },
     /// Turn the shared clipboard on or off.
     SetClipboard(bool),
+    /// Change the service-owned edge effects and source cursor visibility.
+    SetAppearance {
+        /// Draw the linked-edge glyph strip.
+        edge_effects: bool,
+        /// Hide the source cursor during remote input.
+        hide_remote_cursor: bool,
+    },
     /// Apply the edited layout document.
     UpdateTopology {
         /// The document, in the `[topology]` schema.
@@ -2130,6 +2153,16 @@ impl Action {
             Action::SetClipboard(enabled) => (
                 Request::SetClipboard,
                 Msg::SetClipboard(ipc::SetClipboard { enabled: *enabled }),
+            ),
+            Action::SetAppearance {
+                edge_effects,
+                hide_remote_cursor,
+            } => (
+                Request::SetAppearance,
+                Msg::SetAppearance(ipc::SetAppearance {
+                    edge_effects: *edge_effects,
+                    hide_remote_cursor: *hide_remote_cursor,
+                }),
             ),
             Action::UpdateTopology {
                 layout_toml,
@@ -3141,6 +3174,7 @@ fn success_text(request: Request) -> String {
         Request::PairingAnswer => "ответ отправлен".to_owned(),
         Request::UpdateTopology => "раскладка сохранена".to_owned(),
         Request::SetClipboard => "буфер обмена переключён".to_owned(),
+        Request::SetAppearance => "эффекты краёв переключены".to_owned(),
         Request::RevokePeer => "компьютер удалён из пары".to_owned(),
         Request::ResetPortalGrants => "разрешения порталов забыты".to_owned(),
         Request::RetryAgent => "повторный запуск службы ввода начат".to_owned(),
