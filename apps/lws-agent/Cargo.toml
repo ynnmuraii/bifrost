@@ -12,6 +12,7 @@ anyhow = "1"
 # the agent owns the local selection, and this crate is what decides what may be applied
 # (ADR-008). The per-platform halves are behind `platform-win`/`platform-x11`.
 clipboard = { path = "../../crates/clipboard" }
+config = { path = "../../crates/config" }
 edgefx = { path = "../../crates/edgefx" }
 input-model = { path = "../../crates/input-model" }
 ipc = { path = "../../crates/ipc" }
