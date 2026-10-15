@@ -1220,18 +1220,17 @@ mod tests {
                 vkCode: u32::from(EmergencyCombo::default().vk),
                 ..Default::default()
             };
-            assert_eq!(
-                handle_keyboard(
-                    &shared,
-                    WPARAM(WM_KEYDOWN as usize),
-                    LPARAM(&kb as *const _ as isize)
-                ),
-                None
-            );
+            let press = |shared: &Shared, message: u32| {
+                handle_keyboard(shared, WPARAM(message as usize), LPARAM(&kb as *const _ as isize))
+            };
+            // A hotkey trigger is this app's own shortcut: the hook swallows the key, on the way
+            // down and on the way up, so no local application sees the combination.
+            assert_eq!(press(&shared, WM_KEYDOWN), Some(true));
             assert_eq!(capture_kind(&shared), CaptureKind::Observe);
             assert!(!shared.hold_valid.load(Ordering::SeqCst));
             assert!(matches!(rx.try_recv(), Ok(CaptureEvent::Emergency)));
             assert!(!remote(&shared));
+            assert_eq!(press(&shared, WM_KEYUP), Some(true));
         }
     }
 
