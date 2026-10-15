@@ -623,6 +623,8 @@ fn clip_body(
     });
     row(ui, pal, text(lang, Key::History), true, |ui| {
         let connected = vm.connection.is_connected();
+        // The list is a stack of two-line entries: keep them close to each other.
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
         if vm.clipboard_history.is_empty() {
             st.confirm_clear_history = false;
         }
@@ -675,8 +677,8 @@ fn clip_body(
             .as_millis();
         for entry in &vm.clipboard_history {
             ui.push_id(entry.id, |ui| {
-                // Two lines per entry: the metadata and the preview, nothing else.
-                ui.spacing_mut().item_spacing = Vec2::new(8.0, 3.0);
+                // Two lines per entry: the metadata and the preview, close together.
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 1.0);
                 ui.separator();
                 let direction =
                     match protocol::ipc::ClipboardHistoryDirection::try_from(entry.direction) {
@@ -698,20 +700,21 @@ fn clip_body(
                     ],
                 );
                 ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(metadata)
+                                .font(font(11.0, fam::sans()))
+                                .color(pal.ink2),
+                        )
+                        .truncate(),
+                    );
+                    // «Копировать» keeps to the right edge, the metadata stays left.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if widgets::small_button(ui, pal, text(lang, Key::Copy), connected)
                             .clicked()
                         {
                             actions.push(Action::CopyClipboardHistory(entry.id));
                         }
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(metadata)
-                                    .font(font(11.0, fam::sans()))
-                                    .color(pal.ink2),
-                            )
-                            .truncate(),
-                        );
                     });
                 });
                 // Flatten only the displayed preview; Copy still uses the stored entry id.
