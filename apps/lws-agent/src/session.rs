@@ -98,6 +98,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
     let Some((mut backend, ready, refusals)) = selected else {
         return Ok(());
     };
+    backend.set_effects(attach.edge_effects, attach.hide_cursor);
     if args.dry_inject {
         tracing::warn!("dry mode: no capture hooks, no injection; Inject is only logged");
     }
@@ -712,6 +713,14 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         Msg::SetClipboardText(set) => {
             handle_set_clipboard(link, backend, clipboard, set).await?;
         }
+        Msg::SetEffects(settings) => {
+            backend.set_effects(settings.edge_effects, settings.hide_cursor);
+        }
+        Msg::EdgeFx(frame) => {
+            if let Some(update) = decode_edge_fx(&frame) {
+                backend.edge_fx(&frame.display_id, update);
+            }
+        }
         Msg::Shutdown(_) => {
             tracing::info!("shutdown requested by core");
             release_everything(backend, repeat, deadline, self_timeout, held_lease).await;
@@ -728,6 +737,53 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     Ok(None)
+}
+
+/// Reject malformed cosmetic geometry before it can size an OS window.
+fn decode_edge_fx(frame: &ipc::EdgeFx) -> Option<edgefx::Update> {
+    use edgefx::{Edge, Target, Update};
+    use ipc::EdgeFxKind;
+    let kind = EdgeFxKind::try_from(frame.kind).ok()?;
+    match kind {
+        EdgeFxKind::EdgeFxClear => return Some(Update::Clear),
+        EdgeFxKind::EdgeFxLeft => return Some(Update::Left),
+        EdgeFxKind::EdgeFxCrossed if frame.display_id.is_empty() => {
+            return Some(Update::Crossed(None));
+        }
+        _ => {}
+    }
+    let edge = match ipc::PortalEdge::try_from(frame.edge).ok()? {
+        ipc::PortalEdge::Left => Edge::Left,
+        ipc::PortalEdge::Right => Edge::Right,
+        ipc::PortalEdge::Top => Edge::Top,
+        ipc::PortalEdge::Bottom => Edge::Bottom,
+        _ => return None,
+    };
+    if frame.display_id.is_empty()
+        || ![frame.seg_start, frame.seg_end, frame.along, frame.distance]
+            .iter()
+            .all(|value| value.is_finite() && value.abs() <= 1_000_000.0)
+        || frame.seg_start < 0.0
+        || frame.seg_end <= frame.seg_start
+        || !(frame.seg_start..=frame.seg_end).contains(&frame.along)
+    {
+        return None;
+    }
+    let target = Target {
+        edge,
+        start: frame.seg_start as f32,
+        end: frame.seg_end as f32,
+        along: frame.along as f32,
+    };
+    match kind {
+        EdgeFxKind::EdgeFxProximity if frame.distance >= 0.0 => Some(Update::Proximity {
+            target,
+            distance: frame.distance as f32,
+        }),
+        EdgeFxKind::EdgeFxCrossed => Some(Update::Crossed(Some(target))),
+        EdgeFxKind::EdgeFxEntered => Some(Update::Entered(target)),
+        _ => None,
+    }
 }
 
 /// The agent's clipboard state: the versions it speaks, and the transfer it is assembling.
@@ -1238,6 +1294,30 @@ fn monotonic_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cosmetic_frames_reject_invalid_geometry_but_allow_clear_and_targetless_crossing() {
+        let mut frame = ipc::EdgeFx {
+            kind: ipc::EdgeFxKind::EdgeFxEntered as i32,
+            display_id: "display".to_owned(),
+            edge: ipc::PortalEdge::Left as i32,
+            seg_start: 0.0,
+            seg_end: 1080.0,
+            along: 500.0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_edge_fx(&frame),
+            Some(edgefx::Update::Entered(_))
+        ));
+        frame.seg_end = f64::INFINITY;
+        assert!(decode_edge_fx(&frame).is_none());
+        frame.kind = ipc::EdgeFxKind::EdgeFxClear as i32;
+        assert_eq!(decode_edge_fx(&frame), Some(edgefx::Update::Clear));
+        frame.kind = ipc::EdgeFxKind::EdgeFxCrossed as i32;
+        frame.display_id.clear();
+        assert_eq!(decode_edge_fx(&frame), Some(edgefx::Update::Crossed(None)));
+    }
     use crate::backend::BackendKindArg;
     use clipboard::Marker;
     use std::path::PathBuf;

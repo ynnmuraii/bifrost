@@ -6,7 +6,7 @@
 use crate::Update;
 
 /// Minimum spacing of two frames (30 Hz).
-pub const MIN_GAP_MS: u64 = 33;
+pub const MIN_GAP_MS: u64 = 34;
 
 /// `P` rides along with an [`Update`] (the display id the frame names).
 #[derive(Debug)]

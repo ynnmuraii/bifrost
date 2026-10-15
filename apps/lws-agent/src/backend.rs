@@ -278,6 +278,32 @@ impl Ready {
     }
 }
 
+impl Backend {
+    /// Applies appearance settings without changing input ownership.
+    pub fn set_effects(&mut self, edge_effects: bool, hide_cursor: bool) {
+        match self {
+            #[cfg(windows)]
+            Self::Win(backend) => backend.set_effects(edge_effects, hide_cursor),
+            #[cfg(target_os = "linux")]
+            Self::Wayland(backend) => backend.set_effects(edge_effects, hide_cursor),
+            _ => {}
+        }
+        let _ = (edge_effects, hide_cursor);
+    }
+
+    /// Cosmetic updates never enter the capture hook.
+    pub fn edge_fx(&mut self, display: &str, update: edgefx::Update) {
+        match self {
+            #[cfg(windows)]
+            Self::Win(backend) => backend.edge_fx(display, update),
+            #[cfg(target_os = "linux")]
+            Self::Wayland(backend) => backend.edge_fx(update),
+            _ => {}
+        }
+        let _ = (display, update);
+    }
+}
+
 /// Decides whether this session runs a receiver-takeover detector, from `[input]` and the
 /// session the probe chose.
 ///

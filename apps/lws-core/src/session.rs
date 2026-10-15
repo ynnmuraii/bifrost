@@ -2913,7 +2913,14 @@ impl Session {
                 self.edgefx.await_entry();
                 None
             }
-            fr::AgentCommand::Inject { events, .. } if self.edgefx.take_entry_wanted() => {
+            fr::AgentCommand::Inject { events, .. } => {
+                if !events
+                    .iter()
+                    .any(|event| matches!(event, InputEvent::PointerAbsolute(_)))
+                    || !self.edgefx.take_entry_wanted()
+                {
+                    return;
+                }
                 let first = events.iter().find_map(|event| match event {
                     InputEvent::PointerAbsolute(position) => Some(position),
                     _ => None,
