@@ -816,6 +816,7 @@ pub fn error_code_from_i32(value: i32) -> Result<fr::ErrorCode, ConvertError> {
         | WireCode::InvalidTopology
         | WireCode::ClipboardTooLarge
         | WireCode::ClipboardDisabled
+        | WireCode::ClipboardSuperseded
         | WireCode::UnsupportedKey
         | WireCode::RateLimited
         | WireCode::PortalDenied
