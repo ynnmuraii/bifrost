@@ -86,7 +86,8 @@ impl EmergencyShortcuts {
                 .bind_shortcuts(&session, &requested, None, BindShortcutsOptions::default())
                 .await?
                 .response()
-        }.await;
+        }
+        .await;
         let bound = match bound {
             Ok(bound) => bound,
             Err(error) => {
@@ -94,14 +95,20 @@ impl EmergencyShortcuts {
                 return Err(classify(error));
             }
         };
-        let returned: Vec<_> = bound.shortcuts().iter()
+        let returned: Vec<_> = bound
+            .shortcuts()
+            .iter()
             .map(|shortcut| (shortcut.id(), shortcut.trigger_description()))
             .collect();
         if !all_bindings_granted(bindings, &returned) {
             let _ = session.close().await;
-            let missing: Vec<_> = bindings.iter()
-                .filter(|(id, _, _)| !returned.iter()
-                    .any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty()))
+            let missing: Vec<_> = bindings
+                .iter()
+                .filter(|(id, _, _)| {
+                    !returned
+                        .iter()
+                        .any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty())
+                })
                 .map(|(id, _, chord)| format!("{id} ({chord})"))
                 .collect();
             return Err(WaylandError::Io(std::io::Error::other(format!(
@@ -109,10 +116,12 @@ impl EmergencyShortcuts {
                 missing.join(", "),
             ))));
         }
-        let trigger_description = returned.iter()
+        let trigger_description = returned
+            .iter()
             .find(|(id, _)| *id == EMERGENCY_SHORTCUT_ID)
             .map(|(_, trigger)| (*trigger).to_owned());
-        let trigger_descriptions = returned.iter()
+        let trigger_descriptions = returned
+            .iter()
             .map(|(id, trigger)| ((*id).to_owned(), (*trigger).to_owned()))
             .collect();
         Ok(Self {
@@ -135,7 +144,8 @@ impl EmergencyShortcuts {
     /// User-visible actual trigger returned by the compositor for an action.
     #[must_use]
     pub fn trigger_description(&self, id: &str) -> Option<&str> {
-        self.trigger_descriptions.iter()
+        self.trigger_descriptions
+            .iter()
             .find(|(bound_id, _)| bound_id == id)
             .map(|(_, trigger)| trigger.as_str())
     }
@@ -170,7 +180,9 @@ impl EmergencyShortcuts {
 
 fn all_bindings_granted(requested: &[(&str, &str, &str)], returned: &[(&str, &str)]) -> bool {
     requested.iter().all(|(id, _, _)| {
-        returned.iter().any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty())
+        returned
+            .iter()
+            .any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty())
     })
 }
 
@@ -180,10 +192,22 @@ mod tests {
 
     #[test]
     fn candidate_requires_every_action_and_nonempty_triggers() {
-        let requested = [("emergency", "release", "CTRL+F12"), ("next", "next", "CTRL+F11")];
-        assert!(all_bindings_granted(&requested, &[("emergency", "Ctrl+F12"), ("next", "Ctrl+F11")]));
-        assert!(!all_bindings_granted(&requested, &[("emergency", "Ctrl+F12")]));
-        assert!(!all_bindings_granted(&requested, &[("emergency", "Ctrl+F12"), ("next", " ")]));
+        let requested = [
+            ("emergency", "release", "CTRL+F12"),
+            ("next", "next", "CTRL+F11"),
+        ];
+        assert!(all_bindings_granted(
+            &requested,
+            &[("emergency", "Ctrl+F12"), ("next", "Ctrl+F11")]
+        ));
+        assert!(!all_bindings_granted(
+            &requested,
+            &[("emergency", "Ctrl+F12")]
+        ));
+        assert!(!all_bindings_granted(
+            &requested,
+            &[("emergency", "Ctrl+F12"), ("next", " ")]
+        ));
     }
 }
 

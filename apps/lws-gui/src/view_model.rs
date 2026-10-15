@@ -37,8 +37,8 @@ use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
 use ui_text::{fill, fill_named, text, Key, Lang};
 
-pub mod layout;
 pub mod hotkeys;
+pub mod layout;
 
 /// How long a request may stay unanswered before the window says «Служба не отвечает».
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);

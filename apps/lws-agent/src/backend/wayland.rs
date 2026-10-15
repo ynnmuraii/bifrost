@@ -75,7 +75,9 @@ impl ShortcutTask {
                         None => break,
                     },
                 };
-                let Some(action) = shortcut_action(&id) else { continue };
+                let Some(action) = shortcut_action(&id) else {
+                    continue;
+                };
                 if action == config::HotkeyAction::EmergencyRelease {
                     if let Some(emergency) = &emergency {
                         if let Err(error) = emergency.release().await {
@@ -89,7 +91,10 @@ impl ShortcutTask {
             }
             let _ = shortcuts.close().await;
         });
-        Self { events, stop: Some(stop) }
+        Self {
+            events,
+            stop: Some(stop),
+        }
     }
 }
 
@@ -112,19 +117,41 @@ fn shortcut_action(id: &str) -> Option<config::HotkeyAction> {
     }
 }
 
-async fn register_shortcuts(bindings: &config::HotkeyBindings) -> Result<EmergencyShortcuts, String> {
+async fn register_shortcuts(
+    bindings: &config::HotkeyBindings,
+) -> Result<EmergencyShortcuts, String> {
     bindings.validate().map_err(|error| error.to_string())?;
     let requested = [
-        ("emergency", "LAN Workspace: emergency release", &bindings.emergency_release),
-        ("switch_next", "LAN Workspace: switch to next machine", &bindings.switch_next),
-        ("return_local", "LAN Workspace: return to this machine", &bindings.return_local),
-        ("claim_ownership", "LAN Workspace: claim keyboard and pointer ownership", &bindings.claim_ownership),
+        (
+            "emergency",
+            "LAN Workspace: emergency release",
+            &bindings.emergency_release,
+        ),
+        (
+            "switch_next",
+            "LAN Workspace: switch to next machine",
+            &bindings.switch_next,
+        ),
+        (
+            "return_local",
+            "LAN Workspace: return to this machine",
+            &bindings.return_local,
+        ),
+        (
+            "claim_ownership",
+            "LAN Workspace: claim keyboard and pointer ownership",
+            &bindings.claim_ownership,
+        ),
     ];
-    let requested: Vec<_> = requested.into_iter()
+    let requested: Vec<_> = requested
+        .into_iter()
         .filter(|(_, _, chord)| !chord.trim().is_empty())
-        .map(|(id, description, chord)| portal_trigger(chord).map(|trigger| (id, description, trigger)))
+        .map(|(id, description, chord)| {
+            portal_trigger(chord).map(|trigger| (id, description, trigger))
+        })
         .collect::<Result<_, _>>()?;
-    let borrowed: Vec<_> = requested.iter()
+    let borrowed: Vec<_> = requested
+        .iter()
         .map(|(id, description, trigger)| (*id, *description, trigger.as_str()))
         .collect();
     EmergencyShortcuts::register_bindings(&borrowed).await.map_err(|error| format!(
@@ -298,7 +325,9 @@ impl Wayland {
         // Establish the safety path before trying optional actions. The startup
         // SetHotkeys candidate replaces it only after every enabled action is granted.
         let initial = match portal_trigger(&hotkeys.emergency_release) {
-            Ok(trigger) => EmergencyShortcuts::register(&trigger).await.map_err(|error| error.to_string()),
+            Ok(trigger) => EmergencyShortcuts::register(&trigger)
+                .await
+                .map_err(|error| error.to_string()),
             Err(error) => Err(error),
         };
         let shortcuts = match initial {
@@ -353,7 +382,12 @@ impl Wayland {
             capture = None;
         }
         let shortcuts = shortcuts.map(|shortcuts| {
-            ShortcutTask::start(shortcuts, capture.as_ref().map(WaylandCapture::portal_emergency_release))
+            ShortcutTask::start(
+                shortcuts,
+                capture
+                    .as_ref()
+                    .map(WaylandCapture::portal_emergency_release),
+            )
         });
 
         // New tokens are core's to persist: `AgentAttach.restore_tokens` arrive from
@@ -445,7 +479,9 @@ impl Wayland {
         let candidate = register_shortcuts(bindings).await?;
         let candidate = ShortcutTask::start(
             candidate,
-            self.capture.as_ref().map(WaylandCapture::portal_emergency_release),
+            self.capture
+                .as_ref()
+                .map(WaylandCapture::portal_emergency_release),
         );
         self.shortcuts = Some(candidate);
         Ok(())
@@ -840,7 +876,10 @@ impl Wayland {
         self.injector.pump().await;
 
         let Wayland {
-            capture, shortcuts, hotkey_update, ..
+            capture,
+            shortcuts,
+            hotkey_update,
+            ..
         } = self;
         let shortcut = async {
             match shortcuts.as_mut() {
@@ -939,7 +978,8 @@ impl Wayland {
                 self.shortcuts = None;
                 Some(Event::Failed {
                     code: "HOTKEY_UNAVAILABLE",
-                    detail: "GlobalShortcuts portal session ended; hotkeys are unavailable".to_owned(),
+                    detail: "GlobalShortcuts portal session ended; hotkeys are unavailable"
+                        .to_owned(),
                 })
             }
             Step::Captured(None) => {
@@ -1324,12 +1364,14 @@ mod activation_tests {
     use super::*;
     #[test]
     fn portal_trigger_uses_xdg_modifier_and_keysym_names() {
-        assert_eq!(portal_trigger("Ctrl+Alt+Shift+F12").unwrap(), "CTRL+ALT+SHIFT+F12");
+        assert_eq!(
+            portal_trigger("Ctrl+Alt+Shift+F12").unwrap(),
+            "CTRL+ALT+SHIFT+F12"
+        );
         assert_eq!(portal_trigger("Super+Enter").unwrap(), "LOGO+Return");
         assert_eq!(portal_trigger("Ctrl+A").unwrap(), "CTRL+a");
         assert_eq!(portal_trigger("Alt+PageDown").unwrap(), "ALT+Next");
     }
-
 
     #[test]
     fn portal_ids_map_to_all_four_actions_without_falling_back_to_emergency() {

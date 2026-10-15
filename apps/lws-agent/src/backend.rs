@@ -99,7 +99,9 @@ pub fn wire_hotkey_action(action: config::HotkeyAction) -> ipc::HotkeyAction {
     }
 }
 
-pub fn hotkeys_from_wire(bindings: &[ipc::HotkeyBinding]) -> Result<config::HotkeyBindings, String> {
+pub fn hotkeys_from_wire(
+    bindings: &[ipc::HotkeyBinding],
+) -> Result<config::HotkeyBindings, String> {
     let mut parsed = config::HotkeyBindings::default();
     let mut seen = [false; 4];
     for binding in bindings {
@@ -132,12 +134,19 @@ pub fn hotkey_result(
     ipc::HotkeysResult {
         success,
         detail: detail.clone(),
-        bindings: bindings.iter().map(|(action, chord)| ipc::HotkeyBinding {
-            action: wire_hotkey_action(action) as i32,
-            chord: chord.to_owned(),
-            available: success && !chord.is_empty(),
-            detail: if chord.is_empty() { "Disabled".to_owned() } else { detail.clone() },
-        }).collect(),
+        bindings: bindings
+            .iter()
+            .map(|(action, chord)| ipc::HotkeyBinding {
+                action: wire_hotkey_action(action) as i32,
+                chord: chord.to_owned(),
+                available: success && !chord.is_empty(),
+                detail: if chord.is_empty() {
+                    "Disabled".to_owned()
+                } else {
+                    detail.clone()
+                },
+            })
+            .collect(),
     }
 }
 
@@ -148,12 +157,15 @@ mod hotkey_tests {
     #[test]
     fn complete_wire_set_roundtrips_and_rejects_partial_or_duplicate_updates() {
         let expected = config::HotkeyBindings::default();
-        let mut wire: Vec<_> = expected.iter().map(|(action, chord)| ipc::HotkeyBinding {
-            action: wire_hotkey_action(action) as i32,
-            chord: chord.to_owned(),
-            available: false,
-            detail: String::new(),
-        }).collect();
+        let mut wire: Vec<_> = expected
+            .iter()
+            .map(|(action, chord)| ipc::HotkeyBinding {
+                action: wire_hotkey_action(action) as i32,
+                chord: chord.to_owned(),
+                available: false,
+                detail: String::new(),
+            })
+            .collect();
         let parsed = hotkeys_from_wire(&wire).expect("complete update");
         for (action, chord) in expected.iter() {
             assert_eq!(parsed.get(action), chord);
@@ -1078,7 +1090,9 @@ impl Backend {
                     dry.hotkeys = bindings.clone();
                     Ok(())
                 }
-                Backend::Dry(_) => Err("global hotkeys are unavailable without a desktop backend".to_owned()),
+                Backend::Dry(_) => {
+                    Err("global hotkeys are unavailable without a desktop backend".to_owned())
+                }
                 #[cfg(windows)]
                 Backend::Win(backend) => backend.set_hotkeys(bindings),
                 #[cfg(target_os = "linux")]
@@ -1099,7 +1113,10 @@ impl Backend {
     }
 
     /// Queues portal approval without blocking heartbeats, deadlines, or capture polling.
-    pub async fn request_hotkeys(&mut self, bindings: config::HotkeyBindings) -> Option<ipc::HotkeysResult> {
+    pub async fn request_hotkeys(
+        &mut self,
+        bindings: config::HotkeyBindings,
+    ) -> Option<ipc::HotkeysResult> {
         if let Err(error) = bindings.validate() {
             return Some(hotkey_result(&bindings, Err(error.to_string()), ""));
         }
@@ -1777,7 +1794,10 @@ mod tests {
         let marker = dir.join("pressed");
         let mut dry = Dry::new(
             Ready::degraded("test", "platform-test", "windows"),
-            0, false, None, false,
+            0,
+            false,
+            None,
+            false,
         );
         dry.hotkey_file = Some(marker.clone());
         let mut backend = Backend::Dry(Box::new(dry));
@@ -1793,9 +1813,14 @@ mod tests {
         invalid.emergency_release.clear();
         assert!(!backend.set_hotkeys(&invalid).await.success);
         write(&marker, "2");
-        assert_eq!(backend.next_event().await, Some(Event::HotkeyPressed(config::HotkeyAction::SwitchNext)));
+        assert_eq!(
+            backend.next_event().await,
+            Some(Event::HotkeyPressed(config::HotkeyAction::SwitchNext))
+        );
         assert!(!marker.exists());
-        let Backend::Dry(dry) = &backend else { panic!("dry backend") };
+        let Backend::Dry(dry) = &backend else {
+            panic!("dry backend")
+        };
         assert_eq!(dry.hotkeys.emergency_release, bindings.emergency_release);
         std::fs::remove_dir_all(dir).expect("remove hotkey controls");
     }

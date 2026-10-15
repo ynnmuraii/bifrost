@@ -84,8 +84,11 @@ impl X11 {
             forwarding: false,
             pending_hotkeys: std::collections::VecDeque::new(),
             capture: Some({
-                let mut capture = X11Capture::new(CaptureKind::Observe).map_err(|error| error.to_string())?;
-                capture.set_hotkeys([None; 4]).map_err(|error| error.to_string())?;
+                let mut capture =
+                    X11Capture::new(CaptureKind::Observe).map_err(|error| error.to_string())?;
+                capture
+                    .set_hotkeys([None; 4])
+                    .map_err(|error| error.to_string())?;
                 capture
             }),
             injector: None,
@@ -113,23 +116,34 @@ impl X11 {
     }
 
     pub fn set_hotkeys(&mut self, bindings: &config::HotkeyBindings) -> Result<(), String> {
-        let capture = self.capture.as_mut().ok_or("X11 hotkey connection unavailable")?;
+        let capture = self
+            .capture
+            .as_mut()
+            .ok_or("X11 hotkey connection unavailable")?;
         let mut compiled = [None; 4];
         for (index, (_, chord)) in bindings.iter().enumerate() {
-            if chord.is_empty() { continue; }
+            if chord.is_empty() {
+                continue;
+            }
             let chord = config::Hotkey::parse(chord).map_err(|error| error.to_string())?;
             let keysym = platform_x11::hotkeys::keysym(chord.key())
                 .ok_or_else(|| format!("unsupported X11 hotkey key {}", chord.key()))?;
-            let keycode = capture.hotkey_keycode(keysym).map_err(|error| error.to_string())?;
-            let modifiers = chord.modifiers().iter().fold(0, |mask, modifier| mask | match modifier {
-                config::Modifier::Shift => 1,
-                config::Modifier::Ctrl => 4,
-                config::Modifier::Alt => 8,
-                config::Modifier::Super => 64,
+            let keycode = capture
+                .hotkey_keycode(keysym)
+                .map_err(|error| error.to_string())?;
+            let modifiers = chord.modifiers().iter().fold(0, |mask, modifier| {
+                mask | match modifier {
+                    config::Modifier::Shift => 1,
+                    config::Modifier::Ctrl => 4,
+                    config::Modifier::Alt => 8,
+                    config::Modifier::Super => 64,
+                }
             });
             compiled[index] = Some(platform_x11::hotkeys::Hotkey { keycode, modifiers });
         }
-        capture.set_hotkeys(compiled).map_err(|error| error.to_string())
+        capture
+            .set_hotkeys(compiled)
+            .map_err(|error| error.to_string())
     }
 
     /// Whether this backend owns a connection to the CLIPBOARD selection.
@@ -426,7 +440,9 @@ impl X11 {
                 }
                 // Rule 4: the emergency combination works on a receiver too.
                 Ok(Some(CapturedEvent::Emergency)) => return Some(Event::Emergency),
-                Ok(Some(CapturedEvent::HotkeyPressed(action))) => return Some(hotkey_event(action)),
+                Ok(Some(CapturedEvent::HotkeyPressed(action))) => {
+                    return Some(hotkey_event(action))
+                }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, "the receiver takeover detector stopped; disarming");
