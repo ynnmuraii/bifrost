@@ -29,14 +29,14 @@ const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
 /// The session object's interface, per the XDG desktop portal specification.
 const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
 
-type ActivationStream = Pin<Box<dyn Stream<Item = Activated> + Send>>;
+type ActivationStream = Pin<Box<dyn Stream<Item = Activated> + Send + Sync>>;
 
 /// A registered emergency hotkey.
 pub struct EmergencyShortcuts {
     session: Session<GlobalShortcuts>,
     session_path: String,
     activated: ActivationStream,
-    closed: Pin<Box<dyn Stream<Item = ()> + Send>>,
+    closed: Pin<Box<dyn Stream<Item = ()> + Send + Sync>>,
     trigger_description: Option<String>,
     trigger_descriptions: Vec<(String, String)>,
     portal_version: u32,
@@ -193,7 +193,7 @@ impl EmergencyShortcuts {
 /// needs no dependency of its own.
 async fn closed_stream(
     session_path: &str,
-) -> Result<Pin<Box<dyn Stream<Item = ()> + Send>>, WaylandError> {
+) -> Result<Pin<Box<dyn Stream<Item = ()> + Send + Sync>>, WaylandError> {
     let zbus_error = |error| WaylandError::Portal(ashpd::Error::Zbus(error));
     let connection = ashpd::zbus::Connection::session()
         .await
