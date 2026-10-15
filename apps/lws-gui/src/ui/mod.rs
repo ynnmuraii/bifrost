@@ -9,9 +9,11 @@
 //!
 //! Nothing in the drawing code asks for a frame on its own. [`draw`] returns when the *next*
 //! frame is due ([`Output::repaint_after`]) and only for things that really change with time:
-//! the particle field (30 fps, only while [`Env::animate`]) and the pairing countdown (1 Hz,
-//! only while a window is open). A window with the field off and no pairing window open draws
-//! when the user does something or the service says something, and never otherwise.
+//! the particle field (30 fps while the pointer is over the map and it still reports movement,
+//! and no frame at all once the particles have settled into the attracted or repelled state the
+//! pointer holds them in) and the pairing countdown (1 Hz, only while a window is open). A
+//! window with the field at rest and no pairing window open draws when the user does something
+//! or the service says something, and never otherwise.
 
 mod appearance;
 mod dock;
@@ -38,6 +40,11 @@ use widgets::{Dot, Icon, Kind, Run};
 const TOP_H: f32 = 60.0;
 /// The rail's width.
 const RAIL_W: f32 = 64.0;
+/// Where the rail's first slot starts, and how far apart the slots are.
+const RAIL_TOP: f32 = 12.0;
+const RAIL_SLOT: f32 = 50.0;
+/// The number the appearance button carries, so it matches the five sections above it.
+const APPEARANCE_NUM: &str = "06";
 /// Below this window width the dock is 2 × 2 and the peer pills are hidden.
 const NARROW: f32 = 1180.0;
 /// How long the field asks to wait between frames. eframe's event loop wakes a little before
@@ -290,82 +297,35 @@ fn rail_draw(
         Icon::Settings,
     ];
     let mut tip: Option<(Rect, &'static str)> = None;
+    // The six slots of the rail, in one column from the top and in one style: the five sections
+    // and, after them, appearance.
     for (i, modal) in Modal::ALL.iter().enumerate() {
-        // Settings sits at the bottom; the other five stack from the top.
-        let y = if *modal == Modal::Settings {
-            rect.min.y + 12.0 + 4.0 * 50.0 + 6.0
-        } else {
-            rect.min.y + 12.0 + i as f32 * 50.0
-        };
-        let btn = Rect::from_min_size(Pos2::new(rect.center().x - 22.0, y), Vec2::splat(44.0));
-        let response = ui
-            .interact(btn, ui.id().with(("rail", i)), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let btn = rail_slot(rect, i);
         let on = vm.modal == Some(*modal);
-        let hover = response.hovered() || response.has_focus();
-        if on {
-            painter.rect(
-                btn,
-                pal.rad_sm(),
-                pal.accent_soft,
-                Stroke::new(1.0, pal.accent),
-                egui::StrokeKind::Inside,
-            );
-        } else if hover {
-            painter.rect(
-                btn,
-                pal.rad_sm(),
-                pal.bg2,
-                pal.hairline(),
-                egui::StrokeKind::Inside,
-            );
-        }
-        let ink = if on {
-            pal.accent
-        } else if hover {
-            pal.ink
-        } else {
-            pal.ink2
-        };
-        widgets::paint_icon(&painter, icons[i], btn.center(), 20.0, ink);
-        let num = painter.layout_no_wrap(
-            modal.num().to_owned(),
-            font(8.0, fam::mono()),
-            Color32::PLACEHOLDER,
-        );
-        painter.add(egui::epaint::TextShape::new(
-            Pos2::new(
-                btn.max.x - 3.0 - num.size().x,
-                btn.max.y - 2.0 - num.size().y,
-            ),
-            num,
-            Color32::from_rgba_unmultiplied(ink.r(), ink.g(), ink.b(), 150),
-        ));
-        if hover {
-            tip = Some((btn, modal.title()));
-        }
-        if response.clicked() {
+        if rail_button(
+            ui,
+            pal,
+            btn,
+            icons[i],
+            modal.num(),
+            on,
+            &mut tip,
+            modal.title(),
+        ) {
             actions.push(Action::ToggleModal(*modal));
         }
     }
-    let appearance = Rect::from_min_size(
-        Pos2::new(rect.center().x - 22.0, rect.max.y - 62.0),
-        Vec2::splat(44.0),
-    );
-    let response = ui
-        .interact(appearance, ui.id().with("appearance"), Sense::click())
-        .on_hover_text("Оформление");
-    if response.hovered() || vm.appearance_open {
-        painter.rect_filled(appearance, pal.rad_sm(), pal.bg2);
-    }
-    widgets::paint_icon(
-        &painter,
+    let appearance = rail_slot(rect, Modal::ALL.len());
+    if rail_button(
+        ui,
+        pal,
+        appearance,
         Icon::Appearance,
-        appearance.center(),
-        20.0,
-        pal.ink2,
-    );
-    if response.clicked() {
+        APPEARANCE_NUM,
+        vm.appearance_open,
+        &mut tip,
+        "Оформление",
+    ) {
         actions.push(Action::ToggleAppearance);
     }
     if let Some((btn, title)) = tip {
@@ -391,6 +351,76 @@ fn rail_draw(
         );
     }
     appearance
+}
+
+/// Where the rail's slot `index` is: one column, from the top.
+fn rail_slot(rect: Rect, index: usize) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            rect.center().x - 22.0,
+            rect.min.y + RAIL_TOP + index as f32 * RAIL_SLOT,
+        ),
+        Vec2::splat(44.0),
+    )
+}
+
+/// One slot of the rail: the icon, its number in the corner, and the same hover and «on» look
+/// for every section. Returns `true` when it was clicked.
+#[allow(clippy::too_many_arguments)]
+fn rail_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    btn: Rect,
+    icon: Icon,
+    num: &str,
+    on: bool,
+    tip: &mut Option<(Rect, &'static str)>,
+    title: &'static str,
+) -> bool {
+    let painter = ui.painter().clone();
+    let response = ui
+        .interact(btn, ui.id().with(("rail", num)), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hover = response.hovered() || response.has_focus();
+    if on {
+        painter.rect(
+            btn,
+            pal.rad_sm(),
+            pal.accent_soft,
+            Stroke::new(1.0, pal.accent),
+            egui::StrokeKind::Inside,
+        );
+    } else if hover {
+        painter.rect(
+            btn,
+            pal.rad_sm(),
+            pal.bg2,
+            pal.hairline(),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let ink = if on {
+        pal.accent
+    } else if hover {
+        pal.ink
+    } else {
+        pal.ink2
+    };
+    widgets::paint_icon(&painter, icon, btn.center(), 20.0, ink);
+    let galley =
+        painter.layout_no_wrap(num.to_owned(), font(8.0, fam::mono()), Color32::PLACEHOLDER);
+    painter.add(egui::epaint::TextShape::new(
+        Pos2::new(
+            btn.max.x - 3.0 - galley.size().x,
+            btn.max.y - 2.0 - galley.size().y,
+        ),
+        galley,
+        Color32::from_rgba_unmultiplied(ink.r(), ink.g(), ink.b(), 150),
+    ));
+    if hover {
+        *tip = Some((btn, title));
+    }
+    response.clicked()
 }
 
 /// Convenience for the sub-modules: a plain button that pushes `action` when clicked.

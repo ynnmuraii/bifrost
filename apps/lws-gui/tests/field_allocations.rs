@@ -66,12 +66,11 @@ fn active_field_and_ascii_links_allocate_nothing_after_warmup() {
                 },
                 |ui| {
                     let pointer = Some(egui::pos2(300.0 + n as f32, 250.0));
-                    let animate = field.active(pointer, t, true);
                     let frame = FieldFrame {
                         map: ui.ctx().content_rect(),
                         pal: &pal,
                         look,
-                        animate,
+                        simulate: true,
                         t,
                         pointer,
                         flows: &[],

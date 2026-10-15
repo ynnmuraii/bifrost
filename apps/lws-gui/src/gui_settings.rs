@@ -12,14 +12,15 @@ use serde::{Deserialize, Serialize};
 /// The file name inside the configuration directory.
 pub const FILE_NAME: &str = "gui.toml";
 
-/// «Antigravity Light» or «Overmind Dark».
+/// «Светлая» or «Тёмная»: the same window with different colours, and the same radii. The
+/// stored values stay `light` and `dark`, so a file written before the rename still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
-    /// «Antigravity Light».
+    /// «Светлая».
     #[default]
     Light,
-    /// «Overmind Dark».
+    /// «Тёмная».
     Dark,
 }
 
@@ -57,27 +58,15 @@ pub enum LinkStyle {
     Line,
 }
 
-/// How fast they drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Pace {
-    /// «Спокойно».
-    #[default]
-    Calm,
-    /// «Живо».
-    Live,
-}
-
 /// The look of the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Look {
     /// The theme.
     pub theme: Theme,
     /// The particle field.
     pub field: FieldMode,
-    /// Its pace.
-    pub pace: Pace,
+    /// The speed of the particles, `SPEED_MIN..=SPEED_MAX`.
+    pub speed: f32,
     /// «ASCII-облака».
     pub clouds: bool,
     /// How links are drawn.
@@ -95,12 +84,21 @@ pub struct Look {
 /// The furthest the map may be panned, in points.
 pub const PAN_MAX: i16 = 2000;
 
+/// The slowest the particles may be told to chase.
+pub const SPEED_MIN: f32 = 0.3;
+/// The fastest.
+pub const SPEED_MAX: f32 = 2.0;
+/// The speed the slider starts at: exactly the pace «Спокойно».
+pub const SPEED_DEFAULT: f32 = 1.0;
+/// The speed «Живо» used to be, for a file that still says `pace = "live"`.
+const SPEED_LIVE: f32 = 1.8;
+
 impl Default for Look {
     fn default() -> Self {
         Look {
             theme: Theme::default(),
             field: FieldMode::default(),
-            pace: Pace::default(),
+            speed: SPEED_DEFAULT,
             clouds: true,
             link_style: LinkStyle::default(),
             zoom_percent: 100,
@@ -108,6 +106,88 @@ impl Default for Look {
             pan_y: 0,
             dock_open: true,
         }
+    }
+}
+
+/// The two-step pace of the window before the slider replaced it; read, never written.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Pace {
+    /// «Спокойно».
+    Calm,
+    /// «Живо».
+    Live,
+}
+
+impl Pace {
+    /// The speed the slider shows for it.
+    const fn speed(self) -> f32 {
+        match self {
+            Pace::Calm => SPEED_DEFAULT,
+            Pace::Live => SPEED_LIVE,
+        }
+    }
+}
+
+/// `gui.toml` as any version of the window may have written it.
+#[derive(Deserialize)]
+#[serde(default)]
+struct Stored {
+    theme: Theme,
+    field: FieldMode,
+    clouds: bool,
+    link_style: LinkStyle,
+    zoom_percent: u16,
+    pan_x: i16,
+    pan_y: i16,
+    dock_open: bool,
+    /// The slider, since it replaced the pace.
+    speed: Option<f32>,
+    /// The pace, as a file written before the slider still says it.
+    pace: Option<Pace>,
+}
+
+impl Default for Stored {
+    fn default() -> Self {
+        let look = Look::default();
+        Stored {
+            theme: look.theme,
+            field: look.field,
+            clouds: look.clouds,
+            link_style: look.link_style,
+            zoom_percent: look.zoom_percent,
+            pan_x: look.pan_x,
+            pan_y: look.pan_y,
+            dock_open: look.dock_open,
+            speed: None,
+            pace: None,
+        }
+    }
+}
+
+impl From<Stored> for Look {
+    fn from(stored: Stored) -> Look {
+        Look {
+            theme: stored.theme,
+            field: stored.field,
+            // A file with both says the speed; one with neither is a file of the pace era.
+            speed: stored
+                .speed
+                .or_else(|| stored.pace.map(Pace::speed))
+                .unwrap_or(SPEED_DEFAULT),
+            clouds: stored.clouds,
+            link_style: stored.link_style,
+            zoom_percent: stored.zoom_percent,
+            pan_x: stored.pan_x,
+            pan_y: stored.pan_y,
+            dock_open: stored.dock_open,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Look {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Stored::deserialize(deserializer)?.into())
     }
 }
 
@@ -123,6 +203,7 @@ pub fn load(path: &Path) -> Look {
         .and_then(|text| toml::from_str(&text).ok())
         .map(|mut look: Look| {
             look.zoom_percent = look.zoom_percent.clamp(70, 150);
+            look.speed = look.speed.clamp(SPEED_MIN, SPEED_MAX);
             look.pan_x = look.pan_x.clamp(-PAN_MAX, PAN_MAX);
             look.pan_y = look.pan_y.clamp(-PAN_MAX, PAN_MAX);
             look
@@ -157,7 +238,8 @@ mod tests {
         assert_eq!(look.theme, Theme::Light);
         assert_eq!(look.field, FieldMode::Attract);
         assert_eq!(look.link_style, LinkStyle::Ascii);
-        assert_eq!(look.pace, Pace::Calm);
+        assert_eq!(look.speed, SPEED_DEFAULT);
+        assert_eq!(look.speed, 1.0);
         assert!(look.clouds && look.dock_open);
         assert_eq!((look.pan_x, look.pan_y), (0, 0));
     }
@@ -169,7 +251,7 @@ mod tests {
         let look = Look {
             theme: Theme::Dark,
             field: FieldMode::Repel,
-            pace: Pace::Live,
+            speed: 1.4,
             clouds: false,
             link_style: LinkStyle::Line,
             zoom_percent: 125,
@@ -180,6 +262,33 @@ mod tests {
         save(&path, &look).expect("the directory is created");
         assert_eq!(load(&path), look);
         assert!(!path.with_extension("toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_two_step_pace_reads_as_the_speed_it_meant() {
+        let dir = dir("pace");
+        let path = path_in(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (stored, expected) in [
+            ("pace = \"calm\"", SPEED_DEFAULT),
+            ("pace = \"live\"", SPEED_LIVE),
+            ("pace = \"live\"\nspeed = 0.5", 0.5),
+        ] {
+            std::fs::write(&path, format!("{stored}\n")).expect("write");
+            let look = load(&path);
+            assert_eq!(look.speed, expected, "{stored}");
+            // The written file no longer carries a pace: the slider is the only fact.
+            save(&path, &look).expect("write");
+            let text = std::fs::read_to_string(&path).expect("read");
+            assert!(text.contains("speed = "), "{text}");
+            assert!(!text.contains("pace"), "{text}");
+        }
+        // And the speeds a file may hold are bounded like the slider bounds them.
+        for (stored, expected) in [(0.0, SPEED_MIN), (1.6, 1.6), (9.0, SPEED_MAX)] {
+            std::fs::write(&path, format!("speed = {stored}\n")).expect("write");
+            assert_eq!(load(&path).speed, expected);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

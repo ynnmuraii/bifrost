@@ -1591,6 +1591,14 @@ impl ViewModel {
             && member.node_id == status.owner_node_id
     }
 
+    /// `true` when this system's desktop has portals to forget: the Wayland backend, and only
+    /// it, so the window shows the «Порталы» row on Wayland and on nothing else.
+    pub fn uses_portals(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| status.backend == "platform-wayland")
+    }
+
     /// The backend in the words the owner reads.
     pub fn backend_label(&self) -> String {
         let Some(status) = &self.status else {

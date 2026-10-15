@@ -210,7 +210,7 @@ fn direct_field() {
                 map: ui.ctx().content_rect(),
                 pal: &pal,
                 look,
-                animate: true,
+                simulate: true,
                 t: t.as_secs_f32(),
                 pointer: Some(egui::pos2(300.0 + (n % 400) as f32, 250.0)),
                 flows: &[],

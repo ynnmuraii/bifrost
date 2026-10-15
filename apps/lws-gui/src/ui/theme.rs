@@ -1,7 +1,8 @@
 //! The design tokens of `mdf.css`, for both themes, and the embedded fonts.
 //!
-//! Every colour, radius and size here is a value of the mockup's `.mdf` / `.mdf[data-theme=dark]`
-//! blocks; nothing is derived from egui's own palette, so the window cannot drift from the
+//! Every colour here is a value of the mockup's `.mdf` / `.mdf[data-theme=dark]` blocks, and
+//! every radius and size a value of `.mdf` alone: the two themes are one design in two sets of
+//! colours. Nothing is derived from egui's own palette, so the window cannot drift from the
 //! design by an egui upgrade.
 
 use std::sync::Arc;
@@ -61,13 +62,15 @@ pub struct Palette {
     pub on_accent: Color32,
     /// The green of `.dot.ok`.
     pub ok: Color32,
-    /// `--r`.
-    pub r: u8,
-    /// `--r-sm`.
-    pub r_sm: u8,
-    /// `--r-btn`; 99 is the pill.
-    pub r_btn: u8,
 }
+
+/// `--r`: the radius of a card or a dialog. One style for both themes — the themes change
+/// colours and nothing else.
+pub const R: u8 = 16;
+/// `--r-sm`: the radius of a small control.
+pub const R_SM: u8 = 10;
+/// `--r-btn`: the radius of a button, which is the full pill.
+pub const R_BTN: u8 = 99;
 
 impl Palette {
     /// The tokens of `theme`.
@@ -91,9 +94,6 @@ impl Palette {
                     glow: rgba(37, 99, 235, 0.22),
                     on_accent: rgb(0xFFFFFF),
                     ok: rgb(0x10B981),
-                    r: 16,
-                    r_sm: 10,
-                    r_btn: 99,
                 }
             }
             Theme::Dark => {
@@ -114,9 +114,6 @@ impl Palette {
                     glow: rgba(255, 90, 46, 0.28),
                     on_accent: rgb(0x0B0B0A),
                     ok: rgb(0x10B981),
-                    r: 10,
-                    r_sm: 8,
-                    r_btn: 8,
                 }
             }
         }
@@ -124,18 +121,17 @@ impl Palette {
 
     /// `--r` as a corner radius.
     pub fn rad(&self) -> CornerRadius {
-        CornerRadius::same(self.r)
+        CornerRadius::same(R)
     }
 
     /// `--r-sm` as a corner radius.
     pub fn rad_sm(&self) -> CornerRadius {
-        CornerRadius::same(self.r_sm)
+        CornerRadius::same(R_SM)
     }
 
-    /// The corner radius of a control `height` tall: `--r-btn`, which is the full pill in the
-    /// light theme.
+    /// The corner radius of a control `height` tall: `--r-btn`, which is the full pill.
     pub fn rad_btn(&self, height: f32) -> CornerRadius {
-        CornerRadius::same(self.r_btn.min((height / 2.0) as u8))
+        CornerRadius::same(R_BTN.min((height / 2.0) as u8))
     }
 
     /// A 1 px stroke of `--hair`.
@@ -316,23 +312,23 @@ mod tests {
         let light = Palette::of(Theme::Light);
         assert_eq!(light.bg, Color32::from_rgb(0xFB, 0xFC, 0xFE));
         assert_eq!(light.accent, Color32::from_rgb(0x25, 0x63, 0xEB));
-        assert_eq!((light.r, light.r_sm, light.r_btn), (16, 10, 99));
         let dark = Palette::of(Theme::Dark);
         assert_eq!(dark.bg, Color32::from_rgb(0x0B, 0x0B, 0x0A));
         assert_eq!(dark.accent, Color32::from_rgb(0xFF, 0x5A, 0x2E));
         assert_eq!(dark.ink, Color32::from_rgb(0xEE, 0xEC, 0xE4));
-        assert_eq!((dark.r, dark.r_sm, dark.r_btn), (10, 8, 8));
     }
 
     #[test]
-    fn a_pill_is_half_its_height_and_a_dark_button_is_square_ish() {
-        assert_eq!(
-            Palette::of(Theme::Light).rad_btn(44.0),
-            CornerRadius::same(22)
-        );
-        assert_eq!(
-            Palette::of(Theme::Dark).rad_btn(44.0),
-            CornerRadius::same(8)
-        );
+    fn both_themes_share_one_rounded_style() {
+        let (light, dark) = (Palette::of(Theme::Light), Palette::of(Theme::Dark));
+        assert_eq!(light.rad(), dark.rad());
+        assert_eq!(light.rad_sm(), dark.rad_sm());
+        // The pill: a 44 px control is a half-round, in either theme.
+        for pal in [light, dark] {
+            assert_eq!(pal.rad(), CornerRadius::same(R));
+            assert_eq!(pal.rad_sm(), CornerRadius::same(R_SM));
+            assert_eq!(pal.rad_btn(44.0), CornerRadius::same(22));
+            assert_eq!(pal.rad_btn(38.0), CornerRadius::same(19));
+        }
     }
 }
