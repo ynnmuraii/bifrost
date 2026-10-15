@@ -207,6 +207,9 @@ pub struct Config {
     /// `[ui]`.
     #[serde(default)]
     pub ui: UiConfig,
+    /// `[appearance]`.
+    #[serde(default)]
+    pub appearance: AppearanceConfig,
     /// `[log]`.
     #[serde(default)]
     pub log: LogConfig,
@@ -227,6 +230,7 @@ impl Default for Config {
             input: InputConfig::default(),
             clipboard: ClipboardConfig::default(),
             ui: UiConfig::default(),
+            appearance: AppearanceConfig::default(),
             log: LogConfig::default(),
             topology: TopologyConfig::default(),
         }
@@ -934,6 +938,34 @@ pub struct UiConfig {
     /// Start on login; enabled only after a successful test.
     #[serde(default)]
     pub autostart: bool,
+}
+
+/// `[appearance]`: the small visual effects at linked edges. Read by the core and pushed to the
+/// agent (the overlay runs without the GUI); the GUI-local `gui.toml` is not involved.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppearanceConfig {
+    /// The ASCII strip that gathers toward the cursor at a linked edge, and its release on
+    /// the machine the cursor arrives at.
+    #[serde(default = "default_true")]
+    pub edge_effects: bool,
+    /// Hide the cursor on this machine while input is on another one (Windows: a small
+    /// veil window tied to the agent process; Wayland: the portal already hides it).
+    #[serde(default = "default_true")]
+    pub hide_remote_cursor: bool,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            edge_effects: true,
+            hide_remote_cursor: true,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// `[log]`.

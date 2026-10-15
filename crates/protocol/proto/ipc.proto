@@ -30,6 +30,8 @@ message AgentFrame {
     ForgetPortalGrants forget_portal_grants = 21; // drop stored restore tokens, re-ask the user
     StopRepeat stop_repeat = 22; // AC-14: `repeat_guard_ms` silent, stop repeating/let the keys up
     SetClipboardText set_clipboard_text = 23; // core -> agent: own the local CLIPBOARD and put this text on it
+    EdgeFx edge_fx = 24;                 // edge-effect frame for the overlay (cosmetic, rate-limited by core)
+    SetEffects set_effects = 25;         // live `[appearance]` update
 
     // agent -> core
     AgentReady ready = 40;
@@ -84,6 +86,8 @@ message AgentAttach {
   uint32 takeover_threshold_px = 9;        // `[input].takeover_threshold_px`: physical movement that ends a lease
   RepeatMode repeat_mode = 10;             // `[input].repeat_mode`: which engine repeats a held key here
   bool allow_portal_sessions = 11;          // false in RECOVERY or after a portal failure until manual retry
+  bool edge_effects = 12;                   // `[appearance].edge_effects`
+  bool hide_cursor = 13;                    // `[appearance].hide_remote_cursor`
 }
 
 // `[input].repeat_mode`: which side repeats a held key. ADR-006: one engine only — the
@@ -141,6 +145,15 @@ message ReleaseKeys { repeated HidKey keys = 1; repeated uint32 buttons = 2; } /
 message QueryDisplays {}
 message AgentShutdown {}
 message ForgetPortalGrants {} // drop stored restore tokens and let the portal ask again
+// ---------- edge effects (core -> agent; cosmetic, payload-free of input) ----------
+// Display-local logical px. PROXIMITY: the pointer is `distance` px from the linked edge segment
+// seg_start..seg_end (measured along the edge), `along` is the crossing point; sent at most 30 Hz and only
+// within reach of a linked edge. CROSSED: input left this machine (edge/along optional: set when no approach
+// was shown). ENTERED: input arrived at `along` on `edge`. LEFT: input left again. CLEAR: stop at once.
+enum EdgeFxKind { EDGE_FX_KIND_UNSPECIFIED = 0; EDGE_FX_PROXIMITY = 1; EDGE_FX_CROSSED = 2; EDGE_FX_ENTERED = 3; EDGE_FX_LEFT = 4; EDGE_FX_CLEAR = 5; }
+message EdgeFx { EdgeFxKind kind = 1; string display_id = 2; PortalEdge edge = 3; double seg_start = 4; double seg_end = 5; double along = 6; double distance = 7; }
+// Live settings (also carried by AgentAttach for the first values).
+message SetEffects { bool edge_effects = 1; bool hide_cursor = 2; }
 message Ping { uint64 nonce = 1; }
 
 message AgentReady {
@@ -258,6 +271,7 @@ message GuiFrame {
     PairingAnswer pairing_answer = 14;
     UpdateTopology update_topology = 15; // any node; the edit is forwarded to the coordinator
     SetClipboard set_clipboard = 16;
+    SetAppearance set_appearance = 30;
     RevokePeer revoke_peer = 17;
     ExportDiagnostics export_diagnostics = 18;
     ResetPortalGrants reset_portal_grants = 19; // forget restore tokens, re-ask the portal
@@ -292,6 +306,7 @@ message PairWith { string address = 1; }
 message PairingAnswer { bytes attempt_id = 1; bool approve = 2; }
 message UpdateTopology { bytes layout_toml = 1; uint64 expected_revision = 2; bytes expected_author = 3; } // any node; coordinator applies (CAS)
 message SetClipboard { bool enabled = 1; }
+message SetAppearance { bool edge_effects = 1; bool hide_remote_cursor = 2; } // core saves `[appearance]` under the config lock and pushes SetEffects to the agent at once
 message RevokePeer { bytes peer_node_id = 1; }
 message ExportDiagnostics { string target_path = 1; }
 message ResetPortalGrants {} // GUI: drop portal permissions for this node
@@ -322,6 +337,8 @@ message Status {
   string agent_degraded_reason = 22;        // last typed agent/portal failure or restart breaker reason
   bool agent_restart_circuit_open = 23;     // automatic restarts stopped; manual retry is available
   string transition_disabled_reason = 24;  // complete user-facing sentence; "" when transitions are available
+  bool edge_effects = 25;                  // `[appearance].edge_effects`: the ASCII strip at linked edges
+  bool hide_remote_cursor = 26;            // `[appearance].hide_remote_cursor`: hide the cursor here while input is elsewhere
 }
 message MemberStatus {
   string node_id = 1;

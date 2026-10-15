@@ -1006,6 +1006,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefx"
+version = "0.0.0"
+
+[[package]]
 name = "eframe"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -68,7 +68,8 @@ pub use lock::{update_locked, FileLock};
 pub use paths::{default_paths, Paths};
 pub use save::save_atomic;
 pub use schema::{
-    Backend, ClipboardConfig, ClipboardTransfer, Config, DisplayConfig, Edge, EndpointConfig,
+    AppearanceConfig, Backend, ClipboardConfig, ClipboardTransfer, Config, DisplayConfig, Edge,
+    EndpointConfig,
     InputConfig, Language, LinkConfig, LogConfig, LogLevel, NetworkConfig, NodeConfig, PeerConfig,
     PlatformConfig, RepeatMode, TakeoverDetection, TimingConfig, TopologyConfig, UiConfig,
     WorkspaceConfig,
