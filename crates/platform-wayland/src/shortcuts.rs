@@ -218,31 +218,6 @@ fn all_bindings_granted(requested: &[(&str, &str, &str)], returned: &[(&str, &st
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::all_bindings_granted;
-
-    #[test]
-    fn candidate_requires_every_action_and_nonempty_triggers() {
-        let requested = [
-            ("emergency", "release", "CTRL+F12"),
-            ("next", "next", "CTRL+F11"),
-        ];
-        assert!(all_bindings_granted(
-            &requested,
-            &[("emergency", "Ctrl+F12"), ("next", "Ctrl+F11")]
-        ));
-        assert!(!all_bindings_granted(
-            &requested,
-            &[("emergency", "Ctrl+F12")]
-        ));
-        assert!(!all_bindings_granted(
-            &requested,
-            &[("emergency", "Ctrl+F12"), ("next", " ")]
-        ));
-    }
-}
-
 /// Classifies a portal failure as "no emergency hotkey here" or as a real error.
 fn classify(error: ashpd::Error) -> WaylandError {
     let unavailable = match &error {
@@ -261,5 +236,29 @@ fn classify(error: ashpd::Error) -> WaylandError {
         }
     } else {
         WaylandError::Portal(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_bindings_granted;
+    #[test]
+    fn candidate_requires_every_action_and_nonempty_triggers() {
+        let requested = [
+            ("emergency", "release", "CTRL+F12"),
+            ("next", "next", "CTRL+F11"),
+        ];
+        assert!(all_bindings_granted(
+            &requested,
+            &[("emergency", "Ctrl+F12"), ("next", "Ctrl+F11")]
+        ));
+        assert!(!all_bindings_granted(
+            &requested,
+            &[("emergency", "Ctrl+F12")]
+        ));
+        assert!(!all_bindings_granted(
+            &requested,
+            &[("emergency", "Ctrl+F12"), ("next", " ")]
+        ));
     }
 }
