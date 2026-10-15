@@ -300,7 +300,10 @@ fn run(rx: &Receiver<Command>, enabled: bool, ready: &Sender<u32>) {
                         veil.engage(hold(&probe), &mut host);
                     }
                     Command::SetEnabled(on) => veil.set_enabled(on, hold(&probe), &mut host),
-                    Command::Release => veil.release(&mut host),
+                    Command::Release => {
+                        probe = None;
+                        veil.release(&mut host);
+                    }
                 }
             }
         } else if message.hwnd == hwnd && message.message == WM_TIMER {

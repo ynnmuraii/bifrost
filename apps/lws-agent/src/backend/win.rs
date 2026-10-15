@@ -6,6 +6,10 @@
 //! through), injection is `Injector::inject`. This module is the thin translation
 //! between those and the agent's vocabulary.
 //!
+//! Edge effects use the addressed monitor's native placement. The Remote cursor veil
+//! independently probes capture atomics, so emergency/expiry/stop hide it even if the
+//! session task cannot process its release notification.
+//!
 //! Known gaps of this slice, stated rather than hidden:
 //!
 //! * `EndCapture` drops the capture object, which uninstalls the hooks; re-arming
@@ -72,6 +76,8 @@ pub struct Win {
     pending_source_seed: bool,
     injector: Injector,
     emergency: EmergencyCombo,
+    cursor_veil: platform_win::veil::CursorVeil,
+    edge_strip: platform_win::strip::EdgeStrip,
     /// The receiver-takeover detector, when `[input].takeover_detection` armed it.
     ///
     /// It is a *second*, observe-only capture: while this node is a receiver its own
@@ -150,6 +156,8 @@ impl Win {
             pending_source_seed: false,
             injector: Injector::new(),
             emergency,
+            cursor_veil: platform_win::veil::CursorVeil::new(true),
+            edge_strip: platform_win::strip::EdgeStrip::new(true),
             detector: None,
             plan,
             repeats: RepeatFilter::new(),
@@ -164,6 +172,36 @@ impl Win {
 
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    pub fn set_effects(&mut self, edge_effects: bool, hide_cursor: bool) {
+        self.edge_strip.set_enabled(edge_effects);
+        self.cursor_veil.set_enabled(hide_cursor);
+        if hide_cursor {
+            if let Some(capture) = &self.capture {
+                if capture.mode() == CaptureKind::Remote {
+                    self.cursor_veil.engage(capture.cursor_probe());
+                }
+            }
+        }
+    }
+
+    pub fn edge_fx(&mut self, display_id: &str, update: edgefx::Update) {
+        let Ok(monitors) = platform_win::displays::enumerate() else {
+            return;
+        };
+        if let Some(monitor) = monitors
+            .iter()
+            .find(|monitor| monitor.id == display_id || monitor.device_name == display_id)
+        {
+            self.edge_strip.send(
+                update,
+                platform_win::strip::Placement {
+                    native: monitor.native,
+                    scale: monitor.scale as f32,
+                },
+            );
+        }
     }
 
     /// Whether this backend's clipboard listener is up.
@@ -306,6 +344,13 @@ impl Win {
                 self.capture = Some(capture);
             }
         }
+        if kind == CaptureKind::Remote {
+            if let Some(capture) = &self.capture {
+                self.cursor_veil.engage(capture.cursor_probe());
+            }
+        } else {
+            self.cursor_veil.release();
+        }
         self.last_capture_stats = self
             .capture
             .as_ref()
@@ -323,6 +368,7 @@ impl Win {
 
     pub fn end_capture(&mut self) -> Result<Released, String> {
         self.report_capture_stats(true);
+        self.cursor_veil.release();
         // Dropping the capture stops its thread and uninstalls both hooks, so
         // nothing of this session can keep suppressing input (S1/S2/S3).
         if self.capture.take().is_none() {
@@ -413,6 +459,7 @@ impl Win {
     }
 
     pub fn release_session(&mut self) -> Released {
+        self.cursor_veil.release();
         // `ReleaseSession` ends the receiver side of a lease as surely as `EndCapture`.
         self.disarm_detector();
         let keys_before = self.injector.ledger().key_count();
