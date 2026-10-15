@@ -754,7 +754,7 @@ impl Session {
         let address = connection.address.to_string();
         tokio::spawn(async move {
             match within(
-                OPENER_HELLO_TIMEOUT,
+                opener_hello_timeout(&window, identity::now_unix_ms() as u64),
                 identity::accept_stream(
                     connection.stream,
                     &identity,
@@ -1109,6 +1109,12 @@ fn node_id_of(bytes: &[u8]) -> Option<geometry::NodeId> {
 /// hold one of the three pending slots, a task and a socket until the window closes.
 const OPENER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn opener_hello_timeout(window: &identity::PairingWindow, now_ms: u64) -> Duration {
+    OPENER_HELLO_TIMEOUT.min(Duration::from_millis(
+        window.deadline_ms().saturating_sub(now_ms),
+    ))
+}
+
 /// `future` under `limit`; a timeout is an error like any other failure of the ceremony.
 async fn within<T, E: std::fmt::Display>(
     limit: Duration,
@@ -1126,6 +1132,20 @@ async fn within<T, E: std::fmt::Display>(
 #[cfg(test)]
 mod opener_tests {
     use super::*;
+
+    #[test]
+    fn handshake_deadline_never_outlives_its_pairing_window() {
+        let window = identity::PairingWindow::open(0, [1; 16]);
+        assert_eq!(opener_hello_timeout(&window, 0), OPENER_HELLO_TIMEOUT);
+        assert_eq!(
+            opener_hello_timeout(&window, window.deadline_ms() - 1),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            opener_hello_timeout(&window, window.deadline_ms()),
+            Duration::ZERO
+        );
+    }
 
     /// Review R5': a silent dialer must fail the ceremony instead of holding its slot.
     #[tokio::test]
