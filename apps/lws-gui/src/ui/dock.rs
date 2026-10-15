@@ -59,15 +59,32 @@ pub fn draw(
     let response = ui
         .interact(handle, ui.id().with("dock-toggle"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    painter.text(
-        handle.center(),
-        egui::Align2::CENTER_CENTER,
-        if vm.look.dock_open {
-            "Сопряжение  ▾"
-        } else {
-            "Сопряжение  ▴"
-        },
+    let label = painter.layout_no_wrap(
+        "Сопряжение".to_owned(),
         font(12.0, fam::sans_medium()),
+        pal.ink2,
+    );
+    let center = handle.center();
+    let start = center.x - (label.size().x + 22.0) / 2.0;
+    let chevron = Pos2::new(start + 5.0, center.y);
+    let direction = if vm.look.dock_open { 1.0 } else { -1.0 };
+    painter.line_segment(
+        [
+            chevron + Vec2::new(-4.0, -2.0 * direction),
+            chevron + Vec2::new(0.0, 2.0 * direction),
+        ],
+        Stroke::new(1.5, pal.ink2),
+    );
+    painter.line_segment(
+        [
+            chevron + Vec2::new(0.0, 2.0 * direction),
+            chevron + Vec2::new(4.0, -2.0 * direction),
+        ],
+        Stroke::new(1.5, pal.ink2),
+    );
+    painter.galley(
+        Pos2::new(start + 22.0, center.y - label.size().y / 2.0),
+        label,
         pal.ink2,
     );
     if response.clicked() {

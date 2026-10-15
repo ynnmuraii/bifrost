@@ -134,7 +134,8 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
             "Workstation",
             "linux-box",
             "1920×1080",
-            "Тяните компьютер — края примагнитятся",
+            "ввод здесь",
+            "в сети",
             "ЭТОТ КОМПЬЮТЕР",
             "ОКНО СОПРЯЖЕНИЯ",
             "ПОДКЛЮЧИТЬСЯ ПО АДРЕСУ",
@@ -145,6 +146,35 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
         ],
     );
     assert!(shows(&frame, ":47901"), "the port the other computer dials");
+    for removed in [
+        "Связь краёв",
+        "Сюда идёт ввод",
+        "Размер приблизительный",
+        "Тяните компьютер — края примагнитятся",
+        "Ввод ",
+        "осн.",
+        "← ввод",
+        "ввод →",
+    ] {
+        assert!(
+            !frame.texts.iter().any(|text| text == removed),
+            "{removed} must not be drawn"
+        );
+    }
+}
+
+#[test]
+fn collapsed_pairing_keeps_only_its_clear_expand_handle() {
+    let mut vm = connected();
+    vm.look.dock_open = false;
+    let mut harness = Harness::new();
+    let frame = harness.settle(&vm, false);
+    expect(&frame, &["Сопряжение"]);
+    assert!(!shows(&frame, "Открыть окно сопряжения"));
+    assert!(!shows(&frame, "Сопряжение  ?"));
+    let at = egui::pos2((SIZE.x - 64.0) / 2.0, SIZE.y - 16.0);
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(frame.output.actions.contains(&Action::ToggleDock));
 }
 
 #[test]
@@ -177,8 +207,6 @@ fn a_window_with_no_service_says_so_and_offers_to_start_it() {
 #[test]
 fn every_modal_shows_its_own_real_data() {
     let mut vm = connected();
-    vm.config.switch_hotkey = "Ctrl+Alt+Shift+Right".to_owned();
-    vm.config.claim_hotkey = "Ctrl+Alt+Shift+F11".to_owned();
     vm.settings.lan.candidates = vec!["192.168.1.24".to_owned(), "10.0.0.5".to_owned()];
     let cases: [(Modal, &[&str]); 5] = [
         (
@@ -188,7 +216,14 @@ fn every_modal_shows_its_own_real_data() {
         (
             Modal::Keys,
             // The emergency chord is the one `Status` carries, key by key.
-            &["Клавиши", "АВАРИЙНАЯ", "F12", "Shift", "→", "F11"],
+            &[
+                "Клавиши",
+                "АВАРИЙНАЯ",
+                "F12",
+                "Shift",
+                "Этот компьютер уже координатор",
+                "Открыть файл настроек",
+            ],
         ),
         (Modal::Clip, &["Буфер обмена", "Включён", "Только текст"]),
         (
@@ -209,11 +244,18 @@ fn every_modal_shows_its_own_real_data() {
         vm.local(&Action::ToggleModal(modal));
         let mut harness = Harness::new();
         // The reveal takes 0.32 s of the window's clock; step past it.
-        harness.frame(&vm, false, SIZE, Vec::new());
+        let size = egui::vec2(1280.0, 720.0);
+        harness.frame(&vm, false, size, Vec::new());
         harness.now += Duration::from_millis(500);
-        harness.frame(&vm, false, SIZE, Vec::new());
-        let frame = harness.frame(&vm, false, SIZE, Vec::new());
+        harness.frame(&vm, false, size, Vec::new());
+        let frame = harness.frame(&vm, false, size, Vec::new());
         expect(&frame, needles);
+        if modal == Modal::Keys {
+            for absent in ["ПЕРЕКЛЮЧЕНИЕ", "F11", "ИСТОЧНИК", "config.toml · секци"]
+            {
+                assert!(!shows(&frame, absent), "unexpected {absent:?}");
+            }
+        }
     }
 }
 

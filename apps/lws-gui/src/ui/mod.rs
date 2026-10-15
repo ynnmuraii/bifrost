@@ -160,7 +160,7 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
     out
 }
 
-/// The top bar: brand, service, route, peers, theme.
+/// The top bar: brand, service and theme.
 fn topbar(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -225,18 +225,6 @@ fn topbar(
         runs.push(Run::strong(address, pal.ink));
     }
     widgets::pill(bar, pal, Some(dot), &runs);
-
-    let route = vm.route_text();
-    let live = vm.status.is_some() && connected;
-    widgets::pill(
-        bar,
-        pal,
-        Some(if live { Dot::Live } else { Dot::Off }),
-        &[
-            Run::plain("Ввод ", pal.ink2),
-            Run::strong(&route, if live { pal.accent } else { pal.ink }),
-        ],
-    );
 
     bar.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;

@@ -3,6 +3,10 @@
 //! The opening is the only animation here: the dialog is revealed top-down in eight steps over
 //! 0.32 s (the mockup's `steps(8)` clip-path), and the next frame is requested only until that
 //! is done.
+//!
+//! Modal bodies scroll independently of their fixed header and footer. Every final row
+//! keeps 16 px below its contents; Keys lists the implemented emergency shortcut and
+//! retains the manual ownership control, without advertising unhandled config hotkeys.
 
 use eframe::egui::{
     self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2,
@@ -313,11 +317,8 @@ fn row(ui: &mut egui::Ui, pal: &Palette, label: &str, last: bool, add: impl FnOn
         },
     );
     let bottom = inner.response.rect.max.y.max(top + 20.0) + 16.0;
-    let used = bottom - ui.cursor().min.y;
-    ui.allocate_space(Vec2::new(
-        right - left,
-        (used - inner.response.rect.height()).max(0.0) + 0.0,
-    ));
+    // The scope already advanced the cursor past its contents, not the row padding.
+    ui.add_space((bottom - ui.cursor().min.y).max(0.0));
     if !last {
         painter.line_segment(
             [
@@ -355,7 +356,7 @@ fn footer(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
 
 fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let peers = vm.peers();
-    for peer in &peers {
+    for (index, peer) in peers.iter().enumerate() {
         let left = ui.max_rect().left();
         let right = ui.max_rect().right();
         let top = ui.cursor().min.y + 14.0;
@@ -438,7 +439,7 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
         if widgets::button(&mut child, pal, "Удалить", Kind::Plain, !asking).clicked() {
             actions.push(Action::SelectRevoke(Some(peer.node_id.clone())));
         }
-        ui.allocate_space(Vec2::new(right - left, 14.0 + 44.0 + 14.0));
+        ui.allocate_space(Vec2::new(right - left, 14.0 + 44.0 + 16.0));
         if asking {
             let id = peer.node_id.clone();
             ui.horizontal(|ui| {
@@ -474,13 +475,15 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
             });
             ui.add_space(16.0);
         }
-        painter.line_segment(
-            [
-                Pos2::new(left, ui.cursor().min.y - 0.5),
-                Pos2::new(right, ui.cursor().min.y - 0.5),
-            ],
-            pal.hairline(),
-        );
+        if index + 1 < peers.len() {
+            painter.line_segment(
+                [
+                    Pos2::new(left, ui.cursor().min.y - 0.5),
+                    Pos2::new(right, ui.cursor().min.y - 0.5),
+                ],
+                pal.hairline(),
+            );
+        }
     }
     if peers.is_empty() {
         row(ui, pal, "Пусто", true, |ui| {
@@ -531,12 +534,7 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
             });
         }
     });
-    row(ui, pal, "Переключение", false, |ui| {
-        widgets::chord(ui, pal, &vm.config.switch_hotkey);
-        widgets::hint(ui, pal, "Отдать ввод следующему компьютеру по раскладке");
-    });
-    row(ui, pal, "Взять управление", false, |ui| {
-        widgets::chord(ui, pal, &vm.config.claim_hotkey);
+    row(ui, pal, "Взять управление", true, |ui| {
         widgets::hint(ui, pal, "Сделать этот компьютер координатором");
         let owner = vm.status.as_ref().is_some_and(|s| s.is_owner);
         act(
@@ -552,21 +550,6 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
             actions,
             || Action::Claim,
         );
-    });
-    row(ui, pal, "Источник", true, |ui| {
-        let file = vm.config.config_file.display().to_string();
-        let text = if file.is_empty() {
-            "config.toml · секция [input]".to_owned()
-        } else {
-            format!("{file} · секции [input], [workspace]")
-        };
-        let galley = ui.painter().layout(
-            text,
-            font(12.0, fam::mono()),
-            pal.ink2,
-            ui.available_width(),
-        );
-        widgets::show_galley(ui, galley);
     });
 }
 
@@ -779,4 +762,27 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             },
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_keep_bottom_padding_after_short_and_tall_content() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let pal = Palette::of(Theme::Dark);
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            for height in [20.0, 120.0] {
+                let mut content_bottom = 0.0;
+                row(ui, &pal, "Row", true, |ui| {
+                    content_bottom = ui.allocate_space(Vec2::new(100.0, height)).1.bottom();
+                });
+                assert!((ui.cursor().min.y - content_bottom - 16.0).abs() < 0.5);
+            }
+        });
+        output.drop_without_applying_deltas();
+    }
 }

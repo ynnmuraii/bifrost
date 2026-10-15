@@ -351,7 +351,6 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
         model.links[0].whole_desktop,
         "an `auto` link is the whole desktop"
     );
-    assert_eq!(model.links[0].label, "весь стол");
     assert_eq!(model.links[0].state, LinkState::Idle);
     assert!(!model.dirty);
     // No draft: the document is sent back exactly as it was, link id included.
@@ -946,7 +945,6 @@ fn the_route_and_link_state_follow_the_core() {
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
     vm.apply(event(Msg::TopologyDoc(linked_doc(7))));
     vm.on_connected("endpoint");
-    assert_eq!(vm.route_text(), "этот компьютер");
     let map = vm.map_model();
     let peer = index_of(&vm, PEER_NODE);
     assert!(!map.nodes[peer].target);
@@ -955,12 +953,10 @@ fn the_route_and_link_state_follow_the_core() {
     // Input is on the other computer: the route says so, the link carries it, and the button
     // brings it back (a second `switch` while Remote is the return edge).
     vm.apply(event(Msg::Status(status_with("REMOTE"))));
-    assert_eq!(vm.route_text(), "Workstation → linux-box");
     let map = vm.map_model();
     assert!(map.nodes[peer].target);
-    assert_eq!(map.nodes[peer].focus, "● клавиатура и мышь здесь");
+    assert_eq!(map.nodes[peer].focus, "ввод здесь");
     assert_eq!(map.links[0].state, LinkState::Active);
-    assert_eq!(map.links[0].label, "ввод →");
     assert_eq!(map.nodes[peer].mons[0].tag, "ввод");
 
     // An offline peer: nothing to switch to, and its link is drawn offline.
@@ -971,8 +967,8 @@ fn the_route_and_link_state_follow_the_core() {
     doc.members[1].online = false;
     vm.apply(event(Msg::TopologyDoc(doc)));
     assert_eq!(vm.map_model().links[0].state, LinkState::Offline);
-    assert_eq!(vm.map_model().links[0].label, "офлайн");
-    assert_eq!(vm.map_model().nodes[peer].mons[0].tag, "офлайн");
+    assert_eq!(vm.map_model().nodes[peer].focus, "офлайн");
+    assert_eq!(vm.map_model().nodes[peer].mons[0].tag, "");
 }
 
 #[test]
