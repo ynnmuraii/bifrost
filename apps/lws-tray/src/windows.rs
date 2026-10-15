@@ -17,11 +17,13 @@ const STOP: u32 = WM_APP + 3;
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
+use std::cell::RefCell;
 struct Window {
     state: watch::Receiver<State>,
     commands: mpsc::UnboundedSender<Action>,
-    icon: NOTIFYICONDATAW,
+    icon: RefCell<NOTIFYICONDATAW>,
     taskbar_created: u32,
+    ready: lws_desktop::TrayReady,
 }
 
 // SAFETY: Windows calls this on the creating thread. GWLP_USERDATA points to the
@@ -35,9 +37,13 @@ unsafe extern "system" fn procedure(
     unsafe {
         let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Window;
         if !data.is_null() {
-            let window = &mut *data;
+            // A shared reference only: the nested loop of `TrackPopupMenu` dispatches more
+            // messages into this function while an outer call is still live.
+            let window = &*data;
             if message == window.taskbar_created {
-                Shell_NotifyIconW(NIM_ADD, &window.icon);
+                window
+                    .ready
+                    .set(Shell_NotifyIconW(NIM_ADD, &*window.icon.borrow()) != 0);
                 return 0;
             }
             match message {
@@ -89,23 +95,20 @@ unsafe extern "system" fn procedure(
                     return 0;
                 }
                 UPDATE => {
-                    let latest = window.state.borrow_and_update();
+                    let latest = window.state.borrow();
                     let text = latest
                         .items()
                         .get(1)
                         .map(|i| i.label.clone())
                         .unwrap_or_else(|| "MultiDeskFlow".into());
-                    window.icon.szTip.fill(0);
-                    for (slot, ch) in window
-                        .icon
-                        .szTip
-                        .iter_mut()
-                        .take(127)
-                        .zip(text.encode_utf16())
-                    {
+                    // The icon is borrowed only for these statements, never across a
+                    // nested message loop (`TrackPopupMenu` below re-enters this function).
+                    let mut icon = window.icon.borrow_mut();
+                    icon.szTip.fill(0);
+                    for (slot, ch) in icon.szTip.iter_mut().take(127).zip(text.encode_utf16()) {
                         *slot = ch;
                     }
-                    Shell_NotifyIconW(NIM_MODIFY, &window.icon);
+                    Shell_NotifyIconW(NIM_MODIFY, &*icon);
                     return 0;
                 }
                 STOP | WM_CLOSE => {
@@ -113,7 +116,8 @@ unsafe extern "system" fn procedure(
                     return 0;
                 }
                 WM_DESTROY => {
-                    Shell_NotifyIconW(NIM_DELETE, &window.icon);
+                    window.ready.set(false);
+                    Shell_NotifyIconW(NIM_DELETE, &*window.icon.borrow());
                     PostQuitMessage(0);
                     return 0;
                 }
@@ -127,6 +131,7 @@ unsafe extern "system" fn procedure(
 pub(super) fn run(
     state: watch::Receiver<State>,
     commands: mpsc::UnboundedSender<Action>,
+    ready: lws_desktop::TrayReady,
 ) -> Result<(), String> {
     // SAFETY: all native objects are created and destroyed on this thread. Only
     // PostMessageW crosses threads; it does not dereference the window's user data.
@@ -209,18 +214,18 @@ pub(super) fn run(
         for (slot, ch) in notify.szTip.iter_mut().zip("MultiDeskFlow".encode_utf16()) {
             *slot = ch;
         }
-        let mut window = Box::new(Window {
+        let window = Box::new(Window {
             state: state.clone(),
             commands,
-            icon: notify,
+            icon: RefCell::new(notify),
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
+            ready,
         });
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *window as *mut Window) as isize);
-        if Shell_NotifyIconW(NIM_ADD, &window.icon) == 0 {
-            DestroyWindow(hwnd);
-            DestroyIcon(icon);
-            UnregisterClassW(class.as_ptr(), instance);
-            return Err(std::io::Error::last_os_error().to_string());
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*window as *const Window) as isize);
+        // Explorer may not have a taskbar yet (early autostart): that is not fatal. The
+        // `TaskbarCreated` broadcast re-adds the icon, and only then is the tray "ready".
+        if Shell_NotifyIconW(NIM_ADD, &*window.icon.borrow()) != 0 {
+            window.ready.set(true);
         }
         // A watch receiver blocks without polling; status broadcasts wake the native loop.
         let address = hwnd as usize;

@@ -1,10 +1,16 @@
 use crate::{menu::Action, State};
 use ksni::TrayMethods;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc, watch};
 
 struct Tray {
     state: State,
     commands: mpsc::UnboundedSender<Action>,
+    ready: lws_desktop::TrayReady,
+    watcher_up: Arc<AtomicBool>,
 }
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
@@ -48,28 +54,51 @@ impl ksni::Tray for Tray {
             })
             .collect()
     }
+    fn watcher_online(&self) {
+        self.watcher_up.store(true, Ordering::Release);
+        self.ready.set(true);
+    }
+    fn watcher_offline(&self, _: ksni::OfflineReason) -> bool {
+        // No StatusNotifierWatcher (yet): keep running, the icon appears when one does.
+        self.watcher_up.store(false, Ordering::Release);
+        self.ready.set(false);
+        true
+    }
 }
 
 pub(super) fn run(
     mut state: watch::Receiver<State>,
     commands: mpsc::UnboundedSender<Action>,
+    ready: lws_desktop::TrayReady,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async move {
+        let watcher_up = Arc::new(AtomicBool::new(true));
         let tray = Tray {
             state: state.borrow().clone(),
             commands,
+            ready: ready.clone(),
+            watcher_up: watcher_up.clone(),
         };
-        let handle = tray.spawn().await.map_err(|e| e.to_string())?;
+        // A desktop whose tray host starts after us (KDE autostart before plasmashell, GNOME
+        // without the extension yet) must not make the tray give up: the soft error goes to
+        // `watcher_offline`, and `watcher_online` raises the flag when the host appears.
+        let handle = tray
+            .assume_sni_available(true)
+            .spawn()
+            .await
+            .map_err(|e| e.to_string())?;
+        ready.set(watcher_up.load(Ordering::Acquire));
         while state.changed().await.is_ok() {
             let latest = state.borrow_and_update().clone();
             if handle.update(|tray| tray.state = latest).await.is_none() {
                 break;
             }
         }
+        ready.set(false);
         handle.shutdown().await;
         Ok(())
     })

@@ -60,6 +60,22 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // The tray is started with the window, not after it closes: by the time the user closes the
+    // window the icon is normally there, and the close handler (`app::close_decision`) can
+    // refuse to leave the user with neither.
+    let tray_args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+    {
+        let tray_args = tray_args.clone();
+        let _ = std::thread::Builder::new()
+            .name("lws-tray-start".into())
+            .spawn(move || {
+                if let Err(error) =
+                    lws_desktop::start_tray(&tray_args, lws_desktop::TRAY_START_TIMEOUT)
+                {
+                    eprintln!("multideskflow gui: tray: {error}");
+                }
+            });
+    }
     let options = app::native_options();
     let result = eframe::run_native(
         TITLE,
@@ -77,10 +93,14 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
     );
     match result {
         Ok(()) => {
-            let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-            if let Err(error) = lws_desktop::spawn_role(lws_desktop::Role::Tray, &args) {
-                eprintln!("multideskflow gui: tray: {error}");
-                return std::process::ExitCode::FAILURE;
+            // The close handler only lets the window go while the icon is up; this covers a
+            // tray that died in between.
+            if !lws_desktop::tray_is_ready() {
+                if let Err(error) =
+                    lws_desktop::start_tray(&tray_args, lws_desktop::TRAY_START_TIMEOUT)
+                {
+                    eprintln!("multideskflow gui: tray: {error}");
+                }
             }
             std::process::ExitCode::SUCCESS
         }
