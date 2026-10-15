@@ -638,7 +638,9 @@ fn clip_body(
                 if widgets::small_button(ui, pal, text(lang, Key::Cancel), true).clicked() {
                     st.confirm_clear_history = false;
                 }
-                if widgets::small_button(ui, pal, text(lang, Key::ClearHistory), connected).clicked() {
+                if widgets::small_button(ui, pal, text(lang, Key::ClearHistory), connected)
+                    .clicked()
+                {
                     actions.push(Action::ClearClipboardHistory);
                     st.confirm_clear_history = false;
                 }
@@ -695,7 +697,9 @@ fn clip_body(
                 );
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if widgets::small_button(ui, pal, text(lang, Key::Copy), connected).clicked() {
+                        if widgets::small_button(ui, pal, text(lang, Key::Copy), connected)
+                            .clicked()
+                        {
                             actions.push(Action::CopyClipboardHistory(entry.id));
                         }
                         ui.add(
