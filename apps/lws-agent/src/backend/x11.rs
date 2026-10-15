@@ -7,10 +7,8 @@
 //!
 //! Known gaps of this slice, stated rather than hidden:
 //!
-//! * The emergency combination comes from the platform crate's fixed F12 keycode
-//!   (`platform_x11::EMERGENCY_F12_X11_KEYCODE`), not from
-//!   `AgentAttach.emergency_hotkey`; the X11 spike never took the combination as a
-//!   parameter. The keycode is checked against the current XKB map by that crate.
+//! * Global actions use lifetime passive key grabs, while remote capture retains its
+//!   active keyboard/pointer grabs. The fixed emergency chord remains an additional safety path.
 //! * Temporary capture leaves the X11 grabs released. Discrete local events
 //!   are not forwarded or buffered for replay.
 
@@ -28,6 +26,8 @@ use input_model::RepeatFilter;
 pub struct X11 {
     ready: Ready,
     capture: Option<X11Capture>,
+    forwarding: bool,
+    pending_hotkeys: std::collections::VecDeque<Event>,
     injector: Option<X11Injector>,
     /// The receiver-takeover detector, when `[input].takeover_detection` armed it.
     ///
@@ -57,28 +57,13 @@ pub struct X11 {
 }
 
 impl X11 {
-    /// Builds the X11 backend. The capture and injection connections are opened lazily, so a
-    /// source that never injects and a receiver that never captures each pay for one; the
-    /// clipboard's connection is opened here because the capability reported in `AgentReady`
-    /// has to be the truth about what this session will do (ADR-008).
-    ///
-    /// `emergency_hotkey` is only checked, not honoured: the X11 spike recognises a
-    /// fixed F12 keycode (`platform_x11::EMERGENCY_F12_X11_KEYCODE`) and never took
-    /// the combination as a parameter, so a configuration that names another key is
-    /// reported instead of being pretended to work.
+    /// Opens a lifetime observe connection for passive shortcuts; injection stays lazy.
+    /// Clipboard failure degrades only clipboard availability.
     pub fn new(
         ready: &Ready,
         emergency_hotkey: &str,
         plan: Option<TakeoverPlan>,
     ) -> Result<Self, String> {
-        let configured = emergency_hotkey.trim();
-        if !configured.is_empty() && !configured.eq_ignore_ascii_case("Ctrl+Alt+Shift+F12") {
-            tracing::warn!(
-                configured,
-                "platform-x11 arms a fixed Ctrl+Alt+Shift+F12 combination; the configured \
-                 emergency hotkey is not used by this backend (KVM-013)"
-            );
-        }
         // Losing the clipboard connection costs the clipboard and nothing else, so it is
         // reported in the capability rather than refused.
         let clipboard = match platform_x11::clipboard::Clipboard::connect() {
@@ -94,20 +79,57 @@ impl X11 {
         };
         let mut ready = ready.clone();
         ready.set_text_clipboard(clipboard.is_some());
-        Ok(X11 {
+        let mut backend = X11 {
             ready,
-            capture: None,
+            forwarding: false,
+            pending_hotkeys: std::collections::VecDeque::new(),
+            capture: Some({
+                let mut capture = X11Capture::new(CaptureKind::Observe).map_err(|error| error.to_string())?;
+                capture.set_hotkeys([None; 4]).map_err(|error| error.to_string())?;
+                capture
+            }),
             injector: None,
             detector: None,
             plan,
             repeats: RepeatFilter::new(),
             clipboard,
             applied_text: None,
-        })
+        };
+        backend.set_hotkeys(&config::HotkeyBindings {
+            emergency_release: if emergency_hotkey.trim().is_empty() {
+                config::HotkeyBindings::default().emergency_release
+            } else {
+                emergency_hotkey.to_owned()
+            },
+            switch_next: String::new(),
+            return_local: String::new(),
+            claim_ownership: String::new(),
+        })?;
+        Ok(backend)
     }
 
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    pub fn set_hotkeys(&mut self, bindings: &config::HotkeyBindings) -> Result<(), String> {
+        let capture = self.capture.as_mut().ok_or("X11 hotkey connection unavailable")?;
+        let mut compiled = [None; 4];
+        for (index, (_, chord)) in bindings.iter().enumerate() {
+            if chord.is_empty() { continue; }
+            let chord = config::Hotkey::parse(chord).map_err(|error| error.to_string())?;
+            let keysym = platform_x11::hotkeys::keysym(chord.key())
+                .ok_or_else(|| format!("unsupported X11 hotkey key {}", chord.key()))?;
+            let keycode = capture.hotkey_keycode(keysym).map_err(|error| error.to_string())?;
+            let modifiers = chord.modifiers().iter().fold(0, |mask, modifier| mask | match modifier {
+                config::Modifier::Shift => 1,
+                config::Modifier::Ctrl => 4,
+                config::Modifier::Alt => 8,
+                config::Modifier::Super => 64,
+            });
+            compiled[index] = Some(platform_x11::hotkeys::Hotkey { keycode, modifiers });
+        }
+        capture.set_hotkeys(compiled).map_err(|error| error.to_string())
     }
 
     /// Whether this backend owns a connection to the CLIPBOARD selection.
@@ -186,6 +208,7 @@ impl X11 {
     }
 
     pub fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
+        self.forwarding = true;
         if self.capture.is_none() {
             let capture = X11Capture::new(kind).map_err(|error| error.to_string())?;
             self.capture = Some(capture);
@@ -205,6 +228,9 @@ impl X11 {
                 if matches!(event, CapturedEvent::Emergency) {
                     return Err("EMERGENCY: capture commit cancelled by local hotkey".to_owned());
                 }
+                if let CapturedEvent::HotkeyPressed(action) = event {
+                    self.pending_hotkeys.push_back(hotkey_event(action));
+                }
             }
             self.repeats.clear();
         }
@@ -212,10 +238,10 @@ impl X11 {
     }
 
     pub fn end_capture(&mut self) -> Result<Released, String> {
+        self.forwarding = false;
         if let Some(capture) = &mut self.capture {
             capture.ungrab();
         }
-        self.capture = None;
         self.repeats.clear();
         self.disarm_detector();
         let released = match &mut self.injector {
@@ -345,6 +371,40 @@ impl X11 {
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
+        if let Some(event) = self.pending_hotkeys.pop_front() {
+            return Some(event);
+        }
+        if let Some(capture) = &mut self.capture {
+            // A non-blocking poll; the loop's tick provides the wait. The drain skips the OS
+            // autorepeats without ending the call (batch-3 audit F13): returning as soon as one
+            // was seen made the session's `select!` call this again immediately, so a held key
+            // — which the X server repeats on its own schedule — spun the poll loop at full CPU
+            // instead of its tick.
+            match drain_capture(
+                || loop {
+                    let event = capture.next_event(Some(Duration::ZERO))?;
+                    if !self.forwarding && matches!(event, Some(CapturedEvent::Input(_))) {
+                        continue;
+                    }
+                    break Ok(event);
+                },
+                &mut self.repeats,
+            ) {
+                // An ungrabbed observation/Temporary edge already reached the
+                // local desktop; never make it a deferred peer input.
+                Ok(Some(Event::Input(
+                    InputEvent::Key { .. } | InputEvent::Button { .. } | InputEvent::Scroll { .. },
+                ))) if !capture.grab_active() => {}
+                Ok(Some(event)) => return Some(event),
+                Ok(None) => {}
+                Err(error) => {
+                    return Some(Event::Failed {
+                        code: "CAPTURE_FAILED",
+                        detail: error.to_string(),
+                    })
+                }
+            }
+        }
         if let Some((detector, capture)) = &mut self.detector {
             match capture.next_event(Some(Duration::ZERO)) {
                 Ok(Some(CapturedEvent::Input(event))) => {
@@ -366,35 +426,11 @@ impl X11 {
                 }
                 // Rule 4: the emergency combination works on a receiver too.
                 Ok(Some(CapturedEvent::Emergency)) => return Some(Event::Emergency),
+                Ok(Some(CapturedEvent::HotkeyPressed(action))) => return Some(hotkey_event(action)),
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, "the receiver takeover detector stopped; disarming");
                     self.detector = None;
-                }
-            }
-        }
-        if let Some(capture) = &mut self.capture {
-            // A non-blocking poll; the loop's tick provides the wait. The drain skips the OS
-            // autorepeats without ending the call (batch-3 audit F13): returning as soon as one
-            // was seen made the session's `select!` call this again immediately, so a held key
-            // — which the X server repeats on its own schedule — spun the poll loop at full CPU
-            // instead of its tick.
-            match drain_capture(
-                || capture.next_event(Some(Duration::ZERO)),
-                &mut self.repeats,
-            ) {
-                // An ungrabbed observation/Temporary edge already reached the
-                // local desktop; never make it a deferred peer input.
-                Ok(Some(Event::Input(
-                    InputEvent::Key { .. } | InputEvent::Button { .. } | InputEvent::Scroll { .. },
-                ))) if !capture.grab_active() => {}
-                Ok(Some(event)) => return Some(event),
-                Ok(None) => {}
-                Err(error) => {
-                    return Some(Event::Failed {
-                        code: "CAPTURE_FAILED",
-                        detail: error.to_string(),
-                    })
                 }
             }
         }
@@ -437,8 +473,18 @@ fn drain_capture(
                 return Ok(Some(Event::Input(event)));
             }
             CapturedEvent::Emergency => return Ok(Some(Event::Emergency)),
+            CapturedEvent::HotkeyPressed(action) => return Ok(Some(hotkey_event(action))),
         }
     }
+}
+
+fn hotkey_event(action: u8) -> Event {
+    Event::HotkeyPressed(match action {
+        1 => config::HotkeyAction::SwitchNext,
+        2 => config::HotkeyAction::ReturnLocal,
+        3 => config::HotkeyAction::ClaimOwnership,
+        _ => config::HotkeyAction::EmergencyRelease,
+    })
 }
 
 /// Releases everything the injector still holds, counting what actually went up.

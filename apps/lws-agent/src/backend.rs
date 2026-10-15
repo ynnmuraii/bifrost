@@ -1082,7 +1082,7 @@ impl Backend {
                 #[cfg(windows)]
                 Backend::Win(backend) => backend.set_hotkeys(bindings),
                 #[cfg(target_os = "linux")]
-                Backend::X11(_) => Err("X11 has no global shortcut grab path; fixed Ctrl+Alt+Shift+F12 emergency remains armed".to_owned()),
+                Backend::X11(backend) => backend.set_hotkeys(bindings),
                 #[cfg(target_os = "linux")]
                 Backend::Wayland(backend) => backend.set_hotkeys(bindings).await,
             },
