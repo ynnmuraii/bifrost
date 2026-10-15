@@ -317,6 +317,11 @@ impl Field {
         self.form_rect = Some(r);
     }
 
+    #[cfg(test)]
+    pub(super) fn outline_rect(&self) -> Option<Rect> {
+        self.form_rect
+    }
+
     /// Lets the particles of a shape go.
     pub fn release(&mut self) {
         if !self.shaped {

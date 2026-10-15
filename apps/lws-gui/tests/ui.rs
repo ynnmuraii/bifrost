@@ -72,6 +72,12 @@ impl Harness {
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut texts);
         }
+        assert!(
+            output.viewport_output.values().all(|viewport| viewport.commands.iter().all(|command|
+                !matches!(command, egui::ViewportCommand::Close | egui::ViewportCommand::Minimized(true) | egui::ViewportCommand::Visible(false))
+            )),
+            "drawing widgets must not hide or close the native window"
+        );
         output.drop_without_applying_deltas();
         Frame {
             texts,
@@ -176,6 +182,30 @@ fn collapsed_pairing_keeps_only_its_clear_expand_handle() {
     let at = egui::pos2((SIZE.x - 64.0) / 2.0, SIZE.y - 16.0);
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(frame.output.actions.contains(&Action::ToggleDock));
+}
+
+#[test]
+fn opening_pairing_from_modal_keeps_root_viewport_and_expands_dock() {
+    let mut vm = connected();
+    vm.look.dock_open = false;
+    vm.local(&Action::ToggleModal(Modal::Pairs));
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    harness.now += Duration::from_secs(1);
+    harness.settle(&vm, false);
+    let at = text_position(&mut harness, &vm, "Открыть окно сопряжения");
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(frame.output.actions.contains(&Action::StartPairing { window_s: 120 }));
+    for action in frame.output.actions {
+        vm.local(&action);
+    }
+    assert!(vm.look.dock_open);
+    assert_eq!(vm.modal, None);
+    for _ in 0..20 {
+        harness.now += Duration::from_millis(16);
+        let frame = harness.frame(&vm, false, SIZE, Vec::new());
+        assert!(!frame.texts.is_empty());
+    }
 }
 
 #[test]

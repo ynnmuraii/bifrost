@@ -897,6 +897,7 @@ mod transform_tests {
                 let xf = Xf::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0)), 150);
                 let shown: Vec<_> = model.nodes.iter().map(|n| xf.p(n.at.x, n.at.y)).collect();
                 let (a, b) = link_ends(&model, &link, &shown, xf);
+                eprintln!("owner layout {style:?} {state:?}: link {a:?} -> {b:?}");
                 assert!(b.x - a.x > 30.0);
                 let mut field = super::super::field::Field::new();
                 let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -908,6 +909,7 @@ mod transform_tests {
                     match shape {
                         Shape::Vec(shapes) => for s in shapes { inspect(s, a, b, rails, chain); },
                         Shape::LineSegment { points, stroke } => {
+                            eprintln!("line {points:?} {stroke:?}");
                             assert!(stroke.color.a() > 100);
                             if stroke.width == 3.0 {
                                 assert!(points.iter().all(|p| p.x > a.x && p.x < b.x));
@@ -917,6 +919,7 @@ mod transform_tests {
                             }
                         }
                         Shape::Text(text) => {
+                            eprintln!("glyph {:?} at {:?}", text.galley.text(), text.pos);
                             let center = text.pos + text.galley.size() / 2.0;
                             if center.x > a.x && center.x < b.x { *chain += 1; }
                         }
@@ -932,16 +935,68 @@ mod transform_tests {
     }
 
     #[test]
-    fn hover_geometry_uses_the_animated_card_not_its_target() {
-        let model = owner_layout();
-        let xf = Xf::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0)), 150);
-        let node = &model.nodes[1];
-        let target = xf.p(node.at.x, node.at.y);
-        let shown = target + Vec2::new(96.0, 27.0);
-        let card = monitor_rect(shown, node.mons[0].rect, xf.s);
-        let stale = monitor_rect(target, node.mons[0].rect, xf.s);
-        assert_eq!(card.min - stale.min, shown - target);
-        assert_eq!(card.size(), stale.size());
+    fn repeated_draw_frames_carry_the_same_hover_outline_with_the_animated_card() {
+        use crate::view_model::{CoreEndpoint, EditorDisplay, EditorNode, LocalConfig};
+        use crate::map::{Pt, Rect as MapRect, Shape as MapShape};
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready { description: String::new() },
+            LocalConfig::default(),
+        );
+        vm.look.clouds = false;
+        vm.look.pan_x = 0;
+        vm.look.pan_y = 0;
+        vm.look.zoom_percent = 100;
+        let mon = MapRect::new(0.0, 0.0, 200.0, 100.0);
+        vm.editor.nodes = vec![EditorNode {
+            node_id: "01".repeat(32), display_name: "notebook".to_owned(), online: true,
+            displays: vec![EditorDisplay {
+                id: "zone-0".to_owned(), x: 0.0, y: 0.0, w: 1745.0, h: 1091.0,
+                primary: true, native_known: false, rotation: 0,
+            }],
+        }];
+        vm.editor.shapes = vec![MapShape { mons: vec![mon], w: mon.w, h: mon.h }];
+        vm.editor.placement = vec![Pt::new(300.0, 100.0)];
+        vm.editor.baseline = vm.editor.placement.clone();
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let now = std::time::Instant::now();
+        let mut st = UiState::new(now);
+        let pal = Palette::of(vm.look.theme);
+        let map = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0));
+        let xf = Xf::new(map, vm.look.zoom_percent);
+        // Remains inside the card throughout its 40-stage-unit glide.
+        let pointer = xf.p(400.0, 150.0);
+        let mut initial_outline = None;
+        for frame in 0..12 {
+            if frame == 4 {
+                vm.editor.placement[0].x += 40.0;
+            }
+            let t = frame as f32 / 30.0;
+            let output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(map),
+                time: Some(f64::from(t)),
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..Default::default()
+            }, |ui| {
+                let _ = draw(ui, &pal, &vm, &mut st, map, Env { now, animate: true }, t, &mut Vec::new());
+            });
+            output.drop_without_applying_deltas();
+            if frame >= 2 {
+                assert_eq!(st.hover, Some((0, 0)), "hover identity must not change");
+                let target = vm.editor.placement[0];
+                let x = ctx.animate_value_with_time(egui::Id::new(("node-x", 0usize)), target.x as f32, 0.45);
+                let y = ctx.animate_value_with_time(egui::Id::new(("node-y", 0usize)), target.y as f32, 0.45);
+                let expected = monitor_rect(xf.p(f64::from(x), f64::from(y)), mon, xf.s);
+                let outline = st.field.outline_rect().expect("hover forms an outline");
+                assert!(outline.min.distance(expected.min) < 0.001, "frame {frame}: {outline:?} vs {expected:?}");
+                assert_eq!(outline.size(), expected.size());
+                if frame == 3 { initial_outline = Some(outline); }
+                if frame == 11 {
+                    assert!(outline.min.x > initial_outline.unwrap().min.x + 1.0);
+                    assert!(outline.min.x < monitor_rect(xf.p(target.x, target.y), mon, xf.s).min.x);
+                }
+            }
+        }
     }
 
     #[test]

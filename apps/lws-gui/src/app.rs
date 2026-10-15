@@ -104,7 +104,11 @@ impl eframe::App for GuiApp {
         let arrived = self.bridge.pump();
         self.bridge.view_mut().tick(now);
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+        if close_requested {
+            eprintln!("[DEBUG-ui-pair] native close_requested; modal={:?} dock_open={}", self.bridge.view().modal, self.bridge.view().look.dock_open);
+        }
         if close_requested && close_decision(lws_desktop::tray_is_ready()) == Close::Minimize {
+            eprintln!("[DEBUG-ui-pair] ViewportCommand CancelClose + Minimized(true)");
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ui.ctx()
@@ -125,8 +129,14 @@ impl eframe::App for GuiApp {
 
         let acted = !output.actions.is_empty();
         for action in output.actions {
+            eprintln!("[DEBUG-ui-pair] action {action:?}");
             self.bridge.dispatch(action, now);
         }
+        ui.ctx().viewport(|viewport| {
+            for command in &viewport.commands {
+                eprintln!("[DEBUG-ui-pair] viewport command {command:?}");
+            }
+        });
         self.save_look();
         // What an action changed is drawn by the next frame; an arrival was folded after the
         // widgets that show it were laid out.
