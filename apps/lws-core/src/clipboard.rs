@@ -1159,6 +1159,10 @@ impl Handle {
     /// peer, so the address has to be the one this node is already talking to, and the port
     /// has to be the one the peer named (`network.port_clipboard` is configurable, so the
     /// default 47902 is only the fallback for a grant that names none).
+    ///
+    /// The dial runs in a task of its own and under [`DIAL_TIMEOUT`]: the caller is the session
+    /// loop, and a peer that drops the SYN or stalls the TLS handshake must not freeze input
+    /// links, lease renewals and the GUI for the OS connect timeout (or forever).
     async fn dial(
         &self,
         peer: NodeId,
@@ -1168,29 +1172,42 @@ impl Handle {
         token: [u8; 32],
         queue_capacity: usize,
     ) {
-        let result = dial_clipboard(
-            &self.identity,
-            Arc::clone(&self.trusted_peers),
-            peer,
-            address,
-            parent,
-            channel_id,
-            token,
-        )
-        .await;
-        match result {
-            Ok(connection) => {
-                self.serve(peer, channel_id, connection, queue_capacity)
-                    .await
+        let handle = self.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                DIAL_TIMEOUT,
+                dial_clipboard(
+                    &handle.identity,
+                    Arc::clone(&handle.trusted_peers),
+                    peer,
+                    address,
+                    parent,
+                    channel_id,
+                    token,
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(connection)) => {
+                    handle
+                        .serve(peer, channel_id, connection, queue_capacity)
+                        .await
+                }
+                // A refused bind shows up on the peer as a closed connection; the next grant
+                // from that peer opens a fresh one.
+                Ok(Err(error)) => {
+                    tracing::warn!(peer = %peer, %address, %error, "the clipboard bind failed")
+                }
+                Err(_) => {
+                    tracing::warn!(peer = %peer, %address, "the clipboard dial timed out")
+                }
             }
-            // A refused bind shows up on the peer as a closed connection; the next grant from
-            // that peer opens a fresh one.
-            Err(error) => {
-                tracing::warn!(peer = %peer, %address, %error, "the clipboard bind failed")
-            }
-        }
+        });
     }
 }
+
+/// How long one clipboard dial (TCP connect, TLS handshake, bind) may take.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Writes one channel's queue; the reader is a separate task so a blocked read never stalls a
 /// send (`KVM-042`).
@@ -1668,6 +1685,41 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review R4': a peer that accepts the TCP connection and then says nothing must not stall
+    /// the caller — `dial` runs on the session loop, where a stall freezes input, lease renewals
+    /// and the GUI.
+    #[tokio::test]
+    async fn dialing_a_silent_peer_does_not_block_the_caller() {
+        let handle = test_handle().await;
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a silent listener");
+        let address = silent.local_addr().expect("its address");
+        let accepter = tokio::spawn(async move {
+            // Accept and hold the socket open without ever answering the TLS handshake.
+            let held = silent.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+        let returned = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle.dial(
+                [0x55u8; 32].into(),
+                address,
+                [1u8; 16],
+                [2u8; 16],
+                [3u8; 32],
+                4,
+            ),
+        )
+        .await;
+        assert!(
+            returned.is_ok(),
+            "dial must hand the work to a task and return"
+        );
+        accepter.abort();
     }
 
     #[test]
