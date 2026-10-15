@@ -3240,6 +3240,7 @@ impl Session {
         if self.agent_lost_reported {
             return;
         }
+        self.edgefx.set_enabled(self.appearance.edge_effects);
         // The agent process is going away with whatever capture it held: a restarted agent
         // starts with none, so the observation must be armed again once it is back.
         self.disarm_observation();
