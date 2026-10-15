@@ -110,6 +110,7 @@ enum ErrorCode {
   ERROR_CODE_MEMBERSHIP_FULL = 23;    // N_max = 4 reached (max_members <= 4); link refused
   ERROR_CODE_NO_COORDINATOR = 24;     // no owner reachable to apply a layout edit
   ERROR_CODE_CANNOT_OWN = 25;         // OwnerClaim from a node whose Hello.can_own = false; the claim is refused
+  ERROR_CODE_CLIPBOARD_SUPERSEDED = 26; // a newer local copy cancels a pending incoming offer
 }
 
 enum LeaveReason {

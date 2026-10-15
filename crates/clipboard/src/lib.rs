@@ -68,6 +68,8 @@ pub enum ClipboardError {
     Invalid,
     /// `CLIPBOARD_SECRET`: marked by a password manager and `skip_secret_marked = true`.
     Secret,
+    /// `CLIPBOARD_SUPERSEDED`: a newer local copy won over this incoming offer.
+    Superseded,
 }
 
 impl ClipboardError {
@@ -79,6 +81,7 @@ impl ClipboardError {
             ClipboardError::HashMismatch => "CLIPBOARD_HASH_MISMATCH",
             ClipboardError::Invalid => "CLIPBOARD_INVALID",
             ClipboardError::Secret => "CLIPBOARD_SECRET",
+            ClipboardError::Superseded => "CLIPBOARD_SUPERSEDED",
         }
     }
 }
@@ -123,6 +126,7 @@ mod tests {
             (ClipboardError::HashMismatch, "CLIPBOARD_HASH_MISMATCH"),
             (ClipboardError::Invalid, "CLIPBOARD_INVALID"),
             (ClipboardError::Secret, "CLIPBOARD_SECRET"),
+            (ClipboardError::Superseded, "CLIPBOARD_SUPERSEDED"),
         ] {
             assert_eq!(error.code(), code);
         }
