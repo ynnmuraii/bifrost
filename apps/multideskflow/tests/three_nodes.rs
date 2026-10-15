@@ -188,7 +188,9 @@ fn chain_once(cluster: &Cluster) -> bool {
     let expiry_before = chain_expiries(cluster);
     for receiver in [1, 2] {
         let remote_before = remote_entries(cluster.node(receiver));
-        cluster.switch(0, receiver).expect("owner switches to receiver");
+        cluster
+            .switch(0, receiver)
+            .expect("owner switches to receiver");
         let deadline = Instant::now() + Duration::from_secs(15);
         // A CLI Status poll can miss the entire valid lease during a host stall.
         // The cumulative Remote log proves that the real receiver entered the lease.
@@ -202,19 +204,26 @@ fn chain_once(cluster: &Cluster) -> bool {
         }
         let source = cluster.node(0).status().expect("source status");
         if source.focus == "Remote" {
-            cluster.switch(0, receiver).expect("owner returns from receiver");
+            cluster
+                .switch(0, receiver)
+                .expect("owner returns from receiver");
         } else {
-            assert!(chain_expiries(cluster) != expiry_before,
-                "source left Remote without expiry: {source:?}");
+            assert!(
+                chain_expiries(cluster) != expiry_before,
+                "source left Remote without expiry: {source:?}"
+            );
         }
         if chain_expiries(cluster) != expiry_before {
             settle_expired_chain(cluster);
             return false;
         }
         for index in [0, receiver] {
-            cluster.node(index).wait_for(
-                "chain endpoint is at rest", Duration::from_secs(15), |s| s.is_idle(),
-            ).expect("both endpoints return to Local");
+            cluster
+                .node(index)
+                .wait_for("chain endpoint is at rest", Duration::from_secs(15), |s| {
+                    s.is_idle()
+                })
+                .expect("both endpoints return to Local");
         }
     }
     true
@@ -225,24 +234,37 @@ fn remote_entries(node: &Node) -> usize {
 }
 
 fn chain_expiries(cluster: &Cluster) -> usize {
-    cluster.nodes.iter().map(|node| {
-        let log = node.log();
-        log.matches("notice=LeaseExpired").count()
-            + log.matches("deadline expired; releasing the session").count()
-    }).sum()
+    cluster
+        .nodes
+        .iter()
+        .map(|node| {
+            let log = node.log();
+            log.matches("notice=LeaseExpired").count()
+                + log
+                    .matches("deadline expired; releasing the session")
+                    .count()
+        })
+        .sum()
 }
 
 fn settle_expired_chain(cluster: &Cluster) {
     // A stall between status and the return toggle can start a replacement lease.
     let source = cluster.node(0).status().expect("source after expiry");
     if source.focus == "Remote" {
-        let receiver = cluster.nodes.iter().position(|node| node.id == source.peer)
+        let receiver = cluster
+            .nodes
+            .iter()
+            .position(|node| node.id == source.peer)
             .expect("replacement lease names a cluster receiver");
-        cluster.switch(0, receiver).expect("release replacement lease");
+        cluster
+            .switch(0, receiver)
+            .expect("release replacement lease");
     }
     for node in &cluster.nodes {
-        node.wait_for("expired chain safely Local", Duration::from_secs(15), |s| s.is_idle())
-            .expect("expiry must release every endpoint");
+        node.wait_for("expired chain safely Local", Duration::from_secs(15), |s| {
+            s.is_idle()
+        })
+        .expect("expiry must release every endpoint");
     }
 }
 
@@ -256,9 +278,16 @@ impl ChainExpiryBudget {
     fn expired(&mut self, cycles: usize) {
         self.expired_attempts += 1;
         self.consecutive += 1;
-        assert!(self.consecutive < 3, "three consecutive chain attempts expired");
-        assert!(self.expired_attempts <= cycles / 20,
-            "more than 5% of chain cycles expired: {}/{}", self.expired_attempts, cycles);
+        assert!(
+            self.consecutive < 3,
+            "three consecutive chain attempts expired"
+        );
+        assert!(
+            self.expired_attempts <= cycles / 20,
+            "more than 5% of chain cycles expired: {}/{}",
+            self.expired_attempts,
+            cycles
+        );
     }
 
     fn completed(&mut self) {
@@ -278,15 +307,26 @@ fn run_chain_cycles(cluster: &Cluster, cycles: usize) {
                 break;
             }
             budget.expired(cycles);
-            println!("  cycle {} attempt {} expired; retrying", cycle + 1, attempt + 1);
+            println!(
+                "  cycle {} attempt {} expired; retrying",
+                cycle + 1,
+                attempt + 1
+            );
         }
         assert!(completed, "cycle {} exhausted three retries", cycle + 1);
         if cycle % 50 == 49 {
-            println!("  {}/{cycles} chain cycles ({:?})", cycle + 1, started.elapsed());
+            println!(
+                "  {}/{cycles} chain cycles ({:?})",
+                cycle + 1,
+                started.elapsed()
+            );
         }
     }
-    println!("{cycles} chain cycles in {:?}; expiry attempts: {}",
-        started.elapsed(), budget.expired_attempts);
+    println!(
+        "{cycles} chain cycles in {:?}; expiry attempts: {}",
+        started.elapsed(),
+        budget.expired_attempts
+    );
 }
 
 #[test]
