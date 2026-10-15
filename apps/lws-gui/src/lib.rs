@@ -85,7 +85,6 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
         Box::new(|cc| {
             let ctx = cc.egui_ctx.clone();
             instance.set_show_handler(move || {
-                eprintln!("[DEBUG-ui-pair] show signal: ViewportCommand Visible(true), Minimized(false), Focus");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
