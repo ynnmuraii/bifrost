@@ -212,6 +212,22 @@ mod tests {
     }
 
     #[test]
+    fn an_old_guard_does_not_release_a_new_windows_pending_slot() {
+        let gate = PairingGate::closed();
+        gate.open(window_at([1u8; 16]));
+        gate.admit(0).expect("old window admits");
+        let old_guard = gate.admit_guard();
+
+        gate.open(window_at([2u8; 16]));
+        gate.admit(0).expect("new window admits");
+        drop(old_guard);
+
+        let window = gate.window(0).expect("new window stays open");
+        assert_eq!(window.pending(), 1);
+        assert_eq!(window.attempts(), 0);
+    }
+
+    #[test]
     fn a_disarmed_guard_leaves_the_slot_to_finish() {
         let gate = PairingGate::closed();
         gate.open(window_at([4u8; 16]));
