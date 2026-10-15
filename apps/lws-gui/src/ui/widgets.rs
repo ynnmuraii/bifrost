@@ -204,7 +204,7 @@ pub fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: Kind, enabled: bool
 
 /// A compact framed control, sharing the standard button's paint and interaction.
 pub fn small_button(ui: &mut Ui, pal: &Palette, label: &str, enabled: bool) -> Response {
-    button_sized(ui, pal, label, Kind::Plain, enabled, 26.0, 10.0, 12.0)
+    button_sized(ui, pal, label, Kind::Plain, enabled, 22.0, 9.0, 12.0)
 }
 
 fn button_sized(

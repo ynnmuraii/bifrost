@@ -675,6 +675,8 @@ fn clip_body(
             .as_millis();
         for entry in &vm.clipboard_history {
             ui.push_id(entry.id, |ui| {
+                // Two lines per entry: the metadata and the preview, nothing else.
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 3.0);
                 ui.separator();
                 let direction =
                     match protocol::ipc::ClipboardHistoryDirection::try_from(entry.direction) {
