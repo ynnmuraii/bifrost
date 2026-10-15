@@ -500,7 +500,7 @@ impl App {
                 busy: [false; BUFFERS],
             },
             surface: None,
-            effect: Effect::new(std::process::id()),
+            effect: Effect::new(),
             enabled: true,
             last_step: None,
             last_draw: None,

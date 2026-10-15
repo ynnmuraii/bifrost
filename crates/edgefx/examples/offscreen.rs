@@ -2,7 +2,7 @@
 //! Writes shared-rasterizer PNGs to target/ui-shots (or the first argument), then
 //! measures process CPU over three seconds each of idle, 30 Hz approach, and
 //! 256 alternating enter/cross updates per 30 Hz frame. No windows or input APIs.
-use edgefx::{Canvas, Edge, Effect, Target, Update, FRAME_S};
+use edgefx::{Canvas, Edge, Effect, Strip, Target, Update, FRAME_S};
 use std::{
     error::Error,
     fs,
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             end: 640.0,
             along: 320.0,
         };
-        let mut fx = Effect::new(42);
+        let mut fx = Effect::new();
         for _ in 0..18 {
             fx.update(Update::Proximity {
                 target,
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         fx.step(FRAME_S * 2.0);
         shot(&output, name, "entered", &fx)?;
     }
-    println!("CPU method: process kernel+user time / monotonic wall time; 100% = one core.\n3 seconds/scenario, 30 Hz deadlines; shared step+draw, preallocated 1600x36 buffer; no compositor/IPC/GPU cost.");
+    println!("CPU method: process kernel+user time / monotonic wall time; 100% = one core.\n3 seconds/scenario, 30 Hz deadlines; shared step+draw, preallocated strip buffer; no compositor/IPC/GPU cost.");
     println!("CPU counters may be quantized: a zero sample is below counter resolution, not proof of zero cost. frame-work is monotonic elapsed update+step+draw time, not CPU time.");
     for mode in ["idle", "active", "ping-pong"] {
         measure(mode)?;
@@ -74,8 +74,9 @@ fn measure(mode: &str) -> Result<(), Box<dyn Error>> {
         end: 1600.0,
         along: 800.0,
     };
-    let mut fx = Effect::new(42);
-    let mut pixels = vec![0; 1600 * 36];
+    let mut fx = Effect::new();
+    let (fw, fh) = Strip::of(&target).size_px(1.0);
+    let mut pixels = vec![0; (fw * fh) as usize];
     let interval = Duration::from_secs_f64(1.0 / 30.0);
     let duration = Duration::from_secs(3);
     let cpu_start = cpu_time()?;
@@ -106,7 +107,7 @@ fn measure(mode: &str) -> Result<(), Box<dyn Error>> {
                 updates += 256;
             }
             fx.step(FRAME_S);
-            fx.draw(&mut Canvas::new(&mut pixels, 1600, 36), 1.0);
+            fx.draw(&mut Canvas::new(&mut pixels, fw as usize, fh as usize), 1.0);
             black_box(&pixels);
             frames += 1;
             work += frame_start.elapsed();
