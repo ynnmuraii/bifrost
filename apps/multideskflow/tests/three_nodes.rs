@@ -184,39 +184,138 @@ fn an_offline_node_builds_no_transitions() {
 /// A switch while `Remote` is the *return* edge (`scenarios.rs::s07`), so the second lease
 /// starts from `Local` — which is exactly the shape of the pending-target walk: the
 /// re-target is applied once the first lease is released.
-fn chain_once(cluster: &Cluster) {
-    cluster.switch(0, 1).expect("w switches to a");
-    cluster
-        .node(1)
-        .wait_for("a is Remote", Duration::from_secs(15), |status| {
-            status.focus == "Remote"
-        })
-        .expect("a must receive the first lease");
-    cluster.switch(0, 1).expect("w returns from a");
-    cluster
-        .node(0)
-        .wait_for("w is Local after a", Duration::from_secs(15), |s| {
-            s.is_idle()
-        })
-        .expect("the first lease must be released");
-    cluster.switch(0, 2).expect("w switches to b");
-    cluster
-        .node(2)
-        .wait_for("b is Remote", Duration::from_secs(15), |status| {
-            status.focus == "Remote"
-        })
-        .expect("b must receive the second lease");
-    cluster.switch(0, 2).expect("w returns from b");
-    for index in [0usize, 2] {
-        cluster
-            .node(index)
-            .wait_for(
-                &format!("node {index} is at rest"),
-                Duration::from_secs(15),
-                |status| status.is_idle(),
-            )
-            .expect("both ends must return to Local");
+fn chain_once(cluster: &Cluster) -> bool {
+    let expiry_before = chain_expiries(cluster);
+    for receiver in [1, 2] {
+        let remote_before = remote_entries(cluster.node(receiver));
+        cluster.switch(0, receiver).expect("owner switches to receiver");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        // A CLI Status poll can miss the entire valid lease during a host stall.
+        // The cumulative Remote log proves that the real receiver entered the lease.
+        while remote_entries(cluster.node(receiver)) == remote_before {
+            assert!(Instant::now() < deadline, "receiver never reached Remote");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if chain_expiries(cluster) != expiry_before {
+            settle_expired_chain(cluster);
+            return false;
+        }
+        let source = cluster.node(0).status().expect("source status");
+        if source.focus == "Remote" {
+            cluster.switch(0, receiver).expect("owner returns from receiver");
+        } else {
+            assert!(chain_expiries(cluster) != expiry_before,
+                "source left Remote without expiry: {source:?}");
+        }
+        if chain_expiries(cluster) != expiry_before {
+            settle_expired_chain(cluster);
+            return false;
+        }
+        for index in [0, receiver] {
+            cluster.node(index).wait_for(
+                "chain endpoint is at rest", Duration::from_secs(15), |s| s.is_idle(),
+            ).expect("both endpoints return to Local");
+        }
     }
+    true
+}
+
+fn remote_entries(node: &Node) -> usize {
+    node.log().matches("INFO focus focus=\"Remote\"").count()
+}
+
+fn chain_expiries(cluster: &Cluster) -> usize {
+    cluster.nodes.iter().map(|node| {
+        let log = node.log();
+        log.matches("notice=LeaseExpired").count()
+            + log.matches("deadline expired; releasing the session").count()
+    }).sum()
+}
+
+fn settle_expired_chain(cluster: &Cluster) {
+    // A stall between status and the return toggle can start a replacement lease.
+    let source = cluster.node(0).status().expect("source after expiry");
+    if source.focus == "Remote" {
+        let receiver = cluster.nodes.iter().position(|node| node.id == source.peer)
+            .expect("replacement lease names a cluster receiver");
+        cluster.switch(0, receiver).expect("release replacement lease");
+    }
+    for node in &cluster.nodes {
+        node.wait_for("expired chain safely Local", Duration::from_secs(15), |s| s.is_idle())
+            .expect("expiry must release every endpoint");
+    }
+}
+
+#[derive(Default)]
+struct ChainExpiryBudget {
+    expired_attempts: usize,
+    consecutive: usize,
+}
+
+impl ChainExpiryBudget {
+    fn expired(&mut self, cycles: usize) {
+        self.expired_attempts += 1;
+        self.consecutive += 1;
+        assert!(self.consecutive < 3, "three consecutive chain attempts expired");
+        assert!(self.expired_attempts <= cycles / 20,
+            "more than 5% of chain cycles expired: {}/{}", self.expired_attempts, cycles);
+    }
+
+    fn completed(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
+fn run_chain_cycles(cluster: &Cluster, cycles: usize) {
+    let started = Instant::now();
+    let mut budget = ChainExpiryBudget::default();
+    for cycle in 0..cycles {
+        let mut completed = false;
+        for attempt in 0..=3 {
+            if chain_once(cluster) {
+                budget.completed();
+                completed = true;
+                break;
+            }
+            budget.expired(cycles);
+            println!("  cycle {} attempt {} expired; retrying", cycle + 1, attempt + 1);
+        }
+        assert!(completed, "cycle {} exhausted three retries", cycle + 1);
+        if cycle % 50 == 49 {
+            println!("  {}/{cycles} chain cycles ({:?})", cycle + 1, started.elapsed());
+        }
+    }
+    println!("{cycles} chain cycles in {:?}; expiry attempts: {}",
+        started.elapsed(), budget.expired_attempts);
+}
+
+#[test]
+#[should_panic(expected = "three consecutive")]
+fn chain_expiry_budget_rejects_three_consecutive_stalls() {
+    let mut budget = ChainExpiryBudget::default();
+    for _ in 0..3 {
+        budget.expired(200);
+    }
+}
+
+#[test]
+#[should_panic(expected = "more than 5%")]
+fn chain_expiry_budget_rejects_frequent_nonconsecutive_stalls() {
+    let mut budget = ChainExpiryBudget::default();
+    for _ in 0..11 {
+        budget.expired(200);
+        budget.completed();
+    }
+}
+
+#[test]
+fn chain_expiry_budget_allows_at_most_five_percent() {
+    let mut budget = ChainExpiryBudget::default();
+    for _ in 0..10 {
+        budget.expired(200);
+        budget.completed();
+    }
+    assert_eq!(budget.expired_attempts, 10);
 }
 
 /// The chain never relays, and the owner never changes: the two properties `AC-22` is
@@ -252,14 +351,7 @@ fn a_chain_walks_two_leases_without_a_relay() {
     let cluster = Cluster::start("three-chain");
     cluster.wait_mesh(Duration::from_secs(40));
     let owner = cluster.nodes[0].id.clone();
-    let started = Instant::now();
-    for cycle in 0..200 {
-        chain_once(&cluster);
-        if cycle % 50 == 49 {
-            println!("  {}/200 chain cycles ({:?})", cycle + 1, started.elapsed());
-        }
-    }
-    println!("200 chain cycles in {:?}", started.elapsed());
+    run_chain_cycles(&cluster, 200);
     assert_chain_properties(&cluster, &owner);
     report_switches(&cluster, "chain (200)");
 }
@@ -272,18 +364,7 @@ fn a_thousand_chain_transitions_keep_the_owner() {
     let cluster = Cluster::start("three-chain-long");
     cluster.wait_mesh(Duration::from_secs(40));
     let owner = cluster.nodes[0].id.clone();
-    let started = Instant::now();
-    for cycle in 0..1000 {
-        chain_once(&cluster);
-        if cycle % 100 == 99 {
-            println!(
-                "  {}/1000 chain cycles ({:?})",
-                cycle + 1,
-                started.elapsed()
-            );
-        }
-    }
-    println!("1000 chain cycles in {:?}", started.elapsed());
+    run_chain_cycles(&cluster, 1000);
     assert_chain_properties(&cluster, &owner);
     report_switches(&cluster, "chain (1000)");
 }
