@@ -1221,7 +1221,11 @@ mod tests {
                 ..Default::default()
             };
             let press = |shared: &Shared, message: u32| {
-                handle_keyboard(shared, WPARAM(message as usize), LPARAM(&kb as *const _ as isize))
+                handle_keyboard(
+                    shared,
+                    WPARAM(message as usize),
+                    LPARAM(&kb as *const _ as isize),
+                )
             };
             // A hotkey trigger is this app's own shortcut: the hook swallows the key, on the way
             // down and on the way up, so no local application sees the combination.
