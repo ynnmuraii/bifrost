@@ -1185,7 +1185,55 @@ pub fn config_from_wire(
     Ok(layout)
 }
 
+/// The manifests `build` runs against: the live agent report when there is one, otherwise the
+/// configured snapshot; peers from their live reports over the configured snapshots.
+#[must_use]
+pub fn live_inputs(
+    layout: &config::TopologyConfig,
+    local_node_id: &[u8; 32],
+    agent_displays: &[ipc::DisplayInfo],
+    peer_displays: &BTreeMap<NodeId, (u64, Vec<wire::Display>)>,
+) -> (Vec<ipc::DisplayInfo>, Vec<(NodeId, Vec<wire::Display>)>) {
+    let local = if agent_displays.is_empty() {
+        snapshot_displays(layout, local_node_id)
+    } else {
+        agent_displays.to_vec()
+    };
+    let mut peers: BTreeMap<NodeId, Vec<wire::Display>> =
+        snapshot_peers(layout, local_node_id).into_iter().collect();
+    peers.extend(
+        peer_displays
+            .iter()
+            .map(|(node, (_, displays))| (*node, displays.clone())),
+    );
+    (local, peers.into_iter().collect())
+}
+
+/// Whether `layout` can be built against the manifests this node knows right now.
+///
+/// The coordinator asks this before it applies an edit: a document the live manifests cannot
+/// build (overlapping or ambiguous links, an unknown node) would otherwise be applied,
+/// published, and leave every member with no edge transitions at all. `Err` is the text of
+/// the `INVALID_TOPOLOGY` the editor sees.
+pub fn check_layout(
+    layout: &config::TopologyConfig,
+    local_node_id: &[u8; 32],
+    agent_displays: &[ipc::DisplayInfo],
+    peer_displays: &BTreeMap<NodeId, (u64, Vec<wire::Display>)>,
+) -> Result<(), String> {
+    let (local, peers) = live_inputs(layout, local_node_id, agent_displays, peer_displays);
+    build(&Documents {
+        local_node_id: *local_node_id,
+        topology: layout,
+        local_displays: &local,
+        peer_displays: &peers,
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
+
 mod tests {
     use super::*;
 
@@ -1852,6 +1900,77 @@ bidirectional = true
             primary,
             native_known: false,
         }
+    }
+
+    fn auto_link_config(
+        id: &str,
+        peer: [u8; 32],
+        edge: config::Edge,
+        to: config::Edge,
+    ) -> config::LinkConfig {
+        let endpoint = |node: String, edge| config::EndpointConfig {
+            node,
+            display: config::AUTO_DISPLAY.to_owned(),
+            edge,
+            start: 0.0,
+            end: 0.0,
+        };
+        config::LinkConfig {
+            id: id.to_owned(),
+            from: endpoint("self".to_owned(), edge),
+            to: endpoint(config::peer_reference(&peer), to),
+            bidirectional: true,
+        }
+    }
+
+    fn three_desks() -> (
+        Vec<ipc::DisplayInfo>,
+        BTreeMap<NodeId, (u64, Vec<wire::Display>)>,
+    ) {
+        let local = vec![info(
+            "L",
+            [0.0, 0.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        let mut peers = BTreeMap::new();
+        for id in [[0xAA; 32], [0xBB; 32]] {
+            peers.insert(
+                NodeId::new(id),
+                (1, vec![wire_display("P", [0.0, 0.0, 1920.0, 1080.0], true)]),
+            );
+        }
+        (local, peers)
+    }
+
+    /// Review G1: a document the live manifests cannot build is refused at edit time, before it
+    /// is applied, instead of silently disabling every transition afterwards.
+    #[test]
+    fn an_edit_the_live_manifests_cannot_build_is_refused() {
+        let (local, peers) = three_desks();
+        let mut layout = config::TopologyConfig::default();
+        // Two peers on the same side of one desktop: the segments overlap.
+        layout.links = vec![
+            auto_link_config("one", [0xAA; 32], config::Edge::Right, config::Edge::Left),
+            auto_link_config("two", [0xBB; 32], config::Edge::Right, config::Edge::Left),
+        ];
+        let error = check_layout(&layout, &local_id(), &local, &peers)
+            .expect_err("overlapping auto links must not be applied");
+        assert!(
+            error.contains("overlap") || error.contains("Overlap"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn adjacent_auto_links_to_two_peers_are_accepted() {
+        let (local, peers) = three_desks();
+        let mut layout = config::TopologyConfig::default();
+        layout.links = vec![
+            auto_link_config("one", [0xAA; 32], config::Edge::Right, config::Edge::Left),
+            auto_link_config("two", [0xBB; 32], config::Edge::Bottom, config::Edge::Top),
+        ];
+        check_layout(&layout, &local_id(), &local, &peers).expect("right + bottom");
     }
 
     /// Batch-2 audit: a transition with no edge starts on the receiver's primary display, and
