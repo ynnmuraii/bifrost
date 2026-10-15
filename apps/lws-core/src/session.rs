@@ -3012,23 +3012,10 @@ impl Session {
     /// Arms the band of the edge the pointer just came home through, and places the local
     /// pointer inside it.
     ///
-    /// `step` is the scaled captured delta that carried the pointer out of the peer's
-    /// display: its dominant axis and sign are the edge, and `input.edge_hysteresis_px` is
-    /// the band. Without this a pointer that came home sitting on the edge resolved a fresh
-    /// crossing on the next sample — the `Local`/`Remote` oscillation at the boundary.
-    fn arm_return_guard(&mut self, step: geometry::Point, entry: &geometry::Position) {
-        // The step's sign is the direction the pointer came home *in*, which is the inward
-        // direction on this side; the entry point is where it came home.
-        let armed_at = if step.x.abs() >= step.y.abs() {
-            entry.x
-        } else {
-            entry.y
-        };
-        let Some(guard) =
-            crate::topology::ReturnGuard::after_return(step, armed_at, self.edge_hysteresis_px)
-        else {
-            return;
-        };
+    /// The target endpoint supplies the axis and inward normal, even for diagonal motion.
+    fn arm_return_guard(&mut self, edge: geometry::Edge, entry: &geometry::Position) {
+        let guard =
+            crate::topology::ReturnGuard::after_return(edge, entry, self.edge_hysteresis_px);
         self.local_pointer = Some(guard.entry(entry));
         self.edge_guard = Some(guard);
         tracing::debug!(
@@ -3040,12 +3027,8 @@ impl Session {
 
     /// `Local`: a step that leaves a display through a link endpoint opens the transition.
     async fn track_local(&mut self, position: &geometry::Position, motion: geometry::Point) {
-        // A pointer still inside the band of the edge it came home through is not a
-        // crossing, however hard it is pushed at that edge (`input.edge_hysteresis_px`).
-        if let Some(guard) = self.edge_guard {
-            if guard.holds(position) {
-                return;
-            }
+        // Leaving the band re-arms its edge, even when this sample crosses no link.
+        if self.edge_guard.is_some_and(|guard| !guard.holds(position)) {
             self.edge_guard = None;
         }
         // Only the owner opens leases, so only the owner reacts to an edge; a follower
@@ -3061,6 +3044,12 @@ impl Session {
         let Some(transition) = step else {
             return;
         };
+        if self
+            .edge_guard
+            .is_some_and(|guard| guard.holds_crossing(position, transition.source.edge))
+        {
+            return;
+        }
         let target = transition.target.node;
         if target == self.node_id {
             return;
@@ -3070,14 +3059,11 @@ impl Session {
         {
             return;
         }
-        let inward = geometry::Point::new(-motion.x, -motion.y);
-        let armed_at = if motion.x.abs() >= motion.y.abs() {
-            position.x
-        } else {
-            position.y
-        };
-        self.pending_edge_guard =
-            crate::topology::ReturnGuard::after_return(inward, armed_at, self.edge_hysteresis_px);
+        self.pending_edge_guard = Some(crate::topology::ReturnGuard::after_return(
+            transition.source.edge,
+            position,
+            self.edge_hysteresis_px,
+        ));
         let entry_position = transition.target_position;
         let topology_revision = self.router.topology_revision();
         tracing::info!(
@@ -3130,7 +3116,7 @@ impl Session {
             // Disarm the edge the pointer came home through until it leaves the band: a
             // pointer that came home sitting on the edge would otherwise resolve a fresh
             // crossing on the next sample (see `arm_return_guard`).
-            self.arm_return_guard(step, &entry_position);
+            self.arm_return_guard(transition.target.edge, &entry_position);
             return_effect = self.topology.as_ref().and_then(|topology| {
                 crate::edgefx::entry(
                     topology,

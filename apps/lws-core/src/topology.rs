@@ -553,18 +553,13 @@ pub enum Axis {
 /// `[input] edge_hysteresis_px` was parsed and never read (audit F6), so a pointer that
 /// returned sitting *on* the edge resolved a fresh crossing on the very next sample that
 /// pushed the same way, and the focus oscillated `Local`/`Remote` once per sample — the
-/// owner's cursor jumping back and forth at the boundary. This is that hysteresis: the
-/// axis and the sign of the step that carried the pointer out, the edge's own coordinate
-/// on that axis, and the band width. It holds while the pointer is still inside the band
-/// and lets go as soon as it is clear of it, which is also when the edge may trigger
-/// again.
+/// owner's cursor jumping back and forth at the boundary. The crossed endpoint, not
+/// the dominant motion axis, determines the band and its inward direction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReturnGuard {
     axis: Axis,
-    /// The direction the pointer came home *in*, along `axis`: `+1.0` or `-1.0`.
-    ///
-    /// The peer's edge maps to this side's edge, so the direction the captured motion had
-    /// when it crossed is also the direction that carries the pointer *inward* here.
+    edge: geometry::Edge,
+    /// The inward normal along the crossed edge's axis.
     inward: f64,
     /// The coordinate the pointer came home at: the transition's own entry point.
     armed_at: f64,
@@ -572,30 +567,26 @@ pub struct ReturnGuard {
 }
 
 impl ReturnGuard {
-    /// The guard a return through `step` arms at `armed_at`, or `None` without an axis.
-    ///
-    /// `step` is the captured delta that resolved the return and `armed_at` the coordinate
-    /// of the transition's target position on its axis — the point the pointer came home
-    /// at, in the local node's frame.
+    /// Arms the crossed local endpoint at its display-local entry position.
     #[must_use]
     pub fn after_return(
-        step: geometry::Point,
-        armed_at: f64,
+        edge: geometry::Edge,
+        entry: &geometry::Position,
         hysteresis: f64,
-    ) -> Option<ReturnGuard> {
-        let (axis, inward) = if step.x.abs() >= step.y.abs() && step.x != 0.0 {
-            (Axis::X, step.x.signum())
-        } else if step.y != 0.0 {
-            (Axis::Y, step.y.signum())
-        } else {
-            return None;
+    ) -> ReturnGuard {
+        let (axis, inward, armed_at) = match edge {
+            geometry::Edge::Left => (Axis::X, 1.0, entry.x),
+            geometry::Edge::Right => (Axis::X, -1.0, entry.x),
+            geometry::Edge::Top => (Axis::Y, 1.0, entry.y),
+            geometry::Edge::Bottom => (Axis::Y, -1.0, entry.y),
         };
-        Some(ReturnGuard {
+        ReturnGuard {
             axis,
+            edge,
             inward,
             armed_at,
             hysteresis,
-        })
+        }
     }
 
     /// Whether `position` is still inside the band, i.e. the edge is still disarmed.
@@ -606,6 +597,12 @@ impl ReturnGuard {
             Axis::Y => position.y,
         };
         (coordinate - self.armed_at) * self.inward < self.hysteresis
+    }
+
+    /// Only the crossed edge is disarmed; other links remain available in the band.
+    #[must_use]
+    pub fn holds_crossing(&self, position: &geometry::Position, edge: geometry::Edge) -> bool {
+        self.edge == edge && self.holds(position)
     }
 
     /// Where the pointer is placed when it comes home: the entry point, the band further in.
@@ -1449,11 +1446,12 @@ mod tests {
     fn a_diagonal_bottom_return_uses_the_crossed_edge_not_the_dominant_delta() {
         // A (-30, -20) step returns through Bottom, even though X dominates.
         let entry = geometry::Position::new("eDP-1", 960.0, 1078.0);
-        let guard = ReturnGuard::after_return(geometry::Point::new(-30.0, -20.0), entry.x, 8.0)
-            .unwrap();
+        let guard = ReturnGuard::after_return(geometry::Edge::Bottom, &entry, 8.0);
         assert_eq!(guard.axis(), Axis::Y);
         assert!(guard.holds(&entry));
         assert!(!guard.holds(&geometry::Position::new("eDP-1", 960.0, 1068.0)));
+        assert!(guard.holds_crossing(&entry, geometry::Edge::Bottom));
+        assert!(!guard.holds_crossing(&entry, geometry::Edge::Right));
     }
 
     /// A pointer that comes home must not re-open the lease by being pushed at the edge it
@@ -1463,8 +1461,11 @@ mod tests {
     fn a_return_disarms_the_edge_until_the_pointer_leaves_the_band() {
         // The live shape: the pointer crossed back over the right edge of a 1080-wide
         // display with a leftward step, and the transition put it home at x=1078.
-        let guard = ReturnGuard::after_return(geometry::Point::new(-32.0, 0.0), 1078.0, 8.0)
-            .expect("a horizontal return arms the guard");
+        let guard = ReturnGuard::after_return(
+            geometry::Edge::Right,
+            &geometry::Position::new("eDP-1", 1078.0, 540.0),
+            8.0,
+        );
         for x in [1080.0, 1079.0, 1078.0, 1071.0] {
             let sample = geometry::Position::new("eDP-1", x, 540.0);
             assert!(guard.holds(&sample), "a push at {x} is inside the band");
@@ -1483,69 +1484,62 @@ mod tests {
     /// A failed outward crossing re-arms only after a deliberate inward retreat.
     #[test]
     fn a_failed_edge_stays_disarmed_while_the_pointer_is_held_outward() {
-        for (outward, boundary, held, further_out, retreat) in [
+        for (edge, held, further_out, retreat) in [
             (
-                geometry::Point::new(32.0, 0.0),
-                1919.0,
+                geometry::Edge::Right,
                 geometry::Position::new("dry-0", 1919.0, 540.0),
                 geometry::Position::new("dry-0", 1960.0, 540.0),
                 geometry::Position::new("dry-0", 1911.0, 540.0),
             ),
             (
-                geometry::Point::new(-32.0, 0.0),
-                0.0,
+                geometry::Edge::Left,
                 geometry::Position::new("dry-0", 0.0, 540.0),
                 geometry::Position::new("dry-0", -40.0, 540.0),
                 geometry::Position::new("dry-0", 8.0, 540.0),
             ),
             (
-                geometry::Point::new(0.0, 32.0),
-                1079.0,
+                geometry::Edge::Bottom,
                 geometry::Position::new("dry-0", 960.0, 1079.0),
                 geometry::Position::new("dry-0", 960.0, 1120.0),
                 geometry::Position::new("dry-0", 960.0, 1071.0),
             ),
             (
-                geometry::Point::new(0.0, -32.0),
-                0.0,
+                geometry::Edge::Top,
                 geometry::Position::new("dry-0", 960.0, 0.0),
                 geometry::Position::new("dry-0", 960.0, -40.0),
                 geometry::Position::new("dry-0", 960.0, 8.0),
             ),
         ] {
-            // Failure keeps the pointer on the source: inward is the opposite
-            // of the attempted crossing, not the direction toward the peer.
-            let inward = geometry::Point::new(-outward.x, -outward.y);
-            let guard = ReturnGuard::after_return(inward, boundary, 8.0)
-                .expect("a failed crossing has a motion axis");
+            let guard = ReturnGuard::after_return(edge, &held, 8.0);
             assert!(guard.holds(&held));
             assert!(guard.holds(&further_out));
             assert!(!guard.holds(&retreat));
         }
     }
 
-    /// What matters on the other edges is the direction the pointer came home in: that is
-    /// the inward direction on this side, whatever the document calls the edge.
+    /// Every endpoint supplies its own inward normal.
     #[test]
     fn every_edge_arms_its_own_band() {
         // Up through the bottom edge: inward is -y, the pointer is home at y=1918.
-        let guard = ReturnGuard::after_return(geometry::Point::new(0.0, -100.0), 1918.0, 8.0)
-            .expect("a vertical return arms the guard");
+        let guard = ReturnGuard::after_return(
+            geometry::Edge::Bottom,
+            &geometry::Position::new("eDP-1", 540.0, 1918.0),
+            8.0,
+        );
         assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 1918.0)));
         assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 1911.0)));
         assert!(!guard.holds(&geometry::Position::new("eDP-1", 540.0, 1910.0)));
         // Down through the top edge: inward is +y, the pointer is home at y=2.
-        let guard = ReturnGuard::after_return(geometry::Point::new(0.0, 100.0), 2.0, 8.0)
-            .expect("a vertical return arms the guard");
+        let guard = ReturnGuard::after_return(
+            geometry::Edge::Top,
+            &geometry::Position::new("eDP-1", 540.0, 2.0),
+            8.0,
+        );
         assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 0.0)));
         assert!(!guard.holds(&geometry::Position::new("eDP-1", 540.0, 10.0)));
         assert_eq!(
             guard.entry(&geometry::Position::new("eDP-1", 540.0, 2.0)).y,
             10.0
-        );
-        assert_eq!(
-            ReturnGuard::after_return(geometry::Point::new(0.0, 0.0), 2.0, 8.0),
-            None
         );
     }
 
