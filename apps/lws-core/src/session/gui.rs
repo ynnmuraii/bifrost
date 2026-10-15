@@ -16,6 +16,7 @@
 //! 50 ms, so an open GUI never shows a stale screen, and a GUI nobody opened costs nothing
 //! but the comparison.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -752,13 +753,16 @@ impl Session {
         let window = connection.window.clone();
         let address = connection.address.to_string();
         tokio::spawn(async move {
-            match identity::accept_stream(
-                connection.stream,
-                &identity,
-                &window,
-                Some(address),
-                listen_port,
-                &display_name,
+            match within(
+                OPENER_HELLO_TIMEOUT,
+                identity::accept_stream(
+                    connection.stream,
+                    &identity,
+                    &window,
+                    Some(address),
+                    listen_port,
+                    &display_name,
+                ),
             )
             .await
             {
@@ -767,6 +771,8 @@ impl Session {
                         .await;
                 }
                 Err(error) => {
+                    // A dialer that completes TLS and then says nothing must not hold its slot:
+                    // the failure releases the ceremony and the window's pending count.
                     let _ = events
                         .send(pairing::Event::Finished {
                             ceremony_id,
@@ -1096,4 +1102,44 @@ fn hex(bytes: &[u8]) -> String {
 /// The `NodeId` a 32-byte wire id names, when it is one.
 fn node_id_of(bytes: &[u8]) -> Option<geometry::NodeId> {
     <[u8; 32]>::try_from(bytes).ok().map(geometry::NodeId::new)
+}
+
+/// How long an accepted `pair/1` connection may take to deliver its `PairHello`. The window
+/// itself lasts two minutes; a dialer that completes TLS and then goes silent would otherwise
+/// hold one of the three pending slots, a task and a socket until the window closes.
+const OPENER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `future` under `limit`; a timeout is an error like any other failure of the ceremony.
+async fn within<T, E: std::fmt::Display>(
+    limit: Duration,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(limit, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => {
+            Err("the other computer did not complete the pairing handshake in time".to_owned())
+        }
+    }
+}
+
+#[cfg(test)]
+mod opener_tests {
+    use super::*;
+
+    /// Review R5': a silent dialer must fail the ceremony instead of holding its slot.
+    #[tokio::test]
+    async fn a_silent_dialer_times_out_instead_of_holding_its_slot() {
+        let error = within::<(), String>(
+            Duration::from_millis(50),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .expect_err("a handshake that never finishes is a failure");
+        assert!(error.contains("in time"), "{error}");
+        assert_eq!(
+            within::<u8, String>(Duration::from_secs(1), async { Ok(7) }).await,
+            Ok(7)
+        );
+    }
 }
