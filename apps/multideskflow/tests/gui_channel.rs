@@ -853,15 +853,28 @@ fn live_hotkey_rebinds_are_serialized_validated_and_persisted_without_desktop_in
             status.focus == "Local" && !marker.exists()
         })
         .expect("still local");
-    std::fs::write(
-        harness.b.root.join("run/hotkey-dry"),
-        (protocol::ipc::HotkeyAction::ClaimOwnership as i32).to_string(),
-    )
-    .expect("claim hotkey");
+    // This harness writes the receiver `can_own = false` (`common::write_config`), so B can never
+    // take the workspace and the only node that may is A, which already holds it. The key is
+    // therefore exercised the way the ownership buttons are: A gives the workspace up through the
+    // window, and its own ClaimOwnership key takes it back.
+    let answer = window.request(gui_frame::Msg::AbandonOwnership(
+        protocol::ipc::AbandonOwnership {},
+    ));
+    assert!(
+        matches!(&answer, gui_frame::Msg::OpResult(result) if result.ok),
+        "abandon: {answer:?}"
+    );
     harness
-        .b
+        .a
+        .wait_for("ownership given up", DEADLINE, |status| {
+            status.owner != harness.a.id
+        })
+        .expect("A released ownership");
+    trigger(protocol::ipc::HotkeyAction::ClaimOwnership);
+    harness
+        .a
         .wait_for("hotkey ownership claim", DEADLINE, |status| {
-            status.owner == harness.b.id
+            status.owner == harness.a.id
         })
         .expect("claimed");
     let old_agent = harness.a.agent_pid().expect("agent pid");
