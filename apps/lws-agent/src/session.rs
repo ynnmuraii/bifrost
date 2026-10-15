@@ -1102,6 +1102,7 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
             }))
             .await?;
         }
+        #[cfg(target_os = "linux")]
         Event::HotkeysResult(result) => {
             link.send(Msg::HotkeysResult(result)).await?;
         }
