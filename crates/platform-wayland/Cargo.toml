@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 input-model = { path = "../input-model" }
 edgefx = { path = "../edgefx" }
+# The marker vocabulary the adapter translates Linux's secret hints into; the crate is pure,
+# so it is fine on every host (KVM-041).
+clipboard = { path = "../clipboard" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # ashpd: XDG desktop portal client (pure Rust, MIT). Chosen runtime: tokio, because
@@ -34,4 +37,9 @@ tracing = "0.1"
 # buffers from a memfd. wayland-client's default backend is pure Rust (no libwayland).
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-rustix = { version = "1", features = ["event", "fs"] }
+# `staging` carries `ext-data-control-v1`: the clipboard the owner's KWin implements
+# (KVM-044). The XML ships with the crate, so there is no protocol file to vendor.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# `pipe`: a selection transfer is two pipes (one per direction); `event` gives them their
+# timeouts.
+rustix = { version = "1", features = ["event", "fs", "pipe"] }
