@@ -942,7 +942,7 @@ pub struct UiConfig {
 
 /// `[appearance]`: the small visual effects at linked edges. Read by the core and pushed to the
 /// agent (the overlay runs without the GUI); the GUI-local `gui.toml` is not involved.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppearanceConfig {
     /// The ASCII strip that gathers toward the cursor at a linked edge, and its release on

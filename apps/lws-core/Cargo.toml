@@ -10,6 +10,7 @@ publish = false
 anyhow = "1"
 clipboard = { path = "../../crates/clipboard" }
 config = { path = "../../crates/config" }
+edgefx = { path = "../../crates/edgefx" }
 logging = { path = "../../crates/logging" }
 focus-router = { path = "../../crates/focus-router" }
 geometry = { path = "../../crates/geometry" }

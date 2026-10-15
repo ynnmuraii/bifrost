@@ -332,6 +332,11 @@ pub struct Session {
     trust: identity::TrustStore,
     /// Persists the ownership pair across restarts (`config.toml`).
     ownership_store: OwnershipStore,
+    /// `[appearance]`: saved by `SetAppearance`, pushed live to the agent as `SetEffects`.
+    appearance: config::AppearanceConfig,
+    appearance_path: Option<std::path::PathBuf>,
+    /// The edge-effect frames for the agent's overlay (rate-limited, ~30 Hz).
+    edgefx: crate::edgefx::Emitter,
     /// The layout document's revision discipline (KVM-072): CAS, floor, pending.
     layout_state: crate::layout::Layout,
     /// Persists the layout pair into `[topology]`.
@@ -542,6 +547,9 @@ impl Session {
             backend,
             trust,
             ownership_store,
+            appearance: config::AppearanceConfig::default(),
+            appearance_path: None,
+            edgefx: crate::edgefx::Emitter::new(true),
             layout_state,
             layout_store,
             applied_wire: None,
@@ -831,6 +839,18 @@ impl Session {
         self.layout_edit_document(text, expected, source).await
     }
 
+    /// Seeds `[appearance]` and the config path `SetAppearance` saves to (the GUI never
+    /// writes the file: this core is its single writer, under the config lock).
+    pub fn set_appearance_source(
+        &mut self,
+        path: std::path::PathBuf,
+        appearance: config::AppearanceConfig,
+    ) {
+        self.edgefx.set_enabled(appearance.edge_effects);
+        self.appearance = appearance;
+        self.appearance_path = Some(path);
+    }
+
     /// The monotonic millisecond clock shared with the FSM.
     fn now_ms(&self) -> u64 {
         self.clock.monotonic_ms()
@@ -1034,6 +1054,9 @@ impl Session {
             self.agent_restart_due = Some(Instant::now());
         }
 
+        if let Some(frame) = self.edgefx.due(now) {
+            self.send_edgefx(Some(frame)).await;
+        }
         for timer in self.timers.due(now) {
             tracing::debug!(?timer, "timer expired");
             self.feed(fr::Input::TimerExpired(timer)).await;
@@ -1064,6 +1087,9 @@ impl Session {
     /// When the loop must wake next, in `now_ms` millis.
     fn next_deadline(&self, now_ms: u64) -> u64 {
         let mut deadline = now_ms.saturating_add(IDLE_TICK.as_millis() as u64);
+        if let Some(due) = self.edgefx.due_at() {
+            deadline = deadline.min(due.max(now_ms));
+        }
         if let Some((_, timer_deadline)) = self.timers.next() {
             deadline = deadline.min(timer_deadline);
         }
@@ -1159,6 +1185,7 @@ impl Session {
                 }
                 Effect::Agent(command) => {
                     self.context.on_command(&command);
+                    self.edgefx_for_command(&command).await;
                     if matches!(
                         command,
                         fr::AgentCommand::EndCapture { .. }
@@ -2847,6 +2874,72 @@ impl Session {
         }
     }
 
+    /// Sends one edge-effect frame. Cosmetic: a failure is the agent loss path's business.
+    async fn send_edgefx(&mut self, frame: Option<protocol::ipc::EdgeFx>) {
+        if let Some(frame) = frame {
+            let _ = self.agent.send(Msg::EdgeFx(frame)).await;
+        }
+    }
+
+    /// One pointer sample on the owner while `Local`: at most ~30 Hz of work, and only a
+    /// frame when the pointer is within reach of a linked edge.
+    async fn sample_edgefx(&mut self, position: &geometry::Position) {
+        let now = self.now_ms();
+        if !self.edgefx.wants_sample(now) {
+            return;
+        }
+        let near = self
+            .topology
+            .as_ref()
+            .and_then(|topology| crate::edgefx::proximity(topology, &self.node_id, position));
+        let frame = match near {
+            Some((update, display)) => self.edgefx.push(update, &display, now),
+            None => self.edgefx.out_of_reach(now),
+        };
+        self.send_edgefx(frame).await;
+    }
+
+    /// The edge effects a command to the agent implies: `Crossed` when this node starts
+    /// sending input away, `Entered` at the first pointer position of a receiver lease,
+    /// `Left` when either lease ends.
+    async fn edgefx_for_command(&mut self, command: &fr::AgentCommand) {
+        let now = self.now_ms();
+        let update = match command {
+            fr::AgentCommand::BeginCapture {
+                kind: input_model::CaptureKind::Remote,
+                ..
+            } => Some((edgefx::Update::Crossed(None), String::new())),
+            fr::AgentCommand::PrepareInject { .. } => {
+                self.edgefx.await_entry();
+                None
+            }
+            fr::AgentCommand::Inject { events, .. } if self.edgefx.take_entry_wanted() => {
+                let first = events.iter().find_map(|event| match event {
+                    InputEvent::PointerAbsolute(position) => Some(position),
+                    _ => None,
+                });
+                match (first, self.topology.as_ref()) {
+                    (Some(position), Some(topology)) => crate::edgefx::entry_in_desktop(
+                        topology,
+                        &self.node_id,
+                        position.x,
+                        position.y,
+                    ),
+                    _ => None,
+                }
+            }
+            fr::AgentCommand::EndCapture { .. } | fr::AgentCommand::ReleaseSession { .. } => {
+                self.edgefx.cancel_entry();
+                Some((edgefx::Update::Left, String::new()))
+            }
+            _ => None,
+        };
+        if let Some((update, display)) = update {
+            let frame = self.edgefx.push(update, &display, now);
+            self.send_edgefx(frame).await;
+        }
+    }
+
     /// Asks the agent to watch the local pointer, once, for the node that owns input.
     ///
     /// An observation has no lease and no suppression, so its `lease_id` is empty — which
@@ -2937,6 +3030,7 @@ impl Session {
         if !self.router.is_owner() || self.router.focus() != fr::FocusState::Local {
             return;
         }
+        self.sample_edgefx(position).await;
         let step = match self.topology.as_ref() {
             Some(topology) => geometry::resolve_motion(topology, &self.node_id, position, motion),
             None => None,
@@ -3013,6 +3107,19 @@ impl Session {
             // pointer that came home sitting on the edge would otherwise resolve a fresh
             // crossing on the next sample (see `arm_return_guard`).
             self.arm_return_guard(step, &entry_position);
+            let returned = self.topology.as_ref().and_then(|topology| {
+                crate::edgefx::entry(
+                    topology,
+                    &self.node_id,
+                    &entry_position.display_id,
+                    entry_position.x,
+                    entry_position.y,
+                )
+            });
+            if let Some((update, display)) = returned {
+                let frame = self.edgefx.push(update, &display, self.now_ms());
+                self.send_edgefx(frame).await;
+            }
         } else {
             // A link that leads further on: the lease has to be released first, so the
             // target is remembered and walked once the FSM is Local again.

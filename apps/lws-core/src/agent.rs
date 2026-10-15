@@ -257,6 +257,8 @@ pub struct Supervisor {
     portal: crate::portal::PortalGrants,
     /// A portal failure disables new portal sessions across automatic agent restarts.
     allow_portal_sessions: bool,
+    /// `[appearance]`, sent in every `AgentAttach`.
+    appearance: config::AppearanceConfig,
     /// Rule 11's heartbeat, with the startup grace; the supervisor marks every launch
     /// and every received frame, so the state survives a session's watchdog questions.
     heartbeat: AgentHeartbeat,
@@ -310,6 +312,7 @@ impl Supervisor {
             takeover,
             repeat_mode,
             allow_portal_sessions: true,
+            appearance: config::AppearanceConfig::default(),
             heartbeat: AgentHeartbeat::new(core_silence_ms),
             launches: 0,
             child: None,
@@ -318,6 +321,18 @@ impl Supervisor {
             token_file: None,
             state: AgentState::Starting,
         }
+    }
+
+    /// The `[appearance]` values every later `AgentAttach` carries (a restarted agent starts
+    /// with the current ones, not the ones from launch).
+    #[must_use]
+    pub fn with_appearance(mut self, appearance: config::AppearanceConfig) -> Self {
+        self.appearance = appearance;
+        self
+    }
+
+    pub fn set_appearance(&mut self, appearance: config::AppearanceConfig) {
+        self.appearance = appearance;
     }
 
     /// The agent's state word for the status line.
@@ -455,6 +470,7 @@ impl Supervisor {
             self.takeover.threshold_px,
             self.repeat_mode,
             self.allow_portal_sessions,
+            self.appearance,
         );
         if let Err(error) = link.attach(attach).await {
             self.stop().await;

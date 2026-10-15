@@ -2184,6 +2184,7 @@ dependencies = [
  "anyhow",
  "clipboard",
  "config",
+ "edgefx",
  "focus-router",
  "geometry",
  "identity",
