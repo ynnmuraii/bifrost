@@ -6,7 +6,7 @@ use eframe::egui::{
     self, Align, Color32, Layout, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, UiBuilder, Vec2,
 };
 
-use super::field::{Flow, Frame};
+use super::field::{Flow, Frame, Ribbon};
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
 use super::{act, Env, UiState, FIELD_FRAME};
@@ -15,6 +15,10 @@ use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
 use ui_text::{text, Key};
+
+/// How far the ribbon of «ASCII-изолиния» arches above the midpoint of a link, in points per
+/// unit of scale — the mockup's own 110 (`docs/design/mockup/Main.dc.html`).
+const RIBBON_ARCH: f32 = 110.0;
 
 /// Stage → screen.
 #[derive(Clone, Copy)]
@@ -98,7 +102,8 @@ pub fn draw(
         })
         .collect();
 
-    // The links input flows through, for the field.
+    // The links input flows through, for the field: a live link in «ASCII-изолиния» also gets
+    // the ribbon's arc, from the centre of one computer to the centre of the other.
     let flows: Vec<Flow> = model
         .links
         .iter()
@@ -106,10 +111,24 @@ pub fn draw(
         .map(|l| {
             let (a, b) = link_ends(&model, l, &shown, xf);
             let (from, to) = if l.forward { (a, b) } else { (b, a) };
+            let centre = |n: usize| {
+                let node = &model.nodes[n];
+                Pos2::new(
+                    shown[n].x + node.w as f32 * s / 2.0,
+                    shown[n].y + node.h as f32 * s / 2.0,
+                )
+            };
+            let (ca, cb) = (centre(l.a), centre(l.b));
+            let (ca, cb) = if l.forward { (ca, cb) } else { (cb, ca) };
             Flow {
                 from,
                 to,
                 horizontal: l.dir == Dir::Horizontal,
+                arc: Ribbon {
+                    a: ca,
+                    c: Pos2::new((ca.x + cb.x) / 2.0, ca.y.min(cb.y) - RIBBON_ARCH * s),
+                    b: cb,
+                },
             }
         })
         .collect();
@@ -860,27 +879,66 @@ mod transform_tests {
         use crate::view_model::{layout::MapMonitor, Side};
         let arrangement = map::arrange(
             &[
-                vec![MapRect::new(0.0, 0.0, 1920.0, 1080.0),
-                     MapRect::new(1920.0, -247.0, 1080.0, 1920.0)],
+                vec![
+                    MapRect::new(0.0, 0.0, 1920.0, 1080.0),
+                    MapRect::new(1920.0, -247.0, 1080.0, 1920.0),
+                ],
                 vec![MapRect::new(0.0, 0.0, 1745.0, 1091.0)],
             ],
-            &[DocLink { a: 0, side: Side::Left, b: 1 }],
+            &[DocLink {
+                a: 0,
+                side: Side::Left,
+                b: 1,
+            }],
             0,
         );
-        let nodes = arrangement.shapes.iter().enumerate().map(|(i, shape)| MapNode {
-            node_id: i.to_string(),
-            name: ["YNNMURAII", "ynn-notebook"][i].to_owned(),
-            os: String::new(), focus: String::new(), online: true,
-            target: i == 0, approx: i == 1, at: arrangement.pos[i], w: shape.w, h: shape.h,
-            mons: shape.mons.iter().map(|&rect| MapMonitor {
-                rect, num: String::new(), res: String::new(), tag: "",
-            }).collect(),
-        }).collect();
-        let links = map::links(&arrangement.shapes, &arrangement.pos).into_iter().map(|l| MapLink {
-            a: l.a, b: l.b, from: l.from, to: l.to, dir: l.dir, span: l.span,
-            state: LinkState::Active, whole_desktop: true, forward: false,
-        }).collect();
-        MapModel { nodes, links, screens: 3, dirty: false }
+        let nodes = arrangement
+            .shapes
+            .iter()
+            .enumerate()
+            .map(|(i, shape)| MapNode {
+                node_id: i.to_string(),
+                name: ["YNNMURAII", "ynn-notebook"][i].to_owned(),
+                os: String::new(),
+                focus: String::new(),
+                online: true,
+                target: i == 0,
+                approx: i == 1,
+                at: arrangement.pos[i],
+                w: shape.w,
+                h: shape.h,
+                mons: shape
+                    .mons
+                    .iter()
+                    .map(|&rect| MapMonitor {
+                        rect,
+                        num: String::new(),
+                        res: String::new(),
+                        tag: "",
+                    })
+                    .collect(),
+            })
+            .collect();
+        let links = map::links(&arrangement.shapes, &arrangement.pos)
+            .into_iter()
+            .map(|l| MapLink {
+                a: l.a,
+                b: l.b,
+                from: l.from,
+                to: l.to,
+                dir: l.dir,
+                span: l.span,
+                state: LinkState::Active,
+                whole_desktop: true,
+                forward: false,
+            })
+            .collect();
+        MapModel {
+            nodes,
+            links,
+            screens: 3,
+            dirty: false,
+        }
     }
 
     #[test]
@@ -894,20 +952,36 @@ mod transform_tests {
             for state in [LinkState::Active, LinkState::Idle] {
                 let mut link = model.links[0].clone();
                 link.state = state;
-                let xf = Xf::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0)), 150);
+                let xf = Xf::new(
+                    Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0)),
+                    150,
+                );
                 let shown: Vec<_> = model.nodes.iter().map(|n| xf.p(n.at.x, n.at.y)).collect();
                 let (a, b) = link_ends(&model, &link, &shown, xf);
                 eprintln!("owner layout {style:?} {state:?}: link {a:?} -> {b:?}");
                 assert!(b.x - a.x > 30.0);
                 let mut field = super::super::field::Field::new();
                 let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    draw_link(ui.painter(), &pal, &model, &link, &shown, xf, style, &mut field);
+                    draw_link(
+                        ui.painter(),
+                        &pal,
+                        &model,
+                        &link,
+                        &shown,
+                        xf,
+                        style,
+                        &mut field,
+                    );
                 });
                 let mut rails = 0;
                 let mut chain = 0;
                 fn inspect(shape: &Shape, a: Pos2, b: Pos2, rails: &mut usize, chain: &mut usize) {
                     match shape {
-                        Shape::Vec(shapes) => for s in shapes { inspect(s, a, b, rails, chain); },
+                        Shape::Vec(shapes) => {
+                            for s in shapes {
+                                inspect(s, a, b, rails, chain);
+                            }
+                        }
                         Shape::LineSegment { points, stroke } => {
                             eprintln!("line {points:?} {stroke:?}");
                             assert!(stroke.color.a() > 100);
@@ -921,12 +995,16 @@ mod transform_tests {
                         Shape::Text(text) => {
                             eprintln!("glyph {:?} at {:?}", text.galley.text(), text.pos);
                             let center = text.pos + text.galley.size() / 2.0;
-                            if center.x > a.x && center.x < b.x { *chain += 1; }
+                            if center.x > a.x && center.x < b.x {
+                                *chain += 1;
+                            }
                         }
                         _ => {}
                     }
                 }
-                for clipped in &output.shapes { inspect(&clipped.shape, a, b, &mut rails, &mut chain); }
+                for clipped in &output.shapes {
+                    inspect(&clipped.shape, a, b, &mut rails, &mut chain);
+                }
                 assert_eq!(rails, 2, "{style:?} {state:?}");
                 assert!(chain > 2, "{style:?} {state:?}");
                 output.drop_without_applying_deltas();
@@ -936,10 +1014,12 @@ mod transform_tests {
 
     #[test]
     fn repeated_draw_frames_carry_the_same_hover_outline_with_the_animated_card() {
-        use crate::view_model::{CoreEndpoint, EditorDisplay, EditorNode, LocalConfig};
         use crate::map::{Pt, Rect as MapRect, Shape as MapShape};
+        use crate::view_model::{CoreEndpoint, EditorDisplay, EditorNode, LocalConfig};
         let mut vm = ViewModel::new(
-            CoreEndpoint::Ready { description: String::new() },
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
             LocalConfig::default(),
         );
         vm.look.clouds = false;
@@ -948,13 +1028,25 @@ mod transform_tests {
         vm.look.zoom_percent = 100;
         let mon = MapRect::new(0.0, 0.0, 200.0, 100.0);
         vm.editor.nodes = vec![EditorNode {
-            node_id: "01".repeat(32), display_name: "notebook".to_owned(), online: true,
+            node_id: "01".repeat(32),
+            display_name: "notebook".to_owned(),
+            online: true,
             displays: vec![EditorDisplay {
-                id: "zone-0".to_owned(), x: 0.0, y: 0.0, w: 1745.0, h: 1091.0,
-                primary: true, native_known: false, rotation: 0,
+                id: "zone-0".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                w: 1745.0,
+                h: 1091.0,
+                primary: true,
+                native_known: false,
+                rotation: 0,
             }],
         }];
-        vm.editor.shapes = vec![MapShape { mons: vec![mon], w: mon.w, h: mon.h }];
+        vm.editor.shapes = vec![MapShape {
+            mons: vec![mon],
+            w: mon.w,
+            h: mon.h,
+        }];
         vm.editor.placement = vec![Pt::new(300.0, 100.0)];
         vm.editor.baseline = vm.editor.placement.clone();
         let ctx = egui::Context::default();
@@ -974,33 +1066,52 @@ mod transform_tests {
             }
             let t = frame as f32 / 30.0;
             let mut painted = None;
-            let output = ctx.run_ui(egui::RawInput {
-                screen_rect: Some(map),
-                time: Some(f64::from(t)),
-                events: vec![egui::Event::PointerMoved(pointer)],
-                ..Default::default()
-            }, |ui| {
-                let _ = draw(ui, &pal, &vm, &mut st, map, Env { now, animate: true }, t, &mut Vec::new());
-                // What the painter was handed this frame is the outline's ground truth; the
-                // animation itself cannot be asked for a value twice in one frame, and reading
-                // the response after the pass would hand back the frame before.
-                painted = ui
-                    .ctx()
-                    .read_response(card_id)
-                    .map(|response| response.rect.translate(-map.min.to_vec2()));
-            });
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(map),
+                    time: Some(f64::from(t)),
+                    events: vec![egui::Event::PointerMoved(pointer)],
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = draw(
+                        ui,
+                        &pal,
+                        &vm,
+                        &mut st,
+                        map,
+                        Env { now, animate: true },
+                        t,
+                        &mut Vec::new(),
+                    );
+                    // What the painter was handed this frame is the outline's ground truth; the
+                    // animation itself cannot be asked for a value twice in one frame, and reading
+                    // the response after the pass would hand back the frame before.
+                    painted = ui
+                        .ctx()
+                        .read_response(card_id)
+                        .map(|response| response.rect.translate(-map.min.to_vec2()));
+                },
+            );
             output.drop_without_applying_deltas();
             if frame >= 2 {
                 assert_eq!(st.hover, Some((0, 0)), "hover identity must not change");
                 let painted = painted.expect("the hovered monitor is a widget");
                 let outline = st.field.outline_rect().expect("hover forms an outline");
-                assert!(outline.min.distance(painted.min) < 0.001, "frame {frame}: {outline:?} vs {painted:?}");
+                assert!(
+                    outline.min.distance(painted.min) < 0.001,
+                    "frame {frame}: {outline:?} vs {painted:?}"
+                );
                 assert_eq!(outline.size(), painted.size());
-                if frame == 3 { initial_outline = Some(outline); }
+                if frame == 3 {
+                    initial_outline = Some(outline);
+                }
                 if frame == 11 {
                     let target = vm.editor.placement[0];
                     assert!(outline.min.x > initial_outline.unwrap().min.x + 1.0);
-                    assert!(outline.min.x < monitor_rect(xf.p(target.x, target.y), mon, xf.s).min.x);
+                    assert!(
+                        outline.min.x < monitor_rect(xf.p(target.x, target.y), mon, xf.s).min.x
+                    );
                 }
             }
         }

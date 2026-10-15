@@ -40,6 +40,9 @@ const SETTLED_POINTER: f32 = 0.5;
 /// How far apart the glyphs of an ASCII isoline are, in points: a character every 13 points
 /// leaves gaps wide enough that the chain is unmistakably made of glyphs.
 const LINK_STEP: f32 = 13.0;
+/// How many particles the «ASCII-изолиния» ribbons may take from the field at once, however
+/// many links are live. The mockup takes 40% of the field, capped at 260.
+const RIBBON_MAX: usize = 260;
 
 const BAYER: [f32; 16] = [
     0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0,
@@ -129,6 +132,33 @@ pub struct Flow {
     pub to: Pos2,
     /// `true` for a horizontal link (the wobble is vertical).
     pub horizontal: bool,
+    /// The arc the ribbon of «ASCII-изолиния» follows: the two ends and the arch over them.
+    pub arc: Ribbon,
+}
+
+/// The «ASCII-изолиния» of one active link, in screen points: the ribbon of particles leaves
+/// the centre of one computer along this quadratic Bézier and arrives at the centre of the
+/// other. The mockup (`docs/design/mockup/Main.dc.html`) is the shape: the control point sits
+/// over the midpoint, raised by 110 points × scale.
+#[derive(Debug, Clone, Copy)]
+pub struct Ribbon {
+    /// The centre of the computer the ribbon leaves.
+    pub a: Pos2,
+    /// The control point: the midpoint, raised.
+    pub c: Pos2,
+    /// The centre of the computer the ribbon reaches.
+    pub b: Pos2,
+}
+
+impl Ribbon {
+    /// The point of the arc at `u` (`0` at `a`, `1` at `b`).
+    pub fn at(self, u: f32) -> Pos2 {
+        let w = 1.0 - u;
+        Pos2::new(
+            w * w * self.a.x + 2.0 * w * u * self.c.x + u * u * self.b.x,
+            w * w * self.a.y + 2.0 * w * u * self.c.y + u * u * self.b.y,
+        )
+    }
 }
 
 /// What a frame of the field needs to know.
@@ -169,6 +199,9 @@ pub struct Field {
     animation_t: f32,
     shaped: bool,
     form_rect: Option<Rect>,
+    /// How many particles the ribbons hold at the front of the field; `0` when the style is
+    /// «Линия» or no link is live. Kept across a frozen frame, so the ribbon stays drawn.
+    ribbon: usize,
 }
 
 impl Field {
@@ -509,20 +542,47 @@ impl Field {
         let mode = frame.look.field;
         let m = self.mouse;
         let radius = 140.0f32;
+        // The ribbons of «ASCII-изолиния»: a share of the particles leaves its place for the arc
+        // between the centres of the linked computers. The mockup's share is 40% of the field,
+        // capped, and it is what keeps the window asking for frames while a link is live.
+        let arcs = if frame.look.link_style == LinkStyle::Ascii {
+            frame.flows.len()
+        } else {
+            0
+        };
+        let per = ((self.parts.len() as f32 * 0.4) as usize).min(RIBBON_MAX) / arcs.max(1);
+        let held = if arcs == 0 { 0 } else { per * arcs };
+        self.ribbon = held;
+        // The particles live in map coordinates; the arc arrives in screen points.
+        let origin = frame.map.min;
         let mut fastest = 0.0f32;
-        for p in &mut self.parts {
+        for (i, p) in self.parts.iter_mut().enumerate() {
             let mut tx: f32;
             let mut ty: f32;
             let mut want = 0.0f32;
+            let mut on_arc = false;
             if p.g != '\0' {
                 tx = p.tx;
                 ty = p.ty;
                 want = 1.0;
+            } else if i < held {
+                let u = ((i % per) as f32 / per as f32 + t * 0.12).fract();
+                let at = frame.flows[i / per].arc.at(u);
+                tx = at.x - origin.x;
+                ty = at.y - origin.y
+                    + ((i % 7) as f32 - 3.0) * 5.0
+                    + (u * 9.4 + t * 1.6).sin() * 6.0;
+                // Kept on the particle: `tx`/`ty` are its target while it belongs to a shape,
+                // and the ribbon is the shape it belongs to for as long as one is live.
+                p.tx = tx;
+                p.ty = ty;
+                want = 1.0;
+                on_arc = true;
             } else {
                 tx = p.hx + (t * p.sp + p.ph).cos() * amp;
                 ty = p.hy + (t * p.sp * 0.8 + p.ph).sin() * amp;
             }
-            if m.on && p.g == '\0' {
+            if m.on && p.g == '\0' && !on_arc {
                 let (dx, dy) = (p.x - m.sx, p.y - m.sy);
                 let d2 = dx * dx + dy * dy;
                 if d2 < radius * radius && d2 > 1.0 {
@@ -570,9 +630,16 @@ impl Field {
         };
         let hot = with_alpha(pal.accent, 0.92);
         let origin = frame.map.min;
-        painter.extend(self.parts.iter().filter_map(|p| {
+        painter.extend(self.parts.iter().enumerate().filter_map(|(i, p)| {
             let c = if p.g != '\0' {
                 p.g
+            } else if i < self.ribbon {
+                // The mockup's own glyphs for the ribbon: a dot, and a plus every third.
+                if i % 3 == 0 {
+                    '+'
+                } else {
+                    '·'
+                }
             } else if p.sx < 0.35 {
                 '·'
             } else if p.sx < 1.4 {
@@ -624,6 +691,18 @@ impl Field {
                 ));
             }
         }
+    }
+
+    /// How many particles the ribbons hold at the front of the field (tests).
+    #[cfg(test)]
+    pub(super) fn ribbon(&self) -> usize {
+        self.ribbon
+    }
+
+    /// The target of particle `i`, in map coordinates (tests).
+    #[cfg(test)]
+    pub(super) fn target(&self, i: usize) -> (f32, f32) {
+        (self.parts[i].tx, self.parts[i].ty)
     }
 
     /// How many particles there are (for tests and the resource report).
@@ -828,6 +907,120 @@ mod tests {
         sum / field.parts.len().max(1) as f32
     }
 
+    /// The distance from `p` to the quadratic Bézier `arc`, by walking the curve.
+    fn distance_to_arc(arc: Ribbon, p: Pos2) -> f32 {
+        (0..=200)
+            .map(|i| arc.at(i as f32 / 200.0).distance(p))
+            .fold(f32::MAX, f32::min)
+    }
+
+    /// The mockup's «ASCII-изолиния»: a share of the field leaves its place for the arc between
+    /// the two computers. The other style draws a dashed line and takes no particle, and a frame
+    /// that is not simulating keeps the ribbon exactly where it is.
+    #[test]
+    fn the_ascii_style_pulls_a_ribbon_of_particles_onto_the_link_and_the_line_style_takes_none() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let pal = Palette::of(Look::default().theme);
+        let pointer = Pos2::new(400.0, 300.0);
+        let arc = Ribbon {
+            a: Pos2::new(120.0, 520.0),
+            c: Pos2::new(600.0, 190.0),
+            b: Pos2::new(1080.0, 520.0),
+        };
+        let flow = Flow {
+            from: arc.a,
+            to: arc.b,
+            horizontal: true,
+            arc,
+        };
+        let mut map = Rect::ZERO;
+        for style in [LinkStyle::Ascii, LinkStyle::Line] {
+            let look = Look {
+                link_style: style,
+                ..Look::default()
+            };
+            let mut field = Field::new();
+            let flows = [flow];
+            for n in 0..=8 {
+                let t = n as f32 / 30.0;
+                ctx.run_ui(map_input(t), |ui| {
+                    map = ui.ctx().content_rect();
+                    field.paint(
+                        ui.painter(),
+                        &Frame {
+                            map,
+                            pal: &pal,
+                            look,
+                            simulate: true,
+                            t,
+                            pointer: Some(pointer),
+                            flows: &flows,
+                        },
+                    );
+                })
+                .drop_without_applying_deltas();
+            }
+            let held = field.ribbon();
+            if style == LinkStyle::Line {
+                assert_eq!(held, 0, "«Линия» is a dashed line and takes no particle");
+                continue;
+            }
+            assert!(
+                held >= 100 && held <= RIBBON_MAX,
+                "the ribbon is a share of the field, capped: {held}"
+            );
+            let at = |i: usize| {
+                let (tx, ty) = field.target(i);
+                Pos2::new(tx + map.min.x, ty + map.min.y)
+            };
+            for i in 0..held {
+                let off = distance_to_arc(arc, at(i));
+                assert!(off < 22.0, "particle {i} sits {off} points off the arc");
+            }
+            // It spans the two computers: the centres of the cards are the ends of the ribbon.
+            assert!(
+                (0..held).any(|i| at(i).distance(arc.a) < 30.0),
+                "the ribbon leaves the centre of the first computer"
+            );
+            assert!(
+                (0..held).any(|i| at(i).distance(arc.b) < 30.0),
+                "the ribbon arrives at the centre of the other"
+            );
+            // A frozen frame: no repaint, and every particle stays exactly where it was.
+            let held_targets: Vec<(f32, f32)> = (0..held).map(|i| field.target(i)).collect();
+            let parts: Vec<(f32, f32)> = field.parts.iter().map(|p| (p.x, p.y)).collect();
+            let mut moving = true;
+            ctx.run_ui(map_input(9.0), |ui| {
+                moving = field.paint(
+                    ui.painter(),
+                    &Frame {
+                        map,
+                        pal: &pal,
+                        look,
+                        simulate: false,
+                        t: 9.0,
+                        pointer: None,
+                        flows: &flows,
+                    },
+                );
+            })
+            .drop_without_applying_deltas();
+            assert!(!moving, "a window that is not simulating asks for no frame");
+            assert_eq!(field.ribbon(), held, "the ribbon stays drawn while frozen");
+            assert_eq!(
+                (0..held).map(|i| field.target(i)).collect::<Vec<_>>(),
+                held_targets,
+                "the frozen frame keeps the ribbon's targets"
+            );
+            assert_eq!(
+                field.parts.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
+                parts,
+                "nothing snaps when the pointer leaves"
+            );
+        }
+    }
+
     #[test]
     fn a_held_pointer_keeps_the_particles_and_stops_the_frames_once_they_have_converged() {
         let ctx = egui::Context::default();
@@ -933,6 +1126,11 @@ mod tests {
             from,
             to,
             horizontal: true,
+            arc: Ribbon {
+                a: from,
+                c: Pos2::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0),
+                b: to,
+            },
         }];
         let mut found = Vec::new();
         let output = ctx.run_ui(map_input(0.0), |ui| {
@@ -1052,7 +1250,11 @@ mod tests {
         field.retarget_form(card.translate(delta));
         for (old, new) in before.iter().zip(&field.parts) {
             assert_eq!(old.g, new.g);
-            let movement = if old.g == '\0' { egui::Vec2::ZERO } else { delta };
+            let movement = if old.g == '\0' {
+                egui::Vec2::ZERO
+            } else {
+                delta
+            };
             assert_eq!(new.tx, old.tx + movement.x);
             assert_eq!(new.ty, old.ty + movement.y);
             assert_eq!(new.x, old.x + movement.x);
