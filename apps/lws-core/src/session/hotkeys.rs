@@ -5,7 +5,6 @@ pub(super) struct Pending {
     request: crate::gui::Request,
     wanted: config::HotkeyBindings,
     rollback: bool,
-    deadline: std::time::Instant,
 }
 
 pub(crate) fn bindings(config: &config::HotkeyBindings) -> Vec<ipc::HotkeyBinding> {
@@ -21,12 +20,6 @@ pub(crate) fn bindings(config: &config::HotkeyBindings) -> Vec<ipc::HotkeyBindin
 }
 
 impl Session {
-    pub(super) async fn hotkeys_tick(&mut self) {
-        if self.hotkey_pending.as_ref().is_some_and(|pending| std::time::Instant::now() >= pending.deadline) {
-            self.agent.stop().await;
-            self.hotkeys_agent_lost().await;
-        }
-    }
     pub(super) async fn hotkeys_agent_lost(&mut self) {
         for binding in &mut self.hotkey_status {
             binding.available = false;
@@ -78,7 +71,7 @@ impl Session {
                 self.hotkey_answer(request, false, &error).await;
                 continue;
             }
-            self.hotkey_pending = Some(Pending { request, wanted, rollback: false, deadline: std::time::Instant::now() + std::time::Duration::from_secs(30) });
+            self.hotkey_pending = Some(Pending { request, wanted, rollback: false });
         }
     }
 
@@ -109,7 +102,7 @@ impl Session {
                 self.emergency_hotkey = self.hotkeys.emergency_release.clone();
                 self.agent.set_hotkeys(self.hotkeys.clone());
                 self.hotkey_status = result.bindings;
-                self.hotkey_answer(pending.request, true, "").await;
+                self.hotkey_answer(pending.request, true, &result.detail).await;
             } else {
                 pending.rollback = true;
                 if self.agent.send(Msg::SetHotkeys(ipc::SetHotkeys { bindings: bindings(&self.hotkeys) })).await.is_ok() {
