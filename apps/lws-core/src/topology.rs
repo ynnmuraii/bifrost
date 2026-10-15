@@ -1233,7 +1233,6 @@ pub fn check_layout(
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 
@@ -1923,10 +1922,9 @@ bidirectional = true
         }
     }
 
-    fn three_desks() -> (
-        Vec<ipc::DisplayInfo>,
-        BTreeMap<NodeId, (u64, Vec<wire::Display>)>,
-    ) {
+    type Peers = BTreeMap<NodeId, (u64, Vec<wire::Display>)>;
+
+    fn three_desks() -> (Vec<ipc::DisplayInfo>, Peers) {
         let local = vec![info(
             "L",
             [0.0, 0.0, 1920.0, 1080.0],
@@ -1948,12 +1946,14 @@ bidirectional = true
     #[test]
     fn an_edit_the_live_manifests_cannot_build_is_refused() {
         let (local, peers) = three_desks();
-        let mut layout = config::TopologyConfig::default();
         // Two peers on the same side of one desktop: the segments overlap.
-        layout.links = vec![
-            auto_link_config("one", [0xAA; 32], config::Edge::Right, config::Edge::Left),
-            auto_link_config("two", [0xBB; 32], config::Edge::Right, config::Edge::Left),
-        ];
+        let layout = config::TopologyConfig {
+            links: vec![
+                auto_link_config("one", [0xAA; 32], config::Edge::Right, config::Edge::Left),
+                auto_link_config("two", [0xBB; 32], config::Edge::Right, config::Edge::Left),
+            ],
+            ..config::TopologyConfig::default()
+        };
         let error = check_layout(&layout, &local_id(), &local, &peers)
             .expect_err("overlapping auto links must not be applied");
         assert!(
@@ -1965,11 +1965,13 @@ bidirectional = true
     #[test]
     fn adjacent_auto_links_to_two_peers_are_accepted() {
         let (local, peers) = three_desks();
-        let mut layout = config::TopologyConfig::default();
-        layout.links = vec![
-            auto_link_config("one", [0xAA; 32], config::Edge::Right, config::Edge::Left),
-            auto_link_config("two", [0xBB; 32], config::Edge::Bottom, config::Edge::Top),
-        ];
+        let layout = config::TopologyConfig {
+            links: vec![
+                auto_link_config("one", [0xAA; 32], config::Edge::Right, config::Edge::Left),
+                auto_link_config("two", [0xBB; 32], config::Edge::Bottom, config::Edge::Top),
+            ],
+            ..config::TopologyConfig::default()
+        };
         check_layout(&layout, &local_id(), &local, &peers).expect("right + bottom");
     }
 
