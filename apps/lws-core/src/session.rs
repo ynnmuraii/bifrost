@@ -2511,11 +2511,7 @@ impl Session {
             "the agent's adapter decides the clipboard capability"
         );
         self.capabilities.text_clipboard = has_clipboard;
-        let bit = protocol::wire::Capability::TextClipboard as i32;
-        self.local_hello.capabilities.retain(|value| *value != bit);
-        if has_clipboard {
-            self.local_hello.capabilities.push(bit);
-        }
+        routing::set_clipboard_bit(&mut self.local_hello.capabilities, has_clipboard);
         self.manager
             .update_local_hello(self.local_hello.clone())
             .await;

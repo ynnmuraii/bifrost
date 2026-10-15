@@ -265,6 +265,21 @@ pub fn deadline_rearm_ms(timer: fr::Timer, deadline_ms: u64, now_ms: u64) -> Opt
     }
 }
 
+/// Sets or clears `TEXT_CLIPBOARD` in a `Hello` capability list.
+///
+/// This is the one bit the probe cannot decide: ADR-008 declares the clipboard only once the
+/// *platform* says it has one, and on a Wayland session only the adapter knows (a KWin session
+/// has it through `ext-data-control-v1`, a Mutter session has none). The agent reports what its
+/// backend really holds, and this is how that answer reaches the nodes that need it — peers read
+/// the local `Hello` when their link is established.
+pub fn set_clipboard_bit(capabilities: &mut Vec<i32>, has_clipboard: bool) {
+    let bit = wire::Capability::TextClipboard as i32;
+    capabilities.retain(|value| *value != bit);
+    if has_clipboard {
+        capabilities.push(bit);
+    }
+}
+
 /// The `Hello.capabilities` numbers for the bits the FSM and the product use.
 pub fn capability_bits(capabilities: Capabilities) -> Vec<i32> {
     let mut bits = Vec::new();
@@ -1529,6 +1544,43 @@ mod contract_tests {
             expected,
             "capability_bits must map every bit `Capabilities::advertised()` names"
         );
+    }
+
+    /// The clipboard bit is the one the probe cannot decide, so the runtime answer must be able
+    /// to *set* it, not only clear it: a Wayland node whose adapter holds a data-control
+    /// clipboard has to be able to tell its peers (otherwise core refuses every offer for it by
+    /// design, ADR-008).
+    #[test]
+    fn the_clipboard_bit_follows_the_adapter_answer() {
+        let bit = wire::Capability::TextClipboard as i32;
+        // A probe answer without the bit: what a Wayland session gets at probe time.
+        let probe = platform_probe::Capabilities {
+            capture: true,
+            inject: true,
+            absolute_pointer: true,
+            physical_hid_keys: false,
+            text_clipboard: false,
+            native_repeat: false,
+            software_repeat: false,
+            receiver_takeover: false,
+            displays_changed: true,
+            emergency_hotkey: false,
+        };
+        let mut bits = capability_bits(probe);
+        assert!(!bits.contains(&bit));
+
+        set_clipboard_bit(&mut bits, true);
+        assert!(bits.contains(&bit));
+        // Idempotent: the bit is never listed twice.
+        set_clipboard_bit(&mut bits, true);
+        assert_eq!(bits.iter().filter(|value| **value == bit).count(), 1);
+        // And the other direction works too (an adapter that lost its clipboard).
+        set_clipboard_bit(&mut bits, false);
+        assert!(!bits.contains(&bit));
+        set_clipboard_bit(&mut bits, false);
+        assert!(!bits.contains(&bit));
+        // Nothing else in the list moved.
+        assert_eq!(bits, capability_bits(probe));
     }
 
     #[test]

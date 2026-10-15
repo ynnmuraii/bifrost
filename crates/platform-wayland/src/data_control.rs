@@ -69,7 +69,7 @@ pub struct Change {
 ///
 /// `None`: this selection offers no text at all. An image-only or file-list selection is not
 /// an error, it is simply nothing this adapter can carry.
-pub fn text_mime_of<'a>(mimes: &'a [String]) -> Option<&'a str> {
+pub fn text_mime_of(mimes: &[String]) -> Option<&str> {
     let exact = |mime: &str| mimes.iter().find(|offered| offered.as_str() == mime);
     let ci = |mime: &str| {
         mimes
@@ -184,7 +184,7 @@ mod glue {
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::wl_registry::{self, WlRegistry};
     use wayland_client::protocol::wl_seat::WlSeat;
-    use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle};
+    use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle};
     use wayland_protocols::ext::data_control::v1::client::{
         ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
         ext_data_control_manager_v1::ExtDataControlManagerV1,
@@ -433,17 +433,23 @@ mod glue {
                     }
                     state.finished = true;
                 }
-                ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                ext_data_control_device_v1::Event::PrimarySelection { id: Some(id) } => {
                     // PRIMARY is deliberately not carried (`docs/03-architecture.md`:
                     // «Clipboard: только CLIPBOARD, без PRIMARY»), so the offer is released
                     // here rather than leaked.
-                    if let Some(id) = id {
-                        id.destroy();
-                    }
+                    id.destroy();
                 }
                 _ => {}
             }
         }
+
+        // `data_offer` carries a `new_id`: without this specialization wayland-client panics
+        // the first time a selection is announced ("Missing event_created_child
+        // specialization"). The offer's user data is the unit this adapter's `Dispatch` for
+        // `ExtDataControlOfferV1` expects; the MIME types are read out of `State` by id.
+        wayland_client::event_created_child!(State, ExtDataControlDeviceV1, [
+            ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
+        ]);
     }
 
     struct App {
@@ -715,9 +721,7 @@ mod glue {
     /// Writes the text this adapter owns to the pipe the compositor handed us, on its own
     /// thread: the reader on the other side may be slow, and the loop must not wait for it.
     fn serve(fd: OwnedFd, text: &str) {
-        let Ok(mut file) = std::fs::File::from(fd) else {
-            return;
-        };
+        let mut file = std::fs::File::from(fd);
         let bytes = text.as_bytes();
         let mut offset = 0;
         while offset < bytes.len() {
