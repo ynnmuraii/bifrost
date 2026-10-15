@@ -1013,9 +1013,27 @@ mod tests {
             1,
             "handshake task must actually be active"
         );
+        // A socket eventually closing is not enough: shutdown must join pending work
+        // before returning, rather than merely scheduling its cancellation.
+        struct Finished(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = Finished(Arc::clone(&finished));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        listener.pending.spawn(async move {
+            let _completion = completion;
+            let _ = started.send(());
+            std::future::pending().await
+        });
+        ready.await.expect("pending task started");
         tokio::time::timeout(std::time::Duration::from_secs(1), listener.shutdown())
             .await
             .expect("shutdown must not wait for the handshake deadline");
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
         let mut byte = [0];
         let read = tokio::time::timeout(std::time::Duration::from_secs(1), silent.read(&mut byte))
             .await
