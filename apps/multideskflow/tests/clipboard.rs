@@ -135,6 +135,21 @@ fn ten_gui_on_off_cycles_release_sockets_and_keep_peer_delivery_working() {
     }
 }
 
+#[test]
+fn toggling_the_sender_preserves_origin_versions_for_a_live_receiver() {
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+    let first = payload("before-sender-toggle", 64);
+    harness.a.copy_to_clipboard(&first);
+    harness.b.wait_for_clipboard(&first, SETTLE).expect("initial copy");
+    toggle_clipboard(&harness.a, false);
+    toggle_clipboard(&harness.a, true);
+    let second = payload("after-sender-toggle", 64);
+    harness.a.copy_to_clipboard(&second);
+    harness.b.wait_for_clipboard(&second, Duration::from_secs(10))
+        .expect("new local copy must not reuse a version suppressed by the live receiver");
+}
+
 /// Distinct payloads, so a later assertion cannot pass on an earlier copy.
 fn payload(tag: &str, len: usize) -> String {
     let mut text = format!("lws-{tag}-{}-", std::process::id());
