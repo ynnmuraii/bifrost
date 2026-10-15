@@ -3104,6 +3104,7 @@ impl Session {
         let target = transition.target.node;
         let entry_position = transition.target_position;
         let topology_revision = self.router.topology_revision();
+        let mut return_effect = None;
         if target == self.node_id {
             // The reverse direction of the link we came in on: back to Local, with the
             // reason the FSM takes from the trigger (`RETURN_EDGE`).
@@ -3114,7 +3115,7 @@ impl Session {
             // pointer that came home sitting on the edge would otherwise resolve a fresh
             // crossing on the next sample (see `arm_return_guard`).
             self.arm_return_guard(step, &entry_position);
-            let returned = self.topology.as_ref().and_then(|topology| {
+            return_effect = self.topology.as_ref().and_then(|topology| {
                 crate::edgefx::entry(
                     topology,
                     &self.node_id,
@@ -3123,10 +3124,6 @@ impl Session {
                     entry_position.y,
                 )
             });
-            if let Some((update, display)) = returned {
-                let frame = self.edgefx.push(update, &display, self.now_ms());
-                self.send_edgefx(frame).await;
-            }
         } else {
             // A link that leads further on: the lease has to be released first, so the
             // target is remembered and walked once the FSM is Local again.
@@ -3150,6 +3147,10 @@ impl Session {
             topology_revision,
         }))
         .await;
+        if let Some((update, display)) = return_effect {
+            let frame = self.edgefx.push(update, &display, self.now_ms());
+            self.send_edgefx(frame).await;
+        }
     }
 
     /// Captured input goes on the wire as `InputBatch` for the active source lease.
