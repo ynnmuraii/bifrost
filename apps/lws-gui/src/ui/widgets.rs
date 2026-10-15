@@ -512,8 +512,6 @@ pub fn duo(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 /// The icons of the rail and the top bar, in the 22-unit box of the mockup's SVGs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
-    /// «Раскладка».
-    Layout,
     /// «Пары».
     Pairs,
     /// «Клавиши».
@@ -538,13 +536,6 @@ enum Prim {
 fn prims(icon: Icon) -> &'static [Prim] {
     use Prim::{Line, Rect as R};
     match icon {
-        Icon::Layout => &[
-            R(1.75, 5.75, 8.5, 6.5, 1.5),
-            R(11.75, 3.75, 8.5, 10.5, 1.5),
-            Line(&[(6.0, 16.0), (6.0, 18.25)]),
-            Line(&[(16.0, 16.0), (16.0, 18.25)]),
-            Line(&[(3.0, 18.25), (19.0, 18.25)]),
-        ],
         Icon::Pairs => &[
             R(2.75, 7.75, 7.5, 6.5, 1.5),
             R(11.75, 7.75, 7.5, 6.5, 1.5),

@@ -13,6 +13,7 @@
 //! only while a window is open). A window with the field off and no pairing window open draws
 //! when the user does something or the service says something, and never otherwise.
 
+mod appearance;
 mod dock;
 mod field;
 mod map_view;
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 
-pub use field::Field;
+pub use field::{Field, Frame as FieldFrame};
 pub use theme::{install_fonts, Palette};
 
 use crate::gui_settings::Theme;
@@ -78,9 +79,6 @@ pub struct UiState {
     pub field: Field,
     drag: Option<Drag>,
     hover: Option<(usize, usize)>,
-    ribbon: Option<(String, String)>,
-    ribbon_until: f32,
-    ribbon_hover: bool,
     applied: Option<Theme>,
     modal_open: Option<(Modal, f32)>,
 }
@@ -93,9 +91,6 @@ impl UiState {
             field: Field::new(),
             drag: None,
             hover: None,
-            ribbon: None,
-            ribbon_until: 0.0,
-            ribbon_hover: false,
             applied: None,
             modal_open: None,
         }
@@ -129,7 +124,7 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
 
     let narrow = full.width() < NARROW;
     let body_w = full.width() - RAIL_W;
-    let dock_h = dock::height(vm, narrow);
+    let dock_h = dock::height(ui.ctx(), vm, narrow);
     let top = Rect::from_min_size(full.min, Vec2::new(full.width(), TOP_H));
     let rail = Rect::from_min_max(Pos2::new(full.max.x - RAIL_W, top.max.y), full.max);
     let dock_rect = Rect::from_min_max(
@@ -144,9 +139,18 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
     let t = st.t(env.now);
     let mut wants = map_view::draw(ui, &pal, vm, st, map, env, t, &mut out.actions);
     dock::draw(ui, &pal, vm, dock_rect, narrow, env.now, &mut out.actions);
-    rail_draw(ui, &pal, vm, rail, &mut out.actions);
+    let appearance_anchor = rail_draw(ui, &pal, vm, rail, &mut out.actions);
     topbar(ui, &pal, vm, top, narrow, &mut out.actions);
+    appearance::draw(ui, &pal, vm, full, appearance_anchor, &mut out.actions);
     modal::draw(ui, &pal, vm, st, full, t, &mut out.actions);
+    if out
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::StartPairing { .. }))
+    {
+        ui.ctx()
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("pairing-address")));
+    }
 
     // The one thing besides the field that moves by itself: the pairing countdown.
     if vm.pairing.window_deadline.is_some() && vm.pairing.window.is_some() {
@@ -162,7 +166,7 @@ fn topbar(
     pal: &Palette,
     vm: &ViewModel,
     rect: Rect,
-    narrow: bool,
+    _narrow: bool,
     actions: &mut Vec<Action>,
 ) {
     let painter = ui.painter().clone();
@@ -270,31 +274,6 @@ fn topbar(
             actions.push(Action::SetLook(look));
         }
         ui.add_space(6.0);
-        if narrow {
-            return;
-        }
-        let peers = vm.peers();
-        for peer in peers.iter().rev() {
-            let state = if peer.online {
-                " в сети"
-            } else {
-                " не в сети"
-            };
-            let runs = [
-                Run::strong(&peer.name, pal.ink),
-                Run::plain(state, pal.ink2),
-            ];
-            let probe = widgets::mono_runs(ui, &runs, 11.0, f32::INFINITY).size().x + 39.0;
-            if probe > ui.available_width() - 12.0 {
-                break;
-            }
-            widgets::pill(
-                ui,
-                pal,
-                Some(if peer.online { Dot::Ok } else { Dot::Off }),
-                &runs,
-            );
-        }
     });
 }
 
@@ -305,7 +284,7 @@ fn rail_draw(
     vm: &ViewModel,
     rect: Rect,
     actions: &mut Vec<Action>,
-) {
+) -> Rect {
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment(
@@ -316,7 +295,6 @@ fn rail_draw(
         pal.hairline(),
     );
     let icons = [
-        Icon::Layout,
         Icon::Pairs,
         Icon::Keys,
         Icon::Clip,
@@ -327,7 +305,7 @@ fn rail_draw(
     for (i, modal) in Modal::ALL.iter().enumerate() {
         // Settings sits at the bottom; the other five stack from the top.
         let y = if *modal == Modal::Settings {
-            rect.min.y + 12.0 + 5.0 * 50.0 + 6.0 + 0.0
+            rect.min.y + 12.0 + 4.0 * 50.0 + 6.0
         } else {
             rect.min.y + 12.0 + i as f32 * 50.0
         };
@@ -382,18 +360,20 @@ fn rail_draw(
             actions.push(Action::ToggleModal(*modal));
         }
     }
-    // «LAN Workspace», rotated to read from the bottom up.
-    let caption = painter.layout_no_wrap(
-        "LAN WORKSPACE".to_owned(),
-        font(10.0, fam::mono()),
-        pal.ink2,
+    let appearance = Rect::from_min_size(
+        Pos2::new(rect.center().x - 22.0, rect.max.y - 62.0),
+        Vec2::splat(44.0),
     );
-    let size = caption.size();
-    let at = Pos2::new(rect.center().x - size.y / 2.0, rect.max.y - 8.0);
-    painter.add(
-        egui::epaint::TextShape::new(at, caption, pal.ink2)
-            .with_angle(-std::f32::consts::FRAC_PI_2),
-    );
+    let response = ui
+        .interact(appearance, ui.id().with("appearance"), Sense::click())
+        .on_hover_text("Оформление");
+    if response.hovered() || vm.appearance_open {
+        painter.rect_filled(appearance, pal.rad_sm(), pal.bg2);
+    }
+    widgets::paint_icon(&painter, Icon::Theme, appearance.center(), 20.0, pal.ink2);
+    if response.clicked() {
+        actions.push(Action::ToggleAppearance);
+    }
     if let Some((btn, title)) = tip {
         let layer = ui.ctx().layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
@@ -416,6 +396,7 @@ fn rail_draw(
             pal.bg,
         );
     }
+    appearance
 }
 
 /// Convenience for the sub-modules: a plain button that pushes `action` when clicked.

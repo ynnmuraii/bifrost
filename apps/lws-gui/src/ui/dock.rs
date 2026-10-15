@@ -13,14 +13,14 @@ use super::widgets::{self, Kind, Run};
 use crate::view_model::{Action, ViewModel};
 
 /// The dock's usual height.
-const BASE_H: f32 = 214.0;
+const BASE_H: f32 = 220.0;
 /// What the open fingerprints add.
 const DETAILS_H: f32 = 96.0;
 /// How long the core keeps a pairing window open.
 const WINDOW_S: u32 = 120;
 
 /// The height of the dock for the current state.
-pub fn height(vm: &ViewModel, narrow: bool) -> f32 {
+pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     // A prompt names the other computer and wraps in a quarter of the window: it needs room.
     let prompt = if vm.pairing.prompt.is_some() {
         40.0
@@ -33,11 +33,13 @@ pub fn height(vm: &ViewModel, narrow: bool) -> f32 {
         } else {
             0.0
         };
-    if narrow {
+    let expanded = if narrow {
         2.0 * 188.0 + extra
     } else {
         BASE_H + extra
-    }
+    };
+    32.0 + expanded
+        * ctx.animate_bool_with_time(egui::Id::new("dock-open"), vm.look.dock_open, 0.18)
 }
 
 /// Draws the dock into `rect`.
@@ -53,6 +55,28 @@ pub fn draw(
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment([rect.left_top(), rect.right_top()], pal.hairline());
+    let handle = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 32.0));
+    let response = ui
+        .interact(handle, ui.id().with("dock-toggle"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    painter.text(
+        handle.center(),
+        egui::Align2::CENTER_CENTER,
+        if vm.look.dock_open {
+            "Сопряжение  ▾"
+        } else {
+            "Сопряжение  ▴"
+        },
+        font(12.0, fam::sans_medium()),
+        pal.ink2,
+    );
+    if response.clicked() {
+        actions.push(Action::ToggleDock);
+    }
+    if rect.height() <= 33.0 {
+        return;
+    }
+    let rect = Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + 32.0), rect.max);
     let (cols, rows) = if narrow { (2usize, 2usize) } else { (4, 1) };
     let cw = rect.width() / cols as f32;
     let ch = rect.height() / rows as f32;
@@ -227,6 +251,7 @@ fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Acti
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut address)
+                            .id(egui::Id::new("pairing-address"))
                             .frame(egui::Frame::NONE)
                             .hint_text(egui::RichText::new("192.168.1.10:47901").color(pal.ink2))
                             .font(font(13.0, fam::mono()))
@@ -441,11 +466,16 @@ mod tests {
             },
             LocalConfig::default(),
         );
-        assert_eq!(height(&vm, false), BASE_H);
-        assert_eq!(height(&vm, true), 376.0);
+        let ctx = egui::Context::default();
+        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H);
+        assert_eq!(height(&ctx, &vm, true), 32.0 + 376.0);
         vm.pairing.details = true;
-        assert_eq!(height(&vm, false), BASE_H, "no prompt, nothing to show");
+        assert_eq!(
+            height(&ctx, &vm, false),
+            32.0 + BASE_H,
+            "no prompt, nothing to show"
+        );
         vm.pairing.prompt = Some(protocol::ipc::PairingPrompt::default());
-        assert_eq!(height(&vm, false), BASE_H + 40.0 + DETAILS_H);
+        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H + 40.0 + DETAILS_H);
     }
 }
