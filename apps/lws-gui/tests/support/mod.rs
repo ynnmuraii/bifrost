@@ -23,8 +23,6 @@ pub fn view() -> ViewModel {
         },
         LocalConfig {
             display_name: "Workstation".to_owned(),
-            switch_hotkey: "Ctrl+Alt+Shift+Right".to_owned(),
-            claim_hotkey: "Ctrl+Alt+Shift+F11".to_owned(),
             ..LocalConfig::default()
         },
     )
