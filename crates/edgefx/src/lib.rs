@@ -188,8 +188,19 @@ mod tests {
     /// nothing of the effect is cut off.
     #[test]
     fn the_strip_covers_the_whole_glow_around_the_crossing_point() {
-        assert_eq!(MAX_STRIP_PX, 2.0 * GLOW_REACH_PX);
-        assert!(MAX_STRIP_PX > 0.0);
+        let strip = Strip::of(&Target {
+            edge: Edge::Left,
+            start: 0.0,
+            end: 100_000.0,
+            along: 50_000.0,
+        });
+        assert_eq!(strip.len, MAX_STRIP_PX);
+        assert!(
+            strip.len >= 2.0 * GLOW_REACH_PX,
+            "the glow would be cut off: {} < {}",
+            strip.len,
+            2.0 * GLOW_REACH_PX
+        );
     }
 
     #[test]
