@@ -3076,6 +3076,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::PairingAnswer(_) => "PairingAnswer",
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
+        Msg::SetAppearance(_) => "SetAppearance",
         Msg::RevokePeer(_) => "RevokePeer",
         Msg::ExportDiagnostics(_) => "ExportDiagnostics",
         Msg::ResetPortalGrants(_) => "ResetPortalGrants",
