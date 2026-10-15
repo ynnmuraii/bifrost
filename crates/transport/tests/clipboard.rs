@@ -5,6 +5,7 @@
 //! loopback port, so nothing here touches the user's profile or a fixed port. No mock: the
 //! clipboard connections are real TLS sessions on `47902`'s channel/ALPN.
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -28,6 +29,22 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Generous bounds: the tests wait for events, never for a fixed sleep.
 const FORM_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Every socket wait in this file is bounded.
+///
+/// A frame that never arrives must fail the test with the step that stalled, not hold a CI
+/// runner until the job is cancelled: the round trip below once sat in `recv` for 75 minutes on
+/// `windows-latest`. The whole 300 KiB transfer takes milliseconds on loopback, so this is
+/// slack, not a deadline the transfer races against.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Awaits I/O under [`IO_TIMEOUT`], naming the step in the panic.
+async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+    match tokio::time::timeout(IO_TIMEOUT, future).await {
+        Ok(value) => value,
+        Err(_) => panic!("{what} did not finish within {IO_TIMEOUT:?}"),
+    }
+}
 
 fn temp_root(label: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -207,18 +224,21 @@ async fn a_transfer_round_trips_in_chunks() {
     let expected_payload = payload.clone();
     let receiver_sha = expected_sha.clone();
 
-    let (accept_result, dial_result) = tokio::join!(
-        listener.accept(),
-        dial_clipboard(
-            &client,
-            &client_trust,
-            server.node_id(),
-            address,
-            parent,
-            channel_id,
-            token,
+    let (accept_result, dial_result) = within("the clipboard accept and dial", async {
+        tokio::join!(
+            listener.accept(),
+            dial_clipboard(
+                &client,
+                &client_trust,
+                server.node_id(),
+                address,
+                parent,
+                channel_id,
+                token,
+            )
         )
-    );
+    })
+    .await;
     let (mut server_conn, bind) = accept_result.expect("accept");
     let mut client_conn = dial_result.expect("dial");
 
@@ -320,8 +340,12 @@ async fn a_transfer_round_trips_in_chunks() {
         }
     });
 
-    let largest_chunk = sender.await.expect("sender task");
-    let assembled = receiver.await.expect("receiver task");
+    let largest_chunk = within("the sender task", sender)
+        .await
+        .expect("sender task");
+    let assembled = within("the receiver task", receiver)
+        .await
+        .expect("receiver task");
     assert_eq!(
         assembled, expected_payload,
         "the assembled payload is byte-equal"
@@ -610,18 +634,21 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
     let expected_sha = clipboard::sha256(&payload);
     let payload_len = payload.len() as u64;
 
-    let (accept_result, dial_result) = tokio::join!(
-        listener.accept(),
-        dial_clipboard(
-            &identity_b,
-            &trust_b,
-            id_a,
-            clipboard_address,
-            parent,
-            channel_id,
-            token,
+    let (accept_result, dial_result) = within("the clipboard accept and dial", async {
+        tokio::join!(
+            listener.accept(),
+            dial_clipboard(
+                &identity_b,
+                &trust_b,
+                id_a,
+                clipboard_address,
+                parent,
+                channel_id,
+                token,
+            )
         )
-    );
+    })
+    .await;
     let (mut server_conn, _bind) = accept_result.expect("accept");
     let mut client_conn = dial_result.expect("dial");
 
@@ -707,14 +734,18 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
         "the input link must not be blocked by the clipboard transfer (took {latency:?})"
     );
 
-    let received = receiver.await.expect("receiver task");
+    let received = within("the receiver task", receiver)
+        .await
+        .expect("receiver task");
     assert_eq!(
         received.len() as u64,
         payload_len,
         "the whole payload arrives"
     );
     assert_eq!(clipboard::sha256(received.as_bytes()), expected_sha);
-    let transfer_time = sender.await.expect("sender task");
+    let transfer_time = within("the sender task", sender)
+        .await
+        .expect("sender task");
     assert!(
         transfer_time >= Duration::from_millis(400),
         "the transfer was actually paced, not sent instantly: {transfer_time:?}"
@@ -777,14 +808,17 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
     // Before pairing: B dials A. A pins nobody, so its verifier refuses the handshake. TLS 1.3
     // lets the client finish its half before the server's rejection lands, so the proof is on
     // the server side: the connection is closed, never handed to the application.
-    let before = dial_clipboard(
-        &identity_b,
-        Arc::clone(&b_pins),
-        id_a,
-        address_a,
-        [1; 16],
-        [2; 16],
-        [3; 32],
+    let before = within(
+        "the pre-pairing dial",
+        dial_clipboard(
+            &identity_b,
+            Arc::clone(&b_pins),
+            id_a,
+            address_a,
+            [1; 16],
+            [2; 16],
+            [3; 32],
+        ),
     )
     .await;
     assert_refused(before).await;
@@ -796,14 +830,17 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
     // Runtime pairing: A adds B to its shared pins WITHOUT restarting the listener.
     a_pins.write().unwrap().insert(id_b);
 
-    let conn_b = dial_clipboard(
-        &identity_b,
-        Arc::clone(&b_pins),
-        id_a,
-        address_a,
-        [1; 16],
-        [2; 16],
-        [3; 32],
+    let conn_b = within(
+        "the paired dial",
+        dial_clipboard(
+            &identity_b,
+            Arc::clone(&b_pins),
+            id_a,
+            address_a,
+            [1; 16],
+            [2; 16],
+            [3; 32],
+        ),
     )
     .await
     .expect("the dial must succeed once B is pinned");
@@ -818,14 +855,17 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
 
     // Revoke: A removes B from its shared pins, and the handshake is refused again.
     a_pins.write().unwrap().remove(&id_b);
-    let after = dial_clipboard(
-        &identity_b,
-        Arc::new(std::sync::RwLock::new([id_a].into_iter().collect())),
-        id_a,
-        address_a,
-        [4; 16],
-        [5; 16],
-        [6; 32],
+    let after = within(
+        "the post-revocation dial",
+        dial_clipboard(
+            &identity_b,
+            Arc::new(std::sync::RwLock::new([id_a].into_iter().collect())),
+            id_a,
+            address_a,
+            [4; 16],
+            [5; 16],
+            [6; 32],
+        ),
     )
     .await;
     assert_refused(after).await;
@@ -886,7 +926,10 @@ async fn a_silent_connection_does_not_block_a_valid_one() {
     assert_eq!(connection.peer, id_b);
     assert!(matches!(message, ClipboardMessage::Bind { .. }));
 
-    let dialed = dial.await.expect("join").expect("dial");
+    let dialed = within("the queued dial", dial)
+        .await
+        .expect("join")
+        .expect("dial");
     assert_eq!(dialed.peer, id_a);
     drop(silent);
     let _ = std::fs::remove_dir_all(&root);
