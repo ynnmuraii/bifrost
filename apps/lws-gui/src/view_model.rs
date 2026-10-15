@@ -1591,6 +1591,18 @@ impl ViewModel {
             && member.node_id == status.owner_node_id
     }
 
+    /// `true` when the core named `code` among the capabilities the active backend cannot
+    /// provide. A window greys out the control that would use it rather than offering a switch
+    /// that cannot do anything.
+    pub fn capability_missing(&self, code: &str) -> bool {
+        self.status.as_ref().is_some_and(|status| {
+            status
+                .capabilities_unavailable
+                .iter()
+                .any(|named| named == code)
+        })
+    }
+
     /// `true` when this system's desktop has portals to forget: the Wayland backend, and only
     /// it, so the window shows the «Порталы» row on Wayland and on nothing else.
     pub fn uses_portals(&self) -> bool {

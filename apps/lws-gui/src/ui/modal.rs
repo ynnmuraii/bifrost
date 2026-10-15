@@ -512,11 +512,7 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
         .map(|s| s.emergency_hotkey.as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or(vm.config.emergency_hotkey.as_str());
-    let missing = vm.status.as_ref().is_some_and(|s| {
-        s.capabilities_unavailable
-            .iter()
-            .any(|c| c == "EMERGENCY_HOTKEY")
-    });
+    let missing = vm.capability_missing("EMERGENCY_HOTKEY");
     row(ui, pal, "Аварийная", true, |ui| {
         widgets::chord(ui, pal, emergency);
         if missing {
@@ -546,8 +542,11 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
 fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let pending = vm.settings.clipboard_pending;
     let on = pending.unwrap_or_else(|| vm.status.as_ref().is_some_and(|s| s.clipboard_enabled));
+    // A backend that cannot deliver the clipboard is told so by the core: the toggle is then
+    // not offered at all, because a switch that does nothing is worse than no switch.
+    let missing = vm.capability_missing("TEXT_CLIPBOARD");
     row(ui, pal, "Общий буфер", false, |ui| {
-        let enabled = vm.connection.is_connected() && pending.is_none();
+        let enabled = vm.connection.is_connected() && pending.is_none() && !missing;
         ui.add_enabled_ui(enabled, |ui| {
             if let Some(i) = widgets::seg(ui, pal, &["Включён", "Выключен"], usize::from(!on))
             {
@@ -556,12 +555,17 @@ fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
         });
         let text = if pending.is_some() {
             "Применяем…"
+        } else if missing {
+            "Эта система не может передавать содержимое буфера обмена"
         } else if on {
             "Текст можно копировать на одном компьютере и вставлять на другом"
         } else {
             "Общий буфер обмена выключен"
         };
         widgets::wrapped(ui, text, 13.0, fam::sans(), pal.ink);
+        if missing {
+            widgets::hint(ui, pal, "Служба сообщила: общий буфер обмена недоступен");
+        }
     });
     row(ui, pal, "Что передаётся", true, |ui| {
         widgets::wrapped(

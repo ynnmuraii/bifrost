@@ -80,18 +80,27 @@ fn snapshot() -> Result<ViewModel, String> {
     Ok(view)
 }
 
-fn input(t: Duration, pointer: Option<egui::Pos2>) -> egui::RawInput {
+fn input(t: Duration, events: Vec<egui::Event>) -> egui::RawInput {
     egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(1920.0, 1080.0),
         )),
         time: Some(t.as_secs_f64()),
-        events: pointer
-            .map(|p| vec![egui::Event::PointerMoved(p)])
-            .unwrap_or_default(),
+        events,
         ..Default::default()
     }
+}
+
+/// How the phases below drive the pointer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drive {
+    /// It moves across the map at 20 Hz.
+    Moves,
+    /// It arrives over the map once, and then stays exactly where it is.
+    Still,
+    /// It leaves the map: the window has nothing to animate at all.
+    Gone,
 }
 
 fn main() -> Result<(), String> {
@@ -108,17 +117,20 @@ fn main() -> Result<(), String> {
     let mut due = Duration::ZERO;
     let mut total = 0u64;
     let mut idle_frames = 0;
-    for (label, start, end, moving) in [
-        ("warmup", 0, 3, true),
-        ("active", 3, 8, true),
-        ("settling", 8, 11, false),
-        ("idle", 11, 21, false),
+    // `hold` is the round-3 promise: a pointer that stops over the map keeps the particles it
+    // has attracted or repelled, and the window stops asking for frames once they have settled.
+    for (label, start, end, drive) in [
+        ("warmup", 0, 3, Drive::Moves),
+        ("active", 3, 8, Drive::Moves),
+        ("hold", 8, 13, Drive::Still),
+        ("idle", 13, 23, Drive::Gone),
     ] {
         let begin = Duration::from_secs(start);
         let end = Duration::from_secs(end);
-        let mut event = if moving { begin } else { Duration::MAX };
+        let mut event = begin;
         let mut frames = 0u64;
         let mut repaint_frames = 0u64;
+        let mut late_frames = 0u64;
         let mut cpu = Duration::ZERO;
         let mut allocations = 0u64;
         let mut draw_allocations = 0u64;
@@ -129,13 +141,28 @@ fn main() -> Result<(), String> {
                 break;
             }
             let is_event = event <= due;
-            let pointer = if is_event {
-                event += Duration::from_millis(50);
-                Some(egui::pos2(300.0 + (t.as_secs_f32() * 120.0) % 600.0, 250.0))
+            let events = if is_event {
+                match drive {
+                    Drive::Moves => {
+                        event += Duration::from_millis(50);
+                        vec![egui::Event::PointerMoved(egui::pos2(
+                            300.0 + (t.as_secs_f32() * 120.0) % 600.0,
+                            250.0,
+                        ))]
+                    }
+                    Drive::Still => {
+                        event = Duration::MAX;
+                        vec![egui::Event::PointerMoved(egui::pos2(900.0, 500.0))]
+                    }
+                    Drive::Gone => {
+                        event = Duration::MAX;
+                        vec![egui::Event::PointerGone]
+                    }
+                }
             } else {
-                None
+                Vec::new()
             };
-            let raw = input(t, pointer);
+            let raw = input(t, events);
             let before = ALLOCS.load(Ordering::Relaxed);
             let began = Instant::now();
             let mut output = ctx.run_ui(raw, |ui| {
@@ -170,11 +197,27 @@ fn main() -> Result<(), String> {
             };
             frames += 1;
             repaint_frames += u64::from(!is_event);
+            late_frames += u64::from(t > begin + Duration::from_secs(1));
             total += 1;
             assert!(total < 100_000, "reactive loop failed to advance");
         }
         if label == "idle" {
             idle_frames = frames;
+        }
+        if label == "hold" {
+            assert!(
+                frames < 100,
+                "a held pointer must settle instead of animating for the whole phase: {frames}"
+            );
+        }
+        if label == "idle" {
+            // The pointer leaving the map costs the frame it arrives on and the one that puts
+            // the particles back: after that a window with nothing on the map is silent for
+            // the rest of the ten virtual seconds.
+            assert_eq!(
+                late_frames, 0,
+                "an idle window must not repaint on a timer: {late_frames} frames after the                  first second"
+            );
         }
         let seconds = (end - begin).as_secs_f64();
         println!("{label}: virtual_s={seconds:.1} frames={frames} timed_repaints={repaint_frames} cpu_ms={:.3} cpu_us/frame={:.2} allocs={allocations} allocs/frame={:.2} cpu_ms/virtual_s={:.3}",
@@ -188,9 +231,9 @@ fn main() -> Result<(), String> {
             allocations.saturating_sub(draw_allocations + tessellation_allocations) as f64 / frames.max(1) as f64);
     }
     direct_field();
-    assert_eq!(
-        idle_frames, 0,
-        "settled default field must stop requesting repaints"
+    assert!(
+        idle_frames <= 3,
+        "the pointer leaving the map is a transition, not a loop: {idle_frames} frames"
     );
     Ok(())
 }
@@ -205,7 +248,7 @@ fn direct_field() {
     let mut cpu = Duration::ZERO;
     for n in 0..660 {
         let t = Duration::from_secs_f64(f64::from(n) / 30.0);
-        let output = ctx.run_ui(input(t, None), |ui| {
+        let output = ctx.run_ui(input(t, Vec::new()), |ui| {
             let frame = FieldFrame {
                 map: ui.ctx().content_rect(),
                 pal: &pal,

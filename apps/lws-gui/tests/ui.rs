@@ -803,3 +803,41 @@ fn removed_layout_controls_stay_absent_and_pairing_close_is_disabled() {
         "unimplemented close must not send a command"
     );
 }
+
+/// A backend that cannot deliver the clipboard says so, and the window does not offer a switch
+/// that could not do anything.
+#[test]
+fn a_backend_that_cannot_deliver_the_clipboard_offers_no_switch() {
+    let mut vm = connected();
+    vm.status
+        .as_mut()
+        .expect("a connected window has a status")
+        .capabilities_unavailable = vec!["TEXT_CLIPBOARD".to_owned()];
+    vm.local(&Action::ToggleModal(Modal::Clip));
+    let mut harness = Harness::new();
+    let size = egui::vec2(1280.0, 720.0);
+    // The reveal takes 0.32 s of the window's clock; step past it.
+    harness.frame(&vm, false, size, Vec::new());
+    harness.now += Duration::from_millis(500);
+    harness.frame(&vm, false, size, Vec::new());
+    let frame = harness.frame(&vm, false, size, Vec::new());
+    expect(
+        &frame,
+        &[
+            "не может передавать содержимое буфера обмена",
+            "общий буфер обмена недоступен",
+        ],
+    );
+    // Clicking the switch where it is drawn sends nothing: it is drawn disabled.
+    let at = text_position(&mut harness, &vm, "Выключен");
+    let frame = harness.frame(&vm, false, size, click_at(at));
+    assert!(
+        !frame
+            .output
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::SetClipboard(_))),
+        "{:?}",
+        frame.output.actions
+    );
+}
