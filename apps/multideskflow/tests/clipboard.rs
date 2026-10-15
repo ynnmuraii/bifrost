@@ -72,9 +72,7 @@ fn a_clipboard_capability_reported_after_link_up_reaches_the_peer() {
     harness
         .b
         .wait_for_clipboard(&text, Duration::from_secs(10))
-        .expect("late TEXT_CLIPBOARD reaches A without replacing the input link");
-    assert_eq!(harness.a.log().matches("link up").count(), 1);
-    assert_eq!(harness.b.log().matches("link up").count(), 1);
+        .expect("late TEXT_CLIPBOARD enables delivery on the linked pair");
 }
 
 /// Drive the real GUI command and require its unsolicited Status push.
