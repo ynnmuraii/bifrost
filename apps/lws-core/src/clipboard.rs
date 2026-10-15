@@ -27,7 +27,7 @@
 //! sender runs on a task of its own and the session only ever hands it a payload. Everything
 //! this module does *inside* the session loop is bookkeeping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,6 +156,9 @@ pub struct Clipboard {
     pending_request: Option<(NodeId, [u8; 16])>,
     /// One transfer per offer we asked for, keyed by `offer_id`.
     incoming: BTreeMap<[u8; 16], Incoming>,
+    /// Peers whose connection is closed (link down, revoke): frames still queued from them are
+    /// dropped. Cleared when the peer's link comes up again.
+    down: BTreeSet<NodeId>,
     /// The agent's chunks for the copy it is currently reporting.
     local: Option<LocalAssembly>,
     /// The payload of the local clipboard, kept so a member that joins later still gets it.
@@ -182,6 +185,8 @@ struct Peer {
 
 /// A payload we asked a peer for.
 struct Incoming {
+    /// Who is sending it: only that peer may complete it, and it ends with that peer's link.
+    peer: NodeId,
     offer: cb::Offer,
     assembler: cb::Assembler,
 }
@@ -221,6 +226,7 @@ impl Clipboard {
             offered: BTreeMap::new(),
             pending_request: None,
             incoming: BTreeMap::new(),
+            down: BTreeSet::new(),
             local: None,
             payload: Vec::new(),
             queue_capacity,
@@ -349,6 +355,12 @@ impl Clipboard {
 
     /// A local copy: the only path that mints a version, and the only one that offers.
     async fn on_local_copy(&mut self, payload: Vec<u8>, markers: Vec<cb::Marker>) -> Vec<Out> {
+        // «Локальное копирование побеждает»: *any* new local copy — even one the policy then
+        // refuses (a password) or a disabled node ignores — supersedes the transfer the wire was
+        // about to deliver, otherwise a late `ClipboardComplete` would apply the peer's payload
+        // over what the user just copied.
+        self.incoming.clear();
+        self.pending_request = None;
         if !self.settings.enabled {
             // `CLIPBOARD_DISABLED`: a disabled node never offers anything.
             return Vec::new();
@@ -382,14 +394,10 @@ impl Clipboard {
             "clipboard offer"
         );
         self.payload = payload;
-        // «Локальное копирование побеждает»: a fresh local copy cancels the **incoming**
-        // transfer the wire was about to deliver — otherwise a late `ClipboardComplete` would
-        // apply the peer's payload over this one. The outgoing offers go too: the payload they
-        // carry belongs to the copy this one replaced. (`incoming` and `pending_request` are
-        // what the peer's transfer would otherwise complete into.)
+        // «Локальное копирование побеждает» — see the top of this function: the incoming side
+        // was cancelled before the policy ran. The outgoing offers carry the payload this copy
+        // replaced, so they go too.
         self.offered.clear();
-        self.incoming.clear();
-        self.pending_request = None;
         self.fan_out(offer).await
     }
 
@@ -502,6 +510,10 @@ impl Clipboard {
 
     /// One message from a peer on the clipboard channel.
     pub async fn on_peer_message(&mut self, peer: NodeId, message: ClipboardMessage) -> Vec<Out> {
+        if self.down.contains(&peer) {
+            // Frames of a connection that is already closed (a revoked peer's last, queued ones).
+            return Vec::new();
+        }
         match message {
             ClipboardMessage::Offer {
                 offer_id,
@@ -541,7 +553,7 @@ impl Clipboard {
                 chunk_count,
                 data,
             } => {
-                let outcome = match self.incoming.get_mut(&offer_id) {
+                let outcome = match self.incoming.get_mut(&offer_id).filter(|i| i.peer == peer) {
                     Some(incoming) => {
                         incoming
                             .assembler
@@ -564,6 +576,9 @@ impl Clipboard {
                 }
             }
             ClipboardMessage::Complete { offer_id, sha256 } => {
+                if self.incoming.get(&offer_id).is_none_or(|i| i.peer != peer) {
+                    return Vec::new();
+                }
                 let Some(incoming) = self.incoming.remove(&offer_id) else {
                     return Vec::new();
                 };
@@ -661,8 +676,14 @@ impl Clipboard {
                 reason: cb::ClipboardError::TooLarge,
             }];
         };
-        self.incoming
-            .insert(offer_id, Incoming { offer, assembler });
+        self.incoming.insert(
+            offer_id,
+            Incoming {
+                peer,
+                offer,
+                assembler,
+            },
+        );
         if self.settings.eager {
             let _ = self
                 .runtime
@@ -730,6 +751,7 @@ impl Clipboard {
         text_clipboard: bool,
         remote_ip: std::net::IpAddr,
     ) -> Vec<Out> {
+        self.down.remove(&peer);
         let state = self.peers.entry(peer).or_default();
         state.parent = Some(connection_id);
         state.text_clipboard = text_clipboard;
@@ -758,6 +780,10 @@ impl Clipboard {
         self.peers.remove(&peer);
         self.waiting.remove(&peer);
         self.offered.remove(&peer);
+        // What the peer was sending is not delivered after it left (a revoke), even when its
+        // last frames are already queued behind this call.
+        self.incoming.retain(|_, incoming| incoming.peer != peer);
+        self.down.insert(peer);
         if matches!(self.pending_request, Some((pending, _)) if pending == peer) {
             self.pending_request = None;
         }
@@ -847,14 +873,18 @@ struct Handle {
 struct Inner {
     /// The one-use binding tokens.
     grants: Grants,
-    /// Bound channels, by peer.
-    channels: BTreeMap<NodeId, mpsc::Sender<ClipboardMessage>>,
-    /// The reader task of each bound channel, so a revocation can close the connection.
-    ///
-    /// Dropping the sender only ends the writer task; the TLS stream stays open because the
-    /// reader task still owns its half, so a revoked peer would keep its bound channel. The
-    /// handle is aborted to drop that half too.
-    readers: BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
+    /// The bound connection of each peer: its sender, and its reader task so a revocation can
+    /// close the connection (dropping the sender only ends the writer; the reader still owns
+    /// half of the TLS stream).
+    conns: BTreeMap<NodeId, Conn>,
+    /// Numbers the connections, so a replaced one cannot unregister its successor.
+    generation: u64,
+}
+
+struct Conn {
+    generation: u64,
+    tx: mpsc::Sender<ClipboardMessage>,
+    reader: tokio::task::JoinHandle<()>,
 }
 
 impl Handle {
@@ -874,8 +904,8 @@ impl Handle {
         let handle = Handle {
             inner: Arc::new(Mutex::new(Inner {
                 grants: Grants::default(),
-                channels: BTreeMap::new(),
-                readers: BTreeMap::new(),
+                conns: BTreeMap::new(),
+                generation: 0,
             })),
             identity,
             trusted_peers,
@@ -929,7 +959,13 @@ impl Handle {
 
     /// Queues one message on the peer's channel.
     async fn send(&self, peer: NodeId, message: ClipboardMessage) -> Result<(), ()> {
-        let channel = self.inner.lock().await.channels.get(&peer).cloned();
+        let channel = self
+            .inner
+            .lock()
+            .await
+            .conns
+            .get(&peer)
+            .map(|conn| conn.tx.clone());
         match channel {
             Some(tx) => tx.send(message).await.map_err(|_| ()),
             None => Err(()),
@@ -944,7 +980,13 @@ impl Handle {
         payload: Vec<u8>,
         rate_bytes_per_s: u64,
     ) -> Result<(), ()> {
-        let channel = self.inner.lock().await.channels.get(&peer).cloned();
+        let channel = self
+            .inner
+            .lock()
+            .await
+            .conns
+            .get(&peer)
+            .map(|conn| conn.tx.clone());
         let Some(tx) = channel else {
             return Err(());
         };
@@ -970,12 +1012,11 @@ impl Handle {
 
     /// Drops the channel to `peer` and closes its connection.
     async fn close(&self, peer: NodeId) {
-        let mut inner = self.inner.lock().await;
-        inner.channels.remove(&peer);
-        if let Some(task) = inner.readers.remove(&peer) {
-            // Aborting drops the reader half; with the sender already gone the whole TLS
-            // stream is closed, so a revoked peer's bound channel does not survive.
-            task.abort();
+        let conn = self.inner.lock().await.conns.remove(&peer);
+        if let Some(conn) = conn {
+            // Aborting drops the reader half; with the sender gone too the whole TLS stream is
+            // closed, so a revoked peer's bound channel does not survive.
+            conn.reader.abort();
         }
     }
 
@@ -1032,22 +1073,58 @@ impl Handle {
         connection: ClipboardConnection,
         queue_capacity: usize,
     ) {
+        // A revoke that landed while this connection was being dialled or accepted: the pin set
+        // no longer names the peer, so the connection is dropped (closed) instead of bound.
+        let still_trusted = self
+            .trusted_peers
+            .read()
+            .map(|pins| pins.contains(&peer))
+            .unwrap_or(false);
+        if !still_trusted {
+            tracing::info!(peer = %peer, "clipboard connection dropped: the peer is no longer trusted");
+            return;
+        }
         let (reader, writer) = connection.into_split();
         let (tx, rx) = mpsc::channel(queue_capacity.max(1));
         let events = self.events.clone();
         let handle = self.clone();
         let reader_events = events.clone();
+        // Registered under the lock the reader's cleanup also takes, so a connection that
+        // closes at once cannot clean up before it is registered and leave a dead entry.
+        let mut inner = self.inner.lock().await;
+        inner.generation += 1;
+        let generation = inner.generation;
         let reader_task = tokio::spawn(async move {
             handle.read_task(peer, reader, reader_events.clone()).await;
-            let _ = reader_events.send(Inbound::Down { peer }).await;
             let mut inner = handle.inner.lock().await;
-            inner.channels.remove(&peer);
-            inner.readers.remove(&peer);
+            // Only the connection that is still the peer's current one unregisters itself and
+            // reports the channel down: an older one that was replaced is not the peer's.
+            let current = inner
+                .conns
+                .get(&peer)
+                .is_some_and(|conn| conn.generation == generation);
+            if current {
+                inner.conns.remove(&peer);
+            }
+            drop(inner);
+            if current {
+                let _ = reader_events.send(Inbound::Down { peer }).await;
+            }
         });
-        let mut inner = self.inner.lock().await;
-        inner.channels.insert(peer, tx);
-        inner.readers.insert(peer, reader_task);
+        let replaced = inner.conns.insert(
+            peer,
+            Conn {
+                generation,
+                tx,
+                reader: reader_task,
+            },
+        );
         drop(inner);
+        if let Some(old) = replaced {
+            // Both sides dialled at once: the older connection (and its sender) goes, instead of
+            // lingering unregistered where a revoke could never reach it.
+            old.reader.abort();
+        }
         let _ = events.send(Inbound::Bound { peer, channel_id }).await;
         tokio::spawn(async move { write_task(writer, rx).await });
     }
@@ -1378,6 +1455,218 @@ mod tests {
             "the incoming transfer is gone"
         );
         assert!(clipboard.pending_request.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    async fn started_clipboard(tag: &str) -> (Clipboard, std::path::PathBuf) {
+        use std::collections::BTreeSet;
+        use std::sync::RwLock;
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(&root))
+                .expect("identity")
+                .0,
+        );
+        let settings = Settings {
+            enabled: true,
+            policy: cb::Policy {
+                enabled: true,
+                skip_secret_marked: true,
+                max_bytes: cb::MAX_BYTES,
+            },
+            rate_bytes_per_s: 0,
+            eager: false,
+        };
+        let (clipboard, _events) = Clipboard::start(
+            identity.node_id(),
+            settings,
+            identity,
+            Arc::new(RwLock::new(BTreeSet::new())),
+            "127.0.0.1:0".parse().expect("an address"),
+            4,
+        )
+        .await
+        .expect("the clipboard endpoint starts");
+        (clipboard, root)
+    }
+
+    async fn offer_and_data(
+        clipboard: &mut Clipboard,
+        peer: NodeId,
+        offer_id: [u8; 16],
+        text: &[u8],
+    ) {
+        let out = clipboard
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Offer {
+                    offer_id,
+                    origin_node_id: [0x31u8; 32],
+                    origin_version: 9,
+                    mime: cb::MIME.to_owned(),
+                    size_bytes: text.len() as u64,
+                },
+            )
+            .await;
+        assert!(out.is_empty());
+        let out = clipboard
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Data {
+                    offer_id,
+                    chunk_index: 0,
+                    chunk_count: 1,
+                    data: text.to_vec(),
+                },
+            )
+            .await;
+        assert!(out.is_empty());
+    }
+
+    /// Review R2': the transfer a peer had in flight when it was revoked must not land in the
+    /// clipboard after the revoke, even if its `Complete` was already queued.
+    #[tokio::test]
+    async fn a_revoked_peers_queued_complete_is_not_applied() {
+        let (mut clipboard, root) = started_clipboard("revoked-queue").await;
+        let peer: NodeId = [0x21u8; 32].into();
+        let offer_id = [0x41u8; 16];
+        let remote = b"from a peer the user just revoked".to_vec();
+        offer_and_data(&mut clipboard, peer, offer_id, &remote).await;
+
+        clipboard.on_link_down(peer).await;
+        assert!(clipboard.incoming.is_empty(), "its transfers go with it");
+
+        let out = clipboard
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Complete {
+                    offer_id,
+                    sha256: cb::sha256(&remote),
+                },
+            )
+            .await;
+        assert!(out.iter().all(|out| !matches!(out, Out::Agent(_))));
+        // A frame the dead connection had queued must not start a new transfer either.
+        offer_and_data(&mut clipboard, peer, [0x42u8; 16], &remote).await;
+        assert!(
+            clipboard.incoming.is_empty(),
+            "nothing is accepted from a closed peer"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review R3': a local copy the policy refuses (a password) still supersedes the wire:
+    /// the peer's late `Complete` must not overwrite what the user just copied.
+    #[tokio::test]
+    async fn a_refused_local_copy_still_cancels_the_incoming_transfer() {
+        let (mut clipboard, root) = started_clipboard("refused-copy").await;
+        let peer: NodeId = [0x21u8; 32].into();
+        let offer_id = [0x41u8; 16];
+        let remote = b"the peer's payload".to_vec();
+        offer_and_data(&mut clipboard, peer, offer_id, &remote).await;
+
+        let _ = clipboard
+            .on_local_copy(b"hunter2".to_vec(), vec![cb::Marker::ExcludeFromMonitor])
+            .await;
+
+        let out = clipboard
+            .on_peer_message(
+                peer,
+                ClipboardMessage::Complete {
+                    offer_id,
+                    sha256: cb::sha256(&remote),
+                },
+            )
+            .await;
+        assert!(
+            out.iter().all(|out| !matches!(out, Out::Agent(_))),
+            "the password the user copied must not be overwritten"
+        );
+        assert!(clipboard.incoming.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review R1': two connections of one peer (both sides dialled) must both die on revoke,
+    /// and the older one's exit must not unregister the newer one.
+    #[tokio::test]
+    async fn revoking_a_peer_closes_every_connection_it_holds() {
+        use std::collections::BTreeSet;
+        use std::sync::RwLock;
+
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-two-conn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let load = |name: &str| {
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(
+                root.join(name),
+            ))
+            .expect("identity")
+            .0
+        };
+        let identity_a = Arc::new(load("a"));
+        let identity_b = Arc::new(load("b"));
+        let id_a = identity_a.node_id();
+        let id_b = identity_b.node_id();
+        let a_pins = Arc::new(RwLock::new(BTreeSet::from([id_b])));
+        let (handle, mut events) = Handle::start(
+            Arc::clone(&identity_a),
+            Arc::clone(&a_pins),
+            "127.0.0.1:0".parse().expect("an address"),
+            4,
+        )
+        .await
+        .expect("the clipboard runtime starts");
+        let address = handle.listen_address;
+        let b_pins = Arc::new(RwLock::new(BTreeSet::from([id_a])));
+
+        let mut dialers = Vec::new();
+        for parent in [[7u8; 16], [8u8; 16]] {
+            let (channel, token) = handle.issue(parent).await;
+            let identity_b = Arc::clone(&identity_b);
+            let b_pins = Arc::clone(&b_pins);
+            dialers.push(tokio::spawn(async move {
+                dial_clipboard(&identity_b, b_pins, id_a, address, parent, channel, token).await
+            }));
+        }
+        let mut bound = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, Inbound::Bound { peer, .. } if peer == id_b) {
+                    bound += 1;
+                    if bound == 2 {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("both channels bind");
+
+        handle.close(id_b).await;
+
+        for dialer in dialers {
+            let connection = dialer.await.expect("dial task").expect("dialled");
+            let (mut reader, _writer) = connection.into_split();
+            let closed = tokio::time::timeout(Duration::from_secs(3), reader.recv()).await;
+            assert!(
+                matches!(closed, Ok(Err(_))),
+                "every connection of a revoked peer must close, got {closed:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
