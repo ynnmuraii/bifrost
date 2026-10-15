@@ -2939,21 +2939,14 @@ impl Session {
         }
     }
 
-    /// One pointer sample on the owner while `Local`: at most ~30 Hz of work, and only a
-    /// frame when the pointer is within reach of a linked edge.
+    /// One pointer sample on the owner while `Local`: at most ~30 Hz of frames, and only a
+    /// frame when the pointer is within reach of a linked edge. The emitter decides what is
+    /// worth resolving; a sample that ends an approach is never dropped by the rate limit.
     async fn sample_edgefx(&mut self, position: &geometry::Position) {
         let now = self.now_ms();
-        if !self.edgefx.wants_sample(now) {
-            return;
-        }
-        let near = self
-            .topology
-            .as_ref()
-            .and_then(|topology| crate::edgefx::proximity(topology, &self.node_id, position));
-        let frame = match near {
-            Some((update, display)) => self.edgefx.push(update, &display, now),
-            None => self.edgefx.out_of_reach(now),
-        };
+        let frame = self
+            .edgefx
+            .sample(self.topology.as_ref(), &self.node_id, position, now);
         self.send_edgefx(frame).await;
     }
 
@@ -2997,16 +2990,13 @@ impl Session {
                     }
                     return;
                 }
-                if !self.edgefx.wants_sample(now) {
-                    return;
-                }
-                let near = self.topology.as_ref().and_then(|topology| {
-                    crate::edgefx::proximity_in_desktop(topology, &self.node_id, last.x, last.y)
-                });
-                let frame = match near {
-                    Some((update, display)) => self.edgefx.own_near(update, &display, now),
-                    None => self.edgefx.own_away(now),
-                };
+                let frame = self.edgefx.sample_own(
+                    self.topology.as_ref(),
+                    &self.node_id,
+                    last.x,
+                    last.y,
+                    now,
+                );
                 self.send_edgefx(frame).await;
                 return;
             }

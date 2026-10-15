@@ -21,6 +21,10 @@ pub use raster::{Canvas, ACCENT, GLOW_REACH_PX, GLOW_SIGMA_PX, MAX_ALPHA};
 
 /// Distance (logical px) from a linked edge at which the glow starts to appear.
 pub const REACH_PX: f32 = 160.0;
+/// How much further than [`REACH_PX`] the pointer must go before an approach already showing
+/// ends. The core owns that state (it is the side that sees the pointer); the band keeps a
+/// pointer resting on the boundary from flipping approach↔leave, which reads as a flicker.
+pub const REACH_HYSTERESIS_PX: f32 = 24.0;
 /// How deep the glow reaches into the display (logical px).
 pub const DEPTH_PX: f32 = 36.0;
 /// The longest strip the overlay window will cover (logical px): the glow's own support, so
@@ -30,8 +34,10 @@ pub const MAX_STRIP_PX: f32 = 2.0 * GLOW_REACH_PX;
 pub const FADE_OUT_S: f32 = 0.30;
 /// Receiver side: how long the entry bloom plays.
 pub const RELEASE_S: f32 = 0.40;
-/// An approach with no update for this long fades out (core died, agent kept alone).
-pub const STALE_S: f32 = 0.25;
+/// An approach the core has said nothing about for this long fades out: it died mid-approach
+/// (or the link went away) and left the effect alone. A pointer that stops moving sends no
+/// samples at all, so this is a backstop for lost messages, never the effect's normal life.
+pub const LOST_S: f32 = 5.0;
 /// Frame cap while an effect is alive.
 pub const FRAME_S: f32 = 1.0 / 30.0;
 

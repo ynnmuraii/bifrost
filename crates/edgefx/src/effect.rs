@@ -4,9 +4,14 @@
 //! There is exactly one [`Effect`] per overlay, so a burst of events can never stack
 //! animations: a new event *steers* the live one instead of starting a second. All it carries
 //! is the strip to cover, the crossing point on it and two levels — one of them capped at 1.
+//!
+//! An approach ends on a message (`LEFT`, `CLEAR`, `CROSSED`), never on a timer: a pointer
+//! that rests inside the reach sends no samples at all, and the glow it earned stays lit and
+//! steady until the core says where it went. [`LOST_S`] is only the backstop for a core that
+//! died mid-approach.
 
 use crate::raster::{self, Canvas};
-use crate::{intensity, Strip, Target, Update, FADE_OUT_S, REACH_PX, RELEASE_S, STALE_S};
+use crate::{intensity, Strip, Target, Update, FADE_OUT_S, LOST_S, REACH_PX, RELEASE_S};
 
 /// Where the effect is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -16,7 +21,7 @@ pub enum Phase {
     Idle,
     /// The pointer is near a linked edge; `intensity` follows its distance.
     Approach,
-    /// Input crossed away (or the approach went stale): fading, `t` seconds in.
+    /// Input crossed away (or the core went silent): fading, `t` seconds in.
     Fading { t: f32 },
     /// Input arrived here: the bloom fades out, `t` seconds in.
     Releasing { t: f32 },
@@ -136,10 +141,13 @@ impl Effect {
     fn begin(&mut self, target: &Target) {
         let strip = Strip::of(target);
         self.point = (target.along - strip.start).clamp(0.0, strip.len);
-        if self.strip != Some(strip) {
-            self.strip = Some(strip);
+        // A segment longer than the window carries it along with the pointer, so one sample
+        // gives a strip that overlaps this one by a pixel less: the same glow, moving. Only a
+        // window that touches nothing of the old one is somewhere else entirely.
+        if self.strip.is_some_and(|was| !touches(was, strip)) {
             self.intensity = 0.0;
         }
+        self.strip = Some(strip);
     }
 
     /// Advances by `dt` seconds. Returns whether the effect is still active.
@@ -153,7 +161,7 @@ impl Effect {
             Phase::Idle => {}
             Phase::Approach => {
                 self.stale += dt;
-                if self.stale > STALE_S {
+                if self.stale > LOST_S {
                     self.phase = Phase::Fading { t: 0.0 };
                 } else {
                     self.intensity += (self.goal - self.intensity) * (1.0 - (-10.0 * dt).exp());
@@ -190,10 +198,17 @@ impl Effect {
     }
 }
 
+/// Whether two strips share any of their edge: the glow can carry on from one to the other,
+/// so a new one is not a restart. Two windows over the same segment always do; another
+/// display's segment does not.
+fn touches(a: Strip, b: Strip) -> bool {
+    a.edge == b.edge && a.start < b.start + b.len && b.start < a.start + a.len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Edge, MAX_ALPHA, MAX_STRIP_PX};
+    use crate::{Edge, FRAME_S, MAX_ALPHA, MAX_STRIP_PX};
     use std::cell::Cell;
 
     thread_local! {
@@ -231,6 +246,19 @@ mod tests {
             effect.step(0.033);
             t += 0.033;
         }
+    }
+
+    /// One step of a ±`px` tremor: a fixed seed makes the same walk every run, so a failure
+    /// is reproducible.
+    fn tremor(seed: &mut u32, px: f32) -> f32 {
+        (fraction(seed) - 0.5) * 2.0 * px
+    }
+
+    /// The next number of a small LCG, in `0..1`. The tests want a repeatable sequence of
+    /// gaps and offsets, not a random one, and no dependency on a generator crate.
+    fn fraction(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*seed >> 8) as f32 / 16_777_216.0
     }
 
     /// The brightest drawn pixel's coordinates and alpha at `scale`.
@@ -298,14 +326,146 @@ mod tests {
     }
 
     #[test]
-    fn an_approach_with_no_updates_fades_by_itself() {
+    fn an_approach_the_core_goes_silent_about_fades_by_itself() {
         let mut fx = Effect::new();
         fx.update(Update::Proximity {
             target: target(500.0),
             distance: 10.0,
         });
-        run(&mut fx, STALE_S + FADE_OUT_S + 0.2);
+        run(&mut fx, LOST_S + FADE_OUT_S + 0.2);
         assert_eq!(fx.phase(), Phase::Idle);
+    }
+
+    /// The owner's report: the cursor rests near the edge and trembles. The glow it earned
+    /// must hold its level — no fade, no restart — however irregular the samples are.
+    #[test]
+    fn a_trembling_pointer_inside_the_reach_neither_fades_nor_restarts() {
+        let mut fx = Effect::new();
+        let mut seed = 1u32;
+        // 40 px from the edge, ±2 px of tremor, and along the edge too: a 1080 px segment
+        // means every sample slides the window, which used to restart the glow.
+        let steady = intensity(40.0, REACH_PX);
+        let mut t = 0.0;
+        let mut next = 0.0;
+        let mut previous = 0.0;
+        let mut floor = f32::MAX;
+        while t < 5.0 {
+            if t >= next {
+                fx.update(Update::Proximity {
+                    target: target(500.0 + tremor(&mut seed, 2.0)),
+                    distance: 40.0 + tremor(&mut seed, 2.0),
+                });
+                // The OS hands the core samples 30..300 ms apart.
+                next = t + 0.030 + 0.270 * fraction(&mut seed);
+            }
+            assert_eq!(
+                fx.phase(),
+                Phase::Approach,
+                "the glow left the approach at {t}"
+            );
+            fx.step(FRAME_S);
+            let alpha = fx.alpha();
+            if t > 0.5 {
+                assert!(
+                    alpha >= previous * 0.9,
+                    "the glow flickered at {t}: {previous} → {alpha}"
+                );
+                floor = floor.min(alpha);
+            }
+            previous = alpha;
+            t += FRAME_S;
+        }
+        assert!(
+            floor >= steady * 0.9,
+            "the glow dimmed to {floor}, under the {steady} it should hold"
+        );
+    }
+
+    /// A pointer that stops inside the reach: the core sends nothing more, and the glow stays
+    /// up and steady instead of fading out under it.
+    #[test]
+    fn a_resting_pointer_inside_the_reach_keeps_the_glow_up() {
+        let mut fx = Effect::new();
+        fx.update(Update::Proximity {
+            target: target(500.0),
+            distance: 40.0,
+        });
+        run(&mut fx, 3.0);
+        assert_eq!(
+            fx.phase(),
+            Phase::Approach,
+            "the glow faded while the pointer stayed"
+        );
+        assert!(fx.is_active());
+        assert!(fx.alpha() > 0.8, "the glow dimmed: {}", fx.alpha());
+    }
+
+    /// Leaving the reach fades the glow out over the existing fade time — no lingering, and
+    /// no cutting it short.
+    #[test]
+    fn leaving_the_reach_fades_out_within_the_fade_time() {
+        let mut fx = Effect::new();
+        fx.update(Update::Proximity {
+            target: target(500.0),
+            distance: 0.0,
+        });
+        run(&mut fx, 0.3);
+        fx.update(Update::Left);
+        assert!(matches!(fx.phase(), Phase::Fading { .. }));
+        run(&mut fx, FADE_OUT_S - 0.05);
+        assert!(fx.is_active(), "the fade ended early");
+        assert!(fx.alpha() < 0.2, "still bright: {}", fx.alpha());
+        run(&mut fx, 0.15);
+        assert_eq!(fx.phase(), Phase::Idle);
+    }
+
+    /// A walk along a long segment: the window slides a pixel with the pointer, and the glow
+    /// keeps the level it had — the same effect, moving, not a new one every sample.
+    #[test]
+    fn walking_along_the_edge_keeps_the_level() {
+        let mut fx = Effect::new();
+        let steady = intensity(40.0, REACH_PX);
+        let mut floor = f32::MAX;
+        for step in 0..90 {
+            fx.update(Update::Proximity {
+                target: target(500.0 + step as f32),
+                distance: 40.0,
+            });
+            fx.step(FRAME_S);
+            if step >= 15 {
+                floor = floor.min(fx.alpha());
+            }
+        }
+        // Without the window fix every sample zeroes the level: the drawn alpha sits at the
+        // one-frame share of the smoothing, ~0.28 of the steady value.
+        assert!(
+            floor >= steady * 0.9,
+            "the glow restarted on every step: {floor} against {steady}"
+        );
+    }
+
+    /// The core's hysteresis keeps a pointer on the boundary inside the band, so the overlay
+    /// only ever sees approaches: nothing to fade and nothing to restart.
+    #[test]
+    fn a_pointer_oscillating_on_the_reach_boundary_only_steers() {
+        let mut fx = Effect::new();
+        for step in 0..90 {
+            let distance = if step % 2 == 0 {
+                REACH_PX - 5.0
+            } else {
+                REACH_PX + 5.0
+            };
+            fx.update(Update::Proximity {
+                target: target(500.0),
+                distance,
+            });
+            fx.step(FRAME_S);
+            assert_eq!(
+                fx.phase(),
+                Phase::Approach,
+                "the boundary flipped the effect"
+            );
+        }
     }
 
     #[test]
