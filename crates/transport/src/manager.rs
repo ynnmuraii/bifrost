@@ -121,6 +121,8 @@ struct LinkSettings {
 struct PendingLink {
     handle: LinkHandle,
     initiator: NodeId,
+    /// The capabilities in this link's handshake Hello, before any cache refresh.
+    local_capabilities: Vec<i32>,
     task: tokio::task::JoinHandle<()>,
     /// The peer this link is for, so a report can be matched without the live map's key.
     peer: NodeId,
@@ -138,6 +140,7 @@ enum ManagerMessage {
         key: [u8; 16],
         peer: NodeId,
         direction: Direction,
+        local_capabilities: Vec<i32>,
         handle: LinkHandle,
         task: tokio::task::JoinHandle<()>,
     },
@@ -564,6 +567,7 @@ impl LinkManager {
                 key,
                 peer,
                 direction,
+                local_capabilities,
                 handle,
                 task,
             } => {
@@ -575,6 +579,7 @@ impl LinkManager {
                         peer,
                         handle,
                         initiator,
+                        local_capabilities,
                         task,
                         registered_at_ns,
                     },
@@ -770,10 +775,12 @@ impl LinkManager {
             // Serialize catch-up and insertion with later updates, including their enqueues.
             let current = self.local_hello.read().await;
             let mut inner = self.inner.lock().await;
-            let _ = pending
-                .handle
-                .send_capabilities(current.capabilities.clone())
-                .await;
+            if pending.local_capabilities != current.capabilities {
+                let _ = pending
+                    .handle
+                    .send_capabilities(current.capabilities.clone())
+                    .await;
+            }
             inner
                 .last_lease_diagnostics
                 .insert(peer, pending.handle.lease_diagnostics_counters());
@@ -1126,6 +1133,7 @@ async fn start_link(
         direction,
     } = spawn;
     let (reports_tx, mut reports_rx) = mpsc::channel::<LinkReport>(64);
+    let local_capabilities = local_hello.capabilities.clone();
     let Ok(link) = crate::link::spawn(LinkConfig {
         key,
         peer,
@@ -1145,6 +1153,7 @@ async fn start_link(
             key,
             peer,
             direction,
+            local_capabilities,
             handle,
             task: link.task,
         })
