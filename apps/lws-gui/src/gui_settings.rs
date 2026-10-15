@@ -259,6 +259,7 @@ mod tests {
         let dir = dir("roundtrip");
         let path = path_in(&dir);
         let look = Look {
+            language: Lang::Ru,
             theme: Theme::Dark,
             field: FieldMode::Repel,
             speed: 1.4,

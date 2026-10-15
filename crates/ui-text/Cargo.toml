@@ -9,6 +9,7 @@ description = "Every string the owner reads, in the window and in the tray, in b
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Globalization"] }

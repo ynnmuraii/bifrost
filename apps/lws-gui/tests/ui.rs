@@ -832,6 +832,56 @@ fn the_appearance_switches_show_what_the_service_reports() {
     );
 }
 
+/// The window speaks the language it is given, the switch hands it over, and the choice is
+/// what `gui.toml` keeps.
+#[test]
+fn the_language_switch_changes_the_window_and_is_stored() {
+    let mut vm = connected();
+    vm.look.language = ui_text::Lang::En;
+    let mut harness = Harness::new();
+    let frame = harness.settle(&vm, false);
+    expect(&frame, &["MULTIDESKFLOW", "01 — MONITOR MAP"]);
+    assert!(
+        !shows(&frame, "КАРТА МОНИТОРОВ"),
+        "the Russian map line is gone"
+    );
+
+    // The row in Settings: RU | EN, in the shared rounded style.
+    vm.look.language = ui_text::Lang::Ru;
+    vm.local(&Action::ToggleModal(Modal::Settings));
+    let size = egui::vec2(1280.0, 720.0);
+    harness.frame(&vm, false, size, Vec::new());
+    harness.now += Duration::from_millis(500);
+    harness.frame(&vm, false, size, Vec::new());
+    let frame = harness.frame(&vm, false, size, Vec::new());
+    expect(&frame, &["ЯЗЫК", "RU", "EN"]);
+    let at = text_position(&mut harness, &vm, "EN");
+    let frame = harness.frame(&vm, false, size, click_at(at));
+    assert_eq!(
+        frame.output.actions,
+        vec![Action::SetLook(Look {
+            language: ui_text::Lang::En,
+            ..vm.look
+        })],
+        "the switch asks for English"
+    );
+
+    // And that is the value the window writes to its own file.
+    let dir = std::env::temp_dir().join(format!("lws-gui-language-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = lws_gui::gui_settings::path_in(&dir);
+    let mut look = vm.look;
+    look.language = ui_text::Lang::En;
+    lws_gui::gui_settings::save(&path, &look).expect("the directory is created");
+    assert_eq!(
+        lws_gui::gui_settings::load(&path).language,
+        ui_text::Lang::En
+    );
+    let text = std::fs::read_to_string(&path).expect("read");
+    assert!(text.contains("language = \"en\""), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A backend that cannot deliver the clipboard says so, and the window does not offer a switch
 /// that could not do anything.
 #[test]

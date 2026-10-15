@@ -691,6 +691,20 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 
 fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
+    // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
+    // the change is instant, because every string is drawn from the catalogue each frame.
+    row(ui, pal, text(lang, Key::Language), false, |ui| {
+        let mut look = vm.look;
+        if let Some(i) = widgets::seg(
+            ui,
+            pal,
+            &[Lang::Ru.code().to_uppercase().as_str(), "EN"],
+            usize::from(look.language == Lang::En),
+        ) {
+            look.language = if i == 0 { Lang::Ru } else { Lang::En };
+            actions.push(Action::SetLook(look));
+        }
+    });
     let current = vm.config.listen_address.clone();
     row(ui, pal, text(lang, Key::LANAddress), false, |ui| {
         let options = vm.settings.lan.options(&current);

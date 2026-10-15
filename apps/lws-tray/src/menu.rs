@@ -1,5 +1,5 @@
 use protocol::ipc::{MemberStatus, Status, TopologyDoc};
-use ui_text::{fill, text, Key};
+use ui_text::{fill, text, Key, Lang};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -15,7 +15,7 @@ pub(crate) struct Item {
     pub action: Option<Action>,
 }
 
-fn name(member: &MemberStatus) -> String {
+fn name(member: &MemberStatus, lang: Lang) -> String {
     if member.display_name.is_empty() {
         fill(
             lang,
@@ -29,7 +29,11 @@ fn name(member: &MemberStatus) -> String {
 
 // Mirrors the GUI's transfer decision: remote returns via its active peer; local
 // prefers an online topology neighbour, preserving Status member order on ties.
-fn transfer(status: &Status, topology: Option<&TopologyDoc>) -> Option<(String, String)> {
+fn transfer(
+    status: &Status,
+    topology: Option<&TopologyDoc>,
+    lang: Lang,
+) -> Option<(String, String)> {
     if !status.transition_disabled_reason.is_empty() {
         return None;
     }
@@ -71,14 +75,17 @@ fn transfer(status: &Status, topology: Option<&TopologyDoc>) -> Option<(String, 
     if status.focus == "REMOTE" {
         let peer = peers
             .iter()
-            .find(|m| name(m) == status.active_peer)
+            .find(|m| name(m, lang) == status.active_peer)
             .or_else(|| peers.first())?;
         let local = this
             .and_then(|id| topology?.members.iter().find(|m| m.node_id == id))
             .map(|m| m.display_name.as_str())
             .filter(|name| !name.is_empty())
             .unwrap_or(text(lang, Key::ThisComputer));
-        return Some((format!("Передать ввод → {local}"), peer.node_id.clone()));
+        return Some((
+            fill(lang, Key::SendInputTo, &[&local]),
+            peer.node_id.clone(),
+        ));
     }
     if status.focus != "LOCAL" {
         return None;
@@ -92,24 +99,29 @@ fn transfer(status: &Status, topology: Option<&TopologyDoc>) -> Option<(String, 
         .filter(|m| m.online)
         .min_by_key(|m| !neighbours.contains(&m.node_id))?;
     Some((
-        format!("Передать ввод → {}", name(peer)),
+        fill(lang, Key::SendInputTo, &[&name(peer, lang)]),
         peer.node_id.clone(),
     ))
 }
 
-pub(crate) fn items(status: Option<&Status>, topology: Option<&TopologyDoc>) -> Vec<Item> {
+pub(crate) fn items(
+    status: Option<&Status>,
+    topology: Option<&TopologyDoc>,
+    lang: Lang,
+) -> Vec<Item> {
     let mut items = vec![Item {
-        label: "Открыть MultiDeskFlow".into(),
+        label: text(lang, Key::OpenMultiDeskFlow).into(),
         action: Some(Action::Open),
     }];
     let label = match status {
-        Some(s) if s.focus == "REMOTE" => format!(
-            "Ввод → {}",
-            if s.active_peer.is_empty() {
+        Some(s) if s.focus == "REMOTE" => fill(
+            lang,
+            Key::Input2,
+            &[&if s.active_peer.is_empty() {
                 text(lang, Key::TheOtherComputer)
             } else {
                 &s.active_peer
-            }
+            }],
         ),
         Some(_) => text(lang, Key::TheServiceIsRunning).into(),
         None => text(lang, Key::TheServiceIsStopped).into(),
@@ -118,18 +130,18 @@ pub(crate) fn items(status: Option<&Status>, topology: Option<&TopologyDoc>) -> 
         label,
         action: None,
     });
-    if let Some((label, peer)) = status.and_then(|s| transfer(s, topology)) {
+    if let Some((label, peer)) = status.and_then(|s| transfer(s, topology, lang)) {
         items.push(Item {
             label,
             action: Some(Action::Switch(peer)),
         });
     }
     items.push(Item {
-        label: "Остановить службу".into(),
+        label: text(lang, Key::StopTheService).into(),
         action: status.map(|_| Action::Stop),
     });
     items.push(Item {
-        label: "Выход (служба продолжит работать)".into(),
+        label: text(lang, Key::QuitTheServiceKeepsRunning).into(),
         action: Some(Action::Exit),
     });
     items
@@ -162,7 +174,7 @@ mod tests {
     }
     #[test]
     fn offline_has_no_service_actions() {
-        let menu = items(None, None);
+        let menu = items(None, None, Lang::Ru);
         assert!(!menu
             .iter()
             .any(|i| matches!(i.action, Some(Action::Switch(_) | Action::Stop))));
@@ -172,28 +184,28 @@ mod tests {
     fn local_and_remote_use_same_peer() {
         let mut s = status();
         assert_eq!(
-            transfer(&s, None),
+            transfer(&s, None, Lang::Ru),
             Some(("Передать ввод → Ноутбук".into(), "peer".into()))
         );
         s.focus = "REMOTE".into();
         s.active_peer = "Ноутбук".into();
         assert_eq!(
-            transfer(&s, None),
+            transfer(&s, None, Lang::Ru),
             Some(("Передать ввод → этот компьютер".into(), "peer".into()))
         );
         s.transition_disabled_reason = "Нет разрешения".into();
-        assert_eq!(transfer(&s, None), None);
+        assert_eq!(transfer(&s, None, Lang::Ru), None);
     }
     #[test]
     fn impossible_transitions_are_hidden() {
         let mut s = status();
         for focus in ["PREPARING", "BLOCKED"] {
             s.focus = focus.into();
-            assert_eq!(transfer(&s, None), None);
+            assert_eq!(transfer(&s, None, Lang::Ru), None);
         }
         s.focus = "LOCAL".into();
         s.members[1].online = false;
-        assert_eq!(transfer(&s, None), None);
+        assert_eq!(transfer(&s, None, Lang::Ru), None);
     }
 }
 
@@ -243,7 +255,7 @@ mod topology_tests {
             ..Default::default()
         };
         assert_eq!(
-            transfer(&s, Some(&doc)).map(|(_, id)| id),
+            transfer(&s, Some(&doc), Lang::Ru).map(|(_, id)| id),
             Some("neighbour".into())
         );
     }
@@ -261,7 +273,10 @@ mod topology_tests {
             }],
             ..Default::default()
         };
-        assert_eq!(transfer(&s, None).map(|(_, id)| id), Some("peer-id".into()));
+        assert_eq!(
+            transfer(&s, None, Lang::Ru).map(|(_, id)| id),
+            Some("peer-id".into())
+        );
     }
 }
 
@@ -270,7 +285,7 @@ mod labels {
     use super::*;
     #[test]
     fn owner_menu_labels_are_stable() {
-        let offline = items(None, None);
+        let offline = items(None, None, Lang::Ru);
         assert_eq!(offline[0].label, "Открыть MultiDeskFlow");
         assert_eq!(offline[1].label, "Служба остановлена");
         assert_eq!(
@@ -286,6 +301,9 @@ mod labels {
             active_peer: "Ноутбук".into(),
             ..Default::default()
         };
-        assert_eq!(items(Some(&remote), None)[1].label, "Ввод → Ноутбук");
+        assert_eq!(
+            items(Some(&remote), None, Lang::Ru)[1].label,
+            "Ввод → Ноутбук"
+        );
     }
 }

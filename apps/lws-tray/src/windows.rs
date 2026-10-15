@@ -18,7 +18,6 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 use std::cell::RefCell;
-use ui_text::fill;
 struct Window {
     state: watch::Receiver<State>,
     commands: mpsc::UnboundedSender<Action>,

@@ -980,7 +980,7 @@ fn the_pairing_wizard_pairs_two_cores_through_the_view_model() {
         view.outcome
             .as_ref()
             .filter(|outcome| outcome.ok && outcome.text.contains("сопряжён"))
-            .map(|outcome| outcome.line())
+            .map(|outcome| outcome.line(ui_text::Lang::Ru))
     };
     let left_line = wait_for(&mut left, "the left window's pairing verdict", verdict);
     let right_line = wait_for(&mut right, "the right window's pairing verdict", verdict);

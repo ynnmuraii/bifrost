@@ -31,6 +31,8 @@
 
 #![forbid(unsafe_code)]
 
+pub use ui_text;
+
 pub mod app;
 pub mod gui_settings;
 pub mod map;
