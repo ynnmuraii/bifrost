@@ -629,6 +629,13 @@ async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
     let bytes = encode_message(Channel::Clipboard, &envelope)
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
     writer.write_all(&bytes).await?;
+    // TLS buffers: `write_all` may consume the whole frame while the records that carry it are
+    // still in the session (`tokio-rustls` returns a short-but-Ready write when the socket
+    // would block). Without this flush the frame can stay there until some *later* write, so a
+    // sender that waits for an answer after sending — `Bind`, `Offer`, `Request`, the last
+    // `Data` — would wait for a peer that never sees it. `link::write_frame` flushes for the
+    // same reason.
+    writer.flush().await?;
     *out_seq = seq;
     Ok(())
 }
@@ -989,6 +996,151 @@ impl Outgoing {
 mod tests {
     use super::*;
     use identity::{IdentityPaths, NodeIdentity, TrustStore, TrustedPeer};
+
+    struct BufferedWriter {
+        pending: Vec<u8>,
+        delivered: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for BufferedWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let pending = std::mem::take(&mut self.pending);
+            self.delivered.extend_from_slice(&pending);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    /// A frame must be on the wire when `send` returns, not left in the transport's buffer.
+    ///
+    /// `tokio-rustls` reports a short-but-ready write when the socket would block, and it leaves
+    /// the unsent TLS records in the session; a sender that waits for an answer after sending
+    /// (`Bind`, `Offer`, `Request`, the last `Data`) then deadlocks against a peer that never
+    /// sees the frame. This is the exact shape that hung `a_transfer_round_trips_in_chunks` on
+    /// CI: the frame was written but never flushed, and both sides waited in `recv`.
+    #[tokio::test]
+    async fn send_flushes_buffered_output() {
+        let mut writer = BufferedWriter {
+            pending: Vec::new(),
+            delivered: Vec::new(),
+        };
+        let parent = [1u8; 16];
+        let message = ClipboardMessage::Bind {
+            parent_connection_id: parent,
+            channel_id: [2u8; 16],
+            binding_token: [3u8; 32],
+        };
+        let expected = encode_message(
+            Channel::Clipboard,
+            &message.to_envelope(1, &parent).expect("envelope"),
+        )
+        .expect("frame");
+
+        send_message(&mut writer, &Some(parent), &mut 0, message)
+            .await
+            .expect("send");
+
+        assert_eq!(
+            writer.delivered, expected,
+            "the frame must be flushed before send returns"
+        );
+        assert!(writer.pending.is_empty());
+    }
+
+    /// `true` when the dialer's TLS session still holds records waiting for a `write_tls`.
+    fn dialer_session_has_queued_records(connection: &ClipboardConnection) -> bool {
+        let Stream::Client(stream) = &connection.stream else {
+            panic!("the dialed side");
+        };
+        stream.get_ref().1.wants_write()
+    }
+
+    /// `send` must leave nothing queued in the TLS session: a queued record is a frame the peer
+    /// cannot see yet, and the sender's next step is usually a `recv`.
+    ///
+    /// The integration round trip below passed 50/50 even without the flush, because a short
+    /// write needs the socket to refuse one; this asserts the property on the real stack
+    /// instead of relying on that race.
+    #[tokio::test]
+    async fn send_leaves_no_unsent_records_in_the_tls_session() {
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-flush-{}-{:x}",
+            std::process::id(),
+            u128::from_le_bytes(identity::random16().expect("entropy"))
+        ));
+        let server = Arc::new(
+            NodeIdentity::load_or_create(&IdentityPaths::rooted_at(root.join("server")))
+                .expect("server identity")
+                .0,
+        );
+        let client = NodeIdentity::load_or_create(&IdentityPaths::rooted_at(root.join("client")))
+            .expect("client identity")
+            .0;
+        let mut server_trust = TrustStore::new();
+        server_trust.trust(TrustedPeer::paired(client.node_id(), "client", None, 0));
+        let mut client_trust = TrustStore::new();
+        client_trust.trust(TrustedPeer::paired(server.node_id(), "server", None, 0));
+        let mut listener = ClipboardListener::bind(
+            Arc::clone(&server),
+            server_trust,
+            "127.0.0.1:0".parse().expect("address"),
+        )
+        .await
+        .expect("listener");
+        let address = listener.local_addr();
+        let (accepted, dialed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                listener.accept(),
+                dial_clipboard(
+                    &client,
+                    &client_trust,
+                    server.node_id(),
+                    address,
+                    [1; 16],
+                    [2; 16],
+                    [3; 32],
+                )
+            )
+        })
+        .await
+        .expect("TLS link deadline");
+        let _accepted = accepted.expect("accepted TLS link");
+        let mut dialed = dialed.expect("dialed TLS link");
+        assert!(
+            !dialer_session_has_queued_records(&dialed),
+            "the dialer's Bind must have reached the socket, not the session"
+        );
+
+        dialed
+            .send(ClipboardMessage::Request {
+                offer_id: [5u8; 16],
+            })
+            .await
+            .expect("request");
+        assert!(
+            !dialer_session_has_queued_records(&dialed),
+            "a sent frame must not stay queued in the TLS session"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn shutdown_joins_a_silent_handshake_and_releases_the_port() {
