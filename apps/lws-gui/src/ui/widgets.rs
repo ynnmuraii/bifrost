@@ -516,6 +516,8 @@ pub enum Icon {
     Diag,
     /// «Настройки».
     Settings,
+    /// Appearance: a paintbrush, distinct from the theme toggle and service settings.
+    Appearance,
     /// ✕.
     Close,
     /// The theme toggle.
@@ -564,6 +566,24 @@ fn prims(icon: Icon) -> &'static [Prim] {
             Line(&[(10.5, 15.5), (19.5, 15.5)]),
             R(12.75, 4.25, 4.5, 4.5, 1.0),
             R(5.75, 13.25, 4.5, 4.5, 1.0),
+        ],
+        Icon::Appearance => &[
+            Line(&[
+                (9.0, 12.0),
+                (16.5, 3.5),
+                (19.5, 6.5),
+                (11.0, 14.0),
+                (9.0, 12.0),
+            ]),
+            Line(&[
+                (9.0, 12.0),
+                (6.0, 12.5),
+                (4.5, 17.0),
+                (2.5, 19.0),
+                (8.0, 19.0),
+                (11.0, 16.0),
+                (11.0, 14.0),
+            ]),
         ],
         Icon::Close => &[
             Line(&[(4.0, 4.0), (14.0, 14.0)]),
