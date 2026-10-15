@@ -98,6 +98,9 @@ pub struct Wayland {
     /// `None` while no usable capture session exists (never connected or closed).
     capture: Option<WaylandCapture>,
     injector: WaylandInjector,
+    overlay: Option<platform_wayland::overlay::EdgeOverlay>,
+    edge_effects: bool,
+    overlay_attempted: bool,
     /// `None` when this compositor has no `GlobalShortcuts` portal (GNOME 46).
     shortcuts: Option<EmergencyShortcuts>,
     /// Restore tokens handed over by core in `AgentAttach`; kept in memory, because
@@ -257,6 +260,9 @@ impl Wayland {
             ready: ready.clone(),
             capture,
             injector,
+            overlay: None,
+            edge_effects: false,
+            overlay_attempted: false,
             shortcuts,
             grants,
             mode: Mode::Observe,
@@ -276,6 +282,35 @@ impl Wayland {
     /// The capability report sent right after the attach.
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    /// The capture portal owns cursor visibility; no local cursor override is needed.
+    pub fn set_effects(&mut self, edge_effects: bool, _hide_cursor: bool) {
+        self.edge_effects = edge_effects;
+        if let Some(overlay) = &self.overlay {
+            overlay.set_enabled(edge_effects);
+        }
+    }
+
+    /// Starts the optional overlay only when there is an effect to display.
+    pub fn edge_fx(&mut self, update: edgefx::Update) {
+        if !self.edge_effects {
+            return;
+        }
+        if !self.overlay_attempted
+            && matches!(
+                update,
+                edgefx::Update::Proximity { .. }
+                    | edgefx::Update::Crossed(Some(_))
+                    | edgefx::Update::Entered(_)
+            )
+        {
+            self.overlay_attempted = true;
+            self.overlay = platform_wayland::overlay::EdgeOverlay::spawn();
+        }
+        if let Some(overlay) = &self.overlay {
+            overlay.send(update);
+        }
     }
 
     /// Whether this backend can own and read the local CLIPBOARD selection.
@@ -350,6 +385,7 @@ impl Wayland {
     /// Ends capture. `replay_locally` plays buffered events through the inject session
     /// instead of forwarding them, which is the documented cancellation path.
     pub async fn end_capture(&mut self, replay_locally: bool) -> Result<Released, String> {
+        self.edge_fx(edgefx::Update::Clear);
         if replay_locally && !self.buffered.is_empty() {
             let buffered: Vec<InputEvent> = std::mem::take(&mut self.buffered);
             let outcome = self.inject(&buffered).await;
@@ -544,6 +580,7 @@ impl Wayland {
     /// Releases everything this session emulated, which is what a receiver must do when
     /// it loses the lease.
     pub fn release_session(&mut self) -> Released {
+        self.edge_fx(edgefx::Update::Clear);
         self.receiving = false;
         let outcome = self.injector.release_all();
         let released = Released {
@@ -648,6 +685,7 @@ impl Wayland {
             Step::Captured(None) => {
                 // The portal session ended (the compositor closed or disabled it).
                 self.capture = None;
+                self.edge_fx(edgefx::Update::Clear);
                 if self.mode == Mode::Observe {
                     tracing::info!("the Wayland capture session ended");
                     None
@@ -719,6 +757,7 @@ impl Wayland {
                 })
             }
             CapturedEvent::Deactivated => {
+                self.edge_fx(edgefx::Update::Clear);
                 self.activation = None;
                 if self.mode == Mode::Observe {
                     // The pointer left the barrier; the session stays armed.
@@ -746,7 +785,10 @@ impl Wayland {
                     }),
                 }
             }
-            CapturedEvent::Emergency => Some(Event::Emergency),
+            CapturedEvent::Emergency => {
+                self.edge_fx(edgefx::Update::Clear);
+                Some(Event::Emergency)
+            }
         }
     }
 
