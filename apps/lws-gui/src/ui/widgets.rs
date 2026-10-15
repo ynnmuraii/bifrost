@@ -199,13 +199,36 @@ fn dim(c: Color32) -> Color32 {
 
 /// `.btn`: 44 px high, 18 px padding, 13 px medium text.
 pub fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: Kind, enabled: bool) -> Response {
-    button_sized(ui, pal, label, kind, enabled, 44.0, 18.0, 13.0)
+    button_sized(ui, pal, label, kind, enabled, BTN)
 }
 
-/// A compact framed control, sharing the standard button's paint and interaction.
+/// The small pill: 22 px high, 9 px padding, 12 px text.
 pub fn small_button(ui: &mut Ui, pal: &Palette, label: &str, enabled: bool) -> Response {
-    button_sized(ui, pal, label, Kind::Plain, enabled, 22.0, 9.0, 12.0)
+    button_sized(ui, pal, label, Kind::Plain, enabled, SMALL)
 }
+
+/// The measured size of a button: the height of its frame, the padding on each
+/// side of its label and the size of that label.
+#[derive(Clone, Copy)]
+struct Metrics {
+    height: f32,
+    padding: f32,
+    text_size: f32,
+}
+
+/// `.btn`.
+const BTN: Metrics = Metrics {
+    height: 44.0,
+    padding: 18.0,
+    text_size: 13.0,
+};
+
+/// The compact framed control.
+const SMALL: Metrics = Metrics {
+    height: 22.0,
+    padding: 9.0,
+    text_size: 12.0,
+};
 
 fn button_sized(
     ui: &mut Ui,
@@ -213,19 +236,17 @@ fn button_sized(
     label: &str,
     kind: Kind,
     enabled: bool,
-    height: f32,
-    padding: f32,
-    text_size: f32,
+    metrics: Metrics,
 ) -> Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
-        font(text_size, fam::sans_medium()),
+        font(metrics.text_size, fam::sans_medium()),
         Color32::PLACEHOLDER,
     );
     let (w, h) = if kind == Kind::Link {
         (galley.size().x, galley.size().y)
     } else {
-        (galley.size().x + padding * 2.0, height)
+        (galley.size().x + metrics.padding * 2.0, metrics.height)
     };
     let sense = if enabled {
         Sense::click()
