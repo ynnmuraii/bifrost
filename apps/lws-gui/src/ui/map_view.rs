@@ -16,9 +16,12 @@ use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
 use ui_text::{text, Key};
 
-/// How far the ribbon of «ASCII-изолиния» arches above the midpoint of a link, in points per
-/// unit of scale — the mockup's own 110 (`docs/design/mockup/Main.dc.html`).
+/// How far the ribbon of «ASCII-изолиния» arches above the midpoint of a link, in screen
+/// points per unit of zoom — the mockup's own 110 (`docs/design/mockup/Main.dc.html`), which
+/// is the stage's scale to the window, not the map's own scale of the virtual coordinates.
 const RIBBON_ARCH: f32 = 110.0;
+/// The flattest the arch may ever be: a ribbon hugging the cards reads as a scratch.
+const RIBBON_ARCH_MIN: f32 = 60.0;
 
 /// Stage → screen.
 #[derive(Clone, Copy)]
@@ -102,8 +105,15 @@ pub fn draw(
         })
         .collect();
 
-    // The links input flows through, for the field: a live link in «ASCII-изолиния» also gets
-    // the ribbon's arc, from the centre of one computer to the centre of the other.
+    // The ribbon of «ASCII-изолиния» arches in screen points, scaled by the map's zoom and
+    // never flatter than the mockup's floor.
+    let arch = (RIBBON_ARCH * f32::from(vm.look.zoom_percent) / 100.0).max(RIBBON_ARCH_MIN);
+    let card = |n: usize| {
+        Rect::from_min_size(
+            shown[n],
+            Vec2::new(model.nodes[n].w as f32 * s, model.nodes[n].h as f32 * s),
+        )
+    };
     let flows: Vec<Flow> = model
         .links
         .iter()
@@ -111,24 +121,21 @@ pub fn draw(
         .map(|l| {
             let (a, b) = link_ends(&model, l, &shown, xf);
             let (from, to) = if l.forward { (a, b) } else { (b, a) };
-            let centre = |n: usize| {
-                let node = &model.nodes[n];
-                Pos2::new(
-                    shown[n].x + node.w as f32 * s / 2.0,
-                    shown[n].y + node.h as f32 * s / 2.0,
-                )
+            let arc = ribbon_arc(card(l.a), card(l.b), arch);
+            let arc = if l.forward {
+                arc
+            } else {
+                Ribbon {
+                    a: arc.b,
+                    c: arc.c,
+                    b: arc.a,
+                }
             };
-            let (ca, cb) = (centre(l.a), centre(l.b));
-            let (ca, cb) = if l.forward { (ca, cb) } else { (cb, ca) };
             Flow {
                 from,
                 to,
                 horizontal: l.dir == Dir::Horizontal,
-                arc: Ribbon {
-                    a: ca,
-                    c: Pos2::new((ca.x + cb.x) / 2.0, ca.y.min(cb.y) - RIBBON_ARCH * s),
-                    b: cb,
-                },
+                arc,
             }
         })
         .collect();
@@ -487,6 +494,32 @@ fn draw_link(
 fn fade(c: Color32, k: f32) -> Color32 {
     // Color32 stores premultiplied channels; do not premultiply them a second time.
     c.gamma_multiply(k)
+}
+
+/// The ribbon of one link: it leaves the edge of the first card facing the second, arrives on
+/// the edge of the second, and arches `arch` points over the midpoint between the two.
+fn ribbon_arc(first: Rect, second: Rect, arch: f32) -> Ribbon {
+    let edge = |from: Rect, to: Rect| {
+        let (centre, delta) = (from.center(), to.center() - from.center());
+        let half = from.size() / 2.0;
+        let tx = if delta.x.abs() > f32::EPSILON {
+            half.x / delta.x.abs()
+        } else {
+            f32::INFINITY
+        };
+        let ty = if delta.y.abs() > f32::EPSILON {
+            half.y / delta.y.abs()
+        } else {
+            f32::INFINITY
+        };
+        centre + delta * tx.min(ty).min(1.0)
+    };
+    let (a, b) = (edge(first, second), edge(second, first));
+    Ribbon {
+        a,
+        c: Pos2::new((a.x + b.x) / 2.0, a.y.min(b.y) - arch),
+        b,
+    }
 }
 
 fn monitor_rect(at: Pos2, r: crate::map::Rect, s: f32) -> Rect {
@@ -872,6 +905,35 @@ mod transform_tests {
                 assert!(xf.p(STAGE_W / 2.0, STAGE_H / 2.0).distance(rect.center()) < 0.001);
             }
         }
+    }
+
+    #[test]
+    fn the_ribbon_starts_and_ends_on_the_card_edges_under_a_high_arch() {
+        let first = Rect::from_min_size(Pos2::new(0.0, 100.0), Vec2::new(200.0, 120.0));
+        let second = Rect::from_min_size(Pos2::new(400.0, 200.0), Vec2::new(160.0, 90.0));
+        let arch = RIBBON_ARCH.max(RIBBON_ARCH_MIN);
+        let ribbon = ribbon_arc(first, second, arch);
+        // The ends are on the edges, facing each other.
+        assert!((ribbon.a.x - first.max.x).abs() < 0.001, "{ribbon:?}");
+        assert!(
+            ribbon.a.y > first.min.y && ribbon.a.y < first.max.y,
+            "{ribbon:?}"
+        );
+        assert!((ribbon.b.x - second.min.x).abs() < 0.001, "{ribbon:?}");
+        assert!(
+            ribbon.b.y > second.min.y && ribbon.b.y < second.max.y,
+            "{ribbon:?}"
+        );
+        // The arch is over the midpoint between the ends, as high as asked and never flat.
+        assert!((ribbon.c.x - (ribbon.a.x + ribbon.b.x) / 2.0).abs() < 0.001);
+        let rise = ribbon.a.y.min(ribbon.b.y) - ribbon.c.y;
+        assert!((rise - arch).abs() < 0.001, "{rise}");
+        assert!(rise >= 60.0);
+        // And it passes above both cards rather than through them.
+        assert!(
+            ribbon.c.y < first.min.y && ribbon.c.y < second.min.y,
+            "{ribbon:?}"
+        );
     }
 
     fn owner_layout() -> MapModel {
