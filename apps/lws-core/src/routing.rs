@@ -178,6 +178,7 @@ pub fn attach(
     takeover_threshold_px: u32,
     repeat_mode: ipc::RepeatMode,
     allow_portal_sessions: bool,
+    appearance: config::AppearanceConfig,
 ) -> ipc::AgentAttach {
     ipc::AgentAttach {
         launch_token,
@@ -193,6 +194,8 @@ pub fn attach(
         takeover_threshold_px,
         repeat_mode: repeat_mode as i32,
         allow_portal_sessions: allow_portal_sessions && mode != ipc::AgentMode::Recovery,
+        edge_effects: appearance.edge_effects,
+        hide_cursor: appearance.hide_remote_cursor,
     }
 }
 
@@ -719,6 +722,8 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::PortalGrant(_) => "PortalGrantChanged",
         Msg::SetClipboardText(_) => "SetClipboardText",
         Msg::ClipboardChanged(_) => "ClipboardChanged",
+        Msg::EdgeFx(_) => "EdgeFx",
+        Msg::SetEffects(_) => "SetEffects",
     }
 }
 
@@ -744,6 +749,7 @@ mod tests {
                 12,
                 ipc::RepeatMode::ReceiverNative,
                 true,
+                config::AppearanceConfig::default(),
             )
         };
         assert!(!make(ipc::AgentMode::Recovery).allow_portal_sessions);

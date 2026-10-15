@@ -26,6 +26,7 @@ mod agent;
 mod clipboard;
 mod command;
 mod ctl;
+mod edgefx;
 mod gui;
 mod ids;
 mod job;
@@ -522,7 +523,8 @@ async fn run_async(
             threshold_px: config.input.takeover_threshold_px,
         },
         repeat_mode(&config),
-    );
+    )
+    .with_appearance(config.appearance);
     // The layout document is assembled by the session (`Session::rebuild_topology`), which
     // is also where it is rebuilt when the agent reports its displays; doing it here as well
     // would only produce a second, snapshot-only opinion of the same document.
@@ -565,6 +567,7 @@ async fn run_async(
         options.dev_capture_injected,
         pairing_gate,
     );
+    session.set_appearance_source(paths.config_file(), config.appearance);
     session.run().await.map_err(|error| error.to_string())
 }
 

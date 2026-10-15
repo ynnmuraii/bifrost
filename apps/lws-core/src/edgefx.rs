@@ -17,6 +17,7 @@ pub struct Emitter {
     enabled: bool,
     gate: Coalescer<String>,
     near: bool,
+    entry_wanted: bool,
 }
 
 impl Emitter {
@@ -26,17 +27,27 @@ impl Emitter {
             enabled,
             gate: Coalescer::default(),
             near: false,
+            entry_wanted: false,
         }
-    }
-
-    #[must_use]
-    pub const fn enabled(&self) -> bool {
-        self.enabled
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.near = false;
+    }
+
+    /// A receiver lease was prepared: the next pointer position is where input arrived.
+    pub fn await_entry(&mut self) {
+        self.entry_wanted = true;
+    }
+
+    /// `true` once per prepared lease, on the first `Inject` after [`Self::await_entry`].
+    pub fn take_entry_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.entry_wanted)
+    }
+
+    pub fn cancel_entry(&mut self) {
+        self.entry_wanted = false;
     }
 
     /// Whether a proximity sample is worth computing at `now_ms` (cheap: a comparison).
@@ -108,7 +119,10 @@ pub fn frame(update: &Update, display: &str) -> ipc::EdgeFx {
         out.along = f64::from(target.along);
     };
     match update {
-        Update::Proximity { target: t, distance } => {
+        Update::Proximity {
+            target: t,
+            distance,
+        } => {
             out.kind = ipc::EdgeFxKind::EdgeFxProximity as i32;
             target(&mut out, t);
             out.distance = f64::from(*distance);
@@ -135,7 +149,11 @@ fn sides(size: Size, x: f64, y: f64) -> [(geometry::Edge, f64, Point); 4] {
         (geometry::Edge::Left, x, Point::new(-1.0, 0.0)),
         (geometry::Edge::Right, size.width - x, Point::new(1.0, 0.0)),
         (geometry::Edge::Top, y, Point::new(0.0, -1.0)),
-        (geometry::Edge::Bottom, size.height - y, Point::new(0.0, 1.0)),
+        (
+            geometry::Edge::Bottom,
+            size.height - y,
+            Point::new(0.0, 1.0),
+        ),
     ]
 }
 
@@ -157,10 +175,16 @@ pub fn proximity(
         if !(0.0..f64::from(REACH_PX)).contains(&distance) {
             continue;
         }
-        if best.as_ref().is_some_and(|(_, nearest, _)| *nearest <= distance) {
+        if best
+            .as_ref()
+            .is_some_and(|(_, nearest, _)| *nearest <= distance)
+        {
             continue;
         }
-        let probe = Point::new(direction.x * (distance + 1.0), direction.y * (distance + 1.0));
+        let probe = Point::new(
+            direction.x * (distance + 1.0),
+            direction.y * (distance + 1.0),
+        );
         let Some(transition) = geometry::resolve_motion(topology, node, position, probe) else {
             continue;
         };
@@ -170,7 +194,11 @@ pub fn proximity(
         best = Some((edge, distance, transition));
     }
     let (edge, distance, transition) = best?;
-    let along = if edge.is_vertical() { position.y } else { position.x };
+    let along = if edge.is_vertical() {
+        position.y
+    } else {
+        position.x
+    };
     let segment = transition.source.segment;
     Some((
         Update::Proximity {
@@ -217,10 +245,35 @@ pub fn entry(
     ))
 }
 
+/// [`entry`] for a point in the node's logical desktop space (what an injected
+/// `PointerAbsolute` carries): finds the display that holds it and works display-locally.
+#[must_use]
+pub fn entry_in_desktop(
+    topology: &Topology,
+    node: &NodeId,
+    x: f64,
+    y: f64,
+) -> Option<(Update, String)> {
+    let member = topology.node(node)?;
+    let display = member
+        .displays
+        .iter()
+        .find(|display| display.logical_bounds.contains(Point::new(x, y)))?;
+    entry(
+        topology,
+        node,
+        &display.id,
+        x - display.logical_bounds.x,
+        y - display.logical_bounds.y,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geometry::{Display, Endpoint, NodeDisplays, Rect, Rotation, Scale, Segment, TransitionLink};
+    use geometry::{
+        Display, Endpoint, NodeDisplays, Rect, Rotation, Scale, Segment, TransitionLink,
+    };
 
     fn node(n: u8) -> NodeId {
         NodeId::new([n; 32])
@@ -243,13 +296,31 @@ mod tests {
             7,
             node(1),
             vec![
-                NodeDisplays::new(node(1), vec![display("a", Rect::new(0.0, 0.0, 1200.0, 1000.0))], true),
-                NodeDisplays::new(node(2), vec![display("b", Rect::new(0.0, 0.0, 1000.0, 800.0))], true),
+                NodeDisplays::new(
+                    node(1),
+                    vec![display("a", Rect::new(0.0, 0.0, 1200.0, 1000.0))],
+                    true,
+                ),
+                NodeDisplays::new(
+                    node(2),
+                    vec![display("b", Rect::new(0.0, 0.0, 1000.0, 800.0))],
+                    true,
+                ),
             ],
             vec![TransitionLink::new(
                 "a-to-b",
-                Endpoint::new(node(1), "a", geometry::Edge::Right, Segment::new(120.0, 1000.0)),
-                Endpoint::new(node(2), "b", geometry::Edge::Left, Segment::new(40.0, 760.0)),
+                Endpoint::new(
+                    node(1),
+                    "a",
+                    geometry::Edge::Right,
+                    Segment::new(120.0, 1000.0),
+                ),
+                Endpoint::new(
+                    node(2),
+                    "b",
+                    geometry::Edge::Left,
+                    Segment::new(40.0, 760.0),
+                ),
                 true,
             )],
         )
@@ -268,7 +339,10 @@ mod tests {
         };
         assert_eq!(near.1, "a");
         assert_eq!(target.edge, Edge::Right);
-        assert_eq!((target.start, target.end, target.along), (120.0, 1000.0, 500.0));
+        assert_eq!(
+            (target.start, target.end, target.along),
+            (120.0, 1000.0, 500.0)
+        );
         assert_eq!(distance, 50.0);
         // Too far, an unlinked edge, and the part of the right edge no link covers.
         assert!(proximity(&topology, &node(1), &at(600.0, 500.0)).is_none());
@@ -285,19 +359,42 @@ mod tests {
         };
         assert_eq!(display, "b");
         assert_eq!(target.edge, Edge::Left);
-        assert_eq!((target.start, target.end, target.along), (0.0, 800.0, 300.0));
+        assert_eq!(
+            (target.start, target.end, target.along),
+            (0.0, 800.0, 300.0)
+        );
         let (update, _) = entry(&topology, &node(2), &"b".into(), 500.0, 798.0).expect("entry");
-        assert!(matches!(update, Update::Entered(Target { edge: Edge::Bottom, .. })));
+        assert!(matches!(
+            update,
+            Update::Entered(Target {
+                edge: Edge::Bottom,
+                ..
+            })
+        ));
     }
 
     #[test]
     fn frames_carry_the_edge_and_stay_small() {
-        let target = Target { edge: Edge::Top, start: 1.0, end: 2.0, along: 1.5 };
-        let out = frame(&Update::Proximity { target, distance: 9.0 }, "a");
+        let target = Target {
+            edge: Edge::Top,
+            start: 1.0,
+            end: 2.0,
+            along: 1.5,
+        };
+        let out = frame(
+            &Update::Proximity {
+                target,
+                distance: 9.0,
+            },
+            "a",
+        );
         assert_eq!(out.kind, ipc::EdgeFxKind::EdgeFxProximity as i32);
         assert_eq!(out.edge, ipc::PortalEdge::Top as i32);
         assert_eq!((out.display_id.as_str(), out.distance), ("a", 9.0));
-        assert_eq!(frame(&Update::Clear, "").kind, ipc::EdgeFxKind::EdgeFxClear as i32);
+        assert_eq!(
+            frame(&Update::Clear, "").kind,
+            ipc::EdgeFxKind::EdgeFxClear as i32
+        );
     }
 
     #[test]
@@ -312,8 +409,22 @@ mod tests {
     fn leaving_the_reach_sends_one_left_and_only_after_an_approach() {
         let mut emitter = Emitter::new(true);
         assert!(emitter.out_of_reach(0).is_none());
-        let target = Target { edge: Edge::Right, start: 0.0, end: 10.0, along: 5.0 };
-        assert!(emitter.push(Update::Proximity { target, distance: 5.0 }, "a", 0).is_some());
+        let target = Target {
+            edge: Edge::Right,
+            start: 0.0,
+            end: 10.0,
+            along: 5.0,
+        };
+        assert!(emitter
+            .push(
+                Update::Proximity {
+                    target,
+                    distance: 5.0
+                },
+                "a",
+                0
+            )
+            .is_some());
         let left = emitter.out_of_reach(40).expect("one LEFT");
         assert_eq!(left.kind, ipc::EdgeFxKind::EdgeFxLeft as i32);
         assert!(emitter.out_of_reach(80).is_none());

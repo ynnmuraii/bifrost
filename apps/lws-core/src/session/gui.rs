@@ -129,6 +129,8 @@ impl Session {
             agent_degraded_reason: self.agent_degraded_reason.clone(),
             agent_restart_circuit_open: self.agent_restart_circuit.is_open(),
             transition_disabled_reason: self.transition_disabled_reason(),
+            edge_effects: self.appearance.edge_effects,
+            hide_remote_cursor: self.appearance.hide_remote_cursor,
         }
     }
 
@@ -399,6 +401,12 @@ impl Session {
             }
             Msg::SetClipboard(set) => {
                 let result = self.set_clipboard(set.enabled);
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::SetAppearance(set) => {
+                let result = self
+                    .set_appearance(set.edge_effects, set.hide_remote_cursor)
+                    .await;
                 answer(&out, request_id, Msg::OpResult(result)).await;
             }
             Msg::RevokePeer(revoke) => {
@@ -801,6 +809,53 @@ impl Session {
         };
         clipboard.set_enabled(enabled);
         tracing::info!(enabled, "clipboard toggled from the GUI");
+        ok()
+    }
+
+    /// `SetAppearance`: save `[appearance]` (this core is the config's single writer, under the
+    /// cross-process lock) and push the values to the agent at once, so the effect changes
+    /// live. A restarted agent gets them through `AgentAttach`.
+    async fn set_appearance(
+        &mut self,
+        edge_effects: bool,
+        hide_remote_cursor: bool,
+    ) -> ipc::OpResult {
+        let Some(path) = self.appearance_path.clone() else {
+            return ipc::OpResult {
+                ok: false,
+                error_code: "APPEARANCE_UNAVAILABLE".to_owned(),
+            };
+        };
+        let wanted = config::AppearanceConfig {
+            edge_effects,
+            hide_remote_cursor,
+        };
+        let saved = tokio::task::spawn_blocking(move || {
+            config::lock::update_locked(&path, |config| config.appearance = wanted)
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            tracing::warn!("cannot save [appearance]");
+            return ipc::OpResult {
+                ok: false,
+                error_code: "APPEARANCE_WRITE".to_owned(),
+            };
+        }
+        self.appearance = wanted;
+        self.agent.set_appearance(wanted);
+        self.edgefx.set_enabled(edge_effects);
+        let frame = ipc::agent_frame::Msg::SetEffects(ipc::SetEffects {
+            edge_effects,
+            hide_cursor: hide_remote_cursor,
+        });
+        if let Err(error) = self.agent.send(frame).await {
+            tracing::warn!(%error, "cannot push the appearance to the agent");
+        }
+        tracing::info!(
+            edge_effects,
+            hide_remote_cursor,
+            "appearance changed from the GUI"
+        );
         ok()
     }
 
