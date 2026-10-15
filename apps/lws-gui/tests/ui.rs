@@ -131,13 +131,9 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
             "этот компьютер",
             "01 — КАРТА МОНИТОРОВ",
             "2 компьютера · 2 экрана",
-            "ревизия 14 · координатор Workstation",
             "Workstation",
             "linux-box",
             "1920×1080",
-            "Авто",
-            "Применить",
-            "↔ Передать ввод → linux-box",
             "Тяните компьютер — края примагнитятся",
             "ЭТОТ КОМПЬЮТЕР",
             "ОКНО СОПРЯЖЕНИЯ",
@@ -146,7 +142,6 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
             "Открыть окно сопряжения",
             "Подключиться",
             "Код появится после подключения",
-            "LAN WORKSPACE",
         ],
     );
     assert!(shows(&frame, ":47901"), "the port the other computer dials");
@@ -185,16 +180,7 @@ fn every_modal_shows_its_own_real_data() {
     vm.config.switch_hotkey = "Ctrl+Alt+Shift+Right".to_owned();
     vm.config.claim_hotkey = "Ctrl+Alt+Shift+F11".to_owned();
     vm.settings.lan.candidates = vec!["192.168.1.24".to_owned(), "10.0.0.5".to_owned()];
-    let cases: [(Modal, &[&str]); 6] = [
-        (
-            Modal::Layout,
-            &[
-                "Раскладка",
-                "mdf layout",
-                "ПРИМЕНЕНО",
-                "Расположить автоматически",
-            ],
-        ),
+    let cases: [(Modal, &[&str]); 5] = [
         (
             Modal::Pairs,
             &["Пары", "linux-box", "BB22·BB22", "в сети", "Удалить"],
@@ -215,16 +201,7 @@ fn every_modal_shows_its_own_real_data() {
         ),
         (
             Modal::Settings,
-            &[
-                "Настройки",
-                "АДРЕС В LAN",
-                "Перезапустить",
-                "Остановить",
-                "Antigravity Light",
-                "Overmind Dark",
-                "Без движения",
-                "ASCII-облака",
-            ],
+            &["Настройки", "АДРЕС В LAN", "Перезапустить", "Остановить"],
         ),
     ];
     for (modal, needles) in cases {
@@ -300,8 +277,7 @@ fn an_idle_window_asks_for_no_frame_and_an_animated_one_for_thirty_a_second() {
     let mut vm = connected();
     let mut harness = Harness::new();
 
-    // Default look: field «Без движения». Visible and focused, and still nothing is scheduled.
-    assert_eq!(vm.look.field, FieldMode::Off);
+    assert_eq!(vm.look.field, FieldMode::Attract);
     let frame = harness.settle(&vm, true);
     assert_eq!(
         frame.output.repaint_after, None,
@@ -310,9 +286,27 @@ fn an_idle_window_asks_for_no_frame_and_an_animated_one_for_thirty_a_second() {
 
     // The field moves: 30 fps, and not faster.
     vm.look.field = FieldMode::Repel;
-    let frame = harness.settle(&vm, true);
+    let frame = harness.frame(
+        &vm,
+        true,
+        SIZE,
+        vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))],
+    );
     assert_eq!(frame.output.repaint_after, Some(ui::FIELD_FRAME));
     assert!(ui::FIELD_FRAME >= Duration::from_millis(33));
+    harness.now += Duration::from_secs(2);
+    let frame = harness.settle(&vm, true);
+    assert_eq!(
+        frame.output.repaint_after, None,
+        "a stationary pointer settles"
+    );
+    let frame = harness.frame(
+        &vm,
+        true,
+        SIZE,
+        vec![egui::Event::PointerMoved(egui::pos2(420.0, 300.0))],
+    );
+    assert_eq!(frame.output.repaint_after, Some(ui::FIELD_FRAME));
 
     // The window is hidden, minimised or unfocused: no animation frame at all.
     let frame = harness.settle(&vm, false);
@@ -338,7 +332,12 @@ fn an_open_pairing_window_ticks_once_a_second_and_nothing_faster() {
     assert_eq!(frame.output.repaint_after, Some(Duration::from_secs(1)));
     // With the field moving too, the faster of the two wins — never a sum of both.
     vm.look.field = FieldMode::Attract;
-    let frame = harness.settle(&vm, true);
+    let frame = harness.frame(
+        &vm,
+        true,
+        SIZE,
+        vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))],
+    );
     assert_eq!(frame.output.repaint_after, Some(ui::FIELD_FRAME));
 }
 
@@ -369,33 +368,18 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
         frame
             .output
             .actions
-            .contains(&Action::ToggleModal(Modal::Layout)),
+            .contains(&Action::ToggleModal(Modal::Pairs)),
         "{:?}",
         frame.output.actions
     );
 
-    // The theme toggle is the last control of the top bar.
-    let frame = harness.frame(
-        &vm,
-        false,
-        SIZE,
-        click_at(egui::pos2(SIZE.x - 12.0 - 20.0, 30.0)),
-    );
-    let wanted = frame
-        .output
-        .actions
-        .iter()
-        .find_map(|action| match action {
-            Action::SetLook(look) => Some(*look),
-            _ => None,
-        })
-        .expect("the toggle asks for a look");
-    assert_eq!(wanted.theme, Theme::Dark);
-    assert_eq!(wanted.field, FieldMode::Off, "and changes nothing else");
+    let at = egui::pos2(SIZE.x - 32.0, SIZE.y - 40.0);
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(frame.output.actions.contains(&Action::ToggleAppearance));
 }
 
 #[test]
-fn the_dial_button_sends_the_typed_address_and_the_transfer_button_the_switch() {
+fn the_dial_button_sends_the_typed_address_and_map_commands_are_absent() {
     let mut vm = connected();
     vm.pairing.address = "192.168.1.10:47901".to_owned();
     let mut harness = Harness::new();
@@ -441,17 +425,10 @@ fn the_dial_button_sends_the_typed_address_and_the_transfer_button_the_switch() 
         frame.output.actions
     );
 
-    let at = find(&mut harness, &vm, "↔ Передать ввод → linux-box");
-    let frame = harness.frame(&vm, false, SIZE, click_at(at));
-    assert!(
-        frame
-            .output
-            .actions
-            .contains(&Action::SwitchTo(PEER_NODE.to_owned())),
-        "{:?}",
-        frame.output.actions
-    );
-    let _ = SELF_NODE;
+    for removed in ["↔ Передать ввод → linux-box", "Применить", "Авто"]
+    {
+        assert!(!shows(&frame, removed), "{removed} must not be drawn");
+    }
 }
 
 #[test]
@@ -533,18 +510,18 @@ fn dispatch_frame(bridge: &mut lws_gui::view_model::Bridge, frame: Frame, now: I
 fn assert_no_layout_requests(bridge: &lws_gui::view_model::Bridge) {
     use lws_gui::view_model::Request;
     assert!(
-        bridge.view().inflight.iter().all(|request| !matches!(
-            request.request,
-            Request::UpdateTopology | Request::LayoutAuto
-        )),
+        bridge
+            .view()
+            .inflight
+            .iter()
+            .all(|request| !matches!(request.request, Request::UpdateTopology)),
         "{:?}",
         bridge.view().inflight
     );
 }
 
 #[test]
-fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
-    use lws_gui::view_model::Request;
+fn map_drag_frames_focus_loss_modal_close_and_reconnect_never_save() {
     let mut bridge = dry_bridge();
     let mut harness = Harness::new();
     harness.settle(bridge.view(), false);
@@ -561,7 +538,10 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
         .iter()
         .any(|action| matches!(action, Action::NudgeNode { .. })));
     dispatch_frame(&mut bridge, frame, harness.now);
-    assert!(bridge.view().editor.dirty());
+    assert!(
+        !bridge.view().editor.dirty(),
+        "an invalid keyboard drop rolls back"
+    );
     assert_no_layout_requests(&bridge);
 
     // Drag the rendered monitor. Start the drag on one frame and move again on another,
@@ -606,7 +586,7 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
     dispatch_frame(&mut bridge, frame, harness.now);
     assert_no_layout_requests(&bridge);
 
-    bridge.dispatch(Action::ToggleModal(Modal::Layout), harness.now);
+    bridge.dispatch(Action::ToggleModal(Modal::Keys), harness.now);
     harness.settle(bridge.view(), false);
     let frame = harness.frame(bridge.view(), false, SIZE, vec![key(egui::Key::Escape)]);
     assert!(frame.output.actions.contains(&Action::CloseModal));
@@ -625,61 +605,6 @@ fn map_edits_focus_loss_modal_close_and_reconnect_never_apply_but_buttons_do() {
     let frame = harness.settle(bridge.view(), false);
     dispatch_frame(&mut bridge, frame, harness.now);
     assert_no_layout_requests(&bridge);
-
-    // Restore a connected draft after the deliberately endpoint-free client reports offline.
-    bridge.view_mut().on_connected("endpoint");
-    bridge.dispatch(
-        Action::NudgeNode {
-            node_id: PEER_NODE.to_owned(),
-            dx: 16.0,
-            dy: 0.0,
-        },
-        harness.now,
-    );
-    harness.settle(bridge.view(), false);
-    let at = text_position(&mut harness, bridge.view(), "Применить");
-    let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
-    assert_eq!(
-        frame
-            .output
-            .actions
-            .iter()
-            .filter(|action| matches!(action, Action::UpdateTopology { .. }))
-            .count(),
-        1
-    );
-    dispatch_frame(&mut bridge, frame, harness.now);
-    assert_eq!(
-        bridge
-            .view()
-            .inflight
-            .iter()
-            .filter(|request| request.request == Request::UpdateTopology)
-            .count(),
-        1
-    );
-
-    let at = text_position(&mut harness, bridge.view(), "Авто");
-    let frame = harness.frame(bridge.view(), false, SIZE, click_at(at));
-    assert_eq!(
-        frame
-            .output
-            .actions
-            .iter()
-            .filter(|action| matches!(action, Action::LayoutAuto))
-            .count(),
-        1
-    );
-    dispatch_frame(&mut bridge, frame, harness.now);
-    assert_eq!(
-        bridge
-            .view()
-            .inflight
-            .iter()
-            .filter(|request| request.request == Request::LayoutAuto)
-            .count(),
-        1
-    );
 }
 
 #[test]
@@ -765,7 +690,7 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
         .actions
         .iter()
         .any(|action| matches!(action, Action::SetLook(_))));
-    vm.modal = Some(Modal::Layout);
+    vm.modal = Some(Modal::Keys);
     let frame = harness.frame(&vm, false, SIZE, wheel(-32.0));
     assert!(!frame
         .output
@@ -775,29 +700,17 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
 }
 
 #[test]
-fn layout_modal_has_no_second_layout_editor_and_pairing_close_is_disabled() {
+fn removed_layout_controls_stay_absent_and_pairing_close_is_disabled() {
     let mut vm = connected();
-    vm.modal = Some(Modal::Layout);
     let mut harness = Harness::new();
-    harness.frame(&vm, false, SIZE, Vec::new());
-    harness.now += Duration::from_millis(500);
     let frame = harness.settle(&vm, false);
-    expect(
-        &frame,
-        &["ПРИМЕНЕНО", "Расположить автоматически", "Применить"],
-    );
     for removed in [
-        "СОЕДИНИТЬ С",
+        "ПРИМЕНЕНО",
+        "Расположить автоматически",
+        "Применить",
         "СТОРОНА",
-        "Слева",
-        "Справа",
-        "Сверху",
-        "Снизу",
     ] {
-        assert!(
-            !frame.texts.iter().any(|text| text == removed),
-            "{removed} must not be drawn"
-        );
+        assert!(!shows(&frame, removed), "{removed} must not be drawn");
     }
     vm.modal = None;
     vm.apply(event(Msg::PairingWindow(protocol::ipc::PairingWindow {
