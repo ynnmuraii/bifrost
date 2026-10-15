@@ -63,6 +63,10 @@ transfer = "on_offer"                # "on_offer" | "on_focus_enter"
 language = "ru"                      # "ru" | "en"
 autostart = false                    # включается только после успешного теста
 
+[appearance]
+edge_effects = true                 # ASCII-полоска у связанного края и «выдох» на другой машине
+hide_remote_cursor = true           # прятать курсор здесь, пока ввод на другой машине (Windows)
+
 [log]
 level = "info"                       # никогда не логирует клавиши и clipboard
 max_file_mb = 5
