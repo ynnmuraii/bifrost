@@ -807,7 +807,11 @@ impl ClipboardListener {
 
     /// Closes the listening socket, then aborts and joins every pending TLS/bind handshake.
     pub async fn shutdown(self) {
-        let Self { listener, acceptor: _, mut pending } = self;
+        let Self {
+            listener,
+            acceptor: _,
+            mut pending,
+        } = self;
         drop(listener);
         pending.shutdown().await;
     }
@@ -986,24 +990,40 @@ mod tests {
         ));
         let identity = Arc::new(
             NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&root))
-                .expect("identity").0,
+                .expect("identity")
+                .0,
         );
         let mut listener = ClipboardListener::bind(
-            Arc::clone(&identity), TrustStore::new(), "127.0.0.1:0".parse().expect("address"),
-        ).await.expect("listener");
+            Arc::clone(&identity),
+            TrustStore::new(),
+            "127.0.0.1:0".parse().expect("address"),
+        )
+        .await
+        .expect("listener");
         let address = listener.local_addr();
         let mut silent = TcpStream::connect(address).await.expect("connect");
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
-            .await.is_err(), "silent peer cannot complete TLS");
-        assert_eq!(listener.pending.len(), 1, "handshake task must actually be active");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "silent peer cannot complete TLS"
+        );
+        assert_eq!(
+            listener.pending.len(),
+            1,
+            "handshake task must actually be active"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(1), listener.shutdown())
-            .await.expect("shutdown must not wait for the handshake deadline");
+            .await
+            .expect("shutdown must not wait for the handshake deadline");
         let mut byte = [0];
         let read = tokio::time::timeout(std::time::Duration::from_secs(1), silent.read(&mut byte))
-            .await.expect("silent socket closes");
+            .await
+            .expect("silent socket closes");
         assert!(matches!(read, Ok(0) | Err(_)));
         let replacement = ClipboardListener::bind(identity, TrustStore::new(), address)
-            .await.expect("exact port is released");
+            .await
+            .expect("exact port is released");
         replacement.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }

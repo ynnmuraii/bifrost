@@ -844,7 +844,11 @@ impl Session {
             }
             let mut out = Vec::new();
             for (&peer, &(connection, supported, address)) in &self.clipboard_links {
-                out.extend(clipboard.on_link_up(peer, connection, supported, address).await);
+                out.extend(
+                    clipboard
+                        .on_link_up(peer, connection, supported, address)
+                        .await,
+                );
             }
             self.clipboard_events = events;
             self.clipboard = Some(clipboard);
