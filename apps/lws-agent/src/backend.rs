@@ -529,12 +529,16 @@ impl DryClipboard {
 
     /// Looks for a copy the user made, at most every [`DRY_CLIPBOARD_POLL`].
     fn poll(&mut self) -> Option<ClipboardChange> {
+        self.poll_at(Instant::now())
+    }
+
+    fn poll_at(&mut self, now: Instant) -> Option<ClipboardChange> {
         if let Some(last) = self.last_poll {
-            if last.elapsed() < DRY_CLIPBOARD_POLL {
+            if now.duration_since(last) < DRY_CLIPBOARD_POLL {
                 return None;
             }
         }
-        self.last_poll = Some(Instant::now());
+        self.last_poll = Some(now);
         let current = file_stamp(&self.in_path);
         if current == self.observed {
             return None;
@@ -1709,16 +1713,23 @@ mod tests {
         assert_eq!(read(&in_path), "copied by the user");
         assert_eq!(dry.clipboard_change(), None);
 
-        // Two polls have to wait for the hook's own pacing: the second one within the interval
-        // learns nothing new.
+        // Filesystem operations and descheduling may take longer than the poll interval.
+        // Drive the production pacing check with explicit timestamps, not wall-clock guesses.
         write(&in_path, "another copy");
-        let immediate = dry.clipboard_change();
-        wait_for_poll();
-        let later = dry.clipboard_change();
-        assert!(
-            later.is_some(),
-            "the change is seen once the interval passed (immediate: {immediate:?})"
+        let clipboard = dry.clipboard.as_mut().expect("dry clipboard");
+        let last = clipboard.last_poll.expect("previous poll");
+        assert!(clipboard
+            .poll_at(last + DRY_CLIPBOARD_POLL - Duration::from_nanos(1))
+            .is_none());
+        let boundary = last + DRY_CLIPBOARD_POLL;
+        assert_eq!(
+            clipboard
+                .poll_at(boundary)
+                .expect("copy at interval boundary")
+                .text,
+            "another copy"
         );
+        assert!(clipboard.poll_at(boundary).is_none());
     }
 
     /// `in.markers` is what makes `AC-15` testable without a password manager: the names are
