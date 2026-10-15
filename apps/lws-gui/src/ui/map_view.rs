@@ -408,7 +408,7 @@ fn draw_link(
     let carry_a = shown[link.a] - xf.p(model.nodes[link.a].at.x, model.nodes[link.a].at.y);
     let carry_b = shown[link.b] - xf.p(model.nodes[link.b].at.x, model.nodes[link.b].at.y);
     let horizontal = link.dir == Dir::Horizontal;
-    let (mut color, mut alpha) = (pal.line, 1.0f32);
+    let (mut color, mut alpha) = (pal.ink2, 1.0f32);
     match link.state {
         LinkState::Active => color = pal.accent,
         LinkState::Offline | LinkState::Inactive => alpha = 0.45,
@@ -430,17 +430,17 @@ fn draw_link(
         let (s0, s1) = (link.span.0, link.span.1);
         let (p0, p1, q0, q1) = if horizontal {
             (
-                xf.p(link.from.x - 4.0, s0),
-                xf.p(link.from.x - 4.0, s1),
-                xf.p(link.to.x + 4.0, s0),
-                xf.p(link.to.x + 4.0, s1),
+                xf.p(link.from.x + 4.0, s0),
+                xf.p(link.from.x + 4.0, s1),
+                xf.p(link.to.x - 4.0, s0),
+                xf.p(link.to.x - 4.0, s1),
             )
         } else {
             (
-                xf.p(s0, link.from.y - 4.0),
-                xf.p(s1, link.from.y - 4.0),
-                xf.p(s0, link.to.y + 4.0),
-                xf.p(s1, link.to.y + 4.0),
+                xf.p(s0, link.from.y + 4.0),
+                xf.p(s1, link.from.y + 4.0),
+                xf.p(s0, link.to.y - 4.0),
+                xf.p(s1, link.to.y - 4.0),
             )
         };
         let (p0, p1, q0, q1) = (p0 + carry_a, p1 + carry_a, q0 + carry_b, q1 + carry_b);
@@ -450,7 +450,7 @@ fn draw_link(
                 if link.state == LinkState::Active {
                     pal.accent
                 } else {
-                    pal.line
+                    pal.ink2
                 },
                 alpha * 0.6,
             ),
@@ -461,7 +461,8 @@ fn draw_link(
 }
 
 fn fade(c: Color32, k: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (f32::from(c.a()) * k).round() as u8)
+    // Color32 stores premultiplied channels; do not premultiply them a second time.
+    c.gamma_multiply(k)
 }
 
 /// One computer: its displays (draggable), and the caption under it.
@@ -843,5 +844,88 @@ mod transform_tests {
                 assert!(xf.p(STAGE_W / 2.0, STAGE_H / 2.0).distance(rect.center()) < 0.001);
             }
         }
+    }
+
+    fn owner_layout() -> MapModel {
+        use crate::map::{self, DocLink, Rect as MapRect};
+        use crate::view_model::{layout::MapMonitor, Side};
+        let arrangement = map::arrange(
+            &[
+                vec![MapRect::new(0.0, 0.0, 1920.0, 1080.0),
+                     MapRect::new(1920.0, -247.0, 1080.0, 1920.0)],
+                vec![MapRect::new(0.0, 0.0, 1745.0, 1091.0)],
+            ],
+            &[DocLink { a: 0, side: Side::Left, b: 1 }],
+            0,
+        );
+        let nodes = arrangement.shapes.iter().enumerate().map(|(i, shape)| MapNode {
+            node_id: i.to_string(),
+            name: ["YNNMURAII", "ynn-notebook"][i].to_owned(),
+            os: String::new(), focus: String::new(), online: true,
+            target: i == 0, approx: i == 1, at: arrangement.pos[i], w: shape.w, h: shape.h,
+            mons: shape.mons.iter().map(|&rect| MapMonitor {
+                rect, num: String::new(), res: String::new(), tag: "",
+            }).collect(),
+        }).collect();
+        let links = map::links(&arrangement.shapes, &arrangement.pos).into_iter().map(|l| MapLink {
+            a: l.a, b: l.b, from: l.from, to: l.to, dir: l.dir, span: l.span,
+            state: LinkState::Active, whole_desktop: true, forward: false,
+        }).collect();
+        MapModel { nodes, links, screens: 3, dirty: false }
+    }
+
+    #[test]
+    fn separated_owner_desktops_have_visible_links_and_external_rails_in_both_styles() {
+        let model = owner_layout();
+        assert_eq!(model.links.len(), 1);
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let pal = Palette::of(crate::gui_settings::Theme::Dark);
+        for style in [LinkStyle::Ascii, LinkStyle::Line] {
+            for state in [LinkState::Active, LinkState::Idle] {
+                let mut link = model.links[0].clone();
+                link.state = state;
+                let xf = Xf::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0)), 150);
+                let shown: Vec<_> = model.nodes.iter().map(|n| xf.p(n.at.x, n.at.y)).collect();
+                let (a, b) = link_ends(&model, &link, &shown, xf);
+                assert!(b.x - a.x > 30.0);
+                let mut field = super::super::field::Field::new();
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    draw_link(ui.painter(), &pal, &model, &link, &shown, xf, style, &mut field);
+                });
+                let mut rails = 0;
+                let mut chain = 0;
+                fn inspect(shape: &Shape, a: Pos2, b: Pos2, rails: &mut usize, chain: &mut usize) {
+                    match shape {
+                        Shape::Vec(shapes) => for s in shapes { inspect(s, a, b, rails, chain); },
+                        Shape::LineSegment { points, stroke } => {
+                            assert!(stroke.color.a() > 100);
+                            if stroke.width == 3.0 {
+                                assert!(points.iter().all(|p| p.x > a.x && p.x < b.x));
+                                *rails += 1;
+                            } else {
+                                *chain += 1;
+                            }
+                        }
+                        Shape::Text(text) => {
+                            let center = text.pos + text.galley.size() / 2.0;
+                            if center.x > a.x && center.x < b.x { *chain += 1; }
+                        }
+                        _ => {}
+                    }
+                }
+                for clipped in &output.shapes { inspect(&clipped.shape, a, b, &mut rails, &mut chain); }
+                assert_eq!(rails, 2, "{style:?} {state:?}");
+                assert!(chain > 2, "{style:?} {state:?}");
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn fading_preserves_premultiplied_color_without_darkening_it_twice() {
+        let c = Color32::from_rgba_unmultiplied(238, 236, 228, 71);
+        assert_eq!(fade(c, 1.0), c);
+        assert!(fade(c, 0.6).r() > 35);
     }
 }
