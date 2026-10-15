@@ -568,25 +568,7 @@ impl Clipboard {
             return Vec::new();
         }
         match message {
-            ClipboardMessage::Offer {
-                offer_id,
-                origin_node_id,
-                origin_version,
-                mime,
-                size_bytes,
-                secret_marked,
-            } => {
-                self.on_offer(
-                    peer,
-                    offer_id,
-                    &origin_node_id,
-                    origin_version,
-                    mime,
-                    size_bytes,
-                    secret_marked,
-                )
-                .await
-            }
+            offer @ ClipboardMessage::Offer { .. } => self.on_offer(peer, offer).await,
             ClipboardMessage::Request { offer_id } => {
                 let asked = matches!(
                     self.offered.get(&peer),
@@ -709,16 +691,18 @@ impl Clipboard {
     }
 
     /// An offer arrived: judge it against the policy and the echo set, then ask for it.
-    async fn on_offer(
-        &mut self,
-        peer: NodeId,
-        offer_id: [u8; 16],
-        origin_node_id: &[u8],
-        origin_version: u64,
-        mime: String,
-        size_bytes: u64,
-        secret: bool,
-    ) -> Vec<Out> {
+    async fn on_offer(&mut self, peer: NodeId, message: ClipboardMessage) -> Vec<Out> {
+        let ClipboardMessage::Offer {
+            offer_id,
+            origin_node_id,
+            origin_version,
+            mime,
+            size_bytes,
+            secret_marked: secret,
+        } = message
+        else {
+            unreachable!("only Offer is dispatched to on_offer");
+        };
         if !self.settings.enabled {
             // `CLIPBOARD_DISABLED`: the receiver is off, so nothing is asked for or applied.
             return vec![Out::Cancel {
@@ -741,7 +725,7 @@ impl Clipboard {
                 reason: cb::ClipboardError::Invalid,
             }];
         }
-        let Ok(origin) = <[u8; 32]>::try_from(origin_node_id) else {
+        let Ok(origin) = <[u8; 32]>::try_from(origin_node_id.as_slice()) else {
             return vec![Out::Cancel {
                 peer,
                 offer_id,
@@ -1650,12 +1634,14 @@ mod tests {
             endpoint
                 .on_offer(
                     peer,
-                    offer_id,
-                    &[0x31; 32],
-                    1,
-                    cb::MIME.to_owned(),
-                    4,
-                    secret,
+                    ClipboardMessage::Offer {
+                        offer_id,
+                        origin_node_id: vec![0x31; 32],
+                        origin_version: 1,
+                        mime: cb::MIME.to_owned(),
+                        size_bytes: 4,
+                        secret_marked: secret,
+                    },
                 )
                 .await;
             endpoint
@@ -1804,7 +1790,17 @@ mod tests {
             let second = [0x42; 16];
             offer_and_data(&mut endpoint, peer, first, b"old").await;
             assert!(endpoint
-                .on_offer(peer, second, &[0x31; 32], 10, cb::MIME.to_owned(), 5, false)
+                .on_offer(
+                    peer,
+                    ClipboardMessage::Offer {
+                        offer_id: second,
+                        origin_node_id: vec![0x31; 32],
+                        origin_version: 10,
+                        mime: cb::MIME.to_owned(),
+                        size_bytes: 5,
+                        secret_marked: false,
+                    }
+                )
                 .await
                 .is_empty());
             assert_eq!(endpoint.incoming.len(), 2);
