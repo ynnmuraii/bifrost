@@ -884,17 +884,41 @@ impl Wayland {
                 self.hotkey_update = None;
                 match result {
                     Ok((bindings, candidate)) => {
+                        let mut descriptions = Vec::new();
                         let result = candidate.map(|candidate| {
+                            for (action, chord) in bindings.iter() {
+                                let id = match action {
+                                    config::HotkeyAction::EmergencyRelease => "emergency",
+                                    config::HotkeyAction::SwitchNext => "switch_next",
+                                    config::HotkeyAction::ReturnLocal => "return_local",
+                                    config::HotkeyAction::ClaimOwnership => "claim_ownership",
+                                };
+                                descriptions.push(if chord.trim().is_empty() {
+                                    format!("{}: disabled", action.as_str())
+                                } else {
+                                    format!(
+                                        "{}: compositor actual trigger {:?}; requested chord {:?}. The compositor may remap preferred chords; change the actual trigger in its shortcut editor.",
+                                        action.as_str(), candidate.trigger_description(id).expect("validated candidate grants every enabled action"), chord,
+                                    )
+                                });
+                            }
                             self.shortcuts = Some(ShortcutTask::start(
                                 candidate,
                                 self.capture.as_ref().map(WaylandCapture::portal_emergency_release),
                             ));
                         });
-                        Some(Event::HotkeysResult(crate::backend::hotkey_result(
-                            &bindings,
-                            result,
-                            "GlobalShortcuts registered preferred chords. The compositor may remap them; inspect its shortcut editor. Changes may require a compositor approval dialog.",
-                        )))
+                        let mut response = crate::backend::hotkey_result(
+                            &bindings, result,
+                            "GlobalShortcuts approval completed; actual triggers are reported per action.",
+                        );
+                        if response.success {
+                            response.detail = descriptions.join("\n");
+                            for (binding, detail) in response.bindings.iter_mut().zip(descriptions) {
+                                binding.available = !binding.chord.trim().is_empty();
+                                binding.detail = detail;
+                            }
+                        }
+                        Some(Event::HotkeysResult(response))
                     }
                     Err(error) => Some(Event::Failed {
                         code: "HOTKEY_UNAVAILABLE",
