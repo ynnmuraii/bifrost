@@ -39,10 +39,10 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
     PostThreadMessageW, RegisterClassW, SetCursor, SetLayeredWindowAttributes, SetTimer,
-    SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE, MSG,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_APP,
-    WM_MOUSEACTIVATE, WM_QUIT, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SetWindowPos, ShowWindow, TranslateMessage, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA,
+    MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SW_HIDE, WM_APP, WM_MOUSEACTIVATE, WM_QUIT, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::CursorProbe;
@@ -177,23 +177,27 @@ impl Host {
 impl VeilHost for Host {
     fn show(&mut self, at: Point) {
         self.place(at);
+        self.raise();
         // SAFETY: a null cursor hides it for this thread's window under the hotspot.
         let _ = unsafe { SetCursor(None) };
     }
 
     fn raise(&mut self) {
-        // SAFETY: re-assert the topmost band position without moving, sizing or activating.
-        let _ = unsafe {
-            SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-            )
-        };
+        // Reassert even if another topmost window rose above us.
+        for band in [HWND_NOTOPMOST, HWND_TOPMOST] {
+            // SAFETY: our window, without moving, sizing or activating.
+            let _ = unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    Some(band),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                )
+            };
+        }
     }
 
     fn hide(&mut self) {
