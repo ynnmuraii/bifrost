@@ -106,11 +106,16 @@ pub fn draw(
     dialog.spacing_mut().item_spacing = Vec2::ZERO;
 
     header(dialog, pal, modal, rect, progress, actions);
+    /// The height of a dialog's footer.
     const FOOT_H: f32 = 72.0;
-    let body_h = (height - HEAD_H - FOOT_H).max(0.0);
+    // Only the dialogs with an action of their own have a footer; one that held nothing but
+    // «Закрыть» is gone, because the × in the header, Escape and a click outside the dialog
+    // are all ways out of any of them.
+    let foot_h = if has_footer(modal) { FOOT_H } else { 0.0 };
+    let body_h = (height - HEAD_H - foot_h).max(0.0);
     let body_rect = Rect::from_min_max(
         Pos2::new(rect.left(), rect.top() + HEAD_H),
-        Pos2::new(rect.right(), rect.bottom() - FOOT_H),
+        Pos2::new(rect.right(), rect.bottom() - foot_h),
     );
     let mut body = dialog.new_child(
         UiBuilder::new()
@@ -133,50 +138,52 @@ pub fn draw(
                 Modal::Settings => settings_body(ui, pal, vm, actions),
             }
         });
-    let footer_rect = Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - FOOT_H), rect.max);
-    let mut foot = dialog.new_child(
-        UiBuilder::new()
-            .id_salt(("modal-footer", modal as u8))
-            .max_rect(footer_rect)
-            .layout(Layout::top_down(Align::Min)),
-    );
-    foot.set_clip_rect(footer_rect.intersect(reveal).intersect(full));
-    footer(&mut foot, pal, |ui| {
-        match modal {
-            Modal::Pairs => act(
-                ui,
-                pal,
-                "Открыть окно сопряжения",
-                Kind::Hot,
-                vm.connection.is_connected(),
-                actions,
-                || Action::StartPairing { window_s: 120 },
-            ),
-            Modal::Keys => act(
-                ui,
-                pal,
-                "Открыть файл настроек",
-                Kind::Solid,
-                true,
-                actions,
-                || Action::OpenConfigFile,
-            ),
-            _ => act(
-                ui,
-                pal,
-                "Закрыть",
-                Kind::Plain,
-                true,
-                actions,
-                || Action::CloseModal,
-            ),
-        };
-    });
-    let measured = HEAD_H + used.content_size.y + FOOT_H;
+    if foot_h > 0.0 {
+        let footer_rect =
+            Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - foot_h), rect.max);
+        let mut foot = dialog.new_child(
+            UiBuilder::new()
+                .id_salt(("modal-footer", modal as u8))
+                .max_rect(footer_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        foot.set_clip_rect(footer_rect.intersect(reveal).intersect(full));
+        footer(&mut foot, pal, |ui| match modal {
+            Modal::Pairs => {
+                act(
+                    ui,
+                    pal,
+                    "Открыть окно сопряжения",
+                    Kind::Hot,
+                    vm.connection.is_connected(),
+                    actions,
+                    || Action::StartPairing { window_s: 120 },
+                );
+            }
+            Modal::Keys => {
+                act(
+                    ui,
+                    pal,
+                    "Открыть файл настроек",
+                    Kind::Solid,
+                    true,
+                    actions,
+                    || Action::OpenConfigFile,
+                );
+            }
+            Modal::Clip | Modal::Diag | Modal::Settings => {}
+        });
+    }
+    let measured = HEAD_H + used.content_size.y + foot_h;
     if (known.unwrap_or(0.0) - measured).abs() > 0.5 {
         ui.ctx().data_mut(|d| d.insert_temp(height_id, measured));
         ui.ctx().request_repaint();
     }
+}
+
+/// Whether a dialog has a footer: only the two whose footer carries an action of their own.
+fn has_footer(modal: Modal) -> bool {
+    matches!(modal, Modal::Pairs | Modal::Keys)
 }
 
 /// The header: the number, the title with its «load» line, and the close button.
@@ -675,15 +682,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             "После «Применить» служба перезапустится с новым адресом",
         );
     });
-    row(ui, pal, "Служба", false, |ui| {
-        let (dot, text) = if vm.silent {
-            (widgets::Dot::Off, "Не отвечает")
-        } else if vm.connection.is_connected() {
-            (widgets::Dot::Ok, "Работает")
-        } else {
-            (widgets::Dot::Off, "Не запущена")
-        };
-        widgets::pill_state(ui, pal, dot, text);
+    row(ui, pal, "Служба", !vm.uses_portals(), |ui| {
         let busy = vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
         widgets::duo(ui, |ui| {
             act(
@@ -721,30 +720,22 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             );
         }
     });
-    row(ui, pal, "Порталы", true, |ui| {
-        let wayland = vm
-            .status
-            .as_ref()
-            .is_some_and(|s| s.backend == "platform-wayland");
-        act(
-            ui,
-            pal,
-            "Забыть разрешения порталов",
-            Kind::Plain,
-            wayland && vm.connection.is_connected(),
-            actions,
-            || Action::ResetPortalGrants,
-        );
-        widgets::hint(
-            ui,
-            pal,
-            if wayland {
-                "Служба попросит разрешения заново"
-            } else {
-                "Только Linux / Wayland: на этой системе порталов нет"
-            },
-        );
-    });
+    // Portals are a Wayland desktop's, and only a Wayland desktop's: a window on Windows or
+    // X11 has nothing to forget and does not show the row at all.
+    if vm.uses_portals() {
+        row(ui, pal, "Порталы", true, |ui| {
+            act(
+                ui,
+                pal,
+                "Забыть разрешения порталов",
+                Kind::Plain,
+                vm.connection.is_connected(),
+                actions,
+                || Action::ResetPortalGrants,
+            );
+            widgets::hint(ui, pal, "Служба попросит разрешения заново");
+        });
+    }
 }
 
 #[cfg(test)]

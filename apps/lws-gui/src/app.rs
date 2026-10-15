@@ -14,8 +14,9 @@
 //!   for, and for nothing else. This file asks for exactly three things: a repaint when the
 //!   client thread says something (`GuiClient::set_wake`), the one frame at which a pending
 //!   request runs out (`ViewModel::next_wakeup`), and what `ui::draw` reports — 30 fps for the
-//!   particle field, 1 Hz for a pairing countdown — and the field only while the window is
-//!   visible *and* focused.
+//!   particle field, 1 Hz for a pairing countdown. The field asks for frames only while the
+//!   window is visible *and* focused *and* the pointer is over the map, and stops as soon as
+//!   the particles have settled where the pointer holds them.
 //! * A minimised window asks for no timed frame at all.
 
 use std::path::PathBuf;

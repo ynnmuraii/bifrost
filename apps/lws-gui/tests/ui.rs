@@ -340,19 +340,31 @@ fn an_idle_window_asks_for_no_frame_and_an_animated_one_for_thirty_a_second() {
     );
     assert_eq!(frame.output.repaint_after, Some(ui::FIELD_FRAME));
     assert!(ui::FIELD_FRAME >= Duration::from_millis(33));
-    harness.now += Duration::from_secs(2);
-    let frame = harness.settle(&vm, true);
-    assert_eq!(
-        frame.output.repaint_after, None,
-        "a stationary pointer settles"
+
+    // The pointer stays where it is: the particles keep the state it put them in — five
+    // seconds of a still pointer is not a reset — and the frames stop once they have settled.
+    let mut frames = 0;
+    while harness
+        .frame(&vm, true, SIZE, Vec::new())
+        .output
+        .repaint_after
+        .is_some()
+    {
+        harness.now += ui::FIELD_FRAME;
+        frames += 1;
+        assert!(frames < 200, "the field never settles");
+    }
+    assert!(frames > 1, "a pointer on the map moves the field");
+    assert!(
+        harness.state.field.displacement() > 20.0,
+        "the particles hold the state the pointer put them in: {}",
+        harness.state.field.displacement()
     );
-    let frame = harness.frame(
-        &vm,
-        true,
-        SIZE,
-        vec![egui::Event::PointerMoved(egui::pos2(420.0, 300.0))],
-    );
-    assert_eq!(frame.output.repaint_after, Some(ui::FIELD_FRAME));
+    // A frame that some other event causes draws the same settled state and asks for nothing.
+    harness.now += ui::FIELD_FRAME;
+    let frame = harness.frame(&vm, true, SIZE, Vec::new());
+    assert_eq!(frame.output.repaint_after, None);
+    assert!(harness.state.field.displacement() > 20.0);
 
     // The window is hidden, minimised or unfocused: no animation frame at all.
     let frame = harness.settle(&vm, false);
@@ -362,6 +374,11 @@ fn an_idle_window_asks_for_no_frame_and_an_animated_one_for_thirty_a_second() {
     vm.local(&Action::ToggleModal(Modal::Keys));
     let frame = harness.settle(&vm, true);
     assert_eq!(frame.output.repaint_after, None);
+    assert_eq!(
+        harness.state.field.displacement(),
+        0.0,
+        "a covered map rests"
+    );
 }
 
 #[test]
@@ -419,9 +436,22 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
         frame.output.actions
     );
 
-    let at = egui::pos2(SIZE.x - 32.0, SIZE.y - 40.0);
+    // Appearance is the sixth slot of that same column, right under the five sections.
+    let at = egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + 5.0 * 50.0 + 22.0);
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(frame.output.actions.contains(&Action::ToggleAppearance));
+    // Nothing sits at the bottom of the rail any more.
+    let frame = harness.frame(
+        &vm,
+        false,
+        SIZE,
+        click_at(egui::pos2(SIZE.x - 32.0, SIZE.y - 40.0)),
+    );
+    assert!(
+        frame.output.actions.is_empty(),
+        "{:?}",
+        frame.output.actions
+    );
 }
 
 #[test]

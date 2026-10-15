@@ -6,10 +6,11 @@
 //!   allocates nothing here;
 //! * glyphs are laid out once per scale factor ([`Glyphs`]); particles share those galleys,
 //!   clouds, particles and ASCII links each submit a lazy iterator under one painter lock;
-//! * the clouds are rebuilt at most every [`CLOUD_EVERY`] seconds while animating (and only when
-//!   the pointer moves while still), never on a plain repaint;
+//! * the clouds are rebuilt at most every [`CLOUD_EVERY`] seconds while the field moves (and
+//!   only when the pointer moves while it is still), never on a plain repaint;
 //! * nothing here schedules a repaint: [`crate::app`] does, and only while the window is
-//!   visible and focused, at most 30 times a second.
+//!   visible and focused, at most 30 times a second — and only while the field is still
+//!   moving. [`Field::paint`] says whether it is.
 
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use eframe::egui::{self, Color32, Galley, Painter, Pos2, Rect, Shape};
 use eframe::epaint::TextShape;
 
 use super::theme::{fam, font, Palette};
-use crate::gui_settings::{FieldMode, LinkStyle, Look, Pace, Theme};
+use crate::gui_settings::{FieldMode, LinkStyle, Look, Theme};
 
 /// A particle per this many square points of the map.
 const POINTS_PER_PARTICLE: f32 = 1000.0;
@@ -28,6 +29,14 @@ const CLOUD_EVERY: f32 = 0.08;
 /// Cloud cell size.
 const CELL_W: f32 = 7.0;
 const CELL_H: f32 = 11.0;
+/// A field whose fastest particle moves less than this many points a second has settled: the
+/// caller is told to stop asking for frames, and the positions the particles have reached are
+/// what the window goes on showing. It sits above the home drift (a few points a second at
+/// most) so that the drift alone never keeps the window awake, and far below a particle
+/// chasing the pointer (hundreds).
+const SETTLED_SPEED: f32 = 8.0;
+/// How close the eased pointer must be to the real one for the field to count as settled.
+const SETTLED_POINTER: f32 = 0.5;
 
 const BAYER: [f32; 16] = [
     0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0,
@@ -127,8 +136,10 @@ pub struct Frame<'a> {
     pub pal: &'a Palette,
     /// The look.
     pub look: Look,
-    /// `true` while the field moves this frame (visible, focused, not «Без движения»).
-    pub animate: bool,
+    /// `true` while the field simulates this frame: the window is visible and focused, the
+    /// field is not «Без движения» and the pointer is over the map. The pointer is what moves
+    /// the particles, so without one the field rests where it is.
+    pub simulate: bool,
     /// Seconds since the window opened; only differences matter.
     pub t: f32,
     /// The pointer, when it is over the map.
@@ -152,10 +163,8 @@ pub struct Field {
     last_cloud: f32,
     cloud_key: Option<(Theme, bool, bool, bool)>,
     moved: bool,
-    was_animating: bool,
+    was_simulating: bool,
     shaped: bool,
-    pointer_at: Option<Pos2>,
-    last_motion: Option<f32>,
 }
 
 impl Field {
@@ -166,18 +175,6 @@ impl Field {
             last_cloud: -1.0,
             ..Field::default()
         }
-    }
-
-    /// Animation is event-driven and stops after the pointer has been still for 1.5 seconds.
-    pub fn active(&mut self, pointer: Option<Pos2>, t: f32, enabled: bool) -> bool {
-        if enabled && pointer.is_some() && pointer != self.pointer_at {
-            self.last_motion = Some(t);
-        }
-        self.pointer_at = pointer;
-        if !enabled || pointer.is_none() {
-            self.last_motion = None;
-        }
-        enabled && self.last_motion.is_some_and(|last| t - last < 1.5)
     }
 
     /// A cached-glyph ASCII isoline, without per-link strings or layout allocations.
@@ -314,8 +311,13 @@ impl Field {
         self.shaped = false;
     }
 
-    /// Draws one frame, moving the particles first when `frame.animate`.
-    pub fn paint(&mut self, painter: &Painter, frame: &Frame<'_>) {
+    /// Draws one frame, moving the particles first while `frame.simulate`; `true` when the
+    /// field is still visibly moving and the caller should ask for another frame.
+    ///
+    /// The pointer holds the field: for as long as it is over the map the particles stay where
+    /// it has pulled or pushed them, and the simulation neither resets nor fades back to the
+    /// resting state. When the pointer leaves, the field settles home as before.
+    pub fn paint(&mut self, painter: &Painter, frame: &Frame<'_>) -> bool {
         let map = frame.map;
         self.resize(map.width(), map.height());
         self.glyphs12.ensure(painter, 12.0);
@@ -323,11 +325,11 @@ impl Field {
         self.glyphs11.ensure(painter, 11.0);
         let dt = (frame.t - self.last_t).clamp(0.0, 0.1);
         self.last_t = frame.t;
-        let animate = frame.animate && frame.look.field != FieldMode::Off;
-        if self.was_animating && !animate {
+        let simulate = frame.simulate && frame.look.field != FieldMode::Off;
+        if self.was_simulating && !simulate {
             self.settle();
         }
-        self.was_animating = animate;
+        self.was_simulating = simulate;
 
         // The pointer, in map coordinates, eased towards the real one.
         let local = frame.pointer.map(|p| (p.x - map.min.x, p.y - map.min.y));
@@ -355,25 +357,28 @@ impl Field {
         }
 
         // The clouds: only when something about them changed.
-        let key = (frame.look.theme, frame.look.clouds, animate, self.mouse.on);
+        let key = (frame.look.theme, frame.look.clouds, simulate, self.mouse.on);
         let due = self.last_cloud < 0.0
             || self.cloud_key != Some(key)
-            || (animate && frame.t - self.last_cloud > CLOUD_EVERY)
-            || (!animate && self.mouse.on && self.moved);
+            || (simulate && frame.t - self.last_cloud > CLOUD_EVERY)
+            || (!simulate && self.mouse.on && self.moved);
         if due {
-            self.build_clouds(frame, if animate { frame.t } else { 0.0 });
+            self.build_clouds(frame, if simulate { frame.t } else { 0.0 });
             self.cloud_key = Some(key);
             self.last_cloud = frame.t;
         }
         self.draw_clouds(painter, frame);
 
-        if animate {
-            self.step(frame, dt);
-        }
-        self.draw_particles(painter, frame, animate);
+        let moving = if simulate {
+            self.step(frame, dt)
+        } else {
+            false
+        };
+        self.draw_particles(painter, frame, simulate);
         if frame.look.link_style != LinkStyle::Ascii {
-            self.draw_flows(painter, frame, animate);
+            self.draw_flows(painter, frame, simulate);
         }
+        moving
     }
 
     fn build_clouds(&mut self, frame: &Frame<'_>, t: f32) {
@@ -470,21 +475,19 @@ impl Field {
         }));
     }
 
-    fn step(&mut self, frame: &Frame<'_>, dt: f32) {
-        let live = frame.look.pace == Pace::Live;
-        let (k, max, amp) = if live {
-            (0.075, 5.5, 6.0)
-        } else {
-            (0.042, 3.0, 4.0)
-        };
+    /// Moves every particle one frame and says whether the field is still moving: the caller
+    /// keeps asking for frames until it is not.
+    fn step(&mut self, frame: &Frame<'_>, dt: f32) -> bool {
+        // The slider scales all three: how fast a particle chases its target, how fast it may
+        // move at all, and how far it drifts around its home.
+        let speed = frame.look.speed;
+        let (k, max, amp) = (0.042 * speed, 3.0 * speed, 4.0 * speed);
         let f = (dt * 60.0).clamp(0.5, 3.0);
         let t = frame.t;
         let mode = frame.look.field;
         let m = self.mouse;
         let radius = 140.0f32;
-        let strength = self
-            .last_motion
-            .map_or(0.0, |last| ((1.5 - (frame.t - last)) / 0.6).clamp(0.0, 1.0));
+        let mut fastest = 0.0f32;
         for p in &mut self.parts {
             let mut tx: f32;
             let mut ty: f32;
@@ -513,9 +516,6 @@ impl Field {
                     want = want.max(fall);
                 }
             }
-            tx = p.hx + (tx - p.hx) * strength;
-            ty = p.hy + (ty - p.hy) * strength;
-            want *= strength;
             let (mut sx, mut sy) = ((tx - p.x) * k * f, (ty - p.y) * k * f);
             let len = sx.hypot(sy);
             let cap = max * f;
@@ -527,7 +527,15 @@ impl Field {
             p.y += sy;
             p.sx += (len / f - p.sx) * 0.2;
             p.heat += (want - p.heat) * 0.08;
+            fastest = fastest.max(sx.hypot(sy));
         }
+        // The field has settled when the pointer it eases towards has arrived and no particle
+        // is moving any more: it then holds the positions it reached. Two frames of one
+        // instant cannot say that anything has settled.
+        if dt <= 0.0 {
+            return true;
+        }
+        (m.x - m.sx).hypot(m.y - m.sy) > SETTLED_POINTER || fastest / dt > SETTLED_SPEED
     }
 
     fn draw_particles(&self, painter: &Painter, frame: &Frame<'_>, animate: bool) {
@@ -599,6 +607,16 @@ impl Field {
     /// How many particles there are (for tests and the resource report).
     pub fn particles(&self) -> usize {
         self.parts.len()
+    }
+
+    /// How far the furthest particle is from its own resting place, in points: zero when the
+    /// field is at rest, tens of points while the pointer holds it away. For tests and the
+    /// resource report.
+    pub fn displacement(&self) -> f32 {
+        self.parts
+            .iter()
+            .map(|p| (p.x - p.hx).hypot(p.y - p.hy))
+            .fold(0.0, f32::max)
     }
 
     /// How many cloud cells are cached.
@@ -677,19 +695,140 @@ mod tests {
         output.drop_without_applying_deltas();
     }
 
+    /// A frame of the map the size the window is drawn at.
+    fn map_input(t: f32) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            time: Some(f64::from(t)),
+            ..egui::RawInput::default()
+        }
+    }
+
+    /// One frame of a field held by a still pointer; `true` while it still moves.
+    fn held_frame(
+        ctx: &egui::Context,
+        field: &mut Field,
+        pal: &Palette,
+        look: Look,
+        pointer: Pos2,
+        t: f32,
+    ) -> bool {
+        let mut moving = false;
+        ctx.run_ui(map_input(t), |ui| {
+            moving = field.paint(
+                ui.painter(),
+                &Frame {
+                    map: ui.ctx().content_rect(),
+                    pal,
+                    look,
+                    simulate: true,
+                    t,
+                    pointer: Some(pointer),
+                    flows: &[],
+                },
+            );
+        })
+        .drop_without_applying_deltas();
+        moving
+    }
+
+    /// The mean distance of the particles from their homes.
+    fn mean_displacement(field: &Field) -> f32 {
+        let sum: f32 = field
+            .parts
+            .iter()
+            .map(|p| (p.x - p.hx).hypot(p.y - p.hy))
+            .sum();
+        sum / field.parts.len().max(1) as f32
+    }
+
     #[test]
-    fn motion_stops_after_settling_and_does_not_restart_on_plain_repaints() {
+    fn a_held_pointer_keeps_the_particles_and_stops_the_frames_once_they_have_converged() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let look = Look::default();
+        let pal = Palette::of(look.theme);
+        let pointer = Pos2::new(400.0, 300.0);
         let mut field = Field::new();
-        let p = Some(Pos2::new(80.0, 90.0));
-        assert!(!field.active(None, 0.0, true));
-        assert!(field.active(p, 1.0, true));
-        assert!(field.active(p, 2.49, true));
-        assert!(!field.active(p, 2.5, true));
-        assert!(!field.active(p, 9.0, true));
-        assert!(field.active(Some(Pos2::new(81.0, 90.0)), 9.1, true));
-        assert!(!field.active(p, 9.2, false));
-        assert!(!field.active(p, 9.3, true));
-        assert!(!field.active(None, 9.4, true));
+        let mut converged_at = None;
+        // Five seconds of a pointer that does not move: the window's clock moves, the pointer
+        // does not.
+        for n in 0..=150 {
+            let t = n as f32 / 30.0;
+            let moving = held_frame(&ctx, &mut field, &pal, look, pointer, t);
+            if n >= 30 {
+                // Well past the point where the old window faded the pointer out at 1.5 s and
+                // snapped every particle back to its own place.
+                assert!(
+                    field.displacement() > 20.0,
+                    "the pointer holds the particles away from home: {t} s"
+                );
+            }
+            if !moving && converged_at.is_none() {
+                converged_at = Some(t);
+            }
+        }
+        let converged_at = converged_at.expect("the field converges within five seconds");
+        assert!(
+            converged_at < 2.0,
+            "convergence takes a second, not five: {converged_at}"
+        );
+        // Frames drawn after it has settled move nothing and ask for nothing.
+        let held = mean_displacement(&field);
+        for n in 151..=200 {
+            let t = n as f32 / 30.0;
+            assert!(
+                !held_frame(&ctx, &mut field, &pal, look, pointer, t),
+                "a settled field asks for no more frames: {t} s"
+            );
+        }
+        assert!(
+            mean_displacement(&field) > held / 2.0,
+            "a settled field holds where it is: {} of {held}",
+            mean_displacement(&field)
+        );
+        assert!(field.displacement() > 20.0);
+
+        // And the pointer leaving the map puts the field back at rest.
+        let mut settled = false;
+        ctx.run_ui(map_input(7.0), |ui| {
+            settled = field.paint(
+                ui.painter(),
+                &Frame {
+                    map: ui.ctx().content_rect(),
+                    pal: &pal,
+                    look,
+                    simulate: false,
+                    t: 7.0,
+                    pointer: None,
+                    flows: &[],
+                },
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(!settled);
+        assert_eq!(field.displacement(), 0.0);
+    }
+
+    #[test]
+    fn the_speed_slider_moves_the_field_faster() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let pointer = Pos2::new(400.0, 300.0);
+        let moved_by = |speed: f32| {
+            let look = Look {
+                speed,
+                ..Look::default()
+            };
+            let pal = Palette::of(look.theme);
+            let mut field = Field::new();
+            for n in 0..=10 {
+                held_frame(&ctx, &mut field, &pal, look, pointer, n as f32 / 30.0);
+            }
+            mean_displacement(&field)
+        };
+        let (calm, lively) = (moved_by(0.3), moved_by(2.0));
+        assert!(lively > calm * 1.5, "{calm} then {lively}");
     }
 
     #[test]

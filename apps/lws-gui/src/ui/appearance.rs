@@ -3,8 +3,8 @@
 use eframe::egui::{self, Align, Layout, Pos2, Rect, Stroke, StrokeKind, UiBuilder, Vec2};
 
 use super::theme::{fam, Palette};
-use super::widgets::{self, Kind};
-use crate::gui_settings::{FieldMode, LinkStyle, Pace, Theme};
+use super::widgets;
+use crate::gui_settings::{FieldMode, LinkStyle, Theme, SPEED_MAX, SPEED_MIN};
 use crate::view_model::{Action, ViewModel};
 
 /// Draws the appearance popover next to its rail button, within the window bounds.
@@ -19,8 +19,8 @@ pub fn draw(
     if !vm.appearance_open {
         return;
     }
-    let width = 360.0_f32.min((full.width() - 24.0).max(0.0));
-    let height = 548.0_f32.min((full.height() - 24.0).max(0.0));
+    let width = 400.0_f32.min((full.width() - 24.0).max(0.0));
+    let height = 572.0_f32.min((full.height() - 24.0).max(0.0));
     let x = (anchor.right() + 12.0)
         .min(full.right() - width - 12.0)
         .max(full.left() + 12.0);
@@ -60,13 +60,17 @@ pub fn draw(
     );
     panel.set_clip_rect(rect.intersect(full));
     panel.spacing_mut().item_spacing.y = 10.0;
+    // The bar is an overlay that appears only when the content really scrolls, and the width
+    // it may take is reserved for it, so it can never cover «Без движения».
+    panel.style_mut().spacing.scroll.floating_allocated_width = 6.0;
     egui::ScrollArea::vertical()
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
         .max_height(inner.height())
         .show(&mut panel, |ui| {
             ui.horizontal(|ui| {
                 widgets::text(ui, "Внешний вид", 18.0, fam::sans_semibold(), pal.ink);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::button(ui, pal, "Закрыть", Kind::Plain, true).clicked() {
+                    if widgets::close(ui, pal) {
                         actions.push(Action::CloseAppearance);
                     }
                 });
@@ -76,7 +80,7 @@ pub fn draw(
             if let Some(i) = widgets::seg(
                 ui,
                 pal,
-                &["Antigravity Light", "Overmind Dark"],
+                &["Светлая", "Тёмная"],
                 usize::from(look.theme == Theme::Dark),
             ) {
                 look.theme = if i == 0 { Theme::Light } else { Theme::Dark };
@@ -108,13 +112,18 @@ pub fn draw(
             ) {
                 look.field = [FieldMode::Attract, FieldMode::Repel, FieldMode::Off][i];
             }
-            if let Some(i) = widgets::seg(
-                ui,
-                pal,
-                &["Спокойно", "Живо"],
-                usize::from(look.pace == Pace::Live),
-            ) {
-                look.pace = if i == 0 { Pace::Calm } else { Pace::Live };
+            label(ui, pal, "Скорость частиц");
+            // A drag is one decision, not sixty: the value is committed when the drag ends (or
+            // on a keystroke), so a drag does not write `gui.toml` once a frame.
+            let mut speed = look.speed;
+            ui.spacing_mut().slider_width = (ui.available_width() - 52.0).max(80.0);
+            let response = ui.add(
+                egui::Slider::new(&mut speed, SPEED_MIN..=SPEED_MAX)
+                    .fixed_decimals(1)
+                    .show_value(true),
+            );
+            if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                look.speed = speed;
             }
             if let Some(i) = widgets::seg(
                 ui,
@@ -129,27 +138,24 @@ pub fn draw(
             }
             ui.add_space(6.0);
             ui.separator();
-            ui.push_id("edge-effects", |ui| {
-                label(ui, pal, "Эффекты у краёв");
-                let mut edge_effects = vm.status.as_ref().is_some_and(|s| s.edge_effects);
-                let mut hide_remote_cursor =
-                    vm.status.as_ref().is_some_and(|s| s.hide_remote_cursor);
-                ui.add_enabled_ui(vm.can_set_appearance(), |ui| {
-                    let effects_changed =
-                        ui.checkbox(&mut edge_effects, "Эффекты у краёв").changed();
-                    let cursor_changed = ui
-                        .checkbox(
-                            &mut hide_remote_cursor,
-                            "Прятать курсор, пока ввод на другой машине",
-                        )
-                        .changed();
-                    if effects_changed || cursor_changed {
-                        actions.push(Action::SetAppearance {
-                            edge_effects,
-                            hide_remote_cursor,
-                        });
-                    }
-                });
+            let mut edge_effects = vm.status.as_ref().is_some_and(|s| s.edge_effects);
+            let mut hide_remote_cursor = vm.status.as_ref().is_some_and(|s| s.hide_remote_cursor);
+            ui.add_enabled_ui(vm.can_set_appearance(), |ui| {
+                let effects =
+                    widgets::switch(ui, pal, "Эффекты у краёв", &mut edge_effects).clicked();
+                let cursor = widgets::switch(
+                    ui,
+                    pal,
+                    "Прятать курсор, пока ввод на другой машине",
+                    &mut hide_remote_cursor,
+                )
+                .clicked();
+                if effects || cursor {
+                    actions.push(Action::SetAppearance {
+                        edge_effects,
+                        hide_remote_cursor,
+                    });
+                }
             });
         });
 }

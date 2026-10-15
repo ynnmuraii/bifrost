@@ -290,7 +290,13 @@ pub fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: Kind, enabled: bool
     response
 }
 
+/// How long the selected pill of a segmented control takes to slide to the option clicked.
+const SEG_SLIDE: f32 = 0.15;
+
 /// `.seg`: a segmented control; returns the index that was clicked.
+///
+/// The selected pill slides to the new option over [`SEG_SLIDE`] seconds — the frame that
+/// arrives with the value it was asked for is the last one this asks for.
 pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usize> {
     let galleys: Vec<Arc<Galley>> = items
         .iter()
@@ -316,6 +322,34 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
     let rounding = pal.rad_btn(44.0 + 6.0);
     ui.painter()
         .rect(outer, rounding, pal.bg2, pal.hairline(), StrokeKind::Inside);
+    // Where the pill belongs now, and where it is on its way there.
+    let on = on.min(items.len().saturating_sub(1));
+    let mut target_x = outer.min.x + 3.0;
+    for width in &widths[..on] {
+        target_x += width + 2.0;
+    }
+    let id = ui.id().with(("seg-pill", items));
+    let x = ui
+        .ctx()
+        .animate_value_with_time(id.with("x"), target_x, SEG_SLIDE);
+    let width = ui
+        .ctx()
+        .animate_value_with_time(id.with("w"), widths[on], SEG_SLIDE);
+    let pill = Rect::from_min_size(Pos2::new(x, outer.min.y + 3.0), Vec2::new(width, 38.0));
+    ui.painter().rect_filled(pill, pal.rad_btn(38.0), pal.ink);
+    // The option the pill is closest to carries the pill's own ink, so exactly one label is
+    // legible even while the pill is between two of them.
+    let centre = pill.center().x;
+    let (mut nearest, mut distance) = (0usize, f32::INFINITY);
+    let mut centre_x = outer.min.x + 3.0;
+    for (i, width) in widths.iter().enumerate() {
+        let here = (centre_x + width / 2.0 - centre).abs();
+        if here < distance {
+            distance = here;
+            nearest = i;
+        }
+        centre_x += width + 2.0;
+    }
     let mut clicked = None;
     let mut x = outer.min.x + 3.0;
     for (i, galley) in galleys.iter().enumerate() {
@@ -328,8 +362,7 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
             clicked = Some(i);
         }
         let painter = ui.painter();
-        let ink = if i == on {
-            painter.rect_filled(cell, pal.rad_btn(38.0), pal.ink);
+        let ink = if i == nearest {
             pal.bg
         } else if response.hovered() {
             pal.ink
@@ -343,6 +376,108 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
         painter.add(egui::epaint::TextShape::new(at, Arc::clone(galley), ink));
     }
     clicked
+}
+
+/// `.switch`: an on/off control in the same rounded style as everything else — a track, a
+/// knob that slides over 0.12 s, and its own label. The returned response is clicked when the
+/// user asked for the other state.
+pub fn switch(ui: &mut Ui, pal: &Palette, label: &str, on: &mut bool) -> Response {
+    /// The track.
+    const TRACK: Vec2 = Vec2::new(40.0, 22.0);
+    const GAP: f32 = 10.0;
+    let enabled = ui.is_enabled();
+    let full = ui.available_width();
+    let galley = ui.painter().layout(
+        label.to_owned(),
+        font(13.0, fam::sans()),
+        if enabled { pal.ink } else { dim(pal.ink) },
+        (full - TRACK.x - GAP).max(80.0),
+    );
+    let size = Vec2::new(
+        full.min(TRACK.x + GAP + galley.size().x),
+        TRACK.y.max(galley.size().y),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if enabled && response.clicked() {
+        *on = !*on;
+    }
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    if enabled {
+        response.clone().on_hover_cursor(CursorIcon::PointingHand);
+    }
+    let track = Rect::from_min_size(
+        Pos2::new(rect.min.x, rect.center().y - TRACK.y / 2.0),
+        TRACK,
+    );
+    let id = ui.id().with(("switch", label));
+    let travelled = ui
+        .ctx()
+        .animate_value_with_time(id, if *on { 1.0 } else { 0.0 }, 0.12);
+    let (fill, knob) = if *on {
+        (pal.ink, pal.bg)
+    } else {
+        (pal.bg2, pal.ink2)
+    };
+    let (fill, knob) = if enabled {
+        (fill, knob)
+    } else {
+        (dim(fill), dim(knob))
+    };
+    let painter = ui.painter();
+    painter.rect(
+        track,
+        CornerRadius999::of(TRACK.y),
+        fill,
+        if *on { Stroke::NONE } else { pal.hairline() },
+        StrokeKind::Inside,
+    );
+    painter.circle_filled(
+        Pos2::new(
+            track.min.x + TRACK.y / 2.0 + travelled * (TRACK.x - TRACK.y),
+            track.center().y,
+        ),
+        8.0,
+        knob,
+    );
+    painter.add(egui::epaint::TextShape::new(
+        Pos2::new(track.max.x + GAP, rect.center().y - galley.size().y / 2.0),
+        galley,
+        Color32::PLACEHOLDER,
+    ));
+    response
+}
+
+/// A round ✕ in the corner of the appearance popover, for the room it has; `true` when it was
+/// clicked. The modals draw their own, bigger one in their header.
+pub fn close(ui: &mut Ui, pal: &Palette) -> bool {
+    const SIZE: f32 = 28.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    if !ui.is_rect_visible(rect) {
+        return response.clicked();
+    }
+    let hover = response.hovered();
+    let painter = ui.painter();
+    painter.circle(
+        rect.center(),
+        SIZE / 2.0,
+        if hover { pal.accent } else { pal.bg2 },
+        if hover {
+            Stroke::new(1.0, pal.accent)
+        } else {
+            pal.hairline()
+        },
+    );
+    paint_icon(
+        painter,
+        Icon::Close,
+        rect.center(),
+        12.0,
+        if hover { pal.on_accent } else { pal.ink },
+    );
+    response.clicked()
 }
 
 /// Service status dot.
@@ -394,16 +529,6 @@ pub fn pill(ui: &mut Ui, pal: &Palette, dot: Option<Dot>, runs: &[Run<'_>]) -> R
         ));
     }
     response
-}
-
-/// `.state`: a dot and a mono 12 px word, no frame.
-pub fn pill_state(ui: &mut Ui, pal: &Palette, dot: Dot, label: &str) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
-        paint_dot(ui.painter(), pal, rect.center(), dot);
-        text(ui, label, 12.0, fam::mono(), pal.ink2);
-    });
 }
 
 /// A `999px` radius as egui's `CornerRadius`.

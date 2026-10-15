@@ -10,7 +10,7 @@ use super::field::{Flow, Frame};
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
 use super::{act, Env, UiState, FIELD_FRAME};
-use crate::gui_settings::{FieldMode, LinkStyle, Look, PAN_MAX};
+use crate::gui_settings::{LinkStyle, Look, PAN_MAX};
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
@@ -66,11 +66,10 @@ pub fn draw(
     let pointer = ui
         .input(|i| i.pointer.hover_pos())
         .filter(|p| rect.contains(*p) && vm.modal.is_none() && !vm.appearance_open);
-    let animate = st.field.active(
-        pointer,
-        t,
-        env.animate && vm.modal.is_none() && !vm.appearance_open && vm.look.field != FieldMode::Off,
-    );
+    // The pointer is what attracts or repels the particles, and it holds them while it stays:
+    // the field simulates for as long as it is over the map, and it is the field that says
+    // whether it is still moving, so a settled field stops the frames and keeps its state.
+    let simulate = pointer.is_some() && env.animate && vm.modal.is_none() && !vm.appearance_open;
     let mut xf = Xf::new(rect, vm.look.zoom_percent);
     xf.origin += pan(ui, vm, rect, actions);
     let s = xf.s;
@@ -113,13 +112,13 @@ pub fn draw(
         })
         .collect();
 
-    st.field.paint(
+    let moving = st.field.paint(
         &painter,
         &Frame {
             map: rect,
             pal,
             look: vm.look,
-            animate,
+            simulate,
             t,
             pointer,
             flows: &flows,
@@ -159,7 +158,7 @@ pub fn draw(
     }
     if hovered != st.hover {
         match hovered {
-            Some((n, m)) if animate && st.drag.is_none() => {
+            Some((n, m)) if simulate && st.drag.is_none() => {
                 let node = &model.nodes[n];
                 let r = node.mons[m].rect;
                 let local = Rect::from_min_size(
@@ -207,7 +206,9 @@ pub fn draw(
         }
     }
     banner(ui, pal, vm, rect, actions);
-    animate.then_some(FIELD_FRAME)
+    // The field is the only thing here that moves by itself, and it says when it has stopped:
+    // a settled field draws its converged particles and asks for no further frames.
+    moving.then_some(FIELD_FRAME)
 }
 
 fn pan(ui: &egui::Ui, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) -> Vec2 {
