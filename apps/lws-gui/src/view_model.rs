@@ -41,6 +41,15 @@ pub mod layout;
 /// How long a request may stay unanswered before the window says «Служба не отвечает».
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a toast stays when nobody holds it.
+pub const TOAST_FOR: Duration = Duration::from_secs(8);
+
+/// How long «Сохранено» stays.
+pub const SAVED_FOR: Duration = Duration::from_millis(1500);
+
+/// How long a hint stays.
+pub const HINT_FOR: Duration = Duration::from_secs(4);
+
 /// How many lines of the shared log the window keeps in front of the user.
 pub const LOG_LINES: usize = 20;
 
@@ -58,11 +67,9 @@ const INFLIGHT_LIMIT: usize = 32;
 
 // ---------------------------------------------------------------- small types
 
-/// A window over the map: the six sections of the left rail.
+/// A window over the map: the five sections of the rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modal {
-    /// «Раскладка».
-    Layout,
     /// «Пары».
     Pairs,
     /// «Клавиши».
@@ -77,8 +84,7 @@ pub enum Modal {
 
 impl Modal {
     /// Every section, in the order of the rail.
-    pub const ALL: [Modal; 6] = [
-        Modal::Layout,
+    pub const ALL: [Modal; 5] = [
         Modal::Pairs,
         Modal::Keys,
         Modal::Clip,
@@ -89,19 +95,17 @@ impl Modal {
     /// The two-digit number of the section.
     pub const fn num(self) -> &'static str {
         match self {
-            Modal::Layout => "01",
-            Modal::Pairs => "02",
-            Modal::Keys => "03",
-            Modal::Clip => "04",
-            Modal::Diag => "05",
-            Modal::Settings => "06",
+            Modal::Pairs => "01",
+            Modal::Keys => "02",
+            Modal::Clip => "03",
+            Modal::Diag => "04",
+            Modal::Settings => "05",
         }
     }
 
     /// The title of the section.
     pub const fn title(self) -> &'static str {
         match self {
-            Modal::Layout => "Раскладка",
             Modal::Pairs => "Пары",
             Modal::Keys => "Клавиши",
             Modal::Clip => "Буфер обмена",
@@ -113,7 +117,6 @@ impl Modal {
     /// The «command» of the terminal-style header line.
     pub const fn command(self) -> &'static str {
         match self {
-            Modal::Layout => "mdf layout",
             Modal::Pairs => "mdf peers",
             Modal::Keys => "mdf keys",
             Modal::Clip => "mdf clip",
@@ -125,12 +128,11 @@ impl Modal {
     /// The caption after the progress bar.
     pub const fn subtitle(self) -> &'static str {
         match self {
-            Modal::Layout => "края и положение компьютеров",
             Modal::Pairs => "кому доверяет этот компьютер",
             Modal::Keys => "горячие клавиши службы ввода",
             Modal::Clip => "скопировать здесь — вставить там",
             Modal::Diag => "отчёт для разбора проблем",
-            Modal::Settings => "адрес, служба, оформление",
+            Modal::Settings => "адрес и служба",
         }
     }
 }
@@ -262,16 +264,6 @@ pub enum Request {
     RetryAgent,
     /// `Shutdown`.
     Shutdown,
-    /// `LayoutAuto`: rebuild the shared layout from this desktop.
-    LayoutAuto,
-    /// `ListPendingEdits`.
-    ListPendingEdits,
-    /// `ApplyPendingEdit`.
-    ApplyPendingEdit,
-    /// `DiscardPendingEdit`.
-    DiscardPendingEdit,
-    /// `SwitchTo`: «Передать ввод».
-    Switch,
 }
 
 impl Request {
@@ -285,18 +277,13 @@ impl Request {
             Request::StartPairing => "открыть окно сопряжения",
             Request::PairWith => "подключиться по адресу",
             Request::PairingAnswer => "ответ на сопряжение",
-            Request::UpdateTopology => "применить раскладку",
+            Request::UpdateTopology => "сохранить раскладку",
             Request::SetClipboard => "буфер обмена",
             Request::RevokePeer => "удалить компьютер из пары",
             Request::ExportDiagnostics => "сохранить диагностику",
             Request::ResetPortalGrants => "забыть разрешения порталов",
             Request::RetryAgent => "повторить запуск службы ввода",
             Request::Shutdown => "остановить службу",
-            Request::LayoutAuto => "расположить автоматически",
-            Request::ListPendingEdits => "список непринятых правок",
-            Request::ApplyPendingEdit => "применить непринятую правку",
-            Request::DiscardPendingEdit => "отбросить непринятую правку",
-            Request::Switch => "передать ввод",
         }
     }
 }
@@ -526,8 +513,6 @@ pub struct LayoutEditor {
     pub nodes: Vec<EditorNode>,
     /// The applied links, still in wire form: they are rewritten as `[topology]` rows.
     pub links: Vec<ipc::LinkView>,
-    /// The pair's side inferred from the map, for automatic-layout outcome text.
-    pub side: Side,
     /// The drawn shape of every member, parallel to `nodes`.
     pub shapes: Vec<crate::map::Shape>,
     /// Where the user has put every member on the stage, parallel to `nodes`.
@@ -536,6 +521,43 @@ pub struct LayoutEditor {
     pub baseline: Vec<crate::map::Pt>,
     /// Stage units per logical unit the shapes were drawn at.
     pub scale: f64,
+    /// The automatic save of the map: what is wanted, what is in flight, what is owed.
+    pub save: Save,
+}
+
+/// The automatic save of the map (`layout.rs`): a drop is the only thing that starts one.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Save {
+    /// The links of the latest drop the core has not applied yet: latest wins.
+    pub wanted: Option<Vec<config::LinkConfig>>,
+    /// The one `UpdateTopology` in flight.
+    pub sent: Option<Sent>,
+    /// The retry after a `LAYOUT_CONFLICT` of this draft was spent.
+    pub retried: bool,
+    /// A `GetTopology` after a conflict is on its way; the draft goes on top of it.
+    pub reloading: bool,
+    /// A newer draft than the saved one waits for a revision past this one.
+    pub awaiting: Option<u64>,
+}
+
+/// The `UpdateTopology` in flight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sent {
+    /// Its `request_id`.
+    pub request_id: u64,
+    /// The revision it was edited from.
+    pub base_revision: u64,
+    /// The links it carried.
+    pub links: Vec<config::LinkConfig>,
+}
+
+/// A quiet one-line note on the map («Сохранено», a hint) until it runs out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flash {
+    /// The words.
+    pub text: String,
+    /// When it goes.
+    pub until: Instant,
 }
 
 impl LayoutEditor {
@@ -603,8 +625,8 @@ impl Pairing {
 /// The settings screen's state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settings {
-    /// Set when the core answered `CLIPBOARD_DISABLED`.
-    pub clipboard_note: Option<String>,
+    /// What a clipboard toggle asked for, until `Status` shows it or the core refuses.
+    pub clipboard_pending: Option<bool>,
     /// The member «Удалить компьютер из пары» is aimed at.
     pub revoke: Option<String>,
     /// What `ExportDiagnostics` answered.
@@ -733,14 +755,23 @@ pub struct ViewModel {
     pub editor: LayoutEditor,
     /// The pairing screen's state.
     pub pairing: Pairing,
-    /// The divergent edits the core kept after a partition.
-    pub pending_edits: Vec<ipc::PendingEdit>,
     /// The settings screen's state.
     pub settings: Settings,
-    /// The last finished operation.
+    /// The last finished operation, shown as a toast until [`TOAST_FOR`] runs out.
     pub outcome: Option<Outcome>,
-    /// The `LAYOUT_CONFLICT` the core reported, until the document is refreshed.
-    pub conflict: Option<String>,
+    /// The appearance panel at the right edge is open.
+    pub appearance_open: bool,
+    /// A quiet note on the map.
+    pub flash: Option<Flash>,
+    /// The toast the timer below belongs to.
+    outcome_seen: Option<Outcome>,
+    /// When the toast was first drawn; `None` while it waits to be.
+    outcome_since: Option<Instant>,
+    /// The pointer is on the toast: its timer is paused.
+    outcome_hold: bool,
+    /// Requests the view model itself made (the automatic save, a status re-read): already
+    /// recorded as in flight, to be put on the wire by [`Bridge`].
+    outgoing: Vec<(u64, Msg)>,
     /// The last [`LOG_LINES`] lines of what happened.
     pub log: VecDeque<String>,
     /// The requests waiting for an answer.
@@ -766,10 +797,14 @@ impl ViewModel {
             status: None,
             editor: LayoutEditor::default(),
             pairing: Pairing::default(),
-            pending_edits: Vec::new(),
             settings: Settings::default(),
             outcome: None,
-            conflict: None,
+            appearance_open: false,
+            flash: None,
+            outcome_seen: None,
+            outcome_since: None,
+            outcome_hold: false,
+            outgoing: Vec::new(),
             log: VecDeque::new(),
             inflight: Vec::new(),
             silent: false,
@@ -821,6 +856,10 @@ impl ViewModel {
         // under a header that now says «Служба не запущена» is the window contradicting
         // itself, so it goes with the connection (batch-8 audit).
         self.outcome = None;
+        // The save in flight died with the link, and a draft nobody can send is not kept.
+        self.editor.save = Save::default();
+        self.settings.clipboard_pending = None;
+        self.restore_placement();
         // A pairing window belongs to the connection that opened it; the core closes it on
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
@@ -948,7 +987,29 @@ impl ViewModel {
         if let Some(Restart::Stopping { since }) = &self.settings.service.restart {
             consider(*since + SERVICE_STOP_TIMEOUT);
         }
+        if let (Some(since), false) = (self.outcome_since, self.outcome_hold) {
+            consider(since + TOAST_FOR);
+        }
+        if let Some(flash) = &self.flash {
+            consider(flash.until);
+        }
         at.map(|when| when - now)
+    }
+
+    /// Starts the toast's timer when a toast is first seen and ends it when it has run out;
+    /// a toast under the pointer keeps its time.
+    fn tick_toast(&mut self, now: Instant) {
+        if self.outcome != self.outcome_seen {
+            self.outcome_seen.clone_from(&self.outcome);
+            self.outcome_since = self.outcome.as_ref().map(|_| now);
+        }
+        if let (Some(since), false) = (self.outcome_since, self.outcome_hold) {
+            if now.saturating_duration_since(since) >= TOAST_FOR {
+                self.outcome = None;
+                self.outcome_seen = None;
+                self.outcome_since = None;
+            }
+        }
     }
 
     /// Ages the deadlines; called once per frame.
@@ -957,6 +1018,17 @@ impl ViewModel {
             .inflight
             .iter()
             .any(|inflight| now >= inflight.deadline);
+        self.tick_toast(now);
+        if self.flash.as_ref().is_some_and(|flash| now >= flash.until) {
+            self.flash = None;
+        }
+        // A save whose request is no longer anywhere is over: nothing will ever answer it.
+        if let Some(sent) = &self.editor.save.sent {
+            if !self.inflight.iter().any(|inflight| inflight.id == sent.request_id) {
+                self.editor.save = Save::default();
+                self.restore_placement();
+            }
+        }
         // «Перезапустить службу» waits for the link to drop, and that wait has an end: past
         // it the service is left to the user rather than watched from a spinner, because
         // that is the only thing left that can be said honestly.
@@ -1008,7 +1080,7 @@ impl ViewModel {
                     short_error(&why)
                 ));
                 self.settings.service.restart = None;
-                self.outcome = Some(Outcome::failed(format!(
+                self.set_outcome(Outcome::failed(format!(
                     "не удалось запустить службу ({})",
                     short_error(&why)
                 )));
@@ -1044,7 +1116,7 @@ impl ViewModel {
         }
         self.silent = false;
         // The read half of the contract answers with the state itself (`Status`,
-        // `TopologyDoc`, `PendingEdits`) and still carries the `request_id` it answers, so
+        // `TopologyDoc`) and still carries the `request_id` it answers, so
         // those requests are retired here; the write half answers with an `OpResult`, which
         // is the one message that has to name its request to be understood.
         if !matches!(&msg, Msg::OpResult(_)) {
@@ -1053,11 +1125,6 @@ impl ViewModel {
         match msg {
             Msg::Status(status) => self.apply_status(status),
             Msg::TopologyDoc(doc) => self.apply_topology(doc),
-            Msg::PendingEdits(edits) => {
-                let count = edits.edits.len();
-                self.pending_edits = edits.edits;
-                self.push_log(format!("Непринятых правок раскладки: {count}"));
-            }
             Msg::PairingWindow(window) => self.apply_pairing_window(window),
             Msg::PairingPrompt(prompt) => {
                 self.push_log(format!(
@@ -1095,17 +1162,40 @@ impl ViewModel {
             ));
         }
         self.editor.editable = status.layout_editable;
+        // The status is the truth about the clipboard once no toggle is on the wire.
+        if self.settings.clipboard_pending.is_some()
+            && !self
+                .inflight
+                .iter()
+                .any(|inflight| inflight.request == Request::SetClipboard)
+        {
+            self.settings.clipboard_pending = None;
+        }
         // The editor follows the core: what it says is applied is what the editor holds, so
         // a revision applied elsewhere moves the base the next «Применить» names.
         if status.layout_revision > self.editor.revision {
             self.editor.revision = status.layout_revision;
             self.editor.author = status.layout_author.clone();
+            self.continue_save();
         }
         self.status = Some(status);
     }
 
     /// A whole document: the editor's base, as long as it is not older than the one held.
+    ///
+    /// The user's draft survives a push of the revision it was made on (the core pushes the
+    /// document on membership changes too); it is replaced only when the revision moves.
     fn apply_topology(&mut self, doc: ipc::TopologyDoc) {
+        let reloaded = std::mem::take(&mut self.editor.save.reloading);
+        self.fold_topology(doc);
+        if reloaded {
+            // The conflict's retry: the latest draft, on top of the document just read.
+            self.apply_draft();
+        }
+        self.continue_save();
+    }
+
+    fn fold_topology(&mut self, doc: ipc::TopologyDoc) {
         if doc.revision < self.editor.revision {
             self.push_log(format!(
                 "Раскладка: ревизия {} старше текущей {} — оставлена прежняя",
@@ -1113,7 +1203,22 @@ impl ViewModel {
             ));
             return;
         }
-        self.conflict = None;
+        let same_members = self.editor.nodes.len() == doc.members.len()
+            && self
+                .editor
+                .nodes
+                .iter()
+                .zip(&doc.members)
+                .all(|(node, member)| node.node_id == member.node_id);
+        if doc.revision == self.editor.revision && self.editor.dirty() && same_members {
+            // Same revision, same computers: only who is online and how they are called can
+            // have changed, and a draft the user is holding must not be wiped for that.
+            for (node, member) in self.editor.nodes.iter_mut().zip(&doc.members) {
+                node.online = member.online;
+                node.display_name.clone_from(&member.display_name);
+            }
+            return;
+        }
         self.editor.revision = doc.revision;
         self.editor.author = doc.author_node_id.clone();
         self.editor.links = doc
@@ -1137,8 +1242,7 @@ impl ViewModel {
             })
             .collect();
         self.editor.nodes = nodes;
-        // The map is rebuilt from the applied links; the placement the user had is dropped
-        // with the revision it was a draft of.
+        // The map is rebuilt from the applied links (and the draft still owed on top of them).
         self.rebuild_layout();
         self.push_log(format!(
             "Раскладка получена: ревизия {} от {}, участников {}",
@@ -1192,9 +1296,27 @@ impl ViewModel {
             ));
             return;
         };
+        if request == Request::UpdateTopology {
+            // A verdict that arrives late is still the verdict of the one save in flight: it is
+            // matched by id, not by time, so it can never leave the draft stuck.
+            let retrying = self.on_layout_verdict(request_id, &result);
+            if result.ok {
+                self.push_log(format!("{}: готово", request.label()));
+                return;
+            }
+            let failure = failure_text(request, &result.error_code);
+            self.push_log(format!("{}: {}", request.label(), failure));
+            if !retrying {
+                self.set_outcome(Outcome::failed(failure));
+            }
+            return;
+        }
         if result.ok {
             let text = self.success_text(request);
-            self.outcome = Some(Outcome::done(text.clone()));
+            // A toggle shows its own state; a sentence under it says nothing new.
+            if request != Request::SetClipboard {
+                self.set_outcome(Outcome::done(text.clone()));
+            }
             if request == Request::Shutdown {
                 self.settings.service.line = Some(Outcome::done("Служба останавливается"));
             }
@@ -1204,6 +1326,12 @@ impl ViewModel {
                 }
                 Request::PairWith => self.pairing.dialing = false,
                 Request::PairingAnswer => self.finish_pairing(true),
+                Request::SetClipboard if self.settings.clipboard_pending.is_some() => {
+                    // The core has not pushed the new state: ask for it.
+                    let id = self.begin_request(Request::GetStatus, Instant::now());
+                    self.outgoing
+                        .push((id, Msg::GetStatus(ipc::GetStatus {})));
+                }
                 _ => {}
             }
             self.push_log(format!("{}: готово ({text})", request.label()));
@@ -1212,15 +1340,8 @@ impl ViewModel {
         let code = result.error_code.as_str();
         let failure = failure_text(request, code);
         self.push_log(format!("{}: {}", request.label(), failure));
-        if request == Request::SetClipboard && code == "CLIPBOARD_DISABLED" {
-            self.settings.clipboard_note =
-                Some("Буфер обмена выключен в настройках (config.toml)".to_owned());
-        }
-        if request == Request::UpdateTopology && code == "LAYOUT_CONFLICT" {
-            self.conflict = Some(
-                "Раскладку изменили на другом компьютере. Обновите документ и повторите."
-                    .to_owned(),
-            );
+        if request == Request::SetClipboard {
+            self.settings.clipboard_pending = None;
         }
         if request == Request::Shutdown {
             self.settings.service.stopping = None;
@@ -1232,29 +1353,31 @@ impl ViewModel {
         if matches!(request, Request::PairWith | Request::PairingAnswer) {
             self.finish_pairing(false);
         }
-        self.outcome = Some(Outcome::failed(failure));
+        self.set_outcome(Outcome::failed(failure));
     }
 
-    /// Removes and returns the request `id` names.
-    fn take_inflight(&mut self, id: u64) -> Option<Request> {
-        let index = self
-            .inflight
-            .iter()
-            .position(|inflight| inflight.id == id)?;
-        Some(self.inflight.remove(index).request)
+    /// Shows `outcome` as the toast; its timer starts when it is first drawn.
+    pub fn set_outcome(&mut self, outcome: Outcome) {
+        self.outcome = Some(outcome);
+    }
+
+    /// A quiet note on the map for `how_long`.
+    pub fn flash(&mut self, text: impl Into<String>, how_long: Duration) {
+        self.flash = Some(Flash {
+            text: text.into(),
+            until: Instant::now() + how_long,
+        });
+    }
+
+    /// Takes the requests the view model made itself, to be sent as they are.
+    pub fn take_outgoing(&mut self) -> Vec<(u64, Msg)> {
+        std::mem::take(&mut self.outgoing)
     }
 
     /// The sentence a successful request is reported with.
     ///
     /// The pairing answer names the peer; the live link status arrives separately in `Status`.
     fn success_text(&self, request: Request) -> String {
-        if request == Request::LayoutAuto {
-            // The owner asked for this in one sentence: what the automatic layout did.
-            return match self.auto_layout_summary() {
-                Some(summary) => format!("расположено автоматически: {summary}"),
-                None => "расположено автоматически".to_owned(),
-            };
-        }
         if request == Request::PairingAnswer {
             let name = self
                 .pairing
@@ -1268,32 +1391,16 @@ impl ViewModel {
         success_text(request)
     }
 
-    // ------------------------------------------------------------ derived text
-
-    /// What the automatic layout produced, for the status line: which computer it placed,
-    /// on which side, and that the whole desktop is part of it.
-    ///
-    /// Derived from the applied document the window already holds (the auto layout is one
-    /// current node plus the peer, side by side), so the sentence describes what happened
-    /// rather than what was asked for.
-    fn auto_layout_summary(&self) -> Option<String> {
-        let other = self.other_node()?;
-        let name = self
-            .editor
-            .nodes
+    /// Removes and returns the request `id` names.
+    fn take_inflight(&mut self, id: u64) -> Option<Request> {
+        let index = self
+            .inflight
             .iter()
-            .find(|node| node.node_id == other)
-            .map(|node| node.label())
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| "второй компьютер".to_owned());
-        let side = match self.editor.side {
-            Side::Left => "слева",
-            Side::Right => "справа",
-            Side::Top => "сверху",
-            Side::Bottom => "снизу",
-        };
-        Some(format!("{name} {side}, весь рабочий стол"))
+            .position(|inflight| inflight.id == id)?;
+        Some(self.inflight.remove(index).request)
     }
+
+    // ------------------------------------------------------------ derived text
 
     /// The header's status line, in the words of someone who did not install anything: the
     /// thing that must be running is «служба», not «ядро».
@@ -1606,6 +1713,16 @@ impl ViewModel {
         Some(format!("Задержка: {} мс", status.rtt_p95_us / 1_000))
     }
 
+    /// «Открыть файл настроек»: `config.toml` in the system's editor; a failure is a toast.
+    pub fn open_config_file(&mut self) {
+        if let Err(why) = open_in_editor(&self.config.config_file) {
+            self.set_outcome(Outcome::failed(format!(
+                "не удалось открыть файл настроек ({})",
+                short_error(&why)
+            )));
+        }
+    }
+
     /// Appends a line to the window's log.
     pub fn push_log(&mut self, line: impl Into<String>) {
         self.log.push_back(line.into());
@@ -1718,8 +1835,31 @@ impl ViewModel {
                 } else {
                     Some(*modal)
                 };
+                self.appearance_open = false;
                 self.settings.revoke = None;
             }
+            Action::ToggleAppearance => {
+                self.appearance_open = !self.appearance_open;
+                self.modal = None;
+            }
+            Action::CloseAppearance => self.appearance_open = false,
+            Action::ToggleDock => self.look.dock_open = !self.look.dock_open,
+            // «Открыть окно сопряжения»: the window of the rail closes and the dock, which
+            // shows the address and the code, is brought out if it was folded.
+            Action::StartPairing { .. } => {
+                self.modal = None;
+                self.look.dock_open = true;
+            }
+            Action::SetClipboard(enabled) => self.settings.clipboard_pending = Some(*enabled),
+            Action::HoldToast(hold) => {
+                self.outcome_hold = *hold;
+                if !hold {
+                    // The time starts over when the pointer leaves.
+                    self.outcome_seen = None;
+                }
+            }
+            Action::DropNode(node_id) => self.drop_node(node_id),
+            Action::CancelDrag => self.restore_placement(),
             Action::CloseModal => {
                 self.modal = None;
                 self.settings.revoke = None;
@@ -1730,12 +1870,18 @@ impl ViewModel {
                 self.pairing.dialing = true;
                 self.pairing.paired = None;
             }
-            Action::DismissOutcome => self.outcome = None,
+            Action::DismissOutcome => {
+                self.outcome = None;
+                self.outcome_hold = false;
+            }
             Action::SetAddress(address) => self.pairing.address = address.clone(),
             Action::ToggleDetails(open) => self.pairing.details = *open,
-            Action::LayoutAuto => self.discard_draft(),
             Action::MoveNode { node_id, x, y } => self.move_node(node_id, *x, *y),
-            Action::NudgeNode { node_id, dx, dy } => self.nudge_node(node_id, *dx, *dy),
+            Action::NudgeNode { node_id, dx, dy } => {
+                // A key press is a whole edit: it is dropped where it lands.
+                self.nudge_node(node_id, *dx, *dy);
+                self.drop_node(node_id);
+            }
             Action::SelectRevoke(node_id) => {
                 self.settings.revoke = node_id.clone();
             }
@@ -1745,7 +1891,6 @@ impl ViewModel {
             // holds and asks for a process to be stopped, so `Bridge::dispatch` drives it.
             Action::RestartCore => {}
             Action::DismissFirstRun => self.settings.first_run = false,
-            Action::Refresh => self.conflict = None,
             _ => {}
         }
     }
@@ -1868,8 +2013,6 @@ pub enum Action {
     },
     /// Turn the shared clipboard on or off.
     SetClipboard(bool),
-    /// Rebuild the shared layout from this desktop (`LayoutAuto`).
-    LayoutAuto,
     /// Apply the edited layout document.
     UpdateTopology {
         /// The document, in the `[topology]` schema.
@@ -1879,12 +2022,6 @@ pub enum Action {
         /// The author of that revision; empty for the first document.
         expected_author: Vec<u8>,
     },
-    /// Ask for the divergent edits kept after a partition.
-    ListPendingEdits,
-    /// Apply one of them.
-    ApplyPendingEdit(Vec<u8>),
-    /// Drop one of them.
-    DiscardPendingEdit(Vec<u8>),
     /// Forget the portal permissions of this node.
     ResetPortalGrants,
     /// Ask the core to retry its degraded input agent after the user presses «Повторить».
@@ -1905,11 +2042,24 @@ pub enum Action {
     SetLook(crate::gui_settings::Look),
     /// Leave the «Пара создана» message.
     DonePairing,
-    /// «Передать ввод»: the `switch <peer>` verb of the core. A second call while the input
-    /// is on the other computer returns it.
-    SwitchTo(String),
     /// Forget the last finished operation.
     DismissOutcome,
+    /// The pointer is on (`true`) or left (`false`) the toast: its timer waits.
+    HoldToast(bool),
+    /// Open or close the appearance panel.
+    ToggleAppearance,
+    /// Close the appearance panel.
+    CloseAppearance,
+    /// Slide the pairing dock in or out.
+    ToggleDock,
+    /// A drag of a computer ended where it was dropped: save the layout it made. The one thing
+    /// that starts a save.
+    DropNode(String),
+    /// A drag was cut short (focus lost, the pointer left the window): nothing is saved and the
+    /// computer goes back.
+    CancelDrag,
+    /// Open `config.toml` in the system's default editor.
+    OpenConfigFile,
     /// The text of «Подключиться по адресу».
     SetAddress(String),
     /// Open or close the fingerprints under the code (ADR-010).
@@ -1983,7 +2133,6 @@ impl Action {
                 Request::SetClipboard,
                 Msg::SetClipboard(ipc::SetClipboard { enabled: *enabled }),
             ),
-            Action::LayoutAuto => (Request::LayoutAuto, Msg::LayoutAuto(ipc::LayoutAuto {})),
             Action::UpdateTopology {
                 layout_toml,
                 expected_revision,
@@ -1994,22 +2143,6 @@ impl Action {
                     layout_toml: layout_toml.clone(),
                     expected_revision: *expected_revision,
                     expected_author: expected_author.clone(),
-                }),
-            ),
-            Action::ListPendingEdits => (
-                Request::ListPendingEdits,
-                Msg::ListPendingEdits(ipc::ListPendingEdits {}),
-            ),
-            Action::ApplyPendingEdit(edit_id) => (
-                Request::ApplyPendingEdit,
-                Msg::ApplyPendingEdit(ipc::ApplyPendingEdit {
-                    edit_id: edit_id.clone(),
-                }),
-            ),
-            Action::DiscardPendingEdit(edit_id) => (
-                Request::DiscardPendingEdit,
-                Msg::DiscardPendingEdit(ipc::DiscardPendingEdit {
-                    edit_id: edit_id.clone(),
                 }),
             ),
             Action::ResetPortalGrants => (
@@ -2030,10 +2163,6 @@ impl Action {
                 }),
             ),
             Action::StopCore => (Request::Shutdown, Msg::Shutdown(ipc::Shutdown {})),
-            Action::SwitchTo(peer) => (
-                Request::Switch,
-                Msg::SwitchTo(ipc::SwitchTo { peer: peer.clone() }),
-            ),
             _ => return None,
         };
         Some(wire)
@@ -2041,8 +2170,7 @@ impl Action {
 
     /// A second request this action also needs, when it needs one.
     ///
-    /// «Обновить» on the conflict line is a `GetTopology`; [`Action::Refresh`] asks for both
-    /// the status and the document, so it has two.
+    /// [`Action::Refresh`] asks for both the status and the document, so it has two.
     pub fn extra_wire(&self) -> Option<(Request, Msg)> {
         match self {
             Action::Refresh => Some((Request::GetTopology, Msg::GetTopology(ipc::GetTopology {}))),
@@ -2093,8 +2221,20 @@ impl Bridge {
     /// recorded against `now` and handed to the client thread, and the answer arrives later as
     /// a frame [`Bridge::pump`] folds.
     pub fn dispatch(&mut self, action: Action, now: Instant) {
-        // The local half first: a refresh clears the conflict line, and none of the local
-        // actions care whether the wire half below succeeds.
+        self.dispatch_one(action, now);
+        self.send_outgoing();
+    }
+
+    /// Puts on the wire what the view model asked for itself: the automatic save, a re-read.
+    fn send_outgoing(&mut self) {
+        for (id, message) in self.view.take_outgoing() {
+            self.client.send(id, message);
+        }
+    }
+
+    fn dispatch_one(&mut self, action: Action, now: Instant) {
+        // The local half first: none of the local actions care whether the wire half below
+        // succeeds.
         self.view.local(&action);
         if matches!(&action, Action::StopCore) && !self.view.begin_stop(now) {
             return;
@@ -2117,6 +2257,7 @@ impl Bridge {
                 self.client.connect_again();
             }
             Action::RestartCore => self.restart_core(now),
+            Action::OpenConfigFile => self.view.open_config_file(),
             // «Применить» has already written the file above (`local`), and a saved address
             // is not in use until the core that reads it is the fresh one.
             Action::ApplyLanAddress
@@ -2172,7 +2313,10 @@ impl Bridge {
                         self.client.start_core();
                     }
                 }
-                GuiEvent::Frame(frame) => self.view.apply(*frame),
+                GuiEvent::Frame(frame) => {
+                    self.view.apply(*frame);
+                    self.send_outgoing();
+                }
                 GuiEvent::NotSent { id } => self.view.on_not_sent(id),
                 GuiEvent::CoreStarted { started } => self.view.on_core_started(started),
             }
@@ -2643,6 +2787,29 @@ fn own_program() -> PathBuf {
     })
 }
 
+/// Opens `file` in the system's default editor: `explorer` on Windows, `xdg-open` on Linux.
+pub fn open_in_editor(file: &Path) -> Result<(), String> {
+    if file.as_os_str().is_empty() || !file.exists() {
+        return Err("файл настроек не найден".to_owned());
+    }
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = std::process::Command::new(opener)
+        .arg(file)
+        .spawn()
+        .map_err(|error| format!("{opener}: {error}"))?;
+    // Reaped on a thread of its own: the editor outlives the click, the zombie must not.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Stops the core process this window started, by the pid [`StartedCore`] names.
 ///
 /// Windows has no signals, so it is `taskkill /PID <pid> /F` — the documented way to stop a
@@ -2949,7 +3116,7 @@ fn code_label(code: &str) -> String {
         "UNKNOWN_EDIT" => "такой правки больше нет".to_owned(),
         "UNKNOWN_PEER" => "этот компьютер не в паре".to_owned(),
         "TRUST_WRITE" => "не удалось записать список пар".to_owned(),
-        "CLIPBOARD_DISABLED" => "буфер обмена выключен в настройках".to_owned(),
+        "CLIPBOARD_DISABLED" => "буфер обмена не включился".to_owned(),
         "EXPORT_FAILED" => "не удалось записать файл диагностики".to_owned(),
         "PAIRING_FAILED" => "не удалось договориться о сопряжении".to_owned(),
         "PAIRING_GONE" => "окно сопряжения уже закрылось".to_owned(),
@@ -2973,11 +3140,7 @@ fn success_text(request: Request) -> String {
         Request::Abandon => "управление отдано".to_owned(),
         Request::PairWith => "подключение начато".to_owned(),
         Request::PairingAnswer => "ответ отправлен".to_owned(),
-        Request::UpdateTopology => "раскладка отправлена".to_owned(),
-        // The window's own wording is the `ViewModel::success_text` one (it can name the
-        // computer and the side); this is the plain fall-back.
-        Request::LayoutAuto => "расположено автоматически".to_owned(),
-        Request::Switch => "ввод передан".to_owned(),
+        Request::UpdateTopology => "раскладка сохранена".to_owned(),
         Request::SetClipboard => "буфер обмена переключён".to_owned(),
         Request::RevokePeer => "компьютер удалён из пары".to_owned(),
         Request::ResetPortalGrants => "разрешения порталов забыты".to_owned(),
@@ -2985,10 +3148,7 @@ fn success_text(request: Request) -> String {
         Request::Shutdown => "остановка службы начата".to_owned(),
         Request::ExportDiagnostics => "диагностика сохранена".to_owned(),
         Request::StartPairing => "окно сопряжения открыто".to_owned(),
-        Request::ApplyPendingEdit => "правка отправлена координатору".to_owned(),
-        Request::DiscardPendingEdit => "правка отброшена".to_owned(),
         Request::GetStatus | Request::GetTopology => "ядро ответило".to_owned(),
-        Request::ListPendingEdits => "список правок получен".to_owned(),
     }
 }
 
@@ -2996,11 +3156,8 @@ fn success_text(request: Request) -> String {
 fn failure_text(request: Request, code: &str) -> String {
     let label = code_label(code);
     match request {
-        Request::LayoutAuto => {
-            format!("автоматическая раскладка не готова: {label}")
-        }
         Request::UpdateTopology if code == "LAYOUT_CONFLICT" => {
-            "раскладку изменили на другом компьютере — обновите документ и повторите".to_owned()
+            "раскладку изменили на другом компьютере — перетащите ещё раз".to_owned()
         }
         Request::PairingAnswer if code == "PAIRING_FAILED" => {
             "коды не совпали или партнёр отказался".to_owned()
