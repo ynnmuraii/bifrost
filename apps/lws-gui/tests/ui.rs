@@ -959,13 +959,19 @@ fn a_history_row_is_compact_and_clearing_asks_first() {
             "Очистить историю",
         ],
     );
-    assert!(!shows(&frame, "Обновить"), "the history refreshes by itself");
+    assert!(
+        !shows(&frame, "Обновить"),
+        "the history refreshes by itself"
+    );
 
     // The first click only asks; the same spot now draws the confirmation.
     let at = text_position(&mut harness, &vm, "Очистить историю");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(
-        !frame.output.actions.contains(&Action::ClearClipboardHistory),
+        !frame
+            .output
+            .actions
+            .contains(&Action::ClearClipboardHistory),
         "{:?}",
         frame.output.actions
     );
@@ -975,7 +981,10 @@ fn a_history_row_is_compact_and_clearing_asks_first() {
     // «Отмена» puts the question away without clearing anything.
     let at = text_position(&mut harness, &vm, "Отмена");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
-    assert!(!frame.output.actions.contains(&Action::ClearClipboardHistory));
+    assert!(!frame
+        .output
+        .actions
+        .contains(&Action::ClearClipboardHistory));
     let frame = harness.frame(&vm, false, SIZE, Vec::new());
     assert!(!shows(&frame, "Очистить историю на этом компьютере?"));
 
@@ -985,7 +994,10 @@ fn a_history_row_is_compact_and_clearing_asks_first() {
     let at = text_position(&mut harness, &vm, "Очистить историю");
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(
-        frame.output.actions.contains(&Action::ClearClipboardHistory),
+        frame
+            .output
+            .actions
+            .contains(&Action::ClearClipboardHistory),
         "{:?}",
         frame.output.actions
     );
