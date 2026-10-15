@@ -312,42 +312,79 @@ impl Topology {
     }
 }
 
-/// Displays of `member` whose `edge` side lies on the outer boundary of the member's display
-/// bounding box, in the order along that edge (top to bottom for `Left`/`Right`, left to right
-/// for `Top`/`Bottom`). Empty when the member reports no display at all.
+/// Displays of `member` with a stretch of `edge` on the desktop's silhouette (see
+/// [`exposed_extents`]), in the order along that edge (top to bottom for `Left`/`Right`, left to
+/// right for `Top`/`Bottom`). Empty when the member reports no display at all.
 ///
-/// This is what «this edge of the whole desktop» means: `right` is every display whose right
-/// side equals the bounding box' right side, which is the right-most monitor of a row and
-/// *both* monitors of a vertical stack.
+/// This is what «this edge of the whole desktop» means: `right` is every monitor with nothing
+/// to its right, which is the right-most monitor of a row, *both* monitors of a vertical
+/// stack, and a monitor sitting beside a taller neighbour.
 pub fn boundary_displays(member: &NodeDisplays, edge: Edge) -> Vec<&Display> {
-    let Some(bounds) = member.bounds() else {
-        return Vec::new();
-    };
-    let outer = match edge {
-        Edge::Left => bounds.left(),
-        Edge::Right => bounds.right(),
-        Edge::Top => bounds.top(),
-        Edge::Bottom => bounds.bottom(),
-    };
-    let mut displays: Vec<&Display> = member
-        .displays
-        .iter()
-        .filter(|display| {
-            let side = match edge {
-                Edge::Left => display.logical_bounds.left(),
-                Edge::Right => display.logical_bounds.right(),
-                Edge::Top => display.logical_bounds.top(),
-                Edge::Bottom => display.logical_bounds.bottom(),
-            };
-            (side - outer).abs() <= GEOMETRY_EPSILON
-        })
-        .collect();
-    displays.sort_by(|left, right| {
-        edge_axis_interval(left, edge)
-            .0
-            .total_cmp(&edge_axis_interval(right, edge).0)
-    });
+    let mut displays: Vec<&Display> = Vec::new();
+    for extent in exposed_extents(member, edge) {
+        if !displays.iter().any(|seen| seen.id == extent.display.id) {
+            displays.push(extent.display);
+        }
+    }
     displays
+}
+
+/// Every stretch of every display's `edge` that has no other display of the member beyond it,
+/// in the order along the edge: the desktop's silhouette on that side.
+///
+/// The bounding box would be the wrong rule: a landscape monitor beside a taller portrait one
+/// has its bottom exposed although the portrait monitor reaches lower. A stretch is covered
+/// only where another display lies *beyond* the edge and overlaps it along the axis.
+fn exposed_extents(member: &NodeDisplays, edge: Edge) -> Vec<Extent<'_>> {
+    let side_of = |display: &Display| match edge {
+        Edge::Left => display.logical_bounds.left(),
+        Edge::Right => display.logical_bounds.right(),
+        Edge::Top => display.logical_bounds.top(),
+        Edge::Bottom => display.logical_bounds.bottom(),
+    };
+    let beyond = |other: &Display, side: f64| match edge {
+        Edge::Left | Edge::Top => side_of(other) < side - GEOMETRY_EPSILON,
+        Edge::Right | Edge::Bottom => side_of(other) > side + GEOMETRY_EPSILON,
+    };
+    let mut extents = Vec::new();
+    for (index, display) in member.displays.iter().enumerate() {
+        let (low, high) = edge_axis_interval(display, edge);
+        if high - low <= GEOMETRY_EPSILON {
+            continue;
+        }
+        let side = side_of(display);
+        let mut covered: Vec<(f64, f64)> = member
+            .displays
+            .iter()
+            .enumerate()
+            .filter(|(other_index, other)| *other_index != index && beyond(other, side))
+            .filter_map(|(_, other)| {
+                let (other_low, other_high) = edge_axis_interval(other, edge);
+                let (from, to) = (other_low.max(low), other_high.min(high));
+                (to - from > GEOMETRY_EPSILON).then_some((from, to))
+            })
+            .collect();
+        covered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut cursor = low;
+        let mut push = |from: f64, to: f64| {
+            extents.push(Extent {
+                display,
+                range: (from, to),
+                local: (from - low, to - low),
+            });
+        };
+        for (from, to) in covered {
+            if from - cursor > GEOMETRY_EPSILON {
+                push(cursor, from);
+            }
+            cursor = cursor.max(to);
+        }
+        if high - cursor > GEOMETRY_EPSILON {
+            push(cursor, high);
+        }
+    }
+    extents.sort_by(|a, b| a.range.0.total_cmp(&b.range.0));
+    extents
 }
 
 /// The interval a display occupies along `edge`'s axis, in node logical coordinates:
@@ -385,21 +422,7 @@ struct Extent<'a> {
 /// reported right now).
 fn side_extents<'a>(endpoint: &Endpoint, member: &'a NodeDisplays) -> Vec<Extent<'a>> {
     if endpoint.is_auto() {
-        boundary_displays(member, endpoint.edge)
-            .into_iter()
-            .filter_map(|display| {
-                let (low, high) = edge_axis_interval(display, endpoint.edge);
-                if high - low <= GEOMETRY_EPSILON {
-                    // A display with no extent along this edge contributes no segment.
-                    return None;
-                }
-                Some(Extent {
-                    display,
-                    range: (low, high),
-                    local: (0.0, high - low),
-                })
-            })
-            .collect()
+        exposed_extents(member, endpoint.edge)
     } else {
         match member.display(&endpoint.display) {
             Some(display) => vec![Extent {
@@ -412,25 +435,27 @@ fn side_extents<'a>(endpoint: &Endpoint, member: &'a NodeDisplays) -> Vec<Extent
     }
 }
 
-/// [`Extent::range`] union over a whole side, `None` when the side has no extent at all.
-fn side_union(extents: &[Extent<'_>]) -> Option<(f64, f64)> {
-    let mut iter = extents.iter();
-    let first = iter.next()?.range;
-    let (low, high) = iter.fold(first, |(low, high), extent| {
-        (low.min(extent.range.0), high.max(extent.range.1))
-    });
-    if high - low <= GEOMETRY_EPSILON {
-        None
-    } else {
-        Some((low, high))
+/// The extents laid end to end: each one's span as a fraction `(from, to)` of the combined
+/// length, and that length. `None` when the side has no length at all.
+fn normalize(extents: &[Extent<'_>]) -> Option<(Vec<(f64, f64)>, f64)> {
+    let total: f64 = extents
+        .iter()
+        .map(|extent| extent.range.1 - extent.range.0)
+        .sum();
+    if total <= GEOMETRY_EPSILON {
+        return None;
     }
-}
-
-/// The affine image of `value` from the axis `from` onto the axis `to`: the whole of `from`
-/// spans the whole of `to`, which is the proportional mapping the transition math uses inside
-/// one link.
-fn map_axis(value: f64, from: (f64, f64), to: (f64, f64)) -> f64 {
-    to.0 + (value - from.0) / (from.1 - from.0) * (to.1 - to.0)
+    let mut start = 0.0;
+    let spans = extents
+        .iter()
+        .map(|extent| {
+            let end = start + (extent.range.1 - extent.range.0) / total;
+            let span = (start, end);
+            start = end;
+            span
+        })
+        .collect();
+    Some((spans, total))
 }
 
 /// The document's links with every desktop-anchored (`auto`) endpoint expanded into concrete
@@ -470,45 +495,48 @@ pub fn resolve_auto_links(topology: &Topology) -> AutoResolution {
         };
         let from = side_extents(&link.source, source_member);
         let to = side_extents(&link.target, target_member);
-        let (Some(from_union), Some(to_union)) = (side_union(&from), side_union(&to)) else {
+        let (Some((from_spans, from_total)), Some((to_spans, to_total))) =
+            (normalize(&from), normalize(&to))
+        else {
             unresolved.push(link.id.clone());
             continue;
         };
 
+        // Both sides are laid end to end along their combined length and mapped onto each other
+        // as fractions of it, so a stretch of the source silhouette enters the matching stretch
+        // of the peer's, however the monitors on either side are shifted against each other.
+        let at = |extent: &Extent<'_>, span: (f64, f64), value: f64| {
+            extent.local.0
+                + (value - span.0) / (span.1 - span.0) * (extent.range.1 - extent.range.0)
+        };
         let mut produced: Vec<TransitionLink> = Vec::new();
-        for source in &from {
-            let mapped = (
-                map_axis(source.range.0, from_union, to_union),
-                map_axis(source.range.1, from_union, to_union),
-            );
-            for target in &to {
-                let low = mapped.0.max(target.range.0);
-                let high = mapped.1.min(target.range.1);
-                if high - low <= GEOMETRY_EPSILON {
+        for (source, source_span) in from.iter().zip(&from_spans) {
+            for (target, target_span) in to.iter().zip(&to_spans) {
+                let low = source_span.0.max(target_span.0);
+                let high = source_span.1.min(target_span.1);
+                if (high - low) * from_total.min(to_total) <= GEOMETRY_EPSILON {
                     continue;
                 }
-                // Back to the source axis and into the source display's own edge, and into
-                // the target display's own edge: the two segments are affine images of one
-                // another, which is the invariant `map_endpoints` relies on.
-                let source_low =
-                    source.local.0 + map_axis(low, to_union, from_union) - source.range.0;
-                let source_high =
-                    source.local.0 + map_axis(high, to_union, from_union) - source.range.0;
+                // The two segments are affine images of one another, which is the invariant
+                // `map_endpoints` relies on.
                 produced.push(TransitionLink::new(
                     link.id.clone(),
                     Endpoint::new(
                         link.source.node,
                         source.display.id.clone(),
                         link.source.edge,
-                        Segment::new(source_low, source_high),
+                        Segment::new(
+                            at(source, *source_span, low),
+                            at(source, *source_span, high),
+                        ),
                     ),
                     Endpoint::new(
                         link.target.node,
                         target.display.id.clone(),
                         link.target.edge,
                         Segment::new(
-                            target.local.0 + low - target.range.0,
-                            target.local.0 + high - target.range.0,
+                            at(target, *target_span, low),
+                            at(target, *target_span, high),
                         ),
                     ),
                     link.bidirectional,
