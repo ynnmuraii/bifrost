@@ -752,9 +752,10 @@ impl Session {
         let listen_port = self.listen.port();
         let window = connection.window.clone();
         let address = connection.address.to_string();
+        let hello_timeout = opener_hello_timeout(&window, self.now_ms());
         tokio::spawn(async move {
             match within(
-                opener_hello_timeout(&window, identity::now_unix_ms() as u64),
+                hello_timeout,
                 identity::accept_stream(
                     connection.stream,
                     &identity,
