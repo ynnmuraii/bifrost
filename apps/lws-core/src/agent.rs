@@ -245,6 +245,7 @@ pub struct Supervisor {
     /// With `--dry-inject`: let the agent's synthetic pointer cross the right edge.
     dry_motion: bool,
     emergency_hotkey: String,
+    hotkeys: config::HotkeyBindings,
     backend_override: ipc::BackendKind,
     require_emergency_hotkey: bool,
     core_silence_ms: u32,
@@ -305,6 +306,7 @@ impl Supervisor {
             dry_displays,
             dev_capture_injected,
             emergency_hotkey,
+            hotkeys: config::HotkeyBindings::default(),
             backend_override,
             require_emergency_hotkey,
             core_silence_ms,
@@ -333,6 +335,11 @@ impl Supervisor {
 
     pub fn set_appearance(&mut self, appearance: config::AppearanceConfig) {
         self.appearance = appearance;
+    }
+
+    pub fn set_hotkeys(&mut self, hotkeys: config::HotkeyBindings) {
+        self.emergency_hotkey = hotkeys.emergency_release.clone();
+        self.hotkeys = hotkeys;
     }
 
     /// The agent's state word for the status line.
@@ -458,7 +465,7 @@ impl Supervisor {
             }
         };
         let mut link = AgentLink::new(stream, FRAME_MAJOR, protocol::limits::PROTOCOL_MINOR);
-        let attach = crate::routing::attach(
+        let mut attach = crate::routing::attach(
             token.to_vec(),
             mode,
             &self.emergency_hotkey,
@@ -472,6 +479,7 @@ impl Supervisor {
             self.allow_portal_sessions,
             self.appearance,
         );
+        attach.hotkeys = super::session::hotkeys::bindings(&self.hotkeys);
         if let Err(error) = link.attach(attach).await {
             self.stop().await;
             return Err(format!("AgentAttach failed: {error}"));
