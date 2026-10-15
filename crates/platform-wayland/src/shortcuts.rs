@@ -32,6 +32,7 @@ pub struct EmergencyShortcuts {
     activated: ActivationStream,
     closed: Pin<Box<dyn Stream<Item = ()> + Send>>,
     trigger_description: Option<String>,
+    trigger_descriptions: Vec<(String, String)>,
     portal_version: u32,
 }
 
@@ -111,12 +112,16 @@ impl EmergencyShortcuts {
         let trigger_description = returned.iter()
             .find(|(id, _)| *id == EMERGENCY_SHORTCUT_ID)
             .map(|(_, trigger)| (*trigger).to_owned());
+        let trigger_descriptions = returned.iter()
+            .map(|(id, trigger)| ((*id).to_owned(), (*trigger).to_owned()))
+            .collect();
         Ok(Self {
             session,
             session_path,
             activated: Box::pin(activated),
             closed: Box::pin(closed.map(|_| ())),
             trigger_description,
+            trigger_descriptions,
             portal_version,
         })
     }
@@ -125,6 +130,14 @@ impl EmergencyShortcuts {
     #[must_use]
     pub fn bound_trigger_description(&self) -> Option<&str> {
         self.trigger_description.as_deref()
+    }
+
+    /// User-visible actual trigger returned by the compositor for an action.
+    #[must_use]
+    pub fn trigger_description(&self, id: &str) -> Option<&str> {
+        self.trigger_descriptions.iter()
+            .find(|(bound_id, _)| bound_id == id)
+            .map(|(_, trigger)| trigger.as_str())
     }
 
     /// The version of the `GlobalShortcuts` interface.
