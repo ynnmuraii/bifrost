@@ -6,6 +6,7 @@ use super::theme::{fam, Palette};
 use super::widgets;
 use crate::gui_settings::{FieldMode, LinkStyle, Theme, SPEED_MAX, SPEED_MIN};
 use crate::view_model::{Action, ViewModel};
+use ui_text::{text, Key};
 
 /// Draws the appearance popover next to its rail button, within the window bounds.
 pub fn draw(
@@ -16,6 +17,7 @@ pub fn draw(
     anchor: Rect,
     actions: &mut Vec<Action>,
 ) {
+    let lang = vm.look.language;
     if !vm.appearance_open {
         return;
     }
@@ -68,7 +70,13 @@ pub fn draw(
         .max_height(inner.height())
         .show(&mut panel, |ui| {
             ui.horizontal(|ui| {
-                widgets::text(ui, "Внешний вид", 18.0, fam::sans_semibold(), pal.ink);
+                widgets::text(
+                    ui,
+                    text(lang, Key::Appearance2),
+                    18.0,
+                    fam::sans_semibold(),
+                    pal.ink,
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::close(ui, pal) {
                         actions.push(Action::CloseAppearance);
@@ -76,20 +84,20 @@ pub fn draw(
                 });
             });
             let mut look = vm.look;
-            label(ui, pal, "Тема");
+            label(ui, pal, text(lang, Key::Theme));
             if let Some(i) = widgets::seg(
                 ui,
                 pal,
-                &["Светлая", "Тёмная"],
+                &[text(lang, Key::Light), text(lang, Key::Dark)],
                 usize::from(look.theme == Theme::Dark),
             ) {
                 look.theme = if i == 0 { Theme::Light } else { Theme::Dark };
             }
-            label(ui, pal, "Связи между компьютерами");
+            label(ui, pal, text(lang, Key::LinksBetweenComputers));
             if let Some(i) = widgets::seg(
                 ui,
                 pal,
-                &["ASCII-изолиния", "Линия"],
+                &[text(lang, Key::ASCIIIsoline), text(lang, Key::Line)],
                 usize::from(look.link_style == LinkStyle::Line),
             ) {
                 look.link_style = if i == 0 {
@@ -98,7 +106,7 @@ pub fn draw(
                     LinkStyle::Line
                 };
             }
-            label(ui, pal, "Фон · частицы");
+            label(ui, pal, text(lang, Key::BackgroundParticles));
             let selected = match look.field {
                 FieldMode::Attract => 0,
                 FieldMode::Repel => 1,
@@ -107,12 +115,16 @@ pub fn draw(
             if let Some(i) = widgets::seg(
                 ui,
                 pal,
-                &["Собираются", "Разлетаются", "Без движения"],
+                &[
+                    text(lang, Key::Gather),
+                    text(lang, Key::Scatter),
+                    text(lang, Key::Still),
+                ],
                 selected,
             ) {
                 look.field = [FieldMode::Attract, FieldMode::Repel, FieldMode::Off][i];
             }
-            label(ui, pal, "Скорость частиц");
+            label(ui, pal, text(lang, Key::ParticleSpeed));
             // A drag is one decision, not sixty: the value is committed when the drag ends (or
             // on a keystroke), so a drag does not write `gui.toml` once a frame.
             let mut speed = look.speed;
@@ -148,7 +160,7 @@ pub fn draw(
             if let Some(i) = widgets::seg(
                 ui,
                 pal,
-                &["ASCII-облака", "Без облаков"],
+                &[text(lang, Key::ASCIIClouds), text(lang, Key::NoClouds)],
                 usize::from(!look.clouds),
             ) {
                 look.clouds = i == 0;
@@ -162,11 +174,12 @@ pub fn draw(
             let mut hide_remote_cursor = vm.status.as_ref().is_some_and(|s| s.hide_remote_cursor);
             ui.add_enabled_ui(vm.can_set_appearance(), |ui| {
                 let effects =
-                    widgets::switch(ui, pal, "Эффекты у краёв", &mut edge_effects).clicked();
+                    widgets::switch(ui, pal, text(lang, Key::EdgeEffects), &mut edge_effects)
+                        .clicked();
                 let cursor = widgets::switch(
                     ui,
                     pal,
-                    "Прятать курсор, пока ввод на другой машине",
+                    text(lang, Key::HideTheCursorWhileInputIsOnAnotherComputer),
                     &mut hide_remote_cursor,
                 )
                 .clicked();

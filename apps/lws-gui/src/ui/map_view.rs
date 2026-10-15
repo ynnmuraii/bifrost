@@ -14,6 +14,7 @@ use crate::gui_settings::{LinkStyle, Look, PAN_MAX};
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
+use ui_text::{text, Key};
 
 /// Stage → screen.
 #[derive(Clone, Copy)]
@@ -61,6 +62,7 @@ pub fn draw(
     t: f32,
     actions: &mut Vec<Action>,
 ) -> Option<Duration> {
+    let lang = vm.look.language;
     let painter = ui.painter().with_clip_rect(rect);
     let model = vm.map_model();
     let pointer = ui
@@ -177,9 +179,9 @@ pub fn draw(
     if model.nodes.is_empty() {
         let galley = painter.layout_no_wrap(
             if vm.connection.is_connected() {
-                "Раскладка ещё не получена".to_owned()
+                text(lang, Key::TheLayoutHasNotArrivedYet).to_owned()
             } else {
-                "Нет данных от службы".to_owned()
+                text(lang, Key::NoDataFromTheService).to_owned()
             },
             font(14.0, fam::sans()),
             pal.ink2,
@@ -350,10 +352,11 @@ fn zoom_controls(
 
 /// The map heading and monitor count.
 fn header(painter: &egui::Painter, pal: &Palette, vm: &ViewModel, rect: Rect) {
+    let lang = vm.look.language;
     let left = rect.min + Vec2::new(24.0, 20.0);
     let mut job = egui::text::LayoutJob::default();
     job.append(
-        "01 — КАРТА МОНИТОРОВ",
+        text(lang, Key::K01MONITORMAP),
         0.0,
         egui::text::TextFormat {
             font_id: font(11.0, fam::mono()),
@@ -705,6 +708,7 @@ fn dashed_rect(painter: &egui::Painter, r: Rect, stroke: Stroke) {
 
 /// The notice at the top: the service is not running, or the last result of an action.
 fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) {
+    let lang = vm.look.language;
     let mut y = rect.min.y + 18.0;
     let center = rect.center().x;
     if !vm.connection.is_connected() {
@@ -726,7 +730,7 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
         child.add_space(16.0);
         widgets::text(
             &mut child,
-            "Служба не запущена",
+            text(lang, Key::TheServiceIsNotRunning),
             13.0,
             fam::sans_medium(),
             pal.ink,
@@ -738,21 +742,27 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
             act(
                 ui,
                 pal,
-                "Запустить",
+                text(lang, Key::Start),
                 Kind::Hot,
                 !starting,
                 actions,
                 || Action::StartCore,
             );
-            act(ui, pal, "Ещё раз", Kind::Ghost, true, actions, || {
-                Action::ConnectAgain
-            });
+            act(
+                ui,
+                pal,
+                text(lang, Key::OnceMore),
+                Kind::Ghost,
+                true,
+                actions,
+                || Action::ConnectAgain,
+            );
         });
         y += 54.0;
     }
     if let Some(outcome) = &vm.outcome {
         let galley = ui.painter().layout(
-            outcome.line(),
+            outcome.line(lang),
             font(14.0, fam::sans_medium()),
             pal.ink,
             (rect.width() - 92.0).max(40.0),

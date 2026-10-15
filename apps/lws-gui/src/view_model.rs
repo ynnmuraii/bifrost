@@ -35,6 +35,7 @@ use config::Paths;
 use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use protocol::ipc::GuiFrame;
+use ui_text::{fill, fill_named, text, Key, Lang};
 
 pub mod layout;
 
@@ -104,13 +105,13 @@ impl Modal {
     }
 
     /// The title of the section.
-    pub const fn title(self) -> &'static str {
+    pub fn title(self, lang: Lang) -> &'static str {
         match self {
-            Modal::Pairs => "Пары",
-            Modal::Keys => "Клавиши",
-            Modal::Clip => "Буфер обмена",
-            Modal::Diag => "Диагностика",
-            Modal::Settings => "Настройки",
+            Modal::Pairs => text(lang, Key::Pairs),
+            Modal::Keys => text(lang, Key::Keys),
+            Modal::Clip => text(lang, Key::Clipboard),
+            Modal::Diag => text(lang, Key::Diagnostics),
+            Modal::Settings => text(lang, Key::Settings),
         }
     }
 
@@ -126,13 +127,13 @@ impl Modal {
     }
 
     /// The caption after the progress bar.
-    pub const fn subtitle(self) -> &'static str {
+    pub fn subtitle(self, lang: Lang) -> &'static str {
         match self {
-            Modal::Pairs => "кому доверяет этот компьютер",
-            Modal::Keys => "горячие клавиши службы ввода",
-            Modal::Clip => "скопировать здесь — вставить там",
-            Modal::Diag => "отчёт для разбора проблем",
-            Modal::Settings => "адрес и служба",
+            Modal::Pairs => text(lang, Key::WhoThisComputerTrusts),
+            Modal::Keys => text(lang, Key::TheInputServiceSHotkeys),
+            Modal::Clip => text(lang, Key::CopyHerePasteThere),
+            Modal::Diag => text(lang, Key::AReportForTroubleshooting),
+            Modal::Settings => text(lang, Key::AddressAndService),
         }
     }
 }
@@ -156,12 +157,12 @@ impl Side {
     pub const ALL: [Side; 4] = [Side::Left, Side::Right, Side::Top, Side::Bottom];
 
     /// The direction's human-readable label.
-    pub const fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            Side::Left => "Слева",
-            Side::Right => "Справа",
-            Side::Top => "Сверху",
-            Side::Bottom => "Снизу",
+            Side::Left => text(lang, Key::Left),
+            Side::Right => text(lang, Key::Right),
+            Side::Top => text(lang, Key::Top),
+            Side::Bottom => text(lang, Key::Bottom),
         }
     }
 
@@ -270,23 +271,23 @@ pub enum Request {
 
 impl Request {
     /// The request's name in a log line.
-    pub const fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            Request::GetStatus => "состояние",
-            Request::GetTopology => "раскладка",
-            Request::Claim => "взять управление",
-            Request::Abandon => "отдать управление",
-            Request::StartPairing => "открыть окно сопряжения",
-            Request::PairWith => "подключиться по адресу",
-            Request::PairingAnswer => "ответ на сопряжение",
-            Request::UpdateTopology => "сохранить раскладку",
-            Request::SetClipboard => "буфер обмена",
-            Request::SetAppearance => "эффекты краёв",
-            Request::RevokePeer => "удалить компьютер из пары",
-            Request::ExportDiagnostics => "сохранить диагностику",
-            Request::ResetPortalGrants => "забыть разрешения порталов",
-            Request::RetryAgent => "повторить запуск службы ввода",
-            Request::Shutdown => "остановить службу",
+            Request::GetStatus => text(lang, Key::State),
+            Request::GetTopology => text(lang, Key::Layout),
+            Request::Claim => text(lang, Key::TakeControl),
+            Request::Abandon => text(lang, Key::GiveControlBack),
+            Request::StartPairing => text(lang, Key::OpenThePairingWindow),
+            Request::PairWith => text(lang, Key::ConnectByAddress),
+            Request::PairingAnswer => text(lang, Key::AnswerThePairing),
+            Request::UpdateTopology => text(lang, Key::SaveTheLayout),
+            Request::SetClipboard => text(lang, Key::TheClipboard),
+            Request::SetAppearance => text(lang, Key::TheEdgeEffects),
+            Request::RevokePeer => text(lang, Key::RemoveAComputerFromThePair),
+            Request::ExportDiagnostics => text(lang, Key::SaveTheDiagnostics),
+            Request::ResetPortalGrants => text(lang, Key::ForgetThePortalGrants),
+            Request::RetryAgent => text(lang, Key::StartTheInputServiceAgain),
+            Request::Shutdown => text(lang, Key::StopTheService),
         }
     }
 }
@@ -327,11 +328,11 @@ impl Outcome {
     }
 
     /// The line as the screens draw it.
-    pub fn line(&self) -> String {
+    pub fn line(&self, lang: Lang) -> String {
         if self.ok {
-            format!("Готово: {}", self.text)
+            fill(lang, Key::Done, &[&self.text])
         } else {
-            format!("Не получилось: {}", self.text)
+            fill(lang, Key::Failed, &[&self.text])
         }
     }
 }
@@ -397,6 +398,7 @@ impl Default for LocalConfig {
 impl LocalConfig {
     /// Reads `config.toml` through [`Paths`]; every failure is a note, never an error.
     pub fn load(paths: &Paths) -> Self {
+        let lang = Lang::from_system();
         let file = paths.config_file();
         let mut config = LocalConfig {
             config_file: file.clone(),
@@ -415,9 +417,10 @@ impl LocalConfig {
                 config.listen_address = loaded.network.listen_address.clone();
             }
             Err(error) => {
-                config.note = Some(format!(
-                    "Настройки не прочитаны ({}), показаны стандартные значения",
-                    crate::view_model::short_error(&error.to_string())
+                config.note = Some(fill(
+                    lang,
+                    Key::TheSettingsWereNotReadTheDefaultsAreShown,
+                    &[&crate::view_model::short_error(&error.to_string())],
                 ));
             }
         }
@@ -427,6 +430,7 @@ impl LocalConfig {
 
 /// The first line of an error, for a sentence that has to fit next to a widget.
 pub fn short_error(text: &str) -> String {
+    let lang = Lang::from_system();
     let line = text.lines().next().unwrap_or("").trim();
     if line.chars().count() > 120 {
         line.chars().take(120).collect::<String>() + "…"
@@ -489,9 +493,9 @@ pub struct EditorNode {
 
 impl EditorNode {
     /// The name to show; a node without one is named by its node id.
-    pub fn label(&self) -> String {
+    pub fn label(&self, lang: Lang) -> String {
         if self.display_name.is_empty() {
-            format!("компьютер {}", short_id(&self.node_id))
+            fill(lang, Key::ComputerNamed, &[&short_id(&self.node_id)])
         } else {
             self.display_name.clone()
         }
@@ -699,6 +703,7 @@ impl Lan {
 
 /// Only a parsed, non-loopback IPv4 address can be offered as a LAN address.
 fn is_lan_address(address: &str) -> bool {
+    let lang = Lang::from_system();
     address
         .parse::<std::net::Ipv4Addr>()
         .is_ok_and(|address| !address.is_loopback())
@@ -791,10 +796,11 @@ pub struct ViewModel {
 impl ViewModel {
     /// A window that knows where the core is and nothing else.
     pub fn new(endpoint: CoreEndpoint, config: LocalConfig) -> Self {
+        let lang = Lang::from_system();
         let mut view = ViewModel {
             endpoint,
             connection: Connection::Disconnected {
-                why: "служба ещё не отвечала".to_owned(),
+                why: text(lang, Key::TheServiceHasNotAnsweredYet).to_owned(),
             },
             core: None,
             config,
@@ -855,6 +861,7 @@ impl ViewModel {
     /// Returns `true` while «Перезапустить службу» waits for the core it stopped: a dropped
     /// link is the proof it was waiting for, and the window then starts the fresh one.
     pub fn on_disconnected(&mut self, why: String) -> bool {
+        let lang = self.look.language;
         self.push_log(format!("Связь со службой потеряна: {}", short_error(&why)));
         self.connection = Connection::Disconnected { why };
         self.inflight.clear();
@@ -872,7 +879,7 @@ impl ViewModel {
         self.pairing.window = None;
         self.pairing.prompt = None;
         if self.settings.service.stopping.take().is_some() {
-            self.settings.service.line = Some(Outcome::done("Служба остановлена"));
+            self.settings.service.line = Some(Outcome::done(text(lang, Key::TheServiceIsStopped)));
             return false;
         }
         if matches!(
@@ -925,8 +932,9 @@ impl ViewModel {
 
     /// The client could not put a request on the wire (no core is listening).
     pub fn on_not_sent(&mut self, id: u64) {
+        let lang = self.look.language;
         let request = self.take_inflight(id);
-        let name = request.map_or("запрос", Request::label);
+        let name = request.map_or(text(lang, Key::Request), |request| request.label(lang));
         self.push_log(format!("Служба не запущена: {name} не отправлено"));
         if request == Some(Request::Shutdown) {
             self.settings.service.stopping = None;
@@ -1068,6 +1076,7 @@ impl ViewModel {
 
     /// The core process was started, or could not be.
     pub fn on_core_started(&mut self, started: Result<StartedCore, String>) {
+        let lang = self.look.language;
         match started {
             Ok(core) => {
                 self.push_log(format!(
@@ -1095,14 +1104,16 @@ impl ViewModel {
                 }
             }
             Err(why) => {
-                self.push_log(format!(
-                    "Не удалось запустить службу: {}",
-                    short_error(&why)
+                self.push_log(fill(
+                    lang,
+                    Key::CouldNotStartTheService,
+                    &[&short_error(&why)],
                 ));
                 self.settings.service.restart = None;
-                self.set_outcome(Outcome::failed(format!(
-                    "не удалось запустить службу ({})",
-                    short_error(&why)
+                self.set_outcome(Outcome::failed(fill(
+                    lang,
+                    Key::CouldNotStartTheService2,
+                    &[&short_error(&why)],
                 )));
             }
         }
@@ -1126,6 +1137,7 @@ impl ViewModel {
 
     /// Folds one `GuiFrame` — a response or an event — into the state.
     pub fn apply(&mut self, frame: GuiFrame) {
+        let lang = self.look.language;
         let Some(msg) = frame.msg else {
             self.push_log("Служба прислала пустой кадр");
             return;
@@ -1147,13 +1159,14 @@ impl ViewModel {
             Msg::TopologyDoc(doc) => self.apply_topology(doc),
             Msg::PairingWindow(window) => self.apply_pairing_window(window),
             Msg::PairingPrompt(prompt) => {
-                self.push_log(format!(
-                    "Сопряжение: партнёр {} предлагает сверить код",
-                    if prompt.peer_name.is_empty() {
-                        "без имени"
+                self.push_log(fill(
+                    lang,
+                    Key::PairingOffersACodeToCompare,
+                    &[&if prompt.peer_name.is_empty() {
+                        text(lang, Key::WithoutAName)
                     } else {
                         prompt.peer_name.as_str()
-                    }
+                    }],
                 ));
                 self.pairing.details = false;
                 self.pairing.prompt = Some(prompt);
@@ -1161,24 +1174,29 @@ impl ViewModel {
             Msg::OpResult(result) => self.apply_op_result(frame.request_id, result),
             // The pushed half of the contract never arrives here; a GUI that gets one of its
             // own requests back is talking to something that is not a core.
-            other => self.push_log(format!(
-                "Служба прислала неожиданный кадр ({})",
-                message_name(&other)
+            other => self.push_log(fill(
+                lang,
+                Key::TheServiceSentAnUnexpectedFrame,
+                &[&message_name(&other)],
             )),
         }
     }
 
     /// `Status` is a response and an event, and both are the same fold.
     fn apply_status(&mut self, status: ipc::Status) {
+        let lang = self.look.language;
         if self
             .status
             .as_ref()
             .is_none_or(|old| old.layout_revision != status.layout_revision)
         {
-            self.push_log(format!(
-                "Раскладка: ревизия {} от {}",
-                status.layout_revision,
-                author_label(&status.layout_author)
+            self.push_log(fill(
+                lang,
+                Key::LayoutRevisionFrom,
+                &[
+                    &status.layout_revision,
+                    &author_label(lang, &status.layout_author),
+                ],
             ));
         }
         self.editor.editable = status.layout_editable;
@@ -1211,10 +1229,12 @@ impl ViewModel {
     }
 
     fn fold_topology(&mut self, doc: ipc::TopologyDoc) {
+        let lang = self.look.language;
         if doc.revision < self.editor.revision {
-            self.push_log(format!(
-                "Раскладка: ревизия {} старше текущей {} — оставлена прежняя",
-                doc.revision, self.editor.revision
+            self.push_log(fill(
+                lang,
+                Key::LayoutRevisionIsOlderThanTheCurrentThePreviousOneWasKept,
+                &[&doc.revision, &self.editor.revision],
             ));
             return;
         }
@@ -1259,20 +1279,25 @@ impl ViewModel {
         self.editor.nodes = nodes;
         // The map is rebuilt from the applied links (and the draft still owed on top of them).
         self.rebuild_layout();
-        self.push_log(format!(
-            "Раскладка получена: ревизия {} от {}, участников {}",
-            doc.revision,
-            author_label(&doc.author_node_id),
-            doc.members.len()
+        self.push_log(fill(
+            lang,
+            Key::LayoutReceivedRevisionFromMembers,
+            &[
+                &doc.revision,
+                &author_label(lang, &doc.author_node_id),
+                &doc.members.len(),
+            ],
         ));
     }
 
     /// The pairing window opened, changed what is left of it, or closed.
     fn apply_pairing_window(&mut self, window: ipc::PairingWindow) {
+        let lang = self.look.language;
         if window.open {
-            self.push_log(format!(
-                "Окно сопряжения открыто: {} ({} с)",
-                window.address, window.seconds_remaining
+            self.push_log(fill(
+                lang,
+                Key::ThePairingWindowIsOpenS,
+                &[&window.address, &window.seconds_remaining],
             ));
             self.pairing.window_deadline =
                 Some(Instant::now() + Duration::from_secs(u64::from(window.seconds_remaining)));
@@ -1288,6 +1313,7 @@ impl ViewModel {
     /// A ceremony ended: the code and the dialling state are over, and a success stays on
     /// screen until «Готово».
     fn finish_pairing(&mut self, paired: bool) {
+        let lang = self.look.language;
         let name = self
             .pairing
             .prompt
@@ -1296,7 +1322,8 @@ impl ViewModel {
             .filter(|name| !name.is_empty());
         self.pairing.dialing = false;
         if paired {
-            self.pairing.paired = Some(name.unwrap_or_else(|| "Компьютер".to_owned()));
+            self.pairing.paired =
+                Some(name.unwrap_or_else(|| text(lang, Key::ComputerTitle).to_owned()));
             self.pairing.window = None;
             self.pairing.window_deadline = None;
         }
@@ -1304,10 +1331,12 @@ impl ViewModel {
 
     /// The verdict of one request.
     fn apply_op_result(&mut self, request_id: u64, result: ipc::OpResult) {
+        let lang = self.look.language;
         let Some(request) = self.take_inflight(request_id) else {
-            self.push_log(format!(
-                "Ответ на неизвестный запрос ({})",
-                code_label(&result.error_code)
+            self.push_log(fill(
+                lang,
+                Key::AnAnswerToAnUnknownRequest,
+                &[&code_label(lang, &result.error_code)],
             ));
             return;
         };
@@ -1316,28 +1345,29 @@ impl ViewModel {
             // matched by id, not by time, so it can never leave the draft stuck.
             let retrying = self.on_layout_verdict(request_id, &result);
             if result.ok {
-                self.push_log(format!("{}: готово", request.label()));
+                self.push_log(format!("{}: готово", request.label(lang)));
                 return;
             }
-            let failure = failure_text(request, &result.error_code);
-            self.push_log(format!("{}: {}", request.label(), failure));
+            let failure = failure_text(lang, request, &result.error_code);
+            self.push_log(format!("{}: {}", request.label(lang), failure));
             if !retrying {
                 self.set_outcome(Outcome::failed(failure));
             }
             return;
         }
         if result.ok {
-            let text = self.success_text(request);
+            let line = self.success_text(request);
             // A toggle shows its own state; a sentence under it says nothing new.
             if !matches!(request, Request::SetClipboard | Request::SetAppearance) {
-                self.set_outcome(Outcome::done(text.clone()));
+                self.set_outcome(Outcome::done(line.clone()));
             }
             if request == Request::Shutdown {
-                self.settings.service.line = Some(Outcome::done("Служба останавливается"));
+                self.settings.service.line =
+                    Some(Outcome::done(text(lang, Key::TheServiceIsStopping)));
             }
             match request {
                 Request::ExportDiagnostics => {
-                    self.settings.export = Some(Outcome::done(text.clone()));
+                    self.settings.export = Some(Outcome::done(line.clone()));
                 }
                 Request::PairWith => self.pairing.dialing = false,
                 Request::PairingAnswer => self.finish_pairing(true),
@@ -1352,12 +1382,12 @@ impl ViewModel {
                 }
                 _ => {}
             }
-            self.push_log(format!("{}: готово ({text})", request.label()));
+            self.push_log(format!("{}: готово ({line})", request.label(lang)));
             return;
         }
         let code = result.error_code.as_str();
-        let failure = failure_text(request, code);
-        self.push_log(format!("{}: {}", request.label(), failure));
+        let failure = failure_text(lang, request, code);
+        self.push_log(format!("{}: {}", request.label(lang), failure));
         if request == Request::SetClipboard {
             self.settings.clipboard_pending = None;
         }
@@ -1396,6 +1426,7 @@ impl ViewModel {
     ///
     /// The pairing answer names the peer; the live link status arrives separately in `Status`.
     fn success_text(&self, request: Request) -> String {
+        let lang = self.look.language;
         if request == Request::PairingAnswer {
             let name = self
                 .pairing
@@ -1403,10 +1434,10 @@ impl ViewModel {
                 .as_ref()
                 .map(|prompt| prompt.peer_name.clone())
                 .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "Компьютер".to_owned());
-            return format!("{name} сопряжён");
+                .unwrap_or_else(|| text(lang, Key::ComputerTitle).to_owned());
+            return fill_named(lang, Key::NameIsPaired, &[("name", &name)]);
         }
-        success_text(request)
+        success_text(lang, request)
     }
 
     /// Removes and returns the request `id` names.
@@ -1418,17 +1449,18 @@ impl ViewModel {
         Some(self.inflight.remove(index).request)
     }
 
-    // ------------------------------------------------------------ derived text
+    // ------------------------------------------------------------ derived line
 
     /// The header's status line, in the words of someone who did not install anything: the
     /// thing that must be running is «служба», not «ядро».
     pub fn connection_label(&self) -> &'static str {
+        let lang = self.look.language;
         if self.silent {
-            "Служба не отвечает"
+            text(lang, Key::TheServiceIsNotAnswering)
         } else if self.connection.is_connected() {
-            "Служба работает"
+            text(lang, Key::TheServiceIsRunning)
         } else {
-            "Служба не запущена"
+            text(lang, Key::TheServiceIsNotRunning)
         }
     }
 
@@ -1443,39 +1475,46 @@ impl ViewModel {
     /// «Куда идёт ввод» (an NFR of `docs/03-architecture.md`) — the headline the status
     /// screen shows first and largest, because it is the one thing the window exists for.
     pub fn focus_line(&self) -> String {
+        let lang = self.look.language;
         let Some(status) = &self.status else {
-            return "Нет данных от службы".to_owned();
+            return text(lang, Key::NoDataFromTheService).to_owned();
         };
         match status.focus.as_str() {
-            "LOCAL" => "Ввод здесь".to_owned(),
-            "PREPARING" => "Готовим переход…".to_owned(),
+            "LOCAL" => text(lang, Key::InputHere).to_owned(),
+            "PREPARING" => text(lang, Key::PreparingTheSwitch).to_owned(),
             "REMOTE" => {
                 let peer = if status.active_peer.is_empty() {
-                    "другой компьютер".to_owned()
+                    text(lang, Key::TheOtherComputer).to_owned()
                 } else {
                     status.active_peer.clone()
                 };
-                format!("Ввод на {peer}")
+                fill_named(lang, Key::InputOnPeer, &[("peer", &peer)])
             }
-            "BLOCKED" => "Ввод остановлен из-за ошибки".to_owned(),
-            other => format!("Ввод: служба сообщила неизвестное состояние ({other})"),
+            "BLOCKED" => text(lang, Key::InputStoppedBecauseOfAnError).to_owned(),
+            other => fill_named(
+                lang,
+                Key::InputTheServiceReportedAnUnknownStateOther,
+                &[("other", &other)],
+            ),
         }
     }
 
     /// The small line under [`ViewModel::focus_line`]: the one fact that does not fit the
     /// headline, which is the keyboard layout in use on the other computer.
     pub fn focus_detail(&self) -> Option<String> {
+        let lang = self.look.language;
         let status = self.status.as_ref()?;
         (status.focus == "REMOTE" && !status.active_layout.is_empty())
-            .then(|| format!("раскладка {}", status.active_layout))
+            .then(|| fill(lang, Key::Layout2, &[&status.active_layout]))
     }
 
     /// Whether the link to the other computer is up.
     pub fn link_line(&self) -> &'static str {
+        let lang = self.look.language;
         match &self.status {
-            Some(status) if status.connected => "Есть связь",
-            Some(_) => "Нет связи",
-            None => "Нет данных от службы",
+            Some(status) if status.connected => text(lang, Key::Connected),
+            Some(_) => text(lang, Key::Disconnected),
+            None => text(lang, Key::NoDataFromTheService),
         }
     }
 
@@ -1484,17 +1523,19 @@ impl ViewModel {
     ///
     /// The link is not lost: it becomes active again on its own once the monitor is reported.
     pub fn inactive_link_lines(&self) -> Vec<String> {
+        let lang = self.look.language;
         self.editor
             .links
             .iter()
             .filter(|link| !link.active)
             .map(|link| {
                 if link.inactive_reason.is_empty() {
-                    format!("Связь {} неактивна: экран не найден", link.id)
+                    fill(lang, Key::LinkIsInactiveTheDisplayWasNotFound, &[&link.id])
                 } else {
-                    format!(
-                        "Связь {} неактивна: экран «{}» не найден",
-                        link.id, link.inactive_reason
+                    fill(
+                        lang,
+                        Key::LinkIsInactiveDisplayWasNotFound,
+                        &[&link.id, &link.inactive_reason],
                     )
                 }
             })
@@ -1507,6 +1548,7 @@ impl ViewModel {
     /// what the core resolves it to against the live manifests right now — the monitors on the
     /// outer edge of each side. Empty when every link names its displays.
     pub fn auto_link_lines(&self) -> Vec<String> {
+        let lang = self.look.language;
         self.editor
             .links
             .iter()
@@ -1519,13 +1561,14 @@ impl ViewModel {
                     return None;
                 }
                 let screens = if link.auto_displays.is_empty() {
-                    "экраны ещё не получены".to_owned()
+                    text(lang, Key::TheDisplaysHaveNotArrivedYet).to_owned()
                 } else {
                     link.auto_displays.join(", ")
                 };
-                Some(format!(
-                    "Связь {}: Весь рабочий стол (авто) — {screens}",
-                    link.id
+                Some(fill_named(
+                    lang,
+                    Key::LinkTheWholeDesktopAutoScreens,
+                    &[("screens", &link.id)],
                 ))
             })
             .collect()
@@ -1537,8 +1580,9 @@ impl ViewModel {
     /// owner asked why. Who controls the keyboard is said in plain words, «владелец» being
     /// the core's word and not the owner's.
     pub fn member_lines(&self) -> Vec<String> {
+        let lang = self.look.language;
         let Some(status) = &self.status else {
-            return vec!["Нет данных от службы".to_owned()];
+            return vec![text(lang, Key::NoDataFromTheService).to_owned()];
         };
         let this = self.self_node().map(str::to_owned);
         let others: Vec<&protocol::ipc::MemberStatus> = status
@@ -1547,25 +1591,25 @@ impl ViewModel {
             .filter(|member| !self.is_this_computer(member, this.as_deref()))
             .collect();
         if others.is_empty() {
-            return vec!["Пока никого: откройте окно сопряжения".to_owned()];
+            return vec![text(lang, Key::NobodyYetOpenThePairingWindow).to_owned()];
         }
         others
             .into_iter()
             .map(|member| {
                 let name = if member.display_name.is_empty() {
-                    format!("компьютер {}", short_id(&member.node_id))
+                    fill(lang, Key::ComputerNamed, &[&short_id(&member.node_id)])
                 } else {
                     member.display_name.clone()
                 };
                 let state = if member.online {
-                    "в сети"
+                    text(lang, Key::Online)
                 } else {
-                    "не в сети"
+                    text(lang, Key::Offline)
                 };
                 let keyboard = if member.is_owner {
-                    "управляет клавиатурой"
+                    text(lang, Key::OwnsTheKeyboard)
                 } else {
-                    "не управляет клавиатурой"
+                    text(lang, Key::DoesNotOwnTheKeyboard)
                 };
                 format!("{name} — {state}, {keyboard}")
             })
@@ -1613,14 +1657,15 @@ impl ViewModel {
 
     /// The backend in the words the owner reads.
     pub fn backend_label(&self) -> String {
+        let lang = self.look.language;
         let Some(status) = &self.status else {
-            return "неизвестно".to_owned();
+            return text(lang, Key::Unknown).to_owned();
         };
         match status.backend.as_str() {
             "platform-win" => "Windows".to_owned(),
             "platform-x11" => "X11 (Xorg)".to_owned(),
             "platform-wayland" => "Wayland".to_owned(),
-            "" => "неизвестно".to_owned(),
+            "" => text(lang, Key::Unknown).to_owned(),
             other => other.to_owned(),
         }
     }
@@ -1644,18 +1689,22 @@ impl ViewModel {
 
     /// Who owns input, as the two lines the block shows.
     pub fn owner_lines(&self) -> (String, String) {
+        let lang = self.look.language;
         let Some(status) = &self.status else {
-            return ("нет данных от службы".to_owned(), String::new());
+            return (
+                text(lang, Key::NoDataFromTheService2).to_owned(),
+                String::new(),
+            );
         };
         // The serial is the one number in this block and the build spec asks for it small;
         // it is shown whoever owns input, because it is what a support question is about.
         let serial = if status.owner_serial == 0 {
             String::new()
         } else {
-            format!("сеанс владельца {}", status.owner_serial)
+            fill(lang, Key::TheOwnerSSession, &[&status.owner_serial])
         };
         if status.is_owner {
-            return ("Этот компьютер".to_owned(), serial);
+            return (text(lang, Key::ThisComputerTitle).to_owned(), serial);
         }
         let name = status
             .members
@@ -1663,7 +1712,7 @@ impl ViewModel {
             .find(|member| member.is_owner)
             .map(|member| {
                 if member.display_name.is_empty() {
-                    format!("компьютер {}", short_id(&member.node_id))
+                    fill(lang, Key::ComputerNamed, &[&short_id(&member.node_id)])
                 } else {
                     member.display_name.clone()
                 }
@@ -1672,20 +1721,25 @@ impl ViewModel {
                 if status.owner_node_id.is_empty() {
                     None
                 } else {
-                    Some(format!("компьютер {}", short_id(&status.owner_node_id)))
+                    Some(fill(
+                        lang,
+                        Key::ComputerNamed,
+                        &[&short_id(&status.owner_node_id)],
+                    ))
                 }
             })
-            .unwrap_or_else(|| "нет владельца".to_owned());
+            .unwrap_or_else(|| text(lang, Key::NoOwner).to_owned());
         (name, serial)
     }
 
     /// Why the core reports degraded input service, or `None` while it is healthy.
     pub fn agent_degraded_reason(&self) -> Option<&str> {
+        let lang = self.look.language;
         let status = self.status.as_ref()?;
         if !status.agent_degraded_reason.is_empty() {
             Some(status.agent_degraded_reason.as_str())
         } else if status.agent_restart_circuit_open {
-            Some("Служба ввода остановлена")
+            Some(text(lang, Key::TheInputServiceIsStopped))
         } else {
             None
         }
@@ -1693,35 +1747,48 @@ impl ViewModel {
 
     /// The «Ограничения и деградации» block (KVM-056): never invented, only `Status`.
     pub fn limits(&self) -> Vec<String> {
+        let lang = self.look.language;
         let Some(status) = &self.status else {
-            return vec!["Нет данных от службы".to_owned()];
+            return vec![text(lang, Key::NoDataFromTheService).to_owned()];
         };
         let mut lines = Vec::new();
         for code in &status.capabilities_unavailable {
             lines.push(match code.as_str() {
-                "EMERGENCY_HOTKEY" => "Нет аварийной клавиши: прервать захват клавиатуры на этом компьютере можно только мышью".to_owned(),
-                "RECEIVER_TAKEOVER" => "Физический ввод на этом компьютере не завершает сеанс автоматически — переключение только с источника".to_owned(),
-                "TEXT_CLIPBOARD" => "Общий буфер обмена недоступен".to_owned(),
-                "ABSOLUTE_POINTER" => "Этот компьютер не принимает абсолютное положение курсора".to_owned(),
-                "CAPTURE" => "Этот компьютер не может перехватывать ввод".to_owned(),
-                "INJECT" => "Этот компьютер не может вводить события".to_owned(),
-                other => format!("Ограничение: {other}"),
+                "EMERGENCY_HOTKEY" => text(
+                    lang,
+                    Key::NoEmergencyKeyTheKeyboardCanOnlyBeReleasedWithTheMouseHere,
+                )
+                .to_owned(),
+                "RECEIVER_TAKEOVER" => text(
+                    lang,
+                    Key::PhysicalInputHereDoesNotEndTheSessionByItselfOnlyTheSourceCanSwitch,
+                )
+                .to_owned(),
+                "TEXT_CLIPBOARD" => text(lang, Key::TheSharedClipboardIsUnavailable).to_owned(),
+                "ABSOLUTE_POINTER" => text(
+                    lang,
+                    Key::ThisComputerDoesNotAcceptAnAbsolutePointerPosition,
+                )
+                .to_owned(),
+                "CAPTURE" => text(lang, Key::ThisComputerCannotCaptureInput).to_owned(),
+                "INJECT" => text(lang, Key::ThisComputerCannotInjectEvents).to_owned(),
+                other => fill_named(lang, Key::LimitationOther, &[("other", &other)]),
             });
         }
         match status.portal_state.as_str() {
             "restoring" => lines.push(
-                "Разрешение портала восстанавливается из сохранённого токена; диалог не ожидается"
+                text(lang, Key::ThePortalGrantIsBeingRestoredFromTheSavedTokenNoDialogIsExpected)
                     .to_owned(),
             ),
             "permission_required" => lines.push(
-                "Ожидается диалог разрешения портала — подтвердите его, иначе узел не сможет принять ввод"
+                text(lang, Key::APortalPermissionDialogIsExpectedConfirmItOrThisNodeCannotTakeInput)
                     .to_owned(),
             ),
             "denied" => lines.push(
-                "Доступ отклонён в диалоге разрешения. Нажмите «Забыть разрешения порталов» в настройках и попробуйте снова"
+                text(lang, Key::AccessWasDeniedInThePermissionDialogPressForgetThePortalGrantsInTheSettingsAndTryAgain)
                     .to_owned(),
             ),
-            "unavailable" => lines.push("Порталы рабочего стола недоступны на этой системе".to_owned()),
+            "unavailable" => lines.push(text(lang, Key::DesktopPortalsAreUnavailableOnThisSystem).to_owned()),
             _ => {}
         }
         if status.backend == "platform-wayland" {
@@ -1730,13 +1797,18 @@ impl ViewModel {
             // above, if the core could not provide them: on Wayland where they *are*
             // provided (a desktop that supports them), this line must not claim otherwise.
             lines.push(
-                "Wayland: перехват ввода возможен только через порталы рабочего стола".to_owned(),
+                text(
+                    lang,
+                    Key::WaylandInputCanOnlyBeCapturedThroughDesktopPortals,
+                )
+                .to_owned(),
             );
         }
         if !status.last_error_code.is_empty() {
-            lines.push(format!(
-                "Последнее сообщение: {}",
-                code_label(&status.last_error_code)
+            lines.push(fill(
+                lang,
+                Key::LastMessage,
+                &[&code_label(lang, &status.last_error_code)],
             ));
         }
         lines
@@ -1744,19 +1816,22 @@ impl ViewModel {
 
     /// The latency line, or `None` while nobody measures it.
     pub fn delay_line(&self) -> Option<String> {
+        let lang = self.look.language;
         let status = self.status.as_ref()?;
         if status.rtt_p95_us == 0 {
             return None;
         }
-        Some(format!("Задержка: {} мс", status.rtt_p95_us / 1_000))
+        Some(fill(lang, Key::DelayMs, &[&(status.rtt_p95_us / 1_000)]))
     }
 
     /// «Открыть файл настроек»: `config.toml` in the system's editor; a failure is a toast.
     pub fn open_config_file(&mut self) {
+        let lang = self.look.language;
         if let Err(why) = open_in_editor(&self.config.config_file) {
-            self.set_outcome(Outcome::failed(format!(
-                "не удалось открыть файл настроек ({})",
-                short_error(&why)
+            self.set_outcome(Outcome::failed(fill(
+                lang,
+                Key::CouldNotOpenTheSettingsFile,
+                &[&short_error(&why)],
             )));
         }
     }
@@ -1811,7 +1886,7 @@ impl ViewModel {
     ///
     /// The schema is the one `crates/config` defines for `[topology]`
     /// (`docs/config.example.toml`), so the core parses it as
-    /// `config::TopologyConfig` and the file this text would be a section of parses as
+    /// `config::TopologyConfig` and the file this line would be a section of parses as
     /// `config::Config`: `revision > 0` needs an author, the floor never trails the applied
     /// revision, a link id is unique, an endpoint is `"self"` or `"peer:<64 hex digits>"`,
     /// and every segment is finite with `0 <= start < end`.
@@ -1936,18 +2011,21 @@ impl ViewModel {
     /// rules. A host with no resolved directories or no chosen address is refused in words
     /// rather than guessed at, and a failed write is a sentence with the reason in it.
     fn apply_lan_address(&mut self) {
+        let lang = self.look.language;
         let current = self.config.listen_address.clone();
         let chosen = self.settings.lan.selected(&current).unwrap_or_default();
         let Some(address) = chosen.parse::<std::net::Ipv4Addr>().ok() else {
-            self.settings.lan.applied = Some(Outcome::failed(
-                "адрес не выбран — выберите адрес в списке и нажмите «Применить» снова",
-            ));
+            self.settings.lan.applied = Some(Outcome::failed(text(
+                lang,
+                Key::NoAddressIsSelectedPickOneInTheListAndPressApplyAgain,
+            )));
             return;
         };
         let Some(paths) = self.config.paths.clone() else {
-            self.settings.lan.applied = Some(Outcome::failed(
-                "каталоги настроек не определены — перезапустите окно без особых параметров",
-            ));
+            self.settings.lan.applied = Some(Outcome::failed(text(
+                lang,
+                Key::TheSettingsDirectoriesAreUnknownRestartTheWindowWithoutSpecialFlags,
+            )));
             return;
         };
         match config::first_run::set_listen_address(&paths, address) {
@@ -1955,12 +2033,13 @@ impl ViewModel {
                 self.push_log(format!("Адрес этого компьютера: {address}"));
                 self.config.listen_address = address.to_string();
                 self.settings.lan.choice = None;
-                self.settings.lan.applied = Some(Outcome::done("Адрес сохранён"));
+                self.settings.lan.applied = Some(Outcome::done(text(lang, Key::TheAddressIsSaved)));
             }
             Err(why) => {
-                self.settings.lan.applied = Some(Outcome::failed(format!(
-                    "адрес не сохранён ({})",
-                    short_error(&why)
+                self.settings.lan.applied = Some(Outcome::failed(fill(
+                    lang,
+                    Key::TheAddressWasNotSaved,
+                    &[&short_error(&why)],
                 )));
             }
         }
@@ -1975,19 +2054,22 @@ impl ViewModel {
     /// What to do with the answer is the caller's: stopping a process is the one thing a
     /// view model cannot be handed back.
     pub fn begin_restart(&mut self, now: Instant) -> RestartStep {
+        let lang = self.look.language;
         if self.settings.service.restart.is_some() {
             return RestartStep::Refused;
         }
         let Some(core) = &self.core else {
-            self.settings.service.line = Some(Outcome::failed(
-                "служба запущена не этим окном — остановите её сами",
-            ));
+            self.settings.service.line = Some(Outcome::failed(text(
+                lang,
+                Key::TheServiceWasNotStartedByThisWindowStopItYourself,
+            )));
             return RestartStep::Refused;
         };
         let Some(pid) = core.pid else {
-            self.settings.service.line = Some(Outcome::failed(
-                "номер процесса службы неизвестен — остановите её сами",
-            ));
+            self.settings.service.line = Some(Outcome::failed(text(
+                lang,
+                Key::TheServiceSProcessIdIsUnknownStopItYourself,
+            )));
             return RestartStep::Refused;
         };
         if !self.connection.is_connected() {
@@ -2007,11 +2089,14 @@ impl ViewModel {
     /// alone. A stop that was sent leaves the [`Restart::Stopping`] wait standing, because
     /// only a dropped link proves the core is gone.
     pub fn on_core_stopped(&mut self, stopped: Result<(), String>) {
+        let lang = self.look.language;
         if let Err(why) = stopped {
             self.settings.service.restart = None;
             self.push_log(format!("Не удалось остановить службу: {why}"));
-            self.settings.service.line = Some(Outcome::failed(format!(
-                "не удалось остановить службу ({why})"
+            self.settings.service.line = Some(Outcome::failed(fill_named(
+                lang,
+                Key::CouldNotStopTheServiceWhy2,
+                &[("why", &"")],
             )));
         }
     }
@@ -2101,7 +2186,7 @@ pub enum Action {
     CancelDrag,
     /// Open `config.toml` in the system's default editor.
     OpenConfigFile,
-    /// The text of «Подключиться по адресу».
+    /// The line of «Подключиться по адресу».
     SetAddress(String),
     /// Open or close the fingerprints under the code (ADR-010).
     ToggleDetails(bool),
@@ -2474,6 +2559,7 @@ impl GuiClient {
     /// `endpoint` is `None` when the endpoint could not be resolved: the thread then only
     /// answers «не отправлено», which is exactly what the window says on that host.
     pub fn start(endpoint: Option<Endpoint>, launch: Launch) -> Self {
+        let lang = Lang::from_system();
         let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let wake = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -2491,7 +2577,11 @@ impl GuiClient {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = event_tx.send(GuiEvent::Disconnected {
-                            why: format!("не удалось запустить обмен со службой: {error}"),
+                            why: fill_named(
+                                lang,
+                                Key::CouldNotStartTalkingToTheServiceError,
+                                &[("error", &error)],
+                            ),
                         });
                         return;
                     }
@@ -2643,6 +2733,7 @@ async fn serve<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let lang = Lang::from_system();
     loop {
         // The frame is boxed as it leaves `recv`, and the error is turned into its text here,
         // so the value the `select!` returns is small: a `GuiFrame` is by far the largest
@@ -2676,9 +2767,12 @@ where
             Step::Command(Some(Command::StartCore)) => {
                 // A core is already answering here, so «Запустить» has nothing to do; saying
                 // so beats starting a second daemon.
-                let _ = events.send(GuiEvent::CoreStarted {
-                    started: Err("служба уже запущена и отвечает".to_owned()),
-                });
+                let _ =
+                    events.send(GuiEvent::CoreStarted {
+                        started: Err(
+                            text(lang, Key::TheServiceIsAlreadyRunningAndAnswering).to_owned()
+                        ),
+                    });
             }
         }
     }
@@ -2840,8 +2934,9 @@ fn own_program() -> PathBuf {
 
 /// Opens `file` in the system's default editor: `explorer` on Windows, `xdg-open` on Linux.
 pub fn open_in_editor(file: &Path) -> Result<(), String> {
+    let lang = Lang::from_system();
     if file.as_os_str().is_empty() || !file.exists() {
-        return Err("файл настроек не найден".to_owned());
+        return Err(text(lang, Key::TheSettingsFileWasNotFound).to_owned());
     }
     let opener = if cfg!(windows) {
         "explorer"
@@ -2873,6 +2968,7 @@ pub fn open_in_editor(file: &Path) -> Result<(), String> {
 /// The outcome is the window's to report: [`ViewModel::on_core_stopped`] says why in words
 /// when the stop could not be sent at all.
 pub fn stop_core(pid: u32) -> Result<(), String> {
+    let lang = Lang::from_system();
     #[cfg(windows)]
     let (program, mut command) = {
         let mut command = std::process::Command::new("taskkill");
@@ -2900,13 +2996,33 @@ pub fn stop_core(pid: u32) -> Result<(), String> {
         .stderr(std::process::Stdio::null());
     match command.status() {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!(
-            "{program} не остановил процесс {pid} (код {})",
-            status
-                .code()
-                .map_or("неизвестен".to_owned(), |code| code.to_string())
+        Ok(status) => Err(fill_named(
+            lang,
+            Key::ProgramDidNotStopProcessPidCode,
+            &[
+                (
+                    "program",
+                    &status
+                        .code()
+                        .map_or(text(lang, Key::Unknown2).to_owned(), |code| {
+                            code.to_string()
+                        }),
+                ),
+                (
+                    "pid",
+                    &status
+                        .code()
+                        .map_or(text(lang, Key::Unknown2).to_owned(), |code| {
+                            code.to_string()
+                        }),
+                ),
+            ],
         )),
-        Err(error) => Err(format!("{program} не запустился: {error}")),
+        Err(error) => Err(fill_named(
+            lang,
+            Key::ProgramDidNotStartError,
+            &[("program", &program), ("error", &error)],
+        )),
     }
 }
 
@@ -2959,6 +3075,7 @@ pub fn boot(args: CliArgs) -> (ViewModel, GuiClient) {
 /// [`boot`] with the executable the window starts its core from named explicitly: an
 /// integration test is not `multideskflow`, so it points at the real binary.
 pub fn boot_with_program(args: CliArgs, program: PathBuf) -> (ViewModel, GuiClient) {
+    let lang = Lang::from_system();
     let launch = Launch {
         program,
         flags: args.flags(),
@@ -2968,13 +3085,18 @@ pub fn boot_with_program(args: CliArgs, program: PathBuf) -> (ViewModel, GuiClie
         Err(why) => {
             let mut view = ViewModel::new(
                 CoreEndpoint::Failed {
-                    why: format!("не удалось определить каталоги: {why}"),
+                    why: fill_named(
+                        lang,
+                        Key::CouldNotWorkOutTheDirectoriesWhy,
+                        &[("why", &why)],
+                    ),
                 },
                 LocalConfig::default(),
             );
-            view.push_log(format!(
-                "Не удалось определить каталоги: {}",
-                short_error(&why)
+            view.push_log(fill(
+                lang,
+                Key::CouldNotWorkOutTheDirectories,
+                &[&short_error(&why)],
             ));
             return (view, GuiClient::start(None, launch));
         }
@@ -3095,11 +3217,11 @@ fn short_key(node_id: &str) -> String {
 }
 
 /// A node id as a sentence fragment.
-fn author_label(author: &str) -> String {
+fn author_label(lang: Lang, author: &str) -> String {
     if author.is_empty() {
-        "неизвестно".to_owned()
+        text(lang, Key::Unknown).to_owned()
     } else {
-        format!("компьютер {}", short_id(author))
+        fill(lang, Key::ComputerNamed, &[&short_id(author)])
     }
 }
 
@@ -3152,68 +3274,68 @@ fn message_name(msg: &Msg) -> &'static str {
 }
 
 /// What a code means, in a sentence the owner can act on.
-fn code_label(code: &str) -> String {
+fn code_label(lang: Lang, code: &str) -> String {
     match code {
-        "" => "без кода".to_owned(),
-        "EMERGENCY_HOTKEY" => "нет аварийной клавиши".to_owned(),
-        "RECEIVER_TAKEOVER" => "нет завершения сеанса по физическому вводу".to_owned(),
-        "TEXT_CLIPBOARD" => "общий буфер обмена недоступен".to_owned(),
-        "ABSOLUTE_POINTER" => "нет абсолютного курсора".to_owned(),
-        "CAPTURE" => "нет перехвата ввода".to_owned(),
-        "INJECT" => "нет ввода событий".to_owned(),
-        "LAYOUT_CONFLICT" => "раскладку изменили на другом компьютере".to_owned(),
-        "INVALID_TOPOLOGY" => "документ раскладки неверный".to_owned(),
-        "NO_COORDINATOR" => "нет координатора (владельца)".to_owned(),
-        "PENDING_VERDICT" => "координатор не подтвердил правку".to_owned(),
-        "UNKNOWN_EDIT" => "такой правки больше нет".to_owned(),
-        "UNKNOWN_PEER" => "этот компьютер не в паре".to_owned(),
-        "TRUST_WRITE" => "не удалось записать список пар".to_owned(),
-        "CLIPBOARD_DISABLED" => "буфер обмена не включился".to_owned(),
-        "EXPORT_FAILED" => "не удалось записать файл диагностики".to_owned(),
-        "PAIRING_FAILED" => "не удалось договориться о сопряжении".to_owned(),
-        "PAIRING_GONE" => "окно сопряжения уже закрылось".to_owned(),
-        "PAIRING_WINDOW_OPEN" => "окно сопряжения уже открыто".to_owned(),
-        "NO_WINDOW" => "окно сопряжения не открыто".to_owned(),
-        "BAD_ADDRESS" => "адрес неверный".to_owned(),
-        "UNKNOWN_ATTEMPT" => "это сопряжение уже не ждёт ответа".to_owned(),
-        "CLAIM_REFUSED" => "взять управление не получилось".to_owned(),
-        "SWITCH_REFUSED" => "переключение не получилось".to_owned(),
-        "PORTAL_STORE" => "порталы не ответили".to_owned(),
-        "AGENT_LOST" => "агент ввода потерян".to_owned(),
-        "BAD_REQUEST" => "ядро не поняло запрос".to_owned(),
-        other => format!("код {other}"),
+        "" => text(lang, Key::NoCode).to_owned(),
+        "EMERGENCY_HOTKEY" => text(lang, Key::NoEmergencyKey).to_owned(),
+        "RECEIVER_TAKEOVER" => text(lang, Key::TheSessionCannotBeEndedWithPhysicalInput).to_owned(),
+        "TEXT_CLIPBOARD" => text(lang, Key::TheSharedClipboardIsUnavailable2).to_owned(),
+        "ABSOLUTE_POINTER" => text(lang, Key::NoAbsolutePointer).to_owned(),
+        "CAPTURE" => text(lang, Key::InputCannotBeCaptured).to_owned(),
+        "INJECT" => text(lang, Key::EventsCannotBeInjected).to_owned(),
+        "LAYOUT_CONFLICT" => text(lang, Key::TheLayoutWasChangedOnAnotherComputer).to_owned(),
+        "INVALID_TOPOLOGY" => text(lang, Key::TheLayoutDocumentIsInvalid).to_owned(),
+        "NO_COORDINATOR" => text(lang, Key::ThereIsNoCoordinatorOwner).to_owned(),
+        "PENDING_VERDICT" => text(lang, Key::TheCoordinatorDidNotConfirmTheEdit).to_owned(),
+        "UNKNOWN_EDIT" => text(lang, Key::ThatEditIsGone).to_owned(),
+        "UNKNOWN_PEER" => text(lang, Key::ThisComputerIsNotPaired).to_owned(),
+        "TRUST_WRITE" => text(lang, Key::CouldNotWriteThePeerList).to_owned(),
+        "CLIPBOARD_DISABLED" => text(lang, Key::TheClipboardDidNotTurnOn).to_owned(),
+        "EXPORT_FAILED" => text(lang, Key::CouldNotWriteTheDiagnosticsFile).to_owned(),
+        "PAIRING_FAILED" => text(lang, Key::ThePairingCouldNotBeAgreed).to_owned(),
+        "PAIRING_GONE" => text(lang, Key::ThePairingWindowIsAlreadyClosed).to_owned(),
+        "PAIRING_WINDOW_OPEN" => text(lang, Key::ThePairingWindowIsAlreadyOpen).to_owned(),
+        "NO_WINDOW" => text(lang, Key::ThePairingWindowIsNotOpen).to_owned(),
+        "BAD_ADDRESS" => text(lang, Key::TheAddressIsWrong).to_owned(),
+        "UNKNOWN_ATTEMPT" => text(lang, Key::ThisPairingIsNoLongerWaitingForAnAnswer).to_owned(),
+        "CLAIM_REFUSED" => text(lang, Key::TakingControlDidNotWork).to_owned(),
+        "SWITCH_REFUSED" => text(lang, Key::TheSwitchDidNotWork).to_owned(),
+        "PORTAL_STORE" => text(lang, Key::ThePortalsDidNotAnswer).to_owned(),
+        "AGENT_LOST" => text(lang, Key::TheInputAgentIsGone).to_owned(),
+        "BAD_REQUEST" => text(lang, Key::TheCoreDidNotUnderstandTheRequest).to_owned(),
+        other => fill_named(lang, Key::CodeOther, &[("other", &other)]),
     }
 }
 
 /// The sentence a successful request is reported with.
-fn success_text(request: Request) -> String {
+fn success_text(lang: Lang, request: Request) -> String {
     match request {
-        Request::Claim => "управление у этого компьютера".to_owned(),
-        Request::Abandon => "управление отдано".to_owned(),
-        Request::PairWith => "подключение начато".to_owned(),
-        Request::PairingAnswer => "ответ отправлен".to_owned(),
-        Request::UpdateTopology => "раскладка сохранена".to_owned(),
-        Request::SetClipboard => "буфер обмена переключён".to_owned(),
-        Request::SetAppearance => "эффекты краёв переключены".to_owned(),
-        Request::RevokePeer => "компьютер удалён из пары".to_owned(),
-        Request::ResetPortalGrants => "разрешения порталов забыты".to_owned(),
-        Request::RetryAgent => "повторный запуск службы ввода начат".to_owned(),
-        Request::Shutdown => "остановка службы начата".to_owned(),
-        Request::ExportDiagnostics => "диагностика сохранена".to_owned(),
-        Request::StartPairing => "окно сопряжения открыто".to_owned(),
-        Request::GetStatus | Request::GetTopology => "ядро ответило".to_owned(),
+        Request::Claim => text(lang, Key::ThisComputerHasControl).to_owned(),
+        Request::Abandon => text(lang, Key::ControlWasGivenBack).to_owned(),
+        Request::PairWith => text(lang, Key::Connecting).to_owned(),
+        Request::PairingAnswer => text(lang, Key::TheAnswerWasSent).to_owned(),
+        Request::UpdateTopology => text(lang, Key::TheLayoutIsSaved).to_owned(),
+        Request::SetClipboard => text(lang, Key::TheClipboardWasSwitched).to_owned(),
+        Request::SetAppearance => text(lang, Key::TheEdgeEffectsWereSwitched).to_owned(),
+        Request::RevokePeer => text(lang, Key::TheComputerWasRemovedFromThePair).to_owned(),
+        Request::ResetPortalGrants => text(lang, Key::ThePortalGrantsWereForgotten).to_owned(),
+        Request::RetryAgent => text(lang, Key::TheInputServiceIsStartingAgain).to_owned(),
+        Request::Shutdown => text(lang, Key::TheServiceIsStopping2).to_owned(),
+        Request::ExportDiagnostics => text(lang, Key::TheDiagnosticsAreSaved).to_owned(),
+        Request::StartPairing => text(lang, Key::ThePairingWindowIsOpen).to_owned(),
+        Request::GetStatus | Request::GetTopology => text(lang, Key::TheCoreAnswered).to_owned(),
     }
 }
 
 /// The sentence a failed request is reported with.
-fn failure_text(request: Request, code: &str) -> String {
-    let label = code_label(code);
+fn failure_text(lang: Lang, request: Request, code: &str) -> String {
+    let label = code_label(lang, code);
     match request {
         Request::UpdateTopology if code == "LAYOUT_CONFLICT" => {
-            "раскладку изменили на другом компьютере — перетащите ещё раз".to_owned()
+            text(lang, Key::TheLayoutWasChangedOnAnotherComputerDragItAgain).to_owned()
         }
         Request::PairingAnswer if code == "PAIRING_FAILED" => {
-            "коды не совпали или партнёр отказался".to_owned()
+            text(lang, Key::TheCodesDidNotMatchOrThePartnerRefused).to_owned()
         }
         _ => label,
     }

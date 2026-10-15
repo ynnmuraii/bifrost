@@ -2224,6 +2224,7 @@ dependencies = [
  "serde",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
+ "ui-text",
  "windows-sys 0.61.2",
  "winit",
 ]
@@ -2238,6 +2239,7 @@ dependencies = [
  "lws-desktop",
  "protocol",
  "tokio",
+ "ui-text",
  "windows-sys 0.61.2",
 ]
 
@@ -4386,6 +4388,14 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui-text"
+version = "0.0.0"
+dependencies = [
+ "serde",
  "windows-sys 0.61.2",
 ]
 

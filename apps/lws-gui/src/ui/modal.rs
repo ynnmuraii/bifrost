@@ -17,6 +17,7 @@ use super::widgets::{self, Icon, Kind};
 use super::{act, UiState};
 use crate::gui_settings::Theme;
 use crate::view_model::{Action, Modal, ViewModel};
+use ui_text::{fill, text, Key, Lang};
 
 /// The reveal time of a dialog, seconds.
 const OPEN_FOR: f32 = 0.32;
@@ -35,6 +36,7 @@ pub fn draw(
     t: f32,
     actions: &mut Vec<Action>,
 ) {
+    let lang = vm.look.language;
     let Some(modal) = vm.modal else {
         st.modal_open = None;
         return;
@@ -105,7 +107,7 @@ pub fn draw(
     dialog.set_clip_rect(reveal.intersect(full));
     dialog.spacing_mut().item_spacing = Vec2::ZERO;
 
-    header(dialog, pal, modal, rect, progress, actions);
+    header(dialog, pal, lang, modal, rect, progress, actions);
     /// The height of a dialog's footer.
     const FOOT_H: f32 = 72.0;
     // Only the dialogs with an action of their own have a footer; one that held nothing but
@@ -153,7 +155,7 @@ pub fn draw(
                 act(
                     ui,
                     pal,
-                    "Открыть окно сопряжения",
+                    text(lang, Key::OpenThePairingWindow2),
                     Kind::Hot,
                     vm.connection.is_connected(),
                     actions,
@@ -164,7 +166,7 @@ pub fn draw(
                 act(
                     ui,
                     pal,
-                    "Открыть файл настроек",
+                    text(lang, Key::OpenTheSettingsFile),
                     Kind::Solid,
                     true,
                     actions,
@@ -190,6 +192,7 @@ fn has_footer(modal: Modal) -> bool {
 fn header(
     ui: &mut egui::Ui,
     pal: &Palette,
+    lang: Lang,
     modal: Modal,
     rect: Rect,
     progress: f32,
@@ -220,7 +223,7 @@ fn header(
     painter.galley(num.center() - galley.size() / 2.0, galley, pal.ink);
     // Title and the «load» line: `mdf layout [########################] ok · sub`.
     let title = painter.layout_no_wrap(
-        modal.title().to_owned(),
+        modal.title(lang).to_owned(),
         font(24.0, fam::sans_semibold()),
         pal.ink,
     );
@@ -248,7 +251,7 @@ fn header(
     if show_done {
         job.append("ok", 0.0, mono(pal.ink, fam::mono_medium()));
         job.append(
-            &format!(" · {}", modal.subtitle()),
+            &format!(" · {}", modal.subtitle(lang)),
             0.0,
             mono(pal.ink2, fam::mono()),
         );
@@ -362,6 +365,7 @@ fn footer(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
+    let lang = vm.look.language;
     let peers = vm.peers();
     for (index, peer) in peers.iter().enumerate() {
         let left = ui.max_rect().left();
@@ -406,14 +410,14 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
         // State and the delete button, right-aligned.
         let asking = vm.settings.revoke.as_deref() == Some(peer.node_id.as_str());
         let label = if peer.online {
-            "в сети"
+            text(lang, Key::Online)
         } else {
-            "не в сети"
+            text(lang, Key::Offline)
         };
         let state = painter.layout_no_wrap(label.to_owned(), font(12.0, fam::mono()), pal.ink2);
         let button_w = painter
             .layout_no_wrap(
-                "Удалить".to_owned(),
+                text(lang, Key::Remove).to_owned(),
                 font(13.0, fam::sans_medium()),
                 Color32::WHITE,
             )
@@ -443,7 +447,15 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
                 .id_salt(("peer", &peer.node_id))
                 .max_rect(button),
         );
-        if widgets::button(&mut child, pal, "Удалить", Kind::Plain, !asking).clicked() {
+        if widgets::button(
+            &mut child,
+            pal,
+            text(lang, Key::Remove),
+            Kind::Plain,
+            !asking,
+        )
+        .clicked()
+        {
             actions.push(Action::SelectRevoke(Some(peer.node_id.clone())));
         }
         ui.allocate_space(Vec2::new(right - left, 14.0 + 44.0 + 16.0));
@@ -455,9 +467,10 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
                     widgets::warn(ui, pal, |ui| {
                         widgets::wrapped(
                             ui,
-                            &format!(
-                                "Удалить «{}» из пары? Сопрягать придётся заново.",
-                                peer.name
+                            &fill(
+                                lang,
+                                Key::RemoveFromThePairYouWillHaveToPairAgain,
+                                &[&peer.name],
                             ),
                             14.0,
                             fam::sans(),
@@ -467,15 +480,21 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
                             act(
                                 ui,
                                 pal,
-                                "Да, удалить",
+                                text(lang, Key::YesRemove),
                                 Kind::Hot,
                                 true,
                                 actions,
                                 || Action::RevokePeer(crate::view_model::node_id_bytes(&id)),
                             );
-                            act(ui, pal, "Отмена", Kind::Plain, true, actions, || {
-                                Action::SelectRevoke(None)
-                            });
+                            act(
+                                ui,
+                                pal,
+                                text(lang, Key::Cancel),
+                                Kind::Plain,
+                                true,
+                                actions,
+                                || Action::SelectRevoke(None),
+                            );
                         });
                     });
                 });
@@ -493,10 +512,10 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
         }
     }
     if peers.is_empty() {
-        row(ui, pal, "Пусто", true, |ui| {
+        row(ui, pal, text(lang, Key::Empty), true, |ui| {
             widgets::text(
                 ui,
-                "Пока никого: откройте окно сопряжения.",
+                text(lang, Key::NobodyYetOpenThePairingWindow2),
                 14.0,
                 fam::sans(),
                 pal.ink,
@@ -506,6 +525,7 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
 }
 
 fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
+    let lang = vm.look.language;
     let emergency = vm
         .status
         .as_ref()
@@ -513,13 +533,13 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
         .filter(|s| !s.is_empty())
         .unwrap_or(vm.config.emergency_hotkey.as_str());
     let missing = vm.capability_missing("EMERGENCY_HOTKEY");
-    row(ui, pal, "Аварийная", true, |ui| {
+    row(ui, pal, text(lang, Key::Emergency), true, |ui| {
         widgets::chord(ui, pal, emergency);
         if missing {
             widgets::warn(ui, pal, |ui| {
                 widgets::wrapped(
                     ui,
-                    "На этой системе аварийная клавиша недоступна: прервать захват клавиатуры можно только мышью.",
+                    text(lang, Key::TheEmergencyKeyIsUnavailableOnThisSystemTheKeyboardCanOnlyBeReleasedWithTheMouse),
                     12.0,
                     fam::sans(),
                     pal.ink,
@@ -529,7 +549,7 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
             widgets::warn(ui, pal, |ui| {
                 widgets::wrapped(
                     ui,
-                    "Всегда возвращает мышь и клавиатуру этому компьютеру — даже если служба зависла.",
+                    text(lang, Key::AlwaysGivesTheMouseAndKeyboardBackToThisComputerEvenIfTheServiceIsStuck),
                     12.0,
                     fam::sans(),
                     pal.ink,
@@ -540,37 +560,49 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
 }
 
 fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
+    let lang = vm.look.language;
     let pending = vm.settings.clipboard_pending;
     let on = pending.unwrap_or_else(|| vm.status.as_ref().is_some_and(|s| s.clipboard_enabled));
     // A backend that cannot deliver the clipboard is told so by the core: the toggle is then
     // not offered at all, because a switch that does nothing is worse than no switch.
     let missing = vm.capability_missing("TEXT_CLIPBOARD");
-    row(ui, pal, "Общий буфер", false, |ui| {
+    row(ui, pal, text(lang, Key::SharedClipboard), false, |ui| {
         let enabled = vm.connection.is_connected() && pending.is_none() && !missing;
         ui.add_enabled_ui(enabled, |ui| {
-            if let Some(i) = widgets::seg(ui, pal, &["Включён", "Выключен"], usize::from(!on))
-            {
+            if let Some(i) = widgets::seg(
+                ui,
+                pal,
+                &[text(lang, Key::On), text(lang, Key::Off)],
+                usize::from(!on),
+            ) {
                 actions.push(Action::SetClipboard(i == 0));
             }
         });
-        let text = if pending.is_some() {
-            "Применяем…"
+        let line = if pending.is_some() {
+            text(lang, Key::Applying)
         } else if missing {
-            "Эта система не может передавать содержимое буфера обмена"
+            text(lang, Key::ThisSystemCannotCarryTheClipboard)
         } else if on {
-            "Текст можно копировать на одном компьютере и вставлять на другом"
+            text(lang, Key::TextCanBeCopiedOnOneComputerAndPastedOnTheOther)
         } else {
-            "Общий буфер обмена выключен"
+            text(lang, Key::TheSharedClipboardIsOff)
         };
-        widgets::wrapped(ui, text, 13.0, fam::sans(), pal.ink);
+        widgets::wrapped(ui, line, 13.0, fam::sans(), pal.ink);
         if missing {
-            widgets::hint(ui, pal, "Служба сообщила: общий буфер обмена недоступен");
+            widgets::hint(
+                ui,
+                pal,
+                text(
+                    lang,
+                    Key::TheServiceReportedThatTheSharedClipboardIsUnavailable,
+                ),
+            );
         }
     });
-    row(ui, pal, "Что передаётся", true, |ui| {
+    row(ui, pal, text(lang, Key::WhatIsCarried), true, |ui| {
         widgets::wrapped(
             ui,
-            "Только текст. Файлы и изображения — нет.",
+            text(lang, Key::TextOnlyNoFilesNoImages),
             14.0,
             fam::sans(),
             pal.ink,
@@ -578,42 +610,46 @@ fn clip_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
         widgets::hint(
             ui,
             pal,
-            "Содержимое буфера не попадает в отчёты диагностики",
+            text(lang, Key::TheClipboardNeverReachesTheDiagnosticsReports),
         );
     });
 }
 
 fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
-    row(ui, pal, "Отчёт", false, |ui| {
+    let lang = vm.look.language;
+    row(ui, pal, text(lang, Key::Report), false, |ui| {
         act(
             ui,
             pal,
-            "Сохранить диагностику",
+            text(lang, Key::SaveTheDiagnostics2),
             Kind::Solid,
             vm.connection.is_connected(),
             actions,
             || Action::ExportDiagnostics(String::new()),
         );
-        let text = match &vm.settings.export {
-            Some(outcome) => outcome.line(),
-            None => "Отчёт ещё не сохранялся".to_owned(),
+        let line = match &vm.settings.export {
+            Some(outcome) => outcome.line(lang),
+            None => text(lang, Key::NoReportHasBeenSavedYet).to_owned(),
         };
-        widgets::wrapped(ui, &text, 13.0, fam::sans(), pal.ink);
+        widgets::wrapped(ui, &line, 13.0, fam::sans(), pal.ink);
         widgets::hint(
             ui,
             pal,
-            "Служба запишет отчёт без ключей и содержимого буфера обмена",
+            text(
+                lang,
+                Key::TheServiceWritesTheReportWithoutKeysAndWithoutTheClipboard,
+            ),
         );
     });
-    row(ui, pal, "Каталог", false, |ui| {
+    row(ui, pal, text(lang, Key::Directory), false, |ui| {
         let dir = vm.config.state_dir.display().to_string();
-        let text = if dir.is_empty() {
-            "каталог состояния службы не определён".to_owned()
+        let line = if dir.is_empty() {
+            text(lang, Key::TheServiceSStateDirectoryIsUnknown).to_owned()
         } else {
             dir
         };
         let galley = ui.painter().layout(
-            text,
+            line,
             font(12.0, fam::mono()),
             pal.ink2,
             ui.available_width(),
@@ -621,12 +657,12 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
         widgets::show_galley(ui, galley);
     });
     if let Some(reason) = vm.agent_degraded_reason() {
-        row(ui, pal, "Служба ввода", false, |ui| {
+        row(ui, pal, text(lang, Key::InputService), false, |ui| {
             widgets::wrapped(ui, reason, 14.0, fam::sans(), pal.ink);
             act(
                 ui,
                 pal,
-                "Повторить запуск",
+                text(lang, Key::StartAgain),
                 Kind::Plain,
                 vm.connection.is_connected(),
                 actions,
@@ -636,10 +672,10 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
     }
     let lines = vm.limits();
     let delay = vm.delay_line();
-    row(ui, pal, "Состояние", true, |ui| {
+    row(ui, pal, text(lang, Key::State2), true, |ui| {
         widgets::text(
             ui,
-            &format!("Связь: {}", vm.link_line()),
+            &fill(lang, Key::Link, &[&vm.link_line()]),
             13.0,
             fam::sans(),
             pal.ink,
@@ -654,8 +690,9 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 }
 
 fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
+    let lang = vm.look.language;
     let current = vm.config.listen_address.clone();
-    row(ui, pal, "Адрес в LAN", false, |ui| {
+    row(ui, pal, text(lang, Key::LANAddress), false, |ui| {
         let options = vm.settings.lan.options(&current);
         let selected = vm.settings.lan.selected(&current).unwrap_or_default();
         widgets::duo(ui, |ui| {
@@ -670,7 +707,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             act(
                 ui,
                 pal,
-                "Применить",
+                text(lang, Key::Apply),
                 Kind::Plain,
                 !selected.is_empty(),
                 actions,
@@ -678,66 +715,77 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             );
         });
         if let Some(applied) = &vm.settings.lan.applied {
-            widgets::wrapped(ui, &applied.line(), 13.0, fam::sans(), pal.ink);
+            widgets::wrapped(ui, &applied.line(lang), 13.0, fam::sans(), pal.ink);
         }
         widgets::hint(
             ui,
             pal,
-            "После «Применить» служба перезапустится с новым адресом",
+            text(lang, Key::AfterApplyTheServiceRestartsOnTheNewAddress),
         );
     });
-    row(ui, pal, "Служба", !vm.uses_portals(), |ui| {
-        let busy = vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
-        widgets::duo(ui, |ui| {
-            act(
-                ui,
-                pal,
-                "Перезапустить",
-                Kind::Plain,
-                !busy,
-                actions,
-                || Action::RestartCore,
-            );
-            act(
-                ui,
-                pal,
-                "Остановить",
-                Kind::Plain,
-                vm.connection.is_connected() && !busy,
-                actions,
-                || Action::StopCore,
-            );
-        });
-        if let Some(line) = &vm.settings.service.line {
-            widgets::wrapped(ui, &line.line(), 13.0, fam::sans(), pal.ink);
-        }
-        if vm.settings.first_run {
-            widgets::hint(ui, pal, "Настройки созданы автоматически (config.toml).");
-            act(
-                ui,
-                pal,
-                "Понятно",
-                Kind::Plain,
-                true,
-                actions,
-                || Action::DismissFirstRun,
-            );
-        }
-    });
+    row(
+        ui,
+        pal,
+        text(lang, Key::Service),
+        !vm.uses_portals(),
+        |ui| {
+            let busy =
+                vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
+            widgets::duo(ui, |ui| {
+                act(
+                    ui,
+                    pal,
+                    text(lang, Key::Restart),
+                    Kind::Plain,
+                    !busy,
+                    actions,
+                    || Action::RestartCore,
+                );
+                act(
+                    ui,
+                    pal,
+                    text(lang, Key::Stop),
+                    Kind::Plain,
+                    vm.connection.is_connected() && !busy,
+                    actions,
+                    || Action::StopCore,
+                );
+            });
+            if let Some(line) = &vm.settings.service.line {
+                widgets::wrapped(ui, &line.line(lang), 13.0, fam::sans(), pal.ink);
+            }
+            if vm.settings.first_run {
+                widgets::hint(
+                    ui,
+                    pal,
+                    text(lang, Key::TheSettingsWereCreatedAutomaticallyConfigToml2),
+                );
+                act(
+                    ui,
+                    pal,
+                    text(lang, Key::Understood),
+                    Kind::Plain,
+                    true,
+                    actions,
+                    || Action::DismissFirstRun,
+                );
+            }
+        },
+    );
     // Portals are a Wayland desktop's, and only a Wayland desktop's: a window on Windows or
     // X11 has nothing to forget and does not show the row at all.
     if vm.uses_portals() {
-        row(ui, pal, "Порталы", true, |ui| {
+        row(ui, pal, text(lang, Key::Portals), true, |ui| {
             act(
                 ui,
                 pal,
-                "Забыть разрешения порталов",
+                text(lang, Key::ForgetThePortalGrants2),
                 Kind::Plain,
                 vm.connection.is_connected(),
                 actions,
                 || Action::ResetPortalGrants,
             );
-            widgets::hint(ui, pal, "Служба попросит разрешения заново");
+            widgets::hint(ui, pal, text(lang, Key::TheServiceWillAskForTheGrantsAgain));
         });
     }
 }

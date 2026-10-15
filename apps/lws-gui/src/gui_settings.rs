@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use ui_text::Lang;
 
 /// The file name inside the configuration directory.
 pub const FILE_NAME: &str = "gui.toml";
@@ -61,6 +62,8 @@ pub enum LinkStyle {
 /// The look of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Look {
+    /// The language of the window, and of the tray that reads the same file.
+    pub language: Lang,
     /// The theme.
     pub theme: Theme,
     /// The particle field.
@@ -96,6 +99,7 @@ const SPEED_LIVE: f32 = 1.8;
 impl Default for Look {
     fn default() -> Self {
         Look {
+            language: Lang::default(),
             theme: Theme::default(),
             field: FieldMode::default(),
             speed: SPEED_DEFAULT,
@@ -133,6 +137,8 @@ impl Pace {
 #[derive(Deserialize)]
 #[serde(default)]
 struct Stored {
+    /// `None` in a file of the window before it had a language: the system's own.
+    language: Option<Lang>,
     theme: Theme,
     field: FieldMode,
     clouds: bool,
@@ -151,6 +157,7 @@ impl Default for Stored {
     fn default() -> Self {
         let look = Look::default();
         Stored {
+            language: None,
             theme: look.theme,
             field: look.field,
             clouds: look.clouds,
@@ -168,6 +175,7 @@ impl Default for Stored {
 impl From<Stored> for Look {
     fn from(stored: Stored) -> Look {
         Look {
+            language: stored.language.unwrap_or_else(Lang::from_system),
             theme: stored.theme,
             field: stored.field,
             // A file with both says the speed; one with neither is a file of the pace era.
@@ -196,19 +204,21 @@ pub fn path_in(config_dir: &Path) -> PathBuf {
     config_dir.join(FILE_NAME)
 }
 
-/// Reads the settings; anything that is not a valid file is the defaults.
+/// Reads the settings; anything that is not a valid file is the defaults, with the language
+/// this system is set to rather than the stored one.
 pub fn load(path: &Path) -> Look {
-    std::fs::read_to_string(path)
+    let stored = std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| toml::from_str(&text).ok())
-        .map(|mut look: Look| {
-            look.zoom_percent = look.zoom_percent.clamp(70, 150);
-            look.speed = look.speed.clamp(SPEED_MIN, SPEED_MAX);
-            look.pan_x = look.pan_x.clamp(-PAN_MAX, PAN_MAX);
-            look.pan_y = look.pan_y.clamp(-PAN_MAX, PAN_MAX);
-            look
-        })
-        .unwrap_or_default()
+        .and_then(|text| toml::from_str::<Look>(&text).ok());
+    let mut look = stored.unwrap_or(Look {
+        language: Lang::from_system(),
+        ..Look::default()
+    });
+    look.zoom_percent = look.zoom_percent.clamp(70, 150);
+    look.speed = look.speed.clamp(SPEED_MIN, SPEED_MAX);
+    look.pan_x = look.pan_x.clamp(-PAN_MAX, PAN_MAX);
+    look.pan_y = look.pan_y.clamp(-PAN_MAX, PAN_MAX);
+    look
 }
 
 /// Writes the settings through a temporary file, so a crash never leaves half of one.
