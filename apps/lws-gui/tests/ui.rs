@@ -375,11 +375,7 @@ fn an_idle_window_asks_for_no_frame_and_an_animated_one_for_thirty_a_second() {
     vm.local(&Action::ToggleModal(Modal::Keys));
     let frame = harness.settle(&vm, true);
     assert_eq!(frame.output.repaint_after, None);
-    assert_eq!(
-        harness.state.field.displacement(),
-        0.0,
-        "a covered map rests"
-    );
+    assert!(harness.state.field.displacement() > 20.0, "a covered map freezes");
 }
 
 #[test]

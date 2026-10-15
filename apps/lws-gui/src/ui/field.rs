@@ -6,8 +6,8 @@
 //!   allocates nothing here;
 //! * glyphs are laid out once per scale factor ([`Glyphs`]); particles share those galleys,
 //!   clouds, particles and ASCII links each submit a lazy iterator under one painter lock;
-//! * the clouds are rebuilt at most every [`CLOUD_EVERY`] seconds while the field moves (and
-//!   only when the pointer moves while it is still), never on a plain repaint;
+//! * the clouds are rebuilt at most every [`CLOUD_EVERY`] seconds while the field moves;
+//!   pausing preserves both layers and their animation clock, even on unrelated repaints;
 //! * nothing here schedules a repaint: [`crate::app`] does, and only while the window is
 //!   visible and focused, at most 30 times a second — and only while the field is still
 //!   moving. [`Field::paint`] says whether it is.
@@ -50,7 +50,7 @@ const RAMP_LIGHT: &[char] = &[' ', '.', '.', '·', ':', ';', '+', '*', '%', '#',
 const GLYPH_SET: &str = ".,:;-=+*#%@·|•";
 
 /// One particle: its home, where it is, and what it is doing.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Particle {
     hx: f32,
     hy: f32,
@@ -67,7 +67,7 @@ struct Particle {
 }
 
 /// One cell of the clouds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Cell {
     x: f32,
     y: f32,
@@ -164,10 +164,11 @@ pub struct Field {
     glyphs11: Glyphs,
     last_t: f32,
     last_cloud: f32,
-    cloud_key: Option<(Theme, bool, bool, bool)>,
-    moved: bool,
+    cloud_key: Option<(Theme, bool)>,
     was_simulating: bool,
+    animation_t: f32,
     shaped: bool,
+    form_rect: Option<Rect>,
 }
 
 impl Field {
@@ -243,18 +244,6 @@ impl Field {
         self.shaped = false;
     }
 
-    /// Every particle back at its own place.
-    fn settle(&mut self) {
-        for p in &mut self.parts {
-            p.x = p.hx;
-            p.y = p.hy;
-            p.heat = 0.0;
-            p.sx = 0.0;
-            p.g = '\0';
-        }
-        self.shaped = false;
-    }
-
     /// Particles gather into a frame around `r` (map-local points): the mockup's hover effect.
     pub fn form(&mut self, r: Rect) {
         self.release();
@@ -304,6 +293,28 @@ impl Field {
             b += step;
         }
         self.shaped = true;
+        self.form_rect = Some(r);
+    }
+
+    /// Carries an existing outline with the displayed card, without reassigning particles.
+    pub fn retarget_form(&mut self, r: Rect) {
+        let Some(old) = self.form_rect else {
+            return;
+        };
+        if old.size() != r.size() {
+            self.form(r);
+            return;
+        }
+        let delta = r.min - old.min;
+        for p in &mut self.parts {
+            if p.g != '\0' {
+                p.tx += delta.x;
+                p.ty += delta.y;
+                p.x += delta.x;
+                p.y += delta.y;
+            }
+        }
+        self.form_rect = Some(r);
     }
 
     /// Lets the particles of a shape go.
@@ -315,72 +326,70 @@ impl Field {
             p.g = '\0';
         }
         self.shaped = false;
+        self.form_rect = None;
     }
 
     /// Draws one frame, moving the particles first while `frame.simulate`; `true` when the
     /// field is still visibly moving and the caller should ask for another frame.
     ///
-    /// The pointer holds the field: for as long as it is over the map the particles stay where
-    /// it has pulled or pushed them, and the simulation neither resets nor fades back to the
-    /// resting state. When the pointer leaves, the field settles home as before.
+    /// Leaving the map or pausing the window freezes both layers exactly. Reentering resumes
+    /// the animation clock rather than catching up with the time spent outside the map.
     pub fn paint(&mut self, painter: &Painter, frame: &Frame<'_>) -> bool {
         let map = frame.map;
         self.resize(map.width(), map.height());
         self.glyphs12.ensure(painter, 12.0);
         self.glyphs10.ensure(painter, 10.0);
         self.glyphs11.ensure(painter, 11.0);
-        let dt = (frame.t - self.last_t).clamp(0.0, 0.1);
-        self.last_t = frame.t;
         let simulate = frame.simulate && frame.look.field != FieldMode::Off;
-        if self.was_simulating && !simulate {
-            self.settle();
-        }
+        // A resumed frame has no elapsed simulation time, even if no frames were painted
+        // while the window was inactive.
+        let dt = if simulate && self.was_simulating {
+            (frame.t - self.last_t).clamp(0.0, 0.1)
+        } else {
+            0.0
+        };
+        self.last_t = frame.t;
         self.was_simulating = simulate;
+        self.animation_t += dt;
 
         // The pointer, in map coordinates, eased towards the real one.
-        let local = frame.pointer.map(|p| (p.x - map.min.x, p.y - map.min.y));
-        let had_pointer = self.mouse.on;
-        match local {
-            Some((x, y)) => {
-                if !self.mouse.on {
-                    self.mouse.sx = x;
-                    self.mouse.sy = y;
-                }
-                self.moved = (self.mouse.x - x).abs() > 0.5 || (self.mouse.y - y).abs() > 0.5;
-                self.mouse.x = x;
-                self.mouse.y = y;
-                self.mouse.on = true;
+        let local = frame
+            .pointer
+            .filter(|_| simulate)
+            .map(|p| (p.x - map.min.x, p.y - map.min.y));
+        if let Some((x, y)) = local {
+            if !self.mouse.on {
+                self.mouse.sx = x;
+                self.mouse.sy = y;
             }
-            None => {
-                self.moved = had_pointer;
-                self.mouse.on = false;
-            }
+            self.mouse.x = x;
+            self.mouse.y = y;
+            self.mouse.on = true;
         }
-        if self.mouse.on {
+        if simulate && dt > 0.0 && self.mouse.on {
             let k = 1.0 - (1.0 - 0.16f32).powf((dt * 60.0).max(1.0));
             self.mouse.sx += (self.mouse.x - self.mouse.sx) * k;
             self.mouse.sy += (self.mouse.y - self.mouse.sy) * k;
         }
 
         // The clouds: only when something about them changed.
-        let key = (frame.look.theme, frame.look.clouds, simulate, self.mouse.on);
+        let key = (frame.look.theme, frame.look.clouds);
         let due = self.last_cloud < 0.0
             || self.cloud_key != Some(key)
-            || (simulate && frame.t - self.last_cloud > CLOUD_EVERY)
-            || (!simulate && self.mouse.on && self.moved);
+            || (simulate && dt > 0.0 && self.animation_t - self.last_cloud > CLOUD_EVERY);
         if due {
-            self.build_clouds(frame, if simulate { frame.t } else { 0.0 });
+            self.build_clouds(frame, self.animation_t);
             self.cloud_key = Some(key);
-            self.last_cloud = frame.t;
+            self.last_cloud = self.animation_t;
         }
         self.draw_clouds(painter, frame);
 
-        let moving = if simulate {
+        let moving = if simulate && dt > 0.0 {
             self.step(frame, dt)
         } else {
-            false
+            simulate
         };
-        self.draw_particles(painter, frame, simulate);
+        self.draw_particles(painter, frame);
         // The flows are glyphs too: they are part of «ASCII-изолиния», and the plain line the
         // other style draws carries no characters at all.
         if frame.look.link_style == LinkStyle::Ascii {
@@ -491,7 +500,7 @@ impl Field {
         let speed = frame.look.speed;
         let (k, max, amp) = (0.042 * speed, 3.0 * speed, 4.0 * speed);
         let f = (dt * 60.0).clamp(0.5, 3.0);
-        let t = frame.t;
+        let t = self.animation_t;
         let mode = frame.look.field;
         let m = self.mouse;
         let radius = 140.0f32;
@@ -546,7 +555,7 @@ impl Field {
         (m.x - m.sx).hypot(m.y - m.sy) > SETTLED_POINTER || fastest / dt > SETTLED_SPEED
     }
 
-    fn draw_particles(&self, painter: &Painter, frame: &Frame<'_>, animate: bool) {
+    fn draw_particles(&self, painter: &Painter, frame: &Frame<'_>) {
         let pal = frame.pal;
         let dark = pal.theme == Theme::Dark;
         let calm = if dark {
@@ -559,7 +568,7 @@ impl Field {
         painter.extend(self.parts.iter().filter_map(|p| {
             let c = if p.g != '\0' {
                 p.g
-            } else if !animate || p.sx < 0.35 {
+            } else if p.sx < 0.35 {
                 '·'
             } else if p.sx < 1.4 {
                 '+'
@@ -576,7 +585,7 @@ impl Field {
 
     fn draw_flows(&self, painter: &Painter, frame: &Frame<'_>, animate: bool) {
         let accent = frame.pal.accent;
-        let t = frame.t;
+        let t = self.animation_t;
         for flow in frame.flows {
             let n = 7;
             for q in 0..n {
@@ -740,6 +749,70 @@ mod tests {
         moving
     }
 
+    #[test]
+    fn leaving_the_map_or_window_freezes_both_layers_and_resumes_without_wall_time() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let look = Look::default();
+        let pal = Palette::of(look.theme);
+        let pointer = Pos2::new(400.0, 300.0);
+        for paused_pointer in [None, Some(pointer)] {
+            let mut paused = Field::new();
+            let mut control = Field::new();
+            for n in 0..=8 {
+                let t = n as f32 / 32.0;
+                held_frame(&ctx, &mut paused, &pal, look, pointer, t);
+                held_frame(&ctx, &mut control, &pal, look, pointer, t);
+            }
+            let particles = paused.parts.clone();
+            let clouds = paused.cells.clone();
+            let animation_t = paused.animation_t;
+            assert!(paused.displacement() > 0.0);
+            assert!(!clouds.is_empty());
+
+            // Both a missing map pointer and an inactive window retaining its pointer
+            // preserve glyphs, heat, and the clouds' pointer distortion.
+            let mut frozen_shapes = None;
+            for t in [0.5, 8.0, 64.0] {
+                let output = ctx.run_ui(map_input(t), |ui| {
+                    assert!(!paused.paint(
+                        ui.painter(),
+                        &Frame {
+                            map: ui.ctx().content_rect(),
+                            pal: &pal,
+                            look,
+                            simulate: false,
+                            t,
+                            pointer: paused_pointer,
+                            flows: &[],
+                        },
+                    ));
+                });
+                let shapes = format!("{:?}", output.shapes);
+                if let Some(frozen) = &frozen_shapes {
+                    assert_eq!(&shapes, frozen);
+                } else {
+                    frozen_shapes = Some(shapes);
+                }
+                output.drop_without_applying_deltas();
+                assert_eq!(paused.parts, particles);
+                assert_eq!(paused.cells, clouds);
+                assert_eq!(paused.animation_t, animation_t);
+            }
+
+            assert!(held_frame(&ctx, &mut paused, &pal, look, pointer, 64.25));
+            assert_eq!(paused.parts, particles);
+            assert_eq!(paused.cells, clouds);
+            assert_eq!(paused.animation_t, animation_t);
+            // The next tick matches uninterrupted animation, not elapsed wall time.
+            held_frame(&ctx, &mut paused, &pal, look, pointer, 64.28125);
+            held_frame(&ctx, &mut control, &pal, look, pointer, 0.28125);
+            assert_eq!(paused.parts, control.parts);
+            assert_eq!(paused.cells, control.cells);
+            assert_eq!(paused.animation_t, control.animation_t);
+        }
+    }
+
     /// The mean distance of the particles from their homes.
     fn mean_displacement(field: &Field) -> f32 {
         let sum: f32 = field
@@ -797,7 +870,8 @@ mod tests {
         );
         assert!(field.displacement() > 20.0);
 
-        // And the pointer leaving the map puts the field back at rest.
+        // Leaving the map preserves the last particle positions instead of settling home.
+        let frozen = mean_displacement(&field);
         let mut settled = false;
         ctx.run_ui(map_input(7.0), |ui| {
             settled = field.paint(
@@ -815,7 +889,7 @@ mod tests {
         })
         .drop_without_applying_deltas();
         assert!(!settled);
-        assert_eq!(field.displacement(), 0.0);
+        assert_eq!(mean_displacement(&field), frozen);
     }
 
     #[test]
@@ -960,5 +1034,25 @@ mod tests {
         assert!(held > 20, "{held}");
         field.release();
         assert!(field.parts.iter().all(|p| p.g == '\0'));
+    }
+
+    #[test]
+    fn an_outline_moves_with_the_displayed_card_without_particle_reassignment() {
+        let mut field = Field::new();
+        field.resize(800.0, 400.0);
+        let card = Rect::from_min_size(Pos2::new(100.0, 100.0), egui::vec2(140.0, 80.0));
+        field.form(card);
+        let before = field.parts.clone();
+        let delta = egui::vec2(96.0, -27.0);
+        field.retarget_form(card.translate(delta));
+        for (old, new) in before.iter().zip(&field.parts) {
+            assert_eq!(old.g, new.g);
+            let movement = if old.g == '\0' { egui::Vec2::ZERO } else { delta };
+            assert_eq!(new.tx, old.tx + movement.x);
+            assert_eq!(new.ty, old.ty + movement.y);
+            assert_eq!(new.x, old.x + movement.x);
+            assert_eq!(new.y, old.y + movement.y);
+        }
+        assert_eq!(field.form_rect, Some(card.translate(delta)));
     }
 }
