@@ -101,12 +101,7 @@ impl Wake {
     fn notify(&self) {
         if !self.pending.swap(true, Ordering::SeqCst) {
             // EAGAIN means the counter is saturated: the thread is already due to wake up.
-            loop {
-                match rustix::io::write(&self.fd, &1u64.to_ne_bytes()) {
-                    Err(Errno::INTR) => continue,
-                    _ => break,
-                }
-            }
+            while let Err(Errno::INTR) = rustix::io::write(&self.fd, &1u64.to_ne_bytes()) {}
         }
     }
 
