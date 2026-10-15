@@ -639,12 +639,21 @@ fn the_status_screen_holds_the_linked_workspace() {
         (count_lines(view, "Служба работает") > before).then_some(())
     });
 
-    let status = wait_for(&mut window, "a Status naming the other computer", |view| {
-        view.status
-            .as_ref()
-            .filter(|status| !status.members.is_empty())
-            .cloned()
-    });
+    // Peer formation precedes the asynchronous startup claim. A linked follower snapshot is
+    // valid intermediate state, not the status this scenario is asserting.
+    let status = wait_for(
+        &mut window,
+        "the linked workspace's startup ownership",
+        |view| {
+            view.status
+                .as_ref()
+                .filter(|status| {
+                    !status.members.is_empty()
+                        && (status.is_owner || missing_session(status).is_some())
+                })
+                .cloned()
+        },
+    );
     assert!(
         status.connected,
         "two linked cores are a workspace: {status:?}"
