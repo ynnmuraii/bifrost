@@ -384,6 +384,9 @@ pub struct Session {
     /// any member's manifest. They are not an error: the link comes back on the next rebuild
     /// once the monitor is reported. Only the GUI and the log read this.
     inactive_links: Vec<crate::topology::InactiveLink>,
+    /// Why the applied document cannot be built right now (`None` when it can). While set,
+    /// no link is active — the GUI must say so instead of drawing the links as working.
+    topology_error: Option<String>,
     /// The `[topology]` document to persist because it still names displays by a device name
     /// Windows has renumbered. Filled by [`Session::rebuild_topology`], taken and handed to the
     /// ordinary CAS path once by the main loop ([`Session::sync_display_ids`]).
@@ -556,6 +559,7 @@ impl Session {
             agent_lost_reported: false,
             topology: None,
             inactive_links: Vec::new(),
+            topology_error: None,
             display_id_migration: None,
             pending_default_layout: None,
             layout,
@@ -601,29 +605,29 @@ impl Session {
         session
     }
 
+    /// What the coordinator runs on every edit before applying it: the document must parse and
+    /// the live manifests must be able to build it. The clone keeps the closure free of `self`,
+    /// which `apply_edit` borrows.
+    fn layout_checker(&self) -> impl Fn(&str) -> Result<config::TopologyConfig, String> {
+        let node = *self.node_id.as_bytes();
+        let agent = self.agent_displays.clone();
+        let peers = self.peer_displays.clone();
+        move |text| {
+            let layout = parse_layout_toml(text)?;
+            crate::topology::check_layout(&layout, &node, &agent, &peers)?;
+            Ok(layout)
+        }
+    }
+
     /// Assembles the layout using the configured snapshot until a non-empty live report
     /// arrives for a member.
     fn rebuild_topology(&mut self) {
-        let snapshot = crate::topology::snapshot_displays(&self.layout, self.node_id.as_bytes());
-        let displays = if self.agent_displays.is_empty() {
-            snapshot
-        } else {
-            self.agent_displays.clone()
-        };
-        let mut peers: BTreeMap<_, _> =
-            crate::topology::snapshot_peers(&self.layout, self.node_id.as_bytes())
-                .into_iter()
-                .map(|(node, displays)| (node, (0, displays)))
-                .collect();
-        peers.extend(
-            self.peer_displays
-                .iter()
-                .map(|(node, (revision, displays))| (*node, (*revision, displays.clone()))),
+        let (displays, peers) = crate::topology::live_inputs(
+            &self.layout,
+            self.node_id.as_bytes(),
+            &self.agent_displays,
+            &self.peer_displays,
         );
-        let peers: Vec<_> = peers
-            .into_iter()
-            .map(|(node, (_, displays))| (node, displays))
-            .collect();
         let documents = crate::topology::Documents {
             local_node_id: *self.node_id.as_bytes(),
             topology: &self.layout,
@@ -687,6 +691,7 @@ impl Session {
                 }
                 self.topology = Some(document);
                 self.inactive_links = built.inactive;
+                self.topology_error = None;
                 // A stored document that names a display by an old Windows device name still
                 // works through the alias `build` applies; this makes the stored revision carry
                 // the stable id too, through the ordinary CAS path (see `sync_display_ids`).
@@ -710,6 +715,7 @@ impl Session {
                 );
                 self.topology = None;
                 self.inactive_links = Vec::new();
+                self.topology_error = Some(error.to_string());
             }
         }
     }
@@ -1510,6 +1516,7 @@ impl Session {
                         .unwrap_or(*from.as_bytes()),
                 );
                 let layout_toml = String::from_utf8_lossy(&edit.layout_toml).into_owned();
+                let checker = self.layout_checker();
                 let mut candidate = None;
                 let outcome = self.layout_state.apply_edit(
                     &crate::layout::Edit {
@@ -1520,7 +1527,7 @@ impl Session {
                     self.node_id,
                     true,
                     |text| {
-                        candidate = Some(parse_layout_toml(text)?);
+                        candidate = Some(checker(text)?);
                         Ok(())
                     },
                 );
@@ -1964,11 +1971,12 @@ impl Session {
             editor: self.node_id,
             layout_toml,
         };
+        let checker = self.layout_checker();
         let mut candidate = None;
         let outcome = self
             .layout_state
             .apply_edit(&edit, self.node_id, true, |text| {
-                candidate = Some(parse_layout_toml(text)?);
+                candidate = Some(checker(text)?);
                 Ok(())
             });
         Handled::Reply(match outcome {
@@ -2141,11 +2149,12 @@ impl Session {
             editor: self.node_id,
             layout_toml: document_text,
         };
+        let checker = self.layout_checker();
         let mut candidate = None;
         let outcome = self
             .layout_state
             .apply_edit(&edit, self.node_id, is_coordinator, |text| {
-                candidate = Some(parse_layout_toml(text)?);
+                candidate = Some(checker(text)?);
                 Ok(())
             });
         Handled::Reply(match outcome {

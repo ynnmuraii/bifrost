@@ -277,6 +277,9 @@ impl Session {
                     // and says which display is missing instead of dropping it silently.
                     let missing = missing_display(geometry::EndpointSide::Source, from)
                         .or_else(|| missing_display(geometry::EndpointSide::Target, to));
+                    // The whole document is unusable right now (overlapping links, say): no
+                    // link works, and the editor must not draw them as if they did.
+                    let missing = self.topology_error.clone().or(missing);
                     let mut resolved = auto_displays(from);
                     resolved.extend(auto_displays(to));
                     Some(ipc::LinkView {
