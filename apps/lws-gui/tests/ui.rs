@@ -221,7 +221,6 @@ fn every_modal_shows_its_own_real_data() {
                 "АВАРИЙНАЯ",
                 "F12",
                 "Shift",
-                "Этот компьютер уже координатор",
                 "Открыть файл настроек",
             ],
         ),
@@ -251,8 +250,13 @@ fn every_modal_shows_its_own_real_data() {
         let frame = harness.frame(&vm, false, size, Vec::new());
         expect(&frame, needles);
         if modal == Modal::Keys {
-            for absent in ["ПЕРЕКЛЮЧЕНИЕ", "F11", "ИСТОЧНИК", "config.toml · секци"]
-            {
+            for absent in [
+                "ПЕРЕКЛЮЧЕНИЕ",
+                "ВЗЯТЬ УПРАВЛЕНИЕ",
+                "F11",
+                "ИСТОЧНИК",
+                "config.toml · секци",
+            ] {
                 assert!(!shows(&frame, absent), "unexpected {absent:?}");
             }
         }
