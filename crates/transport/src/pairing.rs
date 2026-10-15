@@ -81,17 +81,23 @@ impl PairingGate {
     /// This is what keeps a leaked slot from pinning a pairing window: a TLS accept that
     /// fails, a `Pairing` event whose receiver is gone, or any early return between `admit`
     /// and the hand-off releases the slot instead of counting against the three handshakes.
-    pub fn admit_guard(&self) -> PendingGuard {
+    ///
+    /// Pass the admitted window's `attempt_id`: replacing the window must not let an old
+    /// handshake release a slot belonging to the replacement.
+    pub fn admit_guard(&self, attempt_id: identity::AttemptId) -> PendingGuard {
         PendingGuard {
             gate: self.clone(),
+            attempt_id,
             armed: true,
         }
     }
 
     /// `pending -= 1` without counting an attempt: the handshake never became a ceremony.
-    fn release(&self) {
+    fn release(&self, attempt_id: &identity::AttemptId) {
         if let Some(window) = self.lock().as_mut() {
-            window.release_pending();
+            if window.attempt_id() == attempt_id {
+                window.release_pending();
+            }
         }
     }
 
@@ -117,6 +123,7 @@ impl PairingGate {
 #[derive(Debug)]
 pub struct PendingGuard {
     gate: PairingGate,
+    attempt_id: identity::AttemptId,
     armed: bool,
 }
 
@@ -131,7 +138,7 @@ impl PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.gate.release();
+            self.gate.release(&self.attempt_id);
         }
     }
 }
@@ -196,8 +203,8 @@ mod tests {
         gate.open(window_at([3u8; 16]));
         // Three abandoned handshakes must not pin the window: each drops its guard.
         for _ in 0..MAX_ATTEMPTS {
-            gate.admit(0).expect("admitted");
-            let guard = gate.admit_guard();
+            let window = gate.admit(0).expect("admitted");
+            let guard = gate.admit_guard(*window.attempt_id());
             drop(guard);
         }
         let window = gate.window(0).expect("the window must stay open");
@@ -215,8 +222,8 @@ mod tests {
     fn an_old_guard_does_not_release_a_new_windows_pending_slot() {
         let gate = PairingGate::closed();
         gate.open(window_at([1u8; 16]));
-        gate.admit(0).expect("old window admits");
-        let old_guard = gate.admit_guard();
+        let admitted = gate.admit(0).expect("old window admits");
+        let old_guard = gate.admit_guard(*admitted.attempt_id());
 
         gate.open(window_at([2u8; 16]));
         gate.admit(0).expect("new window admits");
@@ -228,11 +235,26 @@ mod tests {
     }
 
     #[test]
+    fn a_guard_created_after_replacement_still_belongs_to_the_admitted_window() {
+        let gate = PairingGate::closed();
+        gate.open(window_at([1u8; 16]));
+        let admitted = gate.admit(0).expect("old window admits");
+
+        gate.open(window_at([2u8; 16]));
+        gate.admit(0).expect("new window admits");
+        drop(gate.admit_guard(*admitted.attempt_id()));
+
+        let window = gate.window(0).expect("new window stays open");
+        assert_eq!(window.pending(), 1);
+        assert_eq!(window.attempts(), 0);
+    }
+
+    #[test]
     fn a_disarmed_guard_leaves_the_slot_to_finish() {
         let gate = PairingGate::closed();
         gate.open(window_at([4u8; 16]));
-        gate.admit(0).expect("admitted");
-        gate.admit_guard().disarm();
+        let window = gate.admit(0).expect("admitted");
+        gate.admit_guard(*window.attempt_id()).disarm();
         assert_eq!(gate.window(0).map(|w| w.pending()), Some(1));
         gate.finish(0);
         assert_eq!(gate.window(0).map(|w| w.pending()), Some(0));

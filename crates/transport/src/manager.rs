@@ -960,7 +960,7 @@ async fn serve_connection(
         // Every early return past this point releases the admitted slot; only a connection
         // actually handed to the application disarms it, because only then does a ceremony
         // own it and call `PairingGate::finish`.
-        let guard = gate.admit_guard();
+        let guard = gate.admit_guard(*window.attempt_id());
         let stream = match tokio::time::timeout(
             handshake_timeout,
             start.into_stream(pairing_config),
