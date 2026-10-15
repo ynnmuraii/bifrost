@@ -18,6 +18,21 @@ pub struct Emitter {
     gate: Coalescer<String>,
     near: bool,
     entry_wanted: bool,
+    own: Own,
+}
+
+/// What the *receiver's* own edges saw last: the approach to the edge this machine will be
+/// left through, which is a different question from the owner's approach
+/// ([`Emitter::push`]) and needs its own memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Own {
+    /// Input has just arrived: the entry bloom owns the overlay. The approach is armed by the
+    /// first sample out of reach, so the glow cannot replace the bloom the moment it starts.
+    Arrived,
+    /// Out of reach of every linked edge: an approach may start.
+    Away,
+    /// Within reach of a linked edge: an approach is being drawn.
+    Near,
 }
 
 impl Emitter {
@@ -28,6 +43,7 @@ impl Emitter {
             gate: Coalescer::default(),
             near: false,
             entry_wanted: false,
+            own: Own::Away,
         }
     }
 
@@ -36,11 +52,13 @@ impl Emitter {
         self.near = false;
         self.gate = Coalescer::default();
         self.entry_wanted = false;
+        self.own = Own::Away;
     }
 
     /// A receiver lease was prepared: the next pointer position is where input arrived.
     pub fn await_entry(&mut self) {
         self.entry_wanted = true;
+        self.own = Own::Arrived;
     }
 
     /// `true` once per prepared lease, on the first `Inject` after [`Self::await_entry`].
@@ -50,6 +68,7 @@ impl Emitter {
 
     pub fn cancel_entry(&mut self) {
         self.entry_wanted = false;
+        self.own = Own::Away;
     }
 
     /// Whether a proximity sample is worth computing at `now_ms` (cheap: a comparison).
@@ -60,13 +79,30 @@ impl Emitter {
 
     /// Offers a frame; the frame to send now, if the rate limit allows.
     pub fn push(&mut self, update: Update, display: &str, now_ms: u64) -> Option<ipc::EdgeFx> {
-        if !self.enabled {
+        self.near = matches!(update, Update::Proximity { .. });
+        self.emit(update, display, now_ms)
+    }
+
+    /// The receiver's injected pointer is near one of *this* machine's linked edges: the exit
+    /// it would leave through, which is where the core draws the gesture it never saw. Silently
+    /// dropped while the entry bloom plays (`Own::Arrived`).
+    pub fn own_near(&mut self, update: Update, display: &str, now_ms: u64) -> Option<ipc::EdgeFx> {
+        if self.own == Own::Arrived {
             return None;
         }
-        self.near = matches!(update, Update::Proximity { .. });
-        self.gate
-            .push(update, display.to_owned(), now_ms)
-            .map(|(update, display)| frame(&update, &display))
+        self.own = Own::Near;
+        self.emit(update, display, now_ms)
+    }
+
+    /// The receiver's injected pointer is out of reach of its own linked edges: one `LEFT` if
+    /// an approach was being drawn, and the approach is armed for the next one.
+    pub fn own_away(&mut self, now_ms: u64) -> Option<ipc::EdgeFx> {
+        let was_near = self.own == Own::Near;
+        self.own = Own::Away;
+        if !was_near {
+            return None;
+        }
+        self.emit(Update::Left, "", now_ms)
     }
 
     /// The pointer is not near a linked edge any more: one `LEFT` if it was.
@@ -74,7 +110,8 @@ impl Emitter {
         if !self.near {
             return None;
         }
-        self.push(Update::Left, "", now_ms)
+        self.near = false;
+        self.emit(Update::Left, "", now_ms)
     }
 
     /// A held frame whose spacing has elapsed.
@@ -88,6 +125,16 @@ impl Emitter {
     #[must_use]
     pub fn due_at(&self) -> Option<u64> {
         self.gate.due_at()
+    }
+
+    /// Queues one frame behind the rate limit; nothing when the effects are off.
+    fn emit(&mut self, update: Update, display: &str, now_ms: u64) -> Option<ipc::EdgeFx> {
+        if !self.enabled {
+            return None;
+        }
+        self.gate
+            .push(update, display.to_owned(), now_ms)
+            .map(|(update, display)| frame(&update, &display))
     }
 }
 
@@ -256,18 +303,43 @@ pub fn entry_in_desktop(
     x: f64,
     y: f64,
 ) -> Option<(Update, String)> {
+    let local = local_position(topology, node, x, y)?;
+    entry(topology, node, &local.display_id, local.x, local.y)
+}
+
+/// [`proximity`] for a point in the node's logical desktop space.
+///
+/// This is the *receiver's* half of the effects: it injects absolute positions it did not
+/// measure, so the edge it will be left through is a projection of numbers, not a pointer it
+/// can watch. Only the core can do it — the agent knows the position but not the topology —
+/// and the frame goes to this node's own agent, which is the overlay that draws it.
+#[must_use]
+pub fn proximity_in_desktop(
+    topology: &Topology,
+    node: &NodeId,
+    x: f64,
+    y: f64,
+) -> Option<(Update, String)> {
+    let local = local_position(topology, node, x, y)?;
+    proximity(topology, node, &local)
+}
+
+/// A point in the node's logical desktop space as a display-local [`Position`].
+///
+/// The desktop space is the convention every injected `PointerAbsolute` is in: the agent maps
+/// it onto the virtual desktop (`inject_plan::VirtualDesktop`), and the display whose
+/// `logical_bounds` hold it is the one it lands on.
+fn local_position(topology: &Topology, node: &NodeId, x: f64, y: f64) -> Option<Position> {
     let member = topology.node(node)?;
     let display = member
         .displays
         .iter()
         .find(|display| display.logical_bounds.contains(Point::new(x, y)))?;
-    entry(
-        topology,
-        node,
-        &display.id,
+    Some(Position::new(
+        display.id.clone(),
         x - display.logical_bounds.x,
         y - display.logical_bounds.y,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -387,6 +459,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_receiver_nearest_edge_is_the_exit_it_would_leave_through() {
+        let topology = fixture();
+        // Node 2's left edge (40..760) is linked back to node 1; the injected pointer is in
+        // *its* desktop space, which is what `InputBatch` absolute positions carry.
+        let (update, display) = proximity_in_desktop(&topology, &node(2), 90.0, 300.0)
+            .expect("the return edge is within reach");
+        assert_eq!(display, "b");
+        let Update::Proximity { target, distance } = update else {
+            panic!("proximity expected");
+        };
+        assert_eq!(target.edge, Edge::Left);
+        assert_eq!(
+            (target.start, target.end, target.along),
+            (40.0, 760.0, 300.0)
+        );
+        assert_eq!(distance, 90.0);
+        // In the middle of the desktop, and off a display: nothing to draw.
+        assert!(proximity_in_desktop(&topology, &node(2), 500.0, 400.0).is_none());
+        assert!(proximity_in_desktop(&topology, &node(2), 4000.0, 4000.0).is_none());
+    }
+
+    #[test]
+    fn a_receivers_own_approach_starts_only_after_it_has_left_the_reach() {
+        let mut emitter = Emitter::new(true);
+        let target = Target {
+            edge: Edge::Left,
+            start: 0.0,
+            end: 800.0,
+            along: 300.0,
+        };
+        let near = Update::Proximity {
+            target,
+            distance: 90.0,
+        };
+        emitter.await_entry();
+        // The entry bloom owns the overlay: the position it arrived at cannot start an
+        // approach, and no LEFT is pending either.
+        assert!(emitter.own_near(near, "b", 0).is_none());
+        assert!(emitter.own_away(40).is_none());
+        let frame = emitter.own_near(near, "b", 60).expect("the approach");
+        assert_eq!(frame.kind, ipc::EdgeFxKind::EdgeFxProximity as i32);
+        assert_eq!(frame.display_id, "b");
+        assert!(emitter.own_near(near, "b", 70).is_none(), "rate limited");
+        let left = emitter.own_away(100).expect("one LEFT");
+        assert_eq!(left.kind, ipc::EdgeFxKind::EdgeFxLeft as i32);
+        assert!(emitter.own_away(140).is_none());
+        // Off while the effects are switched off, and the entry still wins afterwards.
+        emitter.set_enabled(false);
+        assert!(emitter.own_near(near, "b", 200).is_none());
+        emitter.set_enabled(true);
+        emitter.await_entry();
+        assert!(emitter.own_near(near, "b", 300).is_none());
     }
 
     #[test]
