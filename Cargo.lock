@@ -2162,6 +2162,7 @@ dependencies = [
  "anyhow",
  "ashpd",
  "clipboard",
+ "config",
  "edgefx",
  "input-model",
  "ipc",
