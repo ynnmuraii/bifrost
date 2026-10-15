@@ -1445,6 +1445,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_diagonal_bottom_return_uses_the_crossed_edge_not_the_dominant_delta() {
+        // A (-30, -20) step returns through Bottom, even though X dominates.
+        let entry = geometry::Position::new("eDP-1", 960.0, 1078.0);
+        let guard = ReturnGuard::after_return(geometry::Point::new(-30.0, -20.0), entry.x, 8.0)
+            .unwrap();
+        assert_eq!(guard.axis(), Axis::Y);
+        assert!(guard.holds(&entry));
+        assert!(!guard.holds(&geometry::Position::new("eDP-1", 960.0, 1068.0)));
+    }
+
     /// A pointer that comes home must not re-open the lease by being pushed at the edge it
     /// came home through: that oscillation is the owner's jumping cursor, and
     /// `input.edge_hysteresis_px` is the band that stops it.
