@@ -912,6 +912,8 @@ struct TaskRegistry {
 struct TaskState {
     closed: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    acceptor: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl TaskState {
@@ -926,7 +928,11 @@ impl TaskState {
 
 impl Drop for TaskRegistry {
     fn drop(&mut self) {
-        for task in &self.state.get_mut().expect("task registry").tasks {
+        let state = self.state.get_mut().expect("task registry");
+        if let Some(acceptor) = &state.acceptor {
+            acceptor.abort();
+        }
+        for task in &state.tasks {
             task.abort();
         }
     }
@@ -1008,7 +1014,15 @@ impl Handle {
             _owner: Some(tasks),
         };
         let acceptor = handle.clone();
-        handle.spawn(async move { acceptor.accept_loop(listener, queue_capacity).await });
+        let (shutdown, stopping) = tokio::sync::oneshot::channel();
+        {
+            let tasks = handle.tasks.upgrade().expect("runtime owner");
+            let mut state = tasks.state.lock().expect("task registry");
+            state.shutdown = Some(shutdown);
+            state.acceptor = Some(tokio::spawn(async move {
+                acceptor.accept_loop(listener, queue_capacity, stopping).await;
+            }));
+        }
         Ok((handle, receiver))
     }
 
@@ -1029,15 +1043,21 @@ impl Handle {
         let Some(tasks) = self.tasks.upgrade() else {
             return;
         };
-        let handles = {
+        let (handles, acceptor) = {
             let mut state = tasks.state.lock().expect("task registry");
             state.closed = true;
+            if let Some(shutdown) = state.shutdown.take() {
+                let _ = shutdown.send(());
+            }
             let handles = std::mem::take(&mut state.tasks);
             for task in &handles {
                 task.abort();
             }
-            handles
+            (handles, state.acceptor.take())
         };
+        if let Some(acceptor) = acceptor {
+            let _ = acceptor.await;
+        }
         for task in handles {
             let _ = task.await;
         }
@@ -1163,7 +1183,21 @@ impl Handle {
     }
 
     /// The accept loop: bind, validate, then read.
-    async fn accept_loop(&self, mut listener: ClipboardListener, queue_capacity: usize) {
+    async fn accept_loop(
+        &self,
+        mut listener: ClipboardListener,
+        queue_capacity: usize,
+        mut stopping: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        tokio::select! {
+            biased;
+            _ = &mut stopping => {}
+            _ = self.accept_connections(&mut listener, queue_capacity) => {}
+        }
+        listener.shutdown().await;
+    }
+
+    async fn accept_connections(&self, listener: &mut ClipboardListener, queue_capacity: usize) {
         loop {
             let (connection, message) = match listener.accept().await {
                 Ok(pair) => pair,
@@ -1498,6 +1532,26 @@ mod tests {
             endpoint = next;
         }
         endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stopping_closes_a_silent_incoming_handshake() {
+        use tokio::io::AsyncReadExt;
+        let (endpoint, root) = started_clipboard("silent-accept-stop").await;
+        let address = endpoint.runtime.listen_address;
+        let mut silent = tokio::net::TcpStream::connect(address).await.expect("connect");
+        // Let the accept task spawn its TLS handshake; transport's own regression explicitly
+        // asserts that pending handshakes exist before exercising the same shutdown method.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(1), endpoint.stop()).await
+            .expect("stop must not wait for the TLS handshake deadline");
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), silent.read(&mut byte))
+            .await.expect("silent accepted socket closes");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        let rebound = tokio::net::TcpListener::bind(address).await.expect("listener port released");
+        drop(rebound);
         let _ = std::fs::remove_dir_all(root);
     }
 

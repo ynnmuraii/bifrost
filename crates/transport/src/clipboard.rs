@@ -805,6 +805,13 @@ impl ClipboardListener {
             .expect("a bound listener has a local address")
     }
 
+    /// Closes the listening socket, then aborts and joins every pending TLS/bind handshake.
+    pub async fn shutdown(self) {
+        let Self { listener, acceptor: _, mut pending } = self;
+        drop(listener);
+        pending.shutdown().await;
+    }
+
     /// Accepts the next clipboard connection whose first frame is a `Bind`.
     ///
     /// A handshake on another ALPN, an unpinned peer, a `Bind`-less first frame, a frame that
@@ -968,6 +975,38 @@ impl Outgoing {
 mod tests {
     use super::*;
     use identity::{IdentityPaths, NodeIdentity, TrustStore, TrustedPeer};
+
+    #[tokio::test]
+    async fn shutdown_joins_a_silent_handshake_and_releases_the_port() {
+        use tokio::io::AsyncReadExt;
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-shutdown-{}-{:x}",
+            std::process::id(),
+            u128::from_le_bytes(identity::random16().expect("entropy"))
+        ));
+        let identity = Arc::new(
+            NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&root))
+                .expect("identity").0,
+        );
+        let mut listener = ClipboardListener::bind(
+            Arc::clone(&identity), TrustStore::new(), "127.0.0.1:0".parse().expect("address"),
+        ).await.expect("listener");
+        let address = listener.local_addr();
+        let mut silent = TcpStream::connect(address).await.expect("connect");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await.is_err(), "silent peer cannot complete TLS");
+        assert_eq!(listener.pending.len(), 1, "handshake task must actually be active");
+        tokio::time::timeout(std::time::Duration::from_secs(1), listener.shutdown())
+            .await.expect("shutdown must not wait for the handshake deadline");
+        let mut byte = [0];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(1), silent.read(&mut byte))
+            .await.expect("silent socket closes");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        let replacement = ClipboardListener::bind(identity, TrustStore::new(), address)
+            .await.expect("exact port is released");
+        replacement.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn established_clipboard_links_disable_nagle_on_both_ends() {
