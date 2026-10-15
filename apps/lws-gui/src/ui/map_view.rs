@@ -114,6 +114,17 @@ pub fn draw(
         })
         .collect();
 
+    // Hover identity may stay the same while the card glides, zooms or pans.
+    // Retarget before painting so the outline uses this frame's displayed geometry.
+    if simulate && st.drag.is_none() {
+        if let Some((n, m)) = st.hover {
+            if let Some(mon) = model.nodes.get(n).and_then(|node| node.mons.get(m)) {
+                let local = monitor_rect(shown[n], mon.rect, s).translate(-rect.min.to_vec2());
+                st.field.retarget_form(local);
+            }
+        }
+    }
+
     let moving = st.field.paint(
         &painter,
         &Frame {
@@ -158,18 +169,12 @@ pub fn draw(
             actions,
         );
     }
-    if hovered != st.hover {
+    if simulate && hovered != st.hover {
         match hovered {
             Some((n, m)) if simulate && st.drag.is_none() => {
                 let node = &model.nodes[n];
                 let r = node.mons[m].rect;
-                let local = Rect::from_min_size(
-                    Pos2::new(
-                        shown[n].x - rect.min.x + r.x as f32 * s,
-                        shown[n].y - rect.min.y + r.y as f32 * s,
-                    ),
-                    Vec2::new(r.w as f32 * s, r.h as f32 * s),
-                );
+                let local = monitor_rect(shown[n], r, s).translate(-rect.min.to_vec2());
                 st.field.form(local);
             }
             _ => st.field.release(),
@@ -465,6 +470,13 @@ fn fade(c: Color32, k: f32) -> Color32 {
     c.gamma_multiply(k)
 }
 
+fn monitor_rect(at: Pos2, r: crate::map::Rect, s: f32) -> Rect {
+    Rect::from_min_size(
+        at + Vec2::new(r.x as f32 * s, r.y as f32 * s),
+        Vec2::new(r.w as f32 * s, r.h as f32 * s),
+    )
+}
+
 /// One computer: its displays (draggable), and the caption under it.
 #[allow(clippy::too_many_arguments)]
 fn node_ui(
@@ -484,10 +496,7 @@ fn node_ui(
     let fs = s.clamp(0.8, 1.0);
     let k = if node.online { 1.0 } else { 0.62 };
     for (m, mon) in node.mons.iter().enumerate() {
-        let rect = Rect::from_min_size(
-            at + Vec2::new(mon.rect.x as f32 * s, mon.rect.y as f32 * s),
-            Vec2::new(mon.rect.w as f32 * s, mon.rect.h as f32 * s),
-        );
+        let rect = monitor_rect(at, mon.rect, s);
         let id = egui::Id::new(("mon", &node.node_id, m));
         let response = ui.interact(
             rect,
@@ -920,6 +929,19 @@ mod transform_tests {
                 output.drop_without_applying_deltas();
             }
         }
+    }
+
+    #[test]
+    fn hover_geometry_uses_the_animated_card_not_its_target() {
+        let model = owner_layout();
+        let xf = Xf::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0)), 150);
+        let node = &model.nodes[1];
+        let target = xf.p(node.at.x, node.at.y);
+        let shown = target + Vec2::new(96.0, 27.0);
+        let card = monitor_rect(shown, node.mons[0].rect, xf.s);
+        let stale = monitor_rect(target, node.mons[0].rect, xf.s);
+        assert_eq!(card.min - stale.min, shown - target);
+        assert_eq!(card.size(), stale.size());
     }
 
     #[test]
