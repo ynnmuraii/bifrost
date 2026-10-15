@@ -647,6 +647,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_isolines_emit_ascii_text_not_dashed_paths() {
+        assert_eq!(Look::default().link_style, LinkStyle::Ascii);
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let mut field = Field::new();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            field.link(
+                ui.painter(),
+                Pos2::new(20.0, 20.0),
+                Pos2::new(110.0, 20.0),
+                Color32::WHITE,
+            );
+        });
+        let glyphs: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(glyphs.iter().filter(|&&glyph| glyph == "+").count(), 2);
+        assert!(glyphs.contains(&"-"));
+        assert!(!output
+            .shapes
+            .iter()
+            .any(|shape| matches!(shape.shape, Shape::Path(_))));
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
     fn motion_stops_after_settling_and_does_not_restart_on_plain_repaints() {
         let mut field = Field::new();
         let p = Some(Pos2::new(80.0, 90.0));

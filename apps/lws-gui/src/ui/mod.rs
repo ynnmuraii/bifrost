@@ -358,7 +358,13 @@ fn rail_draw(
     if response.hovered() || vm.appearance_open {
         painter.rect_filled(appearance, pal.rad_sm(), pal.bg2);
     }
-    widgets::paint_icon(&painter, Icon::Theme, appearance.center(), 20.0, pal.ink2);
+    widgets::paint_icon(
+        &painter,
+        Icon::Appearance,
+        appearance.center(),
+        20.0,
+        pal.ink2,
+    );
     if response.clicked() {
         actions.push(Action::ToggleAppearance);
     }
