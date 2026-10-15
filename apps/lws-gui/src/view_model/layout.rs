@@ -30,7 +30,7 @@ pub struct MapMonitor {
     pub num: String,
     /// «1920×1080», «≈ 3840×2160», with the rotation when it is not 0.
     pub res: String,
-    /// «ввод», «осн.», «офлайн» or empty.
+    /// «ввод» on the active display, otherwise empty.
     pub tag: &'static str,
 }
 
@@ -43,7 +43,7 @@ pub struct MapNode {
     pub name: String,
     /// The line under the name.
     pub os: String,
-    /// «● клавиатура и мышь здесь», «○ не в сети» or empty.
+    /// Compact connection/input state shown below the computer.
     pub focus: String,
     /// In the network, as far as the core knows.
     pub online: bool,
@@ -80,8 +80,6 @@ pub struct MapLink {
     pub state: LinkState,
     /// `true` for an `auto` link: the whole desktop's edge.
     pub whole_desktop: bool,
-    /// The text on the link.
-    pub label: String,
     /// `true` when input flows from `from` to `to` (only meaningful while active).
     pub forward: bool,
 }
@@ -504,27 +502,6 @@ impl ViewModel {
         }
     }
 
-    /// «Ввод <…>» of the top bar.
-    pub fn route_text(&self) -> String {
-        let Some(status) = &self.status else {
-            return "—".to_owned();
-        };
-        let this = self.this_name();
-        match status.focus.as_str() {
-            "LOCAL" => "этот компьютер".to_owned(),
-            "REMOTE" if !status.active_peer.is_empty() => {
-                format!("{this} → {}", status.active_peer)
-            }
-            "REMOTE" => format!("{this} → другой компьютер"),
-            "PREPARING" if !status.active_peer.is_empty() => {
-                format!("{this} → {} …", status.active_peer)
-            }
-            "PREPARING" => "переход…".to_owned(),
-            "BLOCKED" => "остановлен из-за ошибки".to_owned(),
-            _ => "—".to_owned(),
-        }
-    }
-
     /// The name of this computer.
     pub fn this_name(&self) -> String {
         self.self_node()
@@ -567,10 +544,6 @@ impl ViewModel {
                 let rect = editor.shapes[i].mons.get(k).copied().unwrap_or_default();
                 let tag = if is_target && (display.primary || single) {
                     "ввод"
-                } else if !node.online {
-                    "офлайн"
-                } else if display.primary && !single {
-                    "осн."
                 } else {
                     ""
                 };
@@ -591,11 +564,11 @@ impl ViewModel {
                 String::new()
             };
             let focus = if is_target {
-                "● клавиатура и мышь здесь".to_owned()
+                "ввод здесь".to_owned()
             } else if !node.online {
-                "○ не в сети".to_owned()
+                "офлайн".to_owned()
             } else {
-                String::new()
+                "в сети".to_owned()
             };
             nodes.push(MapNode {
                 node_id: node.node_id.clone(),
@@ -645,23 +618,6 @@ impl ViewModel {
                 LinkState::Idle
             };
             let forward = this == Some(link.a);
-            let horizontal = link.dir == map::Dir::Horizontal;
-            let label = match state {
-                LinkState::Offline => "офлайн".to_owned(),
-                LinkState::Inactive => "неактивна".to_owned(),
-                LinkState::Active => {
-                    let to_b = target == Some(link.b);
-                    match (horizontal, to_b) {
-                        (true, true) => "ввод →",
-                        (true, false) => "← ввод",
-                        (false, true) => "ввод ↓",
-                        (false, false) => "ввод ↑",
-                    }
-                    .to_owned()
-                }
-                LinkState::Idle if whole_desktop => "весь стол".to_owned(),
-                LinkState::Idle => "край".to_owned(),
-            };
             links.push(MapLink {
                 a: link.a,
                 b: link.b,
@@ -671,7 +627,6 @@ impl ViewModel {
                 span: link.span,
                 state,
                 whole_desktop,
-                label,
                 forward,
             });
         }

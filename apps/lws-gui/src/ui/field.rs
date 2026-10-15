@@ -4,8 +4,8 @@
 //!
 //! * the buffers (`parts`, `cells`) are sized once per window size and reused — a frame
 //!   allocates nothing here;
-//! * glyphs are laid out once per scale factor ([`Glyphs`]) and a particle is one cheap
-//!   `TextShape` that shares the glyph's galley, so no `String` or galley is built per frame;
+//! * glyphs are laid out once per scale factor ([`Glyphs`]); particles share those galleys,
+//!   clouds, particles and ASCII links each submit a lazy iterator under one painter lock;
 //! * the clouds are rebuilt at most every [`CLOUD_EVERY`] seconds while animating (and only when
 //!   the pointer moves while still), never on a plain repaint;
 //! * nothing here schedules a repaint: [`crate::app`] does, and only while the window is
@@ -185,7 +185,7 @@ impl Field {
         self.glyphs11.ensure(painter, 11.0);
         let delta = to - from;
         let count = (delta.length() / 9.0).ceil().max(1.0) as usize;
-        for i in 0..=count {
+        painter.extend((0..=count).filter_map(|i| {
             let ch = if i == 0 || i == count {
                 '+'
             } else if delta.x.abs() >= delta.y.abs() {
@@ -193,11 +193,10 @@ impl Field {
             } else {
                 '|'
             };
-            if let Some(galley) = self.glyphs11.get(ch) {
-                let at = from + delta * (i as f32 / count as f32) - galley.size() / 2.0;
-                painter.add(TextShape::new(at, Arc::clone(galley), color));
-            }
-        }
+            let galley = self.glyphs11.get(ch)?;
+            let at = from + delta * (i as f32 / count as f32) - galley.size() / 2.0;
+            Some(TextShape::new(at, Arc::clone(galley), color).into())
+        }));
     }
 
     fn rand(&mut self) -> f32 {
@@ -455,19 +454,20 @@ impl Field {
         };
         let ink = with_alpha(base, alpha);
         let origin = frame.map.min;
-        for cell in &self.cells {
+        painter.extend(self.cells.iter().filter_map(|cell| {
             let at = Pos2::new(origin.x + cell.x, origin.y + cell.y);
             if cell.ch == '\0' {
-                painter.add(Shape::rect_filled(
+                Some(Shape::rect_filled(
                     Rect::from_min_size(at, egui::vec2(CELL_W, CELL_H)),
                     0.0,
                     ink,
-                ));
-            } else if let Some(galley) = self.glyphs10.get(cell.ch) {
+                ))
+            } else {
+                let galley = self.glyphs10.get(cell.ch)?;
                 let color = if cell.on_solid { pal.bg } else { ink };
-                painter.add(TextShape::new(at, Arc::clone(galley), color));
+                Some(TextShape::new(at, Arc::clone(galley), color).into())
             }
-        }
+        }));
     }
 
     fn step(&mut self, frame: &Frame<'_>, dt: f32) {
@@ -540,7 +540,7 @@ impl Field {
         };
         let hot = with_alpha(pal.accent, 0.92);
         let origin = frame.map.min;
-        for p in &self.parts {
+        painter.extend(self.parts.iter().filter_map(|p| {
             let c = if p.g != '\0' {
                 p.g
             } else if !animate || p.sx < 0.35 {
@@ -550,14 +550,12 @@ impl Field {
             } else {
                 '*'
             };
-            let Some(galley) = self.glyphs12.get(c) else {
-                continue;
-            };
+            let galley = self.glyphs12.get(c)?;
             let size = galley.size();
             let at = Pos2::new(origin.x + p.x - size.x / 2.0, origin.y + p.y - size.y / 2.0);
             let color = if p.heat > 0.28 { hot } else { calm };
-            painter.add(TextShape::new(at, Arc::clone(galley), color));
-        }
+            Some(TextShape::new(at, Arc::clone(galley), color).into())
+        }));
     }
 
     fn draw_flows(&self, painter: &Painter, frame: &Frame<'_>, animate: bool) {

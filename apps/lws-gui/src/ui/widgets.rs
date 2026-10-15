@@ -345,13 +345,11 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
     clicked
 }
 
-/// The three kinds of `.dot`.
+/// Service status dot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dot {
     /// `.dot.ok`.
     Ok,
-    /// `.dot.live` (the mockup blinks it; a still dot costs no repaint).
-    Live,
     /// `.dot.off`.
     Off,
 }
@@ -362,10 +360,6 @@ pub fn paint_dot(painter: &egui::Painter, pal: &Palette, c: Pos2, dot: Dot) {
         Dot::Ok => {
             painter.circle_filled(c, 6.5, super::theme::rgba(16, 185, 129, 0.22));
             painter.circle_filled(c, 3.5, pal.ok);
-        }
-        Dot::Live => {
-            painter.circle_filled(c, 7.0, pal.glow);
-            painter.circle_filled(c, 3.5, pal.accent);
         }
         Dot::Off => {
             painter.circle_stroke(c, 2.75, Stroke::new(1.5, pal.ink2));
