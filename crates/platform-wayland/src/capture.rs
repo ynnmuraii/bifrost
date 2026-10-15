@@ -145,6 +145,25 @@ impl EmergencyHandle {
     }
 }
 
+/// Direct portal escape path, usable independently of core IPC and the capture pump.
+#[derive(Clone)]
+pub struct PortalEmergencyRelease {
+    input_capture: &'static InputCapture,
+    session: Arc<Session<InputCapture>>,
+    emergency: EmergencyHandle,
+}
+
+impl PortalEmergencyRelease {
+    /// Releases the current activation without waiting for the agent session loop.
+    pub async fn release(&self) -> Result<(), WaylandError> {
+        self.emergency.trigger();
+        self.input_capture
+            .release(&self.session, ReleaseOptions::default())
+            .await
+            .map_err(|error| map_portal_error(INPUT_CAPTURE_INTERFACE, error))
+    }
+}
+
 /// One event from the capture side.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CapturedEvent {
@@ -193,7 +212,7 @@ pub enum CapturedEvent {
 pub struct WaylandCapture {
     /// Process-wide proxy; see [`shared_portal`].
     input_capture: &'static InputCapture,
-    session: Session<InputCapture>,
+    session: Arc<Session<InputCapture>>,
     connection: event::Connection,
     events: EiStream,
     activated: SignalStream<Activated>,
@@ -323,7 +342,7 @@ impl WaylandCapture {
 
         Ok(Self {
             input_capture,
-            session,
+            session: Arc::new(session),
             connection,
             events: Box::pin(events),
             activated: Box::pin(activated),
@@ -675,6 +694,16 @@ impl WaylandCapture {
     #[must_use]
     pub fn emergency_handle(&self) -> EmergencyHandle {
         EmergencyHandle(Arc::clone(&self.emergency))
+    }
+
+    /// A direct portal release handle for an independently running shortcuts task.
+    #[must_use]
+    pub fn portal_emergency_release(&self) -> PortalEmergencyRelease {
+        PortalEmergencyRelease {
+            input_capture: self.input_capture,
+            session: Arc::clone(&self.session),
+            emergency: self.emergency_handle(),
+        }
     }
 
     /// Throws away queued events (the emergency path does not replay stale input).

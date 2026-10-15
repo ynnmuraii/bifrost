@@ -98,7 +98,7 @@ pub use clipboard::{availability, Availability, Unavailable};
 pub use data_control::Clipboard;
 
 #[cfg(target_os = "linux")]
-pub use capture::{portal_versions, CapturedEvent, EmergencyHandle, MotionCounts, WaylandCapture};
+pub use capture::{portal_versions, CapturedEvent, EmergencyHandle, MotionCounts, PortalEmergencyRelease, WaylandCapture};
 #[cfg(target_os = "linux")]
 pub use compositor::{compositor_signature, portal_interfaces, Compositor, PortalVersions};
 #[cfg(target_os = "linux")]

@@ -50,6 +50,117 @@ use platform_wayland::{
     INPUT_CAPTURE_INTERFACE, REMOTE_DESKTOP_INTERFACE,
 };
 
+type HotkeyCandidate = (config::HotkeyBindings, Result<EmergencyShortcuts, String>);
+
+/// Owns an independently pumped portal session, never blocked on core IPC.
+struct ShortcutTask {
+    events: tokio::sync::mpsc::UnboundedReceiver<config::HotkeyAction>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ShortcutTask {
+    fn start(
+        mut shortcuts: EmergencyShortcuts,
+        emergency: Option<platform_wayland::PortalEmergencyRelease>,
+    ) -> Self {
+        let (send, events) = tokio::sync::mpsc::unbounded_channel();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                let id = tokio::select! {
+                    biased;
+                    _ = &mut stopped => break,
+                    id = shortcuts.next_activation() => match id {
+                        Some(id) => id,
+                        None => break,
+                    },
+                };
+                let Some(action) = shortcut_action(&id) else { continue };
+                if action == config::HotkeyAction::EmergencyRelease {
+                    if let Some(emergency) = &emergency {
+                        if let Err(error) = emergency.release().await {
+                            tracing::warn!(%error, "autonomous emergency portal release failed");
+                        }
+                    }
+                }
+                if send.send(action).is_err() {
+                    break;
+                }
+            }
+            let _ = shortcuts.close().await;
+        });
+        Self { events, stop: Some(stop) }
+    }
+}
+
+impl Drop for ShortcutTask {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+fn shortcut_action(id: &str) -> Option<config::HotkeyAction> {
+    use config::HotkeyAction;
+    match id {
+        "emergency" => Some(HotkeyAction::EmergencyRelease),
+        "switch_next" => Some(HotkeyAction::SwitchNext),
+        "return_local" => Some(HotkeyAction::ReturnLocal),
+        "claim_ownership" => Some(HotkeyAction::ClaimOwnership),
+        _ => None,
+    }
+}
+
+async fn register_shortcuts(bindings: &config::HotkeyBindings) -> Result<EmergencyShortcuts, String> {
+    bindings.validate().map_err(|error| error.to_string())?;
+    let requested = [
+        ("emergency", "LAN Workspace: emergency release", &bindings.emergency_release),
+        ("switch_next", "LAN Workspace: switch to next machine", &bindings.switch_next),
+        ("return_local", "LAN Workspace: return to this machine", &bindings.return_local),
+        ("claim_ownership", "LAN Workspace: claim keyboard and pointer ownership", &bindings.claim_ownership),
+    ];
+    let requested: Vec<_> = requested.into_iter()
+        .filter(|(_, _, chord)| !chord.trim().is_empty())
+        .map(|(id, description, chord)| portal_trigger(chord).map(|trigger| (id, description, trigger)))
+        .collect::<Result<_, _>>()?;
+    let borrowed: Vec<_> = requested.iter()
+        .map(|(id, description, trigger)| (*id, *description, trigger.as_str()))
+        .collect();
+    EmergencyShortcuts::register_bindings(&borrowed).await.map_err(|error| format!(
+        "GlobalShortcuts registration failed for emergency_release={:?}, switch_next={:?}, return_local={:?}, claim_ownership={:?}: {error}. The compositor may show an approval dialog; cancellation, an unavailable chord, or an omitted action keeps all previous bindings. Preferred chords may be remapped in the compositor shortcut editor.",
+        bindings.emergency_release, bindings.switch_next, bindings.return_local, bindings.claim_ownership,
+    ))
+}
+
+/// XDG shortcuts use xkbcommon modifier and keysym names, not config spelling.
+fn portal_trigger(chord: &str) -> Result<String, String> {
+    let parsed = config::Hotkey::parse(chord).map_err(|error| error.to_string())?;
+    let mut trigger = String::new();
+    for modifier in parsed.modifiers() {
+        trigger.push_str(match modifier {
+            config::Modifier::Ctrl => "CTRL+",
+            config::Modifier::Alt => "ALT+",
+            config::Modifier::Shift => "SHIFT+",
+            config::Modifier::Super => "LOGO+",
+        });
+    }
+    let key = match parsed.key() {
+        "Enter" => "Return",
+        "PageUp" => "Prior",
+        "PageDown" => "Next",
+        "Backspace" => "BackSpace",
+        "Space" => "space",
+        key => key,
+    };
+    if key.len() == 1 {
+        trigger.push_str(&key.to_ascii_lowercase());
+    } else {
+        trigger.push_str(key);
+    }
+    Ok(trigger)
+}
+
 /// Which role the agent currently plays on this desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -102,7 +213,8 @@ pub struct Wayland {
     edge_effects: bool,
     overlay_attempted: bool,
     /// `None` when this compositor has no `GlobalShortcuts` portal (GNOME 46).
-    shortcuts: Option<EmergencyShortcuts>,
+    shortcuts: Option<ShortcutTask>,
+    hotkey_update: Option<tokio::sync::oneshot::Receiver<HotkeyCandidate>>,
     /// Restore tokens handed over by core in `AgentAttach`; kept in memory, because
     /// `docs/03-architecture.md` has *core* own `portal-restore.toml`.
     grants: GrantStore,
@@ -138,7 +250,7 @@ impl Wayland {
     /// belongs to this compositor and these portal versions.
     pub async fn connect(
         session: &SessionInfo,
-        emergency_hotkey: &str,
+        hotkeys: &config::HotkeyBindings,
         restore_tokens: &[protocol::ipc::PortalGrant],
         portal_progress: &tokio::sync::mpsc::UnboundedSender<protocol::ipc::agent_frame::Msg>,
     ) -> Result<(Self, Ready, Vec<Refusal>), Refusal> {
@@ -183,14 +295,19 @@ impl Wayland {
         }
         // The emergency hotkey is registered for the whole run (KVM-018); its absence
         // is the documented reason a GNOME 46 node cannot be a source.
-        let shortcuts = match EmergencyShortcuts::register(emergency_hotkey).await {
+        // Establish the safety path before trying optional actions. The startup
+        // SetHotkeys candidate replaces it only after every enabled action is granted.
+        let initial = match portal_trigger(&hotkeys.emergency_release) {
+            Ok(trigger) => EmergencyShortcuts::register(&trigger).await.map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        let shortcuts = match initial {
             Ok(shortcuts) => Some(shortcuts),
             Err(error) => {
                 refusals.push(Refusal {
                     code: "PORTAL_UNAVAILABLE",
                     detail: format!(
-                        "emergency hotkey {emergency_hotkey:?} is not available: {error}; \
-                         this node cannot be the source while require_emergency_hotkey is true"
+                        "global shortcuts are not available: {error}; this node cannot be the source while require_emergency_hotkey is true"
                     ),
                 });
                 None
@@ -235,6 +352,9 @@ impl Wayland {
             // than leave a half-armed one behind.
             capture = None;
         }
+        let shortcuts = shortcuts.map(|shortcuts| {
+            ShortcutTask::start(shortcuts, capture.as_ref().map(WaylandCapture::portal_emergency_release))
+        });
 
         // New tokens are core's to persist: `AgentAttach.restore_tokens` arrive from
         // it and `PortalGrantChanged` goes back, so `portal-restore.toml` stays core's
@@ -286,6 +406,7 @@ impl Wayland {
             edge_effects: false,
             overlay_attempted: false,
             shortcuts,
+            hotkey_update: None,
             grants,
             mode: Mode::Observe,
             receiving: false,
@@ -300,6 +421,34 @@ impl Wayland {
             clipboard,
         };
         Ok((wayland, ready, refusals))
+    }
+
+    /// Registers the candidate first; cancellation or rejection leaves the old
+    /// independent emergency task alive, including while the approval dialog is open.
+    pub fn request_hotkeys(&mut self, bindings: config::HotkeyBindings) -> Result<(), String> {
+        bindings.validate().map_err(|error| error.to_string())?;
+        if self.hotkey_update.is_some() {
+            return Err("A GlobalShortcuts approval dialog is already pending".to_owned());
+        }
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.hotkey_update = Some(receive);
+        tokio::spawn(async move {
+            let candidate = register_shortcuts(&bindings).await;
+            if let Err((_, Ok(candidate))) = send.send((bindings, candidate)) {
+                let _ = candidate.close().await;
+            }
+        });
+        Ok(())
+    }
+
+    pub async fn set_hotkeys(&mut self, bindings: &config::HotkeyBindings) -> Result<(), String> {
+        let candidate = register_shortcuts(bindings).await?;
+        let candidate = ShortcutTask::start(
+            candidate,
+            self.capture.as_ref().map(WaylandCapture::portal_emergency_release),
+        );
+        self.shortcuts = Some(candidate);
+        Ok(())
     }
 
     /// The capability report sent right after the attach.
@@ -691,43 +840,83 @@ impl Wayland {
         self.injector.pump().await;
 
         let Wayland {
-            capture, shortcuts, ..
+            capture, shortcuts, hotkey_update, ..
         } = self;
         let shortcut = async {
             match shortcuts.as_mut() {
-                Some(shortcuts) => shortcuts.next_activation().await,
+                Some(shortcuts) => shortcuts.events.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let update = async {
+            match hotkey_update.as_mut() {
+                Some(update) => update.await,
                 None => std::future::pending().await,
             }
         };
 
         enum Step {
             Captured(Option<CapturedEvent>),
-            Shortcut,
+            Shortcut(Option<config::HotkeyAction>),
+            Updated(Result<HotkeyCandidate, tokio::sync::oneshot::error::RecvError>),
             Tick,
         }
 
         let step = match capture {
             Some(capture) => tokio::select! {
                 biased;
+                result = update => Step::Updated(result),
+                action = shortcut => Step::Shortcut(action),
                 event = capture.next_event() => Step::Captured(event),
-                _ = shortcut => Step::Shortcut,
                 () = tokio::time::sleep(POLL_TICK) => Step::Tick,
             },
             None => tokio::select! {
                 biased;
-                _ = shortcut => Step::Shortcut,
+                result = update => Step::Updated(result),
+                action = shortcut => Step::Shortcut(action),
                 () = tokio::time::sleep(POLL_TICK) => Step::Tick,
             },
         };
 
         match step {
             Step::Tick => None,
-            Step::Shortcut => {
-                if let Some(capture) = self.capture.as_ref() {
-                    capture.notify_emergency();
-                    tracing::warn!("emergency shortcut fired; releasing the capture locally");
+            Step::Updated(result) => {
+                self.hotkey_update = None;
+                match result {
+                    Ok((bindings, candidate)) => {
+                        let result = candidate.map(|candidate| {
+                            self.shortcuts = Some(ShortcutTask::start(
+                                candidate,
+                                self.capture.as_ref().map(WaylandCapture::portal_emergency_release),
+                            ));
+                        });
+                        Some(Event::HotkeysResult(crate::backend::hotkey_result(
+                            &bindings,
+                            result,
+                            "GlobalShortcuts registered preferred chords. The compositor may remap them; inspect its shortcut editor. Changes may require a compositor approval dialog.",
+                        )))
+                    }
+                    Err(error) => Some(Event::Failed {
+                        code: "HOTKEY_UNAVAILABLE",
+                        detail: format!("GlobalShortcuts registration worker stopped: {error}; existing bindings retained"),
+                    }),
                 }
+            }
+            Step::Shortcut(Some(config::HotkeyAction::EmergencyRelease)) => {
+                if self.capture.is_none() {
+                    return Some(Event::Emergency);
+                }
+                // The independent task already released the portal and raised the
+                // capture flag; its Emergency event drains local input state.
                 None
+            }
+            Step::Shortcut(Some(action)) => Some(Event::HotkeyPressed(action)),
+            Step::Shortcut(None) => {
+                self.shortcuts = None;
+                Some(Event::Failed {
+                    code: "HOTKEY_UNAVAILABLE",
+                    detail: "GlobalShortcuts portal session ended; hotkeys are unavailable".to_owned(),
+                })
             }
             Step::Captured(None) => {
                 // The portal session ended (the compositor closed or disabled it).
@@ -1109,6 +1298,28 @@ fn fatal(error: &WaylandError) -> Refusal {
 #[cfg(test)]
 mod activation_tests {
     use super::*;
+    #[test]
+    fn portal_trigger_uses_xdg_modifier_and_keysym_names() {
+        assert_eq!(portal_trigger("Ctrl+Alt+Shift+F12").unwrap(), "CTRL+ALT+SHIFT+F12");
+        assert_eq!(portal_trigger("Super+Enter").unwrap(), "LOGO+Return");
+        assert_eq!(portal_trigger("Ctrl+A").unwrap(), "CTRL+a");
+        assert_eq!(portal_trigger("Alt+PageDown").unwrap(), "ALT+Next");
+    }
+
+
+    #[test]
+    fn portal_ids_map_to_all_four_actions_without_falling_back_to_emergency() {
+        use config::HotkeyAction;
+        for (id, action) in [
+            ("emergency", HotkeyAction::EmergencyRelease),
+            ("switch_next", HotkeyAction::SwitchNext),
+            ("return_local", HotkeyAction::ReturnLocal),
+            ("claim_ownership", HotkeyAction::ClaimOwnership),
+        ] {
+            assert_eq!(shortcut_action(id), Some(action));
+        }
+        assert_eq!(shortcut_action("unknown"), None);
+    }
 
     #[test]
     fn activation_uses_only_actual_cursor_and_accepted_barrier() {
