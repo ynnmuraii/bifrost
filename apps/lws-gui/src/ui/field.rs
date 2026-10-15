@@ -37,6 +37,9 @@ const CELL_H: f32 = 11.0;
 const SETTLED_SPEED: f32 = 8.0;
 /// How close the eased pointer must be to the real one for the field to count as settled.
 const SETTLED_POINTER: f32 = 0.5;
+/// How far apart the glyphs of an ASCII isoline are, in points: a character every 13 points
+/// leaves gaps wide enough that the chain is unmistakably made of glyphs.
+const LINK_STEP: f32 = 13.0;
 
 const BAYER: [f32; 16] = [
     0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0,
@@ -178,10 +181,13 @@ impl Field {
     }
 
     /// A cached-glyph ASCII isoline, without per-link strings or layout allocations.
+    ///
+    /// The glyphs are spaced by [`LINK_STEP`], wide enough that the chain reads as a chain of
+    /// characters rather than as the dashed line of the other style.
     pub fn link(&mut self, painter: &Painter, from: Pos2, to: Pos2, color: Color32) {
         self.glyphs11.ensure(painter, 11.0);
         let delta = to - from;
-        let count = (delta.length() / 9.0).ceil().max(1.0) as usize;
+        let count = (delta.length() / LINK_STEP).ceil().max(1.0) as usize;
         painter.extend((0..=count).filter_map(|i| {
             let ch = if i == 0 || i == count {
                 '+'
@@ -375,7 +381,9 @@ impl Field {
             false
         };
         self.draw_particles(painter, frame, simulate);
-        if frame.look.link_style != LinkStyle::Ascii {
+        // The flows are glyphs too: they are part of «ASCII-изолиния», and the plain line the
+        // other style draws carries no characters at all.
+        if frame.look.link_style == LinkStyle::Ascii {
             self.draw_flows(painter, frame, simulate);
         }
         moving
@@ -829,6 +837,93 @@ mod tests {
         };
         let (calm, lively) = (moved_by(0.3), moved_by(2.0));
         assert!(lively > calm * 1.5, "{calm} then {lively}");
+    }
+
+    /// Every glyph drawn on the segment `from`→`to`, by a frame of `style` with a link there.
+    fn glyphs_on_link(style: LinkStyle, from: Pos2, to: Pos2) -> Vec<String> {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let look = Look {
+            link_style: style,
+            clouds: false,
+            ..Look::default()
+        };
+        let pal = Palette::of(look.theme);
+        let mut field = Field::new();
+        let flows = [Flow {
+            from,
+            to,
+            horizontal: true,
+        }];
+        let mut found = Vec::new();
+        let output = ctx.run_ui(map_input(0.0), |ui| {
+            field.paint(
+                ui.painter(),
+                &Frame {
+                    map: ui.ctx().content_rect(),
+                    pal: &pal,
+                    look,
+                    // Still: the particles stay at home as '·' and cannot be mistaken for a
+                    // glyph of the link.
+                    simulate: false,
+                    t: 0.0,
+                    pointer: None,
+                    flows: &flows,
+                },
+            );
+            // `map_view` draws the chain for «ASCII-изолиния» and its own dashed line for
+            // «Линия»: what is under test here is everything the field itself draws.
+            if style == LinkStyle::Ascii {
+                field.link(ui.painter(), from, to, Color32::WHITE);
+            }
+        });
+        fn walk(shape: &Shape, from: Pos2, to: Pos2, found: &mut Vec<String>) {
+            match shape {
+                Shape::Text(text) => {
+                    let glyph = text.galley.text();
+                    // The particles and the clouds of this frame are '·' and nothing else; a
+                    // '+', '-', '|' or '•' on the link can only be the link's own drawing.
+                    if matches!(glyph, "+" | "-" | "|" | "•") {
+                        let at = text.pos + text.galley.size() / 2.0;
+                        let along = (to - from).normalized();
+                        let offset = at - from - along * ((at - from).dot(along));
+                        if offset.length() < 8.0 && (at - from).dot(along) >= -8.0 {
+                            found.push(glyph.to_owned());
+                        }
+                    }
+                }
+                Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, from, to, found)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            walk(&clipped.shape, from, to, &mut found);
+        }
+        output.drop_without_applying_deltas();
+        found
+    }
+
+    #[test]
+    fn the_ascii_style_draws_glyphs_on_the_link_and_the_line_style_draws_none() {
+        let (from, to) = (Pos2::new(100.0, 200.0), Pos2::new(500.0, 200.0));
+        let ascii = glyphs_on_link(LinkStyle::Ascii, from, to);
+        assert!(
+            ascii.iter().filter(|glyph| *glyph == "+").count() >= 2,
+            "the isoline ends in two '+' marks: {ascii:?}"
+        );
+        assert!(
+            ascii.iter().filter(|glyph| *glyph == "-").count() > 10,
+            "its middle is the dashed chain of a glyph per {LINK_STEP} points: {ascii:?}"
+        );
+        assert!(
+            ascii.iter().any(|glyph| glyph == "•"),
+            "and the input of an active link flows through it as dots: {ascii:?}"
+        );
+        assert_eq!(
+            glyphs_on_link(LinkStyle::Line, from, to),
+            Vec::<String>::new(),
+            "«Линия» is a plain line: the field draws no character on it"
+        );
     }
 
     #[test]
