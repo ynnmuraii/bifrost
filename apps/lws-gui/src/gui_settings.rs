@@ -1,4 +1,4 @@
-//! The window's own settings: theme and background, in a file of the GUI's own.
+//! The window's own settings: theme, background, map view and dock, in a file of the GUI's own.
 //!
 //! The choice of a theme is a fact about this window and not about the service, so it lives in
 //! `gui.toml` next to `config.toml` and the core never reads it (and `config.toml` is never
@@ -40,10 +40,21 @@ pub enum FieldMode {
     /// «Разлетаются».
     Repel,
     /// «Собираются».
+    #[default]
     Attract,
     /// «Без движения»: nothing moves, nothing is redrawn on a timer.
-    #[default]
     Off,
+}
+
+/// How the links between computers are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkStyle {
+    /// «ASCII-изолиния»: a chain of glyphs.
+    #[default]
+    Ascii,
+    /// «Линия»: a dashed line.
+    Line,
 }
 
 /// How fast they drift.
@@ -69,9 +80,20 @@ pub struct Look {
     pub pace: Pace,
     /// «ASCII-облака».
     pub clouds: bool,
+    /// How links are drawn.
+    pub link_style: LinkStyle,
     /// Map scale relative to its fitted base, stored as a percentage (70..=150).
     pub zoom_percent: u16,
+    /// How far the map was dragged with the right button, in points (`-PAN_MAX..=PAN_MAX`).
+    pub pan_x: i16,
+    /// The same, vertically.
+    pub pan_y: i16,
+    /// The pairing dock is open (`false`: only its handle shows).
+    pub dock_open: bool,
 }
+
+/// The furthest the map may be panned, in points.
+pub const PAN_MAX: i16 = 2000;
 
 impl Default for Look {
     fn default() -> Self {
@@ -80,7 +102,11 @@ impl Default for Look {
             field: FieldMode::default(),
             pace: Pace::default(),
             clouds: true,
+            link_style: LinkStyle::default(),
             zoom_percent: 100,
+            pan_x: 0,
+            pan_y: 0,
+            dock_open: true,
         }
     }
 }
@@ -97,6 +123,8 @@ pub fn load(path: &Path) -> Look {
         .and_then(|text| toml::from_str(&text).ok())
         .map(|mut look: Look| {
             look.zoom_percent = look.zoom_percent.clamp(70, 150);
+            look.pan_x = look.pan_x.clamp(-PAN_MAX, PAN_MAX);
+            look.pan_y = look.pan_y.clamp(-PAN_MAX, PAN_MAX);
             look
         })
         .unwrap_or_default()
@@ -124,12 +152,14 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_are_light_with_a_still_field() {
+    fn the_defaults_are_light_with_the_field_gathering_and_ascii_links() {
         let look = Look::default();
         assert_eq!(look.theme, Theme::Light);
-        assert_eq!(look.field, FieldMode::Off);
+        assert_eq!(look.field, FieldMode::Attract);
+        assert_eq!(look.link_style, LinkStyle::Ascii);
         assert_eq!(look.pace, Pace::Calm);
-        assert!(look.clouds);
+        assert!(look.clouds && look.dock_open);
+        assert_eq!((look.pan_x, look.pan_y), (0, 0));
     }
 
     #[test]
@@ -138,10 +168,14 @@ mod tests {
         let path = path_in(&dir);
         let look = Look {
             theme: Theme::Dark,
-            field: FieldMode::Attract,
+            field: FieldMode::Repel,
             pace: Pace::Live,
             clouds: false,
+            link_style: LinkStyle::Line,
             zoom_percent: 125,
+            pan_x: -120,
+            pan_y: 37,
+            dock_open: false,
         };
         save(&path, &look).expect("the directory is created");
         assert_eq!(load(&path), look);
@@ -160,7 +194,7 @@ mod tests {
         std::fs::write(&path, "theme = \"dark\"\n").expect("write");
         let partial = load(&path);
         assert_eq!(partial.theme, Theme::Dark);
-        assert_eq!(partial.field, FieldMode::Off);
+        assert_eq!(partial.field, FieldMode::Attract);
         assert_eq!(partial.zoom_percent, 100);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -172,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_zoom_is_bounded_without_touching_core_config() {
+    fn persisted_zoom_and_pan_are_bounded_without_touching_core_config() {
         let dir = dir("zoom");
         let path = path_in(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -180,6 +214,9 @@ mod tests {
             std::fs::write(&path, format!("zoom_percent = {stored}\n")).expect("write");
             assert_eq!(load(&path).zoom_percent, expected);
         }
+        std::fs::write(&path, "pan_x = 30000\npan_y = -30000\n").expect("write");
+        let look = load(&path);
+        assert_eq!((look.pan_x, look.pan_y), (PAN_MAX, -PAN_MAX));
         assert!(!dir.join("config.toml").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
