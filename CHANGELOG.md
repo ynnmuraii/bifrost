@@ -1,8 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-10-16
 
 - Fixed the settings version display: it now sits in a padded, localized bottom row instead of overlapping the modal frame.
+- Portable Windows executable available directly, alongside the archive with notices and example settings.
+- Per-user Linux installation and removal with `install.sh`; existing settings and pairing are preserved.
+- English project introduction, screenshots and clearer platform and installation requirements.
+- A fresh GUI starts its core automatically and creates settings without a manual CLI step.
+- Settings now offers a per-user Start at login toggle, pointing at the running executable.
+- Licensed under MIT.
 
 ## 0.1.0 — 2026-10-16
 

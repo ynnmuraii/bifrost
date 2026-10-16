@@ -935,6 +935,19 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             actions.push(Action::SetLook(look));
         }
     });
+    row(ui, pal, text(lang, Key::Autostart), false, |ui| {
+        if let Some(i) = widgets::seg(
+            ui,
+            pal,
+            &[text(lang, Key::On), text(lang, Key::Off)],
+            usize::from(!vm.settings.autostart),
+        ) {
+            actions.push(Action::SetAutostart(i == 0));
+        }
+        if let Some(error) = &vm.settings.autostart_error {
+            widgets::wrapped(ui, error, 13.0, fam::sans(), pal.ink);
+        }
+    });
     let current = vm.config.listen_address.clone();
     row(ui, pal, text(lang, Key::LANAddress), false, |ui| {
         let options = vm.settings.lan.options(&current);
