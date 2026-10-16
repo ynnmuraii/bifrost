@@ -230,17 +230,47 @@ fn the_core_migration_rewrites_the_file_exactly_once() {
     // the untouched legacy document.
     assert_eq!(read(&dir.join("config.toml.bak")), LEGACY_EXAMPLE);
 
+    // The untouched original is also copied next to the file, before the rewrite.
+    let preserved = dir.join("config.toml.pre-hotkeys");
+    assert_eq!(read(&preserved), LEGACY_EXAMPLE);
+
     // Everything but the hotkey spelling is untouched — the strongest form of
     // "keeps the rest of the file" the typed writer can give.
     let after = Config::load(&path).expect("the migrated file loads");
     assert_eq!(after, before);
 
-    // And the second start does not write at all.
+    // The core's very next persistence write — the ownership serial, a moment
+    // after the migration — replaces `.bak` with the migrated document, so only
+    // the copy still holds the original. That is the loss the copy exists to
+    // prevent.
+    config::update_locked(&path, |config| {
+        config.workspace.owner_claim_serial = 7;
+        config.workspace.owner_node_id = config::peer_reference(&[0x11; 32]);
+    })
+    .expect("the ownership write");
+    assert_ne!(
+        read(&dir.join("config.toml.bak")),
+        LEGACY_EXAMPLE,
+        "the ownership write replaces the .bak that held the original"
+    );
+    assert_eq!(
+        read(&preserved),
+        LEGACY_EXAMPLE,
+        "the copy must survive every later write, byte for byte"
+    );
+
+    // And the second start neither rewrites the file nor touches the copy.
+    let backup = read(&dir.join("config.toml.bak"));
     assert!(!config::migrate_legacy_hotkeys(&path).expect("the second check"));
     assert_eq!(
         read(&dir.join("config.toml.bak")),
-        LEGACY_EXAMPLE,
+        backup,
         "the second check must not have written anything"
+    );
+    assert_eq!(
+        read(&preserved),
+        LEGACY_EXAMPLE,
+        "the second check must not have touched the copy"
     );
 }
 
@@ -255,6 +285,34 @@ fn a_current_file_is_never_rewritten() {
     assert!(
         !dir.join("config.toml.bak").exists(),
         "no write means no .bak"
+    );
+    assert!(
+        !dir.join("config.toml.pre-hotkeys").exists(),
+        "no migration means no copy either"
+    );
+}
+
+#[test]
+fn an_existing_pre_hotkeys_copy_is_never_overwritten() {
+    // `create_new`, not a copy-aside-and-replace: a copy an earlier run left
+    // behind *is* the original, and a second attempt must not clobber it.
+    let dir = temp_dir("preserved");
+    let path = dir.join("config.toml");
+    write(&path, LEGACY_EXAMPLE);
+    let preserved = dir.join("config.toml.pre-hotkeys");
+    let earlier = "# the copy an earlier migration left behind\n";
+    write(&preserved, earlier);
+
+    assert!(config::migrate_legacy_hotkeys(&path).expect("the migration writes"));
+
+    assert_eq!(
+        read(&preserved),
+        earlier,
+        "the existing copy must not be replaced"
+    );
+    assert!(
+        !sets_key(&read(&path), "emergency_hotkey"),
+        "the file is migrated regardless"
     );
 }
 
