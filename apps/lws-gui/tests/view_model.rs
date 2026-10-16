@@ -481,12 +481,19 @@ fn a_dragged_computer_becomes_a_document_only_on_drop() {
     let (this, peer) = (index_of(&vm, SELF_NODE), index_of(&vm, PEER_NODE));
     let me = vm.editor.placement[this];
     let width = vm.editor.shapes[this].w;
-    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-    x: me.x + width + 5.0,
-    y: me.y + 1.0, snap_threshold: lws_gui::map::SNAP });
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: me.x + width + 5.0,
+        y: me.y + 1.0,
+        snap_threshold: lws_gui::map::SNAP,
+    });
     assert!(vm.editor.dirty());
     assert!((vm.editor.placement[peer].x - (me.x + width)).abs() < 1e-6);
-    assert_eq!(vm.editor.placement[peer].y, me.y + 1.0, "tangent offset is retained");
+    assert_eq!(
+        vm.editor.placement[peer].y,
+        me.y + 1.0,
+        "tangent offset is retained"
+    );
     assert_eq!(vm.map_model().links.len(), 1, "the preview shows the link");
     assert_eq!(vm.editor.revision, 7, "and nothing was applied");
 
@@ -567,9 +574,12 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
 
     // Dragging the peer away unlinks the pair; putting it back restores the draft to clean.
     let before = vm.editor.placement.clone();
-    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-    x: 700.0,
-    y: 400.0, snap_threshold: lws_gui::map::SNAP });
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: 700.0,
+        y: 400.0,
+        snap_threshold: lws_gui::map::SNAP,
+    });
     assert!(vm.editor.dirty());
     assert!(vm.map_model().links.is_empty());
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
@@ -907,9 +917,12 @@ fn move_to_side(vm: &mut ViewModel, side: Side) {
     let this = index_of(vm, SELF_NODE);
     let peer = index_of(vm, PEER_NODE);
     let target = flush_target(vm, this, peer, side);
-    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-    x: target.x,
-    y: target.y, snap_threshold: lws_gui::map::SNAP });
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: target.x,
+        y: target.y,
+        snap_threshold: lws_gui::map::SNAP,
+    });
 }
 
 fn drop_to_side(vm: &mut ViewModel, side: Side) {
@@ -1007,18 +1020,24 @@ fn conflict_reloads_and_retries_the_latest_drop_only_once() {
 fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
     let mut vm = saving_view();
     let baseline = vm.editor.placement.clone();
-    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-    x: baseline[index_of(&vm, SELF_NODE)].x + 20.0,
-    y: baseline[index_of(&vm, SELF_NODE)].y + 20.0, snap_threshold: lws_gui::map::SNAP });
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: baseline[index_of(&vm, SELF_NODE)].x + 20.0,
+        y: baseline[index_of(&vm, SELF_NODE)].y + 20.0,
+        snap_threshold: lws_gui::map::SNAP,
+    });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, baseline);
     assert!(vm.take_outgoing().is_empty());
     assert!(vm.flash.is_some(), "invalid placement gets a short hint");
     let this = index_of(&vm, SELF_NODE);
     let origin = vm.editor.placement[this];
-    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-    x: origin.x + vm.editor.shapes[this].w / 3.0,
-    y: origin.y + vm.editor.shapes[this].h / 3.0, snap_threshold: lws_gui::map::SNAP });
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: origin.x + vm.editor.shapes[this].w / 3.0,
+        y: origin.y + vm.editor.shapes[this].h / 3.0,
+        snap_threshold: lws_gui::map::SNAP,
+    });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(
         vm.editor.placement, baseline,
@@ -1028,9 +1047,12 @@ fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
     drop_to_side(&mut vm, Side::Right);
     let (id, _) = take_save(&mut vm);
     let accepted = vm.editor.placement.clone();
-    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-    x: origin.x + 20.0,
-    y: origin.y + 20.0, snap_threshold: lws_gui::map::SNAP });
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: origin.x + 20.0,
+        y: origin.y + 20.0,
+        snap_threshold: lws_gui::map::SNAP,
+    });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, accepted);
     assert!(vm.take_outgoing().is_empty());
@@ -1110,9 +1132,12 @@ fn dragging_chooses_all_four_edges() {
     for side in Side::ALL {
         let target = flush_target(&vm, this, peer, side);
         // Flush snapping keeps the requested tangent coordinate.
-        vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-        x: target.x,
-        y: target.y, snap_threshold: lws_gui::map::SNAP });
+        vm.local(&Action::MoveNode {
+            node_id: PEER_NODE.to_owned(),
+            x: target.x,
+            y: target.y,
+            snap_threshold: lws_gui::map::SNAP,
+        });
         assert!((vm.editor.placement[peer].x - target.x).abs() < 1e-6);
         assert!((vm.editor.placement[peer].y - target.y).abs() < 1e-6);
         let links = vm.map_model().links;
@@ -1162,9 +1187,12 @@ fn dragging_chooses_all_four_edges() {
     // through the peer's right edge into this computer's left edge.
     let me = vm.editor.placement[this];
     let peer_width = vm.editor.shapes[peer].w;
-    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
-    x: me.x - peer_width - 4.0,
-    y: me.y + 2.0, snap_threshold: lws_gui::map::SNAP });
+    vm.local(&Action::MoveNode {
+        node_id: PEER_NODE.to_owned(),
+        x: me.x - peer_width - 4.0,
+        y: me.y + 2.0,
+        snap_threshold: lws_gui::map::SNAP,
+    });
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
     let link = &topology.links[0];
     assert_eq!(link.from.node, format!("peer:{PEER_NODE}"));
@@ -1943,7 +1971,10 @@ fn the_address_button_through_the_bridge_writes_and_says_why_it_cannot_restart()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn concrete_doc(mut doc: protocol::ipc::TopologyDoc, links: &[config::LinkConfig]) -> protocol::ipc::TopologyDoc {
+fn concrete_doc(
+    mut doc: protocol::ipc::TopologyDoc,
+    links: &[config::LinkConfig],
+) -> protocol::ipc::TopologyDoc {
     let endpoint = |e: &config::EndpointConfig| protocol::ipc::EndpointView {
         node_id: e.node.strip_prefix("peer:").unwrap_or(&e.node).to_owned(),
         display_id: e.display.clone(),
@@ -1951,14 +1982,17 @@ fn concrete_doc(mut doc: protocol::ipc::TopologyDoc, links: &[config::LinkConfig
         segment_start: e.start,
         segment_end: e.end,
     };
-    doc.links = links.iter().map(|link| protocol::ipc::LinkView {
-        id: link.id.clone(),
-        from: Some(endpoint(&link.from)),
-        to: Some(endpoint(&link.to)),
-        bidirectional: link.bidirectional,
-        active: true,
-        ..Default::default()
-    }).collect();
+    doc.links = links
+        .iter()
+        .map(|link| protocol::ipc::LinkView {
+            id: link.id.clone(),
+            from: Some(endpoint(&link.from)),
+            to: Some(endpoint(&link.to)),
+            bidirectional: link.bidirectional,
+            active: true,
+            ..Default::default()
+        })
+        .collect();
     doc
 }
 
@@ -1983,7 +2017,10 @@ fn lower_half_contacts_keep_display_ids_and_round_trip_offsets() {
         (vm.editor.placement[b].y - origin.y) / vm.editor.scale,
     );
     let mut restored = saving_view();
-    restored.apply(event(Msg::TopologyDoc(concrete_doc(two_node_doc(8), &links))));
+    restored.apply(event(Msg::TopologyDoc(concrete_doc(
+        two_node_doc(8),
+        &links,
+    ))));
     let ra = restored.editor.placement[a];
     let rb = restored.editor.placement[b];
     assert!(((rb.x - ra.x) / restored.editor.scale - relative.x).abs() < 1e-6);
@@ -2003,7 +2040,8 @@ fn disconnected_nonoverlapping_drop_is_accepted_without_relinking() {
     assert_eq!(vm.editor.placement, dropped);
     let (_, request) = take_save(&mut vm);
     let topology: config::TopologyConfig =
-        toml::from_str(std::str::from_utf8(&request.layout_toml).expect("UTF-8")).expect("document");
+        toml::from_str(std::str::from_utf8(&request.layout_toml).expect("UTF-8"))
+            .expect("document");
     assert!(topology.links.is_empty());
 }
 
@@ -2025,7 +2063,11 @@ fn multiple_display_contacts_are_saved_individually() {
         vm.editor.placement[a].y,
     );
     let links = vm.editor_links();
-    assert_eq!(links.len(), 3, "each touching display pair keeps its own overlap");
+    assert_eq!(
+        links.len(),
+        3,
+        "each touching display pair keeps its own overlap"
+    );
     assert!(links.iter().any(|l| l.from.display.ends_with("-lower")));
     assert!(links.iter().any(|l| l.to.display.ends_with("-lower")));
     assert_eq!(vm.map_model().links.len(), links.len());
@@ -2130,8 +2172,7 @@ fn legacy_mixed_auto_and_concrete_endpoints_reconstruct_and_survive() {
     assert_eq!(model.links.len(), 1);
     assert!(model.links[0].whole_desktop);
     assert!((model.links[0].from.x - model.links[0].to.x).abs() < 1e-6);
-    assert!((model.links[0].span.0
-        - (model.links[0].to.y - 350.0 * vm.editor.scale)).abs() < 1e-6);
+    assert!((model.links[0].span.0 - (model.links[0].to.y - 350.0 * vm.editor.scale)).abs() < 1e-6);
     let links = vm.editor_links();
     assert!(links[0].from.is_auto());
     assert!(!links[0].to.is_auto());

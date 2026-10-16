@@ -654,7 +654,12 @@ impl Session {
         let peers = self.peer_displays.clone();
         move |text| {
             let layout = parse_layout_toml(text)?;
-            crate::topology::check_layout(&layout, &node, agent_known.then_some(agent.as_slice()), &peers)?;
+            crate::topology::check_layout(
+                &layout,
+                &node,
+                agent_known.then_some(agent.as_slice()),
+                &peers,
+            )?;
             Ok(layout)
         }
     }
@@ -665,7 +670,8 @@ impl Session {
         let (displays, peers) = crate::topology::live_inputs(
             &self.layout,
             self.node_id.as_bytes(),
-            self.agent_displays_known.then_some(self.agent_displays.as_slice()),
+            self.agent_displays_known
+                .then_some(self.agent_displays.as_slice()),
             &self.peer_displays,
         );
         let documents = crate::topology::Documents {

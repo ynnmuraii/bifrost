@@ -1264,7 +1264,9 @@ to = {{ node = "{peer_ref}", display = "remote", edge = "left", start = 100, end
 bidirectional = true
 "#,
             peer_ref = config::peer_reference(peer.as_bytes())
-        )).expect("configured snapshots and concrete contact").topology;
+        ))
+        .expect("configured snapshots and concrete contact")
+        .topology;
         let local = snapshot_displays(&config, node.as_bytes());
         let peer_manifest = snapshot_peers(&config, node.as_bytes())[0].1.clone();
         let caps = fr::Capabilities {
@@ -1274,61 +1276,121 @@ bidirectional = true
             emergency_hotkey: true,
         };
         let mut router = fr::FocusRouter::new(
-            node, fr::Timing::default(), fr::SequentialIds::default(), caps,
-        ).with_persisted_ownership(1, Some((1, node)));
-        router.handle(0, fr::Input::Hello {
-            peer,
-            hello: fr::PeerHello {
-                can_own: true, capabilities: caps, owner_serial: 1, owner: Some(node),
+            node,
+            fr::Timing::default(),
+            fr::SequentialIds::default(),
+            caps,
+        )
+        .with_persisted_ownership(1, Some((1, node)));
+        router.handle(
+            0,
+            fr::Input::Hello {
+                peer,
+                hello: fr::PeerHello {
+                    can_own: true,
+                    capabilities: caps,
+                    owner_serial: 1,
+                    owner: Some(node),
+                },
             },
-        });
-        router.handle(1, fr::Input::Local(fr::LocalInput::SwitchRequest {
-            trigger: fr::SwitchTrigger::Edge,
-            target: peer,
-            entry_position: geometry::Position::new("remote", 2.0, 300.0),
-            topology_revision: 0,
-        }));
+        );
+        router.handle(
+            1,
+            fr::Input::Local(fr::LocalInput::SwitchRequest {
+                trigger: fr::SwitchTrigger::Edge,
+                target: peer,
+                entry_position: geometry::Position::new("remote", 2.0, 300.0),
+                topology_revision: 0,
+            }),
+        );
         let lease_id = router.lease().source().expect("preparing").lease_id;
-        router.handle(2, fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }));
-        router.handle(3, fr::Input::Net { from: peer, message: fr::Message::EnterAck {
-            lease_id, accepted: true, reason: None,
-        }});
-        router.handle(4, fr::Input::Net { from: peer, message: fr::Message::LeaseChallenge {
-            lease_id, nonce: [8; 16], ttl_ms: 500,
-        }});
-        router.handle(5, fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }));
+        router.handle(
+            2,
+            fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }),
+        );
+        router.handle(
+            3,
+            fr::Input::Net {
+                from: peer,
+                message: fr::Message::EnterAck {
+                    lease_id,
+                    accepted: true,
+                    reason: None,
+                },
+            },
+        );
+        router.handle(
+            4,
+            fr::Input::Net {
+                from: peer,
+                message: fr::Message::LeaseChallenge {
+                    lease_id,
+                    nonce: [8; 16],
+                    ttl_ms: 500,
+                },
+            },
+        );
+        router.handle(
+            5,
+            fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }),
+        );
         assert_eq!(router.focus(), fr::FocusState::Remote);
 
         for missing_local in [true, false] {
             let mut peers = BTreeMap::from([(peer, (1, peer_manifest.clone()))]);
             for empty in [false, true, false] {
                 if !missing_local {
-                    peers.insert(peer, (2, if empty { Vec::new() } else { peer_manifest.clone() }));
+                    peers.insert(
+                        peer,
+                        (
+                            2,
+                            if empty {
+                                Vec::new()
+                            } else {
+                                peer_manifest.clone()
+                            },
+                        ),
+                    );
                 }
-                let report = if missing_local && empty { &[][..] } else { local.as_slice() };
-                let (displays, peer_displays) = live_inputs(&config, node.as_bytes(), Some(report), &peers);
+                let report = if missing_local && empty {
+                    &[][..]
+                } else {
+                    local.as_slice()
+                };
+                let (displays, peer_displays) =
+                    live_inputs(&config, node.as_bytes(), Some(report), &peers);
                 let built = build(&Documents {
-                    local_node_id: *node.as_bytes(), topology: &config,
-                    local_displays: &displays, peer_displays: &peer_displays,
-                }).expect("missing concrete endpoint is inactive");
+                    local_node_id: *node.as_bytes(),
+                    topology: &config,
+                    local_displays: &displays,
+                    peer_displays: &peer_displays,
+                })
+                .expect("missing concrete endpoint is inactive");
                 // This is the only router operation performed by Session::rebuild_topology.
                 router.set_topology_revision(built.topology.revision);
                 assert_eq!(router.focus(), fr::FocusState::Remote);
-                assert_eq!(router.lease().source().expect("same active lease").lease_id, lease_id);
+                assert_eq!(
+                    router.lease().source().expect("same active lease").lease_id,
+                    lease_id
+                );
                 assert_eq!(built.topology.links.len(), usize::from(!empty));
                 assert_eq!(built.inactive.len(), usize::from(empty));
                 assert_eq!(
                     geometry::resolve_transition(
-                        &built.topology, &node,
+                        &built.topology,
+                        &node,
                         &geometry::Position::new("local", 1920.0, 400.0),
-                    ).is_some(),
+                    )
+                    .is_some(),
                     !empty,
                 );
                 assert_eq!(
                     geometry::resolve_transition(
-                        &built.topology, &peer,
+                        &built.topology,
+                        &peer,
                         &geometry::Position::new("remote", 0.0, 300.0),
-                    ).is_some(),
+                    )
+                    .is_some(),
                     !empty,
                 );
             }
@@ -1342,9 +1404,12 @@ bidirectional = true
         let (local, peers) = live_inputs(&config, node.as_bytes(), None, &first_empty_hello);
         assert!(peers[0].1.is_empty());
         let built = build(&Documents {
-            local_node_id: *node.as_bytes(), topology: &config,
-            local_displays: &local, peer_displays: &peers,
-        }).expect("known empty HELLO is inactive");
+            local_node_id: *node.as_bytes(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("known empty HELLO is inactive");
         assert!(built.topology.links.is_empty());
         assert_eq!(built.inactive.len(), 1);
     }
@@ -2588,14 +2653,25 @@ bidirectional = true
             };
             let active = assemble(&local, &peers);
             assert!(active.inactive.is_empty());
-            assert_eq!(active.topology.links[0].source.segment, geometry::Segment::new(200.0, 600.0));
-            assert_eq!(active.topology.links[0].target.segment, geometry::Segment::new(100.0, 500.0));
+            assert_eq!(
+                active.topology.links[0].source.segment,
+                geometry::Segment::new(200.0, 600.0)
+            );
+            assert_eq!(
+                active.topology.links[0].target.segment,
+                geometry::Segment::new(100.0, 500.0)
+            );
             for reverse in [false, true] {
                 let (owner, id, boundary, start, end) = if reverse {
                     (NodeId::new(peer_id()), "DP-1", 0.0, 100.0, 500.0)
                 } else {
-                    (NodeId::new(local_id()), "eDP-1",
-                        if horizontal { 1080.0 } else { 1920.0 }, 200.0, 600.0)
+                    (
+                        NodeId::new(local_id()),
+                        "eDP-1",
+                        if horizontal { 1080.0 } else { 1920.0 },
+                        200.0,
+                        600.0,
+                    )
                 };
                 for along in [start - 1.0, (start + end) / 2.0, end + 1.0] {
                     let position = if horizontal {
@@ -2603,7 +2679,8 @@ bidirectional = true
                     } else {
                         geometry::Position::new(id, boundary, along)
                     };
-                    let transition = geometry::resolve_transition(&active.topology, &owner, &position);
+                    let transition =
+                        geometry::resolve_transition(&active.topology, &owner, &position);
                     assert_eq!(transition.is_some(), along >= start && along <= end);
                     if let Some(transition) = transition {
                         let guard = ReturnGuard::after_return(
@@ -2611,7 +2688,8 @@ bidirectional = true
                             &transition.target_position,
                             8.0,
                         );
-                        assert!(guard.holds_crossing(&transition.target_position, transition.target.edge));
+                        assert!(guard
+                            .holds_crossing(&transition.target_position, transition.target.edge));
                         let entry = guard.entry(&transition.target_position);
                         if horizontal {
                             assert_eq!(entry.x, transition.target_position.x);
@@ -2631,10 +2709,19 @@ bidirectional = true
                     changed_peers[0].1[0].id = "replacement-peer".to_owned();
                 }
                 let inactive = assemble(&changed_local, &changed_peers);
-                assert!(inactive.topology.links.is_empty(), "no automatic replacement");
+                assert!(
+                    inactive.topology.links.is_empty(),
+                    "no automatic replacement"
+                );
                 assert_eq!(inactive.inactive.len(), 1);
-                assert_eq!(inactive.inactive[0].missing[0].side,
-                    if missing_source { geometry::EndpointSide::Source } else { geometry::EndpointSide::Target });
+                assert_eq!(
+                    inactive.inactive[0].missing[0].side,
+                    if missing_source {
+                        geometry::EndpointSide::Source
+                    } else {
+                        geometry::EndpointSide::Target
+                    }
+                );
                 let restored = assemble(&local, &peers);
                 assert!(restored.inactive.is_empty());
                 assert_eq!(restored.topology.links, active.topology.links);

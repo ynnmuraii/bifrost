@@ -1352,20 +1352,28 @@ impl ViewModel {
                 .iter()
                 .zip(&doc.members)
                 .all(|(node, member)| node.node_id == member.node_id);
-        let same_geometry = same_members
-            && self.editor.nodes.iter().zip(&doc.members).all(|(node, member)| {
-                node.displays.len() == member.displays.len()
-                    && node.displays.iter().zip(&member.displays).all(|(display, report)| {
-                        display.id == report.id
-                            && display.x == finite(report.logical_x, 0.0)
-                            && display.y == finite(report.logical_y, 0.0)
-                            && display.w == finite(report.logical_w, 0.0)
-                            && display.h == finite(report.logical_h, 0.0)
-                            && display.primary == report.primary
-                            && display.native_known == report.native_known
-                            && display.rotation == report.rotation_degrees
-                    })
-            });
+        let same_geometry =
+            same_members
+                && self
+                    .editor
+                    .nodes
+                    .iter()
+                    .zip(&doc.members)
+                    .all(|(node, member)| {
+                        node.displays.len() == member.displays.len()
+                            && node.displays.iter().zip(&member.displays).all(
+                                |(display, report)| {
+                                    display.id == report.id
+                                        && display.x == finite(report.logical_x, 0.0)
+                                        && display.y == finite(report.logical_y, 0.0)
+                                        && display.w == finite(report.logical_w, 0.0)
+                                        && display.h == finite(report.logical_h, 0.0)
+                                        && display.primary == report.primary
+                                        && display.native_known == report.native_known
+                                        && display.rotation == report.rotation_degrees
+                                },
+                            )
+                    });
         let retain_placement = same_geometry
             && (self.editor.links == doc.links
                 || self.editor.save.sent.is_some()
@@ -2127,7 +2135,12 @@ impl ViewModel {
             }
             Action::SetAddress(address) => self.pairing.address = address.clone(),
             Action::ToggleDetails(open) => self.pairing.details = *open,
-            Action::MoveNode { node_id, x, y, snap_threshold } => {
+            Action::MoveNode {
+                node_id,
+                x,
+                y,
+                snap_threshold,
+            } => {
                 self.move_node_with_threshold(node_id, *x, *y, *snap_threshold);
             }
             Action::NudgeNode { node_id, dx, dy } => {
