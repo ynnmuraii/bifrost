@@ -1,4 +1,4 @@
-//! LAN Workspace X11 backend (spike that graduates into the real adapter).
+//! Bifrost X11 backend (spike that graduates into the real adapter).
 //!
 //! This crate is the Linux/X11 implementation of the platform-adapter boundary
 //! described by **ADR-002**: it turns normalized [`input_model::InputEvent`]s into

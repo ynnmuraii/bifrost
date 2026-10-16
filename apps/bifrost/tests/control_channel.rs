@@ -9,7 +9,7 @@
 //! makes that accept cancel safe (`PendingInstance`); this test is the count that noticed.
 //!
 //! ```text
-//! cargo test -p multideskflow --test control_channel -- --nocapture
+//! cargo test -p bifrost --test control_channel -- --nocapture
 //! ```
 //!
 //! The core is a real process, the agent is its dry one, and every call is a real CLI process:
@@ -30,7 +30,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The workspace binary under test.
 fn core_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_multideskflow"))
+    PathBuf::from(env!("CARGO_BIN_EXE_bifrost"))
 }
 
 /// A port that is free right now, so a parallel test suite cannot collide with this one.
@@ -85,7 +85,7 @@ fn start_core(root: &Path) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawning multideskflow run");
+        .expect("spawning bifrost run");
 
     let deadline = Instant::now() + READY_TIMEOUT;
     while Instant::now() < deadline {
@@ -108,7 +108,7 @@ fn status_line(root: &Path) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawning multideskflow status");
+        .expect("spawning bifrost status");
     let deadline = Instant::now() + CALL_TIMEOUT;
     loop {
         match child.try_wait().expect("waiting for the client") {

@@ -39,6 +39,7 @@ fn signatures_change_for_each_portal_version_and_compositor() {
         global_shortcuts: 4,
     };
     let signature = compositor_signature(Compositor::Gnome, &versions);
+    assert_eq!(signature, "bifrost;gnome;ic=1;rd=2;cb=3;gs=4");
     assert_eq!(
         compositor_signature(Compositor::Gnome, &versions),
         signature

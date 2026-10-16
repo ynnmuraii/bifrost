@@ -1,4 +1,4 @@
-//! LAN Workspace focus router: the focus/lease FSM and ownership (KVM-022, KVM-032,
+//! Bifrost focus router: the focus/lease FSM and ownership (KVM-022, KVM-032,
 //! KVM-071 core).
 //!
 //! A sans-IO, deterministic, pure crate. It reads no clock (every call takes a

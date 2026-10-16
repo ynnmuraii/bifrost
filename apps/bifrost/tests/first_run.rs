@@ -11,9 +11,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// The `multideskflow` binary under test (the agent is the same executable).
+/// The `bifrost` binary under test (the agent is the same executable).
 fn core_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_multideskflow"))
+    PathBuf::from(env!("CARGO_BIN_EXE_bifrost"))
 }
 
 /// A directory no other test shares.

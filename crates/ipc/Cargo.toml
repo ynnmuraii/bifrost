@@ -1,7 +1,7 @@
 [package]
 name = "ipc"
-version = "0.0.0"
-description = "LAN Workspace local IPC: framed AgentFrame/GuiFrame transport, peer checks, heartbeat watchdog (KVM-023/024)"
+version.workspace = true
+description = "Bifrost local IPC: framed AgentFrame/GuiFrame transport, peer checks, heartbeat watchdog (KVM-023/024)"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

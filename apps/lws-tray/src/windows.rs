@@ -100,7 +100,7 @@ unsafe extern "system" fn procedure(
                         .items()
                         .get(1)
                         .map(|i| i.label.clone())
-                        .unwrap_or_else(|| "multideskflow".into());
+                        .unwrap_or_else(|| "Bifrost".into());
                     // The icon is borrowed only for these statements, never across a
                     // nested message loop (`TrackPopupMenu` below re-enters this function).
                     let mut icon = window.icon.borrow_mut();
@@ -211,7 +211,7 @@ pub(super) fn run(
         notify.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         notify.uCallbackMessage = CALLBACK;
         notify.hIcon = icon;
-        for (slot, ch) in notify.szTip.iter_mut().zip("multideskflow".encode_utf16()) {
+        for (slot, ch) in notify.szTip.iter_mut().zip("Bifrost".encode_utf16()) {
             *slot = ch;
         }
         let window = Box::new(Window {

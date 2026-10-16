@@ -1,11 +1,11 @@
 [package]
 name = "identity"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "LAN Workspace: node identity, pinned mTLS, SAS pairing, trust store (KVM-030)"
+description = "Bifrost: node identity, pinned mTLS, SAS pairing, trust store (KVM-030)"
 
 [lints]
 workspace = true

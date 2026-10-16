@@ -37,7 +37,7 @@ pub fn start() -> Result<(), String> {
             std::thread::sleep(PERIOD);
             if let Err(violation) = check() {
                 tracing::error!(%violation, "agent network guard fired; exiting");
-                eprintln!("multideskflow agent: {violation}");
+                eprintln!("bifrost agent: {violation}");
                 std::process::exit(i32::from(EXIT_CODE));
             }
         })

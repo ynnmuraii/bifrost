@@ -125,11 +125,11 @@ impl Modal {
     /// The «command» of the terminal-style header line.
     pub const fn command(self) -> &'static str {
         match self {
-            Modal::Pairs => "mdf peers",
-            Modal::Keys => "mdf keys",
-            Modal::Clip => "mdf clip",
-            Modal::Diag => "mdf diag",
-            Modal::Settings => "mdf config",
+            Modal::Pairs => "bifrost peers",
+            Modal::Keys => "bifrost keys",
+            Modal::Clip => "bifrost clip",
+            Modal::Diag => "bifrost diag",
+            Modal::Settings => "bifrost config",
         }
     }
 
@@ -3003,10 +3003,10 @@ fn answer_offline(command: Command, launch: &Launch, events: &Events) {
 /// flags are carried through verbatim instead of being rebuilt from [`Paths`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
-    /// The executable that is started with `<flags> run`: `multideskflow`, which is this
+    /// The executable that is started with `<flags> run`: `bifrost`, which is this
     /// process's own executable unless a test names another.
     pub program: PathBuf,
-    /// The global flags, exactly as `multideskflow` wants them.
+    /// The global flags, exactly as `bifrost` wants them.
     pub flags: Vec<String>,
 }
 
@@ -3123,14 +3123,14 @@ pub fn resolve_endpoint(paths: &Paths) -> (CoreEndpoint, Option<Endpoint>) {
     }
 }
 
-/// The program a window-started core runs as: this very executable, `multideskflow`, in its
-/// command-line role (`multideskflow <flags> run`).
+/// The program a window-started core runs as: this very executable, `bifrost`, in its
+/// command-line role (`bifrost <flags> run`).
 fn own_program() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| {
         PathBuf::from(if cfg!(windows) {
-            "multideskflow.exe"
+            "bifrost.exe"
         } else {
-            "multideskflow"
+            "bifrost"
         })
     })
 }
@@ -3240,7 +3240,7 @@ pub fn lan_addresses() -> Vec<String> {
         .collect()
 }
 
-/// Starts `multideskflow run` detached, with the flags the window was given.
+/// Starts `bifrost run` detached, with the flags the window was given.
 ///
 /// `docs/03-architecture.md`: «Закрытие окна GUI не влияет на активный сеанс». The child gets
 /// no inherited standard streams, so its lifetime is its own; it is never waited for.
@@ -3276,7 +3276,7 @@ pub fn boot(args: CliArgs) -> (ViewModel, GuiClient) {
 }
 
 /// [`boot`] with the executable the window starts its core from named explicitly: an
-/// integration test is not `multideskflow`, so it points at the real binary.
+/// integration test is not `bifrost`, so it points at the real binary.
 pub fn boot_with_program(args: CliArgs, program: PathBuf) -> (ViewModel, GuiClient) {
     let lang = Lang::from_system();
     let launch = Launch {

@@ -7,8 +7,8 @@
 //! relayed through the middle node.
 //!
 //! ```text
-//! cargo test -p multideskflow --test three_nodes -- --nocapture
-//! cargo test -p multideskflow --test three_nodes -- --ignored --nocapture --test-threads=1
+//! cargo test -p bifrost --test three_nodes -- --nocapture
+//! cargo test -p bifrost --test three_nodes -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Each scenario starts its own cluster: three ceremonies take a few seconds.
@@ -103,7 +103,7 @@ fn two_simultaneous_claims_leave_exactly_one_owner() {
     let second = cluster.nodes[2].root.clone();
     let claim = |root: std::path::PathBuf| {
         std::thread::spawn(move || {
-            std::process::Command::new(env!("CARGO_BIN_EXE_multideskflow"))
+            std::process::Command::new(env!("CARGO_BIN_EXE_bifrost"))
                 .arg("--root")
                 .arg(root)
                 .arg("claim")
@@ -398,7 +398,7 @@ fn a_chain_walks_two_leases_without_a_relay() {
 
 /// (2) `AC-22`, the long variant: 1000 chain walks.
 #[test]
-#[ignore = "1000 chain cycles: cargo test -p multideskflow --test three_nodes -- --ignored --nocapture --test-threads=1"]
+#[ignore = "1000 chain cycles: cargo test -p bifrost --test three_nodes -- --ignored --nocapture --test-threads=1"]
 fn a_thousand_chain_transitions_keep_the_owner() {
     let _serial = common::serial();
     let cluster = Cluster::start("three-chain-long");

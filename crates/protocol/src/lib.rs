@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Wire protocol of LAN Workspace (KVM-031): generated Protobuf types, the
+//! Wire protocol of Bifrost (KVM-031): generated Protobuf types, the
 //! framing codec, its limits, sequence validation and the `Hello` exchange.
 //!
 //! # What is here

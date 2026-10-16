@@ -1,7 +1,7 @@
 syntax = "proto3";
 package lan_workspace.ipc.v1;
 
-// Local IPC of LAN Workspace: lws-core <-> lws-agent (AgentFrame) and
+// Local IPC of Bifrost: lws-core <-> lws-agent (AgentFrame) and
 // lws-core <-> lws-gui (GuiFrame). See 03-architecture.md, section "Локальный IPC".
 // Framing: 4-byte unsigned big-endian length + serialized AgentFrame / GuiFrame.
 // Max frame: 65536 bytes. Never sent over the network.

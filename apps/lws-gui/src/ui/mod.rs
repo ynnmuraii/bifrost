@@ -268,7 +268,7 @@ fn topbar(
         1.5,
         pal.accent,
     );
-    widgets::text(bar, "MULTIDESKFLOW", 16.0, fam::pixel(), pal.ink);
+    widgets::text(bar, "BIFROST", 16.0, fam::pixel(), pal.ink);
     bar.add_space(-6.0);
 
     let connected = vm.connection.is_connected() && !vm.silent;

@@ -1,4 +1,4 @@
-name: Release
+name: Bifrost Release
 
 on:
   workflow_dispatch:
@@ -61,9 +61,9 @@ jobs:
 
       # `cargo build --release` is deliberately the only build: no
       # cross-compilation, no extra toolchains, nothing staged through cargo.
-      # One binary: `multideskflow` is the window, the command line and the
-      # agent (the core starts its agent as `multideskflow agent …`, and the
-      # window starts the core as `multideskflow run`), so there is no layout
+      # One binary: `bifrost` is the window, the command line and the
+      # agent (the core starts its agent as `bifrost agent …`, and the
+      # window starts the core as `bifrost run`), so there is no layout
       # to keep and nothing to find beside it.
       - name: Build
         run: cargo build --release
@@ -83,17 +83,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "multideskflow-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
+          $version = "${{ github.ref_name || github.sha }}" -replace '^v', ''
+          $name = "bifrost-$version-${{ matrix.platform }}"
           $archive = Join-Path $env:RUNNER_TEMP "$name.zip"
           $stage = Join-Path $env:RUNNER_TEMP "stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target/release/multideskflow.exe $stage
+          Copy-Item target/release/bifrost.exe $stage
           Copy-Item packaging/README_RU.txt $stage
           Copy-Item licenses/THIRD_PARTY_NOTICES.md $stage
           Copy-Item crates/config/examples-data/config.example.toml $stage
-          Copy-Item apps/multideskflow/assets/icon.ico $stage
-          Copy-Item apps/multideskflow/assets/icon.svg $stage
-          Copy-Item apps/multideskflow/assets/icon-256.png $stage
+          Copy-Item apps/bifrost/assets/icon.ico $stage
+          Copy-Item apps/bifrost/assets/icon.svg $stage
+          Copy-Item apps/bifrost/assets/icon-256.png $stage
           Compress-Archive -Path "$stage/*" -DestinationPath $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
           # `<hex>  <file>` with two spaces, the sha256sum convention: the
@@ -104,21 +105,22 @@ jobs:
       - name: Package
         if: runner.os == 'Linux'
         run: |
-          name="multideskflow-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
+          version="${{ github.ref_name || github.sha }}"
+          name="bifrost-${version#v}-${{ matrix.platform }}"
           stage="$RUNNER_TEMP/stage"
           mkdir -p "$stage"
-          install -m 0755 target/release/multideskflow "$stage/"
+          install -m 0755 target/release/bifrost "$stage/"
           cp packaging/README_RU.txt licenses/THIRD_PARTY_NOTICES.md "$stage/"
           cp crates/config/examples-data/config.example.toml "$stage/"
-          install -m 0644 packaging/multideskflow.desktop "$stage/"
+          install -m 0644 packaging/bifrost.desktop "$stage/"
           mkdir -p "$stage/share/applications" "$stage/share/icons/hicolor/scalable/apps"
-          install -m 0644 packaging/multideskflow.desktop "$stage/share/applications/"
-          install -m 0644 packaging/multideskflow.svg "$stage/share/icons/hicolor/scalable/apps/multideskflow.svg"
+          install -m 0644 packaging/bifrost.desktop "$stage/share/applications/"
+          install -m 0644 packaging/bifrost.svg "$stage/share/icons/hicolor/scalable/apps/bifrost.svg"
           for size in 16 20 24 32 40 48 64 256; do
             mkdir -p "$stage/share/icons/hicolor/${size}x${size}/apps"
-            install -m 0644 "apps/multideskflow/assets/icon-${size}.png" "$stage/share/icons/hicolor/${size}x${size}/apps/multideskflow.png"
+            install -m 0644 "apps/bifrost/assets/icon-${size}.png" "$stage/share/icons/hicolor/${size}x${size}/apps/bifrost.png"
           done
-          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" multideskflow README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml multideskflow.desktop share
+          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" bifrost README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml bifrost.desktop share
           # shasum prints `<hex>  <file>` (two spaces), the same format and
           # file name as the Windows step writes. The subshell makes <file>
           # the archive's own name rather than its path, so a user who
@@ -128,9 +130,9 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: multideskflow-${{ matrix.os }}
+          name: bifrost-${{ matrix.os }}
           path: |
-            ${{ runner.temp }}/multideskflow-*-${{ matrix.platform }}.*
+            ${{ runner.temp }}/bifrost-*-${{ matrix.platform }}.*
             ${{ runner.temp }}/SHA256SUMS.txt
 
       # Only the tag trigger: `push` fires here solely on `v*` tags, so this
@@ -142,5 +144,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ runner.temp }}/multideskflow-*-${{ matrix.platform }}.*
+            ${{ runner.temp }}/bifrost-*-${{ matrix.platform }}.*
             ${{ runner.temp }}/SHA256SUMS.txt

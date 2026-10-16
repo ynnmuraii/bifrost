@@ -1,5 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-//! Local IPC of LAN Workspace (KVM-023/KVM-024): the transport, the peer checks
+//! Local IPC of Bifrost (KVM-023/KVM-024): the transport, the peer checks
 //! and the heartbeat watchdog that keep `lws-core`, `lws-agent` and `lws-gui`
 //! talking without a network in between.
 //!

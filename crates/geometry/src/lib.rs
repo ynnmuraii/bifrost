@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Pure geometry for LAN Workspace: displays, edges, transition links, topology
+//! Pure geometry for Bifrost: displays, edges, transition links, topology
 //! validation and edge-crossing transitions.
 //!
 //! The crate is a plain data model plus pure functions: no I/O, no async, no

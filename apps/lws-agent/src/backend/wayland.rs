@@ -124,22 +124,22 @@ async fn register_shortcuts(
     let requested = [
         (
             "emergency",
-            "multideskflow: emergency release",
+            "Bifrost: emergency release",
             &bindings.emergency_release,
         ),
         (
             "switch_next",
-            "multideskflow: switch to next machine",
+            "Bifrost: switch to next machine",
             &bindings.switch_next,
         ),
         (
             "return_local",
-            "multideskflow: return to this machine",
+            "Bifrost: return to this machine",
             &bindings.return_local,
         ),
         (
             "claim_ownership",
-            "multideskflow: claim keyboard and pointer ownership",
+            "Bifrost: claim keyboard and pointer ownership",
             &bindings.claim_ownership,
         ),
     ];

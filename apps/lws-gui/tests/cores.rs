@@ -56,26 +56,26 @@ fn serial() -> MutexGuard<'static, ()> {
 
 // ---------------------------------------------------------------- the binary
 
-/// The `multideskflow` executable, which is every role: the daemon these tests start, its
+/// The `bifrost` executable, which is every role: the daemon these tests start, its
 /// agent, and the one the window itself starts through `boot_with_program`.
 ///
 /// This test's own executable is `target/debug/deps/cores-<hash>` (`.exe` on Windows), so
 /// `target/debug` is two levels up — the same place `cargo build --workspace` puts it. (Only
 /// the package that owns a binary gets `CARGO_BIN_EXE_*`, and that is not this one.)
-fn multideskflow() -> PathBuf {
+fn bifrost() -> PathBuf {
     let exe = std::env::current_exe().expect("this test's own path");
     let directory = exe
         .parent()
         .and_then(Path::parent)
         .expect("target/debug above target/debug/deps");
     let path = directory.join(if cfg!(windows) {
-        "multideskflow.exe"
+        "bifrost.exe"
     } else {
-        "multideskflow"
+        "bifrost"
     });
     assert!(
         path.is_file(),
-        "{} is missing: run `cargo build --workspace` first — it is what puts `multideskflow` \
+        "{} is missing: run `cargo build --workspace` first — it is what puts `bifrost` \
          in target/debug, next to this test",
         path.display()
     );
@@ -126,7 +126,7 @@ impl Core {
         let log = root.join(format!("{label}.log"));
         let out = std::fs::File::create(&log).expect("log file");
         let err = out.try_clone().expect("log file");
-        let mut command = Command::new(multideskflow());
+        let mut command = Command::new(bifrost());
         command
             .arg("--root")
             .arg(&root)
@@ -367,7 +367,7 @@ fn write_topology_revision(
 /// then arrives before the listener is up.
 fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
     let listen = format!("127.0.0.1:{b_port}");
-    let mut opener = Command::new(multideskflow())
+    let mut opener = Command::new(bifrost())
         .arg("--root")
         .arg(b_root)
         .args(["pair", "--open", "--listen", listen.as_str()])
@@ -407,7 +407,7 @@ fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
         .expect("the pairing window must open before the other side dials it");
 
     let dial = format!("127.0.0.1:{b_port}");
-    let mut dialer = Command::new(multideskflow())
+    let mut dialer = Command::new(bifrost())
         .arg("--root")
         .arg(a_root)
         .args(["pair", "--dial", dial.as_str()])
@@ -455,7 +455,7 @@ fn pair(a_root: &Path, b_root: &Path, a_port: u16, b_port: u16) {
 
 /// One node's own id, from the `peers` subcommand (`node <64 hex>`).
 fn node_id(root: &Path) -> String {
-    let output = Command::new(multideskflow())
+    let output = Command::new(bifrost())
         .arg("--root")
         .arg(root)
         .arg("peers")
@@ -474,7 +474,7 @@ fn node_id(root: &Path) -> String {
 fn ctl(root: &Path, request: &str) -> String {
     let mut last = String::new();
     for attempt in 0..5 {
-        let output = Command::new(multideskflow())
+        let output = Command::new(bifrost())
             .arg("--root")
             .arg(root)
             .args(request.split(' '))
@@ -522,7 +522,7 @@ fn links(root: &Path) -> usize {
 fn bridge_for(root: &Path) -> Bridge {
     let (view, client) = boot_with_program(
         CliArgs::parse(["--root".to_owned(), root.display().to_string()]),
-        multideskflow(),
+        bifrost(),
     );
     Bridge::new(view, client)
 }

@@ -1,4 +1,4 @@
-# cargo-deny policy for LAN Workspace (ADR-009: MIT, permissive dependencies only).
+# cargo-deny policy for Bifrost (ADR-009: MIT, permissive dependencies only).
 #
 # Run: `cargo deny check licenses` — the same command the CI job runs. Install the tool with
 # `cargo install cargo-deny --locked`, or fetch the release binary for your target from

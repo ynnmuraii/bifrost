@@ -245,7 +245,7 @@ fn run(rx: &Receiver<Command>, enabled: bool, ready: &Sender<u32>) {
         return;
     };
     let instance = HINSTANCE(module.0);
-    let class = w!("MultideskflowCursorVeil");
+    let class = w!("BifrostCursorVeil");
     let window_class = WNDCLASSW {
         style: WNDCLASS_STYLES(0),
         lpfnWndProc: Some(proc),
@@ -266,7 +266,7 @@ fn run(rx: &Receiver<Command>, enabled: bool, ready: &Sender<u32>) {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             class,
-            w!("multideskflow cursor veil"),
+            w!("bifrost cursor veil"),
             WS_POPUP,
             0,
             0,

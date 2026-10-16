@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=multideskflow
+Name=Bifrost
 Comment=Share your keyboard and mouse between computers
-Exec=multideskflow
-Icon=multideskflow
+Exec=bifrost
+Icon=bifrost
 Terminal=false
 Categories=Utility;RemoteAccess;
-StartupWMClass=multideskflow
+StartupWMClass=bifrost

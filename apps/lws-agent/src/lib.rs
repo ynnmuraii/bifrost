@@ -2,7 +2,7 @@
 //! ledger and the watchdog. It creates no network sockets (`docs/03-architecture.md`,
 //! agent rule 1: no TCP/UDP, enforced by [`netguard`] at run time and by
 //! `tests/no_network.rs` in CI) and is spawned only by the core, as the separate process
-//! `multideskflow agent …` (the executable is `apps/multideskflow`; this crate is its
+//! `bifrost agent …` (the executable is `apps/bifrost`; this crate is its
 //! `agent` role, [`run_agent`]).
 //!
 //! # How core finds it
@@ -78,10 +78,10 @@ struct Args {
 }
 
 const USAGE: &str = "\
-multideskflow agent — input agent (internal; spawned by `multideskflow run`)
+bifrost agent — input agent (internal; spawned by `bifrost run`)
 
 USAGE:
-    multideskflow agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
+    bifrost agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]
                         [--dev-capture-injected] [--dry-displays]
 
 OPTIONS:
@@ -185,7 +185,7 @@ fn init_logging(logs_dir: Option<&std::path::Path>) {
     );
 }
 
-/// Runs the agent role. `args` is argv after `multideskflow agent`; the returned code is the
+/// Runs the agent role. `args` is argv after `bifrost agent`; the returned code is the
 /// process exit code (0 clean stop, 1 failure, 2 usage, 70 the no-network guard fired).
 pub fn run_agent(args: Vec<String>) -> ExitCode {
     // Arguments first: `--logs-dir` is part of what the logger needs, and a bad argument is
@@ -193,7 +193,7 @@ pub fn run_agent(args: Vec<String>) -> ExitCode {
     let args = match parse_args(args) {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("multideskflow agent: {message}");
+            eprintln!("bifrost agent: {message}");
             return ExitCode::from(2);
         }
     };
@@ -208,13 +208,13 @@ pub fn run_agent(args: Vec<String>) -> ExitCode {
         pid = std::process::id(),
         endpoint = args.ipc_endpoint.as_str(),
         dry_inject = args.dry_inject,
-        "multideskflow agent starting"
+        "bifrost agent starting"
     );
     // Rule 1 (no network sockets), checked now — which catches anything inherited from the
     // parent — and then every few seconds for as long as the agent lives.
     if let Err(violation) = netguard::start() {
         tracing::error!(%violation, "agent network guard failed");
-        eprintln!("multideskflow agent: {violation}");
+        eprintln!("bifrost agent: {violation}");
         return ExitCode::from(netguard::EXIT_CODE);
     }
 
@@ -224,7 +224,7 @@ pub fn run_agent(args: Vec<String>) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("multideskflow agent: cannot start the runtime: {error}");
+            eprintln!("bifrost agent: cannot start the runtime: {error}");
             return ExitCode::FAILURE;
         }
     };

@@ -110,7 +110,7 @@ pub(crate) fn items(
     lang: Lang,
 ) -> Vec<Item> {
     let mut items = vec![Item {
-        label: text(lang, Key::OpenMultiDeskFlow).into(),
+        label: text(lang, Key::OpenBifrost).into(),
         action: Some(Action::Open),
     }];
     let label = match status {
@@ -288,7 +288,7 @@ mod labels {
     #[test]
     fn the_english_menu_is_the_same_menu_in_english() {
         let offline = items(None, None, Lang::En);
-        assert_eq!(offline[0].label, "Open multideskflow");
+        assert_eq!(offline[0].label, "Open Bifrost");
         assert_eq!(offline[1].label, "The service is stopped");
         assert_eq!(
             offline.last().unwrap().label,
@@ -315,7 +315,7 @@ mod labels {
     #[test]
     fn owner_menu_labels_are_stable() {
         let offline = items(None, None, Lang::Ru);
-        assert_eq!(offline[0].label, "Открыть multideskflow");
+        assert_eq!(offline[0].label, "Открыть Bifrost");
         assert_eq!(offline[1].label, "Служба остановлена");
         assert_eq!(
             offline.last().unwrap().label,

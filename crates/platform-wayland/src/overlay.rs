@@ -61,7 +61,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 /// Layer-shell namespace of the surface.
-const NAMESPACE: &str = "multideskflow-edgefx";
+const NAMESPACE: &str = "bifrost-edgefx";
 /// Minimum time between two effect steps: just over `1 / edgefx::FRAME_S`, i.e. <= 30 fps.
 const FRAME: Duration = Duration::from_micros(33_334);
 /// Longest `dt` handed to [`Effect::step`] (a stalled thread must not jump the animation).

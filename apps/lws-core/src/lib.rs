@@ -1,13 +1,13 @@
 //! `lws-core` — the process that owns TLS, the protocol, the router, the focus and
 //! ownership FSMs, the link manager and agent supervision.
 //!
-//! This is a library: the executable is `apps/multideskflow`, which hands every
+//! This is a library: the executable is `apps/bifrost`, which hands every
 //! command-line role other than `gui` and `agent` to [`run_core`].
 //!
 //! # CLI
 //!
 //! ```text
-//! multideskflow [--root DIR] [--config-dir DIR] [--data-dir DIR] [--state-dir DIR]
+//! bifrost [--root DIR] [--config-dir DIR] [--data-dir DIR] [--state-dir DIR]
 //!               [--runtime-dir DIR] <command>
 //!
 //!          run      [--dev-capture-injected] [--dry-inject] [--dry-displays] [--dry-input-events N]
@@ -20,7 +20,7 @@
 //! `pair` and `peers` work offline against the configuration directory; `status` and
 //! `switch` talk to a running core over the local control channel
 //! ([`ctl`]). `run` is the daemon: it spawns and supervises the agent (the same executable
-//! started as `multideskflow agent …`), and it is the only role that listens on the network.
+//! started as `bifrost agent …`), and it is the only role that listens on the network.
 
 mod agent;
 mod clipboard;
@@ -71,12 +71,12 @@ pub fn run_core(args: Vec<String>) -> ExitCode {
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Usage(message)) => {
-            eprintln!("multideskflow: {message}");
+            eprintln!("bifrost: {message}");
             eprintln!("\n{USAGE}");
             ExitCode::from(2)
         }
         Err(Failure::Run(error)) => {
-            eprintln!("multideskflow: {error}");
+            eprintln!("bifrost: {error}");
             ExitCode::FAILURE
         }
     }
@@ -114,14 +114,14 @@ impl From<identity::IdentityError> for Failure {
 }
 
 const USAGE: &str = "\
-multideskflow — software KVM
+Bifrost — software KVM
 
 USAGE:
-    multideskflow                       open the window (same as `multideskflow gui`)
-    multideskflow gui [GLOBAL]          open the window
-    multideskflow [GLOBAL] <command> [ARGS]
+    bifrost                       open the window (same as `bifrost gui`)
+    bifrost gui [GLOBAL]          open the window
+    bifrost [GLOBAL] <command> [ARGS]
                                         command line and daemon (commands below)
-    multideskflow agent …               internal: the input agent, started by `run`
+    bifrost agent …               internal: the input agent, started by `run`
                                         as a separate process; not for hand use
 
 GLOBAL:

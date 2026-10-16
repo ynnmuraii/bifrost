@@ -1,7 +1,7 @@
 //! Agent rule 1 (`docs/03-architecture.md`): the agent owns no network sockets.
 //!
 //! The agent used to be its own executable, and the Windows build proved the rule at link
-//! time. The one `multideskflow` executable links Winsock for the core, so the proof is now
+//! time. The one `bifrost` executable links Winsock for the core, so the proof is now
 //! made here, on every `cargo test --workspace` (and by the `agent-no-network` CI job):
 //!
 //! * the agent crate's normal dependency tree holds none of the crates that exist to talk to
@@ -21,7 +21,7 @@ const DENIED_CRATES: &[&str] = &[
     "focus-router",
     "lws-core",
     "lws-gui",
-    "multideskflow",
+    "bifrost",
     "eframe",
     "rustls",
     "tokio-rustls",

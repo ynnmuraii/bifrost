@@ -1,0 +1,14 @@
+# Changelog
+
+## 0.1.0 — 2026-10-16
+
+First release of **Bifrost**, a software KVM for sharing a keyboard, mouse and clipboard between trusted computers on a local network.
+
+- Windows 11 and Linux: X11, KDE Plasma Wayland and GNOME Wayland. Portal support varies: GNOME 46 can receive input but cannot capture it for another computer.
+- Secure mTLS connections with persistent peer trust and pairing by a 6-digit comparison code, confirmed on both computers.
+- A draggable monitor map with links across gaps, adjustable edge segments and an ASCII bridge between computers.
+- Shared clipboard with history, configurable hotkeys and an edge-glow indicator.
+- Russian and English interfaces, light and dark themes, and a system tray. System autostart uses Windows Run/scheduled tasks or a Linux desktop entry; the deployment helper migrates existing entries.
+- One executable, `bifrost` / `bifrost.exe`, for the window, core, agent and tray. Existing settings and pairing remain in the legacy `lan-workspace` directories. Wayland asks for portal permissions once after this app-id change.
+
+This is an early release. Check emergency-release hotkeys on your desktop before relying on remote input; portal availability and permissions determine Wayland capabilities.

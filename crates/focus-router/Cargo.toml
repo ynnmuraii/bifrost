@@ -1,11 +1,11 @@
 [package]
 name = "focus-router"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "LAN Workspace: focus/lease state machines and ownership (KVM-022, KVM-071 core)"
+description = "Bifrost: focus/lease state machines and ownership (KVM-022, KVM-071 core)"
 
 [lints]
 workspace = true

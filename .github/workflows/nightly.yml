@@ -9,7 +9,7 @@
 # multi-process harnesses on every push at 1x.
 #
 # This workflow is the safety net behind that cut. It is the only place the
-# harnesses of `apps/multideskflow/tests` and the rest of the workspace are
+# harnesses of `apps/bifrost/tests` and the rest of the workspace are
 # executed *on Windows*, which is the shipped platform, and the only place the
 # licences check sees the Windows dependency graph.
 #

@@ -37,10 +37,10 @@ pub const AC_02_BUDGET_MS: u64 = LEASE_TTL_MS + 100;
 /// reported either way, so a real regression is visible even when the assert passes.
 pub const HOST_SLACK_MS: u64 = 100;
 
-/// The `multideskflow` binary under test: every role of it — the daemon, and the agent the
-/// daemon spawns as `multideskflow agent …` from its own executable.
+/// The `bifrost` binary under test: every role of it — the daemon, and the agent the
+/// daemon spawns as `bifrost agent …` from its own executable.
 fn core_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_multideskflow"))
+    PathBuf::from(env!("CARGO_BIN_EXE_bifrost"))
 }
 
 /// Milliseconds since the Unix epoch, from the harness's own clock.
@@ -541,7 +541,7 @@ impl Node {
         #[cfg(windows)]
         {
             let script = format!(
-                "(Get-CimInstance Win32_Process -Filter \"Name='multideskflow.exe'\" | \
+                "(Get-CimInstance Win32_Process -Filter \"Name='bifrost.exe'\" | \
                  Where-Object {{$_.ParentProcessId -eq {}}}).ProcessId",
                 self.pid
             );

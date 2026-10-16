@@ -100,13 +100,13 @@ impl PortalVersions {
 
 /// Signature of the portal endpoint that issued a restore token (KVM-017).
 ///
-/// Restore tokens are only valid for the compositor and portal versions that issued
-/// them, so the token is stored together with this string and discarded whenever the
-/// string changes.
+/// Restore tokens are only valid for the application identity, compositor and portal
+/// versions that issued them. Including the app id invalidates pre-Bifrost grants
+/// without sending their obsolete bearer tokens to the portal.
 #[must_use]
 pub fn compositor_signature(compositor: Compositor, versions: &PortalVersions) -> String {
     format!(
-        "{};ic={};rd={};cb={};gs={}",
+        "bifrost;{};ic={};rd={};cb={};gs={}",
         compositor.as_str(),
         versions.input_capture,
         versions.remote_desktop,

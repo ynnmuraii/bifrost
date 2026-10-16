@@ -235,7 +235,7 @@ fn header(
     );
     let galley = painter.layout_no_wrap(modal.num().to_owned(), font(20.0, fam::pixel()), pal.ink);
     widgets::centre_galley(&painter, num, galley, pal.ink);
-    // Title and the «load» line: `mdf layout [########################] ok · sub`.
+    // Title and the «load» line: `bifrost layout [########################] ok · sub`.
     let title = painter.layout_no_wrap(
         modal.title(lang).to_owned(),
         font(24.0, fam::sans_semibold()),
@@ -921,6 +921,7 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 
 fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
+    widgets::hint(ui, pal, concat!("Bifrost ", env!("CARGO_PKG_VERSION")));
     // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
     // the change is instant, because every string is drawn from the catalogue each frame.
     row(ui, pal, text(lang, Key::Language), false, |ui| {

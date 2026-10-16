@@ -1,6 +1,6 @@
 [package]
-name = "multideskflow"
-version = "0.0.0"
+name = "bifrost"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ publish = false
 # which is what the agent's no-network check
 # (`apps/lws-agent/tests/no_network.rs`) relies on.
 [[bin]]
-name = "multideskflow"
+name = "bifrost"
 path = "src/main.rs"
 
 [dependencies]
@@ -30,7 +30,7 @@ winres = "0.1"
 
 [dev-dependencies]
 # The harnesses under `tests/` are integration tests of this package because only the package
-# that owns a binary gets `CARGO_BIN_EXE_multideskflow` — they drive real `multideskflow`
+# that owns a binary gets `CARGO_BIN_EXE_bifrost` — they drive real `bifrost`
 # processes, and read the cores' answers through the same crates the window uses.
 config = { path = "../../crates/config" }
 ipc = { path = "../../crates/ipc" }

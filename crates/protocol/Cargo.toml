@@ -1,7 +1,7 @@
 [package]
 name = "protocol"
-version = "0.0.0"
-description = "LAN Workspace wire protocol: framed Protobuf, limits, sequence and Hello rules (KVM-031)"
+version.workspace = true
+description = "Bifrost wire protocol: framed Protobuf, limits, sequence and Hello rules (KVM-031)"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -1,11 +1,11 @@
 [package]
 name = "platform-win"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Windows capture (low-level hooks + Raw Input) and SendInput injection spikes for LAN Workspace (KVM-010/KVM-011)."
+description = "Windows capture (low-level hooks + Raw Input) and SendInput injection spikes for Bifrost (KVM-010/KVM-011)."
 
 [lints]
 workspace = true

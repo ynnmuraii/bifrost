@@ -14,10 +14,10 @@
 //!
 //! ```text
 //! # the fast variant that runs with the workspace suite (50 cycles + the fault cases)
-//! cargo test -p multideskflow --test fault_injection
+//! cargo test -p bifrost --test fault_injection
 //!
 //! # the full run: 1000 cycles, and the suspend case
-//! cargo test -p multideskflow --test fault_injection -- --ignored --nocapture --test-threads=1
+//! cargo test -p bifrost --test fault_injection -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! The harness is `tests/common/mod.rs`; it polls `status` instead of sleeping, so a slow
@@ -497,7 +497,7 @@ fn fifty_transitions_run_in_ci() {
 /// Ignored by default because it takes minutes; `docs/07-quality-security.md` asks for it
 /// before the E2 gate is called closed.
 #[test]
-#[ignore = "1000 cycles: cargo test -p multideskflow --test fault_injection -- --ignored --nocapture --test-threads=1"]
+#[ignore = "1000 cycles: cargo test -p bifrost --test fault_injection -- --ignored --nocapture --test-threads=1"]
 fn a_thousand_transitions_leave_no_lease_and_no_held_input() {
     // One harness at a time: see `common::serial`.
     let _serial = common::serial();
@@ -810,7 +810,7 @@ fn a_killed_receiver_agent_returns_to_local() {
 /// A frozen core cannot send a `Leave`, and the socket stays open: only the source's own
 /// watchdog can end the lease.
 #[test]
-#[ignore = "needs process suspension (NtSuspendProcess / SIGSTOP): cargo test -p multideskflow --test fault_injection -- --ignored --nocapture --test-threads=1"]
+#[ignore = "needs process suspension (NtSuspendProcess / SIGSTOP): cargo test -p bifrost --test fault_injection -- --ignored --nocapture --test-threads=1"]
 fn a_suspended_receiver_core_trips_the_source_watchdog() {
     // One harness at a time: see `common::serial`.
     let _serial = common::serial();

@@ -312,7 +312,7 @@ impl WaylandCapture {
         let context = ei::Context::new(UnixStream::from(fd))?;
         context.flush().map_err(std::io::Error::from)?;
         let (connection, events) = context
-            .handshake_tokio("lan-workspace", ei::handshake::ContextType::Receiver)
+            .handshake_tokio("Bifrost", ei::handshake::ContextType::Receiver)
             .await?;
 
         let activated = input_capture
