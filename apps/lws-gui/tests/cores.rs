@@ -758,16 +758,9 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
             .iter()
             .position(|node| node.node_id == lab.a_id)
             .expect("local node");
-        let peer = editor
-            .nodes
-            .iter()
-            .position(|node| node.node_id == lab.b_id)
-            .expect("peer node");
-        lws_gui::map::adjacent(
-            &editor.shapes[this],
-            editor.placement[this],
-            &editor.shapes[peer],
-            lws_gui::view_model::Side::Right,
+        lws_gui::map::Pt::new(
+            editor.placement[this].x + editor.shapes[this].w,
+            editor.placement[this].y + 12.5,
         )
     };
     owner.dispatch(
@@ -775,6 +768,7 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
             node_id: lab.b_id.clone(),
             x: target.x,
             y: target.y,
+            snap_threshold: lws_gui::map::SNAP,
         },
         Instant::now(),
     );
