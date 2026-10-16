@@ -9,17 +9,12 @@ use eframe::egui::{
 use super::field::Frame;
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
-use super::{Env, UiState, FIELD_FRAME};
+use super::{Env, PaddleDrag, PaddleHandle, UiState, FIELD_FRAME};
 use crate::gui_settings::{LinkStyle, Look, PAN_MAX};
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
 use ui_text::{text, Key};
-
-/// How near, in screen points, an edge has to be before a drag snaps onto it. The model's
-/// [`crate::map::SNAP`] is the same idea in stage units; a drag converts this one instead,
-/// so the magnet keeps its reach on screen however far the map is zoomed.
-const SNAP_PX: f64 = 12.0;
 
 /// Stage → screen.
 #[derive(Clone, Copy)]
@@ -114,6 +109,9 @@ pub fn draw(
         })
         .collect();
 
+    // Raw edge hit testing runs before card widgets: a paddle never starts a node drag.
+    let paddle_hovered = paddle_interaction(ui, vm, st, &model, &shown, xf, rect, t, actions);
+
     // Hover identity may stay the same while the card glides, zooms or pans.
     // Retarget before painting so the outline uses this frame's displayed geometry.
     if simulate && st.drag.is_none() {
@@ -163,7 +161,10 @@ pub fn draw(
             i,
             shown[i],
             xf,
-            vm.modal.is_none() && !vm.appearance_open,
+            vm.modal.is_none()
+                && !vm.appearance_open
+                && !paddle_hovered
+                && st.paddle_drag.is_none(),
             &mut hovered,
             actions,
         );
@@ -182,12 +183,16 @@ pub fn draw(
                 link.forward,
                 link.dir == Dir::Horizontal,
                 f32::from(vm.look.zoom_percent) / 100.0,
-                (link.span.1 - link.span.0) as f32 * s,
+                (
+                    (link.a_span.1 - link.a_span.0) as f32 * s,
+                    (link.b_span.1 - link.b_span.0) as f32 * s,
+                ),
                 pal.accent,
             );
             st.bridge.paint_latency(&painter, a + (b - a) * 0.5, pal);
         }
     }
+    let paddle_fading = paint_paddles(&painter, pal, st, &model, &shown, xf, t);
     if simulate && hovered != st.hover {
         match hovered {
             Some((n, _)) if simulate && st.drag.is_none() => {
@@ -233,7 +238,7 @@ pub fn draw(
     banner(ui, pal, vm, rect, actions);
     // A bridge has its own clock: a static or settled background must not stop its flow.
     // Both layers freeze without scheduling frames when the map/window is inactive.
-    (moving || (simulate && bridge_live)).then_some(FIELD_FRAME)
+    (moving || paddle_fading || (simulate && bridge_live)).then_some(FIELD_FRAME)
 }
 
 fn pan(ui: &egui::Ui, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) -> Vec2 {
@@ -415,6 +420,214 @@ fn link_ends(model: &MapModel, link: &MapLink, shown: &[Pos2], xf: Xf) -> (Pos2,
     };
     (carried(link.a, link.from), carried(link.b, link.to))
 }
+/// Screen endpoints following the same node animation as the bridge.
+fn paddle_ends(model: &MapModel, link: &MapLink, from: bool, shown: &[Pos2], xf: Xf) -> [Pos2; 2] {
+    let (index, point, span) = if from {
+        (link.a, link.from, link.a_span)
+    } else {
+        (link.b, link.to, link.b_span)
+    };
+    let carry = shown[index] - xf.p(model.nodes[index].at.x, model.nodes[index].at.y);
+    let points = if link.dir == Dir::Horizontal {
+        [xf.p(point.x, span.0), xf.p(point.x, span.1)]
+    } else {
+        [xf.p(span.0, point.y), xf.p(span.1, point.y)]
+    };
+    [points[0] + carry, points[1] + carry]
+}
+
+fn paddle_hit(points: [Pos2; 2], pointer: Pos2, horizontal: bool) -> Option<PaddleHandle> {
+    let (normal, tangent, start, end) = if horizontal {
+        (
+            (pointer.x - points[0].x).abs(),
+            pointer.y,
+            points[0].y,
+            points[1].y,
+        )
+    } else {
+        (
+            (pointer.y - points[0].y).abs(),
+            pointer.x,
+            points[0].x,
+            points[1].x,
+        )
+    };
+    if normal > 8.0 || tangent < start - 8.0 || tangent > end + 8.0 {
+        return None;
+    }
+    Some(if (tangent - start).abs() <= 8.0 {
+        PaddleHandle::Start
+    } else if (tangent - end).abs() <= 8.0 {
+        PaddleHandle::End
+    } else {
+        PaddleHandle::Move
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paddle_interaction(
+    ui: &egui::Ui,
+    vm: &ViewModel,
+    st: &mut UiState,
+    model: &MapModel,
+    shown: &[Pos2],
+    xf: Xf,
+    rect: Rect,
+    time: f32,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let (pointer, pressed, down, released, focused) = ui.input(|input| {
+        (
+            input.pointer.interact_pos(),
+            input.pointer.button_pressed(egui::PointerButton::Primary),
+            input.pointer.button_down(egui::PointerButton::Primary),
+            input.pointer.button_released(egui::PointerButton::Primary),
+            input.focused,
+        )
+    });
+    let enabled = vm.modal.is_none() && !vm.appearance_open && focused;
+    if !enabled {
+        if st.paddle_drag.take().is_some() {
+            actions.push(Action::CancelDrag);
+        }
+        return false;
+    }
+    let hit = if st.drag.is_none() {
+        pointer
+            .filter(|point| rect.contains(*point))
+            .and_then(|point| {
+                model
+                    .links
+                    .iter()
+                    .filter(|link| link.state != LinkState::Inactive && !link.whole_desktop)
+                    .find_map(|link| {
+                        [true, false].into_iter().find_map(|from| {
+                            paddle_hit(
+                                paddle_ends(model, link, from, shown, xf),
+                                point,
+                                link.dir == Dir::Horizontal,
+                            )
+                            .map(|handle| (link, from, handle))
+                        })
+                    })
+            })
+    } else {
+        None
+    };
+    if let Some((link, from, handle)) = hit {
+        st.paddle_reveals.insert(link.id.clone(), time);
+        ui.ctx().set_cursor_icon(paddle_cursor(handle, link.dir));
+        if pressed {
+            st.paddle_drag = Some(PaddleDrag {
+                link_id: link.id.clone(),
+                from,
+                span: if from { link.a_span } else { link.b_span },
+                grab: pointer.expect("a paddle hit has a pointer"),
+                handle,
+            });
+            st.field.release();
+        }
+    }
+    if let Some(drag) = &st.paddle_drag {
+        if let Some(link) = model.links.iter().find(|link| link.id == drag.link_id) {
+            ui.ctx()
+                .set_cursor_icon(paddle_cursor(drag.handle, link.dir));
+            if down {
+                if let Some(pointer) = pointer {
+                    let delta = xf.stage_delta(pointer - drag.grab);
+                    let delta = if link.dir == Dir::Horizontal {
+                        delta.y
+                    } else {
+                        delta.x
+                    };
+                    let bounds = link.span;
+                    let span = match drag.handle {
+                        PaddleHandle::Move => crate::map::move_paddle(drag.span, delta, bounds),
+                        PaddleHandle::Start => {
+                            crate::map::resize_paddle(drag.span, true, drag.span.0 + delta, bounds)
+                        }
+                        PaddleHandle::End => {
+                            crate::map::resize_paddle(drag.span, false, drag.span.1 + delta, bounds)
+                        }
+                    };
+                    actions.push(Action::MovePaddle {
+                        link_id: drag.link_id.clone(),
+                        from: drag.from,
+                        start: span.0,
+                        end: span.1,
+                    });
+                }
+            }
+        }
+        if released {
+            st.paddle_drag = None;
+            actions.push(Action::DropPaddle);
+        } else if !down {
+            st.paddle_drag = None;
+            actions.push(Action::CancelDrag);
+        }
+    }
+    hit.is_some() || st.paddle_drag.is_some()
+}
+
+fn paddle_cursor(handle: PaddleHandle, dir: Dir) -> egui::CursorIcon {
+    match (handle, dir) {
+        (PaddleHandle::Move, _) => egui::CursorIcon::Grab,
+        (_, Dir::Horizontal) => egui::CursorIcon::ResizeVertical,
+        (_, Dir::Vertical) => egui::CursorIcon::ResizeHorizontal,
+    }
+}
+
+fn paddle_alpha(last_reveal: Option<f32>, now: f32) -> f32 {
+    last_reveal.map_or(0.0, |last| {
+        (1.0 - (now - last).max(0.0) / 0.2).clamp(0.0, 1.0)
+    })
+}
+
+fn paint_paddles(
+    painter: &egui::Painter,
+    pal: &Palette,
+    st: &mut UiState,
+    model: &MapModel,
+    shown: &[Pos2],
+    xf: Xf,
+    now: f32,
+) -> bool {
+    let mut fading = false;
+    for link in &model.links {
+        if link.whole_desktop || link.state == LinkState::Inactive {
+            continue;
+        }
+        let held = st.drag.as_ref().is_some_and(|drag| {
+            model.nodes[link.a].node_id == drag.node_id
+                || model.nodes[link.b].node_id == drag.node_id
+        }) || st
+            .paddle_drag
+            .as_ref()
+            .is_some_and(|drag| drag.link_id == link.id);
+        if held {
+            st.paddle_reveals.insert(link.id.clone(), now);
+        }
+        let alpha = paddle_alpha(st.paddle_reveals.get(&link.id).copied(), now);
+        if alpha <= 0.0 {
+            continue;
+        }
+        fading |= !held;
+        for from in [true, false] {
+            let dragged = st
+                .paddle_drag
+                .as_ref()
+                .is_some_and(|drag| drag.link_id == link.id && drag.from == from);
+            let color = if dragged { pal.accent } else { pal.line };
+            painter.line_segment(
+                paddle_ends(model, link, from, shown, xf),
+                Stroke::new(4.0, fade(color, alpha)),
+            );
+        }
+    }
+    st.paddle_reveals.retain(|_, last| now - *last < 0.2);
+    fading
+}
 
 #[allow(clippy::too_many_arguments)]
 fn draw_link(
@@ -428,9 +641,6 @@ fn draw_link(
     field: &mut super::field::Field,
 ) {
     let (a, b) = link_ends(model, link, shown, xf);
-    let carry_a = shown[link.a] - xf.p(model.nodes[link.a].at.x, model.nodes[link.a].at.y);
-    let carry_b = shown[link.b] - xf.p(model.nodes[link.b].at.x, model.nodes[link.b].at.y);
-    let horizontal = link.dir == Dir::Horizontal;
     let (mut color, mut alpha) = (pal.ink2, 1.0f32);
     match link.state {
         LinkState::Active => color = pal.accent,
@@ -450,39 +660,7 @@ fn draw_link(
             3.5,
         ));
     }
-    if link.whole_desktop {
-        // The whole desktop's edge: a short rail along the shared stretch at both ends.
-        let (s0, s1) = (link.span.0, link.span.1);
-        let (p0, p1, q0, q1) = if horizontal {
-            (
-                xf.p(link.from.x + 4.0, s0),
-                xf.p(link.from.x + 4.0, s1),
-                xf.p(link.to.x - 4.0, s0),
-                xf.p(link.to.x - 4.0, s1),
-            )
-        } else {
-            (
-                xf.p(s0, link.from.y + 4.0),
-                xf.p(s1, link.from.y + 4.0),
-                xf.p(s0, link.to.y - 4.0),
-                xf.p(s1, link.to.y - 4.0),
-            )
-        };
-        let (p0, p1, q0, q1) = (p0 + carry_a, p1 + carry_a, q0 + carry_b, q1 + carry_b);
-        let rail = Stroke::new(
-            3.0,
-            fade(
-                if link.state == LinkState::Active {
-                    pal.accent
-                } else {
-                    pal.ink2
-                },
-                alpha * 0.6,
-            ),
-        );
-        painter.line_segment([p0, p1], rail);
-        painter.line_segment([q0, q1], rail);
-    }
+    // Endpoint paddles are painted separately, above cards, only during interaction.
 }
 
 fn fade(c: Color32, k: f32) -> Color32 {
@@ -611,9 +789,8 @@ fn node_ui(
                         node_id: node.node_id.clone(),
                         x: drag.start.x + delta.x,
                         y: drag.start.y + delta.y,
-                        // The magnet reaches `SNAP_PX` points on screen, so it feels the same
-                        // at every zoom; the model works in stage units.
-                        snap_threshold: SNAP_PX / f64::from(s),
+                        // Free placement: proximity creates a bridge, never a forced snap.
+                        snap_threshold: 0.0,
                     });
                 }
             }
@@ -897,6 +1074,214 @@ mod transform_tests {
     use super::*;
 
     #[test]
+    fn paddles_reveal_both_edges_then_finish_fading_without_idle_repaints() {
+        use crate::view_model::{CoreEndpoint, LocalConfig};
+        let mut model = owner_layout();
+        model.links[0].whole_desktop = false;
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let now = std::time::Instant::now();
+        let mut st = UiState::new(now);
+        let vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
+        );
+        let pal = Palette::of(vm.look.theme);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0));
+        let xf = Xf::new(rect, 100);
+        let shown: Vec<_> = model
+            .nodes
+            .iter()
+            .map(|node| xf.p(node.at.x, node.at.y))
+            .collect();
+        let pointer = paddle_ends(&model, &model.links[0], true, &shown, xf)[0];
+        let render = |st: &mut UiState, t, hover: bool| {
+            let mut fading = false;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(f64::from(t)),
+                    events: vec![if hover {
+                        egui::Event::PointerMoved(pointer)
+                    } else {
+                        egui::Event::PointerGone
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    paddle_interaction(ui, &vm, st, &model, &shown, xf, rect, t, &mut Vec::new());
+                    fading = paint_paddles(ui.painter(), &pal, st, &model, &shown, xf, t);
+                },
+            );
+            let count = output
+                .shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(&shape.shape,
+                Shape::LineSegment { stroke, .. } if stroke.width == 4.0)
+                })
+                .count();
+            output.drop_without_applying_deltas();
+            (count, fading)
+        };
+        assert_eq!(render(&mut st, 0.0, false), (0, false), "hidden by default");
+        st.drag = Some(super::super::Drag {
+            node_id: model.nodes[0].node_id.clone(),
+            start: model.nodes[0].at,
+            grab: pointer,
+        });
+        assert_eq!(
+            render(&mut st, 0.1, false),
+            (2, false),
+            "node drag reveals both edges"
+        );
+        st.drag = None;
+        assert_eq!(render(&mut st, 0.2, false), (2, true));
+        assert_eq!(
+            render(&mut st, 0.35, false),
+            (0, false),
+            "fade ends within250ms"
+        );
+        assert_eq!(
+            render(&mut st, 0.4, true).0,
+            2,
+            "linked edge hover reveals both paddles"
+        );
+        assert_eq!(render(&mut st, 0.65, false), (0, false));
+        assert_eq!(render(&mut st, 5.0, false), (0, false), "no idle animation");
+    }
+
+    #[test]
+    fn paddle_pointer_drag_sends_one_layout_update_and_never_moves_the_node() {
+        use crate::map::{Pt, Rect as MapRect, Shape as MapShape};
+        use crate::view_model::{CoreEndpoint, EditorDisplay, EditorNode, LocalConfig};
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
+        );
+        vm.on_connected("test");
+        vm.editor.editable = true;
+        vm.look.clouds = false;
+        vm.look.field = crate::gui_settings::FieldMode::Off;
+        vm.look.pan_x = 0;
+        vm.look.pan_y = 0;
+        vm.look.zoom_percent = 100;
+        vm.editor.nodes = ["aa".repeat(32), "bb".repeat(32)]
+            .into_iter()
+            .map(|id| EditorNode {
+                node_id: id,
+                display_name: String::new(),
+                online: true,
+                displays: vec![EditorDisplay {
+                    id: "screen".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1920.0,
+                    h: 1080.0,
+                    primary: true,
+                    native_known: true,
+                    rotation: 0,
+                }],
+            })
+            .collect();
+        vm.editor.scale = crate::map::BASE_SCALE;
+        let mon = MapRect::new(0.0, 0.0, 144.0, 81.0);
+        vm.editor.shapes = vec![
+            MapShape {
+                mons: vec![mon],
+                w: mon.w,
+                h: mon.h
+            };
+            2
+        ];
+        vm.editor.baseline = vec![Pt::new(200.0, 80.0), Pt::new(600.0, 80.0)];
+        vm.editor.placement = vec![Pt::new(200.0, 80.0), Pt::new(400.0, 80.0)];
+        let positions = vm.editor.placement.clone();
+        let link = vm.map_model().links.remove(0);
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let now = std::time::Instant::now();
+        let mut st = UiState::new(now);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 708.0));
+        let xf = Xf::new(rect, 100);
+        let start = xf.p(link.from.x - 1.0, link.a_span.0 + 1.0);
+        let end = start + Vec2::new(0.0, 20.0);
+        let mut drops = 0;
+        for (frame, pointer, button) in [
+            (0, start, None),
+            (1, start, Some(true)),
+            (2, end, None),
+            (3, end, Some(false)),
+        ] {
+            let mut events = vec![egui::Event::PointerMoved(pointer)];
+            if let Some(pressed) = button {
+                events.push(egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let mut actions = Vec::new();
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(f64::from(frame) * 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(
+                        ui,
+                        &Palette::of(vm.look.theme),
+                        &vm,
+                        &mut st,
+                        rect,
+                        Env {
+                            now,
+                            animate: false,
+                        },
+                        frame as f32 * 0.05,
+                        &mut actions,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+            for action in actions {
+                assert!(!matches!(
+                    action,
+                    Action::MoveNode { .. } | Action::DropNode(_)
+                ));
+                drops += usize::from(matches!(action, Action::DropPaddle));
+                vm.local(&action);
+            }
+        }
+        assert_eq!(drops, 1);
+        assert_eq!(vm.editor.placement, positions);
+        let sent = vm
+            .editor
+            .save
+            .sent
+            .as_ref()
+            .expect("paddle drop sends layout CAS");
+        assert!(sent.links[0].from.start > 0.0);
+        assert_eq!(
+            vm.take_outgoing()
+                .iter()
+                .filter(|frame| matches!(
+                    &frame.msg,
+                    Some(protocol::ipc::gui_frame::Msg::UpdateTopology(_))
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn zoomed_drag_deltas_round_trip_without_changing_stage_coordinates() {
         for size in [Vec2::new(1200.0, 520.0), Vec2::new(900.0, 360.0)] {
             let rect = Rect::from_min_size(Pos2::new(40.0, 70.0), size);
@@ -958,16 +1343,18 @@ mod transform_tests {
                     .collect(),
             })
             .collect();
-        // The document's legacy whole-desktop pair: the laptop is on the left of the desktop and
-        // the two face each other across `GAP`. `map::links` finds touching display edges only —
-        // a legacy pair parked a `GAP` apart has none — so the fixture states the link the
-        // document holds, the way `view_model::layout::map_model` builds it: both edges, whole
-        // desktop, spanning the overlap.
+        // Legacy whole-desktop documents keep their original placement and bridge.
+        // Endpoint editing applies after a concrete per-display link is established.
         let (pc, laptop) = (&arrangement.shapes[0], &arrangement.shapes[1]);
         let (pc_at, laptop_at) = (arrangement.pos[0], arrangement.pos[1]);
         let top = pc_at.y.max(laptop_at.y);
         let bottom = (pc_at.y + pc.h).min(laptop_at.y + laptop.h);
         let links = vec![MapLink {
+            id: "legacy".to_owned(),
+            a_display: 0,
+            b_display: 0,
+            a_span: (top, bottom),
+            b_span: (top, bottom),
             a: 1,
             b: 0,
             from: map::Pt::new(laptop_at.x + laptop.w, (top + bottom) / 2.0),
@@ -1033,7 +1420,7 @@ mod transform_tests {
     }
 
     #[test]
-    fn separated_owner_desktops_have_visible_links_and_external_rails_in_both_styles() {
+    fn separated_owner_desktops_have_visible_bridges_without_permanent_rails() {
         let model = owner_layout();
         assert_eq!(model.links.len(), 1);
         let ctx = egui::Context::default();
@@ -1088,7 +1475,7 @@ mod transform_tests {
                             link.forward,
                             true,
                             1.5,
-                            120.0,
+                            (120.0, 120.0),
                             pal.accent,
                         );
                     }
@@ -1125,7 +1512,7 @@ mod transform_tests {
                 for clipped in &output.shapes {
                     inspect(&clipped.shape, a, b, &mut rails, &mut chain);
                 }
-                assert_eq!(rails, 2, "{style:?} {state:?}");
+                assert_eq!(rails, 0, "{style:?} {state:?}");
                 assert!(chain > 2, "{style:?} {state:?}");
                 let glyphs = output
                     .shapes

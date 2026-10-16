@@ -14,6 +14,8 @@
 //! Rendering is offscreen through egui_kittest/wgpu and requires a working GPU adapter.
 //! `--placement` writes only the owner placement sequence (before, preview, accepted)
 //! at 1745×1091 in RU/EN and light/dark, using mocks and real move/drop actions.
+//! `--gap-links` writes owner, dragged-paddle and vertical-gap views at 1745×1091
+//! in RU/EN and light/dark, using only mocked topology and real layout actions.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,9 @@ fn main() -> std::process::ExitCode {
             .map(|pair| pair[1].clone())
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    if args.iter().any(|arg| arg == "--gap-links") {
+        return gap_link_shots(&dir, option("--prefix").as_deref().unwrap_or("gap-links"));
+    }
     if args.iter().any(|arg| arg == "--placement") {
         return placement_shots(&dir, option("--prefix").as_deref().unwrap_or("placement"));
     }
@@ -298,6 +303,134 @@ fn placement_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
     }
 }
 
+fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
+    let render = || -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+            for (theme_tag, theme) in [("light", Theme::Light), ("dark", Theme::Dark)] {
+                for phase in ["owner", "dragged", "vertical"] {
+                    let vertical = phase == "vertical";
+                    let mut vm = mockup(theme, None, lang);
+                    vm.look.link_style = lws_gui::gui_settings::LinkStyle::Ascii;
+                    vm.look.zoom_percent = 100;
+                    vm.pairing.prompt = None;
+                    vm.pairing.details = false;
+                    if let Some(status) = vm.status.as_mut() {
+                        status.members.retain(|member| member.node_id != *HTPC);
+                        if let Some(pc) = status
+                            .members
+                            .iter_mut()
+                            .find(|member| member.node_id == *WORKSTATION)
+                        {
+                            pc.display_name = "PC".to_owned();
+                        }
+                    }
+                    vm.look.pan_x = 0;
+                    vm.look.pan_y = 0;
+                    vm.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {
+                        revision: 16,
+                        author_node_id: WORKSTATION.to_owned(),
+                        members: vec![
+                            ipc::MemberTopology {
+                                node_id: WORKSTATION.to_owned(),
+                                display_name: "PC".to_owned(),
+                                online: true,
+                                displays: vec![
+                                    display("01", 0.0, 420.0, 1920.0, 1080.0, false, true),
+                                    display("02", 1920.0, 0.0, 1080.0, 1920.0, true, true),
+                                ],
+                            },
+                            ipc::MemberTopology {
+                                node_id: LAPTOP.to_owned(),
+                                display_name: "LAPTOP".to_owned(),
+                                online: true,
+                                displays: vec![display("03", 0.0, 0.0, 1745.0, 1091.0, true, true)],
+                            },
+                        ],
+                        links: vec![ipc::LinkView {
+                            id: "owner-gap".to_owned(),
+                            from: Some(ipc::EndpointView {
+                                node_id: WORKSTATION.to_owned(),
+                                display_id: "02".to_owned(),
+                                edge: if vertical { "BOTTOM" } else { "RIGHT" }.to_owned(),
+                                segment_start: if vertical { 0.0 } else { 414.5 },
+                                segment_end: if vertical { 1080.0 } else { 1505.5 },
+                            }),
+                            to: Some(ipc::EndpointView {
+                                node_id: LAPTOP.to_owned(),
+                                display_id: "03".to_owned(),
+                                edge: if vertical { "TOP" } else { "LEFT" }.to_owned(),
+                                segment_start: 0.0,
+                                segment_end: if vertical { 1080.0 } else { 1091.0 },
+                            }),
+                            bidirectional: true,
+                            active: true,
+                            inactive_reason: String::new(),
+                            auto_displays: Vec::new(),
+                        }],
+                    })));
+                    let owner = vm
+                        .editor
+                        .nodes
+                        .iter()
+                        .position(|n| n.node_id == *WORKSTATION)
+                        .ok_or("missing gap owner")?;
+                    let laptop = vm
+                        .editor
+                        .nodes
+                        .iter()
+                        .position(|n| n.node_id == *LAPTOP)
+                        .ok_or("missing gap laptop")?;
+                    let scale = vm.editor.scale;
+                    let origin = lws_gui::map::Pt::new(40.0, 20.0);
+                    vm.editor.placement[owner] = origin;
+                    vm.editor.placement[laptop] = if vertical {
+                        lws_gui::map::Pt::new(origin.x + 1920.0 * scale, origin.y + 1992.0 * scale)
+                    } else {
+                        lws_gui::map::Pt::new(origin.x + 3072.0 * scale, origin.y + 414.5 * scale)
+                    };
+                    vm.editor.baseline.clone_from(&vm.editor.placement);
+                    let drag = if phase == "dragged" {
+                        let span = (
+                            (414.5 + 150.0) * scale + origin.y,
+                            (1505.5 - 150.0) * scale + origin.y,
+                        );
+                        vm.local(&Action::MovePaddle {
+                            link_id: "owner-gap".to_owned(),
+                            from: true,
+                            start: span.0,
+                            end: span.1,
+                        });
+                        Some(span)
+                    } else {
+                        None
+                    };
+                    let file = dir.join(format!(
+                        "{prefix}-{phase}-{lang_tag}-{theme_tag}-1745x1091.png"
+                    ));
+                    shoot_gap(vm, &file, drag)?;
+                    println!("{}", file.display());
+                }
+            }
+        }
+        Ok(())
+    };
+    match render() {
+        Ok(()) => {
+            println!("12 pictures in {}", dir.display());
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("cannot render gap links: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn shoot_gap(state: ViewModel, file: &Path, drag: Option<(f64, f64)>) -> Result<(), String> {
+    shoot_with_paddle(state, file, [1745, 1091], false, Some(drag))
+}
+
 fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
     let (view, client) = view_model::boot(args);
     let mut bridge = Bridge::new(view, client);
@@ -361,6 +494,16 @@ fn modal_name(modal: Modal) -> &'static str {
 }
 
 fn shoot(state: ViewModel, file: &Path, size: [u32; 2], live: bool) -> Result<(), String> {
+    shoot_with_paddle(state, file, size, live, None)
+}
+
+fn shoot_with_paddle(
+    state: ViewModel,
+    file: &Path,
+    size: [u32; 2],
+    live: bool,
+    paddle: Option<Option<(f64, f64)>>,
+) -> Result<(), String> {
     let drawn = AssertUnwindSafe(|| {
         let mut ui_state = UiState::new(Instant::now());
         let mut harness = Harness::builder()
@@ -371,9 +514,35 @@ fn shoot(state: ViewModel, file: &Path, size: [u32; 2], live: bool) -> Result<()
                     now: Instant::now(),
                     animate: live,
                 };
+                if let Some(drag) = paddle {
+                    ui_state.reveal_paddles("owner-gap", env.now);
+                    if let Some(span) = drag {
+                        if ui.input(|input| input.pointer.primary_down()) {
+                            ui_state.paddle_drag = Some(ui::PaddleDrag {
+                                link_id: "owner-gap".to_owned(),
+                                from: true,
+                                span,
+                                grab: egui::pos2(900.0, 450.0),
+                                handle: ui::PaddleHandle::Move,
+                            });
+                        }
+                    }
+                }
                 let _ = ui::draw(ui, &state, &mut ui_state, env);
             });
         ui::install_fonts(&harness.ctx);
+        if matches!(paddle, Some(Some(_))) {
+            // Hold only the harness pointer: the actual map paints its dragged accent.
+            let pos = egui::pos2(900.0, 450.0);
+            harness.event(egui::Event::WindowFocused(true));
+            harness.event(egui::Event::PointerMoved(pos));
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
         if live {
             // A window showing a live field has the pointer over the map: that is what lets the
             // field simulate, and «ASCII-изолиния» draws its ribbon of particles only then.
