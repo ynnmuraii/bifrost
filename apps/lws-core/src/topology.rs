@@ -1189,18 +1189,19 @@ pub fn config_from_wire(
 
 /// The manifests `build` runs against: the live agent report when there is one, otherwise the
 /// configured snapshot; peers from their live reports over the configured snapshots.
+/// `None` permits bootstrap fallback; `Some(&[])` is a known empty manifest and must not
+/// resurrect configured monitors. Likewise, a peer map entry overrides its snapshot even empty.
 #[must_use]
 pub fn live_inputs(
     layout: &config::TopologyConfig,
     local_node_id: &[u8; 32],
-    agent_displays: &[ipc::DisplayInfo],
+    agent_displays: Option<&[ipc::DisplayInfo]>,
     peer_displays: &BTreeMap<NodeId, (u64, Vec<wire::Display>)>,
 ) -> (Vec<ipc::DisplayInfo>, Vec<(NodeId, Vec<wire::Display>)>) {
-    let local = if agent_displays.is_empty() {
-        snapshot_displays(layout, local_node_id)
-    } else {
-        agent_displays.to_vec()
-    };
+    let local = agent_displays.map_or_else(
+        || snapshot_displays(layout, local_node_id),
+        <[ipc::DisplayInfo]>::to_vec,
+    );
     let mut peers: BTreeMap<NodeId, Vec<wire::Display>> =
         snapshot_peers(layout, local_node_id).into_iter().collect();
     peers.extend(
@@ -1220,7 +1221,7 @@ pub fn live_inputs(
 pub fn check_layout(
     layout: &config::TopologyConfig,
     local_node_id: &[u8; 32],
-    agent_displays: &[ipc::DisplayInfo],
+    agent_displays: Option<&[ipc::DisplayInfo]>,
     peer_displays: &BTreeMap<NodeId, (u64, Vec<wire::Display>)>,
 ) -> Result<(), String> {
     let (local, peers) = live_inputs(layout, local_node_id, agent_displays, peer_displays);
@@ -1232,6 +1233,121 @@ pub fn check_layout(
     })
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod manifest_lifecycle_tests {
+    use super::*;
+    use focus_router as fr;
+
+    #[test]
+    fn remote_lease_survives_empty_manifests_and_contacts_restore() {
+        let node = NodeId::new([1; 32]);
+        let peer = NodeId::new([2; 32]);
+        let config = config::Config::from_str(&format!(
+            r#"
+config_version = 2
+[[topology.displays]]
+node = "self"
+id = "local"
+logical = [0, 0, 1920, 1080]
+primary = true
+[[topology.displays]]
+node = "{peer_ref}"
+id = "remote"
+logical = [0, 0, 1920, 1080]
+primary = true
+[[topology.links]]
+id = "contact"
+from = {{ node = "self", display = "local", edge = "right", start = 200, end = 600 }}
+to = {{ node = "{peer_ref}", display = "remote", edge = "left", start = 100, end = 500 }}
+bidirectional = true
+"#,
+            peer_ref = config::peer_reference(peer.as_bytes())
+        )).expect("configured snapshots and concrete contact").topology;
+        let local = snapshot_displays(&config, node.as_bytes());
+        let peer_manifest = snapshot_peers(&config, node.as_bytes())[0].1.clone();
+        let caps = fr::Capabilities {
+            capture: true,
+            inject: true,
+            absolute_pointer: true,
+            emergency_hotkey: true,
+        };
+        let mut router = fr::FocusRouter::new(
+            node, fr::Timing::default(), fr::SequentialIds::default(), caps,
+        ).with_persisted_ownership(1, Some((1, node)));
+        router.handle(0, fr::Input::Hello {
+            peer,
+            hello: fr::PeerHello {
+                can_own: true, capabilities: caps, owner_serial: 1, owner: Some(node),
+            },
+        });
+        router.handle(1, fr::Input::Local(fr::LocalInput::SwitchRequest {
+            trigger: fr::SwitchTrigger::Edge,
+            target: peer,
+            entry_position: geometry::Position::new("remote", 2.0, 300.0),
+            topology_revision: 0,
+        }));
+        let lease_id = router.lease().source().expect("preparing").lease_id;
+        router.handle(2, fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }));
+        router.handle(3, fr::Input::Net { from: peer, message: fr::Message::EnterAck {
+            lease_id, accepted: true, reason: None,
+        }});
+        router.handle(4, fr::Input::Net { from: peer, message: fr::Message::LeaseChallenge {
+            lease_id, nonce: [8; 16], ttl_ms: 500,
+        }});
+        router.handle(5, fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }));
+        assert_eq!(router.focus(), fr::FocusState::Remote);
+
+        for missing_local in [true, false] {
+            let mut peers = BTreeMap::from([(peer, (1, peer_manifest.clone()))]);
+            for empty in [false, true, false] {
+                if !missing_local {
+                    peers.insert(peer, (2, if empty { Vec::new() } else { peer_manifest.clone() }));
+                }
+                let report = if missing_local && empty { &[][..] } else { local.as_slice() };
+                let (displays, peer_displays) = live_inputs(&config, node.as_bytes(), Some(report), &peers);
+                let built = build(&Documents {
+                    local_node_id: *node.as_bytes(), topology: &config,
+                    local_displays: &displays, peer_displays: &peer_displays,
+                }).expect("missing concrete endpoint is inactive");
+                // This is the only router operation performed by Session::rebuild_topology.
+                router.set_topology_revision(built.topology.revision);
+                assert_eq!(router.focus(), fr::FocusState::Remote);
+                assert_eq!(router.lease().source().expect("same active lease").lease_id, lease_id);
+                assert_eq!(built.topology.links.len(), usize::from(!empty));
+                assert_eq!(built.inactive.len(), usize::from(empty));
+                assert_eq!(
+                    geometry::resolve_transition(
+                        &built.topology, &node,
+                        &geometry::Position::new("local", 1920.0, 400.0),
+                    ).is_some(),
+                    !empty,
+                );
+                assert_eq!(
+                    geometry::resolve_transition(
+                        &built.topology, &peer,
+                        &geometry::Position::new("remote", 0.0, 300.0),
+                    ).is_some(),
+                    !empty,
+                );
+            }
+        }
+        let (bootstrap, peers) = live_inputs(&config, node.as_bytes(), None, &BTreeMap::new());
+        assert_eq!(bootstrap, local);
+        assert_eq!(peers[0].1, peer_manifest);
+        // A first HELLO with a positive revision and no displays overrides the stored
+        // snapshot just like an empty update from an already connected peer.
+        let first_empty_hello = BTreeMap::from([(peer, (2, Vec::new()))]);
+        let (local, peers) = live_inputs(&config, node.as_bytes(), None, &first_empty_hello);
+        assert!(peers[0].1.is_empty());
+        let built = build(&Documents {
+            local_node_id: *node.as_bytes(), topology: &config,
+            local_displays: &local, peer_displays: &peers,
+        }).expect("known empty HELLO is inactive");
+        assert!(built.topology.links.is_empty());
+        assert_eq!(built.inactive.len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1979,7 +2095,7 @@ bidirectional = true
             ],
             ..config::TopologyConfig::default()
         };
-        let error = check_layout(&layout, &local_id(), &local, &peers)
+        let error = check_layout(&layout, &local_id(), Some(&local), &peers)
             .expect_err("overlapping auto links must not be applied");
         assert!(
             error.contains("overlap") || error.contains("Overlap"),
@@ -1997,7 +2113,7 @@ bidirectional = true
             ],
             ..config::TopologyConfig::default()
         };
-        check_layout(&layout, &local_id(), &local, &peers).expect("right + bottom");
+        check_layout(&layout, &local_id(), Some(&local), &peers).expect("right + bottom");
     }
 
     /// Batch-2 audit: a transition with no edge starts on the receiver's primary display, and
