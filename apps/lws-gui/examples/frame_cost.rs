@@ -282,7 +282,7 @@ fn direct_field() {
                 true,
                 true,
                 1.5,
-                120.0,
+                (120.0, 120.0),
                 pal.accent,
             );
             bridge.paint_latency(ui.painter(), egui::pos2(500.0, 200.0), &pal);

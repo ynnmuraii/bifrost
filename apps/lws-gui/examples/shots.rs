@@ -382,7 +382,20 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                         .position(|n| n.node_id == *LAPTOP)
                         .ok_or("missing gap laptop")?;
                     let scale = vm.editor.scale;
-                    let origin = lws_gui::map::Pt::new(40.0, 20.0);
+                    let width = if vertical {
+                        3665.0 * scale
+                    } else {
+                        4745.0 * scale + 72.0
+                    };
+                    let height = if vertical {
+                        3011.0 * scale + 72.0
+                    } else {
+                        1920.0 * scale
+                    };
+                    let origin = lws_gui::map::Pt::new(
+                        (lws_gui::map::STAGE_W - width) / 2.0,
+                        (lws_gui::map::STAGE_H - height) / 2.0,
+                    );
                     vm.editor.placement[owner] = origin;
                     vm.editor.placement[laptop] = if vertical {
                         lws_gui::map::Pt::new(
