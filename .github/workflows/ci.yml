@@ -1,14 +1,65 @@
 name: CI
 
+# The two runners gate different things, and that is deliberate. The ubuntu job
+# is the full one and runs on every push: it is the cheap runner (1x minutes,
+# ~8 minutes) and it is where the whole workspace is exercised, including the
+# multi-process harnesses of `apps/multideskflow/tests` and the Xvfb session
+# they need. The windows job is the expensive one (2x minutes) and keeps on the
+# push only what Windows alone can answer — see the `Test` steps at the bottom.
+# Its full run lives in `nightly.yml`.
 on:
   push:
     branches: [main]
+    # A push that touches neither source nor a build input has nothing here to
+    # compile or assert: `cargo build`, `clippy`, `test` and `deny` read no
+    # Markdown, no doc tree and no packaging text.
+    #
+    # `icon.ico`, `icon-32.rgba` and `apps/lws-gui/assets/fonts/*.ttf` are
+    # deliberately *not* in this list. `apps/multideskflow/build.rs` embeds the
+    # first into the executable (and declares it `rerun-if-changed`), and the
+    # other two are `include_bytes!` inputs, so all three are build inputs like
+    # any `.rs` file. The PNG and SVG copies of the icon are not:
+    # `apps/multideskflow/assets/generate_icons.py` generates them from
+    # `icon.svg`, only `release.yml` opens them, and nothing in the build does.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'packaging/README_RU.txt'
+      - '.gitignore'
+      - '**/*.png'
+      - '**/*.svg'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'packaging/README_RU.txt'
+      - '.gitignore'
+      - '**/*.png'
+      - '**/*.svg'
+
+# One run per ref, and a newer push cancels the one it supersedes. This
+# repository pushes to `main` often and reruns flaky jobs, and without this a
+# burst of pushes leaves a backlog of runs that each bill for their whole
+# length. Cancelling does not weaken the gate: a cancelled job is only billed
+# for the minutes it ran, and the tree that survives the cancellation is the
+# newest one, which is the only one whose result still matters.
+#
+# The group is the ref, so a pull request and a push to `main` never cancel
+# each other, and `nightly.yml` has a group of its own and never cancels.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   # Match the required workspace gate and bound concurrent native linker work.
   CARGO_BUILD_JOBS: 2
+  # Every run restores a dependency cache and rebuilds a handful of crates, so
+  # incremental compilation writes session data that no later run reads; it also
+  # feeds the 10 GB cache budget with artifacts `Swatinem/rust-cache` would strip
+  # anyway (it sets this variable itself). Off, explicitly, so the setting cannot
+  # drift from what the cache holds.
+  CARGO_INCREMENTAL: 0
   # This workflow links the workspace twice: `Build` produces the binaries and
   # `Test` re-links every crate as a test binary. On ubuntu-latest the second set
   # used to grow `target/` from 4.5 GiB to 12 GiB on a 72 GiB runner that the
@@ -26,19 +77,30 @@ jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # A hang must not be able to bill a runner for hours: run 38805173105 sat in
+    # the Windows `Test` step for 90.8 minutes (its job ran 20:50→22:30, 100
+    # minutes at 2x = 200 billed minutes) until it was cancelled by hand. These
+    # budgets are four times the observed job lengths (Windows 18.6 min, Ubuntu
+    # 7.8 min in run 38865434698); they are meant to fail, not to be reached.
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
-        # Both operating systems run the whole workspace: the Unix-socket
-        # transport of crates/ipc, platform-x11, platform-wayland and
-        # platform-probe only execute on ubuntu-latest, where their cfg gates
-        # select them; on Windows the same commands compile them to no tests.
-        # `apps/lws-gui` is that same shape for a different reason: the window
-        # itself only opens where a human is — never in this workflow — and
-        # everything the crate does headlessly (the view model, the screens
-        # drawn into an offscreen `egui::Context`, and its two-core test) runs
-        # on both runners.
-        os: [windows-latest, ubuntu-latest]
+        # Both runners configure the whole workspace — `cargo fmt`, `cargo
+        # clippy --workspace --all-targets` and `cargo build --workspace` cover
+        # every crate on both, so a `cfg(windows)`-only compile error or lint is
+        # still caught on the push. What differs is which tests each one runs:
+        # ubuntu runs the whole workspace (the Unix-socket transport of
+        # crates/ipc, platform-x11, platform-wayland and platform-probe only
+        # execute there, where their cfg gates select them, and the Xvfb session
+        # the fault harnesses need exists only there), while windows runs the
+        # unit tests and the Windows-specific suites — the `Test` steps at the
+        # bottom carry the measurements behind that split.
+        include:
+          - os: ubuntu-latest
+            timeout: 20
+          - os: windows-latest
+            timeout: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -59,6 +121,17 @@ jobs:
           # cargo would rebuild anyway (debuginfo is part of the fingerprint)
           # after the restore had spent the disk this build needs.
           prefix-key: v1-rust
+          # `shared-key` replaces the automatic per-job part of the key, and
+          # names the runner's own target directory: the ubuntu job and the
+          # windows job never share one. It is what `nightly.yml` points at to
+          # restore *this* job's cache — its Windows job names the same string —
+          # because a nightly that rebuilt the dependency graph from scratch
+          # every night would cost more than the nightly saves.
+          shared-key: ${{ matrix.os }}
+          # A pull request restores but never writes: its `target/` belongs to a
+          # synthetic merge commit, and `main` is the tree whose cache is worth
+          # keeping. It is also the only tree that exists at 03:00 UTC.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Defence in depth for the SIGBUS above: a restored cache, a bigger
       # workspace or a runner image with less free space must not end in the
@@ -129,18 +202,23 @@ jobs:
       # distributed binary has to carry is `licenses/THIRD_PARTY_NOTICES.md`, generated with
       # cargo-about from `about.toml`.
       #
-      # It runs on both runners on purpose: the target graphs differ (Windows pulls
-      # `windows`/`clipboard-win`, Linux `zbus`/`ashpd`/`reis`/`x11rb`), and a licence the
-      # Windows graph never sees still has to be acceptable for the Linux build. That is also
-      # why cargo-deny is installed as a prebuilt binary (`taiki-e/install-action` supports
-      # Windows) instead of `EmbarkStudios/cargo-deny-action`: the latter is a Docker action
-      # and dies with «Container action is only supported on Linux» on the Windows runner.
+      # It runs on the Linux runner only, and that is a budget decision, not a policy one: the
+      # ubuntu job is the cheap one, and installing cargo-deny and checking the graph there is
+      # ~20 seconds at 1x. The reason this step used to run on both runners is real — the two
+      # graphs differ (Windows pulls `windows`/`clipboard-win`, Linux `zbus`/`ashpd`/`reis`/
+      # `x11rb`) — and it is kept, once a day instead of thirteen times: `nightly.yml` runs this
+      # same command on windows-latest against the Windows graph. It is also why cargo-deny is
+      # installed as a prebuilt binary (`taiki-e/install-action` supports Windows) rather than
+      # `EmbarkStudios/cargo-deny-action`: the latter is a Docker action and dies with
+      # «Container action is only supported on Linux».
       - name: Install cargo-deny
+        if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
 
       - name: Licences
+        if: runner.os == 'Linux'
         run: cargo deny --all-features check licenses
 
       # `cargo test` builds a package's *test* targets, and the two-core harnesses in
@@ -207,17 +285,60 @@ jobs:
           du -sh target
 
 
-      # Windows runners have a session; Linux ones need Xvfb (above). The fault
-      # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
-      # matter: it spawns two cores and waits for real transitions.
-      - name: Test
+      # The Windows runner is the expensive one (2x minutes), and the full
+      # `cargo test --workspace` there is what its minutes have always gone to:
+      # in run 38865434698 the `Test` step was 15.2 of the job's 18.6 minutes,
+      # and 723 of its 759 seconds of test execution were the five multi-process
+      # harnesses in `apps/multideskflow/tests` — `three_nodes` (287 s),
+      # `fault_injection` (165 s), `clipboard` (110 s), `heartbeat_stress`
+      # (64 s) and `layout` (35 s). Those harnesses are platform-neutral: they
+      # spawn real cores, speak the real protocol and assert the same contracts
+      # on either runner, and the ubuntu job runs every one of them on every
+      # push in 267 s at 1x. Paying 2x for them a second time, a dozen times a
+      # day, is where the month went.
+      #
+      # What stays on the push is what Windows alone can answer. The whole
+      # workspace already had to compile, pass clippy and build above (under
+      # `cfg(windows)`, which is where those lints and that code exist), and
+      # these run only here:
+      #
+      #  * every crate's unit tests (`--lib --bins`), which is where the
+      #    `cfg(windows)` units of `config`, `identity`, `ipc`, `transport` and
+      #    `multideskflow` are — `--bins` because the app's own units live in
+      #    `main.rs`, and a bin-only package has no lib target to select;
+      #  * the suites of the crates whose subject is Windows: `platform-win`
+      #    (Win32 capture, injection, clipboard, DPI), `lws-agent` (netguard,
+      #    the launcher and the backend), `lws-tray`, `identity` (the DPAPI
+      #    keystore), `config` (paths and first run) and `ipc` (the named-pipe
+      #    transport, which `tests/windows_transport.rs` exercises).
+      #
+      # The full `cargo test --workspace` on windows-latest is not dropped: it
+      # moves to `nightly.yml`, which runs it (plus the licences check against
+      # the Windows graph) once a day when `main` has moved. `cargo test -p
+      # lws-agent` below re-runs the no-network test that the step above already
+      # ran alone — 3 seconds, kept so that the suite and the dedicated check
+      # cannot drift apart.
+      - name: Test (unit tests of every crate)
         if: runner.os == 'Windows'
         env:
           LWS_KEEP_ROOTS: "1"
           TMP: ${{ runner.temp }}\lws-roots
           TEMP: ${{ runner.temp }}\lws-roots
-        run: cargo test --workspace
+        run: cargo test --workspace --lib --bins
 
+      - name: Test (Windows-specific suites)
+        if: runner.os == 'Windows'
+        env:
+          LWS_KEEP_ROOTS: "1"
+          TMP: ${{ runner.temp }}\lws-roots
+          TEMP: ${{ runner.temp }}\lws-roots
+        run: cargo test -p platform-win -p lws-agent -p lws-tray -p identity -p config -p ipc
+
+      # Windows runners have a session; Linux ones need Xvfb (above). The fault
+      # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
+      # matter: it spawns two cores and waits for real transitions. It is also
+      # why the full workspace run is kept on this runner on every push rather
+      # than only in the nightly.
       - name: Test
         if: runner.os == 'Linux'
         env:
