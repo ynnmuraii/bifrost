@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=MultiDeskFlow
+Name=multideskflow
 Comment=Share your keyboard and mouse between computers
 Exec=multideskflow
 Icon=multideskflow

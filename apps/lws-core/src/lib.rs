@@ -114,7 +114,7 @@ impl From<identity::IdentityError> for Failure {
 }
 
 const USAGE: &str = "\
-multideskflow — LAN Workspace (software KVM)
+multideskflow — software KVM
 
 USAGE:
     multideskflow                       open the window (same as `multideskflow gui`)

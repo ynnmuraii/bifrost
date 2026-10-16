@@ -43,8 +43,10 @@ pub mod view_model;
 // re-exported instead of being repeated in `[dev-dependencies]` (where it could drift).
 pub use eframe::egui;
 
-/// The window's title, used by the binary and by the tests.
-pub const TITLE: &str = "LAN Workspace";
+/// The window's title, used by the binary and by the tests: the product name the owner
+/// reads in the title bar and in the taskbar. (The top bar draws the wordmark
+/// `MULTIDESKFLOW`, which is the logo's own style and stays as it is.)
+pub const TITLE: &str = "multideskflow";
 
 /// Opens the window and returns when it is closed. This is the `gui` role of the one
 /// `multideskflow` executable (`apps/multideskflow`); `args` is argv after the program name and
@@ -111,5 +113,15 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
             eprintln!("multideskflow gui: {error}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The owner reads the product name in the title bar and in the taskbar: it is the
+    /// lowercase brand, not «LAN Workspace» and not the `MULTIDESKFLOW` top-bar wordmark.
+    #[test]
+    fn the_window_title_is_the_product_name() {
+        assert_eq!(super::TITLE, "multideskflow");
     }
 }

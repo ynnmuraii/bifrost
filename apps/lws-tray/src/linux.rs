@@ -17,7 +17,7 @@ impl ksni::Tray for Tray {
         "multideskflow".into()
     }
     fn title(&self) -> String {
-        "MultiDeskFlow".into()
+        "multideskflow".into()
     }
     fn activate(&mut self, _: i32, _: i32) {
         let _ = self.commands.send(Action::Open);

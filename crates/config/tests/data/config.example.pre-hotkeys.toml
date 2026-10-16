@@ -1,4 +1,4 @@
-# LAN Workspace — пример config.toml (config_version = 2, см. 03-architecture.md)
+# multideskflow — пример config.toml (config_version = 2, см. 03-architecture.md)
 # Файл пишется атомарно: tmp + fsync + rename; предыдущая версия -> config.toml.bak
 
 config_version = 2

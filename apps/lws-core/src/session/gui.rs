@@ -1098,7 +1098,7 @@ impl Session {
             report.push_str(&text);
             report.push('\n');
         };
-        line("lan-workspace diagnostics".to_owned());
+        line("multideskflow diagnostics".to_owned());
         line(format!("generated_at_unix_ms: {}", identity::now_unix_ms()));
         line(format!(
             "node_id: {}",

@@ -591,7 +591,7 @@ pub enum Key {
     TheTextIsCopied,
     /// «история буфера очищена»
     TheClipboardHistoryIsCleared,
-    /// «Открыть MultiDeskFlow»
+    /// «Открыть multideskflow»
     OpenMultiDeskFlow,
     /// «Передать ввод → {}»
     SendInputTo,
@@ -999,7 +999,7 @@ const fn ru(key: Key) -> &'static str {
         Key::TheClipboardHistoryIsRefreshed => "история буфера обновлена",
         Key::TheTextIsCopied => "текст скопирован",
         Key::TheClipboardHistoryIsCleared => "история буфера очищена",
-        Key::OpenMultiDeskFlow => "Открыть MultiDeskFlow",
+        Key::OpenMultiDeskFlow => "Открыть multideskflow",
         Key::SendInputTo => "Передать ввод → {}",
         Key::Input2 => "Ввод → {}",
         Key::StopTheService2 => "Остановить службу",
@@ -1335,7 +1335,7 @@ const fn en(key: Key) -> &'static str {
         Key::TheClipboardHistoryIsRefreshed => "the clipboard history is refreshed",
         Key::TheTextIsCopied => "the text is copied",
         Key::TheClipboardHistoryIsCleared => "the clipboard history is cleared",
-        Key::OpenMultiDeskFlow => "Open MultiDeskFlow",
+        Key::OpenMultiDeskFlow => "Open multideskflow",
         Key::SendInputTo => "Send input to {}",
         Key::Input2 => "Input → {}",
         Key::StopTheService2 => "Stop the service",
