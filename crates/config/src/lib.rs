@@ -26,7 +26,9 @@
 //! * [`hotkey`] — the `Ctrl+Alt+Shift+F12` parser the hotkey rules need.
 //! * [`migrate`] — the once-per-file rewrite of a pre-`[input.hotkeys]` document,
 //!   driven by the core; the loader itself accepts the legacy keys, so a
-//!   read-only role never writes.
+//!   read-only role never writes. The untouched original is copied to
+//!   `config.toml.pre-hotkeys` before the rewrite, because the core's next
+//!   persistence write replaces the `.bak` that would otherwise hold it.
 //! * [`topology`] — `[topology]` links converted into [`geometry::TransitionLink`]
 //!   with `"self"` / `"peer:<hex>"` node references resolved against a local
 //!   node id.
