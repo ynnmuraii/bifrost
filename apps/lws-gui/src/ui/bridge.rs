@@ -4,17 +4,17 @@ use std::sync::Arc;
 use eframe::egui::{Color32, Galley, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use eframe::epaint::TextShape;
 
-use super::theme::{fam, font, Palette};
+use super::theme::{fam, font, font_epoch, Palette};
 
 const GLYPHS: &str = "|:+#<>^v";
 
 #[derive(Default)]
 pub struct Bridge {
     glyphs: Vec<(char, Arc<Galley>)>,
-    key: (u32, u32),
+    key: (u32, u32, usize),
     clock: f32,
     last: Option<f32>,
-    latency_key: Option<(ui_text::Lang, Option<u32>, u32)>,
+    latency_key: Option<(ui_text::Lang, Option<u32>, u32, usize)>,
     latency: Option<Arc<Galley>>,
 }
 
@@ -32,7 +32,12 @@ impl Bridge {
 
     /// Only a changed Status value, language or pixel scale rebuilds the pill's galley.
     pub fn set_latency(&mut self, painter: &Painter, lang: ui_text::Lang, rtt_us: Option<u32>) {
-        let key = (lang, rtt_us, painter.ctx().pixels_per_point().to_bits());
+        let key = (
+            lang,
+            rtt_us,
+            painter.ctx().pixels_per_point().to_bits(),
+            font_epoch(painter),
+        );
         if self.latency_key == Some(key) {
             return;
         }
@@ -70,7 +75,11 @@ impl Bridge {
         color: Color32,
     ) {
         let size = (9.0 * zoom).clamp(9.0, 12.0);
-        let key = (size.to_bits(), painter.ctx().pixels_per_point().to_bits());
+        let key = (
+            size.to_bits(),
+            painter.ctx().pixels_per_point().to_bits(),
+            font_epoch(painter),
+        );
         if self.key != key || self.glyphs.is_empty() {
             self.key = key;
             self.glyphs.clear();
@@ -168,6 +177,34 @@ fn geometry(a: Pos2, b: Pos2, size: f32, horizontal: bool) -> (Pos2, Vec2, usize
 mod tests {
     use super::*;
     use eframe::egui;
+
+    #[test]
+    fn cached_glyphs_refresh_when_the_font_atlas_is_rebuilt_at_the_same_scale() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let mut bridge = Bridge::default();
+        let mut paint = || {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                bridge.paint(
+                    ui.painter(),
+                    Pos2::ZERO,
+                    egui::pos2(100.0, 0.0),
+                    true,
+                    true,
+                    1.0,
+                    100.0,
+                    Color32::WHITE,
+                );
+            })
+            .drop_without_applying_deltas();
+            bridge.key
+        };
+        let before = paint();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let after = paint();
+        assert_eq!(before.1, after.1);
+        assert_ne!(before.2, after.2);
+    }
 
     #[test]
     fn latency_is_rounded_and_localized_without_inventing_transport() {
