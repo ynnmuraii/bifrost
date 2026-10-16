@@ -11,9 +11,9 @@
 //! is [`BASE_SCALE`] shrunk until every computer fits the stage ([`arrange`]).
 //! The UI converts its screen-pixel magnet threshold into stage units.
 //!
-//! Links created by the map are exact overlaps of touching display edges, not
-//! bounding boxes or whole-desktop silhouette anchors. Legacy documents still
-//! determine their initial placement.
+//! Links join visible, facing display edges across at most [`LINK_MAX_GAP`] stage units.
+//! Each display pair retains its own overlap segment, rather than a desktop bounding box.
+//! Legacy documents still determine their initial placement.
 
 use crate::view_model::Side;
 
@@ -25,9 +25,9 @@ pub const STAGE_H: f64 = 270.0;
 pub const GAP: f64 = 72.0;
 /// How near (stage units) an edge has to be before the drag snaps onto it.
 pub const SNAP: f64 = 12.0;
-/// Floating-point tolerance for touching edges.
-pub const LINK_MAX_GAP: f64 = 1e-6;
-/// Positive overlap required for a contact.
+/// Maximum empty space between facing display edges.
+pub const LINK_MAX_GAP: f64 = 288.0;
+/// Floating-point tolerance for touching edges and positive projection overlap.
 pub const MIN_OVERLAP: f64 = 1e-6;
 /// Stage units per logical unit before shrinking (1920 logical → 144).
 pub const BASE_SCALE: f64 = 0.075;
@@ -359,7 +359,7 @@ pub fn snap_with_threshold(
     landed
 }
 
-/// Every real display-edge contact; touching two monitors produces two links.
+/// Every visible facing display-edge segment, including touching edges.
 pub fn links(shapes: &[Shape], pos: &[Pt]) -> Vec<GeoLink> {
     let mut out = Vec::new();
     for i in 0..shapes.len().min(pos.len()) {
@@ -388,25 +388,91 @@ pub fn links(shapes: &[Shape], pos: &[Pt]) -> Vec<GeoLink> {
                                 ay + ar.h,
                             ),
                         ] {
-                            if gap.abs() > LINK_MAX_GAP || end - start <= MIN_OVERLAP {
+                            if gap < -MIN_OVERLAP
+                                || gap > LINK_MAX_GAP + MIN_OVERLAP
+                                || end - start <= MIN_OVERLAP
+                            {
                                 continue;
                             }
-                            let mid = (start + end) / 2.0;
-                            let (from, to) = match dir {
-                                Dir::Horizontal => (Pt::new(edge, mid), Pt::new(bx, mid)),
-                                Dir::Vertical => (Pt::new(mid, edge), Pt::new(mid, by)),
-                            };
-                            out.push(GeoLink {
-                                a,
-                                b,
-                                a_display: am,
-                                b_display: bm,
-                                dir,
-                                gap,
-                                from,
-                                to,
-                                span: (start, end),
-                            });
+                            let mut visible = vec![(start, end)];
+                            for (node, (shape, at)) in shapes.iter().zip(pos).enumerate() {
+                                for (display, rect) in shape.mons.iter().enumerate() {
+                                    if (node == a && display == am)
+                                        || (node == b && display == bm)
+                                    {
+                                        continue;
+                                    }
+                                    let (near, far, lo, hi) = match dir {
+                                        Dir::Horizontal => (
+                                            at.x + rect.x,
+                                            at.x + rect.x + rect.w,
+                                            at.y + rect.y,
+                                            at.y + rect.y + rect.h,
+                                        ),
+                                        Dir::Vertical => (
+                                            at.y + rect.y,
+                                            at.y + rect.y + rect.h,
+                                            at.x + rect.x,
+                                            at.x + rect.x + rect.w,
+                                        ),
+                                    };
+                                    // Include bodies crossing either endpoint edge, but not
+                                    // displays merely touching the outside of the corridor.
+                                    let target = edge + gap.max(0.0);
+                                    if far <= edge + MIN_OVERLAP
+                                        || near >= target - MIN_OVERLAP
+                                            && (gap > MIN_OVERLAP || near > edge + MIN_OVERLAP)
+                                    {
+                                        continue;
+                                    }
+                                    let mut segment = 0;
+                                    while segment < visible.len() {
+                                        let (lo_visible, hi_visible) = visible[segment];
+                                        if hi <= lo_visible || lo >= hi_visible {
+                                            segment += 1;
+                                            continue;
+                                        }
+                                        let keep_start = lo - lo_visible > MIN_OVERLAP;
+                                        let keep_end = hi_visible - hi > MIN_OVERLAP;
+                                        match (keep_start, keep_end) {
+                                            (true, true) => {
+                                                visible[segment] = (lo_visible, lo);
+                                                visible.insert(segment + 1, (hi, hi_visible));
+                                                segment += 2;
+                                            }
+                                            (true, false) => {
+                                                visible[segment] = (lo_visible, lo);
+                                                segment += 1;
+                                            }
+                                            (false, true) => {
+                                                visible[segment] = (hi, hi_visible);
+                                                segment += 1;
+                                            }
+                                            (false, false) => {
+                                                visible.remove(segment);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for (start, end) in visible {
+                                let mid = (start + end) / 2.0;
+                                let (from, to) = match dir {
+                                    Dir::Horizontal => (Pt::new(edge, mid), Pt::new(bx, mid)),
+                                    Dir::Vertical => (Pt::new(mid, edge), Pt::new(mid, by)),
+                                };
+                                out.push(GeoLink {
+                                    a,
+                                    b,
+                                    a_display: am,
+                                    b_display: bm,
+                                    dir,
+                                    gap: gap.max(0.0),
+                                    from,
+                                    to,
+                                    span: (start, end),
+                                });
+                            }
                         }
                     }
                 }
@@ -414,6 +480,35 @@ pub fn links(shapes: &[Shape], pos: &[Pt]) -> Vec<GeoLink> {
         }
     }
     out
+}
+
+/// Clamp an absolute tangent interval to an available edge, with a 12-unit minimum.
+pub fn clamp_paddle(start: f64, end: f64, edge_start: f64, edge_end: f64) -> (f64, f64) {
+    let available = (edge_end - edge_start).max(0.0);
+    let length = (end - start).max(available.min(12.0)).min(available);
+    let start = start.clamp(edge_start, edge_end.max(edge_start) - length);
+    (start, start + length)
+}
+
+/// Translate a paddle without changing its length unless the available edge is shorter.
+pub fn move_paddle(span: (f64, f64), delta: f64, bounds: (f64, f64)) -> (f64, f64) {
+    clamp_paddle(span.0 + delta, span.1 + delta, bounds.0, bounds.1)
+}
+
+/// Resize one endpoint while keeping the opposite endpoint fixed inside the edge.
+pub fn resize_paddle(
+    span: (f64, f64),
+    start_end: bool,
+    value: f64,
+    bounds: (f64, f64),
+) -> (f64, f64) {
+    let span = clamp_paddle(span.0, span.1, bounds.0, bounds.1);
+    let minimum = (bounds.1 - bounds.0).clamp(0.0, 12.0);
+    if start_end {
+        (value.clamp(bounds.0, span.1 - minimum), span.1)
+    } else {
+        (span.0, value.clamp(span.0 + minimum, bounds.1))
+    }
 }
 
 #[cfg(test)]
@@ -474,13 +569,13 @@ mod tests {
     }
 
     #[test]
-    fn free_placement_is_not_clamped_or_linked() {
+    fn free_placement_is_not_clamped_and_gap_links_do_not_snap() {
         let shapes = [boxed(144.0, 90.0), boxed(100.0, 80.0)];
         let pos = [Pt::default(), Pt::default()];
         let landed = snap(&shapes, &pos, 1, -5000.5, 9000.25);
         assert_eq!(landed, Pt::new(-5000.5, 9000.25));
         assert!(links(&shapes, &[pos[0], landed]).is_empty());
-        assert!(links(&shapes, &[pos[0], Pt::new(150.0, 0.0)]).is_empty());
+        assert_eq!(links(&shapes, &[pos[0], Pt::new(150.0, 0.0)]).len(), 1);
     }
 
     #[test]
@@ -596,5 +691,127 @@ mod tests {
             assert!((pos[1].y - pos[0].y - 40.125 * scale / BASE_SCALE).abs() < 1e-9);
             assert_eq!(links(&shapes, &pos).len(), 1);
         }
+    }
+
+    #[test]
+    fn facing_edges_accept_gaps_and_touching_in_both_axes() {
+        let shapes = [boxed(100.0, 80.0), boxed(60.0, 40.0)];
+        for gap in [0.0, 25.0, LINK_MAX_GAP] {
+            for (position, dir, span) in [
+                (Pt::new(100.0 + gap, 20.0), Dir::Horizontal, (20.0, 60.0)),
+                (Pt::new(20.0, 80.0 + gap), Dir::Vertical, (20.0, 80.0)),
+            ] {
+                let found = links(&shapes, &[Pt::default(), position]);
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].dir, dir);
+                assert_eq!(found[0].gap, gap);
+                assert_eq!(found[0].span, span);
+            }
+        }
+        for position in [
+            Pt::new(99.0, 20.0),
+            Pt::new(100.0 + LINK_MAX_GAP + 0.01, 20.0),
+            Pt::new(120.0, 80.0),
+            Pt::new(20.0, 79.0),
+            Pt::new(20.0, 80.0 + LINK_MAX_GAP + 0.01),
+            Pt::new(100.0, 100.0),
+        ] {
+            assert!(links(&shapes, &[Pt::default(), position]).is_empty());
+        }
+    }
+
+    #[test]
+    fn gap_links_keep_each_displays_default_projection_overlap() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 0.0, 100.0, 80.0),
+                Rect::new(0.0, 80.0, 100.0, 120.0),
+            ],
+            w: 100.0,
+            h: 200.0,
+        };
+        let found = links(
+            &[desktop, boxed(100.0, 120.0)],
+            &[Pt::default(), Pt::new(160.0, 40.0)],
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].a_display, found[0].span), (0, (40.0, 80.0)));
+        assert_eq!((found[1].a_display, found[1].span), (1, (80.0, 160.0)));
+    }
+
+    #[test]
+    fn portrait_occludes_the_landscape_edge_across_a_gap() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 20.0, 192.0, 108.0),
+                Rect::new(192.0, 0.0, 108.0, 192.0),
+            ],
+            w: 300.0,
+            h: 192.0,
+        };
+        let found = links(
+            &[desktop, boxed(120.0, 160.0)],
+            &[Pt::default(), Pt::new(350.0, 10.0)],
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].a_display, 1);
+        assert_eq!(found[0].span, (10.0, 170.0));
+    }
+
+    #[test]
+    fn intervening_computers_clip_occluded_projection() {
+        let shapes = [boxed(100.0, 100.0), boxed(100.0, 100.0), boxed(20.0, 40.0)];
+        let found = links(
+            &shapes,
+            &[Pt::default(), Pt::new(200.0, 0.0), Pt::new(140.0, 30.0)],
+        );
+        let outer: Vec<_> = found.iter().filter(|link| link.a == 0 && link.b == 1).collect();
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[0].span, (0.0, 30.0));
+        assert_eq!(outer[1].span, (70.0, 100.0));
+    }
+
+    #[test]
+    fn closer_lower_display_occludes_an_upper_displays_bottom_edge() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 0.0, 100.0, 80.0),
+                Rect::new(0.0, 80.0, 100.0, 40.0),
+            ],
+            w: 100.0,
+            h: 120.0,
+        };
+        let found = links(
+            &[desktop, boxed(80.0, 50.0)],
+            &[Pt::default(), Pt::new(10.0, 150.0)],
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].dir, Dir::Vertical);
+        assert_eq!(found[0].a_display, 1);
+        assert_eq!(found[0].span, (10.0, 90.0));
+    }
+
+    #[test]
+    fn zero_snap_threshold_preserves_free_node_movement() {
+        let shapes = [boxed(100.0, 80.0), boxed(60.0, 40.0)];
+        assert_eq!(
+            snap_with_threshold(&shapes, &[Pt::default(); 2], 1, 103.0, 21.5, 0.0),
+            Pt::new(103.0, 21.5)
+        );
+    }
+
+    #[test]
+    fn paddles_clamp_translate_and_resize_with_a_short_edge_minimum() {
+        assert_eq!(clamp_paddle(-10.0, 10.0, 0.0, 100.0), (0.0, 20.0));
+        assert_eq!(clamp_paddle(95.0, 99.0, 0.0, 100.0), (88.0, 100.0));
+        assert_eq!(clamp_paddle(3.0, 4.0, 2.0, 9.0), (2.0, 9.0));
+        assert_eq!(move_paddle((20.0, 50.0), 100.0, (0.0, 100.0)), (70.0, 100.0));
+        assert_eq!(move_paddle((20.0, 50.0), -100.0, (0.0, 100.0)), (0.0, 30.0));
+        assert_eq!(move_paddle((20.0, 50.0), 0.0, (4.0, 10.0)), (4.0, 10.0));
+        assert_eq!(resize_paddle((20.0, 50.0), true, 49.0, (0.0, 100.0)), (38.0, 50.0));
+        assert_eq!(resize_paddle((20.0, 50.0), false, 21.0, (0.0, 100.0)), (20.0, 32.0));
+        assert_eq!(resize_paddle((20.0, 50.0), false, 120.0, (0.0, 100.0)), (20.0, 100.0));
+        assert_eq!(resize_paddle((2.0, 9.0), true, 8.0, (2.0, 9.0)), (2.0, 9.0));
+        assert_eq!(clamp_paddle(2.0, 4.0, 5.0, 5.0), (5.0, 5.0));
     }
 }

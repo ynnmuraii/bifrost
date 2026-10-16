@@ -282,6 +282,32 @@ fn unequal_segments_map_proportionally_and_clamp_at_both_ends() {
 }
 
 #[test]
+fn unequal_independent_segments_resolve_proportionally_in_both_directions() {
+    let topology = fixture(true);
+    for (owner, position, motion, direction, expected) in [
+        (
+            node(1),
+            Position::new("a", 1199.0, 340.0),
+            Point::new(2.0, 0.0),
+            LinkDirection::Forward,
+            Position::new("b", 2.0, 220.0),
+        ),
+        (
+            node(2),
+            Position::new("b", 1.0, 220.0),
+            Point::new(-2.0, 0.0),
+            LinkDirection::Reverse,
+            Position::new("a", 1198.0, 340.0),
+        ),
+    ] {
+        let transition = resolve_motion(&topology, &owner, &position, motion).unwrap();
+        assert_eq!(transition.direction, direction);
+        assert_eq!(transition.t, 0.25);
+        assert_eq!(transition.target_position, expected);
+    }
+}
+
+#[test]
 fn mapping_enters_two_logical_units_inside_each_target_edge() {
     let topology = fixture(true);
     let mut link = topology.links[0].clone();
