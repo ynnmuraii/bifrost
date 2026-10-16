@@ -62,6 +62,12 @@ pub struct Palette {
     pub on_accent: Color32,
     /// The green of `.dot.ok`.
     pub ok: Color32,
+    /// `--shadow`: the drop shadow of a card that is standing still.
+    pub shadow: Color32,
+    /// `--shadow`: the deeper one a card takes while it is being dragged.
+    pub shadow_drag: Color32,
+    /// `--shadow-lg`: the shadow under a dialog, which sits above the page as well as the map.
+    pub shadow_dialog: Color32,
 }
 
 /// `--r`: the radius of a card or a dialog. One style for both themes — the themes change
@@ -76,24 +82,30 @@ impl Palette {
     /// The tokens of `theme`.
     pub fn of(theme: Theme) -> Self {
         match theme {
+            // The Swiss light theme: paper, near-black ink, hairlines, and one accent — the
+            // dark theme's orange. No colour of it is blue-dominant; the tests below hold it
+            // to that, and to the contrast of its ink on the paper and the surface.
             Theme::Light => {
-                let bg = rgb(0xFBFCFE);
+                let bg = rgb(0xFAFAF8);
                 Palette {
                     theme,
                     bg,
-                    bg2: rgb(0xF1F4F9),
+                    bg2: rgb(0xF1F0EB),
                     card: over(bg, 255, 255, 255, 0.86),
                     card_glass: rgba(255, 255, 255, 0.86),
-                    ink: rgb(0x111827),
-                    ink2: rgb(0x5B6475),
-                    hair: rgba(15, 23, 42, 0.09),
-                    line: rgba(15, 23, 42, 0.2),
-                    scrim: rgba(241, 244, 249, 0.66),
-                    accent: rgb(0x2563EB),
-                    accent_soft: rgba(37, 99, 235, 0.10),
-                    glow: rgba(37, 99, 235, 0.22),
-                    on_accent: rgb(0xFFFFFF),
-                    ok: rgb(0x10B981),
+                    ink: rgb(0x111111),
+                    ink2: rgb(0x5B5A55),
+                    hair: rgba(17, 17, 14, 0.11),
+                    line: rgba(17, 17, 14, 0.26),
+                    scrim: rgba(250, 250, 248, 0.66),
+                    accent: rgb(0xFF5A2E),
+                    accent_soft: rgba(255, 90, 46, 0.12),
+                    glow: rgba(255, 90, 46, 0.2),
+                    on_accent: rgb(0x111111),
+                    ok: rgb(0x0E7A56),
+                    shadow: rgba(17, 17, 17, 0.07),
+                    shadow_drag: rgba(17, 17, 17, 0.16),
+                    shadow_dialog: rgba(17, 17, 17, 0.16),
                 }
             }
             Theme::Dark => {
@@ -114,6 +126,11 @@ impl Palette {
                     glow: rgba(255, 90, 46, 0.28),
                     on_accent: rgb(0x0B0B0A),
                     ok: rgb(0x10B981),
+                    // The dark background swallows a shadow, so the dark theme casts the same
+                    // black four times as dark as the light theme casts its near-black.
+                    shadow: rgba(0, 0, 0, 0.28),
+                    shadow_drag: rgba(0, 0, 0, 0.64),
+                    shadow_dialog: rgba(0, 0, 0, 0.65),
                 }
             }
         }
@@ -258,6 +275,11 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     visuals.window_fill = pal.bg;
     visuals.extreme_bg_color = pal.bg;
     visuals.faint_bg_color = pal.bg2;
+    if pal.theme == Theme::Light {
+        // egui's own light caret is a dark blue — the one blue the widget palette would leave
+        // in a Swiss window. The dark theme's own caret is left as the design had it.
+        visuals.text_cursor.stroke = Stroke::new(2.0, pal.ink);
+    }
     visuals.window_stroke = Stroke::new(1.0, pal.line);
     visuals.selection.bg_fill = pal.accent_soft;
     visuals.selection.stroke = Stroke::new(1.0, pal.accent);
@@ -319,15 +341,102 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
 mod tests {
     use super::*;
 
+    impl Palette {
+        /// Every colour of the theme. The rules of a palette are checked over the whole list,
+        /// so a colour added later is checked by them without anyone remembering to.
+        fn colors(&self) -> Vec<Color32> {
+            vec![
+                self.bg,
+                self.bg2,
+                self.card,
+                self.card_glass,
+                self.ink,
+                self.ink2,
+                self.hair,
+                self.line,
+                self.scrim,
+                self.accent,
+                self.accent_soft,
+                self.glow,
+                self.on_accent,
+                self.ok,
+                self.shadow,
+                self.shadow_drag,
+                self.shadow_dialog,
+            ]
+        }
+    }
+
+    /// The relative luminance of `c` as WCAG 2 defines it: sRGB channels linearised, then
+    /// weighted.
+    fn luminance(c: Color32) -> f32 {
+        let channel = |v: u8| {
+            let s = f32::from(v) / 255.0;
+            if s <= 0.039_28 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+
+    /// The WCAG 2 contrast ratio of two opaque colours, from 1.0 to 21.0.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
     #[test]
     fn the_tokens_are_the_ones_of_mdf_css() {
         let light = Palette::of(Theme::Light);
-        assert_eq!(light.bg, Color32::from_rgb(0xFB, 0xFC, 0xFE));
-        assert_eq!(light.accent, Color32::from_rgb(0x25, 0x63, 0xEB));
+        assert_eq!(light.bg, Color32::from_rgb(0xFA, 0xFA, 0xF8));
+        assert_eq!(light.bg2, Color32::from_rgb(0xF1, 0xF0, 0xEB));
+        assert_eq!(light.ink, Color32::from_rgb(0x11, 0x11, 0x11));
+        assert_eq!(light.ink2, Color32::from_rgb(0x5B, 0x5A, 0x55));
         let dark = Palette::of(Theme::Dark);
         assert_eq!(dark.bg, Color32::from_rgb(0x0B, 0x0B, 0x0A));
         assert_eq!(dark.accent, Color32::from_rgb(0xFF, 0x5A, 0x2E));
         assert_eq!(dark.ink, Color32::from_rgb(0xEE, 0xEC, 0xE4));
+    }
+
+    #[test]
+    fn the_light_ink_is_legible_on_the_paper_and_the_surface() {
+        let light = Palette::of(Theme::Light);
+        // Body text and the dim ink, on the page and on a card laid over it: WCAG AA.
+        for (name, ink) in [("ink", light.ink), ("ink2", light.ink2)] {
+            for (under, surface) in [("bg", light.bg), ("card", light.card)] {
+                let ratio = contrast(ink, surface);
+                assert!(
+                    ratio >= 4.5,
+                    "the light theme's {name} on {under} is {ratio:.2}:1, under WCAG AA's 4.5:1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_colour_of_the_light_theme_is_blue() {
+        let light = Palette::of(Theme::Light);
+        for c in light.colors() {
+            let (r, g, b) = (i32::from(c.r()), i32::from(c.g()), i32::from(c.b()));
+            assert!(
+                !(b > r + 20 && b > g + 20),
+                "{} of the light theme is blue-dominant",
+                c.to_hex()
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_themes_share_one_accent() {
+        let (light, dark) = (Palette::of(Theme::Light), Palette::of(Theme::Dark));
+        assert_eq!(light.accent, dark.accent);
+        // The accent is legible as the ink of a filled button in either theme: the light
+        // theme puts the ink on it, the dark theme its near-black.
+        assert!(contrast(light.on_accent, light.accent) >= 4.5);
+        assert!(contrast(dark.on_accent, dark.accent) >= 4.5);
     }
 
     #[test]

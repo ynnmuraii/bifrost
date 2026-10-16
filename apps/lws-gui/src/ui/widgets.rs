@@ -572,7 +572,9 @@ pub enum Dot {
 pub fn paint_dot(painter: &egui::Painter, pal: &Palette, c: Pos2, dot: Dot) {
     match dot {
         Dot::Ok => {
-            painter.circle_filled(c, 6.5, super::theme::rgba(16, 185, 129, 0.22));
+            // The halo is the same green as the dot, so the light theme's darker one carries.
+            let halo = super::theme::rgba(pal.ok.r(), pal.ok.g(), pal.ok.b(), 0.22);
+            painter.circle_filled(c, 6.5, halo);
             painter.circle_filled(c, 3.5, pal.ok);
         }
         Dot::Off => {
