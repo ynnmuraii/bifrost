@@ -53,6 +53,7 @@ fn active_field_and_ascii_links_allocate_nothing_after_warmup() {
         };
         let pal = Palette::of(theme);
         let mut field = Field::new();
+        let mut bridge = ui::AsciiBridge::default();
         for n in 0..180 {
             let t = n as f32 / 30.0;
             let output = ctx.run_ui(
@@ -73,7 +74,6 @@ fn active_field_and_ascii_links_allocate_nothing_after_warmup() {
                         simulate: true,
                         t,
                         pointer,
-                        flows: &[],
                     };
                     if n >= 60 {
                         COUNT.set(Some(0));
@@ -85,6 +85,19 @@ fn active_field_and_ascii_links_allocate_nothing_after_warmup() {
                         egui::pos2(900.0, 200.0),
                         egui::Color32::WHITE,
                     );
+                    bridge.tick(t, true);
+                    bridge.set_latency(ui.painter(), ui_text::Lang::Ru, Some(1_500));
+                    bridge.paint(
+                        ui.painter(),
+                        egui::pos2(100.0, 200.0),
+                        egui::pos2(900.0, 200.0),
+                        true,
+                        true,
+                        1.5,
+                        120.0,
+                        pal.accent,
+                    );
+                    bridge.paint_latency(ui.painter(), egui::pos2(500.0, 200.0), &pal);
                     let allocations = COUNT.replace(None);
                     if let Some(allocations) = allocations {
                         assert_eq!(allocations, 0, "theme={theme:?}, frame={n}");

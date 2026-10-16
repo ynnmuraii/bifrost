@@ -271,6 +271,10 @@ pub enum Key {
     LastMessage,
     /// «Задержка: {} мс»
     DelayMs,
+    /// «≈ {} мс»
+    ApproxLatencyMs,
+    /// «<1 мс»
+    SubMillisecondLatency,
     /// «не удалось открыть файл настроек ({})»
     CouldNotOpenTheSettingsFile,
     /// «адрес не выбран — выберите адрес в списке и нажмите «Применить» снова»
@@ -835,6 +839,8 @@ const fn ru(key: Key) -> &'static str {
         Key::WaylandInputCanOnlyBeCapturedThroughDesktopPortals => "Wayland: перехват ввода возможен только через порталы рабочего стола",
         Key::LastMessage => "Последнее сообщение: {}",
         Key::DelayMs => "Задержка: {} мс",
+        Key::ApproxLatencyMs => "≈ {} мс",
+        Key::SubMillisecondLatency => "<1 мс",
         Key::CouldNotOpenTheSettingsFile => "не удалось открыть файл настроек ({})",
         Key::NoAddressIsSelectedPickOneInTheListAndPressApplyAgain => "адрес не выбран — выберите адрес в списке и нажмите «Применить» снова",
         Key::TheSettingsDirectoriesAreUnknownRestartTheWindowWithoutSpecialFlags => "каталоги настроек не определены — перезапустите окно без особых параметров",
@@ -1167,6 +1173,8 @@ const fn en(key: Key) -> &'static str {
         Key::WaylandInputCanOnlyBeCapturedThroughDesktopPortals => "Wayland: input can only be captured through desktop portals",
         Key::LastMessage => "Last message: {}",
         Key::DelayMs => "Delay: {} ms",
+        Key::ApproxLatencyMs => "≈ {} ms",
+        Key::SubMillisecondLatency => "<1 ms",
         Key::CouldNotOpenTheSettingsFile => "could not open the settings file ({})",
         Key::NoAddressIsSelectedPickOneInTheListAndPressApplyAgain => "no address is selected — pick one in the list and press «Apply» again",
         Key::TheSettingsDirectoriesAreUnknownRestartTheWindowWithoutSpecialFlags => "the settings directories are unknown — restart the window without special flags",
@@ -1605,7 +1613,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 326] = [
+    pub const EVERY: [Key; 328] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1707,6 +1715,8 @@ mod tests {
         Key::WaylandInputCanOnlyBeCapturedThroughDesktopPortals,
         Key::LastMessage,
         Key::DelayMs,
+        Key::ApproxLatencyMs,
+        Key::SubMillisecondLatency,
         Key::CouldNotOpenTheSettingsFile,
         Key::NoAddressIsSelectedPickOneInTheListAndPressApplyAgain,
         Key::TheSettingsDirectoriesAreUnknownRestartTheWindowWithoutSpecialFlags,

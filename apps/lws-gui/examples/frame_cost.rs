@@ -117,8 +117,14 @@ fn main() -> Result<(), String> {
     let mut due = Duration::ZERO;
     let mut total = 0u64;
     let mut idle_frames = 0;
-    // `hold` is the round-3 promise: a pointer that stops over the map keeps the particles it
-    // has attracted or repelled, and the window stops asking for frames once they have settled.
+    // A bridge keeps flowing under a stationary pointer; the background alone may settle.
+    let has_bridges = vm.map_model().links.iter().any(|link| {
+        matches!(
+            link.state,
+            lws_gui::view_model::layout::LinkState::Idle
+                | lws_gui::view_model::layout::LinkState::Active
+        )
+    });
     for (label, start, end, drive) in [
         ("warmup", 0, 3, Drive::Moves),
         ("active", 3, 8, Drive::Moves),
@@ -205,10 +211,17 @@ fn main() -> Result<(), String> {
             idle_frames = frames;
         }
         if label == "hold" {
-            assert!(
-                frames < 100,
-                "a held pointer must settle instead of animating for the whole phase: {frames}"
-            );
+            if has_bridges {
+                assert!(
+                    frames <= 155,
+                    "bridge animation exceeds 30 fps plus transition frames: {frames}"
+                );
+            } else {
+                assert!(
+                    frames < 100,
+                    "a field without bridges must settle: {frames}"
+                );
+            }
         }
         if label == "idle" {
             // Leaving freezes the last active frame; after the pointer event itself the
@@ -243,6 +256,7 @@ fn direct_field() {
     let look = Look::default();
     let pal = Palette::of(look.theme);
     let mut field = Field::new();
+    let mut bridge = ui::AsciiBridge::default();
     let mut allocations = 0;
     let mut cpu = Duration::ZERO;
     for n in 0..660 {
@@ -255,11 +269,23 @@ fn direct_field() {
                 simulate: true,
                 t: t.as_secs_f32(),
                 pointer: Some(egui::pos2(300.0 + (n % 400) as f32, 250.0)),
-                flows: &[],
             };
             let before = ALLOCS.load(Ordering::Relaxed);
             let began = Instant::now();
             field.paint(ui.painter(), &frame);
+            bridge.tick(t.as_secs_f32(), true);
+            bridge.set_latency(ui.painter(), ui_text::Lang::Ru, Some(1_500));
+            bridge.paint(
+                ui.painter(),
+                egui::pos2(100.0, 200.0),
+                egui::pos2(900.0, 200.0),
+                true,
+                true,
+                1.5,
+                120.0,
+                pal.accent,
+            );
+            bridge.paint_latency(ui.painter(), egui::pos2(500.0, 200.0), &pal);
             if n >= 60 {
                 cpu += began.elapsed();
                 allocations += ALLOCS.load(Ordering::Relaxed) - before;
@@ -268,6 +294,6 @@ fn direct_field() {
         // Keep egui's reused shape buffers, but exclude its work from the direct check.
         output.drop_without_applying_deltas();
     }
-    println!("direct Field::paint: frames=600 cpu_us/frame={:.2} allocs={allocations} allocs/frame={:.3} particles={} cloud_cells={} (excludes egui run/tessellation)",
+    println!("direct Field::paint + ASCII bridge: frames=600 cpu_us/frame={:.2} allocs={allocations} allocs/frame={:.3} particles={} cloud_cells={} (excludes egui run/tessellation)",
         cpu.as_secs_f64() * 1e6 / 600.0, allocations as f64 / 600.0, field.particles(), field.cloud_cells());
 }
