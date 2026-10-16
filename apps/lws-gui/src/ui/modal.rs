@@ -921,7 +921,6 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 
 fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
-    widgets::hint(ui, pal, concat!("Bifrost ", env!("CARGO_PKG_VERSION")));
     // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
     // the change is instant, because every string is drawn from the catalogue each frame.
     row(ui, pal, text(lang, Key::Language), false, |ui| {
@@ -968,59 +967,52 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             text(lang, Key::AfterApplyTheServiceRestartsOnTheNewAddress),
         );
     });
-    row(
-        ui,
-        pal,
-        text(lang, Key::Service),
-        !vm.uses_portals(),
-        |ui| {
-            let busy =
-                vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
-            widgets::duo(ui, |ui| {
-                act(
-                    ui,
-                    pal,
-                    text(lang, Key::Restart),
-                    Kind::Plain,
-                    !busy,
-                    actions,
-                    || Action::RestartCore,
-                );
-                act(
-                    ui,
-                    pal,
-                    text(lang, Key::Stop),
-                    Kind::Plain,
-                    vm.connection.is_connected() && !busy,
-                    actions,
-                    || Action::StopCore,
-                );
-            });
-            if let Some(line) = &vm.settings.service.line {
-                widgets::wrapped(ui, &line.line(lang), 13.0, fam::sans(), pal.ink);
-            }
-            if vm.settings.first_run {
-                widgets::hint(
-                    ui,
-                    pal,
-                    text(lang, Key::TheSettingsWereCreatedAutomaticallyConfigToml2),
-                );
-                act(
-                    ui,
-                    pal,
-                    text(lang, Key::Understood),
-                    Kind::Plain,
-                    true,
-                    actions,
-                    || Action::DismissFirstRun,
-                );
-            }
-        },
-    );
+    row(ui, pal, text(lang, Key::Service), false, |ui| {
+        let busy = vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
+        widgets::duo(ui, |ui| {
+            act(
+                ui,
+                pal,
+                text(lang, Key::Restart),
+                Kind::Plain,
+                !busy,
+                actions,
+                || Action::RestartCore,
+            );
+            act(
+                ui,
+                pal,
+                text(lang, Key::Stop),
+                Kind::Plain,
+                vm.connection.is_connected() && !busy,
+                actions,
+                || Action::StopCore,
+            );
+        });
+        if let Some(line) = &vm.settings.service.line {
+            widgets::wrapped(ui, &line.line(lang), 13.0, fam::sans(), pal.ink);
+        }
+        if vm.settings.first_run {
+            widgets::hint(
+                ui,
+                pal,
+                text(lang, Key::TheSettingsWereCreatedAutomaticallyConfigToml2),
+            );
+            act(
+                ui,
+                pal,
+                text(lang, Key::Understood),
+                Kind::Plain,
+                true,
+                actions,
+                || Action::DismissFirstRun,
+            );
+        }
+    });
     // Portals are a Wayland desktop's, and only a Wayland desktop's: a window on Windows or
     // X11 has nothing to forget and does not show the row at all.
     if vm.uses_portals() {
-        row(ui, pal, text(lang, Key::Portals), true, |ui| {
+        row(ui, pal, text(lang, Key::Portals), false, |ui| {
             act(
                 ui,
                 pal,
@@ -1033,6 +1025,15 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::hint(ui, pal, text(lang, Key::TheServiceWillAskForTheGrantsAgain));
         });
     }
+    row(ui, pal, text(lang, Key::Version), true, |ui| {
+        widgets::text(
+            ui,
+            concat!("Bifrost ", env!("CARGO_PKG_VERSION")),
+            13.0,
+            fam::sans(),
+            pal.ink2,
+        );
+    });
 }
 
 #[cfg(test)]

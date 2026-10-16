@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed the settings version display: it now sits in a padded, localized bottom row instead of overlapping the modal frame.
+
 ## 0.1.0 — 2026-10-16
 
 First release of **Bifrost**, a software KVM for sharing a keyboard, mouse and clipboard between trusted computers on a local network.
