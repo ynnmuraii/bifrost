@@ -1175,7 +1175,8 @@ mod tests {
                 vm.editor.placement[1] = Pt::new(at.x, at.y + vm.editor.shapes[0].h + 40.0);
             }
             let mut docs = vm.editor_links();
-            std::mem::swap(&mut docs[0].from, &mut docs[0].to);
+            let doc = &mut docs[0];
+            std::mem::swap(&mut doc.from, &mut doc.to);
             docs[0].id = "reversed".into();
             vm.editor.paddles = Some(docs.clone());
             let link = vm.map_model().links.remove(0);
