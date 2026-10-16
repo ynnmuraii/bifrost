@@ -45,6 +45,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         fx.step(FRAME_S * 2.0);
         shot(&output, name, "entered", &fx)?;
     }
+    // The owner's report: only part of the display's left edge is linked. The glow used to
+    // run right up to the end of the linked part and stop there square, at full brightness,
+    // because the strip window is cut exactly to it. Two cases: the linked part ending near
+    // the bottom corner with the pointer's projection 40 px above it (the reported one), and
+    // a shorter segment entered at its middle, where both ends have to round off.
+    for (name, target) in [
+        (
+            "partial-corner",
+            Target {
+                edge: Edge::Left,
+                start: 120.0,
+                end: 480.0,
+                along: 440.0,
+            },
+        ),
+        (
+            "short-middle",
+            Target {
+                edge: Edge::Left,
+                start: 300.0,
+                end: 545.0,
+                along: 422.0,
+            },
+        ),
+    ] {
+        taper_pair(&output, name, target)?;
+    }
     println!("CPU method: process kernel+user time / monotonic wall time; 100% = one core.\n3 seconds/scenario, 30 Hz deadlines; shared step+draw, preallocated strip buffer; no compositor/IPC/GPU cost.");
     println!("CPU counters may be quantized: a zero sample is below counter resolution, not proof of zero cost. frame-work is monotonic elapsed update+step+draw time, not CPU time.");
     for mode in ["idle", "active", "ping-pong"] {
@@ -63,6 +90,47 @@ fn shot(output: &str, edge: &str, phase: &str, fx: &Effect) -> Result<(), Box<dy
     println!(
         "{} ({w}x{h}; premultiplied pixels composited over #181818)",
         path.display()
+    );
+    Ok(())
+}
+
+/// The approach and the entry bloom of one `target`, both shot.
+fn taper_pair(output: &str, name: &str, target: Target) -> Result<(), Box<dyn Error>> {
+    let mut fx = Effect::new();
+    for _ in 0..18 {
+        fx.update(Update::Proximity {
+            target,
+            distance: 24.0,
+        });
+        fx.step(FRAME_S);
+    }
+    taper_shot(output, &format!("{name}-approach"), &fx)?;
+    fx.update(Update::Entered(target));
+    fx.step(FRAME_S * 2.0);
+    taper_shot(output, &format!("{name}-entered"), &fx)
+}
+
+/// A screenshot of a strip whose linked segment is only part of its edge: both ends of the
+/// strip must be dark (the glow rounded off where the link ends), with the glow still bright
+/// just inside them. The pixels are the same premultiplied raster the windows get.
+fn taper_shot(output: &str, name: &str, fx: &Effect) -> Result<(), Box<dyn Error>> {
+    let strip = fx.strip().expect("active screenshot");
+    let (w, h) = strip.size_px(1.5);
+    let mut pixels = vec![0; (w * h) as usize];
+    fx.draw(&mut Canvas::new(&mut pixels, w as usize, h as usize), 1.5);
+    // A left edge: the edge itself is the first column, `along` is the row.
+    let at = |along: usize| pixels[along * w as usize] >> 24;
+    let (first, last) = (at(0), at(h as usize - 1));
+    assert!(first <= 2 && last <= 2, "cut square: {first} and {last}");
+    let peak = pixels.iter().map(|p| p >> 24).max().unwrap_or(0);
+    assert!(peak > 20, "too faint to judge: {peak}");
+    let path = Path::new(output).join(format!("edgefx-taper-{name}.png"));
+    png(&path, w, h, &pixels)?;
+    println!(
+        "{} ({w}x{h}; segment {}..{} logical px, ends at {first}/{last} of 255, peak {peak})",
+        path.display(),
+        strip.start,
+        strip.start + strip.len,
     );
     Ok(())
 }

@@ -3,14 +3,14 @@
 //!
 //! There is exactly one [`Effect`] per overlay, so a burst of events can never stack
 //! animations: a new event *steers* the live one instead of starting a second. All it carries
-//! is the strip to cover, the crossing point on it and two levels — one of them capped at 1.
+//! is the segment to cover, the crossing point on it and two levels — one of them capped at 1.
 //!
 //! An approach ends on a message (`LEFT`, `CLEAR`, `CROSSED`), never on a timer: a pointer
 //! that rests inside the reach sends no samples at all, and the glow it earned stays lit and
 //! steady until the core says where it went. [`LOST_S`] is only the backstop for a core that
 //! died mid-approach.
 
-use crate::raster::{self, Canvas};
+use crate::raster::{self, Canvas, Segment};
 use crate::{intensity, Strip, Target, Update, FADE_OUT_S, LOST_S, REACH_PX, RELEASE_S};
 
 /// Where the effect is in its life.
@@ -31,6 +31,10 @@ pub enum Phase {
 pub struct Effect {
     phase: Phase,
     strip: Option<Strip>,
+    /// The linked segment (the two ends the glow tapers into) along the edge, logical px from
+    /// the strip's start, [`Segment`]'s own scale taken as 1: [`Self::draw`] carries it to
+    /// the display it paints on.
+    segment: Segment,
     /// The crossing point along the strip (`0..strip.len`, logical px).
     point: f32,
     /// The level the approach is heading for.
@@ -46,6 +50,7 @@ impl Effect {
         Self {
             phase: Phase::Idle,
             strip: None,
+            segment: Segment::WHOLE,
             point: 0.0,
             goal: 0.0,
             intensity: 0.0,
@@ -141,6 +146,10 @@ impl Effect {
     fn begin(&mut self, target: &Target) {
         let strip = Strip::of(target);
         self.point = (target.along - strip.start).clamp(0.0, strip.len);
+        // The segment the glow tapers into: the linked part of the edge, in the window's
+        // coordinates. A segment longer than the window has its ends outside the canvas, and
+        // the glow is already nothing there.
+        self.segment = Segment::of(target.start - strip.start, target.end - strip.start, 1.0);
         // A segment longer than the window carries it along with the pointer, so one sample
         // gives a strip that overlaps this one by a pixel less: the same glow, moving. Only a
         // window that touches nothing of the old one is somewhere else entirely.
@@ -194,7 +203,16 @@ impl Effect {
         let Some(strip) = self.strip() else {
             return;
         };
-        raster::glow(canvas, strip.edge, self.point * scale, self.alpha());
+        // The same segment, in the canvas's own px: the taper is [`TAPER_PX`] logical px
+        // wherever the pixels are.
+        let segment = Segment::of(self.segment.start * scale, self.segment.end * scale, scale);
+        raster::glow(
+            canvas,
+            strip.edge,
+            self.point * scale,
+            self.alpha(),
+            segment,
+        );
     }
 }
 
@@ -323,6 +341,43 @@ mod tests {
         run(&mut fx, RELEASE_S);
         assert_eq!(fx.phase(), Phase::Idle);
         assert!(!fx.step(0.033));
+    }
+
+    /// The receiver's `Entered` bloom covers the segment the core named and tapers at its
+    /// ends like the source's glow: a bloom on part of an edge rounds off instead of running
+    /// into the display corner at full brightness.
+    #[test]
+    fn the_entry_bloom_tapers_at_the_ends_of_its_segment() {
+        // A 360 px segment 100 px down a right edge, entering 60 px from its end.
+        let target = Target {
+            edge: Edge::Right,
+            start: 100.0,
+            end: 460.0,
+            along: 400.0,
+        };
+        let mut fx = Effect::new();
+        fx.update(Update::Entered(target));
+        let strip = fx.strip().expect("an active effect");
+        assert_eq!((strip.start, strip.len), (100.0, 360.0));
+        let (w, h) = strip.size_px(1.0);
+        let mut px = vec![0u32; (w * h) as usize];
+        fx.draw(&mut Canvas::new(&mut px, w as usize, h as usize), 1.0);
+        // The right edge is the last column; `along` is the row.
+        let at = |along: usize| px[along * w as usize + w as usize - 1] >> 24;
+        // The bloom was cut square at the far end of the segment before the taper.
+        let mut plain = vec![0u32; (w * h) as usize];
+        raster::glow(
+            &mut Canvas::new(&mut plain, w as usize, h as usize),
+            Edge::Right,
+            300.0,
+            1.0,
+            Segment::WHOLE,
+        );
+        let straight = plain[359 * w as usize + w as usize - 1] >> 24;
+        assert!(straight > 40, "the bloom was not bright there: {straight}");
+        assert!(at(359) <= 2, "still a straight cut: {}", at(359));
+        assert!(at(0) <= 2, "still a straight cut at the start: {}", at(0));
+        assert!(at(311) > 90, "the taper ate the bloom: {}", at(311));
     }
 
     #[test]
