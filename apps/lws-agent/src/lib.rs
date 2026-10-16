@@ -78,7 +78,7 @@ struct Args {
 }
 
 const USAGE: &str = "\
-multideskflow agent — LAN Workspace input agent (internal; spawned by `multideskflow run`)
+multideskflow agent — input agent (internal; spawned by `multideskflow run`)
 
 USAGE:
     multideskflow agent --ipc-endpoint <name|path> --token-file <path> [--dry-inject]

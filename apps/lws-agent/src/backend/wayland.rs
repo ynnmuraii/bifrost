@@ -124,22 +124,22 @@ async fn register_shortcuts(
     let requested = [
         (
             "emergency",
-            "LAN Workspace: emergency release",
+            "multideskflow: emergency release",
             &bindings.emergency_release,
         ),
         (
             "switch_next",
-            "LAN Workspace: switch to next machine",
+            "multideskflow: switch to next machine",
             &bindings.switch_next,
         ),
         (
             "return_local",
-            "LAN Workspace: return to this machine",
+            "multideskflow: return to this machine",
             &bindings.return_local,
         ),
         (
             "claim_ownership",
-            "LAN Workspace: claim keyboard and pointer ownership",
+            "multideskflow: claim keyboard and pointer ownership",
             &bindings.claim_ownership,
         ),
     ];

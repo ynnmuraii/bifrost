@@ -83,7 +83,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "lan-workspace-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
+          $name = "multideskflow-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
           $archive = Join-Path $env:RUNNER_TEMP "$name.zip"
           $stage = Join-Path $env:RUNNER_TEMP "stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -104,7 +104,7 @@ jobs:
       - name: Package
         if: runner.os == 'Linux'
         run: |
-          name="lan-workspace-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
+          name="multideskflow-${{ github.ref_name || github.sha }}-${{ matrix.platform }}"
           stage="$RUNNER_TEMP/stage"
           mkdir -p "$stage"
           install -m 0755 target/release/multideskflow "$stage/"
@@ -128,9 +128,9 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: lan-workspace-${{ matrix.os }}
+          name: multideskflow-${{ matrix.os }}
           path: |
-            ${{ runner.temp }}/lan-workspace-*-${{ matrix.platform }}.*
+            ${{ runner.temp }}/multideskflow-*-${{ matrix.platform }}.*
             ${{ runner.temp }}/SHA256SUMS.txt
 
       # Only the tag trigger: `push` fires here solely on `v*` tags, so this
@@ -142,5 +142,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ runner.temp }}/lan-workspace-*-${{ matrix.platform }}.*
+            ${{ runner.temp }}/multideskflow-*-${{ matrix.platform }}.*
             ${{ runner.temp }}/SHA256SUMS.txt

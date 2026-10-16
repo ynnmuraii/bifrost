@@ -21,7 +21,7 @@ pub const EMERGENCY_TRIGGER: &str = "CTRL+ALT+SHIFT+F12";
 /// Human-readable description bound together with the shortcut, shown in the
 /// compositor's shortcut editor.
 const EMERGENCY_DESCRIPTION: &str =
-    "LAN Workspace: release remote input and return the keyboard to this machine";
+    "multideskflow: release remote input and return the keyboard to this machine";
 
 /// The desktop portal's well-known bus name: sessions live at an object path it chooses.
 const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
