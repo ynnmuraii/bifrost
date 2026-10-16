@@ -385,9 +385,15 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                     let origin = lws_gui::map::Pt::new(40.0, 20.0);
                     vm.editor.placement[owner] = origin;
                     vm.editor.placement[laptop] = if vertical {
-                        lws_gui::map::Pt::new(origin.x + 1920.0 * scale, origin.y + 1992.0 * scale)
+                        lws_gui::map::Pt::new(
+                            origin.x + 1920.0 * scale,
+                            origin.y + 1920.0 * scale + 72.0,
+                        )
                     } else {
-                        lws_gui::map::Pt::new(origin.x + 3072.0 * scale, origin.y + 414.5 * scale)
+                        lws_gui::map::Pt::new(
+                            origin.x + 3000.0 * scale + 72.0,
+                            origin.y + 414.5 * scale,
+                        )
                     };
                     vm.editor.baseline.clone_from(&vm.editor.placement);
                     let drag = if phase == "dragged" {

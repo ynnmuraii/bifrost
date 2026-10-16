@@ -280,6 +280,12 @@ impl ViewModel {
                 .as_ref()
                 .map(|sent| sent.links.clone())
         });
+        if self.editor.save.wanted.is_some() {
+            let reconciled = self.editor_links_reconciled(true);
+            self.editor.paddles = Some(reconciled.clone());
+            self.editor.save.paddles = Some(reconciled.clone());
+            self.editor.save.wanted = Some(reconciled);
+        }
     }
 
     pub(crate) fn restore_placement(&mut self) {
@@ -540,22 +546,11 @@ impl ViewModel {
         let Some(facing) = self
             .faced(&self.editor.placement)
             .into_iter()
-            .filter(|g| {
-                g.a == a
-                    && g.b == b
-                    && self.editor.nodes[a]
-                        .displays
-                        .get(g.a_display)
-                        .is_some_and(|d| d.id == doc.from.display)
-                    && self.editor.nodes[b]
-                        .displays
-                        .get(g.b_display)
-                        .is_some_and(|d| d.id == doc.to.display)
-                    && g.side_of_b().edges() == (doc.from.edge, doc.to.edge)
-            })
+            .filter(|g| self.geometric_endpoints(doc, g).is_some())
             .max_by(|left, right| {
                 let score = |g: &map::GeoLink| {
-                    let mon = self.editor.shapes[a].mons[g.a_display];
+                    let display = if g.a == a { g.a_display } else { g.b_display };
+                    let mon = self.editor.shapes[a].mons[display];
                     let at = self.editor.placement[a];
                     let origin = match g.dir {
                         map::Dir::Horizontal => at.y + mon.y,
@@ -571,9 +566,25 @@ impl ViewModel {
             return;
         };
         let (node, display, endpoint) = if from {
-            (a, facing.a_display, &mut doc.from)
+            (
+                a,
+                if facing.a == a {
+                    facing.a_display
+                } else {
+                    facing.b_display
+                },
+                &mut doc.from,
+            )
         } else {
-            (b, facing.b_display, &mut doc.to)
+            (
+                b,
+                if facing.b == b {
+                    facing.b_display
+                } else {
+                    facing.a_display
+                },
+                &mut doc.to,
+            )
         };
         let mon = self.editor.shapes[node].mons[display];
         let at = self.editor.placement[node];
@@ -602,6 +613,36 @@ impl ViewModel {
     /// The pairs of members that face each other in `placement`, with how they face.
     fn faced(&self, placement: &[Pt]) -> Vec<map::GeoLink> {
         map::links(&self.editor.shapes, placement)
+    }
+
+    /// Endpoints in geometric order, and whether the document order is reversed.
+    fn geometric_endpoints<'a>(
+        &self,
+        doc: &'a config::LinkConfig,
+        g: &map::GeoLink,
+    ) -> Option<(&'a config::EndpointConfig, &'a config::EndpointConfig, bool)> {
+        let (ae, be) = g.side_of_b().edges();
+        let matches = |a: &config::EndpointConfig, b: &config::EndpointConfig| {
+            a.node == node_reference(&self.editor.nodes[g.a].node_id)
+                && b.node == node_reference(&self.editor.nodes[g.b].node_id)
+                && a.edge == ae
+                && b.edge == be
+                && self.editor.nodes[g.a]
+                    .displays
+                    .get(g.a_display)
+                    .is_some_and(|d| d.id == a.display)
+                && self.editor.nodes[g.b]
+                    .displays
+                    .get(g.b_display)
+                    .is_some_and(|d| d.id == b.display)
+        };
+        if matches(&doc.from, &doc.to) {
+            Some((&doc.from, &doc.to, false))
+        } else if matches(&doc.to, &doc.from) {
+            Some((&doc.to, &doc.from, true))
+        } else {
+            None
+        }
     }
 
     /// The applied links, as the configuration schema writes them.
@@ -634,6 +675,10 @@ impl ViewModel {
     /// The links the map draft would save: untouched document pairs as they are, moved pairs
     /// as their exact contacts. The document's own text comes from this.
     pub fn editor_links(&self) -> Vec<config::LinkConfig> {
+        self.editor_links_reconciled(false)
+    }
+
+    fn editor_links_reconciled(&self, reconcile: bool) -> Vec<config::LinkConfig> {
         let applied = self.editor.paddles.as_ref().map_or_else(
             || self.applied_links(),
             |links| {
@@ -656,12 +701,14 @@ impl ViewModel {
                     .collect()
             },
         );
-        if !self.editor.dirty() || self.editor.placement.len() != self.editor.nodes.len() {
+        if (!reconcile && !self.editor.dirty())
+            || self.editor.placement.len() != self.editor.nodes.len()
+        {
             return applied.into_iter().map(|(_, link)| link).collect();
         }
         let now = self.faced(&self.editor.placement);
         let baseline = &self.editor.baseline;
-        let moved = |i: usize| self.editor.placement.get(i) != baseline.get(i);
+        let moved = |i: usize| reconcile || self.editor.placement.get(i) != baseline.get(i);
         let mut links: Vec<config::LinkConfig> = Vec::new();
         for (ends, link) in &applied {
             let missing = ends.is_none_or(|(i, j)| {
@@ -694,18 +741,7 @@ impl ViewModel {
                 .map(|(_, doc)| doc)
                 .filter(|doc| {
                     !links.iter().any(|saved| saved.id == doc.id)
-                        && doc.from.node == node_reference(a)
-                        && doc.to.node == node_reference(b)
-                        && doc.from.edge == a_edge
-                        && doc.to.edge == b_edge
-                        && self.editor.nodes[link.a]
-                            .displays
-                            .get(link.a_display)
-                            .is_some_and(|d| d.id == doc.from.display)
-                        && self.editor.nodes[link.b]
-                            .displays
-                            .get(link.b_display)
-                            .is_some_and(|d| d.id == doc.to.display)
+                        && self.geometric_endpoints(doc, link).is_some()
                 })
                 .max_by(|left, right| {
                     let mon = self.editor.shapes[link.a].mons[link.a_display];
@@ -715,8 +751,11 @@ impl ViewModel {
                         map::Dir::Vertical => at.x + mon.x,
                     };
                     let overlap = |doc: &config::LinkConfig| {
-                        (link.span.1.min(origin + doc.from.end * self.editor.scale)
-                            - link.span.0.max(origin + doc.from.start * self.editor.scale))
+                        let (a, _, _) = self
+                            .geometric_endpoints(doc, link)
+                            .expect("matched endpoints");
+                        (link.span.1.min(origin + a.end * self.editor.scale)
+                            - link.span.0.max(origin + a.start * self.editor.scale))
                         .max(0.0)
                     };
                     overlap(left).total_cmp(&overlap(right))
@@ -771,11 +810,19 @@ impl ViewModel {
             {
                 continue;
             }
+            let ends = existing.and_then(|doc| self.geometric_endpoints(doc, link));
+            let a = endpoint(link.a, link.a_display, a_edge, ends.map(|(a, _, _)| a));
+            let b = endpoint(link.b, link.b_display, b_edge, ends.map(|(_, b, _)| b));
+            let (from, to) = if ends.is_some_and(|(_, _, reversed)| reversed) {
+                (b, a)
+            } else {
+                (a, b)
+            };
             links.push(config::LinkConfig {
                 id,
-                from: endpoint(link.a, link.a_display, a_edge, existing.map(|d| &d.from)),
-                to: endpoint(link.b, link.b_display, b_edge, existing.map(|d| &d.to)),
-                bidirectional: true,
+                from,
+                to,
+                bidirectional: existing.is_none_or(|doc| doc.bidirectional),
             });
         }
         links
@@ -979,9 +1026,7 @@ impl ViewModel {
                 .unwrap_or(0);
             let span = facing
                 .iter()
-                .filter(|g| {
-                    g.a == a && g.b == b && g.a_display == a_display && g.b_display == b_display
-                })
+                .filter(|g| self.geometric_endpoints(&doc, g).is_some())
                 .max_by(|left, right| {
                     let score = |g: &map::GeoLink| {
                         (g.span.1.min(a_span.1) - g.span.0.max(a_span.0)).max(0.0)
@@ -1119,6 +1164,73 @@ mod tests {
         vm.editor.nodes[0].displays[0].h = 720.0;
         vm.rebuild_layout();
         assert!(vm.editor.paddles.is_none());
+    }
+
+    #[test]
+    fn reversed_horizontal_and_vertical_links_keep_endpoint_ownership_on_edit_and_move() {
+        for vertical in [false, true] {
+            let mut vm = paddles();
+            if vertical {
+                let at = vm.editor.placement[0];
+                vm.editor.placement[1] = Pt::new(at.x, at.y + vm.editor.shapes[0].h + 40.0);
+            }
+            let mut docs = vm.editor_links();
+            std::mem::swap(&mut docs[0].from, &mut docs[0].to);
+            docs[0].id = "reversed".into();
+            vm.editor.paddles = Some(docs.clone());
+            let link = vm.map_model().links.remove(0);
+            vm.move_paddle(&link.id, true, link.span.0 + 15.0, link.span.0 + 35.0);
+            let adjusted = vm.editor_links().remove(0);
+            assert_eq!(adjusted.id, "reversed");
+            assert_eq!(adjusted.from.node, docs[0].from.node);
+            assert_eq!(adjusted.to, docs[0].to);
+            assert_ne!(adjusted.from.start, docs[0].from.start);
+            vm.move_paddle(&link.id, false, link.span.0 + 10.0, link.span.0 + 50.0);
+            let adjusted = vm.editor_links().remove(0);
+            let id = vm.editor.nodes[1].node_id.clone();
+            let at = vm.editor.placement[1];
+            vm.move_node(&id, at.x + 5.0, at.y + 5.0);
+            let moved = vm.editor_links().remove(0);
+            assert_eq!(moved.id, adjusted.id);
+            assert_eq!(moved.from, adjusted.from);
+            assert_eq!(moved.to.node, adjusted.to.node);
+            assert_eq!(moved.to.start, adjusted.to.start);
+        }
+    }
+
+    #[test]
+    fn resized_displays_reconcile_queued_segments_before_cas_submission() {
+        let mut vm = paddles();
+        let link = vm.map_model().links.remove(0);
+        vm.move_paddle(&link.id, true, link.span.0 + 40.0, link.span.0 + 70.0);
+        vm.move_paddle(&link.id, false, link.span.0 + 40.0, link.span.0 + 70.0);
+        vm.drop_paddle();
+        let first = vm.editor.save.sent.clone().unwrap();
+        vm.take_outgoing();
+        vm.move_paddle(&link.id, true, link.span.0 + 50.0, link.span.0 + 75.0);
+        vm.move_paddle(&link.id, false, link.span.0 + 50.0, link.span.0 + 75.0);
+        vm.drop_paddle();
+        for node in &mut vm.editor.nodes {
+            node.displays[0].h = 400.0;
+        }
+        vm.rebuild_layout();
+        let reconciled = vm.editor.save.wanted.clone().unwrap();
+        assert_eq!(vm.editor_links(), reconciled);
+        for doc in &reconciled {
+            assert!(doc.from.end <= 400.0 + 1e-6);
+            assert!(doc.to.end <= 400.0 + 1e-6);
+        }
+        assert_eq!(vm.editor.save.sent.as_ref(), Some(&first));
+        vm.on_layout_verdict(
+            first.request_id,
+            &protocol::ipc::OpResult {
+                ok: true,
+                error_code: String::new(),
+            },
+        );
+        vm.editor.revision += 1;
+        vm.continue_save();
+        assert_eq!(vm.editor.save.sent.as_ref().unwrap().links, reconciled);
     }
 
     fn paddles() -> ViewModel {

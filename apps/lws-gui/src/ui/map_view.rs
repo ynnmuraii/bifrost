@@ -455,13 +455,18 @@ fn paddle_hit(points: [Pos2; 2], pointer: Pos2, horizontal: bool) -> Option<Padd
     if normal > 8.0 || tangent < start - 8.0 || tangent > end + 8.0 {
         return None;
     }
-    Some(if (tangent - start).abs() <= 8.0 {
-        PaddleHandle::Start
-    } else if (tangent - end).abs() <= 8.0 {
-        PaddleHandle::End
-    } else {
-        PaddleHandle::Move
-    })
+    // Short paddles still have a middle grip and two distinct ends. The outer half
+    // of the edge hit strip also moves them, without requiring subpixel precision.
+    let end_zone = ((end - start) / 3.0).min(8.0);
+    Some(
+        if normal >= 4.0 || (tangent > start + end_zone && tangent < end - end_zone) {
+            PaddleHandle::Move
+        } else if (tangent - start).abs() <= (tangent - end).abs() {
+            PaddleHandle::Start
+        } else {
+            PaddleHandle::End
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -487,6 +492,7 @@ fn paddle_interaction(
     });
     let enabled = vm.modal.is_none() && !vm.appearance_open && focused;
     if !enabled {
+        st.paddle_hover = None;
         if st.paddle_drag.take().is_some() {
             actions.push(Action::CancelDrag);
         }
@@ -514,8 +520,12 @@ fn paddle_interaction(
     } else {
         None
     };
+    let hovered_id = hit.map(|(link, _, _)| link.id.as_str());
+    if st.paddle_hover.as_deref() != hovered_id {
+        st.paddle_hover = hovered_id.map(str::to_owned);
+    }
     if let Some((link, from, handle)) = hit {
-        st.paddle_reveals.insert(link.id.clone(), time);
+        st.reveal_paddle_at(&link.id, time);
         ui.ctx().set_cursor_icon(paddle_cursor(handle, link.dir));
         if pressed {
             st.paddle_drag = Some(PaddleDrag {
@@ -532,7 +542,7 @@ fn paddle_interaction(
         if let Some(link) = model.links.iter().find(|link| link.id == drag.link_id) {
             ui.ctx()
                 .set_cursor_icon(paddle_cursor(drag.handle, link.dir));
-            if down {
+            if down || released {
                 if let Some(pointer) = pointer {
                     let delta = xf.stage_delta(pointer - drag.grab);
                     let delta = if link.dir == Dir::Horizontal {
@@ -604,9 +614,10 @@ fn paint_paddles(
         }) || st
             .paddle_drag
             .as_ref()
-            .is_some_and(|drag| drag.link_id == link.id);
+            .is_some_and(|drag| drag.link_id == link.id)
+            || st.paddle_hover.as_deref() == Some(link.id.as_str());
         if held {
-            st.paddle_reveals.insert(link.id.clone(), now);
+            st.reveal_paddle_at(&link.id, now);
         }
         let alpha = paddle_alpha(st.paddle_reveals.get(&link.id).copied(), now);
         if alpha <= 0.0 {
@@ -1074,6 +1085,28 @@ mod transform_tests {
     use super::*;
 
     #[test]
+    fn minimum_paddles_keep_both_resize_ends_and_a_move_grip_at_every_zoom() {
+        for scale in [0.315, 0.7, 1.0, 1.5] {
+            let points = [
+                Pos2::new(100.0, 100.0),
+                Pos2::new(100.0, 100.0 + 12.0 * scale),
+            ];
+            assert_eq!(
+                paddle_hit(points, points[0], true),
+                Some(PaddleHandle::Start)
+            );
+            assert_eq!(paddle_hit(points, points[1], true), Some(PaddleHandle::End));
+            let middle = points[0] + (points[1] - points[0]) * 0.5;
+            assert_eq!(paddle_hit(points, middle, true), Some(PaddleHandle::Move));
+            assert_eq!(
+                paddle_hit(points, middle + Vec2::new(7.0, 0.0), true),
+                Some(PaddleHandle::Move)
+            );
+            assert_eq!(paddle_hit(points, middle + Vec2::new(9.0, 0.0), true), None);
+        }
+    }
+
+    #[test]
     fn paddles_reveal_both_edges_then_finish_fading_without_idle_repaints() {
         use crate::view_model::{CoreEndpoint, LocalConfig};
         let mut model = owner_layout();
@@ -1145,9 +1178,9 @@ mod transform_tests {
             "fade ends within250ms"
         );
         assert_eq!(
-            render(&mut st, 0.4, true).0,
-            2,
-            "linked edge hover reveals both paddles"
+            render(&mut st, 0.4, true),
+            (2, false),
+            "linked edge hover reveals both paddles without scheduling frames"
         );
         assert_eq!(render(&mut st, 0.65, false), (0, false));
         assert_eq!(render(&mut st, 5.0, false), (0, false), "no idle animation");
@@ -1214,8 +1247,7 @@ mod transform_tests {
         for (frame, pointer, button) in [
             (0, start, None),
             (1, start, Some(true)),
-            (2, end, None),
-            (3, end, Some(false)),
+            (2, end, Some(false)),
         ] {
             let mut events = vec![egui::Event::PointerMoved(pointer)];
             if let Some(pressed) = button {
