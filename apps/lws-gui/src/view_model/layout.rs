@@ -77,6 +77,16 @@ pub struct MapLink {
     pub dir: map::Dir,
     /// The shared stretch of the two edges, along the axis of the edge.
     pub span: (f64, f64),
+    /// Independent endpoint intervals in world tangent coordinates.
+    pub a_span: (f64, f64),
+    /// Destination endpoint interval in world tangent coordinates.
+    pub b_span: (f64, f64),
+    /// Display indices in the respective computer.
+    pub a_display: usize,
+    /// Destination display index in its computer.
+    pub b_display: usize,
+    /// Stable configuration link identity.
+    pub id: String,
     /// What the link is doing.
     pub state: LinkState,
     /// `true` for an `auto` link: the whole desktop's edge.
@@ -261,6 +271,15 @@ impl ViewModel {
             );
             self.editor.save.placement = Some(self.editor.placement.clone());
         }
+        // A changed manifest/replacement document invalidates an in-progress drag.
+        // Retain only the accepted drop, which editor_links reprojects and clamps.
+        self.editor.paddles = self.editor.save.wanted.clone().or_else(|| {
+            self.editor
+                .save
+                .sent
+                .as_ref()
+                .map(|sent| sent.links.clone())
+        });
     }
 
     pub(crate) fn restore_placement(&mut self) {
@@ -271,6 +290,19 @@ impl ViewModel {
                 .as_ref()
                 .unwrap_or(&self.editor.baseline),
         );
+        self.editor.paddles = self
+            .editor
+            .save
+            .wanted
+            .clone()
+            .or_else(|| {
+                self.editor
+                    .save
+                    .sent
+                    .as_ref()
+                    .map(|sent| sent.links.clone())
+            })
+            .or_else(|| self.editor.save.paddles.clone());
     }
 
     fn drop_is_valid(&self, i: usize) -> bool {
@@ -317,6 +349,7 @@ impl ViewModel {
             return;
         }
         self.editor.save.wanted = Some(self.editor_links());
+        self.editor.save.paddles = self.editor.save.wanted.clone();
         self.editor.save.placement = Some(self.editor.placement.clone());
         self.apply_draft();
     }
@@ -340,12 +373,14 @@ impl ViewModel {
         if same_links(&links, &applied) {
             self.editor.save = Save::default();
             self.editor.baseline.clone_from(&self.editor.placement);
+            self.editor.paddles = None;
             return;
         }
         let layout_toml = match toml::to_string(&self.topology_with(links.clone())) {
             Ok(text) => text.into_bytes(),
             Err(_) => {
                 self.editor.save = Save::default();
+                self.editor.paddles = None;
                 self.restore_placement();
                 return;
             }
@@ -409,6 +444,7 @@ impl ViewModel {
             return true;
         }
         self.editor.save = Save::default();
+        self.editor.paddles = None;
         self.restore_placement();
         false
     }
@@ -422,6 +458,19 @@ impl ViewModel {
             if self.editor.save.wanted.is_none() {
                 let accepted = self.editor.save.placement.take();
                 self.editor.save = Save::default();
+                let applied: Vec<_> = self
+                    .applied_links()
+                    .into_iter()
+                    .map(|(_, link)| link)
+                    .collect();
+                if self
+                    .editor
+                    .paddles
+                    .as_ref()
+                    .is_some_and(|draft| same_links(draft, &applied))
+                {
+                    self.editor.paddles = None;
+                }
                 if let Some(accepted) = accepted.filter(|p| p.len() == self.editor.nodes.len()) {
                     self.editor.baseline.clone_from(&accepted);
                     self.editor.placement = accepted;
@@ -431,27 +480,26 @@ impl ViewModel {
         self.apply_draft();
     }
 
-    /// A drag: the computer follows the pointer and snaps to the edge it comes near.
+    /// A free drag: proximity creates links without changing the requested placement.
     pub fn move_node(&mut self, node_id: &str, x: f64, y: f64) {
         self.move_node_with_threshold(node_id, x, y, map::SNAP);
     }
 
-    /// A drag with a stage-space threshold derived from the current screen zoom.
-    pub fn move_node_with_threshold(&mut self, node_id: &str, x: f64, y: f64, snap_threshold: f64) {
+    /// Retains the UI threshold parameter without snapping the computer.
+    pub fn move_node_with_threshold(
+        &mut self,
+        node_id: &str,
+        x: f64,
+        y: f64,
+        _snap_threshold: f64,
+    ) {
         let Some(i) = self.index_of(node_id) else {
             return;
         };
         if i >= self.editor.placement.len() || !x.is_finite() || !y.is_finite() {
             return;
         }
-        self.editor.placement[i] = map::snap_with_threshold(
-            &self.editor.shapes,
-            &self.editor.placement,
-            i,
-            x,
-            y,
-            snap_threshold,
-        );
+        self.editor.placement[i] = Pt::new(x, y);
     }
 
     /// A keyboard step: no snapping, so a step is always the step that was asked for.
@@ -463,6 +511,92 @@ impl ViewModel {
             at.x = (at.x + dx).clamp(-60.0, map::STAGE_W + 60.0);
             at.y = (at.y + dy).clamp(-70.0, map::STAGE_H + 40.0);
         }
+    }
+    /// Adjust one endpoint locally in absolute stage tangent coordinates.
+    pub fn move_paddle(&mut self, link_id: &str, from: bool, start: f64, end: f64) {
+        if !start.is_finite() || !end.is_finite() || !self.editor.editable {
+            return;
+        }
+        let mut links = self.editor_links();
+        let Some(doc) = links.iter_mut().find(|doc| doc.id == link_id) else {
+            return;
+        };
+        let Some(a) = self
+            .editor
+            .nodes
+            .iter()
+            .position(|n| node_reference(&n.node_id) == doc.from.node)
+        else {
+            return;
+        };
+        let Some(b) = self
+            .editor
+            .nodes
+            .iter()
+            .position(|n| node_reference(&n.node_id) == doc.to.node)
+        else {
+            return;
+        };
+        let Some(facing) = self
+            .faced(&self.editor.placement)
+            .into_iter()
+            .filter(|g| {
+                g.a == a
+                    && g.b == b
+                    && self.editor.nodes[a]
+                        .displays
+                        .get(g.a_display)
+                        .is_some_and(|d| d.id == doc.from.display)
+                    && self.editor.nodes[b]
+                        .displays
+                        .get(g.b_display)
+                        .is_some_and(|d| d.id == doc.to.display)
+                    && g.side_of_b().edges() == (doc.from.edge, doc.to.edge)
+            })
+            .max_by(|left, right| {
+                let score = |g: &map::GeoLink| {
+                    let mon = self.editor.shapes[a].mons[g.a_display];
+                    let at = self.editor.placement[a];
+                    let origin = match g.dir {
+                        map::Dir::Horizontal => at.y + mon.y,
+                        map::Dir::Vertical => at.x + mon.x,
+                    };
+                    (g.span.1.min(origin + doc.from.end * self.editor.scale)
+                        - g.span.0.max(origin + doc.from.start * self.editor.scale))
+                    .max(0.0)
+                };
+                score(left).total_cmp(&score(right))
+            })
+        else {
+            return;
+        };
+        let (node, display, endpoint) = if from {
+            (a, facing.a_display, &mut doc.from)
+        } else {
+            (b, facing.b_display, &mut doc.to)
+        };
+        let mon = self.editor.shapes[node].mons[display];
+        let at = self.editor.placement[node];
+        let origin = match facing.dir {
+            map::Dir::Horizontal => at.y + mon.y,
+            map::Dir::Vertical => at.x + mon.x,
+        };
+        let span = map::clamp_paddle(start, end, facing.span.0, facing.span.1);
+        endpoint.start = (span.0 - origin) / self.editor.scale;
+        endpoint.end = (span.1 - origin) / self.editor.scale;
+        self.editor.paddles = Some(links);
+    }
+
+    /// Queue the latest endpoint draft using the existing CAS autosave.
+    pub fn drop_paddle(&mut self) {
+        if self.editor.paddles.is_none() || !self.connection.is_connected() || !self.editor.editable
+        {
+            return;
+        }
+        self.editor.save.wanted = Some(self.editor_links());
+        self.editor.save.paddles = self.editor.save.wanted.clone();
+        self.editor.save.placement = Some(self.editor.placement.clone());
+        self.apply_draft();
     }
 
     /// The pairs of members that face each other in `placement`, with how they face.
@@ -500,7 +634,28 @@ impl ViewModel {
     /// The links the map draft would save: untouched document pairs as they are, moved pairs
     /// as their exact contacts. The document's own text comes from this.
     pub fn editor_links(&self) -> Vec<config::LinkConfig> {
-        let applied = self.applied_links();
+        let applied = self.editor.paddles.as_ref().map_or_else(
+            || self.applied_links(),
+            |links| {
+                links
+                    .iter()
+                    .cloned()
+                    .map(|link| {
+                        let a = self
+                            .editor
+                            .nodes
+                            .iter()
+                            .position(|n| node_reference(&n.node_id) == link.from.node);
+                        let b = self
+                            .editor
+                            .nodes
+                            .iter()
+                            .position(|n| node_reference(&n.node_id) == link.to.node);
+                        (a.zip(b), link)
+                    })
+                    .collect()
+            },
+        );
         if !self.editor.dirty() || self.editor.placement.len() != self.editor.nodes.len() {
             return applied.into_iter().map(|(_, link)| link).collect();
         }
@@ -508,13 +663,21 @@ impl ViewModel {
         let baseline = &self.editor.baseline;
         let moved = |i: usize| self.editor.placement.get(i) != baseline.get(i);
         let mut links: Vec<config::LinkConfig> = Vec::new();
-        for (ends, link) in applied {
-            let keep = match ends {
-                None => true,
-                Some((i, j)) => !moved(i) && !moved(j),
-            };
-            if keep {
-                links.push(link);
+        for (ends, link) in &applied {
+            let missing = ends.is_none_or(|(i, j)| {
+                (!link.from.is_auto()
+                    && !self.editor.nodes[i]
+                        .displays
+                        .iter()
+                        .any(|d| d.id == link.from.display))
+                    || (!link.to.is_auto()
+                        && !self.editor.nodes[j]
+                            .displays
+                            .iter()
+                            .any(|d| d.id == link.to.display))
+            });
+            if missing || ends.is_some_and(|(i, j)| !moved(i) && !moved(j)) {
+                links.push(link.clone());
             }
         }
         for link in &now {
@@ -526,23 +689,74 @@ impl ViewModel {
                 self.editor.nodes[link.b].node_id.as_str(),
             );
             let (a_edge, b_edge) = link.side_of_b().edges();
-            let mut id = format!("gui-{}-{}", short_key(a), short_key(b));
+            let existing = applied
+                .iter()
+                .map(|(_, doc)| doc)
+                .filter(|doc| {
+                    !links.iter().any(|saved| saved.id == doc.id)
+                        && doc.from.node == node_reference(a)
+                        && doc.to.node == node_reference(b)
+                        && doc.from.edge == a_edge
+                        && doc.to.edge == b_edge
+                        && self.editor.nodes[link.a]
+                            .displays
+                            .get(link.a_display)
+                            .is_some_and(|d| d.id == doc.from.display)
+                        && self.editor.nodes[link.b]
+                            .displays
+                            .get(link.b_display)
+                            .is_some_and(|d| d.id == doc.to.display)
+                })
+                .max_by(|left, right| {
+                    let mon = self.editor.shapes[link.a].mons[link.a_display];
+                    let at = self.editor.placement[link.a];
+                    let origin = match link.dir {
+                        map::Dir::Horizontal => at.y + mon.y,
+                        map::Dir::Vertical => at.x + mon.x,
+                    };
+                    let overlap = |doc: &config::LinkConfig| {
+                        (link.span.1.min(origin + doc.from.end * self.editor.scale)
+                            - link.span.0.max(origin + doc.from.start * self.editor.scale))
+                        .max(0.0)
+                    };
+                    overlap(left).total_cmp(&overlap(right))
+                });
+            let mut id = existing.map(|doc| doc.id.clone()).unwrap_or_else(|| {
+                format!(
+                    "gui-{}-{}-{}-{}",
+                    short_key(a),
+                    short_key(b),
+                    link.a_display,
+                    link.b_display
+                )
+            });
             while links.iter().any(|existing| existing.id == id) {
                 id.push('x');
             }
-            let endpoint = |node: usize, display: usize, edge: config::Edge| {
+            let endpoint = |node: usize,
+                            display: usize,
+                            edge: config::Edge,
+                            previous: Option<&config::EndpointConfig>| {
                 let mon = self.editor.shapes[node].mons[display];
                 let at = self.editor.placement[node];
                 let origin = match link.dir {
                     map::Dir::Horizontal => at.y + mon.y,
                     map::Dir::Vertical => at.x + mon.x,
                 };
+                let span = previous.map_or(link.span, |e| {
+                    map::clamp_paddle(
+                        origin + e.start * self.editor.scale,
+                        origin + e.end * self.editor.scale,
+                        link.span.0,
+                        link.span.1,
+                    )
+                });
                 config::EndpointConfig {
                     node: node_reference(&self.editor.nodes[node].node_id),
                     display: self.editor.nodes[node].displays[display].id.clone(),
                     edge,
-                    start: (link.span.0 - origin) / self.editor.scale,
-                    end: (link.span.1 - origin) / self.editor.scale,
+                    start: (span.0 - origin) / self.editor.scale,
+                    end: (span.1 - origin) / self.editor.scale,
                 }
             };
             // A guessed desktop has no stable display identity to persist.
@@ -559,8 +773,8 @@ impl ViewModel {
             }
             links.push(config::LinkConfig {
                 id,
-                from: endpoint(link.a, link.a_display, a_edge),
-                to: endpoint(link.b, link.b_display, b_edge),
+                from: endpoint(link.a, link.a_display, a_edge, existing.map(|d| &d.from)),
+                to: endpoint(link.b, link.b_display, b_edge, existing.map(|d| &d.to)),
                 bidirectional: true,
             });
         }
@@ -683,6 +897,7 @@ impl ViewModel {
         }
         let dirty = editor.dirty();
         let mut links = Vec::new();
+        let facing = self.faced(&editor.placement);
         for doc in self.editor_links() {
             let Some(a) = editor
                 .nodes
@@ -744,10 +959,36 @@ impl ViewModel {
                 config::Edge::Left | config::Edge::Right => map::Dir::Horizontal,
                 config::Edge::Top | config::Edge::Bottom => map::Dir::Vertical,
             };
-            let span = match dir {
+            let a_span = match dir {
                 map::Dir::Horizontal => (f.y, f.y + f.h),
                 map::Dir::Vertical => (f.x, f.x + f.w),
             };
+            let b_span = match dir {
+                map::Dir::Horizontal => (t.y, t.y + t.h),
+                map::Dir::Vertical => (t.x, t.x + t.w),
+            };
+            let a_display = editor.nodes[a]
+                .displays
+                .iter()
+                .position(|d| d.id == doc.from.display)
+                .unwrap_or(0);
+            let b_display = editor.nodes[b]
+                .displays
+                .iter()
+                .position(|d| d.id == doc.to.display)
+                .unwrap_or(0);
+            let span = facing
+                .iter()
+                .filter(|g| {
+                    g.a == a && g.b == b && g.a_display == a_display && g.b_display == b_display
+                })
+                .max_by(|left, right| {
+                    let score = |g: &map::GeoLink| {
+                        (g.span.1.min(a_span.1) - g.span.0.max(a_span.0)).max(0.0)
+                    };
+                    score(left).total_cmp(&score(right))
+                })
+                .map_or((a_span.0.max(b_span.0), a_span.1.min(b_span.1)), |g| g.span);
             let from = Pt::new(f.x + f.w / 2.0, f.y + f.h / 2.0);
             let to = Pt::new(t.x + t.w / 2.0, t.y + t.h / 2.0);
             let documented = editor.links.iter().find(|l| l.id == doc.id);
@@ -775,6 +1016,11 @@ impl ViewModel {
                 to,
                 dir,
                 span,
+                a_span,
+                b_span,
+                a_display,
+                b_display,
+                id: doc.id.clone(),
                 state,
                 whole_desktop,
                 forward,
@@ -842,4 +1088,187 @@ fn resolution(display: &EditorDisplay) -> String {
 
 fn same_links(a: &[config::LinkConfig], b: &[config::LinkConfig]) -> bool {
     a.len() == b.len() && a.iter().all(|link| b.contains(link))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view_model::{CoreEndpoint, EditorNode, LocalConfig};
+
+    #[test]
+    fn cancelled_paddle_drag_restores_last_drop_without_changing_the_queue() {
+        let mut vm = paddles();
+        let link = vm.map_model().links.remove(0);
+        vm.move_paddle(&link.id, true, link.span.0 + 10.0, link.span.0 + 30.0);
+        vm.drop_paddle();
+        let dropped = vm.editor_links();
+        let save = vm.editor.save.clone();
+        vm.move_paddle(&link.id, true, link.span.0 + 40.0, link.span.0 + 60.0);
+        assert_ne!(vm.editor_links(), dropped);
+        vm.restore_placement();
+        assert_eq!(vm.editor_links(), dropped);
+        assert_eq!(vm.editor.save, save);
+    }
+
+    #[test]
+    fn geometry_rebuild_discards_undropped_paddle_adjustment() {
+        let mut vm = paddles();
+        let link = vm.map_model().links.remove(0);
+        vm.move_paddle(&link.id, true, link.span.0 + 10.0, link.span.0 + 30.0);
+        assert!(vm.editor.paddles.is_some());
+        vm.editor.nodes[0].displays[0].h = 720.0;
+        vm.rebuild_layout();
+        assert!(vm.editor.paddles.is_none());
+    }
+
+    fn paddles() -> ViewModel {
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: "paddle-test".into(),
+            },
+            LocalConfig::default(),
+        );
+        vm.on_connected("paddle-test");
+        vm.editor.editable = true;
+        vm.editor.nodes = ["aa".repeat(32), "bb".repeat(32)]
+            .into_iter()
+            .map(|id| EditorNode {
+                node_id: id,
+                display_name: String::new(),
+                online: true,
+                displays: vec![EditorDisplay {
+                    id: "stable-display".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1920.0,
+                    h: 1080.0,
+                    primary: true,
+                    native_known: true,
+                    rotation: 0,
+                }],
+            })
+            .collect();
+        vm.rebuild_layout();
+        let a = vm.editor.placement[0];
+        vm.editor.placement[1] = Pt::new(a.x + vm.editor.shapes[0].w + 40.0, a.y);
+        vm
+    }
+
+    #[test]
+    fn independent_paddles_round_trip_without_moving_nodes() {
+        let mut vm = paddles();
+        let link = vm.map_model().links.remove(0);
+        let positions = vm.editor.placement.clone();
+        vm.move_paddle(&link.id, true, link.span.0 + 12.0, link.span.0 + 30.0);
+        vm.move_paddle(&link.id, false, link.span.0 + 36.0, link.span.0 + 60.0);
+        assert_eq!(vm.editor.placement, positions);
+        assert!(vm.take_outgoing().is_empty());
+        let links = vm.editor_links();
+        assert_ne!(links[0].from.start, links[0].to.start);
+        assert_eq!(links[0].from.display, "stable-display");
+        let topology = vm.topology_with(links.clone());
+        let text = toml::to_string(&topology).unwrap();
+        let restored: config::TopologyConfig = toml::from_str(&text).unwrap();
+        assert_eq!(restored.links, topology.links);
+        vm.drop_paddle();
+        assert!(vm.editor.save.sent.is_some());
+    }
+
+    #[test]
+    fn paddles_clamp_and_disappear_when_displays_stop_facing() {
+        let mut vm = paddles();
+        let link = vm.map_model().links.remove(0);
+        vm.move_paddle(&link.id, true, link.span.0 - 100.0, link.span.1 + 100.0);
+        let adjusted = vm.map_model().links.remove(0);
+        assert_eq!(adjusted.a_span, link.span);
+        let id = vm.editor.nodes[1].node_id.clone();
+        let at = vm.editor.placement[1];
+        vm.move_node(&id, at.x, at.y + 500.0);
+        assert!(vm.editor_links().is_empty());
+    }
+
+    #[test]
+    fn paddle_drop_queue_is_latest_wins() {
+        let mut vm = paddles();
+        let link = vm.map_model().links.remove(0);
+        vm.move_paddle(&link.id, true, link.span.0, link.span.0 + 20.0);
+        vm.drop_paddle();
+        let first = vm.editor.save.sent.clone().unwrap();
+        vm.take_outgoing();
+        vm.move_paddle(&link.id, false, link.span.0 + 30.0, link.span.0 + 50.0);
+        vm.drop_paddle();
+        let latest = vm.editor_links();
+        assert_eq!(vm.editor.save.wanted.as_ref(), Some(&latest));
+        assert_eq!(vm.editor.save.sent.as_ref(), Some(&first));
+        assert!(vm.take_outgoing().is_empty());
+        vm.on_layout_verdict(
+            first.request_id,
+            &protocol::ipc::OpResult {
+                ok: true,
+                error_code: String::new(),
+            },
+        );
+        assert!(vm.take_outgoing().is_empty());
+        vm.editor.revision += 1;
+        vm.continue_save();
+        assert_eq!(vm.editor.save.sent.as_ref().unwrap().links, latest);
+    }
+
+    #[test]
+    fn legacy_whole_desktop_and_contact_documents_stay_untouched() {
+        let mut vm = paddles();
+        vm.editor.baseline = vm.editor.placement.clone();
+        let endpoint =
+            |node: &str, display: &str, edge: &str, start, end| protocol::ipc::EndpointView {
+                node_id: node.into(),
+                display_id: display.into(),
+                edge: edge.into(),
+                segment_start: start,
+                segment_end: end,
+            };
+        for display in ["auto", "stable-display"] {
+            vm.editor.links = vec![protocol::ipc::LinkView {
+                id: "legacy".into(),
+                from: Some(endpoint(
+                    &vm.editor.nodes[0].node_id,
+                    display,
+                    "right",
+                    100.0,
+                    500.0,
+                )),
+                to: Some(endpoint(
+                    &vm.editor.nodes[1].node_id,
+                    display,
+                    "left",
+                    200.0,
+                    600.0,
+                )),
+                bidirectional: true,
+                active: true,
+                ..Default::default()
+            }];
+            let links = vm.editor_links();
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].id, "legacy");
+            assert_eq!(links[0].from.display, display);
+            assert_eq!(links[0].to.display, display);
+            assert_eq!(vm.map_model().links.len(), 1);
+        }
+    }
+
+    #[test]
+    fn moving_nodes_preserves_offsets_then_clamps_to_smaller_overlap() {
+        let mut vm = paddles();
+        let link = vm.map_model().links.remove(0);
+        vm.move_paddle(&link.id, false, link.span.0 + 20.0, link.span.0 + 50.0);
+        let before = vm.editor_links()[0].to.clone();
+        let id = vm.editor.nodes[1].node_id.clone();
+        let at = vm.editor.placement[1];
+        vm.move_node(&id, at.x + 10.0, at.y + 5.0);
+        assert_eq!(vm.editor_links()[0].to, before);
+        vm.move_node(&id, at.x + 10.0, at.y + 70.0);
+        let clamped = vm.map_model().links.remove(0);
+        assert!(clamped.b_span.0 >= clamped.span.0);
+        assert!(clamped.b_span.1 <= clamped.span.1);
+    }
 }
