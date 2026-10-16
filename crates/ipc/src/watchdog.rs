@@ -1,6 +1,6 @@
 //! The heartbeat watchdog, sans-IO.
 //!
-//! Two independent heartbeats exist in LAN Workspace and this type models only
+//! Two independent heartbeats exist in Bifrost and this type models only
 //! the local one (`docs/03-architecture.md`, «Что параметризуется» and rule 11):
 //!
 //! * core → agent: «core шлёт агенту `Ping` каждые `core_silence_ms / 4` (по

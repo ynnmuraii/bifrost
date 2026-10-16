@@ -1,4 +1,4 @@
-//! LAN Workspace transport: pinned TLS links, mesh dedup and liveness (KVM-032/070).
+//! Bifrost transport: pinned TLS links, mesh dedup and liveness (KVM-032/070).
 
 pub mod clipboard;
 pub mod convert;

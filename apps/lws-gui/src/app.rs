@@ -36,6 +36,7 @@ pub fn native_options() -> eframe::NativeOptions {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 720.0])
             .with_title(crate::TITLE)
+            .with_app_id("bifrost")
             .with_icon(egui::IconData {
                 rgba: rgba.to_vec(),
                 width,

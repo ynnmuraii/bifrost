@@ -1,4 +1,4 @@
-//! `lws-gui` — the LAN Workspace window: one binary, no web runtime.
+//! `lws-gui` — the Bifrost window: one binary, no web runtime.
 //!
 //! # Why eframe/egui with glow
 //!
@@ -45,11 +45,11 @@ pub use eframe::egui;
 
 /// The window's title, used by the binary and by the tests: the product name the owner
 /// reads in the title bar and in the taskbar. (The top bar draws the wordmark
-/// `MULTIDESKFLOW`, which is the logo's own style and stays as it is.)
-pub const TITLE: &str = "multideskflow";
+/// `BIFROST`, in the logo's pixel style.)
+pub const TITLE: &str = "Bifrost";
 
 /// Opens the window and returns when it is closed. This is the `gui` role of the one
-/// `multideskflow` executable (`apps/multideskflow`); `args` is argv after the program name and
+/// `bifrost` executable (`apps/bifrost`); `args` is argv after the program name and
 /// after the `gui` token, and the window reads its global flags (`--root`, …) from the process
 /// command line itself (`view_model::cli_args_from_env`, which ignores what it does not know).
 ///
@@ -60,7 +60,7 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
         Ok(lws_desktop::InstanceOutcome::Started(instance)) => instance,
         Ok(lws_desktop::InstanceOutcome::Existing) => return std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("multideskflow gui: single instance: {error}");
+            eprintln!("bifrost gui: single instance: {error}");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -76,7 +76,7 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
                 if let Err(error) =
                     lws_desktop::start_tray(&tray_args, lws_desktop::TRAY_START_TIMEOUT)
                 {
-                    eprintln!("multideskflow gui: tray: {error}");
+                    eprintln!("bifrost gui: tray: {error}");
                 }
             });
     }
@@ -103,14 +103,14 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
                 if let Err(error) =
                     lws_desktop::start_tray(&tray_args, lws_desktop::TRAY_START_TIMEOUT)
                 {
-                    eprintln!("multideskflow gui: tray: {error}");
+                    eprintln!("bifrost gui: tray: {error}");
                 }
             }
             std::process::ExitCode::SUCCESS
         }
         Err(error) => {
             // No console in this role on Windows; the message is for a terminal launch.
-            eprintln!("multideskflow gui: {error}");
+            eprintln!("bifrost gui: {error}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -118,10 +118,9 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    /// The owner reads the product name in the title bar and in the taskbar: it is the
-    /// lowercase brand, not «LAN Workspace» and not the `MULTIDESKFLOW` top-bar wordmark.
+    /// The owner reads the product name in the title bar and in the taskbar.
     #[test]
     fn the_window_title_is_the_product_name() {
-        assert_eq!(super::TITLE, "multideskflow");
+        assert_eq!(super::TITLE, "Bifrost");
     }
 }

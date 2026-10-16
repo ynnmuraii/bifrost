@@ -145,7 +145,7 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
     expect(
         &frame,
         &[
-            "MULTIDESKFLOW",
+            "BIFROST",
             "Служба работает",
             "192.168.1.24",
             "этот компьютер",
@@ -274,7 +274,7 @@ fn both_themes_draw_the_same_window() {
         };
         let mut harness = Harness::new();
         let frame = harness.settle(&vm, false);
-        expect(&frame, &["MULTIDESKFLOW", "2 компьютера · 2 экрана"]);
+        expect(&frame, &["BIFROST", "2 компьютера · 2 экрана"]);
     }
 }
 
@@ -1017,7 +1017,7 @@ fn the_language_switch_changes_the_window_and_is_stored() {
     vm.look.language = ui_text::Lang::En;
     let mut harness = Harness::new();
     let frame = harness.settle(&vm, false);
-    expect(&frame, &["MULTIDESKFLOW", "01 — MONITOR MAP"]);
+    expect(&frame, &["BIFROST", "01 — MONITOR MAP"]);
     assert!(
         !shows(&frame, "КАРТА МОНИТОРОВ"),
         "the Russian map line is gone"

@@ -1,4 +1,4 @@
-//! LAN Workspace input model: the single owner of the normalized input vocabulary
+//! Bifrost input model: the single owner of the normalized input vocabulary
 //! and of the mapping tables every backend shares.
 //!
 //! This crate is pure: no OS dependency, no I/O, no time, no allocation on the hot

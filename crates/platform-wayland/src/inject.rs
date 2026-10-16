@@ -42,7 +42,7 @@ use crate::{map_portal_error, BackendInfo, WaylandError, REMOTE_DESKTOP_INTERFAC
 /// `ConnectToEIS` requires version 2 of the RemoteDesktop interface.
 const REMOTE_DESKTOP_V2: u32 = 2;
 /// Handshake name the compositor logs for this client.
-const HANDSHAKE_NAME: &str = "lan-workspace";
+const HANDSHAKE_NAME: &str = "Bifrost";
 /// How long to wait for the EIS server to resume the device we asked for.
 const DEVICE_RESUME_TIMEOUT: Duration = Duration::from_secs(10);
 /// Collects companion devices arriving shortly after the first device resumes.

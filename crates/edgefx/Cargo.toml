@@ -1,11 +1,11 @@
 [package]
 name = "edgefx"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Edge effects of LAN Workspace: the pure logic (proximity, particles, state machines, rasterizer, cursor-veil lifecycle). No OS code."
+description = "Edge effects of Bifrost: the pure logic (proximity, particles, state machines, rasterizer, cursor-veil lifecycle). No OS code."
 
 [lints]
 workspace = true

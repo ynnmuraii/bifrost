@@ -58,7 +58,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use crate::error::IpcError;
 use crate::peer::{PeerCheck, PeerCredentials};
 
-/// Prefix of every LAN Workspace pipe name.
+/// Prefix of every Bifrost pipe name.
 pub const PIPE_NAME_PREFIX: &str = "lan-workspace-";
 /// The `\\.\pipe\` namespace prefix.
 pub const PIPE_PATH_PREFIX: &str = r"\\.\pipe\";

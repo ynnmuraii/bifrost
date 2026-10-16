@@ -1,4 +1,4 @@
-//! LAN Workspace session detection and backend selection (KVM-014 / KVM-025).
+//! Bifrost session detection and backend selection (KVM-014 / KVM-025).
 //!
 //! The decision is a **pure function** over an injectable [`EnvSnapshot`]:
 //! [`decide`] never touches the environment, the D-Bus or an X server, which is

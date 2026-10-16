@@ -40,6 +40,7 @@ pub struct InstanceGuard {
 
 /// An existing GUI is signalled to show before returning `Existing`.
 pub fn acquire(role: Role) -> io::Result<InstanceOutcome> {
+    // Keep the installed build's lock namespace so an old process is still detected.
     acquire_named(role, "multideskflow", true)
 }
 fn acquire_named(role: Role, namespace: &str, signal: bool) -> io::Result<InstanceOutcome> {

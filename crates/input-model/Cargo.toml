@@ -1,11 +1,11 @@
 [package]
 name = "input-model"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "LAN Workspace: normalized input events and HID<->evdev mapping tables"
+description = "Bifrost: normalized input events and HID<->evdev mapping tables"
 
 [lints]
 workspace = true

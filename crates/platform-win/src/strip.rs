@@ -368,7 +368,7 @@ fn run(rx: &Receiver<Command>, ready: &Sender<u32>) {
         return;
     };
     let instance = HINSTANCE(module.0);
-    let class = w!("MultideskflowEdgeStrip");
+    let class = w!("BifrostEdgeStrip");
     let window_class = WNDCLASSW {
         style: WNDCLASS_STYLES(0),
         lpfnWndProc: Some(proc),
@@ -387,7 +387,7 @@ fn run(rx: &Receiver<Command>, ready: &Sender<u32>) {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             class,
-            w!("multideskflow edge strip"),
+            w!("bifrost edge strip"),
             WS_POPUP,
             0,
             0,

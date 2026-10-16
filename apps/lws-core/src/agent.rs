@@ -1,4 +1,4 @@
-//! Core's supervision of the agent (`multideskflow agent …`): the per-launch channel, the launch token and
+//! Core's supervision of the agent (`bifrost agent …`): the per-launch channel, the launch token and
 //! the `RECOVERY` restart.
 //!
 //! `docs/03-architecture.md` («Кто кого запускает»): «`lws-agent` — Только core
@@ -817,7 +817,7 @@ fn clean_stale_launches(
 
 /// The agent program: this very executable, started in its `agent` role.
 ///
-/// One binary serves every role (`apps/multideskflow`), and the agent is still a process of
+/// One binary serves every role (`apps/bifrost`), and the agent is still a process of
 /// its own — crash isolation, the watchdog and the no-network rule all depend on that — so
 /// the supervisor spawns `current_exe() agent …` rather than a second file.
 pub fn agent_program() -> Result<PathBuf, String> {

@@ -14,10 +14,10 @@ struct Tray {
 }
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
-        "multideskflow".into()
+        "bifrost".into()
     }
     fn title(&self) -> String {
-        "multideskflow".into()
+        "Bifrost".into()
     }
     fn activate(&mut self, _: i32, _: i32) {
         let _ = self.commands.send(Action::Open);

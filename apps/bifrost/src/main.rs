@@ -1,4 +1,4 @@
-//! `multideskflow` — the one executable of LAN Workspace.
+//! `bifrost` — the one executable of Bifrost.
 //!
 //! It only chooses a role from `argv` and hands over the rest of the arguments:
 //!
@@ -27,6 +27,11 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("--version" | "-V") => {
+            console::attach_parent();
+            println!("Bifrost {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         None => lws_gui::run_gui(args),
         Some("gui") => {
             args.remove(0);

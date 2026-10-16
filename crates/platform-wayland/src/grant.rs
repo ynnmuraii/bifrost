@@ -272,5 +272,5 @@ impl From<&PortalGrant> for GrantRecord {
 }
 
 /// Header of the persisted file, including the security note.
-const FILE_HEADER: &str = "# multideskflow portal restore-token grants (KVM-017).\n\
+const FILE_HEADER: &str = "# Bifrost portal restore-token grants (KVM-017).\n\
                            # SECURITY: contains bearer tokens; restrict file permissions.\n";

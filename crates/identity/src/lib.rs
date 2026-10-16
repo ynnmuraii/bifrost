@@ -1,4 +1,4 @@
-//! LAN Workspace identity: node keys, pinned mTLS, the SAS pairing ceremony and the
+//! Bifrost identity: node keys, pinned mTLS, the SAS pairing ceremony and the
 //! trust store (KVM-030).
 //!
 //! # What a node identity is

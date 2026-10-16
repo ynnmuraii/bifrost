@@ -3,7 +3,7 @@ name: CI
 # The two runners gate different things, and that is deliberate. The ubuntu job
 # is the full one and runs on every push: it is the cheap runner (1x minutes,
 # ~8 minutes) and it is where the whole workspace is exercised, including the
-# multi-process harnesses of `apps/multideskflow/tests` and the Xvfb session
+# multi-process harnesses of `apps/bifrost/tests` and the Xvfb session
 # they need. The windows job is the expensive one (2x minutes) and keeps on the
 # push only what Windows alone can answer — see the `Test` steps at the bottom.
 # Its full run lives in `nightly.yml`.
@@ -15,11 +15,11 @@ on:
     # Markdown, no doc tree and no packaging text.
     #
     # `icon.ico`, `icon-32.rgba` and `apps/lws-gui/assets/fonts/*.ttf` are
-    # deliberately *not* in this list. `apps/multideskflow/build.rs` embeds the
+    # deliberately *not* in this list. `apps/bifrost/build.rs` embeds the
     # first into the executable (and declares it `rerun-if-changed`), and the
     # other two are `include_bytes!` inputs, so all three are build inputs like
     # any `.rs` file. The PNG and SVG copies of the icon are not:
-    # `apps/multideskflow/assets/generate_icons.py` generates them from
+    # `apps/bifrost/assets/generate_icons.py` generates them from
     # `icon.svg`, only `release.yml` opens them, and nothing in the build does.
     paths-ignore:
       - '**/*.md'
@@ -222,10 +222,10 @@ jobs:
         run: cargo deny --all-features check licenses
 
       # `cargo test` builds a package's *test* targets, and the two-core harnesses in
-      # `apps/multideskflow/tests` get the binary from `CARGO_BIN_EXE_multideskflow`. The
+      # `apps/bifrost/tests` get the binary from `CARGO_BIN_EXE_bifrost`. The
       # window's own two-core test (`apps/lws-gui/tests/cores.rs`) is a test of another package
-      # and looks for `multideskflow` in target/debug, as does the core when it spawns its
-      # agent (`multideskflow agent …` from its own executable). Build the workspace first.
+      # and looks for `bifrost` in target/debug, as does the core when it spawns its
+      # agent (`bifrost agent …` from its own executable). Build the workspace first.
       - name: Build
         run: cargo build --workspace
 
@@ -233,7 +233,7 @@ jobs:
       #
       # The agent used to be a separate executable, so the Windows build could prove it at
       # link time (no winsock import) and the Linux build by a symbol list. The one
-      # `multideskflow` executable links winsock for the core, and a symbol list over it says
+      # `bifrost` executable links winsock for the core, and a symbol list over it says
       # nothing about the agent, so both link-time checks are gone. What replaces them runs
       # on both runners, before `Test` so that a red suite cannot hide it:
       #
@@ -289,7 +289,7 @@ jobs:
       # `cargo test --workspace` there is what its minutes have always gone to:
       # in run 38865434698 the `Test` step was 15.2 of the job's 18.6 minutes,
       # and 723 of its 759 seconds of test execution were the five multi-process
-      # harnesses in `apps/multideskflow/tests` — `three_nodes` (287 s),
+      # harnesses in `apps/bifrost/tests` — `three_nodes` (287 s),
       # `fault_injection` (165 s), `clipboard` (110 s), `heartbeat_stress`
       # (64 s) and `layout` (35 s). Those harnesses are platform-neutral: they
       # spawn real cores, speak the real protocol and assert the same contracts
@@ -304,7 +304,7 @@ jobs:
       #
       #  * every crate's unit tests (`--lib --bins`), which is where the
       #    `cfg(windows)` units of `config`, `identity`, `ipc`, `transport` and
-      #    `multideskflow` are — `--bins` because the app's own units live in
+      #    `bifrost` are — `--bins` because the app's own units live in
       #    `main.rs`, and a bin-only package has no lib target to select;
       #  * the suites of the crates whose subject is Windows: `platform-win`
       #    (Win32 capture, injection, clipboard, DPI), `lws-agent` (netguard,

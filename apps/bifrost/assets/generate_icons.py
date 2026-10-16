@@ -63,7 +63,7 @@ def png(size, rgba):
 
 
 def main():
-    (ROOT.parents[2] / "packaging" / "multideskflow.svg").write_bytes((ROOT / "icon.svg").read_bytes())
+    (ROOT.parents[2] / "packaging" / "bifrost.svg").write_bytes((ROOT / "icon.svg").read_bytes())
     rectangles = []
     for element in ET.parse(ROOT / "icon.svg").getroot():
         if element.tag != "{http://www.w3.org/2000/svg}rect":

@@ -1,7 +1,7 @@
 # Third-party notices
 
 Generated file — do not edit by hand. It lists the third-party crates a shipped binary
-(`multideskflow`: core, agent, GUI and lightweight tray roles) contains, with their terms.
+(`bifrost`: core, agent, GUI and lightweight tray roles) contains, with their terms.
 The project itself is MIT: see [`../LICENSE`](../LICENSE).
 
 Regenerate from the repository root, after `cargo fetch`:

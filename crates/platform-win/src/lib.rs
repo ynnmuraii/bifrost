@@ -1,4 +1,4 @@
-//! Windows platform adapter spike for LAN Workspace: local input capture
+//! Windows platform adapter spike for Bifrost: local input capture
 //! (KVM-010) and synthetic input injection (KVM-011).
 //!
 //! This crate is the E1 spike for the Windows side of the native adapter. It is

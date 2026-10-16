@@ -1,4 +1,4 @@
-//! LAN Workspace Wayland backend: XDG desktop portal sessions plus EIS I/O (KVM-015..KVM-018).
+//! Bifrost Wayland backend: XDG desktop portal sessions plus EIS I/O (KVM-015..KVM-018).
 //!
 //! This crate is the only place in the product that speaks D-Bus and EIS. Everything
 //! it needs is pure Rust (`ashpd` for the portals, `reis` for the libei/EIS protocol),
