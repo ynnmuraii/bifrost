@@ -344,6 +344,16 @@ fn run(args: &Args) -> Result<(), Failure> {
             "wrote the first-run configuration"
         );
     }
+    // A file written by a build before `[input.hotkeys]` loaded above through the legacy
+    // keys; the core owns the file, so it rewrites it once here — through the same lock
+    // and the same whole-document writer as every other persistence. A failure is not
+    // fatal: `config` already carries the mapped bindings, and refusing to start over a
+    // cosmetic rewrite is exactly the failure this compatibility path exists to remove.
+    match config::migrate_legacy_hotkeys(&paths.config_file()) {
+        Ok(true) => tracing::info!("config migrated: legacy input hotkeys → [input.hotkeys]"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "cannot migrate the legacy hotkey keys"),
+    }
     // The probe runs *before* the runtime exists. On Linux `read_snapshot` reaches the
     // portals through zbus's blocking client, which drives its own runtime: called from
     // inside this one it panics («Cannot start a runtime from within a runtime») and core
