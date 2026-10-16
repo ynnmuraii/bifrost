@@ -768,7 +768,6 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
             node_id: lab.b_id.clone(),
             x: target.x,
             y: target.y,
-            snap_threshold: lws_gui::map::SNAP,
         },
         Instant::now(),
     );

@@ -488,17 +488,6 @@ impl ViewModel {
 
     /// A free drag: proximity creates links without changing the requested placement.
     pub fn move_node(&mut self, node_id: &str, x: f64, y: f64) {
-        self.move_node_with_threshold(node_id, x, y, map::SNAP);
-    }
-
-    /// Retains the UI threshold parameter without snapping the computer.
-    pub fn move_node_with_threshold(
-        &mut self,
-        node_id: &str,
-        x: f64,
-        y: f64,
-        _snap_threshold: f64,
-    ) {
         let Some(i) = self.index_of(node_id) else {
             return;
         };

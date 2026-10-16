@@ -485,7 +485,6 @@ fn a_dragged_computer_becomes_a_document_only_on_drop() {
         node_id: PEER_NODE.to_owned(),
         x: me.x + width + 5.0,
         y: me.y + 1.0,
-        snap_threshold: lws_gui::map::SNAP,
     });
     assert!(vm.editor.dirty());
     assert!((vm.editor.placement[peer].x - (me.x + width + 5.0)).abs() < 1e-6);
@@ -578,7 +577,6 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
         node_id: PEER_NODE.to_owned(),
         x: 700.0,
         y: 400.0,
-        snap_threshold: lws_gui::map::SNAP,
     });
     assert!(vm.editor.dirty());
     assert!(vm.map_model().links.is_empty());
@@ -888,7 +886,6 @@ fn every_wire_request_is_the_message_it_names() {
         node_id: PEER_NODE.to_owned(),
         x: 0.0,
         y: 0.0,
-        snap_threshold: lws_gui::map::SNAP,
     }
     .wire()
     .is_none());
@@ -921,7 +918,6 @@ fn move_to_side(vm: &mut ViewModel, side: Side) {
         node_id: PEER_NODE.to_owned(),
         x: target.x,
         y: target.y,
-        snap_threshold: lws_gui::map::SNAP,
     });
 }
 
@@ -1024,7 +1020,6 @@ fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
         node_id: PEER_NODE.to_owned(),
         x: baseline[index_of(&vm, SELF_NODE)].x + 20.0,
         y: baseline[index_of(&vm, SELF_NODE)].y + 20.0,
-        snap_threshold: lws_gui::map::SNAP,
     });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, baseline);
@@ -1036,7 +1031,6 @@ fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
         node_id: PEER_NODE.to_owned(),
         x: origin.x + vm.editor.shapes[this].w / 3.0,
         y: origin.y + vm.editor.shapes[this].h / 3.0,
-        snap_threshold: lws_gui::map::SNAP,
     });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(
@@ -1051,7 +1045,6 @@ fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
         node_id: PEER_NODE.to_owned(),
         x: origin.x + 20.0,
         y: origin.y + 20.0,
-        snap_threshold: lws_gui::map::SNAP,
     });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, accepted);
@@ -1136,7 +1129,6 @@ fn dragging_chooses_all_four_edges() {
             node_id: PEER_NODE.to_owned(),
             x: target.x,
             y: target.y,
-            snap_threshold: lws_gui::map::SNAP,
         });
         assert!((vm.editor.placement[peer].x - target.x).abs() < 1e-6);
         assert!((vm.editor.placement[peer].y - target.y).abs() < 1e-6);
@@ -1191,7 +1183,6 @@ fn dragging_chooses_all_four_edges() {
         node_id: PEER_NODE.to_owned(),
         x: me.x - peer_width - 4.0,
         y: me.y + 2.0,
-        snap_threshold: lws_gui::map::SNAP,
     });
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
     let link = &topology.links[0];

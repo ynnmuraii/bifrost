@@ -801,8 +801,6 @@ fn node_ui(
                         node_id: node.node_id.clone(),
                         x: drag.start.x + delta.x,
                         y: drag.start.y + delta.y,
-                        // Free placement: proximity creates a bridge, never a forced snap.
-                        snap_threshold: 0.0,
                     });
                 }
             }
