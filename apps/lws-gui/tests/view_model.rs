@@ -488,7 +488,7 @@ fn a_dragged_computer_becomes_a_document_only_on_drop() {
         snap_threshold: lws_gui::map::SNAP,
     });
     assert!(vm.editor.dirty());
-    assert!((vm.editor.placement[peer].x - (me.x + width)).abs() < 1e-6);
+    assert!((vm.editor.placement[peer].x - (me.x + width + 5.0)).abs() < 1e-6);
     assert_eq!(
         vm.editor.placement[peer].y,
         me.y + 1.0,
@@ -2023,7 +2023,7 @@ fn lower_half_contacts_keep_display_ids_and_round_trip_offsets() {
     ))));
     let ra = restored.editor.placement[a];
     let rb = restored.editor.placement[b];
-    assert!(((rb.x - ra.x) / restored.editor.scale - relative.x).abs() < 1e-6);
+    assert!(((rb.x - ra.x - lws_gui::map::GAP) / restored.editor.scale - relative.x).abs() < 1e-6);
     assert!(((rb.y - ra.y) / restored.editor.scale - relative.y).abs() < 1e-6);
     assert_eq!(restored.editor_links(), links);
     assert!(!restored.map_model().links[0].whole_desktop);
@@ -2131,8 +2131,20 @@ fn a_drop_in_empty_desktop_bounding_space_is_not_an_overlap() {
     let dropped = vm.editor.placement.clone();
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, dropped);
-    assert!(!vm.editor.dirty());
-    assert!(vm.take_outgoing().is_empty(), "no link edits need a CAS");
+    assert_eq!(
+        vm.editor_links().len(),
+        2,
+        "the peer faces both actual displays across gaps"
+    );
+    assert!(
+        vm.editor.save.sent.is_some(),
+        "valid facing links are saved"
+    );
+    assert_eq!(
+        vm.take_outgoing().len(),
+        1,
+        "one layout CAS, not an overlap rollback"
+    );
 }
 
 #[test]
@@ -2171,7 +2183,7 @@ fn legacy_mixed_auto_and_concrete_endpoints_reconstruct_and_survive() {
     let model = vm.map_model();
     assert_eq!(model.links.len(), 1);
     assert!(model.links[0].whole_desktop);
-    assert!((model.links[0].from.x - model.links[0].to.x).abs() < 1e-6);
+    assert!((model.links[0].to.x - model.links[0].from.x - lws_gui::map::GAP).abs() < 1e-6);
     assert!((model.links[0].span.0 - (model.links[0].to.y - 350.0 * vm.editor.scale)).abs() < 1e-6);
     let links = vm.editor_links();
     assert!(links[0].from.is_auto());
