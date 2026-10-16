@@ -147,6 +147,9 @@ Preparing-emergency harness стреляет аварийным сигналом
 а фазу подтверждает записанным focus — запуск CLI status не съедает окно prepare.
 Graceful-shutdown transport test устанавливает один link
 с одним инициатором и ждёт завершения formation events; dedup-races проверяются отдельно.
+Windows-регрессия захвата проверяет, что вооружённый Observe отдаёт движение при каждом
+drain, а фоновый lifetime-хук без BeginCapture пропускает только глобальные hotkeys.
+Один режим Observe используется в обоих случаях; наличие source baseline отличает их.
 
 ## Структура workspace
 
