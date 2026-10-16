@@ -136,11 +136,6 @@ impl UiState {
         }
     }
 
-    /// Reveal a junction after an explicit interaction; idle maps have no visible paddles.
-    pub fn reveal_paddles(&mut self, link_id: &str, now: Instant) {
-        self.reveal_paddle_at(link_id, self.t(now));
-    }
-
     fn reveal_paddle_at(&mut self, link_id: &str, time: f32) {
         if let Some(last) = self.paddle_reveals.get_mut(link_id) {
             *last = time;

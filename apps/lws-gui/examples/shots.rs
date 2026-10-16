@@ -534,7 +534,6 @@ fn shoot_with_paddle(
                     animate: live,
                 };
                 if let Some(drag) = paddle {
-                    ui_state.reveal_paddles("owner-gap", env.now);
                     if let Some(span) = drag {
                         if ui.input(|input| input.pointer.primary_down()) {
                             ui_state.paddle_drag = Some(ui::PaddleDrag {

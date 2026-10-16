@@ -1379,7 +1379,8 @@ mod tests {
         let at = vm.editor.placement[1];
         vm.move_node(&id, at.x + 10.0, at.y + 5.0);
         assert_eq!(vm.editor_links()[0].to, before);
-        vm.move_node(&id, at.x + 10.0, at.y + 70.0);
+        let shrinking_overlap = vm.editor.shapes[0].h - 10.0;
+        vm.move_node(&id, at.x + 10.0, at.y + shrinking_overlap);
         let clamped = vm.map_model().links.remove(0);
         assert!(clamped.b_span.0 >= clamped.span.0);
         assert!(clamped.b_span.1 <= clamped.span.1);
