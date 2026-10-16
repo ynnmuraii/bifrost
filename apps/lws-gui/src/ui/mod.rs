@@ -111,6 +111,7 @@ pub struct UiState {
     drag: Option<Drag>,
     pub paddle_drag: Option<PaddleDrag>,
     paddle_reveals: std::collections::HashMap<String, f32>,
+    paddle_hover: Option<String>,
     hover: Option<(usize, usize)>,
     applied: Option<Theme>,
     modal_open: Option<(Modal, f32)>,
@@ -127,6 +128,7 @@ impl UiState {
             drag: None,
             paddle_drag: None,
             paddle_reveals: std::collections::HashMap::new(),
+            paddle_hover: None,
             hover: None,
             applied: None,
             modal_open: None,
@@ -136,7 +138,15 @@ impl UiState {
 
     /// Reveal a junction after an explicit interaction; idle maps have no visible paddles.
     pub fn reveal_paddles(&mut self, link_id: &str, now: Instant) {
-        self.paddle_reveals.insert(link_id.to_owned(), self.t(now));
+        self.reveal_paddle_at(link_id, self.t(now));
+    }
+
+    fn reveal_paddle_at(&mut self, link_id: &str, time: f32) {
+        if let Some(last) = self.paddle_reveals.get_mut(link_id) {
+            *last = time;
+        } else {
+            self.paddle_reveals.insert(link_id.to_owned(), time);
+        }
     }
 
     fn t(&self, now: Instant) -> f32 {

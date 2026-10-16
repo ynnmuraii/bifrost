@@ -164,11 +164,15 @@ fn geometry(a: Pos2, b: Pos2, size: f32, horizontal: bool) -> (Pos2, Vec2, usize
     let mut delta = b - a;
     let mut start = a;
     // A touching seam has no gap: extend a short bridge evenly over both linked edges.
-    if delta.length_sq() < 0.01 {
+    let normal_gap = if horizontal {
+        delta.x.abs()
+    } else {
+        delta.y.abs()
+    };
+    if normal_gap < 0.1 {
         let direction = if horizontal { Vec2::X } else { Vec2::Y };
-        let middle = a + delta * 0.5;
-        delta = direction * size * 2.0;
-        start = middle - delta * 0.5;
+        start = a - direction * size;
+        delta += direction * size * 2.0;
     }
     let step = size * if horizontal { 0.65 } else { 1.2 };
     let columns = (delta.length() / step).floor().max(1.0) as usize;
@@ -179,6 +183,22 @@ fn geometry(a: Pos2, b: Pos2, size: f32, horizontal: bool) -> (Pos2, Vec2, usize
 mod tests {
     use super::*;
     use eframe::egui;
+
+    #[test]
+    fn touching_independent_paddles_keep_a_narrow_normal_seam() {
+        for horizontal in [true, false] {
+            let a = egui::pos2(100.0, 100.0);
+            let b = a + if horizontal {
+                Vec2::new(0.0, 30.0)
+            } else {
+                Vec2::new(30.0, 0.0)
+            };
+            let (start, delta, _) = geometry(a, b, 9.0, horizontal);
+            assert_eq!(start + delta * 0.5, a + (b - a) * 0.5);
+            assert_eq!(if horizontal { delta.x } else { delta.y }, 18.0);
+            assert_eq!(if horizontal { delta.y } else { delta.x }, 30.0);
+        }
+    }
 
     #[test]
     fn cached_glyphs_refresh_when_the_font_atlas_is_rebuilt_at_the_same_scale() {
