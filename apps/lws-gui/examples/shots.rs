@@ -57,6 +57,7 @@ fn main() -> std::process::ExitCode {
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(150)
         .clamp(70, 150);
+    let ascii = args.iter().any(|arg| arg == "--ascii");
     let snapshot = if real {
         match real_snapshot(CliArgs::parse(args)) {
             Ok(view) => Some(view),
@@ -84,11 +85,20 @@ fn main() -> std::process::ExitCode {
             let mut view = snapshot.clone();
             view.look.language = lang;
             view.look.theme = theme;
+            if ascii {
+                view.look.link_style = lws_gui::gui_settings::LinkStyle::Ascii;
+            }
             view.modal = None;
             states.push((format!("{prefix}-main-{tag}"), view.clone()));
             let mut zoomed = view.clone();
             zoomed.look.zoom_percent = zoom;
             states.push((format!("{prefix}-zoom-{tag}"), zoomed));
+            if let Some(owner) = with_owner_left_peer(&view) {
+                states.push((format!("{prefix}-owner150-{tag}"), owner.clone()));
+                let mut owner100 = owner;
+                owner100.look.zoom_percent = 100;
+                states.push((format!("{prefix}-owner100-{tag}"), owner100));
+            }
             states.push((format!("{prefix}-window-{tag}"), with_window(view.clone())));
             if let Some(stacked) = with_vertical_peer(&view) {
                 states.push((format!("{prefix}-vertical-{tag}"), stacked));
@@ -536,6 +546,65 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
         });
     }
     Some(view)
+}
+
+/// The owner's reference arrangement, rendered from the real reported displays only.
+/// This is an offscreen copy: it never applies a placement to the service.
+fn with_owner_left_peer(view: &ViewModel) -> Option<ViewModel> {
+    let pc = view
+        .editor
+        .nodes
+        .iter()
+        .find(|node| node.displays.len() == 2)?;
+    let laptop = view
+        .editor
+        .nodes
+        .iter()
+        .find(|node| node.node_id != pc.node_id && node.displays.len() == 1)?;
+    let document = ipc::TopologyDoc {
+        revision: view.editor.revision,
+        author_node_id: view.editor.author.clone(),
+        members: view
+            .editor
+            .nodes
+            .iter()
+            .map(|node| ipc::MemberTopology {
+                node_id: node.node_id.clone(),
+                display_name: node.display_name.clone(),
+                online: node.online,
+                displays: node
+                    .displays
+                    .iter()
+                    .map(|display| ipc::DisplayView {
+                        id: display.id.clone(),
+                        logical_x: display.x,
+                        logical_y: display.y,
+                        logical_w: display.w,
+                        logical_h: display.h,
+                        rotation_degrees: display.rotation,
+                        primary: display.primary,
+                        native_known: display.native_known,
+                        scale: 1.0,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        links: vec![ipc::LinkView {
+            id: "owner-left-reference".to_owned(),
+            from: auto(&pc.node_id, "LEFT"),
+            to: auto(&laptop.node_id, "RIGHT"),
+            bidirectional: true,
+            active: true,
+            inactive_reason: String::new(),
+            auto_displays: Vec::new(),
+        }],
+    };
+    let mut owner = view.clone();
+    owner.apply(event(Msg::TopologyDoc(document)));
+    owner.look.zoom_percent = 150;
+    owner.look.pan_x = 0;
+    owner.look.pan_y = 0;
+    Some(owner)
 }
 
 /// The same, with an open pairing window instead of a prompt.

@@ -6,7 +6,7 @@ use eframe::egui::{
     self, Align, Color32, Layout, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, UiBuilder, Vec2,
 };
 
-use super::field::{Flow, Frame, Ribbon};
+use super::field::Frame;
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
 use super::{Env, UiState, FIELD_FRAME};
@@ -15,15 +15,6 @@ use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
 use ui_text::{text, Key};
-
-/// How high the ribbon of «ASCII-изолиния» arches over the cards it runs between, as a share of
-/// the base: the distance between the two card centres.
-const RIBBON_RISE: f32 = 0.35;
-/// The flattest the arch may ever be, in points: a ribbon hugging the cards reads as a scratch.
-const RIBBON_RISE_MIN: f32 = 40.0;
-/// The tallest, in points per unit of zoom — the mockup's own 110
-/// (`docs/design/mockup/Main.dc.html`), which is the stage's scale to the window.
-const RIBBON_ARCH: f32 = 110.0;
 
 /// Stage → screen.
 #[derive(Clone, Copy)]
@@ -81,6 +72,17 @@ pub fn draw(
     // the field simulates for as long as it is over the map, and it is the field that says
     // whether it is still moving, so a settled field stops the frames and keeps its state.
     let simulate = pointer.is_some() && env.animate && vm.modal.is_none() && !vm.appearance_open;
+    let bridge_live = vm.look.link_style == LinkStyle::Ascii
+        && model
+            .links
+            .iter()
+            .any(|link| matches!(link.state, LinkState::Active | LinkState::Idle));
+    st.bridge.tick(t, simulate && bridge_live);
+    let rtt = vm
+        .status
+        .as_ref()
+        .and_then(|status| single_peer_rtt(status, vm.self_node()));
+    st.bridge.set_latency(&painter, lang, rtt);
     let mut xf = Xf::new(rect, vm.look.zoom_percent);
     xf.origin += pan(ui, vm, rect, actions);
     let s = xf.s;
@@ -107,47 +109,12 @@ pub fn draw(
         })
         .collect();
 
-    // The ribbon of «ASCII-изолиния»: it runs from the centre of one card to the centre of the
-    // other and arches gently over both, so it reads as an arc rather than a column over the gap.
-    let zoom = f32::from(vm.look.zoom_percent) / 100.0;
-    let card = |n: usize| {
-        Rect::from_min_size(
-            shown[n],
-            Vec2::new(model.nodes[n].w as f32 * s, model.nodes[n].h as f32 * s),
-        )
-    };
-    let flows: Vec<Flow> = model
-        .links
-        .iter()
-        .filter(|l| l.state == LinkState::Active)
-        .map(|l| {
-            let (a, b) = link_ends(&model, l, &shown, xf);
-            let (from, to) = if l.forward { (a, b) } else { (b, a) };
-            let arc = ribbon_arc(card(l.a), card(l.b), zoom);
-            let arc = if l.forward {
-                arc
-            } else {
-                Ribbon {
-                    a: arc.b,
-                    c: arc.c,
-                    b: arc.a,
-                }
-            };
-            Flow {
-                from,
-                to,
-                horizontal: l.dir == Dir::Horizontal,
-                arc,
-            }
-        })
-        .collect();
-
     // Hover identity may stay the same while the card glides, zooms or pans.
     // Retarget before painting so the outline uses this frame's displayed geometry.
     if simulate && st.drag.is_none() {
-        if let Some((n, m)) = st.hover {
-            if let Some(mon) = model.nodes.get(n).and_then(|node| node.mons.get(m)) {
-                let local = monitor_rect(shown[n], mon.rect, s).translate(-rect.min.to_vec2());
+        if let Some((n, _)) = st.hover {
+            if let Some(node) = model.nodes.get(n) {
+                let local = node_rect(shown[n], node, s).translate(-rect.min.to_vec2());
                 st.field.retarget_form(local);
             }
         }
@@ -162,7 +129,6 @@ pub fn draw(
             simulate,
             t,
             pointer,
-            flows: &flows,
         },
     );
 
@@ -197,12 +163,31 @@ pub fn draw(
             actions,
         );
     }
+    if bridge_live {
+        for link in model
+            .links
+            .iter()
+            .filter(|link| matches!(link.state, LinkState::Active | LinkState::Idle))
+        {
+            let (a, b) = link_ends(&model, link, &shown, xf);
+            st.bridge.paint(
+                &painter,
+                a,
+                b,
+                link.forward,
+                link.dir == Dir::Horizontal,
+                f32::from(vm.look.zoom_percent) / 100.0,
+                (link.span.1 - link.span.0) as f32 * s,
+                pal.accent,
+            );
+            st.bridge.paint_latency(&painter, a + (b - a) * 0.5, pal);
+        }
+    }
     if simulate && hovered != st.hover {
         match hovered {
-            Some((n, m)) if simulate && st.drag.is_none() => {
+            Some((n, _)) if simulate && st.drag.is_none() => {
                 let node = &model.nodes[n];
-                let r = node.mons[m].rect;
-                let local = monitor_rect(shown[n], r, s).translate(-rect.min.to_vec2());
+                let local = node_rect(shown[n], node, s).translate(-rect.min.to_vec2());
                 st.field.form(local);
             }
             _ => st.field.release(),
@@ -241,9 +226,9 @@ pub fn draw(
         }
     }
     banner(ui, pal, vm, rect, actions);
-    // The field is the only thing here that moves by itself, and it says when it has stopped:
-    // a settled field draws its converged particles and asks for no further frames.
-    moving.then_some(FIELD_FRAME)
+    // A bridge has its own clock: a static or settled background must not stop its flow.
+    // Both layers freeze without scheduling frames when the map/window is inactive.
+    (moving || (simulate && bridge_live)).then_some(FIELD_FRAME)
 }
 
 fn pan(ui: &egui::Ui, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) -> Vec2 {
@@ -448,7 +433,9 @@ fn draw_link(
         LinkState::Idle => {}
     }
     let color = fade(color, alpha);
-    if style == LinkStyle::Ascii {
+    if style == LinkStyle::Ascii && matches!(link.state, LinkState::Active | LinkState::Idle) {
+        // Painted above the cards so a touching seam remains visible.
+    } else if style == LinkStyle::Ascii {
         field.link(painter, a, b, color);
     } else {
         painter.add(Shape::dashed_line(
@@ -498,25 +485,25 @@ fn fade(c: Color32, k: f32) -> Color32 {
     c.gamma_multiply(k)
 }
 
-/// The ribbon of one link: it leaves the centre of the first card, arrives at the centre of the
-/// second, and arches gently over both — a share of the base, floored so it never hugs the cards
-/// and capped against the map's zoom. The field is drawn under the cards, so the ends of the
-/// ribbon are covered by the cards themselves and only the arch is seen.
-fn ribbon_arc(first: Rect, second: Rect, zoom: f32) -> Ribbon {
-    let (a, b) = (first.center(), second.center());
-    let rise = ((b - a).length() * RIBBON_RISE).clamp(RIBBON_RISE_MIN, RIBBON_ARCH * zoom);
-    Ribbon {
-        a,
-        c: Pos2::new((a.x + b.x) / 2.0, a.y.min(b.y) - rise),
-        b,
-    }
-}
-
 fn monitor_rect(at: Pos2, r: crate::map::Rect, s: f32) -> Rect {
     Rect::from_min_size(
         at + Vec2::new(r.x as f32 * s, r.y as f32 * s),
         Vec2::new(r.w as f32 * s, r.h as f32 * s),
     )
+}
+
+fn node_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
+    Rect::from_min_size(at, Vec2::new(node.w as f32 * scale, node.h as f32 * scale))
+}
+
+fn single_peer_rtt(status: &protocol::ipc::Status, local: Option<&str>) -> Option<u32> {
+    let local = local?;
+    let peers = status
+        .members
+        .iter()
+        .filter(|member| member.online && member.node_id != local)
+        .count();
+    (peers == 1 && status.rtt_p95_us > 0).then_some(status.rtt_p95_us)
 }
 
 /// One computer: its displays (draggable), and the caption under it.
@@ -537,6 +524,18 @@ fn node_ui(
     let s = xf.s;
     let fs = s.clamp(0.8, 1.0);
     let k = if node.online { 1.0 } else { 0.62 };
+    let system_hot = enabled
+        && (ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| node_rect(at, node, s).contains(p))
+            || st
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.node_id == node.node_id)
+            || ui.memory(|mem| {
+                (0..node.mons.len())
+                    .any(|m| mem.has_focus(egui::Id::new(("mon", &node.node_id, m))))
+            }));
     for (m, mon) in node.mons.iter().enumerate() {
         let rect = monitor_rect(at, mon.rect, s);
         let id = egui::Id::new(("mon", &node.node_id, m));
@@ -612,13 +611,13 @@ fn node_ui(
             }
         }
         if enabled && response.hovered() && st.drag.is_none() {
-            *hovered = Some((index, m));
+            *hovered = Some((index, 0));
         }
         if !painter.clip_rect().intersects(rect) {
             continue;
         }
 
-        let hot = response.hovered() || response.dragged() || response.has_focus();
+        let hot = system_hot;
         let dragging = response.dragged();
         let shadow = if dragging {
             egui::epaint::Shadow {
@@ -636,33 +635,13 @@ fn node_ui(
             }
         };
         let radius = pal.rad_sm();
-        if node.target {
-            painter.add(
-                egui::epaint::Shadow {
-                    offset: [0, 16],
-                    blur: 44,
-                    spread: 0,
-                    color: pal.glow,
-                }
-                .as_shape(rect, radius),
-            );
-        } else {
-            painter.add(shadow.as_shape(rect, radius));
-        }
+        painter.add(shadow.as_shape(rect, radius));
         let border = if node.target || hot {
             pal.accent
         } else {
             pal.line
         };
         painter.rect_filled(rect, radius, fade(pal.card, k));
-        if node.target {
-            painter.rect_stroke(
-                rect.expand(1.5),
-                radius,
-                Stroke::new(2.0, fade(pal.accent, k)),
-                StrokeKind::Outside,
-            );
-        }
         let stroke = Stroke::new(1.5, fade(border, k));
         if node.approx {
             dashed_rect(painter, rect.shrink(0.75), stroke);
@@ -917,33 +896,6 @@ mod transform_tests {
         }
     }
 
-    #[test]
-    fn the_ribbon_runs_from_centre_to_centre_under_a_gentle_arch() {
-        let first = Rect::from_min_size(Pos2::new(0.0, 100.0), Vec2::new(200.0, 120.0));
-        let second = Rect::from_min_size(Pos2::new(400.0, 200.0), Vec2::new(160.0, 90.0));
-        let zoom = 1.0;
-        let ribbon = ribbon_arc(first, second, zoom);
-        // The ends are the centres of the cards: the base is their own distance, not the gap.
-        assert!(ribbon.a.distance(first.center()) < 0.001, "{ribbon:?}");
-        assert!(ribbon.b.distance(second.center()) < 0.001, "{ribbon:?}");
-        let base = ribbon.a.distance(ribbon.b);
-        assert!((ribbon.c.x - (ribbon.a.x + ribbon.b.x) / 2.0).abs() < 0.001);
-        // A gentle arch over them: a share of the base, floored and capped.
-        let rise = ribbon.a.y.min(ribbon.b.y) - ribbon.c.y;
-        assert!(
-            (rise - (base * RIBBON_RISE).clamp(RIBBON_RISE_MIN, RIBBON_ARCH * zoom)).abs() < 0.001,
-            "{rise}"
-        );
-        assert!(rise >= RIBBON_RISE_MIN && rise <= RIBBON_ARCH * zoom);
-        // Not a column over the gap: much wider than it is tall.
-        assert!(base > 2.0 * rise, "base {base} rise {rise}");
-        // And it passes above both cards rather than through them.
-        assert!(
-            ribbon.c.y < first.min.y && ribbon.c.y < second.min.y,
-            "{ribbon:?}"
-        );
-    }
-
     fn owner_layout() -> MapModel {
         use crate::map::{self, DocLink, Rect as MapRect};
         use crate::view_model::{layout::MapMonitor, Side};
@@ -1012,6 +964,52 @@ mod transform_tests {
     }
 
     #[test]
+    fn aggregate_rtt_is_only_attributed_to_exactly_one_online_peer() {
+        use protocol::ipc::{MemberStatus, Status};
+        let member = |id: &str, online| MemberStatus {
+            node_id: id.to_owned(),
+            online,
+            ..Default::default()
+        };
+        let mut status = Status {
+            rtt_p95_us: 1_500,
+            members: vec![member("local", true), member("peer", true)],
+            ..Default::default()
+        };
+        assert_eq!(single_peer_rtt(&status, Some("local")), Some(1_500));
+        assert_eq!(single_peer_rtt(&status, None), None);
+        status.members.push(member("offline", false));
+        assert_eq!(single_peer_rtt(&status, Some("local")), Some(1_500));
+        status.members.push(member("second", true));
+        assert_eq!(single_peer_rtt(&status, Some("local")), None);
+        status.members.pop();
+        status.rtt_p95_us = 0;
+        assert_eq!(single_peer_rtt(&status, Some("local")), None);
+        status.members[1].online = false;
+        status.rtt_p95_us = 1_500;
+        assert_eq!(single_peer_rtt(&status, Some("local")), None);
+    }
+
+    #[test]
+    fn owner_system_hover_encloses_every_monitor_with_one_group_rectangle() {
+        let model = owner_layout();
+        let node = model
+            .nodes
+            .iter()
+            .find(|node| node.mons.len() == 2)
+            .unwrap();
+        let at = Pos2::new(70.0, 90.0);
+        for scale in [0.7, 1.0, 1.5] {
+            let group = node_rect(at, node, scale);
+            for monitor in &node.mons {
+                let rect = monitor_rect(at, monitor.rect, scale);
+                assert!(group.contains_rect(rect));
+            }
+            assert_eq!(group.min, at);
+        }
+    }
+
+    #[test]
     fn separated_owner_desktops_have_visible_links_and_external_rails_in_both_styles() {
         let model = owner_layout();
         assert_eq!(model.links.len(), 1);
@@ -1032,6 +1030,23 @@ mod transform_tests {
                 assert!(b.x - a.x > 30.0);
                 let mut field = super::super::field::Field::new();
                 let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let look = Look {
+                        field: crate::gui_settings::FieldMode::Off,
+                        link_style: style,
+                        clouds: false,
+                        ..Look::default()
+                    };
+                    field.paint(
+                        ui.painter(),
+                        &Frame {
+                            map: ui.ctx().content_rect(),
+                            pal: &pal,
+                            look,
+                            simulate: false,
+                            t: 0.0,
+                            pointer: None,
+                        },
+                    );
                     draw_link(
                         ui.painter(),
                         &pal,
@@ -1042,6 +1057,18 @@ mod transform_tests {
                         style,
                         &mut field,
                     );
+                    if style == LinkStyle::Ascii {
+                        super::super::bridge::Bridge::default().paint(
+                            ui.painter(),
+                            a,
+                            b,
+                            link.forward,
+                            true,
+                            1.5,
+                            120.0,
+                            pal.accent,
+                        );
+                    }
                 });
                 let mut rails = 0;
                 let mut chain = 0;
@@ -1077,6 +1104,16 @@ mod transform_tests {
                 }
                 assert_eq!(rails, 2, "{style:?} {state:?}");
                 assert!(chain > 2, "{style:?} {state:?}");
+                let glyphs = output
+                    .shapes
+                    .iter()
+                    .filter(|s| matches!(&s.shape, Shape::Text(t) if matches!(t.galley.text(), ">" | "<" | "^" | "v")))
+                    .count();
+                assert_eq!(
+                    glyphs > 0,
+                    style == LinkStyle::Ascii,
+                    "static field must not hide ASCII bridge or add glyphs to Line"
+                );
                 output.drop_without_applying_deltas();
             }
         }

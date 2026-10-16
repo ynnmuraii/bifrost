@@ -18,6 +18,7 @@
 //! otherwise.
 
 mod appearance;
+mod bridge;
 mod dock;
 mod field;
 mod map_view;
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 
+pub use bridge::Bridge as AsciiBridge;
 pub use field::{Field, Frame as FieldFrame};
 pub use theme::{install_fonts, Palette};
 
@@ -87,6 +89,7 @@ pub struct UiState {
     started: Instant,
     /// The particle field.
     pub field: Field,
+    bridge: bridge::Bridge,
     drag: Option<Drag>,
     hover: Option<(usize, usize)>,
     applied: Option<Theme>,
@@ -100,6 +103,7 @@ impl UiState {
         UiState {
             started: now,
             field: Field::new(),
+            bridge: bridge::Bridge::default(),
             drag: None,
             hover: None,
             applied: None,
