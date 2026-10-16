@@ -184,6 +184,46 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
 }
 
 #[test]
+fn a_link_whose_display_is_missing_is_named_on_the_map() {
+    // Nothing is said while every link names a display that was reported.
+    let mut harness = Harness::new();
+    let frame = harness.settle(&connected(), false);
+    assert!(
+        !shows(&frame, "неактивна"),
+        "a usable link earns no notice: {:?}",
+        frame.texts
+    );
+
+    let end = |node: &str, display: &str, edge: &str| {
+        Some(ipc::EndpointView {
+            node_id: node.to_owned(),
+            display_id: display.to_owned(),
+            edge: edge.to_owned(),
+            segment_start: 100.0,
+            segment_end: 500.0,
+        })
+    };
+    let mut vm = connected();
+    let mut doc = two_node_doc(15);
+    doc.links = vec![ipc::LinkView {
+        id: "contact".to_owned(),
+        from: end(SELF_NODE, "\\\\.\\DISPLAY1", "RIGHT"),
+        to: end(PEER_NODE, "eDP-1", "LEFT"),
+        bidirectional: true,
+        active: false,
+        inactive_reason: "eDP-1".to_owned(),
+        auto_displays: Vec::new(),
+    }];
+    vm.apply(event(Msg::TopologyDoc(doc)));
+
+    let frame = harness.settle(&vm, false);
+    expect(
+        &frame,
+        &["Связь contact неактивна: экран «eDP-1» не найден"],
+    );
+}
+
+#[test]
 fn collapsed_pairing_keeps_only_its_clear_expand_handle() {
     let mut vm = connected();
     vm.look.dock_open = false;

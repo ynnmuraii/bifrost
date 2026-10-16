@@ -172,7 +172,12 @@ impl ViewModel {
                         self.endpoint_segment(b, &link.to, map::BASE_SCALE)?,
                     ))
                 };
-                (a != b).then_some(DocLink { a, side, b, contact })
+                (a != b).then_some(DocLink {
+                    a,
+                    side,
+                    b,
+                    contact,
+                })
             })
             .collect()
     }
@@ -188,8 +193,16 @@ impl ViewModel {
         if endpoint.is_auto() {
             let min_x = displays.iter().map(|d| d.x).fold(f64::INFINITY, f64::min);
             let min_y = displays.iter().map(|d| d.y).fold(f64::INFINITY, f64::min);
-            let w = displays.iter().map(|d| d.x + d.w - min_x).fold(0.0, f64::max) * scale;
-            let h = displays.iter().map(|d| d.y + d.h - min_y).fold(0.0, f64::max) * scale;
+            let w = displays
+                .iter()
+                .map(|d| d.x + d.w - min_x)
+                .fold(0.0, f64::max)
+                * scale;
+            let h = displays
+                .iter()
+                .map(|d| d.y + d.h - min_y)
+                .fold(0.0, f64::max)
+                * scale;
             return Some(match endpoint.edge {
                 config::Edge::Left => Rect::new(0.0, 0.0, 0.0, h),
                 config::Edge::Right => Rect::new(w, 0.0, 0.0, h),
@@ -240,13 +253,12 @@ impl ViewModel {
         self.editor.baseline = arrangement.pos.clone();
         self.editor.placement = arrangement.pos;
         if let Some(wanted) = &self.editor.save.wanted {
-            self.editor.placement =
-                map::place_at_scale(
-                    &self.editor.shapes,
-                    &self.doc_links_from(wanted),
-                    anchor,
-                    self.editor.scale,
-                );
+            self.editor.placement = map::place_at_scale(
+                &self.editor.shapes,
+                &self.doc_links_from(wanted),
+                anchor,
+                self.editor.scale,
+            );
             self.editor.save.placement = Some(self.editor.placement.clone());
         }
     }
@@ -485,8 +497,9 @@ impl ViewModel {
             .collect()
     }
 
-    /// Preserve untouched document pairs; moved pairs are replaced by their exact contacts.
-    pub(crate) fn editor_links(&self) -> Vec<config::LinkConfig> {
+    /// The links the map draft would save: untouched document pairs as they are, moved pairs
+    /// as their exact contacts. The document's own text comes from this.
+    pub fn editor_links(&self) -> Vec<config::LinkConfig> {
         let applied = self.applied_links();
         if !self.editor.dirty() || self.editor.placement.len() != self.editor.nodes.len() {
             return applied.into_iter().map(|(_, link)| link).collect();
@@ -533,8 +546,14 @@ impl ViewModel {
                 }
             };
             // A guessed desktop has no stable display identity to persist.
-            if self.editor.nodes[link.a].displays.get(link.a_display).is_none()
-                || self.editor.nodes[link.b].displays.get(link.b_display).is_none()
+            if self.editor.nodes[link.a]
+                .displays
+                .get(link.a_display)
+                .is_none()
+                || self.editor.nodes[link.b]
+                    .displays
+                    .get(link.b_display)
+                    .is_none()
             {
                 continue;
             }
@@ -665,27 +684,57 @@ impl ViewModel {
         let dirty = editor.dirty();
         let mut links = Vec::new();
         for doc in self.editor_links() {
-            let Some(a) = editor.nodes.iter().position(|n| node_reference(&n.node_id) == doc.from.node) else {
+            let Some(a) = editor
+                .nodes
+                .iter()
+                .position(|n| node_reference(&n.node_id) == doc.from.node)
+            else {
                 continue;
             };
-            let Some(b) = editor.nodes.iter().position(|n| node_reference(&n.node_id) == doc.to.node) else {
+            let Some(b) = editor
+                .nodes
+                .iter()
+                .position(|n| node_reference(&n.node_id) == doc.to.node)
+            else {
                 continue;
             };
             let whole_desktop = doc.from.is_auto() || doc.to.is_auto();
             let mut missing = false;
             let mut endpoint = |node: usize, e: &config::EndpointConfig| {
-                let local = self.endpoint_segment(node, e, editor.scale).unwrap_or_else(|| {
-                    missing |= !e.is_auto();
-                    let shape = &editor.shapes[node];
-                    let start = e.start * editor.scale;
-                    let length = (e.end - e.start) * editor.scale;
-                    match e.edge {
-                        config::Edge::Left => Rect::new(0.0, start, 0.0, if e.is_auto() { shape.h } else { length }),
-                        config::Edge::Right => Rect::new(shape.w, start, 0.0, if e.is_auto() { shape.h } else { length }),
-                        config::Edge::Top => Rect::new(start, 0.0, if e.is_auto() { shape.w } else { length }, 0.0),
-                        config::Edge::Bottom => Rect::new(start, shape.h, if e.is_auto() { shape.w } else { length }, 0.0),
-                    }
-                });
+                let local = self
+                    .endpoint_segment(node, e, editor.scale)
+                    .unwrap_or_else(|| {
+                        missing |= !e.is_auto();
+                        let shape = &editor.shapes[node];
+                        let start = e.start * editor.scale;
+                        let length = (e.end - e.start) * editor.scale;
+                        match e.edge {
+                            config::Edge::Left => Rect::new(
+                                0.0,
+                                start,
+                                0.0,
+                                if e.is_auto() { shape.h } else { length },
+                            ),
+                            config::Edge::Right => Rect::new(
+                                shape.w,
+                                start,
+                                0.0,
+                                if e.is_auto() { shape.h } else { length },
+                            ),
+                            config::Edge::Top => Rect::new(
+                                start,
+                                0.0,
+                                if e.is_auto() { shape.w } else { length },
+                                0.0,
+                            ),
+                            config::Edge::Bottom => Rect::new(
+                                start,
+                                shape.h,
+                                if e.is_auto() { shape.w } else { length },
+                                0.0,
+                            ),
+                        }
+                    });
                 let at = editor.placement[node];
                 Rect::new(at.x + local.x, at.y + local.y, local.w, local.h)
             };
