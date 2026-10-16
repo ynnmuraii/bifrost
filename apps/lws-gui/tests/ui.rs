@@ -751,6 +751,23 @@ fn assert_no_layout_requests(bridge: &lws_gui::view_model::Bridge) {
 #[test]
 fn map_drag_frames_focus_loss_modal_close_and_reconnect_never_save() {
     let mut bridge = dry_bridge();
+    // Explicitly touch the pair: the right-arrow step must overlap the peer.
+    // A keyboard edit is otherwise valid in the new free-placement map, including
+    // gaps and disconnected computers.
+    let editor = &mut bridge.view_mut().editor;
+    let local = editor
+        .nodes
+        .iter()
+        .position(|node| node.node_id == SELF_NODE)
+        .unwrap();
+    let peer = editor
+        .nodes
+        .iter()
+        .position(|node| node.node_id == PEER_NODE)
+        .unwrap();
+    editor.placement[local].x = editor.placement[peer].x - editor.shapes[local].w;
+    editor.placement[local].y = editor.placement[peer].y;
+    editor.baseline.clone_from(&editor.placement);
     let mut harness = Harness::new();
     harness.settle(bridge.view(), false);
 
@@ -841,11 +858,20 @@ fn enter_in_the_dial_field_only_pairs_even_with_a_dirty_layout() {
     let mut bridge = dry_bridge();
     let address = "192.168.1.10:47901";
     bridge.view_mut().pairing.address = address.to_owned();
+    let peer = bridge
+        .view()
+        .editor
+        .nodes
+        .iter()
+        .position(|node| node.node_id == PEER_NODE)
+        .unwrap();
+    let at = bridge.view().editor.placement[peer];
     bridge.dispatch(
-        Action::NudgeNode {
+        Action::MoveNode {
             node_id: PEER_NODE.to_owned(),
-            dx: 16.0,
-            dy: 0.0,
+            x: at.x + 16.0,
+            y: at.y,
+            snap_threshold: 0.0,
         },
         Instant::now(),
     );
