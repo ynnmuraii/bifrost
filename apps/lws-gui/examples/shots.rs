@@ -12,6 +12,8 @@
 //! 1745×1091 and 1280×720, including every modal, appearance and disconnected states.
 //! `--prefix NAME` overrides the prefix; `--zoom PCT` sets the real-mode zoom picture.
 //! Rendering is offscreen through egui_kittest/wgpu and requires a working GPU adapter.
+//! `--placement` writes only the owner placement sequence (before, preview, accepted)
+//! at 1745×1091 in RU/EN and light/dark, using mocks and real move/drop actions.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -46,6 +48,9 @@ fn main() -> std::process::ExitCode {
             .map(|pair| pair[1].clone())
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    if args.iter().any(|arg| arg == "--placement") {
+        return placement_shots(&dir, option("--prefix").as_deref().unwrap_or("placement"));
+    }
     let real = args.iter().any(|arg| arg == "--live" || arg == "--root");
     let prefix =
         option("--prefix").unwrap_or_else(|| if real { "real" } else { "polish" }.to_owned());
@@ -170,6 +175,100 @@ fn main() -> std::process::ExitCode {
     }
     println!("{written} pictures in {}", dir.display());
     std::process::ExitCode::SUCCESS
+}
+
+/// Deterministic offscreen alternative to pointer dragging: the same model operations
+/// as the map, followed by a mocked core acknowledgment of the actual submitted links.
+fn placement_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
+    let render = || -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+            for (theme_tag, theme) in [("light", Theme::Light), ("dark", Theme::Dark)] {
+                let mut vm = mockup(theme, None, lang);
+                let mut doc = ipc::TopologyDoc {
+                    revision: 15,
+                    author_node_id: WORKSTATION.to_owned(),
+                    members: vec![
+                        ipc::MemberTopology {
+                            node_id: WORKSTATION.to_owned(),
+                            display_name: "WORKSTATION".to_owned(),
+                            online: true,
+                            displays: vec![
+                                display("DISPLAY2", 0.0, 240.0, 1920.0, 1080.0, false, true),
+                                display("DISPLAY1", 1920.0, 0.0, 1080.0, 1920.0, true, true),
+                            ],
+                        },
+                        ipc::MemberTopology {
+                            node_id: LAPTOP.to_owned(),
+                            display_name: "LAPTOP".to_owned(),
+                            online: true,
+                            displays: vec![display("eDP-1", 0.0, 0.0, 1745.0, 1091.0, true, true)],
+                        },
+                    ],
+                    links: Vec::new(),
+                };
+                vm.apply(event(Msg::TopologyDoc(doc.clone())));
+                let owner = vm.editor.nodes.iter().position(|n| n.node_id == *WORKSTATION)
+                    .ok_or("missing mock workstation")?;
+                let laptop = vm.editor.nodes.iter().position(|n| n.node_id == *LAPTOP)
+                    .ok_or("missing mock laptop")?;
+                let scale = vm.editor.scale;
+                let origin = lws_gui::map::Pt::new(80.0, 35.0);
+                let target = lws_gui::map::Pt::new(origin.x + 3000.0 * scale, origin.y + 1000.0 * scale);
+                vm.editor.placement[owner] = origin;
+                vm.editor.placement[laptop] = lws_gui::map::Pt::new(target.x + 45.0, target.y);
+                vm.editor.baseline.clone_from(&vm.editor.placement);
+                let save = |state: &ViewModel, phase: &str| -> Result<(), String> {
+                    let file = dir.join(format!("{prefix}-{phase}-{lang_tag}-{theme_tag}-1745x1091.png"));
+                    shoot(state.clone(), &file, [1745, 1091], false)?;
+                    println!("{}", file.display());
+                    Ok(())
+                };
+                save(&vm, "before")?;
+                vm.move_node(&LAPTOP, target.x + 2.0, target.y);
+                save(&vm, "preview")?;
+                vm.local(&Action::DropNode(LAPTOP.to_owned()));
+                let sent = vm.editor.save.sent.clone().ok_or("placement drop did not submit contacts")?;
+                if sent.links.is_empty() {
+                    return Err("placement drop submitted no concrete contacts".to_owned());
+                }
+                let endpoint = |end: &config::EndpointConfig| ipc::EndpointView {
+                    node_id: if end.display == "eDP-1" { LAPTOP.to_owned() } else { WORKSTATION.to_owned() },
+                    display_id: end.display.clone(),
+                    edge: format!("{:?}", end.edge).to_uppercase(),
+                    segment_start: end.start,
+                    segment_end: end.end,
+                };
+                doc.links = sent.links.iter().map(|link| ipc::LinkView {
+                    id: link.id.clone(),
+                    from: Some(endpoint(&link.from)),
+                    to: Some(endpoint(&link.to)),
+                    bidirectional: link.bidirectional,
+                    active: true,
+                    inactive_reason: String::new(),
+                    auto_displays: Vec::new(),
+                }).collect();
+                vm.apply(GuiFrame {
+                    request_id: sent.request_id,
+                    ..event(Msg::OpResult(ipc::OpResult { ok: true, ..Default::default() }))
+                });
+                doc.revision += 1;
+                vm.apply(event(Msg::TopologyDoc(doc)));
+                save(&vm, "accepted")?;
+            }
+        }
+        Ok(())
+    };
+    match render() {
+        Ok(()) => {
+            println!("12 pictures in {}", dir.display());
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("cannot render placement sequence: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
