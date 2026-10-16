@@ -130,6 +130,17 @@ impl EmergencyShortcuts {
             .iter()
             .map(|(id, trigger)| ((*id).to_owned(), (*trigger).to_owned()))
             .collect();
+        // Success was the silent path: only failures logged. The compositor may
+        // remap a preferred trigger, so the granted descriptions are the truth.
+        let granted: Vec<_> = returned
+            .iter()
+            .map(|(id, trigger)| format!("{id}={trigger}"))
+            .collect();
+        tracing::info!(
+            portal_version,
+            bindings = %granted.join(", "),
+            "GlobalShortcuts bindings granted by the portal"
+        );
         Ok(Self {
             session,
             session_path,
