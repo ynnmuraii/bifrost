@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use lws_gui::egui::{self, Shape};
 use lws_gui::gui_settings::{FieldMode, Look, Theme};
 use lws_gui::ui::{self, Env, Output, UiState};
-use lws_gui::view_model::{Action, Modal, ViewModel};
+use lws_gui::view_model::{Action, Modal, ViewModel, SERVICE_START_TIMEOUT};
 use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
 use support::{event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE, SELF_NODE};
@@ -242,6 +242,72 @@ fn a_window_with_no_service_says_so_and_offers_to_start_it() {
         &["Служба не запущена", "Запустить", "Нет данных от службы"],
     );
     assert!(!shows(&frame, "Служба работает"));
+}
+
+/// How many of the service banner's buttons a frame drew: there is only ever one.
+fn banner_buttons(frame: &Frame) -> usize {
+    frame
+        .texts
+        .iter()
+        .filter(|drawn| matches!(drawn.as_str(), "Запустить" | "Ещё раз"))
+        .count()
+}
+
+/// One button in every state of the banner: «Запустить» and off while a start is in flight,
+/// «Ещё раз» with the reason once a start has failed.
+#[test]
+fn the_service_banner_offers_one_button_whatever_it_says() {
+    let mut vm = view();
+    vm.on_disconnected("no core".to_owned());
+    let mut harness = Harness::new();
+    let frame = harness.settle(&vm, false);
+    expect(&frame, &["Служба не запущена", "Запустить"]);
+    assert_eq!(banner_buttons(&frame), 1, "{:?}", frame.texts);
+    let at = text_position(&mut harness, &vm, "Запустить");
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(
+        frame.output.actions.contains(&Action::StartCore),
+        "{:?}",
+        frame.output.actions
+    );
+
+    // A start in flight: the same button, drawn disabled, and no second one beside it.
+    let now = Instant::now();
+    let mut waiting = vm.clone();
+    waiting.begin_service_start(now);
+    let mut harness = Harness::new();
+    let frame = harness.settle(&waiting, false);
+    expect(&frame, &["Служба не запущена", "Запустить"]);
+    assert_eq!(banner_buttons(&frame), 1, "{:?}", frame.texts);
+    let at = text_position(&mut harness, &waiting, "Запустить");
+    let frame = harness.frame(&waiting, false, SIZE, click_at(at));
+    assert!(
+        !frame.output.actions.contains(&Action::StartCore),
+        "the button is off while a start is in flight: {:?}",
+        frame.output.actions
+    );
+
+    // The start failed: the reason is on screen and the button asks for another try.
+    let mut failed = waiting.clone();
+    failed.tick(now + SERVICE_START_TIMEOUT);
+    let mut harness = Harness::new();
+    let frame = harness.settle(&failed, false);
+    expect(
+        &frame,
+        &[
+            "Служба не запущена",
+            "Ещё раз",
+            "Служба не ответила за 15 с",
+        ],
+    );
+    assert_eq!(banner_buttons(&frame), 1, "{:?}", frame.texts);
+    let at = text_position(&mut harness, &failed, "Ещё раз");
+    let frame = harness.frame(&failed, false, SIZE, click_at(at));
+    assert!(
+        frame.output.actions.contains(&Action::StartCore),
+        "{:?}",
+        frame.output.actions
+    );
 }
 
 #[test]

@@ -207,6 +207,17 @@ pub fn small_button(ui: &mut Ui, pal: &Palette, label: &str, enabled: bool) -> R
     button_sized(ui, pal, label, Kind::Plain, enabled, SMALL)
 }
 
+/// The action of a notice: a pill that fits inside a banner's frame with room to spare.
+pub fn notice_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    kind: Kind,
+    enabled: bool,
+) -> Response {
+    button_sized(ui, pal, label, kind, enabled, NOTICE)
+}
+
 /// The measured size of a button: the height of its frame, the padding on each
 /// side of its label and the size of that label.
 #[derive(Clone, Copy)]
@@ -228,6 +239,13 @@ const SMALL: Metrics = Metrics {
     height: 22.0,
     padding: 9.0,
     text_size: 12.0,
+};
+
+/// The control inside a notice.
+const NOTICE: Metrics = Metrics {
+    height: 32.0,
+    padding: 14.0,
+    text_size: 13.0,
 };
 
 fn button_sized(

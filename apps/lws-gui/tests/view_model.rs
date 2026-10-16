@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use lws_gui::map::GAP;
 use lws_gui::view_model::layout::LinkState;
 use lws_gui::view_model::{
-    Action, Bridge, GuiClient, Launch, Modal, Request, Restart, RestartStep, Side, ViewModel,
-    SERVICE_STOP_TIMEOUT,
+    Action, Bridge, GuiClient, Launch, Modal, Request, Restart, RestartStep, ServiceStart, Side,
+    ViewModel, SERVICE_START_TIMEOUT, SERVICE_STOP_TIMEOUT,
 };
 use protocol::ipc::gui_frame::Msg;
 use support::{
@@ -181,6 +181,56 @@ fn clipboard_history_copy_acknowledgment_is_local_and_localized() {
         vm.outcome.as_ref().unwrap().text,
         ui_text::text(ui_text::Lang::En, ui_text::Key::TheTextIsCopied),
     );
+}
+
+/// The «служба не запущена» banner: one button, and the wait it belongs to.
+#[test]
+fn the_service_banner_waits_for_the_core_it_asked_for() {
+    let mut vm = view();
+    vm.on_disconnected("no core".to_owned());
+    assert_eq!(vm.service_start(), &ServiceStart::Idle);
+    assert_eq!(vm.service_start().button(), ui_text::Key::Start);
+    assert!(vm.service_start().reason().is_none());
+    assert!(!vm.waiting_for_core());
+
+    let now = Instant::now();
+    vm.begin_service_start(now);
+    assert!(vm.waiting_for_core(), "the banner shows the wait");
+    assert_eq!(
+        vm.service_start().button(),
+        ui_text::Key::Start,
+        "one button, and it still says «Запустить» while it waits"
+    );
+    assert!(
+        vm.next_wakeup(now)
+            .is_some_and(|after| after <= SERVICE_START_TIMEOUT),
+        "the wait has an end"
+    );
+
+    // No core answered in time: the wait ends by itself, with the reason and «Ещё раз».
+    vm.tick(now + SERVICE_START_TIMEOUT);
+    let ServiceStart::Failed { reason } = vm.service_start().clone() else {
+        panic!("a start that ran out of time has failed");
+    };
+    assert!(
+        reason.contains(&SERVICE_START_TIMEOUT.as_secs().to_string()),
+        "{reason}"
+    );
+    assert_eq!(vm.service_start().button(), ui_text::Key::OnceMore);
+    assert!(!vm.waiting_for_core());
+    assert!(vm.next_wakeup(now + SERVICE_START_TIMEOUT).is_none());
+
+    // «Ещё раз» starts again, and this time the core answers: the banner goes quiet.
+    vm.begin_service_start(now + SERVICE_START_TIMEOUT);
+    assert!(vm.waiting_for_core());
+    vm.on_connected("endpoint");
+    assert!(vm.connection.is_connected());
+    assert_eq!(
+        vm.service_start(),
+        &ServiceStart::Idle,
+        "a core that answers leaves the banner nothing to say"
+    );
+    assert!(!vm.waiting_for_core());
 }
 
 #[test]
@@ -787,7 +837,6 @@ fn every_wire_request_is_the_message_it_names() {
     );
     // The local ones never reach the core.
     assert!(Action::StartCore.wire().is_none());
-    assert!(Action::ConnectAgain.wire().is_none());
     assert!(Action::ToggleModal(Modal::Keys).wire().is_none());
     assert!(Action::MoveNode {
         node_id: PEER_NODE.to_owned(),
