@@ -358,6 +358,49 @@ fn the_service_banner_offers_one_button_whatever_it_says() {
 }
 
 #[test]
+fn settings_version_is_a_padded_bottom_row_in_both_languages_and_themes() {
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for theme in [Theme::Dark, Theme::Light] {
+            for size in [egui::vec2(1280.0, 720.0), egui::vec2(1745.0, 1091.0)] {
+                let mut vm = connected();
+                vm.look.language = lang;
+                vm.look.theme = theme;
+                vm.local(&Action::ToggleModal(Modal::Settings));
+                let mut harness = Harness::new();
+                harness.frame(&vm, false, size, Vec::new());
+                harness.now += Duration::from_millis(500);
+                harness.frame(&vm, false, size, Vec::new());
+                let frame = harness.frame(&vm, false, size, Vec::new());
+                let bounds = |needle: &str| {
+                    frame
+                        .texts
+                        .iter()
+                        .find(|(text, _)| text == needle)
+                        .unwrap_or_else(|| panic!("missing {needle:?}"))
+                        .1
+                };
+                let (version_label, language_label, stop) = match lang {
+                    ui_text::Lang::Ru => ("ВЕРСИЯ", "ЯЗЫК", "Остановить"),
+                    ui_text::Lang::En => ("VERSION", "LANGUAGE", "Stop"),
+                };
+                let label = bounds(version_label);
+                let language = bounds(language_label);
+                let value = bounds(concat!("Bifrost ", env!("CARGO_PKG_VERSION")));
+                // These are glyph-ink bounds, not the shared galley origin.
+                assert!(
+                    (label.left() - language.left()).abs() < 6.0,
+                    "version label {label:?}, language label {language:?}"
+                );
+                assert!(label.top() > bounds(stop).bottom());
+                assert!(value.left() > label.right());
+                assert!((value.center().y - label.center().y).abs() < 8.0);
+                assert!(value.bottom() < size.y - 16.0);
+            }
+        }
+    }
+}
+
+#[test]
 fn every_modal_shows_its_own_real_data() {
     let mut vm = connected();
     vm.settings.lan.candidates = vec!["192.168.1.24".to_owned(), "10.0.0.5".to_owned()];

@@ -507,6 +507,8 @@ pub enum Key {
     AfterApplyTheServiceRestartsOnTheNewAddress,
     /// «Служба»
     Service,
+    /// «Версия»
+    Version,
     /// «Перезапустить»
     Restart,
     /// «Остановить»
@@ -957,6 +959,7 @@ const fn ru(key: Key) -> &'static str {
         Key::Apply => "Применить",
         Key::AfterApplyTheServiceRestartsOnTheNewAddress => "После «Применить» служба перезапустится с новым адресом",
         Key::Service => "Служба",
+        Key::Version => "Версия",
         Key::Restart => "Перезапустить",
         Key::Stop => "Остановить",
         Key::TheSettingsWereCreatedAutomaticallyConfigToml2 => "Настройки созданы автоматически (config.toml).",
@@ -1291,6 +1294,7 @@ const fn en(key: Key) -> &'static str {
         Key::Apply => "Apply",
         Key::AfterApplyTheServiceRestartsOnTheNewAddress => "After «Apply» the service restarts on the new address",
         Key::Service => "Service",
+        Key::Version => "Version",
         Key::Restart => "Restart",
         Key::Stop => "Stop",
         Key::TheSettingsWereCreatedAutomaticallyConfigToml2 => "The settings were created automatically (config.toml).",
@@ -1613,7 +1617,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 328] = [
+    pub const EVERY: [Key; 329] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1833,6 +1837,7 @@ mod tests {
         Key::Apply,
         Key::AfterApplyTheServiceRestartsOnTheNewAddress,
         Key::Service,
+        Key::Version,
         Key::Restart,
         Key::Stop,
         Key::TheSettingsWereCreatedAutomaticallyConfigToml2,
