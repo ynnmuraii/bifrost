@@ -17,7 +17,9 @@ pub mod raster;
 pub mod veil;
 
 pub use effect::{Effect, Phase};
-pub use raster::{Canvas, ACCENT, GLOW_REACH_PX, GLOW_SIGMA_PX, MAX_ALPHA};
+pub use raster::{
+    Canvas, Segment, ACCENT, GLOW_REACH_PX, GLOW_SIGMA_PX, MAX_ALPHA, TAPER_FRACTION, TAPER_PX,
+};
 
 /// Distance (logical px) from a linked edge at which the glow starts to appear.
 pub const REACH_PX: f32 = 160.0;
