@@ -701,17 +701,38 @@ mod tests {
     #[test]
     fn concrete_paddles_reconstruct_with_bridge_room_on_every_side() {
         for (side, from, to, delta) in [
-            (Side::Right, Rect::new(100.0, 20.0, 0.0, 30.0),
-                Rect::new(0.0, 10.0, 0.0, 40.0), Pt::new(100.0 + GAP, 10.0)),
-            (Side::Left, Rect::new(0.0, 20.0, 0.0, 30.0),
-                Rect::new(100.0, 10.0, 0.0, 40.0), Pt::new(-100.0 - GAP, 10.0)),
-            (Side::Bottom, Rect::new(20.0, 80.0, 30.0, 0.0),
-                Rect::new(10.0, 0.0, 40.0, 0.0), Pt::new(10.0, 80.0 + GAP)),
-            (Side::Top, Rect::new(20.0, 0.0, 30.0, 0.0),
-                Rect::new(10.0, 80.0, 40.0, 0.0), Pt::new(10.0, -80.0 - GAP)),
+            (
+                Side::Right,
+                Rect::new(100.0, 20.0, 0.0, 30.0),
+                Rect::new(0.0, 10.0, 0.0, 40.0),
+                Pt::new(100.0 + GAP, 10.0),
+            ),
+            (
+                Side::Left,
+                Rect::new(0.0, 20.0, 0.0, 30.0),
+                Rect::new(100.0, 10.0, 0.0, 40.0),
+                Pt::new(-100.0 - GAP, 10.0),
+            ),
+            (
+                Side::Bottom,
+                Rect::new(20.0, 80.0, 30.0, 0.0),
+                Rect::new(10.0, 0.0, 40.0, 0.0),
+                Pt::new(10.0, 80.0 + GAP),
+            ),
+            (
+                Side::Top,
+                Rect::new(20.0, 0.0, 30.0, 0.0),
+                Rect::new(10.0, 80.0, 40.0, 0.0),
+                Pt::new(10.0, -80.0 - GAP),
+            ),
         ] {
             let shapes = [boxed(100.0, 80.0), boxed(100.0, 80.0)];
-            let doc = [DocLink { a: 0, b: 1, side, contact: Some((from, to)) }];
+            let doc = [DocLink {
+                a: 0,
+                b: 1,
+                side,
+                contact: Some((from, to)),
+            }];
             for anchor in [0, 1] {
                 let pos = place(&shapes, &doc, anchor);
                 assert!((pos[1].x - pos[0].x - delta.x).abs() < 1e-9);
