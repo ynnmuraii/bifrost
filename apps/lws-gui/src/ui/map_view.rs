@@ -481,9 +481,10 @@ fn paddle_interaction(
     time: f32,
     actions: &mut Vec<Action>,
 ) -> bool {
-    let (pointer, pressed, down, released, focused) = ui.input(|input| {
+    let (pointer, hover_pointer, pressed, down, released, focused) = ui.input(|input| {
         (
             input.pointer.interact_pos(),
+            input.pointer.hover_pos(),
             input.pointer.button_pressed(egui::PointerButton::Primary),
             input.pointer.button_down(egui::PointerButton::Primary),
             input.pointer.button_released(egui::PointerButton::Primary),
@@ -499,7 +500,7 @@ fn paddle_interaction(
         return false;
     }
     let hit = if st.drag.is_none() {
-        pointer
+        hover_pointer
             .filter(|point| rect.contains(*point))
             .and_then(|point| {
                 model
