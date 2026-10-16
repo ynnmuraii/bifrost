@@ -185,6 +185,18 @@ impl ViewModel {
         scale: f64,
     ) -> Option<Rect> {
         let displays = &self.editor.nodes.get(node)?.displays;
+        if endpoint.is_auto() {
+            let min_x = displays.iter().map(|d| d.x).fold(f64::INFINITY, f64::min);
+            let min_y = displays.iter().map(|d| d.y).fold(f64::INFINITY, f64::min);
+            let w = displays.iter().map(|d| d.x + d.w - min_x).fold(0.0, f64::max) * scale;
+            let h = displays.iter().map(|d| d.y + d.h - min_y).fold(0.0, f64::max) * scale;
+            return Some(match endpoint.edge {
+                config::Edge::Left => Rect::new(0.0, 0.0, 0.0, h),
+                config::Edge::Right => Rect::new(w, 0.0, 0.0, h),
+                config::Edge::Top => Rect::new(0.0, 0.0, w, 0.0),
+                config::Edge::Bottom => Rect::new(0.0, h, w, 0.0),
+            });
+        }
         let display = displays.iter().find(|d| d.id == endpoint.display)?;
         let x = displays.iter().map(|d| d.x).fold(f64::INFINITY, f64::min);
         let y = displays.iter().map(|d| d.y).fold(f64::INFINITY, f64::min);
@@ -659,7 +671,7 @@ impl ViewModel {
             let Some(b) = editor.nodes.iter().position(|n| node_reference(&n.node_id) == doc.to.node) else {
                 continue;
             };
-            let whole_desktop = doc.from.is_auto() && doc.to.is_auto();
+            let whole_desktop = doc.from.is_auto() || doc.to.is_auto();
             let mut missing = false;
             let mut endpoint = |node: usize, e: &config::EndpointConfig| {
                 let local = self.endpoint_segment(node, e, editor.scale).unwrap_or_else(|| {
