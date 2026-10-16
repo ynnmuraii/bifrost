@@ -94,7 +94,7 @@ fn active_field_and_ascii_links_allocate_nothing_after_warmup() {
                         true,
                         true,
                         1.5,
-                        120.0,
+                        (120.0, 120.0),
                         pal.accent,
                     );
                     bridge.paint_latency(ui.painter(), egui::pos2(500.0, 200.0), &pal);
