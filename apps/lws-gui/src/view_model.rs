@@ -531,6 +531,8 @@ pub struct LayoutEditor {
     pub placement: Vec<crate::map::Pt>,
     /// Where the applied document puts them: what `placement` is compared with.
     pub baseline: Vec<crate::map::Pt>,
+    /// Independently adjusted endpoint draft, in stable display-local coordinates.
+    pub paddles: Option<Vec<config::LinkConfig>>,
     /// Stage units per logical unit the shapes were drawn at.
     pub scale: f64,
     /// The automatic save of the map: what is wanted, what is in flight, what is owed.
@@ -544,6 +546,8 @@ pub struct Save {
     pub wanted: Option<Vec<config::LinkConfig>>,
     /// Exact placement of the last valid drop, for interrupted/invalid drag rollback.
     pub placement: Option<Vec<crate::map::Pt>>,
+    /// Endpoint draft of the last accepted drop, including while its acknowledgment is pending.
+    pub paddles: Option<Vec<config::LinkConfig>>,
     /// The one `UpdateTopology` in flight.
     pub sent: Option<Sent>,
     /// The retry after a `LAYOUT_CONFLICT` of this draft was spent.
@@ -582,7 +586,7 @@ impl LayoutEditor {
 
     /// `true` while the map differs from the applied document (the «черновик»).
     pub fn dirty(&self) -> bool {
-        self.placement != self.baseline
+        self.placement != self.baseline || self.paddles.is_some()
     }
 }
 
@@ -2118,6 +2122,15 @@ impl ViewModel {
                 }
             }
             Action::DropNode(node_id) => self.drop_node(node_id),
+            Action::MovePaddle {
+                link_id,
+                from,
+                start,
+                end,
+            } => {
+                self.move_paddle(link_id, *from, *start, *end);
+            }
+            Action::DropPaddle => self.drop_paddle(),
             Action::CancelDrag => self.restore_placement(),
             Action::CloseModal => {
                 self.modal = None;
@@ -2346,9 +2359,17 @@ pub enum Action {
     CloseAppearance,
     /// Slide the pairing dock in or out.
     ToggleDock,
-    /// A drag of a computer ended where it was dropped: save the layout it made. The one thing
-    /// that starts a save.
+    /// A computer drag ended: save the layout it made.
     DropNode(String),
+    /// Adjust one endpoint without moving either computer; absolute stage coordinates.
+    MovePaddle {
+        link_id: String,
+        from: bool,
+        start: f64,
+        end: f64,
+    },
+    /// Save the latest paddle draft through the same single-flight CAS as node drops.
+    DropPaddle,
     /// A drag was cut short (focus lost, the pointer left the window): nothing is saved and the
     /// computer goes back.
     CancelDrag,
