@@ -94,6 +94,28 @@ pub fn sans_runs(ui: &Ui, runs: &[Run<'_>], size: f32, wrap: f32) -> Arc<Galley>
     ui.painter().layout_job(job)
 }
 
+/// Paints `galley` centred on `rect` by its ink, not by the box the font measures it in.
+///
+/// A galley is as tall as its font's ascent and descent, which are uneven — most of all in the
+/// pixel face — and a glyph is not centred in the space it advances either. A badge laid out at
+/// `rect.center() - galley.size() / 2.0` therefore sits low and to the left. [`Galley::mesh_bounds`]
+/// is the tight box around the glyphs themselves, which is what the eye centres, and it is known
+/// as soon as the galley is laid out: no tessellation is needed to ask for it.
+pub fn centre_galley(painter: &egui::Painter, rect: Rect, galley: Arc<Galley>, color: Color32) {
+    let ink = galley.mesh_bounds;
+    // A galley of nothing but blanks has no mesh at all; the font's box is all there is to centre.
+    let centre = if ink.is_finite() && ink.is_positive() {
+        ink.center().to_vec2()
+    } else {
+        galley.size() / 2.0
+    };
+    painter.add(egui::epaint::TextShape::new(
+        rect.center() - centre,
+        galley,
+        color,
+    ));
+}
+
 /// Paints an already laid-out galley as a widget of its own size.
 pub fn show_galley(ui: &mut Ui, galley: Arc<Galley>) -> Response {
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
@@ -649,11 +671,13 @@ pub fn kbd(ui: &mut Ui, pal: &Palette, label: &str) -> Response {
             ],
             Stroke::new(2.0, pal.line),
         );
-        painter.add(egui::epaint::TextShape::new(
-            Pos2::new(rect.min.x + 9.0, rect.min.y + 6.0),
-            galley,
-            pal.ink,
-        ));
+        // The room the cap leaves for its glyph: inside the 1 px frame and above the 3 px edge,
+        // so the label is centred in what the eye reads as the inside of the key.
+        let inside = Rect::from_min_max(
+            Pos2::new(rect.min.x + 1.0, rect.min.y + 1.0),
+            Pos2::new(rect.max.x - 1.0, rect.max.y - 3.0),
+        );
+        centre_galley(painter, inside, galley, pal.ink);
     }
     response
 }

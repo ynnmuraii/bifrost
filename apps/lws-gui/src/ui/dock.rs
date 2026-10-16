@@ -145,7 +145,7 @@ fn cell_head(ui: &mut egui::Ui, pal: &Palette, letter: &str, caption: &str) {
             StrokeKind::Inside,
         );
         let galley = painter.layout_no_wrap(letter.to_owned(), font(10.0, fam::pixel()), pal.ink);
-        painter.galley(rect.center() - galley.size() / 2.0, galley, pal.ink);
+        widgets::centre_galley(painter, rect, galley, pal.ink);
         widgets::cap(ui, pal, caption);
     });
     ui.add_space(-8.0);
@@ -367,7 +367,7 @@ fn code_box(ui: &mut egui::Ui, pal: &Palette, glyph: &str, wait: bool, lit: bool
             2.0,
         ));
         let galley = painter.layout_no_wrap(glyph.to_owned(), font(16.0, fam::pixel()), pal.ink2);
-        painter.galley(rect.center() - galley.size() / 2.0, galley, pal.ink2);
+        widgets::centre_galley(painter, rect, galley, pal.ink2);
     } else {
         painter.rect(
             rect,
@@ -377,7 +377,7 @@ fn code_box(ui: &mut egui::Ui, pal: &Palette, glyph: &str, wait: bool, lit: bool
             StrokeKind::Inside,
         );
         let galley = painter.layout_no_wrap(glyph.to_owned(), font(24.0, fam::pixel()), pal.ink);
-        painter.galley(rect.center() - galley.size() / 2.0, galley, pal.ink);
+        widgets::centre_galley(painter, rect, galley, pal.ink);
     }
 }
 
