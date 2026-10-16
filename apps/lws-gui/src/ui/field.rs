@@ -17,7 +17,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32, Galley, Painter, Pos2, Rect, Shape};
 use eframe::epaint::TextShape;
 
-use super::theme::{fam, font, Palette};
+use super::theme::{fam, font, font_epoch, Palette};
 use crate::gui_settings::{FieldMode, Look, Theme};
 
 /// A particle per this many square points of the map.
@@ -91,16 +91,19 @@ struct Mouse {
 #[derive(Default)]
 struct Glyphs {
     ppp: f32,
+    epoch: usize,
     items: Vec<(char, Arc<Galley>)>,
 }
 
 impl Glyphs {
     fn ensure(&mut self, painter: &Painter, size: f32) {
         let ppp = painter.ctx().pixels_per_point();
-        if !self.items.is_empty() && (self.ppp - ppp).abs() < f32::EPSILON {
+        let epoch = font_epoch(painter);
+        if !self.items.is_empty() && self.epoch == epoch && (self.ppp - ppp).abs() < f32::EPSILON {
             return;
         }
         self.ppp = ppp;
+        self.epoch = epoch;
         self.items.clear();
         for c in GLYPH_SET.chars().chain(std::iter::once('·')) {
             if self.items.iter().any(|(k, _)| *k == c) {

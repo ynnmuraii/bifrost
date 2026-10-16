@@ -175,6 +175,18 @@ pub fn font(size: f32, family: FontFamily) -> FontId {
     FontId::new(size, family)
 }
 
+/// Identity of the font definitions backing cached galley UVs. egui may rebuild its atlas
+/// without changing pixel scale; that rebuild clones these family vectors.
+pub(super) fn font_epoch(painter: &egui::Painter) -> usize {
+    painter.ctx().fonts_mut(|fonts| {
+        fonts
+            .definitions()
+            .families
+            .get(&egui::FontFamily::Monospace)
+            .map_or(0, |family| family.as_ptr() as usize)
+    })
+}
+
 /// Installs the six embedded faces and nothing else.
 ///
 /// Only the weights the mockup uses are embedded (`assets/fonts`, subset to Latin, Cyrillic and
