@@ -1,0 +1,177 @@
+# The full Windows test run, once a day.
+#
+# `cargo test --workspace` on windows-latest is the most expensive single thing
+# this repository does: the runner bills at 2x and the run takes ~19 minutes, so
+# one full Windows run costs ~38 minutes of the 3000-minute monthly plan, and
+# ci.yml used to spend that on every single push (~13 a day in October). ci.yml
+# now keeps on the Windows push only the unit tests and the Windows-specific
+# suites and leaves the rest to the ubuntu runner, which runs the same
+# multi-process harnesses on every push at 1x.
+#
+# This workflow is the safety net behind that cut. It is the only place the
+# harnesses of `apps/multideskflow/tests` and the rest of the workspace are
+# executed *on Windows*, which is the shipped platform, and the only place the
+# licences check sees the Windows dependency graph.
+#
+# It is also the reason the timeouts in ci.yml can be tight: whatever a tight
+# budget cuts short here is re-run in full, on a runner nobody is waiting for.
+name: Nightly
+
+on:
+  schedule:
+    # 03:00 UTC. Late enough that a day of pushes is over, early enough that a
+    # red night is waiting in the morning.
+    - cron: '0 3 * * *'
+  # A manual dispatch always runs the full suite, whatever `changes` would say:
+  # someone asked for this tree to be tested.
+  workflow_dispatch:
+
+permissions:
+  # The `changes` job reads this repository's own run list; nothing in this
+  # workflow writes anything anywhere.
+  actions: read
+  contents: read
+
+concurrency:
+  # Never two full Windows runs at once, and never cancel one that is already
+  # running: a superseded night is a night whose result nobody ever saw, and the
+  # minutes it burned would buy nothing.
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  # Exactly ci.yml's settings, because the two share one cargo cache (see the
+  # `shared-key` in both workflows): a different profile or a different
+  # incremental setting would change the compiler fingerprint, and the restored
+  # artifacts would be rebuilt instead of reused.
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  changes:
+    name: anything new since the last nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      # The scheduler fires every night whether or not `main` moved, and a full
+      # Windows run of a tree the previous night already tested is ~38 minutes
+      # of nothing. The last *successful* scheduled run's SHA is the comparison:
+      # if `main` still points at it, the tree has been tested and this night is
+      # skipped. A failed night always runs again — its SHA never became the
+      # "last successful" one.
+      #
+      # This check is a ~20-second ubuntu job on purpose: it decides a 38-minute
+      # windows job, and it must not cost a windows runner to decide it.
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          WORKFLOW: ${{ github.workflow }}
+          # No checkout here on purpose: the run list is the only input, and
+          # `gh` cannot infer the repository outside a working tree.
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "schedule" ]; then
+            echo "a manual dispatch tests this tree: running the full suite"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=""
+          if ! last=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --event schedule --status success --limit 1 --json headSha --jq '.[0].headSha // ""'); then
+            # An unreadable run list must not be read as "nothing to do".
+            echo "cannot read the run list: running the full suite" >&2
+            last=""
+          fi
+          echo "last successful nightly tested '$last'; this night would test '$SHA'"
+          if [ -n "$last" ] && [ "$last" = "$SHA" ]; then
+            echo "main has not moved since the last nightly: nothing to test"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-full:
+    name: windows-latest (full workspace)
+    needs: changes
+    # `always()` because a skipped `needs` job would otherwise skip this one: the
+    # decision job is what decides, and its own skips must not. A decision job
+    # that *failed* is the one case where the answer is still "test it" — a
+    # broken gate must not be able to silence the nightly it guards.
+    if: always() && (needs.changes.outputs.run == 'true' || needs.changes.result == 'failure')
+    runs-on: windows-latest
+    # Four times the observed ~19 minutes, and the same ceiling ci.yml puts on
+    # its Windows job. A nightly that hangs must fail here, not bill the rest of
+    # the night: run 38805173105 sat in the `Test` step for 90.8 minutes (200
+    # billed minutes) before a human cancelled it.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same as ci.yml: rust-toolchain.toml in the repository is the source of
+      # truth and names the channel "stable", the one this action installs.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The same cache the Windows job of ci.yml restores: `prefix-key` and
+      # `shared-key` are copied from there, and `shared-key` is what makes the
+      # key independent of the job, so the two jobs share one `target/`. Without
+      # it this job would rebuild the dependency graph from scratch every night,
+      # which costs more than the whole nightly saves.
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: windows-latest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo build --workspace
+
+      # The Windows half of the licences policy: `deny.toml` denies by omission,
+      # and the Windows dependency graph pulls crates the Linux one never sees
+      # (`windows`, `clipboard-win`). ci.yml runs this on the cheap ubuntu runner
+      # on every push; this is where the Windows graph is checked, once a day,
+      # which is what let that step stop paying 2x minutes on every push.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Licences
+        run: cargo deny --all-features check licenses
+
+      # docs/03-architecture.md, agent rule 1: the agent owns no network sockets.
+      # The Linux runner checks the same file, but its run-time guard asks the
+      # host for its own sockets, and this is the shipped platform.
+      - name: Agent owns no network sockets
+        run: cargo test --locked -p lws-agent --test no_network
+
+      # `LWS_KEEP_ROOTS=1` keeps each harness's root, and a failing night uploads
+      # them: the same reasoning as ci.yml's Windows steps. The directory is
+      # created first because the harnesses call `std::env::temp_dir()`, which
+      # resolves through TMP/TEMP.
+      - name: Prepare diagnostics root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\lws-roots" | Out-Null
+
+      - name: Test
+        env:
+          LWS_KEEP_ROOTS: "1"
+          TMP: ${{ runner.temp }}\lws-roots
+          TEMP: ${{ runner.temp }}\lws-roots
+        run: cargo test --workspace
+
+      - name: Upload harness roots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lws-roots-windows-nightly
+          path: ${{ format('{0}/lws-roots', runner.temp) }}
+          if-no-files-found: ignore

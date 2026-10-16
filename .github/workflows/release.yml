@@ -12,6 +12,10 @@ jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # The same ceiling ci.yml puts on its Windows job: a hung release build must
+    # fail rather than hold a 2x-priced runner for the 360-minute default. A
+    # cold release build of this workspace is ~20 minutes; 60 is generous.
+    timeout-minutes: 60
     permissions:
       # The last step attaches archives to a tag, which the read-only default
       # token of a fresh repository would refuse.
