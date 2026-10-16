@@ -21,7 +21,7 @@ use crate::view_model::Side;
 pub const STAGE_W: f64 = 916.0;
 /// Nominal stage height.
 pub const STAGE_H: f64 = 270.0;
-/// Initial spacing for legacy whole-desktop links, never a drag snap target.
+/// Initial spacing for reconstructed links, never a drag snap target.
 pub const GAP: f64 = 72.0;
 /// How near (stage units) an edge has to be before the drag snaps onto it.
 pub const SNAP: f64 = 12.0;
@@ -214,8 +214,8 @@ pub fn bounds(shapes: &[Shape], pos: &[Pt]) -> (f64, f64, f64, f64) {
 
 /// The first placement: the applied links decide where each computer goes.
 ///
-/// `anchor` is the root. Concrete endpoint starts coincide, preserving their
-/// display-relative offsets; legacy whole-desktop links keep their initial [`GAP`].
+/// `anchor` is the root. Concrete endpoint starts align along the tangent, preserving
+/// display-relative offsets; every reconstructed link leaves an initial [`GAP`].
 /// Disconnected computers are parked below the rest. The result is stage-centred.
 pub fn place(shapes: &[Shape], doc_links: &[DocLink], anchor: usize) -> Vec<Pt> {
     place_at_scale(shapes, doc_links, anchor, BASE_SCALE)
@@ -266,9 +266,15 @@ pub fn place_at_scale(
                 pos[j] = Some(if let Some((from, to)) = link.contact {
                     let (from, to) = if link.a == i { (from, to) } else { (to, from) };
                     let factor = scale / BASE_SCALE;
+                    let offset = match side {
+                        Side::Left => Pt::new(-GAP, 0.0),
+                        Side::Right => Pt::new(GAP, 0.0),
+                        Side::Top => Pt::new(0.0, -GAP),
+                        Side::Bottom => Pt::new(0.0, GAP),
+                    };
                     Pt::new(
-                        at_i.x + (from.x - to.x) * factor,
-                        at_i.y + (from.y - to.y) * factor,
+                        at_i.x + (from.x - to.x) * factor + offset.x,
+                        at_i.y + (from.y - to.y) * factor + offset.y,
                     )
                 } else {
                     adjacent(&shapes[i], at_i, &shapes[j], side)
@@ -397,8 +403,7 @@ pub fn links(shapes: &[Shape], pos: &[Pt]) -> Vec<GeoLink> {
                             let mut visible = vec![(start, end)];
                             for (node, (shape, at)) in shapes.iter().zip(pos).enumerate() {
                                 for (display, rect) in shape.mons.iter().enumerate() {
-                                    if (node == a && display == am)
-                                        || (node == b && display == bm)
+                                    if (node == a && display == am) || (node == b && display == bm)
                                     {
                                         continue;
                                     }
@@ -687,9 +692,34 @@ mod tests {
                 )),
             }];
             let pos = place_at_scale(&shapes, &doc, 0, scale);
-            assert!((pos[1].x - pos[0].x - shapes[0].w).abs() < 1e-9);
+            assert!((pos[1].x - pos[0].x - shapes[0].w - GAP).abs() < 1e-9);
             assert!((pos[1].y - pos[0].y - 40.125 * scale / BASE_SCALE).abs() < 1e-9);
             assert_eq!(links(&shapes, &pos).len(), 1);
+        }
+    }
+
+    #[test]
+    fn concrete_paddles_reconstruct_with_bridge_room_on_every_side() {
+        for (side, from, to, delta) in [
+            (Side::Right, Rect::new(100.0, 20.0, 0.0, 30.0),
+                Rect::new(0.0, 10.0, 0.0, 40.0), Pt::new(100.0 + GAP, 10.0)),
+            (Side::Left, Rect::new(0.0, 20.0, 0.0, 30.0),
+                Rect::new(100.0, 10.0, 0.0, 40.0), Pt::new(-100.0 - GAP, 10.0)),
+            (Side::Bottom, Rect::new(20.0, 80.0, 30.0, 0.0),
+                Rect::new(10.0, 0.0, 40.0, 0.0), Pt::new(10.0, 80.0 + GAP)),
+            (Side::Top, Rect::new(20.0, 0.0, 30.0, 0.0),
+                Rect::new(10.0, 80.0, 40.0, 0.0), Pt::new(10.0, -80.0 - GAP)),
+        ] {
+            let shapes = [boxed(100.0, 80.0), boxed(100.0, 80.0)];
+            let doc = [DocLink { a: 0, b: 1, side, contact: Some((from, to)) }];
+            for anchor in [0, 1] {
+                let pos = place(&shapes, &doc, anchor);
+                assert!((pos[1].x - pos[0].x - delta.x).abs() < 1e-9);
+                assert!((pos[1].y - pos[0].y - delta.y).abs() < 1e-9);
+                let found = links(&shapes, &pos);
+                assert_eq!(found.len(), 1);
+                assert!((found[0].gap - GAP).abs() < 1e-9);
+            }
         }
     }
 
@@ -765,7 +795,10 @@ mod tests {
             &shapes,
             &[Pt::default(), Pt::new(200.0, 0.0), Pt::new(140.0, 30.0)],
         );
-        let outer: Vec<_> = found.iter().filter(|link| link.a == 0 && link.b == 1).collect();
+        let outer: Vec<_> = found
+            .iter()
+            .filter(|link| link.a == 0 && link.b == 1)
+            .collect();
         assert_eq!(outer.len(), 2);
         assert_eq!(outer[0].span, (0.0, 30.0));
         assert_eq!(outer[1].span, (70.0, 100.0));
@@ -805,12 +838,24 @@ mod tests {
         assert_eq!(clamp_paddle(-10.0, 10.0, 0.0, 100.0), (0.0, 20.0));
         assert_eq!(clamp_paddle(95.0, 99.0, 0.0, 100.0), (88.0, 100.0));
         assert_eq!(clamp_paddle(3.0, 4.0, 2.0, 9.0), (2.0, 9.0));
-        assert_eq!(move_paddle((20.0, 50.0), 100.0, (0.0, 100.0)), (70.0, 100.0));
+        assert_eq!(
+            move_paddle((20.0, 50.0), 100.0, (0.0, 100.0)),
+            (70.0, 100.0)
+        );
         assert_eq!(move_paddle((20.0, 50.0), -100.0, (0.0, 100.0)), (0.0, 30.0));
         assert_eq!(move_paddle((20.0, 50.0), 0.0, (4.0, 10.0)), (4.0, 10.0));
-        assert_eq!(resize_paddle((20.0, 50.0), true, 49.0, (0.0, 100.0)), (38.0, 50.0));
-        assert_eq!(resize_paddle((20.0, 50.0), false, 21.0, (0.0, 100.0)), (20.0, 32.0));
-        assert_eq!(resize_paddle((20.0, 50.0), false, 120.0, (0.0, 100.0)), (20.0, 100.0));
+        assert_eq!(
+            resize_paddle((20.0, 50.0), true, 49.0, (0.0, 100.0)),
+            (38.0, 50.0)
+        );
+        assert_eq!(
+            resize_paddle((20.0, 50.0), false, 21.0, (0.0, 100.0)),
+            (20.0, 32.0)
+        );
+        assert_eq!(
+            resize_paddle((20.0, 50.0), false, 120.0, (0.0, 100.0)),
+            (20.0, 100.0)
+        );
         assert_eq!(resize_paddle((2.0, 9.0), true, 8.0, (2.0, 9.0)), (2.0, 9.0));
         assert_eq!(clamp_paddle(2.0, 4.0, 5.0, 5.0), (5.0, 5.0));
     }
