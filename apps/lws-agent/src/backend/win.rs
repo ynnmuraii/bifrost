@@ -208,6 +208,25 @@ impl Win {
             .set_hotkeys(platform_win::event::Hotkeys(
                 platform_win::event::Hotkeys::new(combinations).0 | super_bits,
             ));
+        // The emergency combination is already reported by `new` ("armed in the
+        // capture hook"); the rest of the applied set is reported here, so the log
+        // carries every action the capture hook now watches.
+        let applied = bindings
+            .iter()
+            .filter(|(action, _)| !matches!(action, config::HotkeyAction::EmergencyRelease))
+            .map(|(action, chord)| {
+                if chord.trim().is_empty() {
+                    format!("{}: disabled", action.as_str())
+                } else {
+                    format!("{}: {chord}", action.as_str())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(
+            bindings = %applied,
+            "non-emergency hotkeys applied to the capture hook"
+        );
         Ok(())
     }
 
