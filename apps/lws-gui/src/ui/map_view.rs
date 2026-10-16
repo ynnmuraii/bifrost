@@ -1272,9 +1272,9 @@ mod transform_tests {
         assert_eq!(
             vm.take_outgoing()
                 .iter()
-                .filter(|frame| matches!(
-                    &frame.msg,
-                    Some(protocol::ipc::gui_frame::Msg::UpdateTopology(_))
+                .filter(|(_, message)| matches!(
+                    message,
+                    protocol::ipc::gui_frame::Msg::UpdateTopology(_)
                 ))
                 .count(),
             1
