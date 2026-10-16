@@ -447,7 +447,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
 }
 
 fn shoot_gap(state: ViewModel, file: &Path, drag: Option<(f64, f64)>) -> Result<(), String> {
-    shoot_with_paddle(state, file, [1745, 1091], false, Some(drag))
+    shoot_with_paddle(state, file, [1745, 1091], false, drag)
 }
 
 fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
@@ -521,7 +521,7 @@ fn shoot_with_paddle(
     file: &Path,
     size: [u32; 2],
     live: bool,
-    paddle: Option<Option<(f64, f64)>>,
+    paddle: Option<(f64, f64)>,
 ) -> Result<(), String> {
     let drawn = AssertUnwindSafe(|| {
         let mut ui_state = UiState::new(Instant::now());
@@ -533,23 +533,21 @@ fn shoot_with_paddle(
                     now: Instant::now(),
                     animate: live,
                 };
-                if let Some(drag) = paddle {
-                    if let Some(span) = drag {
-                        if ui.input(|input| input.pointer.primary_down()) {
-                            ui_state.paddle_drag = Some(ui::PaddleDrag {
-                                link_id: "owner-gap".to_owned(),
-                                from: true,
-                                span,
-                                grab: egui::pos2(900.0, 450.0),
-                                handle: ui::PaddleHandle::Move,
-                            });
-                        }
+                if let Some(span) = paddle {
+                    if ui.input(|input| input.pointer.primary_down()) {
+                        ui_state.paddle_drag = Some(ui::PaddleDrag {
+                            link_id: "owner-gap".to_owned(),
+                            from: true,
+                            span,
+                            grab: egui::pos2(900.0, 450.0),
+                            handle: ui::PaddleHandle::Move,
+                        });
                     }
                 }
                 let _ = ui::draw(ui, &state, &mut ui_state, env);
             });
         ui::install_fonts(&harness.ctx);
-        if matches!(paddle, Some(Some(_))) {
+        if paddle.is_some() {
             // Hold only the harness pointer: the actual map paints its dragged accent.
             let pos = egui::pos2(900.0, 450.0);
             harness.event(egui::Event::WindowFocused(true));
