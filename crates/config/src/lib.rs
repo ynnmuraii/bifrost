@@ -24,6 +24,9 @@
 //! * [`paths::Paths`] / [`default_paths`] — the per-OS locations of «Файлы и
 //!   пути».
 //! * [`hotkey`] — the `Ctrl+Alt+Shift+F12` parser the hotkey rules need.
+//! * [`migrate`] — the once-per-file rewrite of a pre-`[input.hotkeys]` document,
+//!   driven by the core; the loader itself accepts the legacy keys, so a
+//!   read-only role never writes.
 //! * [`topology`] — `[topology]` links converted into [`geometry::TransitionLink`]
 //!   with `"self"` / `"peer:<hex>"` node references resolved against a local
 //!   node id.
@@ -55,7 +58,9 @@
 pub mod error;
 pub mod first_run;
 pub mod hotkey;
+mod legacy;
 pub mod lock;
+pub mod migrate;
 pub mod paths;
 pub mod save;
 pub mod schema;
@@ -65,6 +70,7 @@ pub use error::{ConfigError, ErrorCode};
 pub use first_run::{choose, ensure_config, lan_addresses, set_listen_address, Candidate};
 pub use hotkey::{Hotkey, HotkeyAction, HotkeyBindings, HotkeyError, Modifier};
 pub use lock::{update_locked, FileLock};
+pub use migrate::migrate_legacy_hotkeys;
 pub use paths::{default_paths, Paths};
 pub use save::save_atomic;
 pub use schema::{

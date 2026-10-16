@@ -15,6 +15,7 @@ geometry = { path = "../geometry" }
 protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 # `first_run` names this host's interfaces to pick a `listen_address`:

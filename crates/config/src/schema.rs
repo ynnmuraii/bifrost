@@ -268,9 +268,16 @@ impl Config {
     /// `config_version` is checked *before* the rest of the document is
     /// deserialized, so a v1 file reports the unsupported version instead of an
     /// unknown key that only exists in v1.
+    ///
+    /// The three hotkey keys of a pre-`[input.hotkeys]` file
+    /// (`input.emergency_hotkey`, `input.switch_hotkey`,
+    /// `workspace.claim_hotkey`) are accepted and mapped into `[input.hotkeys]`
+    /// (see the private `legacy` module). Everything else keeps
+    /// `deny_unknown_fields`. Rewriting such a file is the core's job, not the
+    /// loader's: [`crate::migrate_legacy_hotkeys`].
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Result<Config, ConfigError> {
-        let value: toml::Value =
+        let mut value: toml::Value =
             toml::from_str(text).map_err(|source| ConfigError::Parse { source })?;
         match value.get("config_version") {
             None => return Err(ConfigError::MissingVersion),
@@ -281,6 +288,18 @@ impl Config {
                     });
                 }
             }
+        }
+        let overridden = crate::legacy::strip(&mut value)?;
+        if !overridden.is_empty() {
+            let actions = overridden
+                .iter()
+                .map(|action| action.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                actions,
+                "legacy hotkey key ignored: [input.hotkeys] already sets the action"
+            );
         }
         value
             .try_into()
