@@ -2122,20 +2122,12 @@ fn a_drop_in_empty_desktop_bounding_space_is_not_an_overlap() {
     let dropped = vm.editor.placement.clone();
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, dropped);
-    assert_eq!(
-        vm.editor_links().len(),
-        2,
-        "the peer faces both actual displays across gaps"
-    );
     assert!(
-        vm.editor.save.sent.is_some(),
-        "valid facing links are saved"
+        vm.editor_links().is_empty(),
+        "local monitor holes are not external edges"
     );
-    assert_eq!(
-        vm.take_outgoing().len(),
-        1,
-        "one layout CAS, not an overlap rollback"
-    );
+    assert!(!vm.editor.dirty());
+    assert!(vm.take_outgoing().is_empty(), "no link edits need a CAS");
 }
 
 #[test]

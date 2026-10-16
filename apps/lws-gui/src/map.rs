@@ -421,13 +421,18 @@ pub fn links(shapes: &[Shape], pos: &[Pt]) -> Vec<GeoLink> {
                                             at.x + rect.x + rect.w,
                                         ),
                                     };
-                                    // Include bodies crossing either endpoint edge, but not
-                                    // displays merely touching the outside of the corridor.
+                                    // A node's own siblings hide an edge even beyond the
+                                    // peer: the core rejects links into local monitor holes.
+                                    // Unrelated computers only occlude the bridge corridor.
                                     let target = edge + gap.max(0.0);
-                                    if far <= edge + MIN_OVERLAP
-                                        || near >= target - MIN_OVERLAP
-                                            && (gap > MIN_OVERLAP || near > edge + MIN_OVERLAP)
-                                    {
+                                    let obstructs = if node == a {
+                                        far > edge + MIN_OVERLAP
+                                    } else if node == b {
+                                        near < target - MIN_OVERLAP
+                                    } else {
+                                        far > edge + MIN_OVERLAP && near < target - MIN_OVERLAP
+                                    };
+                                    if !obstructs {
                                         continue;
                                     }
                                     let mut segment = 0;
@@ -788,6 +793,36 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!((found[0].a_display, found[0].span), (0, (40.0, 80.0)));
         assert_eq!((found[1].a_display, found[1].span), (1, (80.0, 160.0)));
+    }
+
+    #[test]
+    fn sibling_monitor_holes_are_not_externally_facing_links() {
+        for vertical in [false, true] {
+            let second = if vertical {
+                Rect::new(0.0, 200.0, 100.0, 100.0)
+            } else {
+                Rect::new(200.0, 0.0, 100.0, 100.0)
+            };
+            let desktop = Shape {
+                mons: vec![Rect::new(0.0, 0.0, 100.0, 100.0), second],
+                w: if vertical { 100.0 } else { 300.0 },
+                h: if vertical { 300.0 } else { 100.0 },
+            };
+            let peer = if vertical {
+                boxed(100.0, 20.0)
+            } else {
+                boxed(20.0, 100.0)
+            };
+            let at = if vertical {
+                Pt::new(0.0, 140.0)
+            } else {
+                Pt::new(140.0, 0.0)
+            };
+            assert!(
+                links(&[desktop, peer], &[Pt::default(), at]).is_empty(),
+                "links into a local monitor hole would fail core SegmentInHole validation"
+            );
+        }
     }
 
     #[test]
