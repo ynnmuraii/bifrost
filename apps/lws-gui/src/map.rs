@@ -223,7 +223,10 @@ pub fn place(shapes: &[Shape], doc_links: &[DocLink], anchor: usize) -> Vec<Pt> 
 
 /// Reconstruct concrete contacts at the scale used by the current shapes.
 pub fn place_at_scale(
-    shapes: &[Shape], doc_links: &[DocLink], anchor: usize, scale: f64,
+    shapes: &[Shape],
+    doc_links: &[DocLink],
+    anchor: usize,
+    scale: f64,
 ) -> Vec<Pt> {
     let n = shapes.len();
     let mut pos: Vec<Option<Pt>> = vec![None; n];
@@ -314,13 +317,22 @@ pub fn snap(shapes: &[Shape], pos: &[Pt], me: usize, x: f64, y: f64) -> Pt {
 
 /// Screen-aware variant, with the pixel threshold converted to stage units.
 pub fn snap_with_threshold(
-    shapes: &[Shape], pos: &[Pt], me: usize, x: f64, y: f64, threshold: f64,
+    shapes: &[Shape],
+    pos: &[Pt],
+    me: usize,
+    x: f64,
+    y: f64,
+    threshold: f64,
 ) -> Pt {
-    let Some(mine) = shapes.get(me) else { return Pt::new(x, y) };
+    let Some(mine) = shapes.get(me) else {
+        return Pt::new(x, y);
+    };
     let mut best = threshold;
     let mut landed = Pt::new(x, y);
     for (index, (other, at)) in shapes.iter().zip(pos).enumerate() {
-        if index == me { continue; }
+        if index == me {
+            continue;
+        }
         for m in &mine.mons {
             for o in &other.mons {
                 let (mx, my) = (x + m.x, y + m.y);
@@ -361,19 +373,38 @@ pub fn links(shapes: &[Shape], pos: &[Pt]) -> Vec<GeoLink> {
                         let (ax, ay) = (ap.x + ar.x, ap.y + ar.y);
                         let (bx, by) = (bp.x + br.x, bp.y + br.y);
                         for (dir, gap, start, end, edge) in [
-                            (Dir::Horizontal, bx - (ax + ar.w), ay.max(by),
-                                (ay + ar.h).min(by + br.h), ax + ar.w),
-                            (Dir::Vertical, by - (ay + ar.h), ax.max(bx),
-                                (ax + ar.w).min(bx + br.w), ay + ar.h),
+                            (
+                                Dir::Horizontal,
+                                bx - (ax + ar.w),
+                                ay.max(by),
+                                (ay + ar.h).min(by + br.h),
+                                ax + ar.w,
+                            ),
+                            (
+                                Dir::Vertical,
+                                by - (ay + ar.h),
+                                ax.max(bx),
+                                (ax + ar.w).min(bx + br.w),
+                                ay + ar.h,
+                            ),
                         ] {
-                            if gap.abs() > LINK_MAX_GAP || end - start <= MIN_OVERLAP { continue; }
+                            if gap.abs() > LINK_MAX_GAP || end - start <= MIN_OVERLAP {
+                                continue;
+                            }
                             let mid = (start + end) / 2.0;
                             let (from, to) = match dir {
                                 Dir::Horizontal => (Pt::new(edge, mid), Pt::new(bx, mid)),
                                 Dir::Vertical => (Pt::new(mid, edge), Pt::new(mid, by)),
                             };
                             out.push(GeoLink {
-                                a, b, a_display: am, b_display: bm, dir, gap, from, to,
+                                a,
+                                b,
+                                a_display: am,
+                                b_display: bm,
+                                dir,
+                                gap,
+                                from,
+                                to,
                                 span: (start, end),
                             });
                         }
@@ -390,19 +421,29 @@ mod tests {
     use super::*;
 
     fn boxed(w: f64, h: f64) -> Shape {
-        Shape { mons: vec![Rect::new(0.0, 0.0, w, h)], w, h }
+        Shape {
+            mons: vec![Rect::new(0.0, 0.0, w, h)],
+            w,
+            h,
+        }
     }
 
     #[test]
     fn real_display_coordinates_are_normalized_without_rearranging() {
-        let shape = Shape::new(&[
-            Rect::new(-1920.0, 100.0, 1920.0, 1080.0),
-            Rect::new(0.0, 0.0, 1080.0, 1920.0),
-        ], 0.1);
-        assert_eq!(shape.mons, vec![
-            Rect::new(0.0, 10.0, 192.0, 108.0),
-            Rect::new(192.0, 0.0, 108.0, 192.0),
-        ]);
+        let shape = Shape::new(
+            &[
+                Rect::new(-1920.0, 100.0, 1920.0, 1080.0),
+                Rect::new(0.0, 0.0, 1080.0, 1920.0),
+            ],
+            0.1,
+        );
+        assert_eq!(
+            shape.mons,
+            vec![
+                Rect::new(0.0, 10.0, 192.0, 108.0),
+                Rect::new(192.0, 0.0, 108.0, 192.0),
+            ]
+        );
     }
 
     #[test]
@@ -410,8 +451,16 @@ mod tests {
         let shapes = [boxed(144.0, 190.0), boxed(100.0, 80.0)];
         let pos = [Pt::new(300.0, 60.0), Pt::default()];
         for (drop, expected, dir) in [
-            (Pt::new(450.0, 157.5), Pt::new(444.0, 157.5), Dir::Horizontal),
-            (Pt::new(194.0, 157.5), Pt::new(200.0, 157.5), Dir::Horizontal),
+            (
+                Pt::new(450.0, 157.5),
+                Pt::new(444.0, 157.5),
+                Dir::Horizontal,
+            ),
+            (
+                Pt::new(194.0, 157.5),
+                Pt::new(200.0, 157.5),
+                Dir::Horizontal,
+            ),
             (Pt::new(327.5, 256.0), Pt::new(327.5, 250.0), Dir::Vertical),
             (Pt::new(327.5, -26.0), Pt::new(327.5, -20.0), Dir::Vertical),
         ] {
@@ -437,9 +486,12 @@ mod tests {
     #[test]
     fn lower_half_of_portrait_monitor_is_the_only_contact() {
         let desktop = Shape {
-            mons: vec![Rect::new(0.0, 20.0, 192.0, 108.0),
-                       Rect::new(192.0, 0.0, 108.0, 192.0)],
-            w: 300.0, h: 192.0,
+            mons: vec![
+                Rect::new(0.0, 20.0, 192.0, 108.0),
+                Rect::new(192.0, 0.0, 108.0, 192.0),
+            ],
+            w: 300.0,
+            h: 192.0,
         };
         let shapes = [desktop, boxed(174.5, 96.0)];
         let pos = [Pt::default(), Pt::new(307.0, 96.0)];
@@ -455,23 +507,34 @@ mod tests {
     #[test]
     fn touching_two_displays_produces_two_exact_segments() {
         let desktop = Shape {
-            mons: vec![Rect::new(0.0, 0.0, 100.0, 80.0),
-                       Rect::new(0.0, 80.0, 100.0, 120.0)],
-            w: 100.0, h: 200.0,
+            mons: vec![
+                Rect::new(0.0, 0.0, 100.0, 80.0),
+                Rect::new(0.0, 80.0, 100.0, 120.0),
+            ],
+            w: 100.0,
+            h: 200.0,
         };
-        let contacts = links(&[desktop, boxed(100.0, 120.0)],
-            &[Pt::default(), Pt::new(100.0, 40.0)]);
+        let contacts = links(
+            &[desktop, boxed(100.0, 120.0)],
+            &[Pt::default(), Pt::new(100.0, 40.0)],
+        );
         assert_eq!(contacts.len(), 2);
         assert_eq!((contacts[0].a_display, contacts[0].span), (0, (40.0, 80.0)));
-        assert_eq!((contacts[1].a_display, contacts[1].span), (1, (80.0, 160.0)));
+        assert_eq!(
+            (contacts[1].a_display, contacts[1].span),
+            (1, (80.0, 160.0))
+        );
     }
 
     #[test]
     fn horizontal_contacts_use_real_edges_of_unequal_height_displays() {
         let desktop = Shape {
-            mons: vec![Rect::new(0.0, 20.0, 100.0, 80.0),
-                       Rect::new(100.0, 0.0, 80.0, 100.0)],
-            w: 180.0, h: 100.0,
+            mons: vec![
+                Rect::new(0.0, 20.0, 100.0, 80.0),
+                Rect::new(100.0, 0.0, 80.0, 100.0),
+            ],
+            w: 180.0,
+            h: 100.0,
         };
         let shapes = [desktop, boxed(120.0, 90.0)];
         let pos = [Pt::default(), Pt::new(40.25, 106.0)];
@@ -488,19 +551,30 @@ mod tests {
     fn screen_threshold_is_not_a_long_distance_magnet() {
         let shapes = [boxed(100.0, 100.0), boxed(80.0, 80.0)];
         let pos = [Pt::default(), Pt::default()];
-        assert_eq!(snap_with_threshold(&shapes, &pos, 1, 107.0, 30.25, 6.0),
-                   Pt::new(107.0, 30.25));
-        assert_eq!(snap_with_threshold(&shapes, &pos, 1, 105.0, 30.25, 6.0),
-                   Pt::new(100.0, 30.25));
+        assert_eq!(
+            snap_with_threshold(&shapes, &pos, 1, 107.0, 30.25, 6.0),
+            Pt::new(107.0, 30.25)
+        );
+        assert_eq!(
+            snap_with_threshold(&shapes, &pos, 1, 105.0, 30.25, 6.0),
+            Pt::new(100.0, 30.25)
+        );
     }
 
     #[test]
     fn legacy_links_load_and_disconnected_nodes_are_parked() {
         let nodes = vec![vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)]; 3];
-        let doc = [DocLink { a: 0, b: 1, side: Side::Right, contact: None }];
+        let doc = [DocLink {
+            a: 0,
+            b: 1,
+            side: Side::Right,
+            contact: None,
+        }];
         let arrangement = arrange(&nodes, &doc, 0);
-        assert!((arrangement.pos[1].x - arrangement.pos[0].x
-            - arrangement.shapes[0].w - GAP).abs() < 1e-6);
+        assert!(
+            (arrangement.pos[1].x - arrangement.pos[0].x - arrangement.shapes[0].w - GAP).abs()
+                < 1e-6
+        );
         assert!(arrangement.pos[2].y > arrangement.pos[0].y + arrangement.shapes[0].h);
     }
 
@@ -509,9 +583,13 @@ mod tests {
         for scale in [BASE_SCALE, BASE_SCALE / 3.0] {
             let shapes = vec![Shape::new(&[Rect::new(0.0, 0.0, 1920.0, 1080.0)], scale); 2];
             let doc = [DocLink {
-                a: 0, b: 1, side: Side::Right,
-                contact: Some((Rect::new(144.0, 40.125, 0.0, 20.0),
-                               Rect::new(0.0, 0.0, 0.0, 20.0))),
+                a: 0,
+                b: 1,
+                side: Side::Right,
+                contact: Some((
+                    Rect::new(144.0, 40.125, 0.0, 20.0),
+                    Rect::new(0.0, 0.0, 0.0, 20.0),
+                )),
             }];
             let pos = place_at_scale(&shapes, &doc, 0, scale);
             assert!((pos[1].x - pos[0].x - shapes[0].w).abs() < 1e-9);

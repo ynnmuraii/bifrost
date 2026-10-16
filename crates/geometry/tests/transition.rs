@@ -490,14 +490,29 @@ fn concrete_contact_segments_only_cross_within_overlap_on_both_axes_and_directio
         assert_eq!(validate_topology(&topology), Ok(()));
 
         for reverse in [false, true] {
-            let (owner, id, start, end, normal, boundary, target_id, target_normal) =
-                if reverse {
-                    (node(2), "b", 100.0, 500.0, -1.0, 0.0, "a",
-                        if horizontal { 998.0 } else { 1198.0 })
-                } else {
-                    (node(1), "a", 200.0, 600.0, 1.0,
-                        if horizontal { 1000.0 } else { 1200.0 }, "b", 2.0)
-                };
+            let (owner, id, start, end, normal, boundary, target_id, target_normal) = if reverse {
+                (
+                    node(2),
+                    "b",
+                    100.0,
+                    500.0,
+                    -1.0,
+                    0.0,
+                    "a",
+                    if horizontal { 998.0 } else { 1198.0 },
+                )
+            } else {
+                (
+                    node(1),
+                    "a",
+                    200.0,
+                    600.0,
+                    1.0,
+                    if horizontal { 1000.0 } else { 1200.0 },
+                    "b",
+                    2.0,
+                )
+            };
             for along in [start - 1.0, start, (start + end) / 2.0, end, end + 1.0] {
                 let position = if horizontal {
                     Position::new(id, along, boundary)
@@ -509,11 +524,8 @@ fn concrete_contact_segments_only_cross_within_overlap_on_both_axes_and_directio
                 } else {
                     Point::new(normal * 20.0, 0.0)
                 };
-                let inside = Position::new(
-                    id,
-                    position.x - delta.x / 2.0,
-                    position.y - delta.y / 2.0,
-                );
+                let inside =
+                    Position::new(id, position.x - delta.x / 2.0, position.y - delta.y / 2.0);
                 let resolved = resolve_transition(&topology, &owner, &position);
                 assert_eq!(resolve_motion(&topology, &owner, &inside, delta), resolved);
                 if along < start || along > end {
@@ -530,7 +542,11 @@ fn concrete_contact_segments_only_cross_within_overlap_on_both_axes_and_directio
                 assert_eq!(transition.target_position, expected);
                 assert_eq!(
                     transition.direction,
-                    if reverse { LinkDirection::Reverse } else { LinkDirection::Forward }
+                    if reverse {
+                        LinkDirection::Reverse
+                    } else {
+                        LinkDirection::Forward
+                    }
                 );
             }
         }
