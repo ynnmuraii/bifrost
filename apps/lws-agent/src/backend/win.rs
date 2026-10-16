@@ -12,9 +12,9 @@
 //!
 //! Known gaps of this slice, stated rather than hidden:
 //!
-//! * `EndCapture` drops the capture object, which uninstalls the hooks; re-arming
-//!   creates them again. Temporary capture passes all input to the local desktop
-//!   and does not queue keys/buttons/scroll, so no local replay is necessary and
+//! * `EndCapture` leaves the lifetime hotkey hook in Observe mode, but clears the source
+//!   baseline so ordinary input is not forwarded until `BeginCapture`. Temporary capture
+//!   passes all input to the local desktop and does not queue keys/buttons/scroll, so
 //!   committing cannot duplicate those edges on the peer.
 //! * `ReleaseKeys` injects key/button ups for exactly the entries core sends. The
 //!   `GetAsyncKeyState` pre-check the documents ask for at spike KVM-011 is not
@@ -119,7 +119,7 @@ pub struct Win {
 
 impl Win {
     /// Builds the Windows backend and installs a lifetime observe hook for global actions.
-    /// Ordinary local input is never forwarded while observing.
+    /// Ordinary local input is forwarded only after `begin_capture` arms a source baseline.
     pub fn new(
         ready: &Ready,
         emergency_hotkey: &str,
@@ -614,13 +614,7 @@ impl Win {
             // — which the OS repeats at its own rate — spun the poll loop at full CPU instead
             // of its tick.
             if let Some(event) = drain_capture(
-                || loop {
-                    let event = capture.try_recv()?;
-                    if mode == CaptureKind::Observe && matches!(event, CaptureEvent::Input(_)) {
-                        continue;
-                    }
-                    break Some(event);
-                },
+                || next_source_capture(mode, self.source_motion.is_some(), || capture.try_recv()),
                 &mut self.repeats,
             ) {
                 let Event::Input(event) = event else {
@@ -736,6 +730,22 @@ impl Win {
         }
         self.last_capture_report = Some(now);
         self.last_capture_stats = stats;
+    }
+}
+
+/// Lifetime hotkey observation and an armed local source both use Observe mode.
+fn next_source_capture(
+    mode: CaptureKind,
+    source_armed: bool,
+    mut next: impl FnMut() -> Option<CaptureEvent>,
+) -> Option<CaptureEvent> {
+    loop {
+        let event = next()?;
+        if mode == CaptureKind::Observe && !source_armed && matches!(event, CaptureEvent::Input(_))
+        {
+            continue;
+        }
+        return Some(event);
     }
 }
 
@@ -951,6 +961,40 @@ fn new_clipboard_sequence(last: &mut Option<u32>, sequence: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn armed_observe_keeps_pointer_motion_across_every_drain() {
+        let mut repeats = RepeatFilter::new();
+        for interval in 0..8 {
+            let point = input_model::Position::new(100.0 + f64::from(interval), 200.0);
+            let mut queue = std::collections::VecDeque::from([CaptureEvent::Input(
+                InputEvent::PointerAbsolute(point),
+            )]);
+            let event = drain_capture(
+                || next_source_capture(CaptureKind::Observe, true, || queue.pop_front()),
+                &mut repeats,
+            );
+            assert!(
+                matches!(event, Some(Event::Input(InputEvent::PointerAbsolute(actual))) if actual == point),
+                "armed Observe lost pointer motion at flush interval {interval}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifetime_observe_discards_input_but_preserves_hotkeys() {
+        let mut queue = std::collections::VecDeque::from([
+            CaptureEvent::Input(InputEvent::PointerAbsolute(input_model::Position::new(
+                1.0, 2.0,
+            ))),
+            CaptureEvent::HotkeyPressed(1),
+        ]);
+        assert!(matches!(
+            next_source_capture(CaptureKind::Observe, false, || queue.pop_front()),
+            Some(CaptureEvent::HotkeyPressed(1))
+        ));
+        assert!(queue.is_empty());
+    }
 
     #[test]
     fn clipboard_notifications_are_deduplicated_without_swallowing_new_copies() {
