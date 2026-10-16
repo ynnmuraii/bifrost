@@ -214,9 +214,9 @@ pub fn bounds(shapes: &[Shape], pos: &[Pt]) -> (f64, f64, f64, f64) {
 
 /// The first placement: the applied links decide where each computer goes.
 ///
-/// `anchor` (this computer) is the root; whatever is linked to it is placed on the side the
-/// link names, `GAP` away; computers with no link at all are parked below the rest, far enough
-/// that [`links`] cannot mistake them for neighbours. The result is centred on the stage.
+/// `anchor` is the root. Concrete endpoint starts coincide, preserving their
+/// display-relative offsets; legacy whole-desktop links keep their initial [`GAP`].
+/// Disconnected computers are parked below the rest. The result is stage-centred.
 pub fn place(shapes: &[Shape], doc_links: &[DocLink], anchor: usize) -> Vec<Pt> {
     place_at_scale(shapes, doc_links, anchor, BASE_SCALE)
 }
