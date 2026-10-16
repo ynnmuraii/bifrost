@@ -417,8 +417,10 @@ pub struct Session {
     edge_guard: Option<crate::topology::ReturnGuard>,
     transition_retry: transition_retry::TransitionRetry,
     pending_edge_guard: Option<crate::topology::ReturnGuard>,
-    /// The last non-empty agent display report; empty reports never replace it.
+    /// The latest agent manifest, including empty reports after discovery.
     agent_displays: Vec<protocol::ipc::DisplayInfo>,
+    /// Bootstrap snapshots are allowed only until the first non-empty live manifest.
+    agent_displays_known: bool,
     /// The last captured local position: the input of an edge crossing in `Local`.
     local_pointer: Option<geometry::Position>,
     /// While a source lease is remote: the virtual position on the peer's display.
@@ -599,6 +601,7 @@ impl Session {
             transition_retry: transition_retry::TransitionRetry::default(),
             pending_edge_guard: None,
             agent_displays: Vec::new(),
+            agent_displays_known: false,
             local_hello,
             peer_displays: BTreeMap::new(),
             local_pointer: None,
@@ -647,10 +650,11 @@ impl Session {
     fn layout_checker(&self) -> impl Fn(&str) -> Result<config::TopologyConfig, String> {
         let node = *self.node_id.as_bytes();
         let agent = self.agent_displays.clone();
+        let agent_known = self.agent_displays_known;
         let peers = self.peer_displays.clone();
         move |text| {
             let layout = parse_layout_toml(text)?;
-            crate::topology::check_layout(&layout, &node, &agent, &peers)?;
+            crate::topology::check_layout(&layout, &node, agent_known.then_some(agent.as_slice()), &peers)?;
             Ok(layout)
         }
     }
@@ -661,7 +665,7 @@ impl Session {
         let (displays, peers) = crate::topology::live_inputs(
             &self.layout,
             self.node_id.as_bytes(),
-            &self.agent_displays,
+            self.agent_displays_known.then_some(self.agent_displays.as_slice()),
             &self.peer_displays,
         );
         let documents = crate::topology::Documents {
@@ -1465,7 +1469,7 @@ impl Session {
                     revision,
                     "peer display report"
                 );
-                if displays.is_empty() {
+                if displays.is_empty() && !self.peer_displays.contains_key(&from) {
                     return;
                 }
                 self.peer_displays.insert(from, (revision, displays));
@@ -2316,7 +2320,9 @@ impl Session {
                     receiver_ready = hello.capabilities.receiver_ready(),
                     "link up"
                 );
-                if hello.displays_revision > 0 && !hello.displays.is_empty() {
+                // A positive revision proves discovery completed, even when this is our
+                // first connection and the peer currently reports no displays.
+                if hello.displays_revision > 0 {
                     self.peer_displays
                         .insert(peer, (hello.displays_revision, hello.displays.clone()));
                 }
@@ -2814,7 +2820,7 @@ impl Session {
                     .iter()
                     .filter_map(crate::topology::display_to_wire)
                     .collect();
-                if displays.is_empty() {
+                if displays.is_empty() && !self.agent_displays_known {
                     self.rebuild_topology();
                     return Ok(());
                 }
@@ -2826,6 +2832,7 @@ impl Session {
                     self.local_hello.displays_revision
                 };
                 self.agent_displays = report.displays;
+                self.agent_displays_known = true;
                 self.local_hello.displays_revision = revision;
                 self.local_hello.displays = displays.clone();
                 self.manager
