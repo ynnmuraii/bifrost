@@ -16,6 +16,11 @@ use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
 use ui_text::{text, Key};
 
+/// How near, in screen points, an edge has to be before a drag snaps onto it. The model's
+/// [`crate::map::SNAP`] is the same idea in stage units; a drag converts this one instead,
+/// so the magnet keeps its reach on screen however far the map is zoomed.
+const SNAP_PX: f64 = 12.0;
+
 /// Stage → screen.
 #[derive(Clone, Copy)]
 struct Xf {
@@ -606,6 +611,9 @@ fn node_ui(
                         node_id: node.node_id.clone(),
                         x: drag.start.x + delta.x,
                         y: drag.start.y + delta.y,
+                        // The magnet reaches `SNAP_PX` points on screen, so it feels the same
+                        // at every zoom; the model works in stage units.
+                        snap_threshold: SNAP_PX / f64::from(s),
                     });
                 }
             }
@@ -874,6 +882,22 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
             );
         }
     }
+    // A link the core keeps but cannot use: a display it names is not reported, so nothing
+    // crosses there until that monitor is back. The map names the display, which the faded
+    // line cannot say on its own; placing the pair again is the way to give it another link,
+    // and this one returns by itself once the display is reported again.
+    for line in vm.inactive_link_lines() {
+        let galley = ui.painter().layout(
+            line,
+            font(12.0, fam::sans_medium()),
+            pal.accent,
+            (rect.width() - 92.0).max(40.0),
+        );
+        let size = galley.size();
+        ui.painter()
+            .galley(Pos2::new(center - size.x / 2.0, y), galley, pal.accent);
+        y += size.y + 4.0;
+    }
 }
 
 #[cfg(test)]
@@ -911,6 +935,7 @@ mod transform_tests {
                 a: 0,
                 side: Side::Left,
                 b: 1,
+                contact: None,
             }],
             0,
         );
