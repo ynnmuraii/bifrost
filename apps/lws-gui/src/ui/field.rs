@@ -922,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ascii_style_draws_glyphs_on_the_link_and_the_line_style_draws_none() {
+    fn inactive_ascii_links_keep_their_quiet_glyph_chain_and_line_style_draws_no_glyphs() {
         let (from, to) = (Pos2::new(100.0, 200.0), Pos2::new(500.0, 200.0));
         let ascii = glyphs_on_link(LinkStyle::Ascii, from, to);
         assert!(
@@ -932,10 +932,6 @@ mod tests {
         assert!(
             ascii.iter().filter(|glyph| *glyph == "-").count() > 10,
             "its middle is the dashed chain of a glyph per {LINK_STEP} points: {ascii:?}"
-        );
-        assert!(
-            ascii.iter().any(|glyph| glyph == "•"),
-            "and the input of an active link flows through it as dots: {ascii:?}"
         );
         assert_eq!(
             glyphs_on_link(LinkStyle::Line, from, to),
