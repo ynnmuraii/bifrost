@@ -16,12 +16,14 @@ use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
 use ui_text::{text, Key};
 
-/// How far the ribbon of «ASCII-изолиния» arches above the midpoint of a link, in screen
-/// points per unit of zoom — the mockup's own 110 (`docs/design/mockup/Main.dc.html`), which
-/// is the stage's scale to the window, not the map's own scale of the virtual coordinates.
+/// How high the ribbon of «ASCII-изолиния» arches over the cards it runs between, as a share of
+/// the base: the distance between the two card centres.
+const RIBBON_RISE: f32 = 0.35;
+/// The flattest the arch may ever be, in points: a ribbon hugging the cards reads as a scratch.
+const RIBBON_RISE_MIN: f32 = 40.0;
+/// The tallest, in points per unit of zoom — the mockup's own 110
+/// (`docs/design/mockup/Main.dc.html`), which is the stage's scale to the window.
 const RIBBON_ARCH: f32 = 110.0;
-/// The flattest the arch may ever be: a ribbon hugging the cards reads as a scratch.
-const RIBBON_ARCH_MIN: f32 = 60.0;
 
 /// Stage → screen.
 #[derive(Clone, Copy)]
@@ -105,9 +107,9 @@ pub fn draw(
         })
         .collect();
 
-    // The ribbon of «ASCII-изолиния» arches in screen points, scaled by the map's zoom and
-    // never flatter than the mockup's floor.
-    let arch = (RIBBON_ARCH * f32::from(vm.look.zoom_percent) / 100.0).max(RIBBON_ARCH_MIN);
+    // The ribbon of «ASCII-изолиния»: it runs from the centre of one card to the centre of the
+    // other and arches gently over both, so it reads as an arc rather than a column over the gap.
+    let zoom = f32::from(vm.look.zoom_percent) / 100.0;
     let card = |n: usize| {
         Rect::from_min_size(
             shown[n],
@@ -121,7 +123,7 @@ pub fn draw(
         .map(|l| {
             let (a, b) = link_ends(&model, l, &shown, xf);
             let (from, to) = if l.forward { (a, b) } else { (b, a) };
-            let arc = ribbon_arc(card(l.a), card(l.b), arch);
+            let arc = ribbon_arc(card(l.a), card(l.b), zoom);
             let arc = if l.forward {
                 arc
             } else {
@@ -496,28 +498,16 @@ fn fade(c: Color32, k: f32) -> Color32 {
     c.gamma_multiply(k)
 }
 
-/// The ribbon of one link: it leaves the edge of the first card facing the second, arrives on
-/// the edge of the second, and arches `arch` points over the midpoint between the two.
-fn ribbon_arc(first: Rect, second: Rect, arch: f32) -> Ribbon {
-    let edge = |from: Rect, to: Rect| {
-        let (centre, delta) = (from.center(), to.center() - from.center());
-        let half = from.size() / 2.0;
-        let tx = if delta.x.abs() > f32::EPSILON {
-            half.x / delta.x.abs()
-        } else {
-            f32::INFINITY
-        };
-        let ty = if delta.y.abs() > f32::EPSILON {
-            half.y / delta.y.abs()
-        } else {
-            f32::INFINITY
-        };
-        centre + delta * tx.min(ty).min(1.0)
-    };
-    let (a, b) = (edge(first, second), edge(second, first));
+/// The ribbon of one link: it leaves the centre of the first card, arrives at the centre of the
+/// second, and arches gently over both — a share of the base, floored so it never hugs the cards
+/// and capped against the map's zoom. The field is drawn under the cards, so the ends of the
+/// ribbon are covered by the cards themselves and only the arch is seen.
+fn ribbon_arc(first: Rect, second: Rect, zoom: f32) -> Ribbon {
+    let (a, b) = (first.center(), second.center());
+    let rise = ((b - a).length() * RIBBON_RISE).clamp(RIBBON_RISE_MIN, RIBBON_ARCH * zoom);
     Ribbon {
         a,
-        c: Pos2::new((a.x + b.x) / 2.0, a.y.min(b.y) - arch),
+        c: Pos2::new((a.x + b.x) / 2.0, a.y.min(b.y) - rise),
         b,
     }
 }
@@ -928,27 +918,25 @@ mod transform_tests {
     }
 
     #[test]
-    fn the_ribbon_starts_and_ends_on_the_card_edges_under_a_high_arch() {
+    fn the_ribbon_runs_from_centre_to_centre_under_a_gentle_arch() {
         let first = Rect::from_min_size(Pos2::new(0.0, 100.0), Vec2::new(200.0, 120.0));
         let second = Rect::from_min_size(Pos2::new(400.0, 200.0), Vec2::new(160.0, 90.0));
-        let arch = RIBBON_ARCH.max(RIBBON_ARCH_MIN);
-        let ribbon = ribbon_arc(first, second, arch);
-        // The ends are on the edges, facing each other.
-        assert!((ribbon.a.x - first.max.x).abs() < 0.001, "{ribbon:?}");
-        assert!(
-            ribbon.a.y > first.min.y && ribbon.a.y < first.max.y,
-            "{ribbon:?}"
-        );
-        assert!((ribbon.b.x - second.min.x).abs() < 0.001, "{ribbon:?}");
-        assert!(
-            ribbon.b.y > second.min.y && ribbon.b.y < second.max.y,
-            "{ribbon:?}"
-        );
-        // The arch is over the midpoint between the ends, as high as asked and never flat.
+        let zoom = 1.0;
+        let ribbon = ribbon_arc(first, second, zoom);
+        // The ends are the centres of the cards: the base is their own distance, not the gap.
+        assert!(ribbon.a.distance(first.center()) < 0.001, "{ribbon:?}");
+        assert!(ribbon.b.distance(second.center()) < 0.001, "{ribbon:?}");
+        let base = ribbon.a.distance(ribbon.b);
         assert!((ribbon.c.x - (ribbon.a.x + ribbon.b.x) / 2.0).abs() < 0.001);
+        // A gentle arch over them: a share of the base, floored and capped.
         let rise = ribbon.a.y.min(ribbon.b.y) - ribbon.c.y;
-        assert!((rise - arch).abs() < 0.001, "{rise}");
-        assert!(rise >= 60.0);
+        assert!(
+            (rise - (base * RIBBON_RISE).clamp(RIBBON_RISE_MIN, RIBBON_ARCH * zoom)).abs() < 0.001,
+            "{rise}"
+        );
+        assert!(rise >= RIBBON_RISE_MIN && rise <= RIBBON_ARCH * zoom);
+        // Not a column over the gap: much wider than it is tall.
+        assert!(base > 2.0 * rise, "base {base} rise {rise}");
         // And it passes above both cards rather than through them.
         assert!(
             ribbon.c.y < first.min.y && ribbon.c.y < second.min.y,
