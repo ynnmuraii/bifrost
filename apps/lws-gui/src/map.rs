@@ -9,7 +9,7 @@
 //! The map works in *stage units*: the nominal stage is [`STAGE_W`] × [`STAGE_H`] and a
 //! display of `logical_w` units is drawn `logical_w * scale` stage units wide, where `scale`
 //! is [`BASE_SCALE`] shrunk until every computer fits the stage ([`arrange`]).
-//! The UI converts its screen-pixel magnet threshold into stage units.
+//! The UI converts free pointer movement and paddle hit targets between screen and stage units.
 //!
 //! Links join visible, facing display edges across at most [`LINK_MAX_GAP`] stage units.
 //! Each display pair retains its own overlap segment, rather than a desktop bounding box.

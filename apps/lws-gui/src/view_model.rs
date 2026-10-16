@@ -2148,13 +2148,8 @@ impl ViewModel {
             }
             Action::SetAddress(address) => self.pairing.address = address.clone(),
             Action::ToggleDetails(open) => self.pairing.details = *open,
-            Action::MoveNode {
-                node_id,
-                x,
-                y,
-                snap_threshold,
-            } => {
-                self.move_node_with_threshold(node_id, *x, *y, *snap_threshold);
+            Action::MoveNode { node_id, x, y } => {
+                self.move_node(node_id, *x, *y);
             }
             Action::NudgeNode { node_id, dx, dy } => {
                 // A key press is a whole edit: it is dropped where it lands.
@@ -2379,8 +2374,7 @@ pub enum Action {
     SetAddress(String),
     /// Open or close the fingerprints under the code (ADR-010).
     ToggleDetails(bool),
-    /// Drag a computer of the map: its top-left corner is wanted at `(x, y)` stage units
-    /// (the map snaps it to a neighbour's edge).
+    /// Freely drag a computer's top-left corner to `(x,y)` stage units.
     MoveNode {
         /// The member.
         node_id: String,
@@ -2388,8 +2382,6 @@ pub enum Action {
         x: f64,
         /// Wanted top, in stage units.
         y: f64,
-        /// Magnetic distance in stage units (converted from screen pixels).
-        snap_threshold: f64,
     },
     /// Move a computer of the map by a keyboard step.
     NudgeNode {

@@ -871,7 +871,6 @@ fn enter_in_the_dial_field_only_pairs_even_with_a_dirty_layout() {
             node_id: PEER_NODE.to_owned(),
             x: at.x + 16.0,
             y: at.y,
-            snap_threshold: 0.0,
         },
         Instant::now(),
     );
