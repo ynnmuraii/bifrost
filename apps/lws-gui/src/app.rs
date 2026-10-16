@@ -77,8 +77,14 @@ impl GuiApp {
             view.look = gui_settings::load(file);
         }
         let saved_look = view.look;
+        view.settings.autostart = crate::autostart::enabled();
+        let start_core = view.config.config_was_missing;
+        let mut bridge = Bridge::new(view, client);
+        if start_core {
+            bridge.dispatch(view_model::Action::StartCore, Instant::now());
+        }
         GuiApp {
-            bridge: Bridge::new(view, client),
+            bridge,
             ui: UiState::new(Instant::now()),
             look_file,
             saved_look,

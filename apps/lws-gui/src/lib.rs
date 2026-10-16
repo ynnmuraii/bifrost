@@ -34,6 +34,7 @@
 pub use ui_text;
 
 pub mod app;
+pub mod autostart;
 pub mod gui_settings;
 pub mod map;
 pub mod ui;

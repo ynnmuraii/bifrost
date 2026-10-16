@@ -657,6 +657,10 @@ pub struct Settings {
     pub first_run: bool,
     /// `true` once that notice was raised: never twice in one session.
     pub first_run_reported: bool,
+    /// Whether this user's login starts the current executable.
+    pub autostart: bool,
+    /// A failed change to the system login entry.
+    pub autostart_error: Option<String>,
 }
 
 /// «Адрес этого компьютера в локальной сети»: the address the file names, and the ones
@@ -2404,6 +2408,8 @@ pub enum Action {
     RestartCore,
     /// Close «Настройки созданы автоматически».
     DismissFirstRun,
+    /// Register or remove this executable at user login.
+    SetAutostart(bool),
 }
 
 impl Action {
@@ -2596,6 +2602,13 @@ impl Bridge {
                 self.client.start_core();
             }
             Action::RestartCore => self.restart_core(now),
+            Action::SetAutostart(enabled) => match crate::autostart::set_enabled(enabled) {
+                Ok(()) => {
+                    self.view.settings.autostart = enabled;
+                    self.view.settings.autostart_error = None;
+                }
+                Err(error) => self.view.settings.autostart_error = Some(error.to_string()),
+            },
             Action::OpenConfigFile => self.view.open_config_file(),
             // «Применить» has already written the file above (`local`), and a saved address
             // is not in use until the core that reads it is the fresh one.

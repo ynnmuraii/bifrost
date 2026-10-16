@@ -5,28 +5,22 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # The same ceiling ci.yml puts on its Windows job: a hung release build must
-    # fail rather than hold a 2x-priced runner for the 360-minute default. A
-    # cold release build of this workspace is ~20 minutes; 60 is generous.
     timeout-minutes: 60
-    permissions:
-      # The last step attaches archives to a tag, which the read-only default
-      # token of a fresh repository would refuse.
-      contents: write
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-22.04 is deliberate: its glibc is older than the one in
-        # Ubuntu 24.04, so the binary built here runs both on CachyOS (a
-        # rolling release with an even newer glibc) and on 24.04. Building on
-        # 24.04 would risk binaries an older glibc refuses to load.
+        # Ubuntu 22.04 keeps the shipped glibc baseline at 2.35 or older.
         os: [windows-latest, ubuntu-22.04]
         include:
           - os: windows-latest
@@ -35,114 +29,95 @@ jobs:
             platform: linux-x86_64
     steps:
       - uses: actions/checkout@v4
-
-      # Not pinned on purpose, same as ci.yml: rust-toolchain.toml is the
-      # source of truth and names the channel "stable", the one this action
-      # installs. The fmt/clippy components and the x86_64 target ci.yml
-      # passes exist there so its later steps can run; a release build needs
-      # neither.
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo and target
-        uses: Swatinem/rust-cache@v2
-
-      # Only what a release build needs: build-essential supplies the C
-      # compiler and the archiver that ring (rustls) compiles its C and
-      # assembly parts with. Everything else in the graph is pure Rust, and
-      # the X11/Wayland clients load their libraries at runtime rather than
-      # at link time (see the longer note on the same step in ci.yml), so no
-      # -dev packages are installed. ci.yml also installs binutils, xvfb and
-      # xauth for its symbol check and test run; this workflow runs neither.
+      - uses: Swatinem/rust-cache@v2
       - name: System dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential
-
-      # `cargo build --release` is deliberately the only build: no
-      # cross-compilation, no extra toolchains, nothing staged through cargo.
-      # One binary: `bifrost` is the window, the command line and the
-      # agent (the core starts its agent as `bifrost agent …`, and the
-      # window starts the core as `bifrost run`), so there is no layout
-      # to keep and nothing to find beside it.
+          sudo apt-get install --yes --no-install-recommends build-essential binutils
       - name: Build
-        run: cargo build --release
-
-      # docs/06-development-plan.md, «CI и выпуск»: «Release manifest и архивы
-      # сборок генерируются в CI, а не хранятся вручную: version, OS/arch,
-      # checksums, известные ограничения и manual matrix». SHA256SUMS.txt is
-      # the checksum half of that manifest, and the archive is flat on
-      # purpose: the user unpacks one binary and three text files into one
-      # directory. The texts are
-      # packaging/README_RU.txt (the in-archive instructions),
-      # licenses/THIRD_PARTY_NOTICES.md (MIT redistributability, ADR-009) and
-      # crates/config/examples-data/config.example.toml - the core requires
-      # config.toml and does not create it (Config::load fails on a missing
-      # file), so a release without the example file cannot start at all.
-      - name: Package
+        run: cargo build --locked --release -p bifrost
+      - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name || github.sha }}" -replace '^v', ''
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          if ('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne "v$version") { throw 'Tag and workspace version differ' }
           $name = "bifrost-$version-${{ matrix.platform }}"
-          $archive = Join-Path $env:RUNNER_TEMP "$name.zip"
-          $stage = Join-Path $env:RUNNER_TEMP "stage"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $out = Join-Path $env:RUNNER_TEMP 'dist'
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          New-Item -ItemType Directory -Force -Path $out, $stage | Out-Null
+          Copy-Item target/release/bifrost.exe "$out/$name.exe"
           Copy-Item target/release/bifrost.exe $stage
-          Copy-Item packaging/README_RU.txt $stage
-          Copy-Item licenses/THIRD_PARTY_NOTICES.md $stage
-          Copy-Item crates/config/examples-data/config.example.toml $stage
-          Copy-Item apps/bifrost/assets/icon.ico $stage
-          Copy-Item apps/bifrost/assets/icon.svg $stage
-          Copy-Item apps/bifrost/assets/icon-256.png $stage
-          Compress-Archive -Path "$stage/*" -DestinationPath $archive
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
-          # `<hex>  <file>` with two spaces, the sha256sum convention: the
-          # name is the archive's own, so `sha256sum -c SHA256SUMS.txt`
-          # verifies a download without knowing where it came from.
-          Set-Content -Path (Join-Path $env:RUNNER_TEMP "SHA256SUMS.txt") -Value "$hash  $name.zip"
-
-      - name: Package
+          Copy-Item packaging/README_RU.txt, LICENSE, licenses/THIRD_PARTY_NOTICES.md, crates/config/examples-data/config.example.toml $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "$out/$name.zip"
+          $info = (Get-Item "$out/$name.exe").VersionInfo
+          if ($info.FileVersion -ne $version -or $info.ProductVersion -ne $version) { throw 'Wrong Windows version metadata' }
+          & "$out/$name.exe" --version
+      - name: Package Linux
         if: runner.os == 'Linux'
         run: |
-          version="${{ github.ref_name || github.sha }}"
-          name="bifrost-${version#v}-${{ matrix.platform }}"
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          if [ '${{ github.ref_type }}' = tag ] && [ '${{ github.ref_name }}' != "v$version" ]; then
+            echo 'Tag and workspace version differ' >&2; exit 1
+          fi
+          name="bifrost-$version-${{ matrix.platform }}"
           stage="$RUNNER_TEMP/stage"
-          mkdir -p "$stage"
-          install -m 0755 target/release/bifrost "$stage/"
-          cp packaging/README_RU.txt licenses/THIRD_PARTY_NOTICES.md "$stage/"
-          cp crates/config/examples-data/config.example.toml "$stage/"
-          install -m 0644 packaging/bifrost.desktop "$stage/"
-          mkdir -p "$stage/share/applications" "$stage/share/icons/hicolor/scalable/apps"
-          install -m 0644 packaging/bifrost.desktop "$stage/share/applications/"
+          mkdir -p "$stage/share/icons/hicolor/scalable/apps" "$RUNNER_TEMP/dist"
+          install -m 0755 target/release/bifrost packaging/install.sh "$stage/"
+          cp packaging/README_RU.txt LICENSE licenses/THIRD_PARTY_NOTICES.md crates/config/examples-data/config.example.toml packaging/bifrost.desktop "$stage/"
           install -m 0644 packaging/bifrost.svg "$stage/share/icons/hicolor/scalable/apps/bifrost.svg"
           for size in 16 20 24 32 40 48 64 256; do
             mkdir -p "$stage/share/icons/hicolor/${size}x${size}/apps"
             install -m 0644 "apps/bifrost/assets/icon-${size}.png" "$stage/share/icons/hicolor/${size}x${size}/apps/bifrost.png"
           done
-          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$stage" bifrost README_RU.txt THIRD_PARTY_NOTICES.md config.example.toml bifrost.desktop share
-          # shasum prints `<hex>  <file>` (two spaces), the same format and
-          # file name as the Windows step writes. The subshell makes <file>
-          # the archive's own name rather than its path, so a user who
-          # unpacked the archive can verify it with `sha256sum -c`.
-          (cd "$RUNNER_TEMP" && shasum -a 256 "$name.tar.gz" > SHA256SUMS.txt)
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
+          ldd --version
+          objdump -T target/release/bifrost | grep -o 'GLIBC_[0-9.]*' | sort -Vu
+          tar -czf "$RUNNER_TEMP/dist/$name.tar.gz" -C "$stage" .
+          HOME="$RUNNER_TEMP/install-test" "$stage/install.sh"
+          HOME="$RUNNER_TEMP/install-test" "$RUNNER_TEMP/install-test/.local/bin/bifrost" --version
+          HOME="$RUNNER_TEMP/install-test" "$stage/install.sh" --uninstall
+          test -z "$(find "$RUNNER_TEMP/install-test" -type f -print -quit)"
+      - uses: actions/upload-artifact@v4
         with:
-          name: bifrost-${{ matrix.os }}
-          path: |
-            ${{ runner.temp }}/bifrost-*-${{ matrix.platform }}.*
-            ${{ runner.temp }}/SHA256SUMS.txt
+          name: release-${{ matrix.platform }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
 
-      # Only the tag trigger: `push` fires here solely on `v*` tags, so this
-      # condition is exactly "a release is being cut". A workflow_dispatch on
-      # a branch still uploads artifacts to test the packaging, but publishes
-      # nothing.
-      - name: Attach to the release
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum bifrost-* > SHA256SUMS.txt)
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          awk -v version="$version" '$0 ~ "^## " version " —" { found=1; next } found && /^## / { exit } found { print }' CHANGELOG.md > release-notes.txt
+          test -s release-notes.txt
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-checksums
+          path: dist/SHA256SUMS.txt
+      - name: Publish
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ runner.temp }}/bifrost-*-${{ matrix.platform }}.*
-            ${{ runner.temp }}/SHA256SUMS.txt
+          name: Bifrost ${{ env.RELEASE_VERSION }}
+          body_path: release-notes.txt
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: dist/*

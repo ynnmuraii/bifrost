@@ -10,8 +10,8 @@ fn main() {
             .set("FileDescription", "Bifrost")
             .set("InternalName", "Bifrost")
             .set("OriginalFilename", "bifrost.exe")
-            .set("FileVersion", "0.1.0")
-            .set("ProductVersion", "0.1.0")
+            .set("FileVersion", env!("CARGO_PKG_VERSION"))
+            .set("ProductVersion", env!("CARGO_PKG_VERSION"))
             .compile()
             .expect("failed to embed the Bifrost Windows icon");
     }

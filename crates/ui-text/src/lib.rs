@@ -79,6 +79,8 @@ pub enum Key {
     Diagnostics,
     /// «Настройки»
     Settings,
+    /// Start this executable at user login.
+    Autostart,
     /// «кому доверяет этот компьютер»
     WhoThisComputerTrusts,
     /// «горячие клавиши службы ввода»
@@ -745,6 +747,7 @@ const fn ru(key: Key) -> &'static str {
         Key::Clipboard => "Буфер обмена",
         Key::Diagnostics => "Диагностика",
         Key::Settings => "Настройки",
+        Key::Autostart => "Запускать при входе",
         Key::WhoThisComputerTrusts => "кому доверяет этот компьютер",
         Key::TheInputServiceSHotkeys => "горячие клавиши службы ввода",
         Key::CopyHerePasteThere => "скопировать здесь — вставить там",
@@ -1080,6 +1083,7 @@ const fn en(key: Key) -> &'static str {
         Key::Clipboard => "Clipboard",
         Key::Diagnostics => "Diagnostics",
         Key::Settings => "Settings",
+        Key::Autostart => "Start at login",
         Key::WhoThisComputerTrusts => "who this computer trusts",
         Key::TheInputServiceSHotkeys => "the input service's hotkeys",
         Key::CopyHerePasteThere => "copy here, paste there",

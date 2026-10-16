@@ -1,219 +1,100 @@
 # Bifrost
 
-Программа для управления несколькими компьютерами в локальной сети одной клавиатурой и
-мышью. Один исполняемый файл `bifrost` (окно, CLI и фоновые процессы): роль «ядро»
-(`bifrost run`) держит сеть и состояние (TLS-линки, протокол, маршрутизацию ввода,
-владение вводом, сопряжение узлов, раскладку экранов), а роль «агент» на каждой машине
-захватывает и подавляет локальный ввод, инжектирует чужой и следит за аварийным
-освобождением. Целевые платформы — Windows 11 и Linux (X11 и Wayland через XDG-порталы);
-задуманный сценарий — три доверенных узла в одной LAN.
+**A rainbow bridge between your computers.**
 
-**Первый выпуск: 0.1.0.** Bifrost — ранняя версия программного KVM для доверенной
-локальной сети. На Wayland возможности зависят от порталов композитора: KDE Plasma
-поддерживает передачу и приём ввода, GNOME 46 — только приём. Перед использованием
-проверьте аварийную комбинацию и сохраните доступ к локальной клавиатуре.
+Bifrost is a software KVM: share one keyboard, mouse and text clipboard across Windows and Linux computers on your LAN. Connections are encrypted with mutual TLS, and you pair computers by comparing a six-digit code on both screens. This is my personal project and an early release—not a polished replacement for every hardware KVM.
 
-При обновлении замените `multideskflow(.exe)` на `bifrost(.exe)` после остановки всех
-старых процессов. Скрипт `docs/work/live-e2e/deploy.ps1` выполняет замену, переносит
-системный автозапуск и удаляет старый Linux-ярлык. Настройки, доверие и журналы остаются
-в `lan-workspace`; имя IPC и блокировка экземпляра также сохранены для совместимости.
-Linux app id теперь `bifrost`: сохранённые разрешения старого приложения игнорируются,
-и портал один раз запросит разрешение заново. Репозиторий GitHub не переименован.
+![Bifrost in dark mode](assets/readme/main-dark.png)
+![Bifrost in light mode](assets/readme/main-light.png)
 
-После подтверждения кода на обоих компьютерах доверие сохраняется, связь устанавливается без
-перезапуска службы, а её состояние появляется в GUI по мере подключения.
+*Screenshots rendered from the actual UI with example computers; no personal network data.*
 
-Для кадров ввода, lease и буфера обмена TCP_NODELAY включён на обоих концах до TLS-handshake:
-мелкие кадры не должны ждать delayed ACK при простое ввода. Каждый кадр input-link явно
-flush-ится из TLS-буфера. Диагностика медленных очередей/IPC — на уровне DEBUG,
-не чаще одной записи в секунду для каждого этапа. Пока lease находится в Remote,
-INFO `lease liveness diagnostics` раз в секунду сообщает накопленные счётчики
-challenge/renew/status на границе FSM, принятые/отклонённые renew/status и возраст
-последних входящих lease-сообщений по монотонным часам. При завершении lease выводится
-финальный снимок. `fsm` считается для одного lease, `transport_connection` — для
-соединения: успешные записи в сокет и декодированные lease-кадры. Эти записи не
-продлевают lease и не меняют TTL или правила watchdog.
-Тот же снимок содержит накопленные `keys_down/keys_up/buttons_down/buttons_up`:
-`hook_edges` (Windows, mapped-события до enqueue, включая dropped и OS autorepeat),
-`captured_edges` (полученные core CapturedBatch в Remote), `inject_edges` (команды
-Inject в агент) и `eis_applied_edges` (события, закодированные в EIS frames; ошибка
-flush по-прежнему отражается в InjectResult). Эти поля считаются для одного lease;
-`None` означает, что этап не применим или ещё не прислал снимок. `transport_connection`
-дополнительно содержит `input_tx/input_rx` — discrete edges всех InputBatch за
-соединение, после успешной записи / проверки входящего envelope соответственно.
-Снимки диагностические, не атомарная транзакция между процессами. Старые односекундные
-`agent CapturedBatch` / `transport InputBatch` / `EIS injection summary` показывают
-только первый batch интервала: отсутствие отдельной строки up не доказывает потерю
-release. Нормальный Observe в Local остаётся нужен для edge tracking; сообщение
-`captured input outside a remote source lease; dropped` теперь DEBUG.
+## What it does
 
-Heartbeat core↔agent учитывает задержку собственного цикла: если он проснулся позже
-планового срока хотя бы на половину `core_silence_ms`, watchdog молчания переармируется,
-а DEBUG сообщает `core loop stalled …; not blaming the agent` (у агента — обратное).
-Это не продлевает lease/deadline: задержка самого процесса не доказывает отказ пира,
-но освобождение ввода по сроку lease сохраняется.
+- Mutual TLS, persistent peer trust and pairing confirmed on both computers.
+- A freely arranged monitor map, edge links across gaps and an animated ASCII bridge.
+- Edge glow to show where input is going.
+- Shared **text** clipboard with history (opt-in; no files or images).
+- Configurable switching hotkeys and an emergency release shortcut.
+- Russian and English, light and dark themes.
+- System tray and a per-user **Start at login** toggle in Settings.
+- One executable for the window, core and input agent—no separate service to install.
 
-Windows capture хранит callback-контекст на собственном потоке: после EndCapture →
-BeginCapture события идут в новую очередь. В Preparing повторные edge/hotkey-триггеры
-не меняют выбранный переход и не перезапускают capture; timeout, отказ и аварийный
-возврат по-прежнему отменяют переход. Агент интегрирует относительные Raw Input-дельты
-в absolute logical-позиции до CapturedBatch; абсолютные Raw Input-записи не трактуются как дельты.
-Core ведёт оценку на дисплее receiver от entry point, проверяет return edge перед clamp
-и отправляет только absolute InputBatch. Форма событий ввода в IPC и сети не меняется.
+## Download & install
 
-При старте owner заново заявляет `max_seen + 1`, даже если сохранённый владелец — он сам.
-При соединении оба узла сообщают текущую пару `(serial, owner)`; более новая пара для
-того же owner вызывает новую заявку. Отказ `StaleOwnerSerial` отменяет Preparing и
-запускает переподтверждение владения, после которого следующий переход возможен без
-ручной заявки. Ownership и layout сохраняют только свои поля `config.toml` под общим
-lock, не откатывая состояние друг друга.
+Get **0.1.1** from [Releases](https://github.com/ynnmuraii/MultideskFlow/releases/latest). The release includes `SHA256SUMS.txt` for checking your downloads.
 
-На Wayland владение по-прежнему берётся явной кнопкой GUI «Взять управление»:
-касание тачпада не переназначает владельца. `InputCapture.Activated` передаёт в core
-позицию и сторону принятого барьера; только owner в Local разрешает переход по
-настроенному link. Активация follower-а, неизвестный барьер или отсутствующая позиция
-возвращают capture композитору без открытия lease. EIS-дельты источника интегрируются
-в node-logical absolute-позицию до `CapturedBatch`, как Raw Input на Windows.
-Изменение зон не пересоздаёт включённую InputCapture-сессию: прежние барьеры сохраняются,
-а невозможность переустановки сообщается как ошибка. Реальный capture и безопасный
-возврат требуют отдельной проверки на живом KDE; headless-тесты этого не доказывают.
+### Windows 11 · x86_64
 
-## Сборка
+Download **`bifrost-0.1.1-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
-Нужен Rust (stable) через [rustup](https://rustup.rs); версия канала и компоненты
-зафиксированы в `rust-toolchain.toml` (`rustfmt`, `clippy`). Единственный нативный код в
-зависимостях — `ring` (криптография для TLS), поэтому нужен компилятор C и архиватор;
-всё остальное — чистый Rust.
+The executable is unsigned. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; computers must be able to reach TCP **47901 and 47902**.
 
-### Windows
+Settings are created automatically in `%APPDATA%\lan-workspace`; logs go to `%LOCALAPPDATA%\lan-workspace`. To start Bifrost when you sign in, enable **Settings → Start at login**. It uses the executable's current path: if you move the file later, turn the toggle off and on again.
 
-1. Установите **Build Tools for Visual Studio** и в нём workload «Desktop development
-   with C++» (даёт MSVC, `cl.exe`, `link.exe` и ассемблер для `ring`; Visual Studio
-   целиком не нужен).
-2. Установите rustup и убедитесь, что хост-триплет — MSVC: `rustup default stable-msvc`
-   (`rustup show` показывает `x86_64-pc-windows-msvc`).
+### Linux · x86_64
 
-### Ubuntu
+Download **`bifrost-0.1.1-linux-x86_64.tar.gz`** and extract it:
+
+```sh
+tar -xzf bifrost-0.1.1-linux-x86_64.tar.gz
+./install.sh
+```
+
+No `sudo`: this installs `~/.local/bin/bifrost`, an application-menu entry and icons. Open **Bifrost** from your applications menu, or run `~/.local/bin/bifrost`. To remove the installed application, run `./install.sh --uninstall` from the extracted archive; your `~/.config/lan-workspace` settings and pairing are never removed.
+
+Runtime: X11 works too; Wayland needs `xdg-desktop-portal` with RemoteDesktop/InputCapture and a compatible backend (KDE Plasma ≥6.1 or GNOME ≥45). The GitHub Linux build targets **glibc 2.35 or newer** (Ubuntu 22.04 baseline); older distributions should build from source. Allow TCP **47901 and 47902** on your LAN firewall if needed.
+
+## Quick start
+
+1. Run Bifrost on both computers, on the same trusted LAN. On a fresh setup, the window starts its core and creates the settings automatically.
+2. On one computer, open the pairing window in the pairing panel. On the other, enter the first computer's LAN address (shown in its window), then connect.
+3. Compare the six-digit codes and confirm on **both** computers. Only confirm if the codes match.
+4. Arrange the screens on the map and connect their edges. Take control on the computer whose keyboard you want to use, then move across a linked edge. Enable the shared clipboard if you want it, and test your emergency shortcut first.
+
+Existing settings and pairing stay in the `lan-workspace` directories when updating. Stop your old Bifrost session before replacing the executable.
+
+## Platform support
+
+| Platform | Status |
+| --- | --- |
+| Windows 11 | Capture and receive input |
+| Linux X11 | Capture and receive input |
+| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required |
+| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer |
+| wlroots-based Wayland desktops | Not supported |
+
+## Known limitations
+
+- Early software: keep access to a local keyboard and test emergency release before relying on remote input.
+- Binaries are unsigned. Windows may show SmartScreen, and Linux desktops may need explicit portal approval.
+- Wayland shows a desktop-portal permission dialog on first use. Support depends on your compositor and portal backend.
+- The emergency hotkey on Wayland depends on the **GlobalShortcuts portal** and may not register on some setups. Check the emergency-hotkey status in **Keys**; it currently does not register on the developer's KDE setup. Do not assume the shortcut works just because the app is running.
+- Clipboard sharing is text-only and is off by default.
+
+## Build from source
+
+Use [Rust via rustup](https://rustup.rs/) with the repository's toolchain (Rust 1.99 or newer). Windows needs the MSVC C++ build tools and Windows SDK. On Ubuntu/Debian, CI uses:
 
 ```sh
 sudo apt-get update
-sudo apt-get install --yes --no-install-recommends build-essential binutils
+sudo apt-get install --yes --no-install-recommends build-essential binutils xvfb xauth
+cargo build --release -p bifrost
 ```
 
-### CachyOS / Arch
+The executable is `target/release/bifrost` (`bifrost.exe` on Windows). `xvfb` and `xauth` are for headless tests, not for building or running the desktop app. X11/Wayland libraries are loaded at runtime; the Rust build does not require their development headers.
 
 ```sh
-sudo pacman -S --needed base-devel
-```
-
-### Сборка и тесты
-
-```sh
-cargo build --workspace          # один бинарник bifrost
-cargo test  --workspace          # автотесты
+cargo build --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Собранный бинарник: `target/debug/bifrost` (`bifrost.exe` на Windows). Роль
-выбирается аргументом: `bifrost` / `bifrost gui` — окно, `bifrost run`,
-`status`, `switch`, … — ядро и CLI, `bifrost agent` — служебный агент (отдельный
-процесс; сетевых сокетов у него нет — это проверяется `lws-agent`/`tests/no_network.rs`
-в CI, а не линковкой, потому что бинарник один). Вручную агент не запускается — его
-поднимает и контролирует ядро.
+Do **not** run ignored tests on your everyday desktop: some intentionally drive real input. Linux CI runs tests under `xvfb-run -a -s "-screen 0 1280x1024x24 -noreset"`.
 
-В окне раскладка редактируется только на карте: перетаскивание и стрелки сохраняют
-расстановку после завершения перемещения. Связи работают слева/справа и сверху/снизу.
-Кнопки «+»/«−» и колесо над картой меняют масштаб от 70% до 150%; масштаб, тема, фон
-и свёрнутое состояние панели «Сопряжение» сохраняются в GUI-local `gui.toml`, не в
-конфигурации службы. Фон по умолчанию — «Собираются»; при уходе указателя с карты
-или потере фокуса сохраняет последний кадр без перерисовок, а при возвращении
-продолжает анимацию с того же состояния. Состояние связи и «ввод здесь» показаны под компьютерами,
-а активный экран выделен рамкой и меткой «ввод», без дублирующих подписей на связях.
-Оба стиля связей (ASCII и линия) видны и между разнесёнными экранами; рамка
-наведения перемещается вместе с текущим анимированным положением экрана.
-В стиле ASCII рабочая связь — плотное облако символов `| : + #` между краями
-экранов, высотой с их общий край: середина ярче, хвосты реже, поток направлен к получателю ввода.
-Мост виден и при выключенном движении фона; на стыке экранов остаётся короткая перемычка поверх шва.
-При уходе указателя с карты или потере фокуса кадр замирает; анимация ограничена 30 Гц.
-Если онлайн ровно один другой компьютер и служба сообщает RTT, в центре моста
-показана измеренная задержка («≈ 2 мс» или «<1 мс»); при нескольких партнёрах
-или отсутствии измерения подписи нет. Подпись обновляется со статусом, без отдельного таймера.
-Наведение выделяет весь компьютер с несколькими мониторами одной общей рамкой.
-Активные экраны меняют цвет существующей границы без второй рамки и дополнительного свечения.
-Доверенные отключённые компьютеры остаются видимыми как офлайн; второе окно получает
-текущий код и время сопряжения. Окно сопряжения закрывается автоматически.
-Диалог «Клавиши» показывает реализованную аварийную комбинацию; файл настроек
-открывается кнопкой в его нижней панели. Содержимое диалогов прокручивается отдельно.
+## License
 
-`cargo run -p lws-gui --example shots -- --root DIR --output target/ui-shots`
-снимает оба оформления и диалоги с данными работающей службы в `DIR`, только через
-запросы IPC и offscreen-рендер, без окна на рабочем столе. `--live` выбирает стандартный
-endpoint пользователя; без этих флагов остаётся отдельная демонстрационная фикстура.
-Флаг `--ascii` показывает ASCII-мост, не меняя сохранённые настройки пользователя;
-`--zoom 100` или `--zoom 150` задаёт масштаб дополнительного снимка реальной карты.
+[MIT](LICENSE). Distributed third-party components are listed in [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).
 
-Часть тестов Linux-бэкендов требует графической сессии; в CI для этого используется
-`xvfb-run -a -s "-screen 0 1280x1024x24 -noreset"` (см. `.github/workflows/ci.yml`):
-`-noreset` предотвращает сброс X-сервера между короткими probe-подключениями.
-Fault harness ожидает `agent=ready` перед переключением и восстановление наблюдения
-после каждого возврата в Local; завершение FSM не означает, что следующий tick уже прошёл.
-Dry click regression проверяет ровно down→up на receiver сразу после входа в Remote
-и спустя две секунды. Linux-тест с локальной Unix socket pair проверяет настоящие
-EIS button frames и release_all для всех удерживаемых кнопок, без portal/desktop ввода.
-Preparing-emergency harness стреляет аварийным сигналом сразу после Temporary-захвата,
-а фазу подтверждает записанным focus — запуск CLI status не съедает окно prepare.
-Graceful-shutdown transport test устанавливает один link
-с одним инициатором и ждёт завершения formation events; dedup-races проверяются отдельно.
-Windows-регрессия захвата проверяет, что вооружённый Observe отдаёт движение при каждом
-drain, а фоновый lifetime-хук без BeginCapture пропускает только глобальные hotkeys.
-Один режим Observe используется в обоих случаях; наличие source baseline отличает их.
-
-## Структура workspace
-
-Cargo-воркспейс `apps/*` + `crates/*`; платформенный код вынесен за feature/cfg-границы,
-так что ядро собирается на любой ОС.
-
-Практически важное:
-
-- `apps/bifrost` — единственный исполняемый файл: по `argv` выбирает роль (без
-  аргументов или `gui` — окно; `agent …` — служебный агент; всё остальное — CLI ядра:
-  `run`, `status`, `switch`, …). Агент остаётся отдельным процессом: ядро запускает
-  `bifrost agent …` из собственного exe.
-- `apps/lws-core` — библиотека роли «ядро» (`run_core`): TLS-линки, протокол,
-  маршрутизация и FSM владения вводом, сопряжение и trust store, раскладка экранов,
-  надзор за агентом.
-- `apps/lws-agent` — библиотека роли «агент» (`run_agent`): захват с подавлением,
-  инжекция, ledger нажатий, watchdog и аварийное освобождение; без сетевых сокетов
-  (`netguard` + тест `tests/no_network.rs`).
-- `apps/lws-gui` — библиотека роли «окно» (`run_gui`).
-
-Крейты:
-
-- `crates/protocol` — форматирование и правила проводного протокола (Protobuf, лимиты,
-  последовательности, Hello).
-- `crates/transport` — защищённые линки (pinned TLS), дедупликация mesh, liveness.
-- `crates/identity` — идентичность узла (`SHA-256(SPKI)`), закреплённый mTLS, сопряжение
-  по 6-значному коду (SAS), trust store.
-- `crates/config` — схема конфигурации (`config_version 2`), валидация, пути, атомарное
-  сохранение.
-- `crates/focus-router` — FSM владения и «фокуса» (owner/follower, claim, hand-off).
-- `crates/ipc` — локальный канал core↔agent: фреймы, проверки пира, watchdog heartbeat.
-- `crates/geometry` — дисплеи, рёбра, связи переходов и геометрия пересечения края.
-- `crates/input-model` — нормализованные события ввода и таблицы HID↔evdev.
-- `crates/clipboard` — текст clipboard: маркеры, лимиты, хэш.
-- `crates/platform-probe` — определение сеанса/композитора/порталов и выбор бэкенда.
-- `crates/platform-win` — Windows-бэкенд: hooks и Raw Input (захват), SendInput (инжекция).
-- `crates/platform-x11` — X11-бэкенд: XTest (инжекция), XI2 (захват), clipboard.
-- `crates/platform-wayland` — Wayland-бэкенд: XDG-порталы (InputCapture/RemoteDesktop) и
-  EIS через `reis`.
-
-## Лицензия
-
-MIT — см. [LICENSE](LICENSE).
-
-Сторонние компоненты: [licenses/THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md) — список крейтов
-и их условий, включая встроенные Geist, Geist Mono и Silkscreen под OFL-1.1; генерируется
-`cargo about generate --workspace --fail -o licenses/THIRD_PARTY_NOTICES.md licenses/notices.hbs` из
-[about.toml](about.toml). Политику допустимых лицензий задаёт [deny.toml](deny.toml) и проверяет CI
-командой `cargo deny check licenses`: GPL/LGPL/AGPL запрещены, MPL возможен только в dev-зависимостях.
+Bifrost was formerly called MultiDeskFlow; the repository URL has not changed.
