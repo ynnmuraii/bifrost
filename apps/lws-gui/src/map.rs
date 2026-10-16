@@ -8,8 +8,8 @@
 //!
 //! The map works in *stage units*: the nominal stage is [`STAGE_W`] × [`STAGE_H`] and a
 //! display of `logical_w` units is drawn `logical_w * scale` stage units wide, where `scale`
-//! is [`BASE_SCALE`] shrunk until every computer fits the stage ([`arrange`]). The gaps and
-//! snap distances below are in stage units, so they feel the same whatever the desktop sizes.
+//! is [`BASE_SCALE`] shrunk until every computer fits the stage ([`arrange`]).
+//! The UI converts its screen-pixel magnet threshold into stage units.
 //!
 //! Links created by the map are exact overlaps of touching display edges, not
 //! bounding boxes or whole-desktop silhouette anchors. Legacy documents still
@@ -21,7 +21,7 @@ use crate::view_model::Side;
 pub const STAGE_W: f64 = 916.0;
 /// Nominal stage height.
 pub const STAGE_H: f64 = 270.0;
-/// The distance a snapped computer keeps from its neighbour.
+/// Initial spacing for legacy whole-desktop links, never a drag snap target.
 pub const GAP: f64 = 72.0;
 /// How near (stage units) an edge has to be before the drag snaps onto it.
 pub const SNAP: f64 = 12.0;

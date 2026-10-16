@@ -2116,3 +2116,24 @@ fn disconnected_placement_survives_refresh_and_the_cas_acknowledgement() {
     assert!(!vm.editor.dirty());
     assert!(vm.map_model().links.is_empty());
 }
+
+#[test]
+fn legacy_mixed_auto_and_concrete_endpoints_reconstruct_and_survive() {
+    let mut doc = linked_doc(8);
+    let endpoint = doc.links[0].to.as_mut().expect("endpoint");
+    endpoint.display_id = doc.members[1].displays[0].id.clone();
+    endpoint.segment_start = 100.0;
+    endpoint.segment_end = 800.0;
+    let mut vm = saving_view();
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    let model = vm.map_model();
+    assert_eq!(model.links.len(), 1);
+    assert!(model.links[0].whole_desktop);
+    assert!((model.links[0].from.x - model.links[0].to.x).abs() < 1e-6);
+    assert!((model.links[0].from.y - model.links[0].to.y).abs() < 1e-6);
+    let links = vm.editor_links();
+    assert!(links[0].from.is_auto());
+    assert!(!links[0].to.is_auto());
+    assert_eq!(links[0].to.start, 100.0);
+    assert_eq!(links[0].to.end, 800.0);
+}
