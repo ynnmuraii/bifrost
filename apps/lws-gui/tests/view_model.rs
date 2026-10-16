@@ -2130,10 +2130,57 @@ fn legacy_mixed_auto_and_concrete_endpoints_reconstruct_and_survive() {
     assert_eq!(model.links.len(), 1);
     assert!(model.links[0].whole_desktop);
     assert!((model.links[0].from.x - model.links[0].to.x).abs() < 1e-6);
-    assert!((model.links[0].from.y - model.links[0].to.y).abs() < 1e-6);
+    assert!((model.links[0].span.0
+        - (model.links[0].to.y - 350.0 * vm.editor.scale)).abs() < 1e-6);
     let links = vm.editor_links();
     assert!(links[0].from.is_auto());
     assert!(!links[0].to.is_auto());
     assert_eq!(links[0].to.start, 100.0);
     assert_eq!(links[0].to.end, 800.0);
+}
+
+#[test]
+fn owner_portrait_lower_half_drop_saves_only_the_real_contact() {
+    let mut doc = two_node_doc(8);
+    doc.members[0].displays[0].id = "stable-landscape-interface-id".to_owned();
+    doc.members[0].displays[0].logical_y = 240.0;
+    let mut portrait = doc.members[0].displays[0].clone();
+    portrait.id = "stable-portrait-interface-id".to_owned();
+    portrait.logical_x = 1920.0;
+    portrait.logical_y = 0.0;
+    portrait.logical_w = 1080.0;
+    portrait.logical_h = 1920.0;
+    portrait.primary = false;
+    doc.members[0].displays.push(portrait);
+    doc.members[1].displays[0].logical_w = 1745.0;
+    doc.members[1].displays[0].logical_h = 1091.0;
+    let mut vm = saving_view();
+    vm.apply(event(Msg::TopologyDoc(doc.clone())));
+    let a = index_of(&vm, SELF_NODE);
+    let b = index_of(&vm, PEER_NODE);
+    let origin = vm.editor.placement[a];
+    let monitor = vm.editor.shapes[a].mons[1];
+    let y = origin.y + monitor.y + monitor.h / 2.0;
+    vm.move_node(PEER_NODE, origin.x + monitor.x + monitor.w + 5.0, y);
+    assert_eq!(vm.editor.placement[b].y, y);
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    let (_, request) = take_save(&mut vm);
+    let topology: config::TopologyConfig =
+        toml::from_str(std::str::from_utf8(&request.layout_toml).expect("UTF-8"))
+            .expect("contact document");
+    assert_eq!(topology.links.len(), 1);
+    let link = &topology.links[0];
+    assert_eq!(link.from.display, "stable-portrait-interface-id");
+    assert_eq!(link.to.display, "eDP-1");
+    assert!((link.from.start - 960.0).abs() < 1e-6);
+    assert!((link.from.end - 1920.0).abs() < 1e-6);
+    assert!(link.to.start.abs() < 1e-6);
+    assert!((link.to.end - 960.0).abs() < 1e-6);
+    let drawn = vm.map_model();
+    assert_eq!(drawn.links.len(), 1);
+    assert!((drawn.links[0].span.0 - y).abs() < 1e-6);
+    assert!((drawn.links[0].span.1 - origin.y - monitor.h).abs() < 1e-6);
+    let mut restored = saving_view();
+    restored.apply(event(Msg::TopologyDoc(concrete_doc(doc, &topology.links))));
+    assert_eq!(restored.editor_links(), topology.links);
 }
