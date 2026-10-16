@@ -23,7 +23,8 @@ use lws_gui::egui;
 use lws_gui::gui_settings::{Look, Theme};
 use lws_gui::ui::{self, Env, UiState};
 use lws_gui::view_model::{
-    self, Action, Bridge, CliArgs, CoreEndpoint, LocalConfig, Modal, ViewModel,
+    self, Action, Bridge, CliArgs, CoreEndpoint, LocalConfig, Modal, ServiceStart, ViewModel,
+    SERVICE_START_TIMEOUT,
 };
 use protocol::ipc;
 use protocol::ipc::gui_frame::Msg;
@@ -114,6 +115,23 @@ fn main() -> std::process::ExitCode {
             let mut offline = mockup(theme, None, lang);
             offline.on_disconnected("Служба недоступна — автономный снимок".to_owned());
             states.push((format!("{prefix}-offline-{tag}"), offline));
+            // The banner's two other states: a start in flight, and a start that failed.
+            let mut starting = mockup(theme, None, lang);
+            starting.on_disconnected("Служба недоступна — автономный снимок".to_owned());
+            starting.settings.service.start = ServiceStart::Starting {
+                since: Instant::now(),
+            };
+            states.push((format!("{prefix}-offline-starting-{tag}"), starting));
+            let mut failed = mockup(theme, None, lang);
+            failed.on_disconnected("Служба недоступна — автономный снимок".to_owned());
+            failed.settings.service.start = ServiceStart::Failed {
+                reason: ui_text::fill_named(
+                    lang,
+                    ui_text::Key::TheServiceDidNotAnswerInSeconds,
+                    &[("seconds", &SERVICE_START_TIMEOUT.as_secs())],
+                ),
+            };
+            states.push((format!("{prefix}-offline-failed-{tag}"), failed));
             for modal in Modal::ALL {
                 states.push((
                     format!("{prefix}-modal-{}-{tag}", modal_name(modal)),

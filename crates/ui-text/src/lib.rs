@@ -155,6 +155,8 @@ pub enum Key {
     CouldNotStartTheService,
     /// «не удалось запустить службу ({})»
     CouldNotStartTheService2,
+    /// «Служба не ответила за {seconds} с»
+    TheServiceDidNotAnswerInSeconds,
     /// «Настройки созданы автоматически (config.toml)»
     TheSettingsWereCreatedAutomaticallyConfigToml,
     /// «Служба прислала пустой кадр»
@@ -749,6 +751,7 @@ const fn ru(key: Key) -> &'static str {
         Key::TheServiceIsNotRunningNameWasNotSent => "Служба не запущена: {name} не отправлено",
         Key::CouldNotStartTheService => "Не удалось запустить службу: {}",
         Key::CouldNotStartTheService2 => "не удалось запустить службу ({})",
+        Key::TheServiceDidNotAnswerInSeconds => "Служба не ответила за {seconds} с",
         Key::TheSettingsWereCreatedAutomaticallyConfigToml => "Настройки созданы автоматически (config.toml)",
         Key::TheServiceSentAnEmptyFrame => "Служба прислала пустой кадр",
         Key::PairingOffersACodeToCompare => "Сопряжение: партнёр {} предлагает сверить код",
@@ -1067,6 +1070,7 @@ const fn en(key: Key) -> &'static str {
         Key::TheServiceIsNotRunningNameWasNotSent => "The service is not running: {name} was not sent",
         Key::CouldNotStartTheService => "Could not start the service: {}",
         Key::CouldNotStartTheService2 => "could not start the service ({})",
+        Key::TheServiceDidNotAnswerInSeconds => "The service did not answer in {seconds} s",
         Key::TheSettingsWereCreatedAutomaticallyConfigToml => "The settings were created automatically (config.toml)",
         Key::TheServiceSentAnEmptyFrame => "The service sent an empty frame",
         Key::PairingOffersACodeToCompare => "Pairing: {} offers a code to compare",
@@ -1464,7 +1468,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 312] = [
+    pub const EVERY: [Key; 313] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1508,6 +1512,7 @@ mod tests {
         Key::TheServiceIsNotRunningNameWasNotSent,
         Key::CouldNotStartTheService,
         Key::CouldNotStartTheService2,
+        Key::TheServiceDidNotAnswerInSeconds,
         Key::TheSettingsWereCreatedAutomaticallyConfigToml,
         Key::TheServiceSentAnEmptyFrame,
         Key::PairingOffersACodeToCompare,

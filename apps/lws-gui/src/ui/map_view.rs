@@ -9,7 +9,7 @@ use eframe::egui::{
 use super::field::{Flow, Frame, Ribbon};
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
-use super::{act, Env, UiState, FIELD_FRAME};
+use super::{Env, UiState, FIELD_FRAME};
 use crate::gui_settings::{LinkStyle, Look, PAN_MAX};
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
@@ -774,8 +774,10 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
     let mut y = rect.min.y + 18.0;
     let center = rect.center().x;
     if !vm.connection.is_connected() {
+        let start = vm.service_start();
+        let waiting = vm.waiting_for_core();
         let width = 460.0f32.min(rect.width() - 48.0);
-        let area = Rect::from_center_size(Pos2::new(center, y + 22.0), Vec2::new(width, 44.0));
+        let area = Rect::from_center_size(Pos2::new(center, y + 24.0), Vec2::new(width, 48.0));
         let mut child = ui.new_child(
             UiBuilder::new()
                 .id_salt("banner-down")
@@ -784,12 +786,12 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
         );
         child.painter().rect(
             area,
-            egui::CornerRadius::same(22),
+            egui::CornerRadius::same(24),
             pal.card,
             Stroke::new(1.0, pal.accent),
             StrokeKind::Inside,
         );
-        child.add_space(16.0);
+        child.add_space(18.0);
         widgets::text(
             &mut child,
             text(lang, Key::TheServiceIsNotRunning),
@@ -797,30 +799,48 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
             fam::sans_medium(),
             pal.ink,
         );
+        if waiting {
+            // A bar along the banner's foot: the window is waiting for a core it asked for.
+            let track = Rect::from_min_max(
+                Pos2::new(area.left() + 18.0, area.bottom() - 9.0),
+                Pos2::new(area.right() - 18.0, area.bottom() - 6.0),
+            );
+            let painter = child.painter();
+            painter.rect_filled(
+                track,
+                egui::CornerRadius::same(2),
+                rgba(pal.accent.r(), pal.accent.g(), pal.accent.b(), 0.25),
+            );
+            let span = track.width() * 0.3;
+            let phase = (ui.input(|input| input.time) as f32 * 0.7).fract();
+            let bar = Rect::from_min_size(
+                Pos2::new(track.left() + (track.width() - span) * phase, track.top()),
+                Vec2::new(span, track.height()),
+            );
+            painter.rect_filled(bar, egui::CornerRadius::same(2), pal.accent);
+        }
+        // One button, whatever the banner is saying: «Запустить», and «Ещё раз» once a start
+        // has failed. It is off while a start is in flight.
         child.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_space(4.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let starting = vm.settings.service.restart.is_some();
-            act(
-                ui,
-                pal,
-                text(lang, Key::Start),
-                Kind::Hot,
-                !starting,
-                actions,
-                || Action::StartCore,
-            );
-            act(
-                ui,
-                pal,
-                text(lang, Key::OnceMore),
-                Kind::Ghost,
-                true,
-                actions,
-                || Action::ConnectAgain,
-            );
+            ui.add_space(18.0);
+            let label = text(lang, start.button());
+            if widgets::notice_button(ui, pal, label, Kind::Hot, !waiting).clicked() {
+                actions.push(Action::StartCore);
+            }
         });
         y += 54.0;
+        if let Some(reason) = start.reason() {
+            let galley = ui.painter().layout(
+                reason.to_owned(),
+                font(13.0, fam::sans()),
+                pal.ink2,
+                (rect.width() - 92.0).max(40.0),
+            );
+            let size = galley.size();
+            ui.painter()
+                .galley(Pos2::new(center - size.x / 2.0, y + 6.0), galley, pal.ink2);
+            y += size.y + 12.0;
+        }
     }
     if let Some(outcome) = &vm.outcome {
         let galley = ui.painter().layout(

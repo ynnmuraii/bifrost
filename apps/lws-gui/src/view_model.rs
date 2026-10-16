@@ -18,8 +18,8 @@
 //! # What the window asks the core for
 //!
 /// [`Action`] is the whole vocabulary: the wire requests of `ipc.proto`
-/// (`GetStatus`, `ClaimOwnership`, `StartPairing`, …), the two things the client does by
-/// itself (`StartCore`, `ConnectAgain`), and the local edits the window applies to its own
+/// (`GetStatus`, `ClaimOwnership`, `StartPairing`, …), the one thing the client does by
+/// itself (`StartCore`), and the local edits the window applies to its own
 /// state (`ToggleModal`, `MoveNode`, …). Only the first group is a `GuiFrame`;
 /// the app sends those to the client and folds the rest into the view model, so no decision
 /// ever happens in drawing code. `StopCore` asks the core to stop itself, so it also works for
@@ -62,6 +62,12 @@ pub const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// How long the GUI waits for the core to stop itself before using its owned pid or reporting failure.
 pub const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long «Запустить» waits for a core to answer before it calls the start failed.
+///
+/// Starting a core is launching a process and waiting for its endpoint; a core that has not
+/// answered by then is not going to.
+pub const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The oldest requests kept while they wait for an answer.
 const INFLIGHT_LIMIT: usize = 32;
@@ -721,6 +727,8 @@ fn is_lan_address(address: &str) -> bool {
 pub struct Service {
     /// What «Перезапустить службу» is waiting for, while it waits.
     pub restart: Option<Restart>,
+    /// What «Запустить» on the «служба не запущена» banner is waiting for.
+    pub start: ServiceStart,
     /// When «Остановить службу» was sent through the core's graceful shutdown request.
     pub stopping: Option<Instant>,
     /// What the last service operation answered, in words.
@@ -749,6 +757,48 @@ pub enum RestartStep {
     Start,
     /// The window must not act; why is already in [`Service::line`].
     Refused,
+}
+
+/// The one button of the «служба не запущена» banner, and the wait behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ServiceStart {
+    /// Nothing was asked for: the banner offers «Запустить» and is still.
+    #[default]
+    Idle,
+    /// A core was asked for and has not answered: the banner shows the wait and its one
+    /// button is drawn disabled.
+    Starting {
+        /// When the start was asked for, so the wait has an end.
+        since: Instant,
+    },
+    /// The last start did not bring a core up: the banner says why and offers «Ещё раз».
+    Failed {
+        /// One line saying what went wrong.
+        reason: String,
+    },
+}
+
+impl ServiceStart {
+    /// `true` while a start is in flight.
+    pub fn is_starting(&self) -> bool {
+        matches!(self, Self::Starting { .. })
+    }
+
+    /// The label of the banner's single button: the failed start is retried, not re-labelled.
+    pub fn button(&self) -> Key {
+        match self {
+            Self::Failed { .. } => Key::OnceMore,
+            Self::Idle | Self::Starting { .. } => Key::Start,
+        }
+    }
+
+    /// The line the banner says under itself, when the last start failed.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason } => Some(reason),
+            Self::Idle | Self::Starting { .. } => None,
+        }
+    }
 }
 
 /// Everything the screens draw, and every decision behind it.
@@ -844,6 +894,8 @@ impl ViewModel {
         self.reload_first_run_config();
         self.connection = Connection::Connected;
         self.silent = false;
+        // A core that answers is a start that worked: the banner has nothing left to show.
+        self.settings.service.start = ServiceStart::Idle;
         // A sentence from a previous core does not describe this connection.
         self.outcome = None;
         self.push_log(format!("Служба работает ({endpoint})"));
@@ -1023,6 +1075,9 @@ impl ViewModel {
         if let Some(Restart::Stopping { since }) = &self.settings.service.restart {
             consider(*since + SERVICE_STOP_TIMEOUT);
         }
+        if let ServiceStart::Starting { since } = self.settings.service.start {
+            consider(since + SERVICE_START_TIMEOUT);
+        }
         if let (Some(since), false) = (self.outcome_since, self.outcome_hold) {
             consider(since + TOAST_FOR);
         }
@@ -1084,6 +1139,35 @@ impl ViewModel {
                 "служба не остановилась за {seconds} c — остановите её сами и нажмите «Перезапустить службу» снова"
             )));
         }
+        // A start that is still unanswered past its timeout is a start that failed: the
+        // banner stops waiting, says why, and offers «Ещё раз».
+        if let ServiceStart::Starting { since } = self.settings.service.start {
+            if now.saturating_duration_since(since) >= SERVICE_START_TIMEOUT {
+                let reason = fill_named(
+                    self.look.language,
+                    Key::TheServiceDidNotAnswerInSeconds,
+                    &[("seconds", &SERVICE_START_TIMEOUT.as_secs())],
+                );
+                self.push_log(reason.clone());
+                self.settings.service.start = ServiceStart::Failed { reason };
+            }
+        }
+    }
+
+    /// «Запустить» on the «служба не запущена» banner was pressed: the wait begins.
+    pub fn begin_service_start(&mut self, now: Instant) {
+        self.settings.service.start = ServiceStart::Starting { since: now };
+    }
+
+    /// What the «служба не запущена» banner says.
+    pub fn service_start(&self) -> &ServiceStart {
+        &self.settings.service.start
+    }
+
+    /// `true` while the window waits for a core it asked for: the banner shows the wait.
+    pub fn waiting_for_core(&self) -> bool {
+        self.service_start().is_starting()
+            || matches!(self.settings.service.restart, Some(Restart::Starting))
     }
 
     /// The core process was started, or could not be.
@@ -1122,11 +1206,13 @@ impl ViewModel {
                     &[&short_error(&why)],
                 ));
                 self.settings.service.restart = None;
-                self.set_outcome(Outcome::failed(fill(
-                    lang,
-                    Key::CouldNotStartTheService2,
-                    &[&short_error(&why)],
-                )));
+                let reason = fill(lang, Key::CouldNotStartTheService2, &[&short_error(&why)]);
+                if self.connection.is_connected() {
+                    // A live window has no banner to carry the reason; the toast does.
+                    self.set_outcome(Outcome::failed(reason));
+                } else {
+                    self.settings.service.start = ServiceStart::Failed { reason };
+                }
             }
         }
     }
@@ -2192,10 +2278,8 @@ pub enum Action {
     RevokePeer(Vec<u8>),
     /// Ask the core to write its diagnostics.
     ExportDiagnostics(String),
-    /// Start `lws-core run` for this user.
+    /// Start `lws-core run` for this user, or try again after a start that failed.
     StartCore,
-    /// Try the core again right now instead of waiting for the 2 s retry.
-    ConnectAgain,
     /// Open the window of a rail section, or close it when it is the one already open.
     ToggleModal(Modal),
     /// Close the window over the map.
@@ -2438,10 +2522,8 @@ impl Bridge {
         }
         match action {
             Action::StartCore => {
+                self.view.begin_service_start(now);
                 self.client.start_core();
-            }
-            Action::ConnectAgain => {
-                self.client.connect_again();
             }
             Action::RestartCore => self.restart_core(now),
             Action::OpenConfigFile => self.view.open_config_file(),

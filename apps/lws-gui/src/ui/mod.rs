@@ -162,6 +162,13 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
             .memory_mut(|memory| memory.request_focus(egui::Id::new("pairing-address")));
     }
 
+    // The service banner's wait: its indicator moves while a core is on its way.
+    if vm.waiting_for_core() {
+        wants = Some(wants.map_or(Duration::from_millis(50), |w| {
+            w.min(Duration::from_millis(50))
+        }));
+    }
+
     // The one thing besides the field that moves by itself: the pairing countdown.
     if vm.pairing.window_deadline.is_some() && vm.pairing.window.is_some() {
         wants = Some(wants.map_or(Duration::from_secs(1), |w| w.min(Duration::from_secs(1))));
