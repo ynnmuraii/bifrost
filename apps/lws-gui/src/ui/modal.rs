@@ -8,6 +8,8 @@
 //! keeps 16 px below its contents. Keys edits service-owned bindings through IPC only,
 //! while preserving the autonomous emergency-release warning.
 
+use std::time::Duration;
+
 use eframe::egui::{
     self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2,
 };
@@ -17,7 +19,7 @@ use super::widgets::{self, Icon, Kind};
 use super::{act, UiState};
 use crate::gui_settings::Theme;
 use crate::view_model::{Action, Modal, ViewModel};
-use ui_text::{clipboard_size, fill, fill_named, text, Key, Lang};
+use ui_text::{ago, ago_next_change_in, clipboard_size, fill, fill_named, text, Key, Lang};
 
 /// The reveal time of a dialog, seconds.
 const OPEN_FOR: f32 = 0.32;
@@ -27,6 +29,9 @@ const LABEL_W: f32 = 172.0;
 const HEAD_H: f32 = 84.0;
 
 /// Draws the open modal, if there is one, over everything.
+///
+/// Returns when the next frame is due for the relative times the open dialog shows (`None` when
+/// none of them changes on a clock), which the caller folds into its own repaint schedule.
 pub fn draw(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -35,7 +40,7 @@ pub fn draw(
     full: Rect,
     t: f32,
     actions: &mut Vec<Action>,
-) {
+) -> Option<Duration> {
     let lang = vm.look.language;
     let Some(modal) = vm.modal else {
         st.modal_open = None;
@@ -43,7 +48,7 @@ pub fn draw(
         ui.ctx().data_mut(|d| {
             d.remove::<crate::view_model::hotkeys::Editor>(egui::Id::new("hotkey-editor"));
         });
-        return;
+        return None;
     };
     let started = match st.modal_open {
         Some((open, at)) if open == modal => at,
@@ -138,6 +143,7 @@ pub fn draw(
             .layout(Layout::top_down(Align::Min)),
     );
     body.set_clip_rect(body_rect.intersect(reveal).intersect(full));
+    let mut relabel: Option<Duration> = None;
     let used = egui::ScrollArea::vertical()
         .id_salt(("modal-scroll", modal as u8))
         .max_height(body_h)
@@ -147,7 +153,7 @@ pub fn draw(
             match modal {
                 Modal::Pairs => pairs_body(ui, pal, vm, actions),
                 Modal::Keys => keys_body(ui, pal, vm, actions),
-                Modal::Clip => clip_body(ui, pal, vm, st, actions),
+                Modal::Clip => clip_body(ui, pal, vm, st, &mut relabel, actions),
                 Modal::Diag => diag_body(ui, pal, vm, actions),
                 Modal::Settings => settings_body(ui, pal, vm, actions),
             }
@@ -193,6 +199,7 @@ pub fn draw(
         ui.ctx().data_mut(|d| d.insert_temp(height_id, measured));
         ui.ctx().request_repaint();
     }
+    relabel
 }
 
 /// Whether a dialog has a footer: only the two whose footer carries an action of their own.
@@ -232,7 +239,7 @@ fn header(
         StrokeKind::Inside,
     );
     let galley = painter.layout_no_wrap(modal.num().to_owned(), font(20.0, fam::pixel()), pal.ink);
-    painter.galley(num.center() - galley.size() / 2.0, galley, pal.ink);
+    widgets::centre_galley(&painter, num, galley, pal.ink);
     // Title and the «load» line: `mdf layout [########################] ok · sub`.
     let title = painter.layout_no_wrap(
         modal.title(lang).to_owned(),
@@ -656,6 +663,8 @@ fn clip_body(
     pal: &Palette,
     vm: &ViewModel,
     st: &mut UiState,
+    // The soonest a relative label of a row changes; `draw` asks for its next frame then.
+    relabel: &mut Option<Duration>,
     actions: &mut Vec<Action>,
 ) {
     let lang = vm.look.language;
@@ -778,14 +787,23 @@ fn clip_body(
                         }
                         _ => text(lang, Key::Transfer),
                     };
-                let age_seconds = now_ms.saturating_sub(u128::from(entry.time_unix_ms)) / 1000;
+                let age_seconds = (now_ms.saturating_sub(u128::from(entry.time_unix_ms)) / 1000)
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                // The next frame this row needs is the one that changes its «10 минут назад»;
+                // one a minute, an hour or a day, and never a frame between them.
+                let wait = Duration::from_secs(ago_next_change_in(age_seconds));
+                *relabel = Some(match *relabel {
+                    Some(w) => w.min(wait),
+                    None => wait,
+                });
                 let metadata = fill_named(
                     lang,
                     Key::HistoryEntryMetadata,
                     &[
                         ("direction", &direction),
                         ("peer_name", &entry.peer_name),
-                        ("age_seconds", &age_seconds.to_string()),
+                        ("age", &ago(lang, age_seconds)),
                         ("size", &clipboard_size(lang, entry.size_bytes)),
                     ],
                 );

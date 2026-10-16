@@ -18,9 +18,11 @@ use support::{event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE,
 
 const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
 
-/// One frame of the window: its text in paint order, and what it produced.
+/// One frame of the window: the text it painted (with the tight box around each glyph's ink, in
+/// the frame's own coordinates), the rectangles it filled, and what it produced.
 struct Frame {
-    texts: Vec<String>,
+    texts: Vec<(String, egui::Rect)>,
+    rects: Vec<egui::Rect>,
     output: Output,
 }
 
@@ -68,9 +70,13 @@ impl Harness {
         let output = self.ctx.run_ui(input, |ui| {
             produced = ui::draw(ui, vm, state, env);
         });
-        let mut texts = Vec::new();
+        let mut frame = Frame {
+            texts: Vec::new(),
+            rects: Vec::new(),
+            output: produced,
+        };
         for clipped in &output.shapes {
-            collect(&clipped.shape, &mut texts);
+            collect(&clipped.shape, &mut frame);
         }
         assert!(
             output
@@ -85,10 +91,7 @@ impl Harness {
             "drawing widgets must not hide or close the native window"
         );
         output.drop_without_applying_deltas();
-        Frame {
-            texts,
-            output: produced,
-        }
+        frame
     }
 
     /// Two frames: the first one sizes the panels and the font atlas, the second is the window.
@@ -98,16 +101,20 @@ impl Harness {
     }
 }
 
-fn collect(shape: &Shape, texts: &mut Vec<String>) {
+fn collect(shape: &Shape, frame: &mut Frame) {
     match shape {
-        Shape::Text(text) => texts.push(text.galley.text().to_owned()),
-        Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, texts)),
+        Shape::Text(text) => frame.texts.push((
+            text.galley.text().to_owned(),
+            text.galley.mesh_bounds.translate(text.pos.to_vec2()),
+        )),
+        Shape::Rect(rect) => frame.rects.push(rect.rect),
+        Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, frame)),
         _ => {}
     }
 }
 
 fn shows(frame: &Frame, needle: &str) -> bool {
-    frame.texts.iter().any(|text| text.contains(needle))
+    frame.texts.iter().any(|(text, _)| text.contains(needle))
 }
 
 fn expect(frame: &Frame, needles: &[&str]) {
@@ -170,7 +177,7 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
         "ввод →",
     ] {
         assert!(
-            !frame.texts.iter().any(|text| text == removed),
+            !frame.texts.iter().any(|(text, _)| text == removed),
             "{removed} must not be drawn"
         );
     }
@@ -249,7 +256,7 @@ fn banner_buttons(frame: &Frame) -> usize {
     frame
         .texts
         .iter()
-        .filter(|drawn| matches!(drawn.as_str(), "Запустить" | "Ещё раз"))
+        .filter(|(drawn, _)| matches!(drawn.as_str(), "Запустить" | "Ещё раз"))
         .count()
 }
 
@@ -392,14 +399,14 @@ fn the_pairing_dock_shows_the_real_window_countdown_and_the_real_code() {
         frame
             .texts
             .iter()
-            .any(|t| t.starts_with('[') || t.contains("] ")),
+            .any(|(t, _)| t.starts_with('[') || t.contains("] ")),
         "the bar: {:?}",
         frame.texts
     );
     assert!(frame
         .texts
         .iter()
-        .any(|t| t.contains(" с") && t.contains(']')));
+        .any(|(t, _)| t.contains(" с") && t.contains(']')));
 
     vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
     vm.local(&Action::ToggleDetails(true));
@@ -1104,5 +1111,115 @@ fn a_history_row_is_compact_and_clearing_asks_first() {
             .contains(&Action::ClearClipboardHistory),
         "{:?}",
         frame.output.actions
+    );
+}
+
+/// Every square badge of a frame and the glyph painted inside it: the four letters of the dock's
+/// cells, the six boxes of a pairing code. A badge is one of the sizes below and its glyph is
+/// painted inside it, which is enough to tell them apart from the window's other rectangles.
+fn badges(frame: &Frame) -> Vec<(&str, egui::Rect, egui::Rect)> {
+    /// A letter of the dock, a digit of the code.
+    const SIZES: [egui::Vec2; 2] = [egui::vec2(20.0, 20.0), egui::vec2(34.0, 46.0)];
+    let mut found = Vec::new();
+    for (text, ink) in &frame.texts {
+        if text.chars().count() != 1 {
+            continue;
+        }
+        let badge = frame
+            .rects
+            .iter()
+            .filter(|rect| SIZES.contains(&rect.size()))
+            .filter(|rect| rect.expand(2.0).contains(ink.center()))
+            .min_by(|a, b| {
+                (a.center() - ink.center())
+                    .length_sq()
+                    .total_cmp(&(b.center() - ink.center()).length_sq())
+            });
+        if let Some(badge) = badge {
+            found.push((text.as_str(), *badge, *ink));
+        }
+    }
+    found
+}
+
+/// The owner's complaint: the letter of a badge sat low and to the left, because the glyph was
+/// centred by the box the font measures rather than by the ink it paints.
+#[test]
+fn every_badge_centres_its_glyph_on_its_own_square() {
+    let mut vm = connected();
+    vm.apply(event(Msg::PairingWindow(protocol::ipc::PairingWindow {
+        open: true,
+        address: "192.168.1.24:47901".to_owned(),
+        seconds_remaining: 90,
+        attempt_id: support::attempt_id(),
+    })));
+    vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
+    vm.local(&Action::ToggleModal(Modal::Pairs));
+    let mut harness = Harness::new();
+    // The reveal takes 0.32 s of the window's clock; step past it.
+    harness.frame(&vm, false, SIZE, Vec::new());
+    harness.now += Duration::from_millis(500);
+    let frame = harness.frame(&vm, false, SIZE, Vec::new());
+    let mut letters: Vec<&str> = badges(&frame).iter().map(|(text, ..)| *text).collect();
+    letters.sort_unstable();
+    assert_eq!(
+        letters,
+        ["1", "2", "3", "4", "8", "9", "A", "B", "C", "D"],
+        "the badges of the dock"
+    );
+    for (text, badge, ink) in badges(&frame) {
+        let off = ink.center() - badge.center();
+        assert!(
+            off.x.abs() <= 1.0 && off.y.abs() <= 1.0,
+            "«{text}» is painted at {ink:?}, {off:?} from the centre of {badge:?}"
+        );
+    }
+}
+
+/// The clipboard rows say how long ago in words, and the frame that draws them is the one due
+/// when the soonest of them changes — a minute away, not a second.
+#[test]
+fn a_history_row_says_how_long_ago_in_words_and_asks_for_the_next_minute() {
+    let mut vm = connected();
+    vm.local(&Action::ToggleModal(Modal::Clip));
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_millis()
+        .try_into()
+        .expect("the clock fits in u64 milliseconds");
+    let entry = |id: u64, age_ms: u64| ipc::ClipboardHistoryEntry {
+        id,
+        direction: ipc::ClipboardHistoryDirection::Received as i32,
+        peer_name: "linux-box".to_owned(),
+        time_unix_ms: now_ms - age_ms,
+        size_bytes: 56,
+        preview: "текст".to_owned(),
+    };
+    vm.apply(event(Msg::ClipboardHistory(ipc::ClipboardHistory {
+        items: vec![
+            // 20 s into the eleventh minute: forty seconds to «12 минут назад».
+            entry(1, 11 * 60_000 + 20_000),
+            // A minute into the fifth hour: fifty-nine minutes to «5 часов назад».
+            entry(2, 4 * 3_600_000 + 60_000),
+        ],
+    })));
+    let mut harness = Harness::new();
+    harness.frame(&vm, false, SIZE, Vec::new());
+    harness.now += Duration::from_millis(500);
+    let frame = harness.frame(&vm, false, SIZE, Vec::new());
+    expect(&frame, &["· 11 минут назад ·", "· 4 часа назад ·"]);
+    assert!(
+        !shows(&frame, " с назад"),
+        "a row must not count seconds: {:?}",
+        frame.texts
+    );
+    let wait = frame
+        .output
+        .repaint_after
+        .expect("the rows are counted in minutes, so a frame is due");
+    assert!(
+        (Duration::from_secs(35)..=Duration::from_secs(45)).contains(&wait),
+        "the next frame is the one that relabels the oldest row: {wait:?}"
     );
 }

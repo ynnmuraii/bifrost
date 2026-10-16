@@ -11,9 +11,11 @@
 //! frame is due ([`Output::repaint_after`]) and only for things that really change with time:
 //! the particle field (30 fps while the pointer is over the map and it still reports movement,
 //! and no frame at all once the particles have settled into the attracted or repelled state the
-//! pointer holds them in) and the pairing countdown (1 Hz, only while a window is open). A
-//! window with the field at rest and no pairing window open draws when the user does something
-//! or the service says something, and never otherwise.
+//! pointer holds them in), the pairing countdown (1 Hz, only while a window is open) and the
+//! «10 минут назад» of a clipboard row (once a minute at its next whole minute, hour or day,
+//! and only while the clipboard dialog is open). A window with the field at rest and no pairing
+//! window open draws when the user does something or the service says something, and never
+//! otherwise.
 
 mod appearance;
 mod dock;
@@ -152,7 +154,6 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
     let appearance_anchor = rail_draw(ui, &pal, vm, rail, &mut out.actions);
     topbar(ui, &pal, vm, top, narrow, &mut out.actions);
     appearance::draw(ui, &pal, vm, full, appearance_anchor, &mut out.actions);
-    modal::draw(ui, &pal, vm, st, full, t, &mut out.actions);
     if out
         .actions
         .iter()
@@ -172,6 +173,12 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
     // The one thing besides the field that moves by itself: the pairing countdown.
     if vm.pairing.window_deadline.is_some() && vm.pairing.window.is_some() {
         wants = Some(wants.map_or(Duration::from_secs(1), |w| w.min(Duration::from_secs(1))));
+    }
+
+    // «10 минут назад» rows of the clipboard dialog: the next frame is the one that changes the
+    // soonest of them, which is a minute, an hour or a day away.
+    if let Some(relabel) = modal::draw(ui, &pal, vm, st, full, t, &mut out.actions) {
+        wants = Some(wants.map_or(relabel, |w| w.min(relabel)));
     }
     out.repaint_after = wants;
     out

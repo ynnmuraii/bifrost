@@ -543,6 +543,32 @@ pub enum Key {
     HistoryEntryMetadata,
     /// «Очистить историю на этом компьютере?»
     ConfirmClearHistory,
+    /// «только что»
+    JustNow,
+    /// «минуту назад»
+    AMinuteAgo,
+    /// «{n} минуту назад» (1, 21, 31 … минут)
+    MinutesAgoOne,
+    /// «{n} минуты назад» (2–4, 22–24 … минут)
+    MinutesAgoFew,
+    /// «{n} минут назад» (5–20, 25–30 … минут)
+    MinutesAgoMany,
+    /// «час назад»
+    AnHourAgo,
+    /// «{n} час назад» (21 час)
+    HoursAgoOne,
+    /// «{n} часа назад» (2–4, 22, 23 часа)
+    HoursAgoFew,
+    /// «{n} часов назад» (5–20 часов)
+    HoursAgoMany,
+    /// «вчера»
+    Yesterday,
+    /// «{n} день назад» (21 день)
+    DaysAgoOne,
+    /// «{n} дня назад» (2–4, 22–24 дня)
+    DaysAgoFew,
+    /// «{n} дней назад» (5–20 дней)
+    DaysAgoMany,
     /// «Б»
     BytesAbbreviation,
     /// «КиБ»
@@ -665,7 +691,7 @@ pub enum Key {
     Dark,
     /// «Связи между компьютерами»
     LinksBetweenComputers,
-    /// «ASCII-изолиния»
+    /// «ASCII-мост»
     ASCIIIsoline,
     /// «Линия»
     Line,
@@ -943,8 +969,21 @@ const fn ru(key: Key) -> &'static str {
         Key::TheLast30TextsInMemoryOnlySecretsAreNotKept => "Последние 30 передач текста. Только в памяти; секреты не сохраняются.",
         Key::TheHistoryIsEmptyForNow => "История пока пуста",
         Key::Transfer => "Передача",
-        Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age_seconds} с назад · {size}",
+        Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age} · {size}",
         Key::ConfirmClearHistory => "Очистить историю на этом компьютере?",
+        Key::JustNow => "только что",
+        Key::AMinuteAgo => "минуту назад",
+        Key::MinutesAgoOne => "{n} минуту назад",
+        Key::MinutesAgoFew => "{n} минуты назад",
+        Key::MinutesAgoMany => "{n} минут назад",
+        Key::AnHourAgo => "час назад",
+        Key::HoursAgoOne => "{n} час назад",
+        Key::HoursAgoFew => "{n} часа назад",
+        Key::HoursAgoMany => "{n} часов назад",
+        Key::Yesterday => "вчера",
+        Key::DaysAgoOne => "{n} день назад",
+        Key::DaysAgoFew => "{n} дня назад",
+        Key::DaysAgoMany => "{n} дней назад",
         Key::BytesAbbreviation => "Б",
         Key::KibibytesAbbreviation => "КиБ",
         Key::MebibytesAbbreviation => "МиБ",
@@ -1006,7 +1045,7 @@ const fn ru(key: Key) -> &'static str {
         Key::Light => "Светлая",
         Key::Dark => "Тёмная",
         Key::LinksBetweenComputers => "Связи между компьютерами",
-        Key::ASCIIIsoline => "ASCII-изолиния",
+        Key::ASCIIIsoline => "ASCII-мост",
         Key::Line => "Линия",
         Key::BackgroundParticles => "Фон · частицы",
         Key::Gather => "Собираются",
@@ -1262,8 +1301,23 @@ const fn en(key: Key) -> &'static str {
         Key::TheLast30TextsInMemoryOnlySecretsAreNotKept => "The last 30 texts. In memory only; secrets are not kept.",
         Key::TheHistoryIsEmptyForNow => "The history is empty for now",
         Key::Transfer => "Transfer",
-        Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age_seconds} s ago · {size}",
+        Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age} · {size}",
         Key::ConfirmClearHistory => "Clear history on this computer?",
+        // English keeps one plural for every count above one, so the three Russian forms read
+        // the same here; `plural_form` only ever picks the first and the last of them.
+        Key::JustNow => "just now",
+        Key::AMinuteAgo => "a minute ago",
+        Key::MinutesAgoOne => "{n} minutes ago",
+        Key::MinutesAgoFew => "{n} minutes ago",
+        Key::MinutesAgoMany => "{n} minutes ago",
+        Key::AnHourAgo => "an hour ago",
+        Key::HoursAgoOne => "{n} hours ago",
+        Key::HoursAgoFew => "{n} hours ago",
+        Key::HoursAgoMany => "{n} hours ago",
+        Key::Yesterday => "yesterday",
+        Key::DaysAgoOne => "{n} days ago",
+        Key::DaysAgoFew => "{n} days ago",
+        Key::DaysAgoMany => "{n} days ago",
         Key::BytesAbbreviation => "B",
         Key::KibibytesAbbreviation => "KiB",
         Key::MebibytesAbbreviation => "MiB",
@@ -1325,7 +1379,7 @@ const fn en(key: Key) -> &'static str {
         Key::Light => "Light",
         Key::Dark => "Dark",
         Key::LinksBetweenComputers => "Links between computers",
-        Key::ASCIIIsoline => "ASCII isoline",
+        Key::ASCIIIsoline => "ASCII bridge",
         Key::Line => "Line",
         Key::BackgroundParticles => "Background · particles",
         Key::Gather => "Gather",
@@ -1407,49 +1461,132 @@ pub fn clipboard_size(lang: Lang, bytes: u64) -> String {
         format!("{whole}{separator}{fraction} {suffix}")
     }
 }
-/// `1 computer`, `2 computers`, `5 computers`: the count with its noun.
-pub fn computers(lang: Lang, n: u64) -> String {
-    let noun = match lang {
-        // Russian keeps three forms; English keeps two.
+/// Which form of a count a language puts after the number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// 1, 21, 101: «1 минуту», «21 минуту».
+    One,
+    /// 2–4, 22–24: «2 минуты».
+    Few,
+    /// 5–20, 25–30, 11–14: «5 минут».
+    Many,
+}
+
+/// The form `lang` uses for `n` whole things: Russian keeps three, English two (`one` below the
+/// count of two, `many` above it, so «1 computer» and «2 computers»).
+fn plural_form(lang: Lang, n: u64) -> Form {
+    match lang {
         Lang::Ru => match n % 100 {
-            11..=14 => text(lang, Key::ComputersMany),
+            11..=14 => Form::Many,
             _ => match n % 10 {
-                1 => text(lang, Key::Computer),
-                2..=4 => text(lang, Key::ComputersFew),
-                _ => text(lang, Key::ComputersMany),
+                1 => Form::One,
+                2..=4 => Form::Few,
+                _ => Form::Many,
             },
         },
         Lang::En => {
             if n == 1 {
-                text(lang, Key::Computer)
+                Form::One
             } else {
-                text(lang, Key::ComputersMany)
+                Form::Many
             }
         }
+    }
+}
+
+/// `1 computer`, `2 computers`, `5 computers`: the count with its noun.
+pub fn computers(lang: Lang, n: u64) -> String {
+    let noun = match plural_form(lang, n) {
+        Form::One => text(lang, Key::Computer),
+        Form::Few => text(lang, Key::ComputersFew),
+        Form::Many => text(lang, Key::ComputersMany),
     };
     format!("{n} {noun}")
 }
 
 /// `1 display`, `2 displays`: the count with its noun.
 pub fn displays(lang: Lang, n: u64) -> String {
-    let noun = match lang {
-        Lang::Ru => match n % 100 {
-            11..=14 => text(lang, Key::DisplaysMany),
-            _ => match n % 10 {
-                1 => text(lang, Key::Display),
-                2..=4 => text(lang, Key::DisplaysFew),
-                _ => text(lang, Key::DisplaysMany),
-            },
-        },
-        Lang::En => {
-            if n == 1 {
-                text(lang, Key::Display)
-            } else {
-                text(lang, Key::DisplaysMany)
-            }
-        }
+    let noun = match plural_form(lang, n) {
+        Form::One => text(lang, Key::Display),
+        Form::Few => text(lang, Key::DisplaysFew),
+        Form::Many => text(lang, Key::DisplaysMany),
     };
     format!("{n} {noun}")
+}
+
+/// Seconds in a minute.
+const MINUTE: u64 = 60;
+/// Seconds in an hour.
+const HOUR: u64 = 60 * MINUTE;
+/// Seconds in a day.
+const DAY: u64 = 24 * HOUR;
+
+/// The count with its number, in the phrase the language uses for it: `forms` are the one, few
+/// and many phrases of the unit, in the order of [`Form`], each with an `{n}` hole.
+fn counted(lang: Lang, n: u64, forms: [Key; 3]) -> String {
+    let key = match plural_form(lang, n) {
+        Form::One => forms[0],
+        Form::Few => forms[1],
+        Form::Many => forms[2],
+    };
+    fill_named(lang, key, &[("n", &n)])
+}
+
+/// How long ago a moment was: «только что», «10 минут назад», «час назад», «вчера», «4 дня назад».
+///
+/// The age is counted down to whole minutes, so the same answer is right for a whole minute and
+/// nothing has to be redrawn every second: [`ago_next_change_in`] says when the next one is due.
+/// The last minute, hour and day have phrases of their own, because both languages say
+/// «минуту назад» and `a minute ago` rather than counting to one.
+pub fn ago(lang: Lang, secs: u64) -> String {
+    if secs < MINUTE {
+        text(lang, Key::JustNow).to_owned()
+    } else if secs < HOUR {
+        match secs / MINUTE {
+            1 => text(lang, Key::AMinuteAgo).to_owned(),
+            minutes => counted(
+                lang,
+                minutes,
+                [Key::MinutesAgoOne, Key::MinutesAgoFew, Key::MinutesAgoMany],
+            ),
+        }
+    } else if secs < DAY {
+        match secs / HOUR {
+            1 => text(lang, Key::AnHourAgo).to_owned(),
+            hours => counted(
+                lang,
+                hours,
+                [Key::HoursAgoOne, Key::HoursAgoFew, Key::HoursAgoMany],
+            ),
+        }
+    } else {
+        match secs / DAY {
+            1 => text(lang, Key::Yesterday).to_owned(),
+            days => counted(
+                lang,
+                days,
+                [Key::DaysAgoOne, Key::DaysAgoFew, Key::DaysAgoMany],
+            ),
+        }
+    }
+}
+
+/// How many seconds [`ago`] keeps giving the same answer for an age of `secs` seconds: the
+/// window asks for its next frame then instead of redrawing once a second.
+///
+/// A label only changes at a whole minute below an hour, at a whole hour below a day and at a
+/// whole day after that, which is what the age is rounded down to. The answer is never zero:
+/// the age is counted in whole seconds, so a minute that has just come round is the next one.
+pub fn ago_next_change_in(secs: u64) -> u64 {
+    if secs < MINUTE {
+        MINUTE - secs
+    } else if secs < HOUR {
+        MINUTE - secs % MINUTE
+    } else if secs < DAY {
+        HOUR - secs % HOUR
+    } else {
+        DAY - secs % DAY
+    }
 }
 
 #[cfg(test)]
@@ -1468,7 +1605,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 313] = [
+    pub const EVERY: [Key; 326] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1706,6 +1843,19 @@ mod tests {
         Key::Transfer,
         Key::HistoryEntryMetadata,
         Key::ConfirmClearHistory,
+        Key::JustNow,
+        Key::AMinuteAgo,
+        Key::MinutesAgoOne,
+        Key::MinutesAgoFew,
+        Key::MinutesAgoMany,
+        Key::AnHourAgo,
+        Key::HoursAgoOne,
+        Key::HoursAgoFew,
+        Key::HoursAgoMany,
+        Key::Yesterday,
+        Key::DaysAgoOne,
+        Key::DaysAgoFew,
+        Key::DaysAgoMany,
         Key::BytesAbbreviation,
         Key::KibibytesAbbreviation,
         Key::MebibytesAbbreviation,
@@ -1809,6 +1959,107 @@ mod tests {
         assert_eq!(computers(Lang::En, 3), "3 computers");
         assert_eq!(displays(Lang::Ru, 2), "2 экрана");
         assert_eq!(displays(Lang::En, 2), "2 displays");
+    }
+
+    /// Every edge of the Russian rule: the teens take the many form however they end, and the
+    /// hundreds do not hide the last digit.
+    #[test]
+    fn the_plural_form_matches_the_grammar_of_both_languages() {
+        use Form::{Few, Many, One};
+        let ru = |n| plural_form(Lang::Ru, n);
+        assert_eq!(ru(1), One);
+        assert_eq!(ru(2), Few);
+        assert_eq!(ru(4), Few);
+        assert_eq!(ru(5), Many);
+        assert_eq!(ru(11), Many);
+        assert_eq!(ru(12), Many);
+        assert_eq!(ru(14), Many);
+        assert_eq!(ru(21), One);
+        assert_eq!(ru(22), Few);
+        assert_eq!(ru(25), Many);
+        assert_eq!(ru(101), One);
+        assert_eq!(ru(102), Few);
+        assert_eq!(ru(111), Many);
+        assert_eq!(ru(114), Many);
+        assert_eq!(ru(121), One);
+        let en = |n| plural_form(Lang::En, n);
+        assert_eq!(en(1), One);
+        assert_eq!(en(2), Many);
+        assert_eq!(en(11), Many);
+        assert_eq!(en(21), Many);
+        assert_eq!(en(111), Many);
+    }
+
+    /// The labels the owner asked for, at every boundary of the three units.
+    #[test]
+    fn ages_read_as_human_time_in_both_languages() {
+        assert_eq!(ago(Lang::Ru, 0), "только что");
+        assert_eq!(ago(Lang::Ru, 9), "только что");
+        assert_eq!(ago(Lang::Ru, 59), "только что");
+        assert_eq!(ago(Lang::Ru, 60), "минуту назад");
+        assert_eq!(ago(Lang::Ru, 119), "минуту назад");
+        assert_eq!(ago(Lang::Ru, 120), "2 минуты назад");
+        assert_eq!(ago(Lang::Ru, 4 * 60), "4 минуты назад");
+        assert_eq!(ago(Lang::Ru, 5 * 60), "5 минут назад");
+        assert_eq!(ago(Lang::Ru, 656), "10 минут назад");
+        assert_eq!(ago(Lang::Ru, 11 * 60), "11 минут назад");
+        assert_eq!(ago(Lang::Ru, 21 * 60), "21 минуту назад");
+        assert_eq!(ago(Lang::Ru, 22 * 60), "22 минуты назад");
+        assert_eq!(ago(Lang::Ru, 59 * 60 + 59), "59 минут назад");
+        assert_eq!(ago(Lang::Ru, HOUR), "час назад");
+        assert_eq!(ago(Lang::Ru, HOUR + 59), "час назад");
+        assert_eq!(ago(Lang::Ru, 2 * HOUR), "2 часа назад");
+        assert_eq!(ago(Lang::Ru, 5 * HOUR), "5 часов назад");
+        assert_eq!(ago(Lang::Ru, 11 * HOUR), "11 часов назад");
+        assert_eq!(ago(Lang::Ru, 21 * HOUR), "21 час назад");
+        assert_eq!(ago(Lang::Ru, 22 * HOUR), "22 часа назад");
+        assert_eq!(ago(Lang::Ru, DAY - 1), "23 часа назад");
+        assert_eq!(ago(Lang::Ru, DAY), "вчера");
+        assert_eq!(ago(Lang::Ru, DAY + 11 * HOUR), "вчера");
+        assert_eq!(ago(Lang::Ru, 2 * DAY), "2 дня назад");
+        assert_eq!(ago(Lang::Ru, 5 * DAY), "5 дней назад");
+        assert_eq!(ago(Lang::Ru, 11 * DAY), "11 дней назад");
+        assert_eq!(ago(Lang::Ru, 21 * DAY), "21 день назад");
+        assert_eq!(ago(Lang::Ru, 22 * DAY), "22 дня назад");
+        assert_eq!(ago(Lang::Ru, 111 * DAY), "111 дней назад");
+
+        assert_eq!(ago(Lang::En, 0), "just now");
+        assert_eq!(ago(Lang::En, 59), "just now");
+        assert_eq!(ago(Lang::En, 60), "a minute ago");
+        assert_eq!(ago(Lang::En, 119), "a minute ago");
+        assert_eq!(ago(Lang::En, 120), "2 minutes ago");
+        assert_eq!(ago(Lang::En, 21 * 60), "21 minutes ago");
+        assert_eq!(ago(Lang::En, HOUR), "an hour ago");
+        assert_eq!(ago(Lang::En, 2 * HOUR), "2 hours ago");
+        assert_eq!(ago(Lang::En, 3 * HOUR), "3 hours ago");
+        assert_eq!(ago(Lang::En, DAY - 1), "23 hours ago");
+        assert_eq!(ago(Lang::En, DAY), "yesterday");
+        assert_eq!(ago(Lang::En, DAY + 5 * HOUR), "yesterday");
+        assert_eq!(ago(Lang::En, 2 * DAY), "2 days ago");
+        assert_eq!(ago(Lang::En, 4 * DAY), "4 days ago");
+        assert_eq!(ago(Lang::En, 21 * DAY), "21 days ago");
+    }
+
+    /// The window redraws when the next label is due and not before: over four days, the answer
+    /// this gives is exactly the moment [`ago`] starts saying something else.
+    #[test]
+    fn a_label_is_replaced_exactly_when_the_next_change_says() {
+        for secs in 0..(4 * DAY + HOUR) {
+            let next = ago_next_change_in(secs);
+            assert!(next > 0, "no wait at {secs}s");
+            for lang in [Lang::Ru, Lang::En] {
+                assert_ne!(
+                    ago(lang, secs),
+                    ago(lang, secs + next),
+                    "{lang:?} at {secs}s, next in {next}s"
+                );
+                assert_eq!(
+                    ago(lang, secs),
+                    ago(lang, secs + next - 1),
+                    "{lang:?} at {secs}s, next in {next}s"
+                );
+            }
+        }
     }
 
     #[test]
