@@ -164,9 +164,39 @@ impl ViewModel {
                     config::Edge::Top => Side::Top,
                     config::Edge::Bottom => Side::Bottom,
                 };
-                (a != b).then_some(DocLink { a, side, b })
+                let contact = if link.from.is_auto() && link.to.is_auto() {
+                    None
+                } else {
+                    Some((
+                        self.endpoint_segment(a, &link.from, map::BASE_SCALE)?,
+                        self.endpoint_segment(b, &link.to, map::BASE_SCALE)?,
+                    ))
+                };
+                (a != b).then_some(DocLink { a, side, b, contact })
             })
             .collect()
+    }
+
+    /// A concrete endpoint in the node's normalized local coordinates.
+    fn endpoint_segment(
+        &self,
+        node: usize,
+        endpoint: &config::EndpointConfig,
+        scale: f64,
+    ) -> Option<Rect> {
+        let displays = &self.editor.nodes.get(node)?.displays;
+        let display = displays.iter().find(|d| d.id == endpoint.display)?;
+        let x = displays.iter().map(|d| d.x).fold(f64::INFINITY, f64::min);
+        let y = displays.iter().map(|d| d.y).fold(f64::INFINITY, f64::min);
+        let (x, y) = ((display.x - x) * scale, (display.y - y) * scale);
+        let start = endpoint.start * scale;
+        let length = (endpoint.end - endpoint.start) * scale;
+        Some(match endpoint.edge {
+            config::Edge::Left => Rect::new(x, y + start, 0.0, length),
+            config::Edge::Right => Rect::new(x + display.w * scale, y + start, 0.0, length),
+            config::Edge::Top => Rect::new(x + start, y, length, 0.0),
+            config::Edge::Bottom => Rect::new(x + start, y + display.h * scale, length, 0.0),
+        })
     }
 
     /// Draws the applied document afresh: shapes, first placement, no draft.
@@ -199,7 +229,12 @@ impl ViewModel {
         self.editor.placement = arrangement.pos;
         if let Some(wanted) = &self.editor.save.wanted {
             self.editor.placement =
-                map::place(&self.editor.shapes, &self.doc_links_from(wanted), anchor);
+                map::place_at_scale(
+                    &self.editor.shapes,
+                    &self.doc_links_from(wanted),
+                    anchor,
+                    self.editor.scale,
+                );
             self.editor.save.placement = Some(self.editor.placement.clone());
         }
     }
@@ -225,18 +260,19 @@ impl ViewModel {
         }
         for a in 0..pos.len() {
             for b in a + 1..pos.len() {
-                if pos[a].x < pos[b].x + shapes[b].w
-                    && pos[b].x < pos[a].x + shapes[a].w
-                    && pos[a].y < pos[b].y + shapes[b].h
-                    && pos[b].y < pos[a].y + shapes[a].h
-                {
+                if shapes[a].mons.iter().any(|ma| {
+                    shapes[b].mons.iter().any(|mb| {
+                        pos[a].x + ma.x < pos[b].x + mb.x + mb.w - 1e-6
+                            && pos[b].x + mb.x < pos[a].x + ma.x + ma.w - 1e-6
+                            && pos[a].y + ma.y < pos[b].y + mb.y + mb.h - 1e-6
+                            && pos[b].y + mb.y < pos[a].y + ma.y + ma.h - 1e-6
+                    })
+                }) {
                     return false;
                 }
             }
         }
-        self.faced(pos)
-            .iter()
-            .any(|link| link.a == i || link.b == i)
+        true
     }
 
     pub(crate) fn drop_node(&mut self, node_id: &str) {
@@ -279,7 +315,7 @@ impl ViewModel {
             .collect();
         if same_links(&links, &applied) {
             self.editor.save = Save::default();
-            self.restore_placement();
+            self.editor.baseline.clone_from(&self.editor.placement);
             return;
         }
         let layout_toml = match toml::to_string(&self.topology_with(links.clone())) {
@@ -360,8 +396,12 @@ impl ViewModel {
             }
             self.editor.save.awaiting = None;
             if self.editor.save.wanted.is_none() {
+                let accepted = self.editor.save.placement.take();
                 self.editor.save = Save::default();
-                self.rebuild_layout();
+                if let Some(accepted) = accepted.filter(|p| p.len() == self.editor.nodes.len()) {
+                    self.editor.baseline.clone_from(&accepted);
+                    self.editor.placement = accepted;
+                }
             }
         }
         self.apply_draft();
@@ -369,13 +409,25 @@ impl ViewModel {
 
     /// A drag: the computer follows the pointer and snaps to the edge it comes near.
     pub fn move_node(&mut self, node_id: &str, x: f64, y: f64) {
+        self.move_node_with_threshold(node_id, x, y, map::SNAP);
+    }
+
+    /// A drag with a stage-space threshold derived from the current screen zoom.
+    pub fn move_node_with_threshold(&mut self, node_id: &str, x: f64, y: f64, snap_threshold: f64) {
         let Some(i) = self.index_of(node_id) else {
             return;
         };
         if i >= self.editor.placement.len() || !x.is_finite() || !y.is_finite() {
             return;
         }
-        self.editor.placement[i] = map::snap(&self.editor.shapes, &self.editor.placement, i, x, y);
+        self.editor.placement[i] = map::snap_with_threshold(
+            &self.editor.shapes,
+            &self.editor.placement,
+            i,
+            x,
+            y,
+            snap_threshold,
+        );
     }
 
     /// A keyboard step: no snapping, so a step is always the step that was asked for.
@@ -421,42 +473,27 @@ impl ViewModel {
             .collect()
     }
 
-    /// The links of the edited document.
-    ///
-    /// With no draft they are the applied links, untouched. With one, a link survives when the
-    /// two computers it joins still face each other the way they did (or neither moved); a pair
-    /// that now faces differently, or newly, gets one `auto` link — the whole desktop's edge,
-    /// which then follows the monitors with no further edit — and a pair that no longer faces
-    /// loses its link. Stacked desktops write Bottom ↔ Top; side-by-side desktops write
-    /// Right ↔ Left, with the upper/left desktop first.
+    /// Preserve untouched document pairs; moved pairs are replaced by their exact contacts.
     pub(crate) fn editor_links(&self) -> Vec<config::LinkConfig> {
         let applied = self.applied_links();
         if !self.editor.dirty() || self.editor.placement.len() != self.editor.nodes.len() {
             return applied.into_iter().map(|(_, link)| link).collect();
         }
         let now = self.faced(&self.editor.placement);
-        let before = self.faced(&self.editor.baseline);
-        let find = |set: &[map::GeoLink], i: usize, j: usize| {
-            set.iter()
-                .find(|l| (l.a, l.b) == (i, j) || (l.a, l.b) == (j, i))
-                .map(|l| (l.a, l.b, l.dir))
-        };
-        let moved = |i: usize| self.editor.placement[i] != self.editor.baseline[i];
+        let baseline = &self.editor.baseline;
+        let moved = |i: usize| self.editor.placement.get(i) != baseline.get(i);
         let mut links: Vec<config::LinkConfig> = Vec::new();
         for (ends, link) in applied {
             let keep = match ends {
                 None => true,
-                Some((i, j)) => {
-                    (!moved(i) && !moved(j))
-                        || (find(&now, i, j).is_some() && find(&now, i, j) == find(&before, i, j))
-                }
+                Some((i, j)) => !moved(i) && !moved(j),
             };
             if keep {
                 links.push(link);
             }
         }
         for link in &now {
-            if find(&before, link.a, link.b) == find(&now, link.a, link.b) {
+            if !moved(link.a) && !moved(link.b) {
                 continue;
             }
             let (a, b) = (
@@ -468,22 +505,31 @@ impl ViewModel {
             while links.iter().any(|existing| existing.id == id) {
                 id.push('x');
             }
+            let endpoint = |node: usize, display: usize, edge: config::Edge| {
+                let mon = self.editor.shapes[node].mons[display];
+                let at = self.editor.placement[node];
+                let origin = match link.dir {
+                    map::Dir::Horizontal => at.y + mon.y,
+                    map::Dir::Vertical => at.x + mon.x,
+                };
+                config::EndpointConfig {
+                    node: node_reference(&self.editor.nodes[node].node_id),
+                    display: self.editor.nodes[node].displays[display].id.clone(),
+                    edge,
+                    start: (link.span.0 - origin) / self.editor.scale,
+                    end: (link.span.1 - origin) / self.editor.scale,
+                }
+            };
+            // A guessed desktop has no stable display identity to persist.
+            if self.editor.nodes[link.a].displays.get(link.a_display).is_none()
+                || self.editor.nodes[link.b].displays.get(link.b_display).is_none()
+            {
+                continue;
+            }
             links.push(config::LinkConfig {
                 id,
-                from: config::EndpointConfig {
-                    node: node_reference(a),
-                    display: config::AUTO_DISPLAY.to_owned(),
-                    edge: a_edge,
-                    start: 0.0,
-                    end: 0.0,
-                },
-                to: config::EndpointConfig {
-                    node: node_reference(b),
-                    display: config::AUTO_DISPLAY.to_owned(),
-                    edge: b_edge,
-                    start: 0.0,
-                    end: 0.0,
-                },
+                from: endpoint(link.a, link.a_display, a_edge),
+                to: endpoint(link.b, link.b_display, b_edge),
                 bidirectional: true,
             });
         }
@@ -606,45 +652,68 @@ impl ViewModel {
         }
         let dirty = editor.dirty();
         let mut links = Vec::new();
-        for link in self.faced(&editor.placement) {
-            let (a, b) = (&editor.nodes[link.a], &editor.nodes[link.b]);
-            let documented = self.editor.links.iter().find(|l| {
-                let (Some(f), Some(t)) = (l.from.as_ref(), l.to.as_ref()) else {
-                    return false;
-                };
-                (f.node_id == a.node_id && t.node_id == b.node_id)
-                    || (f.node_id == b.node_id && t.node_id == a.node_id)
-            });
-            let whole_desktop = match documented {
-                Some(doc) if !dirty => [doc.from.as_ref(), doc.to.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|e| e.display_id == config::AUTO_DISPLAY),
-                _ => true,
+        for doc in self.editor_links() {
+            let Some(a) = editor.nodes.iter().position(|n| node_reference(&n.node_id) == doc.from.node) else {
+                continue;
             };
-            let offline = !a.online || !b.online;
+            let Some(b) = editor.nodes.iter().position(|n| node_reference(&n.node_id) == doc.to.node) else {
+                continue;
+            };
+            let whole_desktop = doc.from.is_auto() && doc.to.is_auto();
+            let mut missing = false;
+            let mut endpoint = |node: usize, e: &config::EndpointConfig| {
+                let local = self.endpoint_segment(node, e, editor.scale).unwrap_or_else(|| {
+                    missing |= !e.is_auto();
+                    let shape = &editor.shapes[node];
+                    let start = e.start * editor.scale;
+                    let length = (e.end - e.start) * editor.scale;
+                    match e.edge {
+                        config::Edge::Left => Rect::new(0.0, start, 0.0, if e.is_auto() { shape.h } else { length }),
+                        config::Edge::Right => Rect::new(shape.w, start, 0.0, if e.is_auto() { shape.h } else { length }),
+                        config::Edge::Top => Rect::new(start, 0.0, if e.is_auto() { shape.w } else { length }, 0.0),
+                        config::Edge::Bottom => Rect::new(start, shape.h, if e.is_auto() { shape.w } else { length }, 0.0),
+                    }
+                });
+                let at = editor.placement[node];
+                Rect::new(at.x + local.x, at.y + local.y, local.w, local.h)
+            };
+            let f = endpoint(a, &doc.from);
+            let t = endpoint(b, &doc.to);
+            let dir = match doc.from.edge {
+                config::Edge::Left | config::Edge::Right => map::Dir::Horizontal,
+                config::Edge::Top | config::Edge::Bottom => map::Dir::Vertical,
+            };
+            let span = match dir {
+                map::Dir::Horizontal => (f.y, f.y + f.h),
+                map::Dir::Vertical => (f.x, f.x + f.w),
+            };
+            let from = Pt::new(f.x + f.w / 2.0, f.y + f.h / 2.0);
+            let to = Pt::new(t.x + t.w / 2.0, t.y + t.h / 2.0);
+            let documented = editor.links.iter().find(|l| l.id == doc.id);
+            let (a_node, b_node) = (&editor.nodes[a], &editor.nodes[b]);
+            let offline = !a_node.online || !b_node.online;
             let active = !offline
                 && target != this
                 && this.is_some()
-                && ((this == Some(link.a) && target == Some(link.b))
-                    || (this == Some(link.b) && target == Some(link.a)));
-            let state = if offline {
-                LinkState::Offline
-            } else if documented.is_some_and(|d| !d.active) && !dirty {
+                && ((this == Some(a) && target == Some(b))
+                    || (this == Some(b) && target == Some(a)));
+            let state = if missing || documented.is_some_and(|d| !d.active) && !dirty {
                 LinkState::Inactive
+            } else if offline {
+                LinkState::Offline
             } else if active {
                 LinkState::Active
             } else {
                 LinkState::Idle
             };
-            let forward = this == Some(link.a);
+            let forward = this == Some(a);
             links.push(MapLink {
-                a: link.a,
-                b: link.b,
-                from: link.from,
-                to: link.to,
-                dir: link.dir,
-                span: link.span,
+                a,
+                b,
+                from,
+                to,
+                dir,
+                span,
                 state,
                 whole_desktop,
                 forward,

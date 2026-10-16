@@ -1352,7 +1352,25 @@ impl ViewModel {
                 .iter()
                 .zip(&doc.members)
                 .all(|(node, member)| node.node_id == member.node_id);
-        if doc.revision == self.editor.revision && self.editor.dirty() && same_members {
+        let same_geometry = same_members
+            && self.editor.nodes.iter().zip(&doc.members).all(|(node, member)| {
+                node.displays.len() == member.displays.len()
+                    && node.displays.iter().zip(&member.displays).all(|(display, report)| {
+                        display.id == report.id
+                            && display.x == finite(report.logical_x, 0.0)
+                            && display.y == finite(report.logical_y, 0.0)
+                            && display.w == finite(report.logical_w, 0.0)
+                            && display.h == finite(report.logical_h, 0.0)
+                            && display.primary == report.primary
+                            && display.native_known == report.native_known
+                            && display.rotation == report.rotation_degrees
+                    })
+            });
+        let retain_placement = same_geometry
+            && (self.editor.links == doc.links
+                || self.editor.save.sent.is_some()
+                || self.editor.save.awaiting.is_some());
+        if doc.revision == self.editor.revision && self.editor.dirty() && same_geometry {
             // Same revision, same computers: only who is online and how they are called can
             // have changed, and a draft the user is holding must not be wiped for that.
             for (node, member) in self.editor.nodes.iter_mut().zip(&doc.members) {
@@ -1384,8 +1402,14 @@ impl ViewModel {
             })
             .collect();
         self.editor.nodes = nodes;
-        // The map is rebuilt from the applied links (and the draft still owed on top of them).
-        self.rebuild_layout();
+        // An unchanged manifest or our own CAS acknowledgment must not move a
+        // freely placed computer. A changed display report rebuilds real geometry.
+        if !retain_placement {
+            if !same_geometry {
+                self.editor.save.placement = None;
+            }
+            self.rebuild_layout();
+        }
         self.push_log(fill(
             lang,
             Key::LayoutReceivedRevisionFromMembers,
@@ -2103,7 +2127,9 @@ impl ViewModel {
             }
             Action::SetAddress(address) => self.pairing.address = address.clone(),
             Action::ToggleDetails(open) => self.pairing.details = *open,
-            Action::MoveNode { node_id, x, y } => self.move_node(node_id, *x, *y),
+            Action::MoveNode { node_id, x, y, snap_threshold } => {
+                self.move_node_with_threshold(node_id, *x, *y, *snap_threshold);
+            }
             Action::NudgeNode { node_id, dx, dy } => {
                 // A key press is a whole edit: it is dropped where it lands.
                 self.nudge_node(node_id, *dx, *dy);
@@ -2328,6 +2354,8 @@ pub enum Action {
         x: f64,
         /// Wanted top, in stage units.
         y: f64,
+        /// Magnetic distance in stage units (converted from screen pixels).
+        snap_threshold: f64,
     },
     /// Move a computer of the map by a keyboard step.
     NudgeNode {

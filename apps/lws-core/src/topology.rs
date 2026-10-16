@@ -2439,6 +2439,94 @@ bidirectional = true
     }
 
     #[test]
+    fn concrete_contacts_survive_rebuilds_without_falling_back_to_other_displays() {
+        for horizontal in [false, true] {
+            let mut config = topology_config();
+            let link = &mut config.links[0];
+            link.from.start = 200.0;
+            link.from.end = 600.0;
+            link.to.start = 100.0;
+            link.to.end = 500.0;
+            if horizontal {
+                link.from.edge = config::Edge::Bottom;
+                link.to.edge = config::Edge::Top;
+            }
+            let local = [info(
+                "eDP-1",
+                [0.0, 0.0, 1920.0, 1080.0],
+                [0, 0, 1920, 1080],
+                true,
+            )];
+            let peers = [(
+                NodeId::new(peer_id()),
+                vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+            )];
+            let assemble = |local: &[ipc::DisplayInfo], peers: &[(NodeId, Vec<wire::Display>)]| {
+                build(&Documents {
+                    local_node_id: local_id(),
+                    topology: &config,
+                    local_displays: local,
+                    peer_displays: peers,
+                })
+                .expect("concrete contact or inactive missing endpoint")
+            };
+            let active = assemble(&local, &peers);
+            assert!(active.inactive.is_empty());
+            assert_eq!(active.topology.links[0].source.segment, geometry::Segment::new(200.0, 600.0));
+            assert_eq!(active.topology.links[0].target.segment, geometry::Segment::new(100.0, 500.0));
+            for reverse in [false, true] {
+                let (owner, id, boundary, start, end) = if reverse {
+                    (NodeId::new(peer_id()), "DP-1", 0.0, 100.0, 500.0)
+                } else {
+                    (NodeId::new(local_id()), "eDP-1",
+                        if horizontal { 1080.0 } else { 1920.0 }, 200.0, 600.0)
+                };
+                for along in [start - 1.0, (start + end) / 2.0, end + 1.0] {
+                    let position = if horizontal {
+                        geometry::Position::new(id, along, boundary)
+                    } else {
+                        geometry::Position::new(id, boundary, along)
+                    };
+                    let transition = geometry::resolve_transition(&active.topology, &owner, &position);
+                    assert_eq!(transition.is_some(), along >= start && along <= end);
+                    if let Some(transition) = transition {
+                        let guard = ReturnGuard::after_return(
+                            transition.target.edge,
+                            &transition.target_position,
+                            8.0,
+                        );
+                        assert!(guard.holds_crossing(&transition.target_position, transition.target.edge));
+                        let entry = guard.entry(&transition.target_position);
+                        if horizontal {
+                            assert_eq!(entry.x, transition.target_position.x);
+                        } else {
+                            assert_eq!(entry.y, transition.target_position.y);
+                        }
+                        assert!(!guard.holds(&entry));
+                    }
+                }
+            }
+            for missing_source in [false, true] {
+                let mut changed_local = local.clone();
+                let mut changed_peers = peers.to_vec();
+                if missing_source {
+                    changed_local[0].id = "replacement-local".to_owned();
+                } else {
+                    changed_peers[0].1[0].id = "replacement-peer".to_owned();
+                }
+                let inactive = assemble(&changed_local, &changed_peers);
+                assert!(inactive.topology.links.is_empty(), "no automatic replacement");
+                assert_eq!(inactive.inactive.len(), 1);
+                assert_eq!(inactive.inactive[0].missing[0].side,
+                    if missing_source { geometry::EndpointSide::Source } else { geometry::EndpointSide::Target });
+                let restored = assemble(&local, &peers);
+                assert!(restored.inactive.is_empty());
+                assert_eq!(restored.topology.links, active.topology.links);
+            }
+        }
+    }
+
+    #[test]
     fn the_link_returns_when_the_display_is_reported_again() {
         let config = two_link_config();
         let local = [

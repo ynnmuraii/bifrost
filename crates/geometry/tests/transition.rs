@@ -475,6 +475,69 @@ fn bottom_edge_transition_maps_to_the_targets_top_edge() {
 }
 
 #[test]
+fn concrete_contact_segments_only_cross_within_overlap_on_both_axes_and_directions() {
+    for horizontal in [false, true] {
+        let mut topology = fixture(true);
+        let (source_edge, target_edge) = if horizontal {
+            (Edge::Bottom, Edge::Top)
+        } else {
+            (Edge::Right, Edge::Left)
+        };
+        topology.links[0].source.edge = source_edge;
+        topology.links[0].source.segment = Segment::new(200.0, 600.0);
+        topology.links[0].target.edge = target_edge;
+        topology.links[0].target.segment = Segment::new(100.0, 500.0);
+        assert_eq!(validate_topology(&topology), Ok(()));
+
+        for reverse in [false, true] {
+            let (owner, id, start, end, normal, boundary, target_id, target_normal) =
+                if reverse {
+                    (node(2), "b", 100.0, 500.0, -1.0, 0.0, "a",
+                        if horizontal { 998.0 } else { 1198.0 })
+                } else {
+                    (node(1), "a", 200.0, 600.0, 1.0,
+                        if horizontal { 1000.0 } else { 1200.0 }, "b", 2.0)
+                };
+            for along in [start - 1.0, start, (start + end) / 2.0, end, end + 1.0] {
+                let position = if horizontal {
+                    Position::new(id, along, boundary)
+                } else {
+                    Position::new(id, boundary, along)
+                };
+                let delta = if horizontal {
+                    Point::new(0.0, normal * 20.0)
+                } else {
+                    Point::new(normal * 20.0, 0.0)
+                };
+                let inside = Position::new(
+                    id,
+                    position.x - delta.x / 2.0,
+                    position.y - delta.y / 2.0,
+                );
+                let resolved = resolve_transition(&topology, &owner, &position);
+                assert_eq!(resolve_motion(&topology, &owner, &inside, delta), resolved);
+                if along < start || along > end {
+                    assert!(resolved.is_none(), "{horizontal} {reverse} {along}");
+                    continue;
+                }
+                let transition = resolved.expect("the concrete contact is traversable");
+                let mapped = along + if reverse { 100.0 } else { -100.0 };
+                let expected = if horizontal {
+                    Position::new(target_id, mapped, target_normal)
+                } else {
+                    Position::new(target_id, target_normal, mapped)
+                };
+                assert_eq!(transition.target_position, expected);
+                assert_eq!(
+                    transition.direction,
+                    if reverse { LinkDirection::Reverse } else { LinkDirection::Forward }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn bidirectional_link_resolves_reverse_with_swapped_endpoints() {
     let topology = fixture(true);
     let transition =

@@ -11,7 +11,6 @@ mod support;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lws_gui::map::GAP;
 use lws_gui::view_model::layout::LinkState;
 use lws_gui::view_model::{
     Action, Bridge, GuiClient, Launch, Modal, Request, Restart, RestartStep, ServiceStart, Side,
@@ -482,14 +481,12 @@ fn a_dragged_computer_becomes_a_document_only_on_drop() {
     let (this, peer) = (index_of(&vm, SELF_NODE), index_of(&vm, PEER_NODE));
     let me = vm.editor.placement[this];
     let width = vm.editor.shapes[this].w;
-    vm.local(&Action::MoveNode {
-        node_id: PEER_NODE.to_owned(),
-        x: me.x + width + GAP + 5.0,
-        y: me.y + 1.0,
-    });
+    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+    x: me.x + width + 5.0,
+    y: me.y + 1.0, snap_threshold: lws_gui::map::SNAP });
     assert!(vm.editor.dirty());
-    assert_eq!(vm.editor.placement[peer].x, (me.x + width + GAP).round());
-    assert_eq!(vm.editor.placement[peer].y, me.y, "and the tops line up");
+    assert!((vm.editor.placement[peer].x - (me.x + width)).abs() < 1e-6);
+    assert_eq!(vm.editor.placement[peer].y, me.y + 1.0, "tangent offset is retained");
     assert_eq!(vm.map_model().links.len(), 1, "the preview shows the link");
     assert_eq!(vm.editor.revision, 7, "and nothing was applied");
 
@@ -524,9 +521,9 @@ fn a_dragged_computer_becomes_a_document_only_on_drop() {
     assert_eq!(link.to.node, format!("peer:{PEER_NODE}"));
     assert_eq!(link.from.edge.to_string(), "right");
     assert_eq!(link.to.edge.to_string(), "left");
-    // A snapped edge is a statement about the desktops, so neither end pins a display: the
-    // core derives the segment from the live manifests and the edge follows the monitors.
-    assert!(link.from.is_auto() && link.to.is_auto());
+    assert!(!link.from.is_auto() && !link.to.is_auto());
+    assert_eq!(link.from.display, vm.editor.nodes[this].displays[0].id);
+    assert_eq!(link.to.display, vm.editor.nodes[peer].displays[0].id);
     let moved = topology
         .displays
         .iter()
@@ -570,11 +567,9 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
 
     // Dragging the peer away unlinks the pair; putting it back restores the draft to clean.
     let before = vm.editor.placement.clone();
-    vm.local(&Action::MoveNode {
-        node_id: PEER_NODE.to_owned(),
-        x: 700.0,
-        y: 400.0,
-    });
+    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+    x: 700.0,
+    y: 400.0, snap_threshold: lws_gui::map::SNAP });
     assert!(vm.editor.dirty());
     assert!(vm.map_model().links.is_empty());
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
@@ -882,7 +877,8 @@ fn every_wire_request_is_the_message_it_names() {
     assert!(Action::MoveNode {
         node_id: PEER_NODE.to_owned(),
         x: 0.0,
-        y: 0.0
+        y: 0.0,
+        snap_threshold: lws_gui::map::SNAP,
     }
     .wire()
     .is_none());
@@ -896,20 +892,24 @@ fn saving_view() -> ViewModel {
     vm
 }
 
+fn flush_target(vm: &ViewModel, a: usize, b: usize, side: Side) -> lws_gui::map::Pt {
+    let at = vm.editor.placement[a];
+    let (a, b) = (&vm.editor.shapes[a], &vm.editor.shapes[b]);
+    match side {
+        Side::Left => lws_gui::map::Pt::new(at.x - b.w, at.y),
+        Side::Right => lws_gui::map::Pt::new(at.x + a.w, at.y),
+        Side::Top => lws_gui::map::Pt::new(at.x, at.y - b.h),
+        Side::Bottom => lws_gui::map::Pt::new(at.x, at.y + a.h),
+    }
+}
+
 fn move_to_side(vm: &mut ViewModel, side: Side) {
     let this = index_of(vm, SELF_NODE);
     let peer = index_of(vm, PEER_NODE);
-    let target = lws_gui::map::adjacent(
-        &vm.editor.shapes[this],
-        vm.editor.placement[this],
-        &vm.editor.shapes[peer],
-        side,
-    );
-    vm.local(&Action::MoveNode {
-        node_id: PEER_NODE.to_owned(),
-        x: target.x,
-        y: target.y,
-    });
+    let target = flush_target(vm, this, peer, side);
+    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+    x: target.x,
+    y: target.y, snap_threshold: lws_gui::map::SNAP });
 }
 
 fn drop_to_side(vm: &mut ViewModel, side: Side) {
@@ -1007,22 +1007,18 @@ fn conflict_reloads_and_retries_the_latest_drop_only_once() {
 fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
     let mut vm = saving_view();
     let baseline = vm.editor.placement.clone();
-    vm.local(&Action::MoveNode {
-        node_id: PEER_NODE.to_owned(),
-        x: 9000.0,
-        y: 9000.0,
-    });
+    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+    x: baseline[index_of(&vm, SELF_NODE)].x + 20.0,
+    y: baseline[index_of(&vm, SELF_NODE)].y + 20.0, snap_threshold: lws_gui::map::SNAP });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, baseline);
     assert!(vm.take_outgoing().is_empty());
     assert!(vm.flash.is_some(), "invalid placement gets a short hint");
     let this = index_of(&vm, SELF_NODE);
     let origin = vm.editor.placement[this];
-    vm.local(&Action::MoveNode {
-        node_id: PEER_NODE.to_owned(),
-        x: origin.x + vm.editor.shapes[this].w / 3.0,
-        y: origin.y + vm.editor.shapes[this].h / 3.0,
-    });
+    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+    x: origin.x + vm.editor.shapes[this].w / 3.0,
+    y: origin.y + vm.editor.shapes[this].h / 3.0, snap_threshold: lws_gui::map::SNAP });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(
         vm.editor.placement, baseline,
@@ -1032,11 +1028,9 @@ fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
     drop_to_side(&mut vm, Side::Right);
     let (id, _) = take_save(&mut vm);
     let accepted = vm.editor.placement.clone();
-    vm.local(&Action::MoveNode {
-        node_id: PEER_NODE.to_owned(),
-        x: 9000.0,
-        y: 9000.0,
-    });
+    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+    x: origin.x + 20.0,
+    y: origin.y + 20.0, snap_threshold: lws_gui::map::SNAP });
     vm.local(&Action::DropNode(PEER_NODE.to_owned()));
     assert_eq!(vm.editor.placement, accepted);
     assert!(vm.take_outgoing().is_empty());
@@ -1114,22 +1108,13 @@ fn dragging_chooses_all_four_edges() {
     let (this, peer) = (index_of(&vm, SELF_NODE), index_of(&vm, PEER_NODE));
 
     for side in Side::ALL {
-        let target = lws_gui::map::adjacent(
-            &vm.editor.shapes[this],
-            vm.editor.placement[this],
-            &vm.editor.shapes[peer],
-            side,
-        );
-        // The drag lands exactly on the edge. `y` is not offset: a snap picks the *nearest*
-        // candidate, and on a vertical edge the top-aligned candidate can be closer than the
-        // centred one when the two computers have different heights.
-        vm.local(&Action::MoveNode {
-            node_id: PEER_NODE.to_owned(),
-            x: target.x + 3.0,
-            y: target.y,
-        });
-        assert_eq!(vm.editor.placement[peer].x, target.x.round());
-        assert_eq!(vm.editor.placement[peer].y, target.y.round());
+        let target = flush_target(&vm, this, peer, side);
+        // Flush snapping keeps the requested tangent coordinate.
+        vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+        x: target.x,
+        y: target.y, snap_threshold: lws_gui::map::SNAP });
+        assert!((vm.editor.placement[peer].x - target.x).abs() < 1e-6);
+        assert!((vm.editor.placement[peer].y - target.y).abs() < 1e-6);
         let links = vm.map_model().links;
         assert_eq!(links.len(), 1, "{}", side.label(ui_text::Lang::Ru));
         let expected_dir = match side {
@@ -1142,7 +1127,7 @@ fn dragging_chooses_all_four_edges() {
         let topology: config::TopologyConfig = toml::from_str(&document).expect("parse");
         assert_eq!(topology.links.len(), 1);
         let link = &topology.links[0];
-        assert!(link.from.is_auto() && link.to.is_auto());
+        assert!(!link.from.is_auto() && !link.to.is_auto());
         let (from, to, from_edge, to_edge) = match side {
             Side::Left => (PEER_NODE, SELF_NODE, "right", "left"),
             Side::Right => (SELF_NODE, PEER_NODE, "right", "left"),
@@ -1177,11 +1162,9 @@ fn dragging_chooses_all_four_edges() {
     // through the peer's right edge into this computer's left edge.
     let me = vm.editor.placement[this];
     let peer_width = vm.editor.shapes[peer].w;
-    vm.local(&Action::MoveNode {
-        node_id: PEER_NODE.to_owned(),
-        x: me.x - GAP - peer_width - 4.0,
-        y: me.y + 2.0,
-    });
+    vm.local(&Action::MoveNode { node_id: PEER_NODE.to_owned(),
+    x: me.x - peer_width - 4.0,
+    y: me.y + 2.0, snap_threshold: lws_gui::map::SNAP });
     let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
     let link = &topology.links[0];
     assert_eq!(link.from.node, format!("peer:{PEER_NODE}"));
@@ -1958,4 +1941,178 @@ fn the_address_button_through_the_bridge_writes_and_says_why_it_cannot_restart()
         "служба запущена не этим окном — остановите её сами"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn concrete_doc(mut doc: protocol::ipc::TopologyDoc, links: &[config::LinkConfig]) -> protocol::ipc::TopologyDoc {
+    let endpoint = |e: &config::EndpointConfig| protocol::ipc::EndpointView {
+        node_id: e.node.strip_prefix("peer:").unwrap_or(&e.node).to_owned(),
+        display_id: e.display.clone(),
+        edge: e.edge.to_string(),
+        segment_start: e.start,
+        segment_end: e.end,
+    };
+    doc.links = links.iter().map(|link| protocol::ipc::LinkView {
+        id: link.id.clone(),
+        from: Some(endpoint(&link.from)),
+        to: Some(endpoint(&link.to)),
+        bidirectional: link.bidirectional,
+        active: true,
+        ..Default::default()
+    }).collect();
+    doc
+}
+
+#[test]
+fn lower_half_contacts_keep_display_ids_and_round_trip_offsets() {
+    let mut vm = saving_view();
+    let a = index_of(&vm, SELF_NODE);
+    let b = index_of(&vm, PEER_NODE);
+    let origin = vm.editor.placement[a];
+    vm.editor.placement[b] = lws_gui::map::Pt::new(
+        origin.x + vm.editor.shapes[a].w,
+        origin.y + vm.editor.shapes[a].h / 2.0,
+    );
+    let links = vm.editor_links();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].from.display, vm.editor.nodes[a].displays[0].id);
+    assert_eq!(links[0].to.display, vm.editor.nodes[b].displays[0].id);
+    assert!((links[0].from.start - 540.0).abs() < 1e-6);
+    assert!(links[0].to.start.abs() < 1e-6);
+    let relative = lws_gui::map::Pt::new(
+        (vm.editor.placement[b].x - origin.x) / vm.editor.scale,
+        (vm.editor.placement[b].y - origin.y) / vm.editor.scale,
+    );
+    let mut restored = saving_view();
+    restored.apply(event(Msg::TopologyDoc(concrete_doc(two_node_doc(8), &links))));
+    let ra = restored.editor.placement[a];
+    let rb = restored.editor.placement[b];
+    assert!(((rb.x - ra.x) / restored.editor.scale - relative.x).abs() < 1e-6);
+    assert!(((rb.y - ra.y) / restored.editor.scale - relative.y).abs() < 1e-6);
+    assert_eq!(restored.editor_links(), links);
+    assert!(!restored.map_model().links[0].whole_desktop);
+}
+
+#[test]
+fn disconnected_nonoverlapping_drop_is_accepted_without_relinking() {
+    let mut vm = saving_view();
+    vm.apply(event(Msg::TopologyDoc(linked_doc(8))));
+    let peer = index_of(&vm, PEER_NODE);
+    vm.editor.placement[peer] = lws_gui::map::Pt::new(800.0, 400.0);
+    let dropped = vm.editor.placement.clone();
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert_eq!(vm.editor.placement, dropped);
+    let (_, request) = take_save(&mut vm);
+    let topology: config::TopologyConfig =
+        toml::from_str(std::str::from_utf8(&request.layout_toml).expect("UTF-8")).expect("document");
+    assert!(topology.links.is_empty());
+}
+
+#[test]
+fn multiple_display_contacts_are_saved_individually() {
+    let mut doc = two_node_doc(8);
+    for member in &mut doc.members {
+        let mut second = member.displays[0].clone();
+        second.id.push_str("-lower");
+        second.logical_y = second.logical_h;
+        member.displays.push(second);
+    }
+    let mut vm = saving_view();
+    vm.apply(event(Msg::TopologyDoc(doc.clone())));
+    let a = index_of(&vm, SELF_NODE);
+    let b = index_of(&vm, PEER_NODE);
+    vm.editor.placement[b] = lws_gui::map::Pt::new(
+        vm.editor.placement[a].x + vm.editor.shapes[a].w,
+        vm.editor.placement[a].y,
+    );
+    let links = vm.editor_links();
+    assert_eq!(links.len(), 3, "each touching display pair keeps its own overlap");
+    assert!(links.iter().any(|l| l.from.display.ends_with("-lower")));
+    assert!(links.iter().any(|l| l.to.display.ends_with("-lower")));
+    assert_eq!(vm.map_model().links.len(), links.len());
+    doc.revision = 9;
+    let mut restored = saving_view();
+    restored.apply(event(Msg::TopologyDoc(concrete_doc(doc, &links))));
+    assert_eq!(restored.editor_links(), links);
+    assert_eq!(restored.map_model().links.len(), 3);
+}
+
+#[test]
+fn missing_concrete_display_is_drawn_inactive_not_as_auto() {
+    let mut vm = saving_view();
+    move_to_side(&mut vm, Side::Right);
+    let links = vm.editor_links();
+    let mut doc = concrete_doc(two_node_doc(8), &links);
+    doc.members[1].displays[0].id = "replacement".to_owned();
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    let model = vm.map_model();
+    assert_eq!(model.links.len(), 1);
+    assert_eq!(model.links[0].state, LinkState::Inactive);
+    assert!(!model.links[0].whole_desktop);
+    assert_eq!(vm.editor_links(), links);
+}
+
+#[test]
+fn moving_an_auto_pair_on_the_same_side_replaces_it_with_exact_segments() {
+    let mut vm = saving_view();
+    vm.apply(event(Msg::TopologyDoc(linked_doc(8))));
+    let a = index_of(&vm, SELF_NODE);
+    let b = index_of(&vm, PEER_NODE);
+    vm.editor.placement[b] = lws_gui::map::Pt::new(
+        vm.editor.placement[a].x + vm.editor.shapes[a].w,
+        vm.editor.placement[a].y + 12.5,
+    );
+    let links = vm.editor_links();
+    assert_eq!(links.len(), 1);
+    assert!(!links[0].from.is_auto());
+    assert!((links[0].from.start - 12.5 / vm.editor.scale).abs() < 1e-6);
+    vm.editor.placement[b].y += 7.25;
+    let changed = vm.editor_links();
+    assert!((changed[0].from.start - 19.75 / vm.editor.scale).abs() < 1e-6);
+    assert_ne!(links, changed);
+}
+
+#[test]
+fn a_drop_in_empty_desktop_bounding_space_is_not_an_overlap() {
+    let mut doc = two_node_doc(8);
+    let mut second = doc.members[0].displays[0].clone();
+    second.id.push_str("-far");
+    second.logical_x = 5000.0;
+    doc.members[0].displays.push(second);
+    let mut vm = saving_view();
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    let a = index_of(&vm, SELF_NODE);
+    let b = index_of(&vm, PEER_NODE);
+    vm.editor.placement[b] = lws_gui::map::Pt::new(
+        vm.editor.placement[a].x + 2500.0 * vm.editor.scale,
+        vm.editor.placement[a].y,
+    );
+    let dropped = vm.editor.placement.clone();
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    assert_eq!(vm.editor.placement, dropped);
+    assert!(!vm.editor.dirty());
+    assert!(vm.take_outgoing().is_empty(), "no link edits need a CAS");
+}
+
+#[test]
+fn disconnected_placement_survives_refresh_and_the_cas_acknowledgement() {
+    let mut vm = saving_view();
+    let b = index_of(&vm, PEER_NODE);
+    vm.editor.placement[b] = lws_gui::map::Pt::new(800.0, 400.0);
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    let free = vm.editor.placement.clone();
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    assert_eq!(vm.editor.placement, free);
+    assert!(vm.take_outgoing().is_empty());
+
+    vm.apply(event(Msg::TopologyDoc(linked_doc(8))));
+    vm.editor.placement[b] = lws_gui::map::Pt::new(800.0, 400.0);
+    vm.local(&Action::DropNode(PEER_NODE.to_owned()));
+    let accepted = vm.editor.placement.clone();
+    let (id, _) = take_save(&mut vm);
+    verdict(&mut vm, id, None);
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(9))));
+    assert_eq!(vm.editor.placement, accepted);
+    assert_eq!(vm.editor.baseline, accepted);
+    assert!(!vm.editor.dirty());
+    assert!(vm.map_model().links.is_empty());
 }
