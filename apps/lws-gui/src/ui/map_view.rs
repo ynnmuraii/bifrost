@@ -966,20 +966,26 @@ mod transform_tests {
                     .collect(),
             })
             .collect();
-        let links = map::links(&arrangement.shapes, &arrangement.pos)
-            .into_iter()
-            .map(|l| MapLink {
-                a: l.a,
-                b: l.b,
-                from: l.from,
-                to: l.to,
-                dir: l.dir,
-                span: l.span,
-                state: LinkState::Active,
-                whole_desktop: true,
-                forward: false,
-            })
-            .collect();
+        // The document's legacy whole-desktop pair: the laptop is on the left of the desktop and
+        // the two face each other across `GAP`. `map::links` finds touching display edges only —
+        // a legacy pair parked a `GAP` apart has none — so the fixture states the link the
+        // document holds, the way `view_model::layout::map_model` builds it: both edges, whole
+        // desktop, spanning the overlap.
+        let (pc, laptop) = (&arrangement.shapes[0], &arrangement.shapes[1]);
+        let (pc_at, laptop_at) = (arrangement.pos[0], arrangement.pos[1]);
+        let top = pc_at.y.max(laptop_at.y);
+        let bottom = (pc_at.y + pc.h).min(laptop_at.y + laptop.h);
+        let links = vec![MapLink {
+            a: 1,
+            b: 0,
+            from: map::Pt::new(laptop_at.x + laptop.w, (top + bottom) / 2.0),
+            to: map::Pt::new(pc_at.x, (top + bottom) / 2.0),
+            dir: Dir::Horizontal,
+            span: (top, bottom),
+            state: LinkState::Active,
+            whole_desktop: true,
+            forward: false,
+        }];
         MapModel {
             nodes,
             links,
