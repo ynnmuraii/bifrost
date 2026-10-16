@@ -71,7 +71,7 @@ impl Bridge {
         forward: bool,
         horizontal: bool,
         zoom: f32,
-        band_height: f32,
+        band_heights: (f32, f32),
         color: Color32,
     ) {
         let size = (9.0 * zoom).clamp(9.0, 12.0);
@@ -108,7 +108,7 @@ impl Bridge {
         let (start, delta, _) = geometry(a, b, size, horizontal);
         let step = size * 0.52;
         let columns = (delta.length() / step).floor().max(1.0) as usize;
-        let height = band_height.max(size * 7.0);
+        let height = band_heights.0.max(band_heights.1).max(1.0);
         let rows = (height / (size * 0.72)).ceil() as usize | 1;
         let across = if horizontal { Vec2::Y } else { Vec2::X };
         let phase = (self.clock * 7.0) as usize;
@@ -118,7 +118,7 @@ impl Bridge {
             let u = (column as f32 + 0.5) / columns as f32;
             let v = (row as f32 + 0.5) / rows as f32 * 2.0 - 1.0;
             let middle = (std::f32::consts::PI * u).sin();
-            let envelope = 0.42 + 0.58 * middle;
+            let envelope = 1.0;
             let flow_column = if forward { columns - column } else { column };
             let seed =
                 (flow_column + phase).wrapping_mul(73_856_093) ^ row.wrapping_mul(19_349_663);
@@ -134,7 +134,9 @@ impl Bridge {
             };
             let galley = &self.glyphs.iter().find(|(c, _)| *c == ch)?.1;
             let jitter = ((seed / 401 % 100) as f32 / 100.0 - 0.5) * step * 0.32;
-            let at = start + delta * u + across * (v * height * 0.5 + jitter) - galley.size() / 2.0;
+            let local_height = band_heights.0 + (band_heights.1 - band_heights.0) * u;
+            let at = start + delta * u + across * (v * local_height * 0.5 + jitter)
+                - galley.size() / 2.0;
             let shimmer = 0.95 + 0.05 * (self.clock * 3.0 + flow_column as f32 * 0.6).sin();
             let alpha = (0.30 + density * 0.40) * (0.65 + middle * 0.35);
             Some(
@@ -192,7 +194,7 @@ mod tests {
                     true,
                     true,
                     1.0,
-                    100.0,
+                    (100.0, 100.0),
                     Color32::WHITE,
                 );
             })
@@ -286,7 +288,7 @@ mod tests {
                     true,
                     true,
                     1.0,
-                    120.0,
+                    (120.0, 120.0),
                     Color32::WHITE,
                 );
                 bridge.paint_latency(

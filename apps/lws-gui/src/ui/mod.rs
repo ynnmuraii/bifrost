@@ -83,6 +83,24 @@ struct Drag {
     grab: Pos2,
 }
 
+/// Which part of a linked edge the pointer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaddleHandle {
+    Move,
+    Start,
+    End,
+}
+
+/// A paddle drag is independent of a computer drag.
+#[derive(Debug, Clone)]
+pub struct PaddleDrag {
+    pub link_id: String,
+    pub from: bool,
+    pub span: (f64, f64),
+    pub grab: Pos2,
+    pub handle: PaddleHandle,
+}
+
 /// The state of the drawing, as opposed to the state of the window: the field, the drag in
 /// progress and the cached palette.
 pub struct UiState {
@@ -91,6 +109,8 @@ pub struct UiState {
     pub field: Field,
     bridge: bridge::Bridge,
     drag: Option<Drag>,
+    pub paddle_drag: Option<PaddleDrag>,
+    paddle_reveals: std::collections::HashMap<String, f32>,
     hover: Option<(usize, usize)>,
     applied: Option<Theme>,
     modal_open: Option<(Modal, f32)>,
@@ -105,11 +125,18 @@ impl UiState {
             field: Field::new(),
             bridge: bridge::Bridge::default(),
             drag: None,
+            paddle_drag: None,
+            paddle_reveals: std::collections::HashMap::new(),
             hover: None,
             applied: None,
             modal_open: None,
             confirm_clear_history: false,
         }
+    }
+
+    /// Reveal a junction after an explicit interaction; idle maps have no visible paddles.
+    pub fn reveal_paddles(&mut self, link_id: &str, now: Instant) {
+        self.paddle_reveals.insert(link_id.to_owned(), self.t(now));
     }
 
     fn t(&self, now: Instant) -> f32 {
