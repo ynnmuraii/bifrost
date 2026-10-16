@@ -632,14 +632,14 @@ fn node_ui(
                 offset: [0, 30],
                 blur: 80,
                 spread: 0,
-                color: shadow_color(pal, 0.16),
+                color: pal.shadow_drag,
             }
         } else {
             egui::epaint::Shadow {
                 offset: [0, 10],
                 blur: 30,
                 spread: 0,
-                color: shadow_color(pal, 0.07),
+                color: pal.shadow,
             }
         };
         let radius = pal.rad_sm();
@@ -722,14 +722,6 @@ fn node_ui(
         let h = galley.size().y;
         painter.galley(Pos2::new(at.x, y), galley, color);
         y += h + 1.0;
-    }
-}
-
-fn shadow_color(pal: &Palette, a: f32) -> Color32 {
-    if pal.theme == crate::gui_settings::Theme::Dark {
-        rgba(0, 0, 0, (a * 4.0).min(0.65))
-    } else {
-        rgba(15, 23, 42, a)
     }
 }
 

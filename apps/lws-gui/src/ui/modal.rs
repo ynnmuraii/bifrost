@@ -17,7 +17,6 @@ use eframe::egui::{
 use super::theme::{fam, font, Palette};
 use super::widgets::{self, Icon, Kind};
 use super::{act, UiState};
-use crate::gui_settings::Theme;
 use crate::view_model::{Action, Modal, ViewModel};
 use ui_text::{ago, ago_next_change_in, clipboard_size, fill, fill_named, text, Key, Lang};
 
@@ -98,11 +97,7 @@ pub fn draw(
             offset: [0, 30],
             blur: 80,
             spread: 0,
-            color: if pal.theme == Theme::Dark {
-                super::theme::rgba(0, 0, 0, 0.65)
-            } else {
-                super::theme::rgba(15, 23, 42, 0.16)
-            },
+            color: pal.shadow_dialog,
         }
         .as_shape(rect, pal.rad()),
     );
@@ -1042,6 +1037,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui_settings::Theme;
 
     #[test]
     fn rows_keep_bottom_padding_after_short_and_tall_content() {
