@@ -403,7 +403,7 @@ async fn run_async(
     peers.sort();
     peers.dedup();
 
-    let local_hello = routing::hello(
+    let mut local_hello = routing::hello(
         node_id,
         config.node.display_name.as_str(),
         config.node.can_own
@@ -418,6 +418,8 @@ async fn run_async(
             displays_revision: 0,
         },
     );
+    local_hello.system_name =
+        protocol::sanitize_system_name(&platform_probe::system_name::detect());
     let session_hello = local_hello.clone();
     // The pairing window is served by this node's own link listener, distinguished by ALPN
     // (`docs/05-protocol.md`: `pair/1` on 47901). The gate is the one switch the transport

@@ -124,12 +124,14 @@ pub fn two_node_doc(revision: u64) -> ipc::TopologyDoc {
             ipc::MemberTopology {
                 node_id: SELF_NODE.to_owned(),
                 display_name: "Workstation".to_owned(),
+                system_name: String::new(),
                 online: true,
                 displays: vec![display("\\\\.\\DISPLAY1", 0.0, 0.0, 1920.0, 1080.0, true)],
             },
             ipc::MemberTopology {
                 node_id: PEER_NODE.to_owned(),
                 display_name: "linux-box".to_owned(),
+                system_name: String::new(),
                 online: true,
                 displays: vec![display("eDP-1", 0.0, 0.0, 1600.0, 900.0, false)],
             },
@@ -142,6 +144,8 @@ pub fn two_node_doc(revision: u64) -> ipc::TopologyDoc {
 fn display(id: &str, x: f64, y: f64, w: f64, h: f64, primary: bool) -> ipc::DisplayView {
     ipc::DisplayView {
         id: id.to_owned(),
+        native_width: w as u32,
+        native_height: h as u32,
         logical_x: x,
         logical_y: y,
         logical_w: w,

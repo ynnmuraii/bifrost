@@ -277,6 +277,7 @@ impl Session {
             .nodes
             .iter()
             .map(|node| ipc::MemberTopology {
+                system_name: String::new(),
                 node_id: hex(&node.node_id),
                 display_name: if node_id_of(&node.node_id) == Some(self.node_id) {
                     self.display_name.clone()
@@ -292,6 +293,21 @@ impl Session {
             })
             .collect();
         append_missing_members(&mut members, &self.trust, &self.peer_displays, &online);
+        for member in &mut members {
+            member.system_name = config::topology::node_id_from_hex(&member.node_id)
+                .map(NodeId::new)
+                .map(|node| {
+                    if node == self.node_id {
+                        self.local_hello.system_name.clone()
+                    } else {
+                        self.peer_system_names
+                            .get(&node)
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                })
+                .unwrap_or_default();
+        }
         ipc::TopologyDoc {
             revision: applied.revision,
             author_node_id: applied
@@ -1277,6 +1293,14 @@ fn display_view(display: &protocol::wire::Display) -> ipc::DisplayView {
         rotation_degrees: display.rotation_degrees,
         primary: display.primary,
         native_known: display.native_known,
+        native_width: display
+            .native_bounds
+            .filter(|_| display.native_known)
+            .map_or(0, |bounds| bounds.width.max(0.0) as u32),
+        native_height: display
+            .native_bounds
+            .filter(|_| display.native_known)
+            .map_or(0, |bounds| bounds.height.max(0.0) as u32),
         // `scale_x` is «positive finite logical -> native scale»; a zero would divide by zero in
         // the editor, so an unknown scale is 1.
         scale: if display.scale_x > 0.0 {
@@ -1394,6 +1418,7 @@ fn append_missing_members(
             continue;
         }
         members.push(ipc::MemberTopology {
+            system_name: String::new(),
             node_id,
             display_name: record.display_name.clone(),
             displays: displays

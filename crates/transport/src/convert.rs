@@ -874,6 +874,8 @@ pub struct PeerInfo {
     pub node_id: NodeId,
     /// `Hello.display_name` (non-authoritative).
     pub display_name: String,
+    /// Sanitized optional OS name/version.
+    pub system_name: String,
     /// `Hello.can_own`.
     pub can_own: bool,
     /// `Hello.owner_serial`.
@@ -909,6 +911,7 @@ impl PeerInfo {
         Ok(Self {
             node_id: NodeId::new(node_id),
             display_name: hello.display_name.clone(),
+            system_name: protocol::sanitize_system_name(&hello.system_name),
             can_own: hello.can_own,
             owner_serial: hello.owner_serial,
             owner: if hello.owner_node_id.is_empty() {

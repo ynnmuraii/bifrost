@@ -413,6 +413,7 @@ message MemberTopology {
   string display_name = 2;
   bool online = 3;                   // advisory, as NodeDisplays.online
   repeated DisplayView displays = 4;
+  string system_name = 5;                  // last known OS name/version, optional
 }
 message DisplayView {
   string id = 1;                     // stable display id
@@ -421,6 +422,8 @@ message DisplayView {
   bool primary = 7;
   bool native_known = 8;             // false on Wayland portals
   double scale = 9;                  // native/logical when known; GUI only
+  uint32 native_width = 10;                // current mode pixels; zero means unknown
+  uint32 native_height = 11;
 }
 message LinkView {
   string id = 1;

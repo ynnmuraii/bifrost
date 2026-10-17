@@ -902,11 +902,29 @@ impl ViewModel {
                 });
             }
             let os = if this == Some(i) {
+                let backend = if node.system_name.is_empty() {
+                    backend.clone()
+                } else {
+                    node.system_name.clone()
+                };
                 if backend == text(lang, Key::Unknown) {
                     text(lang, Key::ThisComputer).to_owned()
                 } else {
                     fill_named(lang, Key::ThisComputerBackend, &[("backend", &backend)])
                 }
+            } else if !node.system_name.is_empty() {
+                format!(
+                    "{} · {}",
+                    text(
+                        lang,
+                        if node.online {
+                            Key::Online
+                        } else {
+                            Key::Offline2
+                        }
+                    ),
+                    node.system_name
+                )
             } else {
                 String::new()
             };
@@ -914,6 +932,9 @@ impl ViewModel {
                 text(lang, Key::TheDisplaysHaveNotArrivedYet).to_owned()
             } else if is_target {
                 text(lang, Key::InputHere2).to_owned()
+            } else if !node.system_name.is_empty() && this != Some(i) {
+                // «в сети»/«офлайн» is already on the OS line of this card.
+                String::new()
             } else if !node.online {
                 text(lang, Key::Offline2).to_owned()
             } else {
@@ -1113,13 +1134,37 @@ impl ViewModel {
 
 /// «1920×1080», «≈ 3840×2160», and «· 90°» for a rotated display.
 fn resolution(display: &EditorDisplay) -> String {
-    let approx = if display.native_known { "" } else { "≈ " };
+    let known = display.native_known;
+    let (width, height) = if known {
+        (
+            if display.native_w > 0.0 {
+                display.native_w
+            } else {
+                display.w * display.scale
+            },
+            if display.native_h > 0.0 {
+                display.native_h
+            } else {
+                display.h * display.scale
+            },
+        )
+    } else {
+        (display.w, display.h)
+    };
+    let scale = if known && (display.scale - 1.0).abs() > 0.005 {
+        format!(" · {:.0}%", display.scale * 100.0)
+    } else {
+        String::new()
+    };
     let rotation = if display.rotation == 0 {
         String::new()
     } else {
         format!(" · {}°", display.rotation)
     };
-    format!("{approx}{:.0}×{:.0}{rotation}", display.w, display.h)
+    format!(
+        "{}{width:.0}×{height:.0}{scale}{rotation}",
+        if known { "" } else { "≈ " }
+    )
 }
 
 fn same_links(a: &[config::LinkConfig], b: &[config::LinkConfig]) -> bool {
@@ -1239,6 +1284,7 @@ mod tests {
             .map(|id| EditorNode {
                 node_id: id,
                 display_name: String::new(),
+                system_name: String::new(),
                 online: true,
                 displays: vec![EditorDisplay {
                     id: "stable-display".into(),
@@ -1248,6 +1294,9 @@ mod tests {
                     h: 1080.0,
                     primary: true,
                     native_known: true,
+                    native_w: 1920.0,
+                    native_h: 1080.0,
+                    scale: 1.0,
                     rotation: 0,
                 }],
             })
@@ -1375,5 +1424,44 @@ mod tests {
         let clamped = vm.map_model().links.remove(0);
         assert!(clamped.b_span.0 >= clamped.span.0);
         assert!(clamped.b_span.1 <= clamped.span.1);
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn native_mode_and_scale_are_labels_not_layout_geometry() {
+        let mut display = EditorDisplay {
+            id: "eDP-1".into(),
+            x: 0.0,
+            y: 0.0,
+            w: 2560.0 / 1.5,
+            h: 1600.0 / 1.5,
+            primary: true,
+            native_known: true,
+            native_w: 2560.0,
+            native_h: 1600.0,
+            scale: 1.5,
+            rotation: 0,
+        };
+        assert_eq!(resolution(&display), "2560×1600 · 150%");
+        assert_eq!(display.w, 2560.0 / 1.5);
+        display.native_known = false;
+        assert_eq!(resolution(&display), "≈ 1707×1067");
+
+        // A peer of a version without the native fields: the scale still reconstructs them.
+        display.native_known = true;
+        display.native_w = 0.0;
+        display.native_h = 0.0;
+        assert_eq!(resolution(&display), "2560×1600 · 150%");
+
+        // 100 % carries no note, and a rotated monitor keeps its degree suffix.
+        display.scale = 1.0;
+        display.native_w = 1920.0;
+        display.native_h = 1200.0;
+        assert_eq!(resolution(&display), "1920×1200");
+        display.rotation = 90;
+        assert_eq!(resolution(&display), "1920×1200 · 90°");
     }
 }

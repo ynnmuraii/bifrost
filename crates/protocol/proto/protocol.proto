@@ -141,6 +141,7 @@ message Hello {
   bool can_own = 11;                       // this node may claim ownership
   uint64 topology_revision = 12;           // applied layout revision
   bytes topology_author = 13;              // author node_id of the applied revision
+  string system_name = 14;                 // optional short OS name/version, non-authoritative
 }
 
 // Replaces only the sender's advertised capability set, not its identity or Hello.

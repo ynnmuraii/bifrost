@@ -1207,6 +1207,7 @@ mod transform_tests {
             .map(|id| EditorNode {
                 node_id: id,
                 display_name: String::new(),
+                system_name: String::new(),
                 online: true,
                 displays: vec![EditorDisplay {
                     id: "screen".into(),
@@ -1216,6 +1217,9 @@ mod transform_tests {
                     h: 1080.0,
                     primary: true,
                     native_known: true,
+                    native_w: 1920.0,
+                    native_h: 1080.0,
+                    scale: 1.0,
                     rotation: 0,
                 }],
             })
@@ -1578,6 +1582,7 @@ mod transform_tests {
         vm.editor.nodes = vec![EditorNode {
             node_id: "01".repeat(32),
             display_name: "notebook".to_owned(),
+            system_name: String::new(),
             online: true,
             displays: vec![EditorDisplay {
                 id: "zone-0".to_owned(),
@@ -1587,6 +1592,9 @@ mod transform_tests {
                 h: 1091.0,
                 primary: true,
                 native_known: false,
+                native_w: 0.0,
+                native_h: 0.0,
+                scale: 1.0,
                 rotation: 0,
             }],
         }];
