@@ -910,7 +910,9 @@ impl ViewModel {
             } else {
                 String::new()
             };
-            let focus = if is_target {
+            let focus = if node.displays.is_empty() {
+                text(lang, Key::TheDisplaysHaveNotArrivedYet).to_owned()
+            } else if is_target {
                 text(lang, Key::InputHere2).to_owned()
             } else if !node.online {
                 text(lang, Key::Offline2).to_owned()

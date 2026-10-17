@@ -40,9 +40,8 @@ pub struct RawDisplay {
 }
 
 impl RawDisplay {
-    /// A display with no physical bounds (the portal case): the Wayland backend is the
-    /// only production caller, so it is dead code on the other platforms.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// A test display whose physical bounds are not known.
+    #[cfg(test)]
     pub fn without_native(id: impl Into<String>, logical: [f64; 4], primary: bool) -> Self {
         RawDisplay {
             id: id.into(),

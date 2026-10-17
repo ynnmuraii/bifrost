@@ -328,6 +328,7 @@ pub struct Session {
     ping_nonce: u64,
     node_id: NodeId,
     local_hello: protocol::wire::Hello,
+    configured_can_own: bool,
     peer_displays: BTreeMap<NodeId, (u64, Vec<protocol::wire::Display>)>,
     backend: String,
     trust: identity::TrustStore,
@@ -520,6 +521,7 @@ impl Session {
         ctl: ctl::Server,
         node_id: NodeId,
         local_hello: protocol::wire::Hello,
+        configured_can_own: bool,
         backend: String,
         trust: identity::TrustStore,
         layout: config::TopologyConfig,
@@ -602,6 +604,7 @@ impl Session {
             pending_edge_guard: None,
             agent_displays: Vec::new(),
             agent_displays_known: false,
+            configured_can_own,
             local_hello,
             peer_displays: BTreeMap::new(),
             local_pointer: None,
@@ -1361,6 +1364,11 @@ impl Session {
         }
     }
     async fn query_agent_displays(&mut self) -> bool {
+        // GUI GetTopology can arrive while a portal is still opening. AgentReady
+        // always queries again; sending now only produces STARTUP_ONLY, not geometry.
+        if self.agent.state() != crate::command::AgentState::Ready {
+            return true;
+        }
         let frame = Msg::QueryDisplays(protocol::ipc::QueryDisplays {});
         match self.agent.send(frame).await {
             Ok(()) => true,
@@ -2470,6 +2478,10 @@ impl Session {
                     self.on_layout(peer, message).await;
                 }
                 transport::convert::Inbound::CapabilitiesChanged(capabilities) => {
+                    self.router.set_peer_capabilities(
+                        peer,
+                        transport::convert::capabilities_from_wire(&capabilities),
+                    );
                     let text_clipboard =
                         capabilities.contains(&(protocol::wire::Capability::TextClipboard as i32));
                     tracing::info!(peer = %peer, text_clipboard, "peer capabilities updated");
@@ -2550,17 +2562,15 @@ impl Session {
     /// none at all. Publish the answer on live links too: a fast peer can complete its
     /// handshake before this adapter has finished opening its portal or clipboard.
     async fn adopt_agent_capabilities(&mut self, capabilities: &[String]) {
-        let has_clipboard = capabilities.iter().any(|name| name == "TEXT_CLIPBOARD");
-        if has_clipboard == self.capabilities.text_clipboard {
-            return;
-        }
-        tracing::info!(
-            capability = "TEXT_CLIPBOARD",
-            available = has_clipboard,
-            "the agent's adapter decides the clipboard capability"
-        );
-        self.capabilities.text_clipboard = has_clipboard;
-        routing::set_clipboard_bit(&mut self.local_hello.capabilities, has_clipboard);
+        routing::adopt_capabilities(&mut self.capabilities, capabilities);
+        self.router.set_capabilities(fr::Capabilities {
+            capture: self.capabilities.capture,
+            inject: self.capabilities.inject,
+            absolute_pointer: self.capabilities.absolute_pointer,
+            emergency_hotkey: self.capabilities.emergency_hotkey,
+        });
+        self.local_hello.can_own = self.configured_can_own && self.router.can_be_source();
+        self.local_hello.capabilities = routing::capability_bits(self.capabilities);
         self.manager
             .update_local_hello(self.local_hello.clone())
             .await;
@@ -3103,7 +3113,11 @@ impl Session {
     /// is also why the FSM ignores the `CaptureReady` that answers it
     /// (`routing::agent_signal`: an empty lease id is not a transition).
     async fn arm_observation(&mut self) {
-        if !self.router.is_owner() || self.router.focus() != fr::FocusState::Local {
+        if self.agent.state() != crate::command::AgentState::Ready
+            || !self.router.can_be_source()
+            || !self.router.is_owner()
+            || self.router.focus() != fr::FocusState::Local
+        {
             // Somewhere else the observation is not ours to hold: a transition replaces
             // the capture, and losing ownership takes the local pointer away. Forgetting
             // it here is what makes the next return to `Local` (or regaining ownership)

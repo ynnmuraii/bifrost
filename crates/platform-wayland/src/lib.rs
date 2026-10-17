@@ -78,6 +78,9 @@ pub mod clipboard;
 mod data_control;
 
 #[cfg(target_os = "linux")]
+pub mod displays;
+
+#[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
 mod compositor;

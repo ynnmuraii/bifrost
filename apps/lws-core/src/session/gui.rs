@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use focus_router as fr;
+use geometry::NodeId;
 use protocol::ipc::{self as ipc, gui_frame::Msg};
 use tokio::sync::{mpsc, oneshot};
 
@@ -290,26 +291,7 @@ impl Session {
                     .is_some_and(|node| node == self.node_id || online.contains(&node)),
             })
             .collect();
-        // A peer the user paired with is on the map whether or not its link is up: a computer
-        // that stopped answering is shown offline with the screens it last reported, instead of
-        // disappearing until it comes back. Only a revoke removes it (then it is not trusted).
-        for record in self.trust.peers.iter().filter(|record| record.is_active()) {
-            let node_id = crate::command::node_id_hex(&record.node_id);
-            if members.iter().any(|member| member.node_id == node_id) {
-                continue;
-            }
-            let last_known = self
-                .peer_displays
-                .get(&record.node_id)
-                .map(|(_, displays)| displays.as_slice())
-                .unwrap_or_default();
-            members.push(ipc::MemberTopology {
-                node_id,
-                display_name: record.display_name.clone(),
-                displays: last_known.iter().map(display_view).collect(),
-                online: false,
-            });
-        }
+        append_missing_members(&mut members, &self.trust, &self.peer_displays, &online);
         ipc::TopologyDoc {
             revision: applied.revision,
             author_node_id: applied
@@ -1395,5 +1377,61 @@ mod opener_tests {
             within::<u8, String>(Duration::from_secs(1), async { Ok(7) }).await,
             Ok(7)
         );
+    }
+}
+
+/// Stored layout membership is not transport membership: newly paired peers may
+/// have no displays and therefore no node in the stored layout yet.
+fn append_missing_members(
+    members: &mut Vec<ipc::MemberTopology>,
+    trust: &identity::TrustStore,
+    displays: &std::collections::BTreeMap<NodeId, (u64, Vec<protocol::wire::Display>)>,
+    online: &[NodeId],
+) {
+    for record in trust.peers.iter().filter(|record| record.is_active()) {
+        let node_id = crate::command::node_id_hex(&record.node_id);
+        if members.iter().any(|member| member.node_id == node_id) {
+            continue;
+        }
+        members.push(ipc::MemberTopology {
+            node_id,
+            display_name: record.display_name.clone(),
+            displays: displays
+                .get(&record.node_id)
+                .map(|(_, displays)| displays.iter().map(display_view).collect())
+                .unwrap_or_default(),
+            online: online.contains(&record.node_id),
+        });
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_unlisted_peer_is_online_without_displays_in_either_direction() {
+        for (local, peer) in [
+            (NodeId::from([1; 32]), NodeId::from([2; 32])),
+            (NodeId::from([2; 32]), NodeId::from([1; 32])),
+        ] {
+            let trust = identity::TrustStore {
+                peers: vec![identity::TrustedPeer::paired(peer, "peer", None, 0)],
+            };
+            let mut members = vec![ipc::MemberTopology {
+                node_id: crate::command::node_id_hex(&local),
+                online: true,
+                ..Default::default()
+            }];
+            append_missing_members(&mut members, &trust, &Default::default(), &[peer]);
+            assert_eq!(members.len(), 2);
+            assert!(members[1].online);
+            assert!(members[1].displays.is_empty());
+            append_missing_members(&mut members, &trust, &Default::default(), &[peer]);
+            assert_eq!(members.len(), 2);
+            members.pop();
+            append_missing_members(&mut members, &trust, &Default::default(), &[]);
+            assert!(!members[1].online);
+        }
     }
 }

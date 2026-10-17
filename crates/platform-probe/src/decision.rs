@@ -9,8 +9,8 @@ use crate::env::{EnvSnapshot, HostOs, PortalVersions};
 
 /// Minimum `org.freedesktop.portal.RemoteDesktop` version for `ConnectToEIS`.
 pub const MIN_REMOTE_DESKTOP_VERSION: u32 = 2;
-/// Minimum `org.freedesktop.portal.InputCapture` version for `ConnectToEIS`/`GetZones`.
-pub const MIN_INPUT_CAPTURE_VERSION: u32 = 1;
+/// Minimum `org.freedesktop.portal.InputCapture` version for persistent capture.
+pub const MIN_INPUT_CAPTURE_VERSION: u32 = 2;
 /// The portal frontend version that first shipped `InputCapture` (XDP 1.17.0).
 pub const MIN_XDP_VERSION: &str = "1.17.0";
 
@@ -341,7 +341,7 @@ impl SessionInfo {
     fn wayland(compositor: Compositor, portals: PortalVersions, xwayland: bool) -> Self {
         let global_shortcuts = portals.global_shortcuts >= 1;
         let remote_desktop_v2 = portals.remote_desktop >= MIN_REMOTE_DESKTOP_VERSION;
-        let input_capture_v2 = portals.input_capture >= 2;
+        let input_capture_v2 = portals.input_capture >= MIN_INPUT_CAPTURE_VERSION;
         Self {
             session_kind: SessionKind::Wayland,
             backend: Backend::Wayland {
@@ -351,7 +351,7 @@ impl SessionInfo {
             portals,
             xwayland,
             capabilities: Capabilities {
-                capture: true,
+                capture: input_capture_v2,
                 inject: true,
                 // Provisional: the version gate is real, the region is the KVM-016 gate.
                 absolute_pointer: remote_desktop_v2,
@@ -619,14 +619,6 @@ pub fn decide(
             }
 
             let portals = snapshot.portals;
-            if portals.input_capture < MIN_INPUT_CAPTURE_VERSION {
-                return Err(UnsupportedSession::new(format!(
-                    "{} version {} is too old: need >= {MIN_INPUT_CAPTURE_VERSION} \
-                     (xdg-desktop-portal >= {MIN_XDP_VERSION})",
-                    PortalVersions::INPUT_CAPTURE,
-                    portals.input_capture,
-                )));
-            }
             if portals.remote_desktop < MIN_REMOTE_DESKTOP_VERSION {
                 return Err(UnsupportedSession::new(format!(
                     "{} version {} is too old: need >= {MIN_REMOTE_DESKTOP_VERSION} for \

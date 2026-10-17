@@ -406,7 +406,9 @@ async fn run_async(
     let local_hello = routing::hello(
         node_id,
         config.node.display_name.as_str(),
-        config.node.can_own,
+        config.node.can_own
+            && session.capabilities.capture
+            && (!config.input.require_emergency_hotkey || session.capabilities.emergency_hotkey),
         session.capabilities,
         session.session_kind,
         routing::Gossip {
@@ -556,6 +558,7 @@ async fn run_async(
         server,
         node_id,
         session_hello,
+        config.node.can_own,
         session.backend,
         trust,
         // The layout document and the pointer gain: what edge-triggered transitions

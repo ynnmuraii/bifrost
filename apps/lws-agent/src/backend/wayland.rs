@@ -26,9 +26,8 @@
 //!   «потерять» нажатие в Preparing» holds on Wayland too.
 //! * A `ZonesChanged` signal attempts to re-arm barriers. Enabled barriers are retained;
 //!   a refused re-arm is reported without recreating the session or opening a new dialog.
-//! * `ZonesChanged` is *not* turned into `DisplaysChanged`: display enumeration is
-//!   KVM-040 and `QueryDisplays` is answered with an explicit refusal by the session
-//!   loop.
+//! * Display enumeration prefers capture zones and falls back to xdg-output logical
+//!   geometry independently of portal input permissions.
 //! * With absolute EIS regions, `EnterPrepare` positions are resolved by
 //!   `platform-wayland` and out-of-region points are refused. Relative-only servers use
 //!   the local logical-zone bounds to estimate cursor position; edge clamping is assumed,
@@ -660,37 +659,51 @@ impl Wayland {
         Ok(released)
     }
 
-    /// The portal zones as displays (KVM-040).
-    ///
-    /// `docs/03-architecture.md`, «Дисплеи и координаты»: «Порталы не отдают физическое
-    /// разрешение. Набор дисплеев строится по зонам (логические границы)», so the zones
-    /// are the display set and the native bounds stay unknown (`native_known = false`).
+    /// Capture zones are authoritative; xdg-output is the permission-free fallback.
+    /// Both provide logical compositor coordinates, never scaled pixel coordinates.
     pub async fn displays(&mut self) -> Vec<crate::displays::RawDisplay> {
-        let Some(capture) = self.capture.as_ref() else {
-            return Vec::new();
-        };
-        let zones = zones_of(capture);
-        if zones.is_empty() {
-            return Vec::new();
-        }
-        // The first zone is the one the pointer starts in; without a better signal it is
-        // reported as primary, which only decides where the node logical origin sits.
-        zones
-            .iter()
+        let zones = self
+            .capture
+            .as_ref()
+            .map(zones_of)
+            .unwrap_or_default()
+            .into_iter()
             .enumerate()
-            .map(|(index, zone)| {
-                crate::displays::RawDisplay::without_native(
-                    format!("zone-{index}"),
-                    [
-                        f64::from(zone.x),
-                        f64::from(zone.y),
-                        f64::from(zone.width),
-                        f64::from(zone.height),
-                    ],
-                    index == 0,
-                )
+            .map(|(index, zone)| platform_wayland::displays::Display {
+                id: format!("zone-{index}"),
+                name: String::new(),
+                logical: [zone.x, zone.y, zone.width, zone.height],
+                scale: 1,
             })
-            .collect()
+            .collect();
+        match tokio::task::spawn_blocking(move || {
+            platform_wayland::displays::discover(zones, platform_wayland::displays::enumerate)
+        })
+        .await
+        {
+            Ok(Ok((source, outputs))) => {
+                tracing::info!(source, displays = outputs.len(), geometry = ?outputs, "display discovery");
+                outputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, output)| crate::displays::RawDisplay {
+                        id: output.id,
+                        name: output.name,
+                        logical: output.logical.map(f64::from),
+                        native: None,
+                        scale: f64::from(output.scale),
+                        primary: index == 0,
+                    })
+                    .collect()
+            }
+            result => {
+                tracing::warn!(
+                    ?result,
+                    "displays not detected: capture zones and Wayland xdg-output unavailable"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// `PrepareInject` clears the relative estimate; positioning is deferred until the

@@ -291,6 +291,23 @@ impl<I: Identifiers> FocusRouter<I> {
         self.topology_revision = revision;
     }
 
+    /// Replaces probe estimates with the running adapter's actual capabilities.
+    pub fn set_capabilities(&mut self, capabilities: Capabilities) {
+        self.own_capabilities = capabilities;
+    }
+
+    /// Refreshes a live peer's adapter capabilities without changing membership.
+    pub fn set_peer_capabilities(&mut self, peer: NodeId, capabilities: Capabilities) {
+        if let Some(hello) = self
+            .peers
+            .get_mut(&peer)
+            .and_then(|entry| entry.hello.as_mut())
+        {
+            hello.capabilities = capabilities;
+            hello.can_own &= capabilities.capture;
+        }
+    }
+
     /// Startup: claim ownership when `claim_on_startup` is set.
     pub fn on_start(&mut self, now_ms: u64) -> Vec<Output> {
         let mut out = Vec::new();
