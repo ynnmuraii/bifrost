@@ -7,6 +7,8 @@
 - Paired computers absent from the stored layout now use established-link membership for online status instead of always appearing offline.
 - Core replaces probe estimates with actual agent capture/injection/emergency capabilities. Missing or older InputCapture portals remain receiver-only; Hello advertises source eligibility rather than configuration alone.
 - GUI display queries wait for agent readiness instead of generating a misleading startup `CaptureFailed`.
+- Computers advertise sanitized short OS names; the map keeps OS labels for offline peers.
+- Monitor labels show the native resolution of the current mode plus the scaling percentage (2560x1600 at 150%), while layout and input stay in logical coordinates. Wayland capture zones keep priority and take physical metadata from the matching wl_output/xdg-output output; Windows reports the physical pixels of each monitor with its DPI scale, X11 the RandR monitor rectangle at scale 1. The approximation sign is now left only where the physical size really is unknown.
 
 ## 0.1.1 — 2026-10-16
 

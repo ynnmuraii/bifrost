@@ -330,6 +330,7 @@ pub struct Session {
     local_hello: protocol::wire::Hello,
     configured_can_own: bool,
     peer_displays: BTreeMap<NodeId, (u64, Vec<protocol::wire::Display>)>,
+    peer_system_names: BTreeMap<NodeId, String>,
     backend: String,
     trust: identity::TrustStore,
     /// Persists the ownership pair across restarts (`config.toml`).
@@ -607,6 +608,7 @@ impl Session {
             configured_can_own,
             local_hello,
             peer_displays: BTreeMap::new(),
+            peer_system_names: BTreeMap::new(),
             local_pointer: None,
             remote_pointer: None,
             remote_seed_lease: None,
@@ -2327,6 +2329,11 @@ impl Session {
                 remote,
             } => {
                 self.layout_connections.insert(peer, connection_id);
+                // A peer string is untrusted: bound it before it is stored or forwarded.
+                let system_name = protocol::sanitize_system_name(&hello.system_name);
+                if !system_name.is_empty() {
+                    self.peer_system_names.insert(peer, system_name);
+                }
                 tracing::info!(
                     peer = %peer,
                     name = hello.display_name.as_str(),

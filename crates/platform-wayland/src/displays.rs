@@ -11,6 +11,9 @@ pub struct Display {
     pub name: String,
     pub logical: [i32; 4],
     pub scale: i32,
+    /// Current mode before compositor transform, in pixels.
+    pub native: Option<[i32; 2]>,
+    pub rotated: bool,
 }
 
 /// Selects one coordinate source, never combines incompatible snapshots.
@@ -21,7 +24,8 @@ pub fn discover(
 ) -> Result<(&'static str, Vec<Display>), String> {
     let zones = merge_mirrors(zones);
     if !zones.is_empty() {
-        return Ok(("input-capture-zones", zones));
+        let outputs = fallback().unwrap_or_default();
+        return Ok(("input-capture-zones", enrich(zones, &outputs)));
     }
     let outputs = merge_mirrors(fallback()?);
     if outputs.is_empty() {
@@ -43,6 +47,39 @@ fn merge_mirrors(outputs: Vec<Display>) -> Vec<Display> {
         }
     }
     result
+}
+
+/// Adds physical-mode metadata without changing capture-zone ids or logical geometry.
+pub fn enrich(mut zones: Vec<Display>, outputs: &[Display]) -> Vec<Display> {
+    for zone in &mut zones {
+        if let Some(output) = outputs.iter().find(|output| output.logical == zone.logical) {
+            zone.native = output.native;
+            zone.rotated = output.rotated;
+            zone.name.clone_from(&output.name);
+            zone.scale = output.scale;
+        }
+    }
+    zones
+}
+
+impl Display {
+    pub fn native_size(&self) -> Option<[i32; 2]> {
+        self.native.map(|[width, height]| {
+            if self.rotated {
+                [height, width]
+            } else {
+                [width, height]
+            }
+        })
+    }
+
+    pub fn logical_scale(&self) -> f64 {
+        self.native_size()
+            .filter(|_| self.logical[2] > 0)
+            .map_or(f64::from(self.scale.max(1)), |native| {
+                f64::from(native[0]) / f64::from(self.logical[2])
+            })
+    }
 }
 
 #[derive(Default)]
@@ -136,6 +173,29 @@ impl Dispatch<wl_output::WlOutput, u32> for Outputs {
             wl_output::Event::Name { name } => output.id = name,
             wl_output::Event::Description { description } => output.name = description,
             wl_output::Event::Scale { factor } => output.scale = factor.max(1),
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                ..
+            } if flags
+                .into_result()
+                .is_ok_and(|flags| flags.contains(wl_output::Mode::Current)) =>
+            {
+                output.native = (width > 0 && height > 0).then_some([width, height]);
+            }
+            wl_output::Event::Geometry {
+                transform: wayland_client::WEnum::Value(transform),
+                ..
+            } => {
+                output.rotated = matches!(
+                    transform,
+                    wl_output::Transform::_90
+                        | wl_output::Transform::_270
+                        | wl_output::Transform::Flipped90
+                        | wl_output::Transform::Flipped270
+                );
+            }
             _ => {}
         }
     }
@@ -183,11 +243,34 @@ mod tests {
     }
 
     #[test]
-    fn capture_zones_win_without_querying_another_source() {
+    fn capture_zones_keep_priority_when_output_metadata_is_unavailable() {
         let zones = vec![output("zone-0", [0, 0, 1920, 1080], 1)];
-        let (source, displays) = discover(zones.clone(), || panic!("unneeded fallback")).unwrap();
+        let (source, displays) = discover(zones.clone(), || Err("no xdg-output".into())).unwrap();
         assert_eq!(source, "input-capture-zones");
         assert_eq!(displays, zones);
+    }
+
+    #[test]
+    fn physical_metadata_enriches_zones_without_moving_or_renaming_them() {
+        let zone = output("zone-0", [0, 0, 1745, 1091], 1);
+        let mut screen = output("eDP-1", zone.logical, 2);
+        screen.native = Some([2560, 1600]);
+        let (source, displays) = discover(vec![zone.clone()], || Ok(vec![screen])).unwrap();
+        assert_eq!(source, "input-capture-zones");
+        assert_eq!(displays[0].id, zone.id);
+        assert_eq!(displays[0].logical, zone.logical);
+        assert_eq!(displays[0].native_size(), Some([2560, 1600]));
+        assert!((displays[0].logical_scale() - 2560.0 / 1745.0).abs() < 1e-10);
+        let mut rotated = displays[0].clone();
+        rotated.rotated = true;
+        assert_eq!(rotated.native_size(), Some([1600, 2560]));
+        // A rotated output is measured against the logical rectangle the compositor handed
+        // back, so a 2560×1600 panel turned by 90° still reports a scale of one.
+        let mut turned = output("DP-1", [0, 0, 2560, 1600], 2);
+        turned.native = Some([1600, 2560]);
+        turned.rotated = true;
+        assert_eq!(turned.native_size(), Some([2560, 1600]));
+        assert!((turned.logical_scale() - 1.0).abs() < 1e-10);
     }
 
     #[test]

@@ -16,6 +16,8 @@
 //! at 1745×1091 in RU/EN and light/dark, using mocks and real move/drop actions.
 //! `--gap-links` writes owner, dragged-paddle and vertical-gap views at 1745×1091
 //! in RU/EN and light/dark, using only mocked topology and real layout actions.
+//! `--metadata` writes only the map at 1745×1091 in RU/EN and light/dark, with the
+//! member OS names and the native display resolutions the map now labels.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -50,6 +52,23 @@ fn main() -> std::process::ExitCode {
             .map(|pair| pair[1].clone())
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    if args.iter().any(|arg| arg == "--metadata") {
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+        for (theme, theme_tag) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
+            for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+                let file = dir.join(format!("metadata-{lang_tag}-{theme_tag}.png"));
+                if let Err(error) = shoot(mockup(theme, None, lang), &file, [1745, 1091], false) {
+                    eprintln!("{error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+                println!("{}", file.display());
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
     if args.iter().any(|arg| arg == "--gap-links") {
         return gap_link_shots(&dir, option("--prefix").as_deref().unwrap_or("gap-links"));
     }
@@ -197,6 +216,7 @@ fn placement_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                         ipc::MemberTopology {
                             node_id: WORKSTATION.to_owned(),
                             display_name: "WORKSTATION".to_owned(),
+                            system_name: "Windows 11".to_owned(),
                             online: true,
                             displays: vec![
                                 display("DISPLAY2", 0.0, 240.0, 1920.0, 1080.0, false, true),
@@ -206,6 +226,7 @@ fn placement_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                         ipc::MemberTopology {
                             node_id: LAPTOP.to_owned(),
                             display_name: "LAPTOP".to_owned(),
+                            system_name: "CachyOS".to_owned(),
                             online: true,
                             displays: vec![display("eDP-1", 0.0, 0.0, 1745.0, 1091.0, true, true)],
                         },
@@ -334,6 +355,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                             ipc::MemberTopology {
                                 node_id: WORKSTATION.to_owned(),
                                 display_name: "PC".to_owned(),
+                                system_name: "Windows 11".to_owned(),
                                 online: true,
                                 displays: vec![
                                     display("01", 0.0, 420.0, 1920.0, 1080.0, false, true),
@@ -343,6 +365,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                             ipc::MemberTopology {
                                 node_id: LAPTOP.to_owned(),
                                 display_name: "LAPTOP".to_owned(),
+                                system_name: "CachyOS".to_owned(),
                                 online: true,
                                 displays: vec![display("03", 0.0, 0.0, 1745.0, 1091.0, true, true)],
                             },
@@ -606,6 +629,10 @@ fn event(msg: Msg) -> GuiFrame {
     }
 }
 
+/// One monitor of a mockup.
+///
+/// The laptop is the owner's real CachyOS panel: a 1920×1200 mode under KDE's 110 % scale,
+/// so the compositor hands the map the 1745×1091 logical rectangle it draws.
 fn display(
     id: &str,
     x: f64,
@@ -615,8 +642,15 @@ fn display(
     primary: bool,
     known: bool,
 ) -> ipc::DisplayView {
+    let (native_width, native_height) = if id == "eDP-1" {
+        (1920.0, 1200.0)
+    } else {
+        (w, h)
+    };
     ipc::DisplayView {
         id: id.to_owned(),
+        native_width: if known { native_width as u32 } else { 0 },
+        native_height: if known { native_height as u32 } else { 0 },
         logical_x: x,
         logical_y: y,
         logical_w: w,
@@ -624,7 +658,11 @@ fn display(
         rotation_degrees: 0,
         primary,
         native_known: known,
-        scale: 1.0,
+        scale: if known {
+            native_width / w.max(1.0)
+        } else {
+            1.0
+        },
     }
 }
 
@@ -737,12 +775,14 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
             ipc::MemberTopology {
                 node_id: LAPTOP.to_owned(),
                 display_name: "LAPTOP".to_owned(),
+                system_name: "CachyOS".to_owned(),
                 online: true,
-                displays: vec![display("eDP-1", 0.0, 0.0, 1920.0, 1200.0, true, true)],
+                displays: vec![display("eDP-1", 0.0, 0.0, 1745.0, 1091.0, true, true)],
             },
             ipc::MemberTopology {
                 node_id: WORKSTATION.to_owned(),
                 display_name: "WORKSTATION".to_owned(),
+                system_name: "Windows 11".to_owned(),
                 online: true,
                 displays: vec![
                     display("DISPLAY2", 0.0, 180.0, 1920.0, 1080.0, false, true),
@@ -752,6 +792,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
             ipc::MemberTopology {
                 node_id: HTPC.to_owned(),
                 display_name: "HTPC".to_owned(),
+                system_name: "Ubuntu 24.04".to_owned(),
                 online: false,
                 displays: vec![display("HDMI-1", 0.0, 0.0, 3840.0, 2160.0, true, false)],
             },
@@ -805,6 +846,8 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
     let peer = "ab".repeat(32);
     let wire = |display: &lws_gui::view_model::EditorDisplay| ipc::DisplayView {
         id: display.id.clone(),
+        native_width: display.native_w as u32,
+        native_height: display.native_h as u32,
         logical_x: display.x,
         logical_y: display.y,
         logical_w: display.w,
@@ -823,6 +866,7 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
             .nodes
             .iter()
             .map(|node| ipc::MemberTopology {
+                system_name: String::new(),
                 node_id: node.node_id.clone(),
                 display_name: node.display_name.clone(),
                 online: node.online,
@@ -832,6 +876,7 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
         links: view.editor.links.clone(),
     };
     document.members.push(ipc::MemberTopology {
+        system_name: String::new(),
         node_id: peer.clone(),
         display_name: "LAPTOP".to_owned(),
         online: true,
@@ -880,6 +925,7 @@ fn with_owner_left_peer(view: &ViewModel) -> Option<ViewModel> {
             .nodes
             .iter()
             .map(|node| ipc::MemberTopology {
+                system_name: String::new(),
                 node_id: node.node_id.clone(),
                 display_name: node.display_name.clone(),
                 online: node.online,
@@ -888,6 +934,8 @@ fn with_owner_left_peer(view: &ViewModel) -> Option<ViewModel> {
                     .iter()
                     .map(|display| ipc::DisplayView {
                         id: display.id.clone(),
+                        native_width: display.native_w as u32,
+                        native_height: display.native_h as u32,
                         logical_x: display.x,
                         logical_y: display.y,
                         logical_w: display.w,

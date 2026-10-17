@@ -230,6 +230,7 @@ pub fn hello(
     wire::Hello {
         node_id: node_id.as_bytes().to_vec(),
         display_name: display_name.to_owned(),
+        system_name: String::new(),
         capabilities: capability_bits(capabilities),
         displays: Vec::new(),
         required_capabilities: Vec::new(),

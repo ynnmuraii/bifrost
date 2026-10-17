@@ -32,6 +32,8 @@ pub use decision::{
 };
 pub use env::{EnvSnapshot, HostOs, PortalVersions, X11Extensions};
 
+pub mod system_name;
+
 #[cfg(target_os = "linux")]
 pub mod probe;
 

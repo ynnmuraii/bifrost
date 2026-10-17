@@ -463,6 +463,10 @@ pub struct EditorDisplay {
     pub primary: bool,
     /// `false` on Wayland portals: the size is a good guess, not a measurement.
     pub native_known: bool,
+    /// Current-mode pixels and scale, independent of layout geometry.
+    pub native_w: f64,
+    pub native_h: f64,
+    pub scale: f64,
     /// Rotation in degrees (0, 90, 180, 270).
     pub rotation: u32,
 }
@@ -479,6 +483,9 @@ impl EditorDisplay {
             primary: view.primary,
             native_known: view.native_known,
             rotation: view.rotation_degrees,
+            native_w: f64::from(view.native_width),
+            native_h: f64::from(view.native_height),
+            scale: finite(view.scale, 1.0).max(f64::EPSILON),
         }
     }
 }
@@ -490,6 +497,8 @@ pub struct EditorNode {
     pub node_id: String,
     /// The display name, empty when the core knew none.
     pub display_name: String,
+    /// Last known sanitized OS name/version; empty for old peers.
+    pub system_name: String,
     /// Advisory, as `NodeDisplays.online`.
     pub online: bool,
     /// The member's displays.
@@ -1377,8 +1386,6 @@ impl ViewModel {
                                         && display.w == finite(report.logical_w, 0.0)
                                         && display.h == finite(report.logical_h, 0.0)
                                         && display.primary == report.primary
-                                        && display.native_known == report.native_known
-                                        && display.rotation == report.rotation_degrees
                                 },
                             )
                     });
@@ -1392,6 +1399,14 @@ impl ViewModel {
             for (node, member) in self.editor.nodes.iter_mut().zip(&doc.members) {
                 node.online = member.online;
                 node.display_name.clone_from(&member.display_name);
+                node.system_name = protocol::sanitize_system_name(&member.system_name);
+                for (display, report) in node.displays.iter_mut().zip(&member.displays) {
+                    display.native_known = report.native_known;
+                    display.native_w = f64::from(report.native_width);
+                    display.native_h = f64::from(report.native_height);
+                    display.scale = finite(report.scale, 1.0).max(f64::EPSILON);
+                    display.rotation = report.rotation_degrees;
+                }
             }
             return;
         }
@@ -1409,6 +1424,7 @@ impl ViewModel {
             .map(|member| EditorNode {
                 node_id: member.node_id.clone(),
                 display_name: member.display_name.clone(),
+                system_name: protocol::sanitize_system_name(&member.system_name),
                 online: member.online,
                 displays: member
                     .displays

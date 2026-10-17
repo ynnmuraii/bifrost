@@ -674,6 +674,7 @@ impl Wayland {
                 name: String::new(),
                 logical: [zone.x, zone.y, zone.width, zone.height],
                 scale: 1,
+                ..Default::default()
             })
             .collect();
         match tokio::task::spawn_blocking(move || {
@@ -686,13 +687,19 @@ impl Wayland {
                 outputs
                     .into_iter()
                     .enumerate()
-                    .map(|(index, output)| crate::displays::RawDisplay {
-                        id: output.id,
-                        name: output.name,
-                        logical: output.logical.map(f64::from),
-                        native: None,
-                        scale: f64::from(output.scale),
-                        primary: index == 0,
+                    .map(|(index, output)| {
+                        let scale = output.logical_scale();
+                        let native = output
+                            .native_size()
+                            .map(|[width, height]| [0, 0, width, height]);
+                        crate::displays::RawDisplay {
+                            id: output.id,
+                            name: output.name,
+                            logical: output.logical.map(f64::from),
+                            native,
+                            scale,
+                            primary: index == 0,
+                        }
                     })
                     .collect()
             }

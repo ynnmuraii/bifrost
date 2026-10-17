@@ -2220,3 +2220,66 @@ fn owner_portrait_lower_half_drop_saves_only_the_real_contact() {
     restored.apply(event(Msg::TopologyDoc(concrete_doc(doc, &topology.links))));
     assert_eq!(restored.editor_links(), topology.links);
 }
+
+#[test]
+fn the_map_names_the_operating_system_of_every_card_in_both_languages() {
+    let mut doc = two_node_doc(8);
+    doc.members[0].system_name = "Windows 11 25H2".to_owned();
+    doc.members[1].system_name = "Ubuntu 24.04".to_owned();
+    let mut vm = saving_view();
+    vm.look.language = lws_gui::ui_text::Lang::Ru;
+    vm.apply(event(Msg::TopologyDoc(doc.clone())));
+    let model = vm.map_model();
+    let this = index_of(&vm, SELF_NODE);
+    let peer = index_of(&vm, PEER_NODE);
+    assert_eq!(model.nodes[this].os, "этот компьютер · Windows 11 25H2");
+    assert_eq!(model.nodes[peer].os, "в сети · Ubuntu 24.04");
+    assert_eq!(
+        model.nodes[peer].focus, "",
+        "«в сети» moved onto the OS line and is not repeated below it"
+    );
+
+    vm.look.language = lws_gui::ui_text::Lang::En;
+    let english = vm.map_model();
+    assert_eq!(english.nodes[peer].os, "online · Ubuntu 24.04");
+
+    // The peer goes offline: the core keeps the last name it had, the card shows it.
+    let mut offline = doc.clone();
+    offline.revision = 9;
+    offline.members[1].online = false;
+    vm.apply(event(Msg::TopologyDoc(offline)));
+    let model = vm.map_model();
+    assert!(!model.nodes[peer].online);
+    assert_eq!(model.nodes[peer].os, "offline · Ubuntu 24.04");
+    assert_eq!(
+        model.nodes[peer].focus, "",
+        "«offline» is on the OS line and is not repeated below it"
+    );
+
+    // A peer of a version that has no such field shows exactly what it showed before.
+    let mut old = doc;
+    old.revision = 10;
+    old.members[1].system_name = String::new();
+    vm.apply(event(Msg::TopologyDoc(old)));
+    let model = vm.map_model();
+    assert_eq!(model.nodes[peer].os, "");
+    assert_eq!(model.nodes[peer].focus, "online");
+}
+
+#[test]
+fn a_hostile_operating_system_name_is_bounded_before_the_map_shows_it() {
+    // The core sanitises what a peer sent, and the window sanitises the document again: the
+    // label must never carry a control character, a bidi override or an unbounded string.
+    let mut doc = two_node_doc(8);
+    doc.members[1].system_name = format!("\u{202e}\u{7}Ubuntu 24.04\u{202c} {}", "я".repeat(40));
+    let mut vm = saving_view();
+    vm.look.language = lws_gui::ui_text::Lang::Ru;
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    let peer = index_of(&vm, PEER_NODE);
+    let os = vm.map_model().nodes[peer].os.clone();
+    let name = os.strip_prefix("в сети · ").expect("the state prefix");
+    assert!(name.starts_with("Ubuntu 24.04"), "{name:?}");
+    assert_eq!(name.chars().count(), 32, "{name:?}");
+    assert!(!name.chars().any(char::is_control), "{name:?}");
+    assert!(!name.contains(['\u{202e}', '\u{202c}']), "{name:?}");
+}
