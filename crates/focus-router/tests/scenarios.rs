@@ -4,6 +4,25 @@ use focus_router::*;
 use input_model::{CaptureKind, HidKey};
 
 #[test]
+fn adapter_capture_loss_keeps_receiver_capability() {
+    let mut r = router(LOCAL);
+    assert!(r.can_be_source());
+    r.set_capabilities(Capabilities {
+        capture: false,
+        inject: true,
+        absolute_pointer: true,
+        emergency_hotkey: false,
+    });
+    assert!(!r.can_be_source());
+    assert!(r.can_be_receiver());
+    let out = r.handle(10, switch(SwitchTrigger::Edge));
+    assert!(!out
+        .iter()
+        .any(|output| matches!(output, Output::Agent(AgentCommand::BeginCapture { .. }))));
+    assert_eq!(r.focus(), FocusState::Local);
+}
+
+#[test]
 fn s01_local_switch_starts_temporary_capture() {
     let mut r = router(LOCAL);
     assert_eq!(

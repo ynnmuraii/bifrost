@@ -14,7 +14,7 @@ fn wayland() -> EnvSnapshot {
     )
     .with_portals(
         PortalVersions {
-            input_capture: 1,
+            input_capture: 2,
             remote_desktop: 2,
             clipboard: 0,
             global_shortcuts: 0,
@@ -138,7 +138,6 @@ fn display_fallbacks_select_the_graphical_backend() {
 #[test]
 fn portal_minimum_failures_identify_interface_observed_and_required_versions() {
     for (ic, rd, interface, observed, minimum) in [
-        (0, 2, PortalVersions::INPUT_CAPTURE, "version 0", ">= 1"),
         (1, 0, PortalVersions::REMOTE_DESKTOP, "version 0", ">= 2"),
         (1, 1, PortalVersions::REMOTE_DESKTOP, "version 1", ">= 2"),
     ] {
@@ -151,6 +150,18 @@ fn portal_minimum_failures_identify_interface_observed_and_required_versions() {
         }
     }
     assert!(decide(&wayland(), BackendOverride::Auto).is_ok());
+}
+
+#[test]
+fn missing_or_v1_capture_portal_is_receiver_only_not_an_unsupported_session() {
+    for version in [0, 1, 2] {
+        let mut snapshot = wayland();
+        snapshot.portals.input_capture = version;
+        let session = decide(&snapshot, BackendOverride::Auto).unwrap();
+        assert_eq!(session.capabilities.capture, version >= 2);
+        assert!(session.capabilities.inject);
+        assert!(session.capabilities.absolute_pointer);
+    }
 }
 
 #[test]

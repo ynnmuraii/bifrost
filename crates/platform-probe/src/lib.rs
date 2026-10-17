@@ -13,7 +13,7 @@
 //! 1. `XDG_SESSION_TYPE=wayland|x11` picks the branch; when it is absent or `tty`,
 //!    `WAYLAND_DISPLAY` wins over `DISPLAY`; neither means `UnsupportedSession`.
 //! 2. X11 requires XTEST, XInput2 and RandR.
-//! 3. Wayland requires `WAYLAND_DISPLAY`, `InputCapture` and `RemoteDesktop >= 2`.
+//! 3. Wayland requires `WAYLAND_DISPLAY` and `RemoteDesktop >= 2`; persistent capture additionally needs `InputCapture >= 2`.
 //! 4. GNOME (Mutter) and KDE (KWin) are level 1; wlroots is level 2 (post-MVP).
 //! 5. `DISPLAY` + `WAYLAND_DISPLAY` means Xwayland: the session stays Wayland and
 //!    `platform-x11` is NEVER chosen for it.

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Wayland display discovery falls back from InputCapture zones to permission-independent xdg-output logical geometry; source selection and failures are logged.
+- Map cards explicitly report when displays are not detected.
+- Paired computers absent from the stored layout now use established-link membership for online status instead of always appearing offline.
+- Core replaces probe estimates with actual agent capture/injection/emergency capabilities. Missing or older InputCapture portals remain receiver-only; Hello advertises source eligibility rather than configuration alone.
+- GUI display queries wait for agent readiness instead of generating a misleading startup `CaptureFailed`.
+
 ## 0.1.1 — 2026-10-16
 
 - Fixed the settings version display: it now sits in a padded, localized bottom row instead of overlapping the modal frame.

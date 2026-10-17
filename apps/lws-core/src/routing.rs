@@ -266,19 +266,14 @@ pub fn deadline_rearm_ms(timer: fr::Timer, deadline_ms: u64, now_ms: u64) -> Opt
     }
 }
 
-/// Sets or clears `TEXT_CLIPBOARD` in a `Hello` capability list.
-///
-/// This is the one bit the probe cannot decide: ADR-008 declares the clipboard only once the
-/// *platform* says it has one, and on a Wayland session only the adapter knows (a KWin session
-/// has it through `ext-data-control-v1`, a Mutter session has none). The agent reports what its
-/// backend really holds, and this is how that answer reaches the nodes that need it — peers read
-/// the local `Hello` when their link is established.
-pub fn set_clipboard_bit(capabilities: &mut Vec<i32>, has_clipboard: bool) {
-    let bit = wire::Capability::TextClipboard as i32;
-    capabilities.retain(|value| *value != bit);
-    if has_clipboard {
-        capabilities.push(bit);
-    }
+/// Replaces capability estimates with the running platform adapter's answer.
+pub fn adopt_capabilities(current: &mut Capabilities, names: &[String]) {
+    let has = |name: &str| names.iter().any(|value| value == name);
+    current.capture = has("CAPTURE");
+    current.inject = has("INJECT");
+    current.absolute_pointer = has("ABSOLUTE_POINTER");
+    current.emergency_hotkey = has("EMERGENCY_HOTKEY");
+    current.text_clipboard = has("TEXT_CLIPBOARD");
 }
 
 /// The `Hello.capabilities` numbers for the bits the FSM and the product use.
@@ -1550,41 +1545,23 @@ mod contract_tests {
         );
     }
 
-    /// The clipboard bit is the one the probe cannot decide, so the runtime answer must be able
-    /// to *set* it, not only clear it: a Wayland node whose adapter holds a data-control
-    /// clipboard has to be able to tell its peers (otherwise core refuses every offer for it by
-    /// design, ADR-008).
     #[test]
-    fn the_clipboard_bit_follows_the_adapter_answer() {
-        let bit = wire::Capability::TextClipboard as i32;
-        // A probe answer without the bit: what a Wayland session gets at probe time.
-        let probe = platform_probe::Capabilities {
-            capture: true,
-            inject: true,
-            absolute_pointer: true,
-            physical_hid_keys: false,
-            text_clipboard: false,
-            native_repeat: false,
-            software_repeat: false,
-            receiver_takeover: false,
-            displays_changed: true,
-            emergency_hotkey: false,
-        };
-        let mut bits = capability_bits(probe);
-        assert!(!bits.contains(&bit));
-
-        set_clipboard_bit(&mut bits, true);
-        assert!(bits.contains(&bit));
-        // Idempotent: the bit is never listed twice.
-        set_clipboard_bit(&mut bits, true);
-        assert_eq!(bits.iter().filter(|value| **value == bit).count(), 1);
-        // And the other direction works too (an adapter that lost its clipboard).
-        set_clipboard_bit(&mut bits, false);
-        assert!(!bits.contains(&bit));
-        set_clipboard_bit(&mut bits, false);
-        assert!(!bits.contains(&bit));
-        // Nothing else in the list moved.
-        assert_eq!(bits, capability_bits(probe));
+    fn adapter_capabilities_override_probe_without_disabling_injection() {
+        let mut capabilities = crate::no_capabilities();
+        capabilities.capture = true;
+        capabilities.emergency_hotkey = true;
+        adopt_capabilities(
+            &mut capabilities,
+            &["INJECT".into(), "ABSOLUTE_POINTER".into()],
+        );
+        assert!(!capabilities.capture);
+        assert!(!capabilities.emergency_hotkey);
+        assert!(capabilities.inject);
+        assert!(capabilities.absolute_pointer);
+        adopt_capabilities(&mut capabilities, &["TEXT_CLIPBOARD".into()]);
+        assert!(capabilities.text_clipboard);
+        adopt_capabilities(&mut capabilities, &[]);
+        assert!(!capabilities.text_clipboard);
     }
 
     #[test]

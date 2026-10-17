@@ -217,6 +217,66 @@ async fn capability_refresh_reaches_live_link_without_replacing_it() {
 }
 
 #[tokio::test]
+async fn inbound_only_membership_is_symmetric_and_capture_refusal_keeps_it() {
+    let root = temp_root("inbound-refusal");
+    let a = Arc::new(identity_at(&root, "a"));
+    let b = Arc::new(identity_at(&root, "b"));
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_addr = free_address().await;
+    let b_addr = free_address().await;
+    let mut a = spawn_node("a", a, a_addr, &[(b_id, b_addr)], &[], 4).await;
+    let mut b = spawn_node("b", b, b_addr, &[(a_id, a_addr)], &[a_addr], 4).await;
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+    settle(&mut a, Duration::from_millis(100)).await;
+    settle(&mut b, Duration::from_millis(100)).await;
+    let refusal = Message::ProtocolError {
+        code: focus_router::ErrorCode::CaptureFailed,
+        related_seq: 0,
+    };
+    a.manager
+        .handle(&b_id)
+        .await
+        .unwrap()
+        .send(refusal.clone())
+        .await
+        .unwrap();
+    assert!(wait_for_event(
+        &mut b.events,
+        |event| matches!(
+            event, LinkEvent::Message { peer, message: Inbound::Focus(message) }
+                if *peer == a_id && *message == refusal
+        ),
+        EVENT_TIMEOUT
+    )
+    .await
+    .is_some());
+    b.manager
+        .handle(&a_id)
+        .await
+        .unwrap()
+        .send(refusal.clone())
+        .await
+        .unwrap();
+    assert!(wait_for_event(
+        &mut a.events,
+        |event| matches!(
+            event, LinkEvent::Message { peer, message: Inbound::Focus(message) }
+                if *peer == b_id && *message == refusal
+        ),
+        EVENT_TIMEOUT
+    )
+    .await
+    .is_some());
+    assert_eq!(a.manager.members().await, vec![b_id]);
+    assert_eq!(b.manager.members().await, vec![a_id]);
+    a.kill().await;
+    b.kill().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn capability_refresh_during_formation_converges_to_latest_set() {
     let root = temp_root("capability-formation");
     let a = Arc::new(identity_at(&root, "a"));
