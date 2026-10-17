@@ -1472,11 +1472,7 @@ impl Session {
 
         match message {
             LayoutMessage::DisplaysChanged { revision, displays } => {
-                if self
-                    .peer_displays
-                    .get(&from)
-                    .is_some_and(|(known, _)| *known >= revision)
-                {
+                if !display_report_supersedes(self.peer_displays.get(&from), revision, &displays) {
                     return;
                 }
                 tracing::info!(
@@ -4608,5 +4604,55 @@ bidirectional = true
                 replay_buffered_locally: true,
             })
         );
+    }
+}
+
+/// Whether a peer's display report replaces the snapshot the receiver holds.
+///
+/// The revision is the peer's own counter of its display *set*, and it restarts at 1 whenever the
+/// peer restarts — so an *equal* revision carrying a different set is the peer coming back,
+/// typically its first report from a build that finally knows its native modes. Refusing it
+/// would leave the receiver on the older, poorer snapshot for as long as the peer's set does not
+/// change (`≈ 1745×1091` instead of `1920×1200 · 110%`). A strictly older revision is still
+/// reordered traffic, and an empty report never wipes a set the receiver already has.
+fn display_report_supersedes(
+    held: Option<&(u64, Vec<protocol::wire::Display>)>,
+    revision: u64,
+    displays: &[protocol::wire::Display],
+) -> bool {
+    let Some((known, known_displays)) = held else {
+        return true;
+    };
+    if displays.is_empty() && !known_displays.is_empty() {
+        return false;
+    }
+    revision > *known || (revision == *known && known_displays.as_slice() != displays)
+}
+
+#[cfg(test)]
+mod display_report_tests {
+    use super::*;
+
+    fn display(id: &str, native_known: bool) -> protocol::wire::Display {
+        protocol::wire::Display {
+            id: id.to_owned(),
+            native_known,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_restarted_peer_heals_the_snapshot_the_receiver_holds() {
+        let stale = (1u64, vec![display("zone-0", false)]);
+        let fresh = vec![display("zone-0", true)];
+        // The peer is back and counts from one again: its new metadata must win.
+        assert!(display_report_supersedes(Some(&stale), 1, &fresh));
+        // A repeat, a reordered report and an empty one never replace what is held.
+        assert!(!display_report_supersedes(Some(&stale), 1, &stale.1));
+        assert!(!display_report_supersedes(Some(&stale), 0, &fresh));
+        assert!(!display_report_supersedes(Some(&stale), 2, &[]));
+        // A newer revision wins, and the first report of a peer is always taken.
+        assert!(display_report_supersedes(Some(&stale), 2, &fresh));
+        assert!(display_report_supersedes(None, 1, &fresh));
     }
 }
