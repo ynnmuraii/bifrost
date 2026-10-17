@@ -115,12 +115,12 @@ mod metadata_roundtrip_tests {
             "Ubuntu 24.04"
         );
         let encoded = hello.encode_to_vec();
+        let mut expected = vec![0x72, 12];
+        expected.extend_from_slice(b"Ubuntu 24.04");
         assert_eq!(
-            &encoded[..2],
-            &[0x72, 0x0b],
-            "Hello.system_name stays tag 14, wire type 2"
+            encoded, expected,
+            "Hello.system_name stays tag 14, wire type 2, length-prefixed"
         );
-        assert_eq!(&encoded[2..], b"Ubuntu 24.04");
         assert!(super::wire::Hello::decode(&[][..])
             .unwrap()
             .system_name
