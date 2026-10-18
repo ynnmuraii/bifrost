@@ -212,14 +212,25 @@ fn a_late_applied_verdict_releases_the_abandoned_edit() {
     let path = edit_file(&harness, "late.toml", "eDP-1");
 
     harness.a.suspend().expect("pause the coordinator");
-    let reply = harness.b.ctl(&format!("layout edit {path}"));
+    // Do not use Node::ctl here: it retries semantic refusals and would submit new edits.
+    let reply = std::process::Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&harness.b.root)
+        .args(["layout", "edit", &path])
+        .output();
     // Keep the coordinator paused past the waiter's timeout and a pruning tick.
     std::thread::sleep(Duration::from_millis(250));
     let resumed = harness.a.resume();
     resumed.expect("resume the coordinator even if the request failed");
+    let reply = reply.expect("the follower CLI runs");
+    let reply = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reply.stdout),
+        String::from_utf8_lossy(&reply.stderr)
+    );
     assert!(
-        reply.unwrap_err().contains("PENDING_VERDICT"),
-        "the waiter must give up before the applied verdict"
+        reply.contains("PENDING_VERDICT"),
+        "the waiter must give up before the applied verdict: {reply}"
     );
     wait_layout(&harness.b, "the late verdict releases the edit", |line| {
         field(line, "pending") == "no"
