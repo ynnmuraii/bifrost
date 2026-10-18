@@ -701,6 +701,11 @@ fn single_peer_rtt(status: &protocol::ipc::Status, local: Option<&str>) -> Optio
     (peers == 1 && status.rtt_p95_us > 0).then_some(status.rtt_p95_us)
 }
 
+fn monitor_hit_rect(monitor: Rect, map: Rect) -> Option<Rect> {
+    let visible = monitor.intersect(map);
+    (visible.width() > 0.0 && visible.height() > 0.0).then_some(visible)
+}
+
 /// One computer: its displays (draggable), and the caption under it.
 #[allow(clippy::too_many_arguments)]
 fn node_ui(
@@ -733,9 +738,12 @@ fn node_ui(
             }));
     for (m, mon) in node.mons.iter().enumerate() {
         let rect = monitor_rect(at, mon.rect, s);
+        let Some(hit_rect) = monitor_hit_rect(rect, painter.clip_rect()) else {
+            continue;
+        };
         let id = egui::Id::new(("mon", &node.node_id, m));
         let response = ui.interact(
-            rect,
+            hit_rect,
             id,
             if enabled {
                 Sense::click_and_drag()
@@ -807,9 +815,6 @@ fn node_ui(
         }
         if enabled && response.hovered() && st.drag.is_none() {
             *hovered = Some((index, 0));
-        }
-        if !painter.clip_rect().intersects(rect) {
-            continue;
         }
 
         let hot = system_hot;
@@ -1086,6 +1091,27 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
 #[cfg(test)]
 mod transform_tests {
     use super::*;
+
+    #[test]
+    fn monitor_hit_rect_excludes_clipped_and_empty_monitor_areas() {
+        let map = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(300.0, 300.0));
+        let monitor = Rect::from_min_max(Pos2::new(50.0, 150.0), Pos2::new(200.0, 250.0));
+        let visible = monitor_hit_rect(monitor, map).expect("partially visible monitor");
+        assert_eq!(
+            visible,
+            Rect::from_min_max(Pos2::new(100.0, 150.0), Pos2::new(200.0, 250.0))
+        );
+        assert!(!visible.contains(Pos2::new(75.0, 200.0)));
+        assert!(visible.contains(Pos2::new(150.0, 200.0)));
+        assert_eq!(monitor_hit_rect(visible, map), Some(visible));
+        for right in [99.0, 100.0] {
+            let outside =
+                Rect::from_min_max(Pos2::new(50.0, 150.0), Pos2::new(right, 250.0));
+            assert_eq!(monitor_hit_rect(outside, map), None);
+        }
+        let below = Rect::from_min_max(Pos2::new(150.0, 300.0), Pos2::new(250.0, 350.0));
+        assert_eq!(monitor_hit_rect(below, map), None);
+    }
 
     #[test]
     fn minimum_paddles_keep_both_resize_ends_and_a_move_grip_at_every_zoom() {
