@@ -424,9 +424,10 @@ pub struct Session {
     layout: config::TopologyConfig,
     /// `input.pointer_gain`, applied to captured deltas while a source lease is remote.
     pointer_gain: f64,
-    /// `input.edge_hysteresis_px` in logical units: the band a return disarms its edge by.
+    /// `input.edge_hysteresis_px` in logical units: the retreat that re-arms the edge a
+    /// return came back through (`topology::ReturnGuard`).
     edge_hysteresis_px: f64,
-    /// The edge a return came back through, until the pointer leaves its band.
+    /// The edge a return came back through, until the pointer retreats or stops pushing.
     edge_guard: Option<crate::topology::ReturnGuard>,
     transition_retry: transition_retry::TransitionRetry,
     pending_edge_guard: Option<crate::topology::ReturnGuard>,
@@ -3239,29 +3240,36 @@ impl Session {
         }
     }
 
-    /// Arms the band of the edge the pointer just came home through, and places the local
+    /// Arms the retreat of the edge the pointer just came home through, and places the local
     /// pointer inside it.
     ///
     /// The target endpoint supplies the axis and inward normal, even for diagonal motion.
     fn arm_return_guard(&mut self, edge: geometry::Edge, entry: &geometry::Position) {
+        let now = self.now_ms();
         let guard =
-            crate::topology::ReturnGuard::after_return(edge, entry, self.edge_hysteresis_px);
+            crate::topology::ReturnGuard::after_return(edge, entry, self.edge_hysteresis_px, now);
         self.local_pointer = Some(guard.entry(entry));
         tracing::debug!(
             axis = ?guard.axis(),
-            hysteresis = guard.hysteresis(),
-            "the edge stays disarmed until the pointer leaves its band"
+            retreat_px = guard.retreat(),
+            "the edge re-arms on a short retreat or a pause without pushing into it"
         );
         self.edge_guard = Some(guard);
     }
 
     /// `Local`: a step that leaves a display through a link endpoint opens the transition.
     async fn track_local(&mut self, position: &geometry::Position, motion: geometry::Point) {
-        // Leaving the band re-arms its edge, even when this sample crosses no link.
-        if self
+        let now = self.now_ms();
+        // A short retreat, or a pause without pushing into the returned edge, re-arms it even
+        // when this sample crosses no link (`topology::ReturnGuard`).
+        let pushing = self
             .edge_guard
             .as_ref()
-            .is_some_and(|guard| !guard.holds(position))
+            .is_some_and(|guard| guard.pushes_into_edge(motion));
+        if self
+            .edge_guard
+            .as_mut()
+            .is_some_and(|guard| !guard.blocks(position, pushing, now))
         {
             self.edge_guard = None;
         }
@@ -3278,11 +3286,9 @@ impl Session {
         let Some(transition) = step else {
             return;
         };
-        if self
-            .edge_guard
-            .as_ref()
-            .is_some_and(|guard| guard.holds_crossing(position, transition.source.edge))
-        {
+        if self.edge_guard.as_mut().is_some_and(|guard| {
+            guard.blocks_crossing(position, transition.source.edge, pushing, now)
+        }) {
             return;
         }
         let target = transition.target.node;
@@ -3298,6 +3304,7 @@ impl Session {
             transition.source.edge,
             position,
             self.edge_hysteresis_px,
+            now,
         ));
         let entry_position = transition.target_position;
         let topology_revision = self.router.topology_revision();
