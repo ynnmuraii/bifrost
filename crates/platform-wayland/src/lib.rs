@@ -15,7 +15,9 @@
 //!
 //! `compositor`, `grant` and `shortcuts` hold the pure logic: compositor detection and
 //! the portal-version signature, restore-token storage (KVM-017) and the
-//! `org.freedesktop.portal.GlobalShortcuts` emergency hotkey (KVM-018).
+//! `org.freedesktop.portal.GlobalShortcuts` emergency hotkey (KVM-018). `appid` is what
+//! the portal calls this process; the compositor keys permissions and global shortcuts
+//! by that name, so the backend establishes it before its first portal call.
 //!
 //! `overlay` is unrelated to input: the optional edge-effect strip, a wlr-layer-shell
 //! surface on its own thread and connection (`edgefx` owns the animation).
@@ -76,6 +78,9 @@ pub mod clipboard;
 // the whole module keeps its pure helpers from being dead code on Windows.
 #[cfg(target_os = "linux")]
 mod data_control;
+
+#[cfg(target_os = "linux")]
+pub mod appid;
 
 #[cfg(target_os = "linux")]
 pub mod displays;
@@ -195,6 +200,18 @@ pub enum WaylandError {
     HotkeyUnavailable {
         /// The D-Bus interface that is required for the hotkey.
         portal_interface: &'static str,
+    },
+    /// The portal answered the bind request, but not with a usable trigger for every
+    /// requested shortcut: the compositor most likely showed its approval dialog and the
+    /// user dismissed it, or it holds that chord for another action.
+    #[error(
+        "the GlobalShortcuts portal granted no usable trigger for {missing}; the compositor \
+         either had its approval dialog dismissed, or that chord is already taken by another \
+         shortcut"
+    )]
+    HotkeyNotGranted {
+        /// The requested actions the portal answered without a trigger, as `id (chord)` pairs.
+        missing: String,
     },
     /// Neither GNOME nor KDE: the backend has no EIS/portal behaviour for it.
     #[error(

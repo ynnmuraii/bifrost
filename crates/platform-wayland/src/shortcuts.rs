@@ -10,7 +10,7 @@ use ashpd::desktop::{CreateSessionOptions, Session};
 use futures_util::stream::StreamExt;
 use futures_util::Stream;
 
-use crate::{WaylandError, GLOBAL_SHORTCUTS_INTERFACE};
+use crate::{appid, WaylandError, GLOBAL_SHORTCUTS_INTERFACE};
 
 /// Shortcut id the backend binds; a compositor echoes it back on activation.
 pub const EMERGENCY_SHORTCUT_ID: &str = "emergency";
@@ -64,6 +64,10 @@ impl EmergencyShortcuts {
     pub async fn register_bindings(bindings: &[(&str, &str, &str)]) -> Result<Self, WaylandError> {
         let shortcuts = GlobalShortcuts::new().await.map_err(classify)?;
         let portal_version = shortcuts.version();
+        // What the compositor keys the binding by: KDE names its `KGlobalAccel` component
+        // after it, so an empty id means the binding is stored under a name that changes
+        // with every run (`appid` registers the real one before the first portal call).
+        let app_id = appid::current().map_or_else(String::new, |app_id| app_id.id.clone());
         let session = shortcuts
             .create_session(CreateSessionOptions::default())
             .await
@@ -98,7 +102,15 @@ impl EmergencyShortcuts {
             Ok(bound) => bound,
             Err(error) => {
                 let _ = session.close().await;
-                return Err(classify(error));
+                let refused = classify(error);
+                let reason = refused.to_string();
+                tracing::warn!(
+                    portal_version,
+                    app_id = app_id.as_str(),
+                    reason = reason.as_str(),
+                    "the GlobalShortcuts portal refused the bind request"
+                );
+                return Err(refused);
             }
         };
         let returned: Vec<_> = bound
@@ -108,19 +120,20 @@ impl EmergencyShortcuts {
             .collect();
         if !all_bindings_granted(bindings, &returned) {
             let _ = session.close().await;
-            let missing: Vec<_> = bindings
+            let missing = missing_bindings(bindings, &returned);
+            let answered: Vec<String> = returned
                 .iter()
-                .filter(|(id, _, _)| {
-                    !returned
-                        .iter()
-                        .any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty())
-                })
-                .map(|(id, _, chord)| format!("{id} ({chord})"))
+                .map(|(id, trigger)| format!("{id}={trigger}"))
                 .collect();
-            return Err(WaylandError::Io(std::io::Error::other(format!(
-                "GlobalShortcuts did not grant usable triggers for {}; existing bindings retained",
-                missing.join(", "),
-            ))));
+            let answered = answered.join(", ");
+            tracing::warn!(
+                portal_version,
+                app_id = app_id.as_str(),
+                missing = missing.as_str(),
+                answered = answered.as_str(),
+                "the GlobalShortcuts portal answered without a usable trigger for some shortcuts"
+            );
+            return Err(WaylandError::HotkeyNotGranted { missing });
         }
         let trigger_description = returned
             .iter()
@@ -138,6 +151,7 @@ impl EmergencyShortcuts {
             .collect();
         tracing::info!(
             portal_version,
+            app_id = app_id.as_str(),
             bindings = %granted.join(", "),
             "GlobalShortcuts bindings granted by the portal"
         );
@@ -221,12 +235,30 @@ async fn closed_stream(
     Ok(Box::pin(closed.map(|_| ())))
 }
 
+/// Whether the portal answered `id` with a trigger the user can actually press.
+///
+/// A compositor reports a shortcut it did not bind as an entry with an empty
+/// `trigger_description` (KDE does this for every row of a dismissed dialog), so an id alone
+/// is not a grant.
+fn granted(id: &str, returned: &[(&str, &str)]) -> bool {
+    returned
+        .iter()
+        .any(|(bound_id, trigger)| id == *bound_id && !trigger.trim().is_empty())
+}
+
 fn all_bindings_granted(requested: &[(&str, &str, &str)], returned: &[(&str, &str)]) -> bool {
-    requested.iter().all(|(id, _, _)| {
-        returned
-            .iter()
-            .any(|(bound_id, trigger)| id == bound_id && !trigger.trim().is_empty())
-    })
+    requested.iter().all(|(id, _, _)| granted(id, returned))
+}
+
+/// The requested actions without a usable trigger, as `id (chord)` pairs, for the log and for
+/// the error the backend reports (`WaylandError::HotkeyNotGranted`).
+fn missing_bindings(requested: &[(&str, &str, &str)], returned: &[(&str, &str)]) -> String {
+    requested
+        .iter()
+        .filter(|(id, _, _)| !granted(id, returned))
+        .map(|(id, _, chord)| format!("{id} ({chord})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Classifies a portal failure as "no emergency hotkey here" or as a real error.
@@ -252,7 +284,7 @@ fn classify(error: ashpd::Error) -> WaylandError {
 
 #[cfg(test)]
 mod tests {
-    use super::all_bindings_granted;
+    use super::{all_bindings_granted, missing_bindings};
     #[test]
     fn candidate_requires_every_action_and_nonempty_triggers() {
         let requested = [
@@ -271,5 +303,24 @@ mod tests {
             &requested,
             &[("emergency", "Ctrl+F12"), ("next", " ")]
         ));
+    }
+
+    #[test]
+    fn the_refused_actions_are_named_with_the_chord_that_was_asked_for() {
+        let requested = [("emergency", "release", "CTRL+ALT+SHIFT+F12")];
+        // KDE answers `Success` with an empty `trigger_description` for a row its dialog
+        // did not bind; that is not a grant.
+        assert_eq!(
+            missing_bindings(&requested, &[("emergency", "")]),
+            "emergency (CTRL+ALT+SHIFT+F12)"
+        );
+        assert_eq!(
+            missing_bindings(&requested, &[]),
+            "emergency (CTRL+ALT+SHIFT+F12)"
+        );
+        assert_eq!(
+            missing_bindings(&requested, &[("emergency", "Ctrl+Alt+Shift+F12")]),
+            ""
+        );
     }
 }

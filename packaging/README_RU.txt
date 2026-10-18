@@ -223,6 +223,15 @@ Ubuntu 24.04 с GNOME 46 (Wayland). Этот ноутбук может толь�
 CachyOS с KDE Plasma 6.7 (Wayland) - целевая система: здесь программа
 работает так, как задумана, в пределах того, что разрешает сама система.
 
+Для ручного запуска через systemd используйте имя приложения:
+  systemd-run --user --unit app-bifrost@lws1.service /полный/путь/bifrost run
+Часть после @ должна содержать только буквы и цифры. Остановка:
+  systemctl --user stop app-bifrost@lws1.service
+Обычный ярлык bifrost.desktop, install.sh и «Запускать при входе» запускают
+bifrost напрямую: агент регистрирует app id bifrost через реестр портала
+(xdg-desktop-portal >= 1.19); менять Exec на systemd-run не требуется.
+На старых порталах app id определяется по имени запускающего systemd-юнита.
+
 
 11. Где логи
 ------------

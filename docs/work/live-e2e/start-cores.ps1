@@ -30,7 +30,7 @@ if ($Dev) { $arguments += '--dev-capture-injected' }
 if ($PlanOnly) {
     Write-PlanHeader 'start-cores.ps1'
     Write-Host "PC:     $exe $($arguments -join ' ')$(if ($Dev) { '  (with LWS_LOG=debug)' })"
-    Write-Host "laptop: systemd-run --user --unit=lws-core-live-test --working-directory=$RemoteInstall $RemoteInstall/bifrost run"
+    Write-Host "laptop: systemd-run --user --unit app-bifrost@lws1.service --working-directory=$RemoteInstall $RemoteInstall/bifrost run"
     Write-Host 'then:   both sides must answer `status` with focus=Local'
     return
 }
@@ -65,7 +65,7 @@ uid=`$(id -u)
 env=`$(systemctl --user show-environment)
 printf '%s\n' "`$env" | grep -qx 'WAYLAND_DISPLAY=wayland-0'
 printf '%s\n' "`$env" | grep -qx 'XDG_CURRENT_DESKTOP=KDE'
-systemd-run --user --unit=lws-core-live-test --collect \
+systemd-run --user --unit app-bifrost@lws1.service --collect \
   --working-directory="$RemoteInstall" \
   --setenv="XDG_RUNTIME_DIR=/run/user/`$uid" \
   --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/`$uid/bus" \
@@ -73,7 +73,7 @@ systemd-run --user --unit=lws-core-live-test --collect \
   --setenv=XDG_SESSION_TYPE=wayland --setenv=XDG_CURRENT_DESKTOP=KDE \
   "$RemoteInstall/bifrost" run
 sleep 2
-systemctl --user --no-pager --full status lws-core-live-test
+systemctl --user --no-pager --full status app-bifrost@lws1.service
 "@
 & ssh $Laptop ($remote.Replace("`r", ''))
 if ($LASTEXITCODE -ne 0) { throw 'Laptop core start failed; verify its user-session environment and service state.' }

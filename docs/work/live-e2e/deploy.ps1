@@ -106,7 +106,7 @@ if ($LASTEXITCODE) { throw 'Linux archive copy failed' }
 $remote = @"
 set -eu
 printf '%s  %s\n' '$linuxSha' '$remoteArchive' | sha256sum -c -
-systemctl --user stop lws-core-live-test lws-gui-trial 2>/dev/null || true
+systemctl --user stop app-bifrost@lws1.service lws-core-live-test lws-gui-trial 2>/dev/null || true
 pkill -x bifrost || true
 pkill -x multideskflow || true
 pkill -x lws-gui || true

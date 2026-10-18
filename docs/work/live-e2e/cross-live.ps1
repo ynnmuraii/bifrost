@@ -164,7 +164,7 @@ if ($windowsDelta -notmatch 'emergency combination: releasing local capture') { 
 if ($windowsDelta -notmatch 'Windows keyboard/mouse capture started' -or $windowsDelta -notmatch 'Windows capture hook counters' -or $windowsDelta -notmatch 'capture_injected=true' -or $windowsDelta -notmatch 'mapped=[1-9]\d*') { throw 'Windows logs do not prove injected keyboard input reached capture' }
 if ($windowsDelta -notmatch 'agent CapturedBatch' -or $windowsDelta -notmatch 'core -> peer.*InputBatch' -or $windowsDelta -notmatch 'transport InputBatch') { throw 'Windows logs do not show the capture-to-transport input path' }
 if ($laptopDelta -notmatch 'transport InputBatch' -or $laptopDelta -notmatch 'core -> agent Inject' -or $laptopDelta -notmatch 'agent InjectResult' -or $laptopDelta -notmatch 'EIS injection summary' -or $laptopDelta -notmatch 'EIS device emulation started' -or $laptopDelta -notmatch 'transport InjectAck') { throw 'laptop logs do not show input reaching the agent and EIS injector' }
-$remoteState = & ssh $Laptop 'set -eu; systemctl --user is-active lws-core-live-test; ps -o args= -C bifrost | grep -qE "/bifrost run( |$)"; echo CORE_ACTIVE'
+$remoteState = & ssh $Laptop 'set -eu; systemctl --user is-active app-bifrost@lws1.service; ps -o args= -C bifrost | grep -qE "/bifrost run( |$)"; echo CORE_ACTIVE'
 if ($LASTEXITCODE -ne 0 -or ($remoteState -join "`n") -notmatch 'CORE_ACTIVE') { throw 'laptop core is not active after the live sequence' }
 if ((Get-Item -LiteralPath $Screenshot).Length -le 0) { throw 'collected laptop screenshot is empty' }
 Write-Host "PASS: typed and saved '$testText' on the laptop; lease held Remote for five idle seconds; emergency chord restored Local. Screenshot: $Screenshot"

@@ -35,7 +35,7 @@ if ($LASTEXITCODE) { throw 'laptop log copy failed' }
 # The laptop core unit goes; the window takes over and starts its own core child.
 $remote = @"
 set -eu
-systemctl --user stop lws-core-live-test lws-gui-trial 2>/dev/null || true
+systemctl --user stop app-bifrost@lws1.service lws-core-live-test lws-gui-trial 2>/dev/null || true
 pkill -x bifrost || true
 pkill -x lws-gui || true
 pkill -x lws-core || true
@@ -45,20 +45,20 @@ uid=`$(id -u)
 env=`$(systemctl --user show-environment)
 printf '%s\n' "`$env" | grep -qx 'WAYLAND_DISPLAY=wayland-0'
 cd "$RemoteInstall"
-# The window has no supervision of its own: it only reconnects to a core, so the core is
-# started first and the window last, both detached.
-XDG_RUNTIME_DIR="/run/user/`$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/`$uid/bus" \
-  WAYLAND_DISPLAY=wayland-0 DISPLAY=:1 XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=KDE \
-  setsid nohup ./bifrost run >/dev/null 2>&1 < /dev/null &
+# Both processes inherit the portal-recognizable application unit.
+systemd-run --user --unit app-bifrost@lws1.service --collect \
+  --working-directory="$RemoteInstall" \
+  --setenv="XDG_RUNTIME_DIR=/run/user/`$uid" \
+  --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/`$uid/bus" \
+  --setenv=WAYLAND_DISPLAY=wayland-0 --setenv=DISPLAY=:1 \
+  --setenv=XDG_SESSION_TYPE=wayland --setenv=XDG_CURRENT_DESKTOP=KDE \
+  /bin/sh -c './bifrost run & exec ./bifrost'
 for attempt in 1 2 3 4 5 6; do
   if ./bifrost status >/dev/null 2>&1; then break; fi
   sleep 2
 done
-XDG_RUNTIME_DIR="/run/user/`$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/`$uid/bus" \
-  WAYLAND_DISPLAY=wayland-0 DISPLAY=:1 XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=KDE \
-  setsid nohup ./bifrost >/dev/null 2>&1 < /dev/null &
 sleep 5
-systemctl --user is-active lws-core-live-test lws-gui-trial || true
+systemctl --user is-active app-bifrost@lws1.service || true
 pgrep -af bifrost || true
 "@
 & ssh $Laptop ($remote.Replace("`r", ''))
@@ -77,7 +77,7 @@ Write-Host "PC_LAYOUT=$((Invoke-Mdf -Exe $core -Arguments @('layout', 'show')).T
 
 $check = @"
 set -eu
-printf 'LAPTOP_UNITS='; systemctl --user is-active lws-core-live-test lws-gui-trial || true
+printf 'LAPTOP_UNITS='; systemctl --user is-active app-bifrost@lws1.service || true
 "$RemoteInstall/bifrost" status
 "$RemoteInstall/bifrost" layout show
 "@
