@@ -850,7 +850,7 @@ fn node_ui(
         clipped.galley(rect.min + Vec2::new(9.0 * fs, 7.0 * fs), num, pal.ink);
         if !mon.tag.is_empty() {
             let (ink, edge, fill) = if node.target {
-                (pal.accent, pal.accent, pal.accent_soft)
+                (pal.accent_ink, pal.accent, pal.accent_soft)
             } else {
                 (pal.ink2, pal.hair, pal.bg2)
             };
@@ -897,7 +897,7 @@ fn node_ui(
         (node.os.as_str(), pal.ink2, fam::mono()),
         (
             node.focus.as_str(),
-            if node.target { pal.accent } else { pal.ink2 },
+            if node.target { pal.accent_ink } else { pal.ink2 },
             fam::mono_medium(),
         ),
     ] {
@@ -1069,12 +1069,12 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
         let galley = ui.painter().layout(
             line,
             font(12.0, fam::sans_medium()),
-            pal.accent,
+            pal.accent_ink,
             (rect.width() - 92.0).max(40.0),
         );
         let size = galley.size();
         ui.painter()
-            .galley(Pos2::new(center - size.x / 2.0, y), galley, pal.accent);
+            .galley(Pos2::new(center - size.x / 2.0, y), galley, pal.accent_ink);
         y += size.y + 4.0;
     }
 }

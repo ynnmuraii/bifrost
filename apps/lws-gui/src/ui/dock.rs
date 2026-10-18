@@ -211,7 +211,7 @@ fn window(
                 ui,
                 &[
                     Run::plain("[", pal.ink),
-                    Run::plain(&full, pal.accent),
+                    Run::plain(&full, pal.accent_ink),
                     Run::plain(&empty, pal.ink2),
                     Run::plain(&tail, pal.ink),
                 ],

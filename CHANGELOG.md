@@ -7,6 +7,7 @@
 - Pairing handshakes abandoned after a window replacement no longer release the new window's pending slot.
 - Late layout verdicts retain their request after its caller disconnects, allowing an applied edit to release the pending slot.
 - Clipboard settings follow pushed status updates without an extra status request.
+- Accent-coloured small text is now readable in the light theme: the countdown, the «ввод» tag and the map's notices use a darker orange (5.0:1 or better on the light background) while fills, borders and the bridge keep the brand accent.
 
 ## 0.1.2 — 2026-10-18
 
