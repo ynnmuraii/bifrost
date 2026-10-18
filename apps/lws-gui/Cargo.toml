@@ -26,6 +26,9 @@ eframe = { version = "0.36.2", default-features = false, features = [
     "x11",
 ] }
 ipc = { path = "../../crates/ipc" }
+# The window's own log file (`lws-gui.log`): see `init_logging` in `lib.rs` for why a window
+# that shows no console still needs one.
+logging = { path = "../../crates/logging" }
 protocol = { path = "../../crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 ui-text = { path = "../../crates/ui-text" }
@@ -33,6 +36,9 @@ ui-text = { path = "../../crates/ui-text" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 # The editor writes its document as TOML in the `[topology]` schema.
 toml = "1"
+# The same logger the daemon and the agent install (`crates/logging`).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `winit/default`, as the build spec asks when eframe's own feature list does not pull it:
 # eframe's `x11`/`wayland` enable winit's `x11` and `wayland` features but not the rest of
 # `default`, and `wayland-dlopen` is the one that matters for the Linux build — without it

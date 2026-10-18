@@ -54,6 +54,11 @@ pub struct GuiApp {
     look_file: Option<PathBuf>,
     /// The look as last written, so a file is written only when it changes.
     saved_look: Look,
+    /// The minimised flag `egui` reported last frame, so a change is logged exactly once.
+    ///
+    /// The other half of the diagnosis: a window that minimises *without* a
+    /// «the window was asked to close» line above it was not this program's close handler.
+    reported_minimized: Option<bool>,
 }
 
 impl GuiApp {
@@ -88,6 +93,7 @@ impl GuiApp {
             ui: UiState::new(Instant::now()),
             look_file,
             saved_look,
+            reported_minimized: None,
         }
     }
 
@@ -111,11 +117,30 @@ impl eframe::App for GuiApp {
         let arrived = self.bridge.pump();
         self.bridge.view_mut().tick(now);
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
-        if close_requested && close_decision(lws_desktop::tray_is_ready()) == Close::Minimize {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        if close_requested {
+            // The one place this window is asked to go away, and the one place it decides
+            // what "away" means. The origin is the OS (the X, Alt+F4, a taskbar close, a
+            // shutdown): nothing in this workspace sends a close request of its own, and the
+            // tray and a second launch only ever send *show* (`lws_desktop::acquire`,
+            // `app::close_decision`). Logged at INFO because it is rare and because an owner
+            // once reported the window minimising on «Открыть окно сопряжения» with a
+            // collapsed dock, and the file has to answer that next time.
+            let tray_ready = lws_desktop::tray_is_ready();
+            let decision = close_decision(tray_ready);
+            tracing::info!(
+                origin = "a native close request (the title bar's X, Alt+F4, a taskbar close)",
+                tray_ready,
+                ?decision,
+                dock_open = self.bridge.view().look.dock_open,
+                modal = ?self.bridge.view().modal,
+                "the window was asked to close"
+            );
+            if decision == Close::Minimize {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
         }
 
         let (focused, minimized) = ui.ctx().input(|input| {
@@ -123,6 +148,14 @@ impl eframe::App for GuiApp {
             (viewport.focused, viewport.minimized)
         });
         let minimized = minimized == Some(true);
+        if self.reported_minimized != Some(minimized) {
+            self.reported_minimized = Some(minimized);
+            // Above, the close handler says when *this program* minimised the window. A
+            // minimisation with no such line before it was the OS's own idea (or the window
+            // manager's), which is what an owner's report of "it minimised by itself" has to
+            // be told apart from.
+            tracing::info!(minimized, focused = ?focused, "the window's minimised state changed");
+        }
         let env = Env {
             now,
             // Animate only when the viewport positively reports focus and is not minimized.
