@@ -193,6 +193,20 @@ impl Node {
     /// before asking, and retry only AgentBlocked if recovery started between the poll
     /// and the request. Fault tests still observe the actual recovery through status.
     pub fn switch(&self, peer: &str) -> Result<String, String> {
+        self.switch_request(&format!("switch {peer}"))
+    }
+
+    /// Directional entry: repeating the request must not toggle back to Local.
+    pub fn switch_to(&self, peer: &str) -> Result<String, String> {
+        self.switch_request(&format!("switch --to {peer}"))
+    }
+
+    /// Directional return: already Local is a no-op, even after an expired lease.
+    pub fn switch_to_local(&self) -> Result<String, String> {
+        self.switch_request("switch --to local")
+    }
+
+    fn switch_request(&self, request: &str) -> Result<String, String> {
         let timeout = Duration::from_secs(15);
         let deadline = Instant::now() + timeout;
         loop {
@@ -205,7 +219,7 @@ impl Node {
             self.wait_for("the agent is ready before switching", remaining, |status| {
                 status.agent == "ready" && status.focus != "Blocked"
             })?;
-            match self.ctl(&format!("switch {peer}")) {
+            match self.ctl(request) {
                 Err(error) if error == "ERR SWITCH_REFUSED AgentBlocked" => {
                     if Instant::now() >= deadline {
                         return Err(error);
@@ -1621,6 +1635,15 @@ impl Cluster {
     pub fn switch(&self, from: usize, to: usize) -> Result<String, String> {
         let target = self.nodes[to].id.clone();
         self.nodes[from].switch(&target)
+    }
+
+    pub fn switch_to(&self, from: usize, to: usize) -> Result<String, String> {
+        let target = self.nodes[to].id.clone();
+        self.nodes[from].switch_to(&target)
+    }
+
+    pub fn switch_to_local(&self, from: usize) -> Result<String, String> {
+        self.nodes[from].switch_to_local()
     }
 
     /// Every node is `Local`, holds no lease and no keys.
