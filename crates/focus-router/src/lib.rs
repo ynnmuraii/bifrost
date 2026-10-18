@@ -68,7 +68,7 @@
 //!
 //! # Times, and what is *not* here
 //!
-//! `prepare_timeout_ms`, `lease_ttl_ms` (with `challenge = lease_ttl / 5` computed) and
+//! `prepare_timeout_ms`, `lease_ttl_ms` (with `challenge = min(lease_ttl / 5, 100 ms)`) and
 //! `claim_grant_timeout_ms` are the whole configurable timing surface
 //! ([`config::Timing`], bounds checked). `repeat_guard_ms` is **not** configurable: it is
 //! the protocol limit [`config::Timing::REPEAT_GUARD_MS`] (150 ms). The agent's own

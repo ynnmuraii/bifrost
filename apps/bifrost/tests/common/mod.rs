@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The documented lease budget the fault tests measure against.
-pub const LEASE_TTL_MS: u64 = 500;
+pub const LEASE_TTL_MS: u64 = 1_000;
 /// `docs/02-product-requirements.md`, AC-02: the budget plus the scheduler's slack.
 pub const AC_02_BUDGET_MS: u64 = LEASE_TTL_MS + 100;
 /// What a *shared* CI host is allowed to add on top: the budget above is the product's

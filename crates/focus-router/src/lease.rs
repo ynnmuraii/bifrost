@@ -301,8 +301,8 @@ impl ReceiverLease {
 
     /// Issues a challenge and returns `(nonce, issue_ms)`.
     ///
-    /// «Receiver каждые `lease_ttl/5` выпускает `LeaseChallenge` с random nonce16,
-    /// хранит собственное monotonic время выдачи». Only meaningful while `Active`.
+    /// Receiver issues a random nonce16 every `min(lease_ttl/5, 100 ms)`,
+    /// retaining its own monotonic issue time. Only meaningful while `Active`.
     pub fn issue_challenge(&mut self, ids: &mut dyn Identifiers, now_ms: u64) -> (Nonce, u64) {
         let nonce = ids.nonce();
         if self.challenges.len() == MAX_CHALLENGES {

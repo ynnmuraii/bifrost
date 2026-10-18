@@ -20,6 +20,8 @@ Bifrost is a software KVM: share one keyboard, mouse and text clipboard across W
 - System tray and a per-user **Start at login** toggle in Settings.
 - One executable for the window, core and input agent—no separate service to install.
 
+The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–1000 ms). Challenges run every `min(TTL/5, 100 ms)`, or 100 ms by default. This fixed budget accommodates a 500 ms TCP stall when renewals resume in time; it cannot guarantee survival through unlimited loss. There is no grace period or adaptive extension: core and agent deadlines stay anchored to challenge issuance plus TTL. The control-return bound is TTL + 100 ms scheduling allowance (1100 ms by default); repeat guard (150 ms) and agent core-silence timeout (300 ms) are unchanged.
+
 ## Download & install
 
 Get **0.1.1** from [Releases](https://github.com/ynnmuraii/MultideskFlow/releases/latest). The release includes `SHA256SUMS.txt` for checking your downloads.

@@ -3,7 +3,7 @@
 //! Values and bounds are from `docs/05-protocol.md`, «Watchdog без зависимости от
 //! синхронизации часов»: «Таймауты настраиваются только внутри пределов ...:
 //! `prepare_timeout_ms` 150..400 (по умолчанию 200), `lease_ttl_ms` 300..1000 (по
-//! умолчанию 500), `challenge = lease_ttl/5` вычисляется, `agent_core_silence_ms`
+//! умолчанию 1000), `challenge = min(lease_ttl/5, 100 ms)` вычисляется, `agent_core_silence_ms`
 //! 200..500, `repeat_guard_ms` 150. Все дедлайны lease выводятся из одного
 //! параметра `lease_ttl_ms`».
 //!
@@ -20,7 +20,7 @@ pub struct Timing {
     /// `Prepared` without `EnterCommit`, and how long a temporary source capture is
     /// given before the transition is abandoned.
     pub prepare_timeout_ms: u64,
-    /// `lease_ttl_ms` (300..=1000, default 500): every lease deadline derives from it.
+    /// `lease_ttl_ms` (300..=1000, default 1000): every lease deadline derives from it.
     pub lease_ttl_ms: u64,
     /// `claim_grant_timeout_ms` (default 600): how long a claimant waits for the
     /// current owner to hand off before self-granting
@@ -32,7 +32,7 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             prepare_timeout_ms: 200,
-            lease_ttl_ms: 500,
+            lease_ttl_ms: 1_000,
             claim_grant_timeout_ms: 600,
         }
     }
@@ -69,12 +69,17 @@ impl Timing {
         }
     }
 
-    /// Challenge period: `lease_ttl_ms / 5` (default 100 ms).
+    /// Challenge period: `min(lease_ttl_ms / 5, 100)` (default 100 ms).
     ///
-    /// Computed, never configured — «`challenge = lease_ttl/5` вычисляется, а не
-    /// задаётся» (`docs/06-development-plan.md`, config table).
+    /// Keep ten renewal opportunities at the default TTL without weakening the
+    /// issue-time deadline or adding grace after a lost source.
     pub const fn challenge_interval_ms(&self) -> u64 {
-        self.lease_ttl_ms / 5
+        let interval = self.lease_ttl_ms / 5;
+        if interval > 100 {
+            100
+        } else {
+            interval
+        }
     }
 
     /// Deadline for a lease whose challenge was issued at `issue_ms`.

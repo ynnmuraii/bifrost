@@ -4,6 +4,87 @@ use focus_router::*;
 use input_model::{CaptureKind, HidKey};
 
 #[test]
+fn default_lease_survives_a_500ms_renew_stall_without_extending_the_death_budget() {
+    let timing = Timing::default();
+    let mut r = FocusRouter::new(LOCAL, timing, SequentialIds::default(), capabilities())
+        .with_persisted_ownership(1, Some((1, PEER)));
+    r.handle(0, hello(PEER, PEER, 1));
+    r.handle(10, net(prepare(L, 1)));
+    r.handle(11, Input::Agent(AgentEvent::Ready { lease_id: L }));
+    r.handle(12, net(Message::EnterCommit { lease_id: L }));
+    let mut delayed_nonce = None;
+    let mut latest_nonce = None;
+
+    // A live source answers, but ordered TCP holds the answers for 500 ms.
+    // Service the real FSM deadline before delivering each network event, as core does.
+    for issued in (112..=612).step_by(100) {
+        if r.lease().receiver().unwrap().deadline_ms <= issued {
+            r.handle(issued, Input::TimerExpired(Timer::ReceiverLeaseDeadline));
+        }
+        let out = r.handle(issued, Input::TimerExpired(Timer::ReceiverChallenge));
+        let nonce = out.iter().find_map(|output| match output {
+            Output::Send {
+                message: Message::LeaseChallenge { nonce, .. },
+                ..
+            } => Some(*nonce),
+            _ => None,
+        });
+        assert_eq!(
+            r.focus(),
+            FocusState::Remote,
+            "a transient 500 ms transport stall must not expire the default lease"
+        );
+        assert!(out.contains(&arm(Timer::ReceiverChallenge, issued + 100)));
+        delayed_nonce = delayed_nonce.or(nonce);
+        latest_nonce = nonce;
+    }
+
+    let resumed_at = 613;
+    let out = r.handle(
+        resumed_at,
+        net(Message::LeaseRenew {
+            lease_id: L,
+            nonce: delayed_nonce.unwrap(),
+        }),
+    );
+    assert!(out.contains(&arm(
+        Timer::ReceiverLeaseDeadline,
+        112 + timing.lease_ttl_ms
+    )));
+    let out = r.handle(
+        resumed_at,
+        net(Message::LeaseRenew {
+            lease_id: L,
+            nonce: latest_nonce.unwrap(),
+        }),
+    );
+    let deadline = 612 + timing.lease_ttl_ms;
+    assert!(out.contains(&arm(Timer::ReceiverLeaseDeadline, deadline)));
+    assert_eq!(r.focus(), FocusState::Remote);
+
+    // The source now really dies. Unanswered challenges cannot buy grace, and an
+    // old queued renew cannot move the deadline past its original issue time + TTL.
+    let out = r.handle(deadline, Input::TimerExpired(Timer::ReceiverLeaseDeadline));
+    assert!(out.contains(&release(L)));
+    assert_eq!(r.focus(), FocusState::Local);
+    assert!(deadline <= resumed_at + timing.lease_ttl_ms);
+    let out = r.handle(
+        deadline + 1,
+        net(Message::LeaseRenew {
+            lease_id: L,
+            nonce: delayed_nonce.unwrap(),
+        }),
+    );
+    assert!(!out.iter().any(|output| matches!(
+        output,
+        Output::ArmTimer {
+            timer: Timer::ReceiverLeaseDeadline,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn adapter_capture_loss_keeps_receiver_capability() {
     let mut r = router(LOCAL);
     assert!(r.can_be_source());

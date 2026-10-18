@@ -277,7 +277,7 @@ pub enum Message {
         /// Injection outcome; `Partial`/`Failed` abort the lease.
         status: InjectStatus,
     },
-    /// `LeaseChallenge`: receiver → source, every `lease_ttl/5`.
+    /// `LeaseChallenge`: receiver → source, every `min(lease_ttl/5, 100 ms)`.
     LeaseChallenge {
         /// The lease being challenged.
         lease_id: LeaseId,

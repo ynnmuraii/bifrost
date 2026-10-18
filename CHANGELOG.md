@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reduced remote-focus drops during brief TCP stalls: the default input lease is now 1000 ms (configurable from 300–1000 ms), with challenges every min(TTL/5, 100 ms). The fixed budget accommodates a 500 ms stall, not unlimited connection loss; there is no grace period or adaptive extension. Lease deadlines remain anchored to challenge issuance, and default control-return bound is 1100 ms.
 - Wayland display discovery falls back from InputCapture zones to permission-independent xdg-output logical geometry; source selection and failures are logged.
 - Map cards explicitly report when displays are not detected.
 - Paired computers absent from the stored layout now use established-link membership for online status instead of always appearing offline.

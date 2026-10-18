@@ -38,7 +38,11 @@ pub fn hello(peer: NodeId, owner: NodeId, serial: u64) -> Input {
 pub fn router(owner: NodeId) -> FocusRouter {
     let mut r = FocusRouter::new(
         LOCAL,
-        Timing::default(),
+        // The protocol scenarios below deliberately exercise the shorter, supported TTL.
+        Timing {
+            lease_ttl_ms: 500,
+            ..Timing::default()
+        },
         SequentialIds::default(),
         capabilities(),
     )
