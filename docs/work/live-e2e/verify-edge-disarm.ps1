@@ -1,7 +1,8 @@
 # verify-edge-disarm.ps1 — live check that a return disarms the edge it came home through.
 #
-# One return, then a full second of continued pushing at the same edge must NOT re-enter,
-# and a pointer that comes clear of the band must cross again. Reads only the PC core log.
+# One return, then: a short continued push at the same edge must NOT re-enter (the
+# anti-bounce hold, ~180 ms); a pause of ~250 ms without pushing must re-arm it; a retreat
+# of ~10 logical px must re-arm it too. Reads only the PC core log.
 # Needs the PC core running with the dev capture flag: run start-cores.ps1 -Dev first.
 #
 # Usage:
@@ -78,24 +79,37 @@ if ($direction -eq 'none') { throw 'no crossing; the edge never entered Remote' 
 $entryPush = [int]$(if ($direction -eq 'left') { -32 } else { 32 })
 $back = -$entryPush
 
-# One return, then push for a full second more at the same edge: exactly one return and no
-# re-entry is the fix; more would be the oscillation.
+# One return, then a short continued push (≈200 ms) at the same edge: exactly one return and
+# no re-entry is the anti-bounce; a re-entry here would be the ping-pong.
 $offset = Get-FileSize -Path $pcCoreLog
-for ($i = 1; $i -le 25; $i++) { [LiveInput]::Mouse($back, 0, 0x0001); Start-Sleep -Milliseconds 40 }
+for ($i = 1; $i -le 5; $i++) { [LiveInput]::Mouse($back, 0, 0x0001); Start-Sleep -Milliseconds 40 }
 Start-Sleep -Milliseconds 200
 $delta = Read-FileDelta -Path $pcCoreLog -Offset $offset
-& $write "PUSHED_SECONDS=$([Math]::Round(25 * 40 / 1000.0, 2)) status=$(Get-Status)"
-& $write "OSCILLATION returns=$(Count-Of -Text $delta -Pattern 'came back over the entry edge') entries=$(Count-Of -Text $delta -Pattern 'reached a link edge')"
-foreach ($line in @(($delta -split "`n") | Where-Object { $_ -match 'came back over the entry edge|reached a link edge' } | Select-Object -First 4)) { & $write "OSC $line" }
+& $write "PUSHED_MS=$([Math]::Round(5 * 40 + 200, 0)) status=$(Get-Status)"
+& $write "ANTIBOUNCE returns=$(Count-Of -Text $delta -Pattern 'came back over the entry edge') entries=$(Count-Of -Text $delta -Pattern 'reached a link edge')"
+foreach ($line in @(($delta -split "`n") | Where-Object { $_ -match 'came back over the entry edge|reached a link edge' } | Select-Object -First 4)) { & $write "ANTIBOUNCE_LINE $line" }
 
-# Clear of the band (8 px) and back to the edge: the edge must be armed again.
-for ($i = 1; $i -le 2; $i++) { [LiveInput]::Mouse($back, 0, 0x0001); Start-Sleep -Milliseconds 40 }
+# A pause without pushing (~250 ms re-arm) and back to the edge: the edge must be armed again.
+Start-Sleep -Milliseconds 400
 $offset2 = Get-FileSize -Path $pcCoreLog
 for ($i = 1; $i -le 20; $i++) { [LiveInput]::Mouse($entryPush, 0, 0x0001); Start-Sleep -Milliseconds 40 }
 Start-Sleep -Milliseconds 300
 $delta2 = Read-FileDelta -Path $pcCoreLog -Offset $offset2
-& $write "REARM status=$(Get-Status) entries=$(Count-Of -Text $delta2 -Pattern 'reached a link edge') returns=$(Count-Of -Text $delta2 -Pattern 'came back over the entry edge')"
-foreach ($line in @(($delta2 -split "`n") | Where-Object { $_ -match 'came back over the entry edge|reached a link edge' } | Select-Object -First 3)) { & $write "REARM_LINE $line" }
+& $write "REARM_PAUSE status=$(Get-Status) entries=$(Count-Of -Text $delta2 -Pattern 'reached a link edge') returns=$(Count-Of -Text $delta2 -Pattern 'came back over the entry edge')"
+foreach ($line in @(($delta2 -split "`n") | Where-Object { $_ -match 'came back over the entry edge|reached a link edge' } | Select-Object -First 3)) { & $write "REARM_PAUSE_LINE $line" }
+if ((Get-Status) -match 'focus=Remote') {
+    for ($i = 1; $i -le 20 -and (Get-Status) -match 'focus=Remote'; $i++) { [LiveInput]::Mouse($back, 0, 0x0001); Start-Sleep -Milliseconds 40 }
+    & $write ('REARM_RETURN=' + (Get-Status))
+}
+
+# A retreat of ~10 logical px re-arms the returned edge just as the pause does: out again.
+for ($i = 1; $i -le 2; $i++) { [LiveInput]::Mouse($back, 0, 0x0001); Start-Sleep -Milliseconds 40 }
+$offset3 = Get-FileSize -Path $pcCoreLog
+for ($i = 1; $i -le 20; $i++) { [LiveInput]::Mouse($entryPush, 0, 0x0001); Start-Sleep -Milliseconds 40 }
+Start-Sleep -Milliseconds 300
+$delta3 = Read-FileDelta -Path $pcCoreLog -Offset $offset3
+& $write "REARM_RETREAT status=$(Get-Status) entries=$(Count-Of -Text $delta3 -Pattern 'reached a link edge') returns=$(Count-Of -Text $delta3 -Pattern 'came back over the entry edge')"
+foreach ($line in @(($delta3 -split "`n") | Where-Object { $_ -match 'came back over the entry edge|reached a link edge' } | Select-Object -First 3)) { & $write "REARM_RETREAT_LINE $line" }
 
 if ((Get-Status) -match 'focus=Remote') { Send-Emergency; & $write ('BACK_TO_LOCAL=' + (Wait-Focus -Focus 'Local' -TimeoutSeconds 20)) }
 & $write ('FINAL=' + (Get-Status))

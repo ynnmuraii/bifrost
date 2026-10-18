@@ -715,7 +715,8 @@ pub struct InputConfig {
     /// Dwell time at an edge before crossing, to avoid accidental transitions.
     #[serde(default)]
     pub edge_dwell_ms: u32,
-    /// Hysteresis band at an edge, in logical units.
+    /// Retreat from an edge a return came home through, in logical units: the edge is
+    /// re-armed that far inward (or after a short pause without pushing into it).
     #[serde(default = "default_edge_hysteresis_px")]
     pub edge_hysteresis_px: u32,
     /// Physical movement on the receiver that ends a lease, in logical units.

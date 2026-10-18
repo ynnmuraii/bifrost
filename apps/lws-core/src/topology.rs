@@ -547,14 +547,36 @@ pub enum Axis {
     Y,
 }
 
-/// The band of the edge a pointer came home through: the edge is disarmed until the
-/// pointer leaves it.
+/// The anti-bounce window after a return, in milliseconds.
+///
+/// A crossing that is still the carried-over push is refused this long; past it even a
+/// continuing push counts as deliberate, so the guard never outlives [`REARM_WINDOW_MS`].
+/// A pointer that stopped pushing beside the edge keeps it disarmed for the whole
+/// [`REARM_WINDOW_MS`] instead, so the next push after a natural pause is never mistaken
+/// for the bounce.
+pub const BOUNCE_HOLD_MS: u64 = 180;
+
+/// How long the returned edge stays disarmed at most, in milliseconds.
+///
+/// This is the ceiling for both release paths: the retreat re-arms the edge sooner, and
+/// neither the pause nor the push can lock the crossing out for longer than this.
+pub const REARM_WINDOW_MS: u64 = 250;
+
+/// The edge a pointer came home through: disarmed until the pointer retreats from it or
+/// the re-arm window after the return has passed.
 ///
 /// `[input] edge_hysteresis_px` was parsed and never read (audit F6), so a pointer that
 /// returned sitting *on* the edge resolved a fresh crossing on the very next sample that
 /// pushed the same way, and the focus oscillated `Local`/`Remote` once per sample — the
 /// owner's cursor jumping back and forth at the boundary. The crossed endpoint, not
-/// the dominant motion axis, determines the band and its inward direction.
+/// the dominant motion axis, determines the retreat and its inward direction.
+///
+/// A band alone, re-armed only by *leaving* it, read as «keep away from the edge or you are
+/// stuck»: working next to the edge, drifting over it, then coming home left the owner
+/// unable to cross again until they moved away and waited. The guard therefore re-arms on
+/// the earlier of two natural actions — a [`Self::retreat`] inward from the return point, or
+/// the re-arm window after the return — and refuses a crossing only while the carried-over
+/// push is live ([`BOUNCE_HOLD_MS`] at the least, [`REARM_WINDOW_MS`] at most).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnGuard {
     axis: Axis,
@@ -564,7 +586,13 @@ pub struct ReturnGuard {
     inward: f64,
     /// The coordinate the pointer came home at: the transition's own entry point.
     armed_at: f64,
-    hysteresis: f64,
+    /// `input.edge_hysteresis_px`: the retreat that re-arms the edge at once.
+    retreat_px: f64,
+    /// When the re-arm window starts: the return itself, or — when the local observation
+    /// was still down at that moment — the first sample that sees the pointer again.
+    window_start_ms: u64,
+    /// Whether a local sample has been seen since the return.
+    sampled: bool,
 }
 
 impl ReturnGuard {
@@ -573,7 +601,8 @@ impl ReturnGuard {
     pub fn after_return(
         edge: geometry::Edge,
         entry: &geometry::Position,
-        hysteresis: f64,
+        retreat_px: f64,
+        now_ms: u64,
     ) -> ReturnGuard {
         let (axis, inward, armed_at) = match edge {
             geometry::Edge::Left => (Axis::X, 1.0, entry.x),
@@ -587,34 +616,75 @@ impl ReturnGuard {
             display_id: entry.display_id.clone(),
             inward,
             armed_at,
-            hysteresis,
+            retreat_px,
+            window_start_ms: now_ms,
+            sampled: false,
         }
     }
 
-    /// Whether `position` is still inside this display's band.
-    #[must_use]
-    pub fn holds(&self, position: &geometry::Position) -> bool {
-        if position.display_id != self.display_id {
-            return false;
-        }
-        let coordinate = match self.axis {
+    /// The crossed axis' coordinate, or `None` when the pointer left this display.
+    fn coordinate(&self, position: &geometry::Position) -> Option<f64> {
+        (position.display_id == self.display_id).then_some(match self.axis {
             Axis::X => position.x,
             Axis::Y => position.y,
-        };
-        (coordinate - self.armed_at) * self.inward < self.hysteresis
+        })
     }
 
-    /// Only the crossed edge is disarmed; other links remain available in the band.
+    /// Whether this sample still leaves the crossed edge disarmed.
+    ///
+    /// `pushing` is whether the sample's motion heads into the crossed edge. It shortens
+    /// the window to [`BOUNCE_HOLD_MS`]: a continuing push is the bounce itself and needs
+    /// only to be refused while it is carried over, while a pointer that stopped pushing
+    /// beside the edge keeps it disarmed for the whole [`REARM_WINDOW_MS`], so the next push
+    /// after a natural pause is treated as deliberate.
+    ///
+    /// The window starts at the first sample after the return: the capture that observes the
+    /// local pointer is torn down for the return and re-armed some time later, and the first
+    /// position it reports differs from the estimate the return left behind, which would
+    /// otherwise read as a crossing after the window had already run out.
     #[must_use]
-    pub fn holds_crossing(&self, position: &geometry::Position, edge: geometry::Edge) -> bool {
-        self.edge == edge && self.holds(position)
+    pub fn blocks(&mut self, position: &geometry::Position, pushing: bool, now_ms: u64) -> bool {
+        let Some(coordinate) = self.coordinate(position) else {
+            return false;
+        };
+        if (coordinate - self.armed_at) * self.inward >= self.retreat_px {
+            return false;
+        }
+        if !self.sampled {
+            self.sampled = true;
+            self.window_start_ms = now_ms;
+        }
+        let since_start = now_ms.saturating_sub(self.window_start_ms);
+        since_start < REARM_WINDOW_MS && (!pushing || since_start < BOUNCE_HOLD_MS)
     }
 
-    /// Where the pointer is placed when it comes home: the entry point, the band further in.
+    /// Only the crossed edge is disarmed; other links remain available.
+    #[must_use]
+    pub fn blocks_crossing(
+        &mut self,
+        position: &geometry::Position,
+        edge: geometry::Edge,
+        pushing: bool,
+        now_ms: u64,
+    ) -> bool {
+        self.edge == edge && self.blocks(position, pushing, now_ms)
+    }
+
+    /// Whether `motion` heads into the crossed edge along its axis.
+    #[must_use]
+    pub fn pushes_into_edge(&self, motion: geometry::Point) -> bool {
+        let along = match self.axis {
+            Axis::X => motion.x,
+            Axis::Y => motion.y,
+        };
+        along * self.inward < 0.0
+    }
+
+    /// Where the pointer is placed when it comes home: the entry point, the retreat further in.
     #[must_use]
     pub fn entry(&self, position: &geometry::Position) -> geometry::Position {
         let mut entry = position.clone();
-        let inset = self.armed_at + self.inward * self.hysteresis;
+        let inset = self.armed_at + self.inward * self.retreat_px;
         match self.axis {
             Axis::X => entry.x = inset,
             Axis::Y => entry.y = inset,
@@ -622,16 +692,16 @@ impl ReturnGuard {
         entry
     }
 
-    /// The axis this band runs perpendicular to.
+    /// The axis this guard runs perpendicular to.
     #[must_use]
     pub fn axis(&self) -> Axis {
         self.axis
     }
 
-    /// The band width in logical units.
+    /// The retreat that re-arms the edge, in logical units.
     #[must_use]
-    pub fn hysteresis(&self) -> f64 {
-        self.hysteresis
+    pub fn retreat(&self) -> f64 {
+        self.retreat_px
     }
 }
 
@@ -1629,17 +1699,20 @@ mod tests {
     }
 
     #[test]
-    fn a_return_band_does_not_follow_the_pointer_to_another_display() {
-        let guard = ReturnGuard::after_return(
+    fn a_return_guard_does_not_follow_the_pointer_to_another_display() {
+        let mut guard = ReturnGuard::after_return(
             geometry::Edge::Bottom,
             &geometry::Position::new("L", 960.0, 1078.0),
             8.0,
+            0,
         );
-        assert!(guard.holds(&geometry::Position::new("L", 960.0, 1078.0)));
-        assert!(!guard.holds(&geometry::Position::new("R", 960.0, 1500.0)));
-        assert!(!guard.holds_crossing(
+        assert!(guard.blocks(&geometry::Position::new("L", 960.0, 1078.0), false, 0));
+        assert!(!guard.blocks(&geometry::Position::new("R", 960.0, 1500.0), false, 0));
+        assert!(!guard.blocks_crossing(
             &geometry::Position::new("R", 960.0, 1500.0),
             geometry::Edge::Bottom,
+            false,
+            0,
         ));
     }
 
@@ -1647,44 +1720,80 @@ mod tests {
     fn a_diagonal_bottom_return_uses_the_crossed_edge_not_the_dominant_delta() {
         // A (-30, -20) step returns through Bottom, even though X dominates.
         let entry = geometry::Position::new("eDP-1", 960.0, 1078.0);
-        let guard = ReturnGuard::after_return(geometry::Edge::Bottom, &entry, 8.0);
+        let mut guard = ReturnGuard::after_return(geometry::Edge::Bottom, &entry, 8.0, 0);
         assert_eq!(guard.axis(), Axis::Y);
-        assert!(guard.holds(&entry));
-        assert!(!guard.holds(&geometry::Position::new("eDP-1", 960.0, 1068.0)));
-        assert!(guard.holds_crossing(&entry, geometry::Edge::Bottom));
-        assert!(!guard.holds_crossing(&entry, geometry::Edge::Right));
+        assert!(guard.blocks(&entry, false, 0));
+        assert!(!guard.blocks(&geometry::Position::new("eDP-1", 960.0, 1068.0), false, 0));
+        assert!(guard.blocks_crossing(&entry, geometry::Edge::Bottom, false, 0));
+        assert!(!guard.blocks_crossing(&entry, geometry::Edge::Right, false, 0));
     }
 
-    /// A pointer that comes home must not re-open the lease by being pushed at the edge it
-    /// came home through: that oscillation is the owner's jumping cursor, and
-    /// `input.edge_hysteresis_px` is the band that stops it.
+    /// A pointer that comes home must not re-open the lease by the push that carried it: the
+    /// anti-bounce guarantee, and the smallest window the guard ever refuses.
     #[test]
-    fn a_return_disarms_the_edge_until_the_pointer_leaves_the_band() {
+    fn an_immediate_push_back_at_the_returned_edge_does_not_reenter() {
         // The live shape: the pointer crossed back over the right edge of a 1080-wide
         // display with a leftward step, and the transition put it home at x=1078.
-        let guard = ReturnGuard::after_return(
-            geometry::Edge::Right,
-            &geometry::Position::new("eDP-1", 1078.0, 540.0),
-            8.0,
-        );
-        for x in [1080.0, 1079.0, 1078.0, 1071.0] {
-            let sample = geometry::Position::new("eDP-1", x, 540.0);
-            assert!(guard.holds(&sample), "a push at {x} is inside the band");
+        let entry = geometry::Position::new("eDP-1", 1078.0, 540.0);
+        let mut guard = ReturnGuard::after_return(geometry::Edge::Right, &entry, 8.0, 0);
+        let out = geometry::Position::new("eDP-1", 1080.0, 540.0);
+        for now in (0..=150).step_by(30) {
+            assert!(
+                guard.blocks(&out, true, now),
+                "a push into the edge at {now} ms is still the bounce"
+            );
         }
-        let clear = geometry::Position::new("eDP-1", 1070.0, 540.0);
+        // The bounce window is bounded: a push that goes on past it is a deliberate crossing.
         assert!(
-            !guard.holds(&clear),
-            "eight pixels inward is clear of the band"
+            !guard.blocks(&out, true, 600),
+            "the guard never outlives the re-arm window"
         );
-        let entry = guard.entry(&geometry::Position::new("eDP-1", 1078.0, 540.0));
-        assert_eq!(entry.x, 1070.0, "the estimate is placed inside the band");
-        assert_eq!(guard.axis(), Axis::X);
-        assert_eq!(guard.hysteresis(), 8.0);
     }
 
-    /// A failed outward crossing re-arms only after a deliberate inward retreat.
+    /// A short retreat from the return point re-arms the edge at once.
     #[test]
-    fn a_failed_edge_stays_disarmed_while_the_pointer_is_held_outward() {
+    fn a_short_retreat_rearms_the_returned_edge() {
+        let entry = geometry::Position::new("eDP-1", 1078.0, 540.0);
+        let mut guard = ReturnGuard::after_return(geometry::Edge::Right, &entry, 8.0, 0);
+        let inside = geometry::Position::new("eDP-1", 1071.0, 540.0);
+        assert!(
+            guard.blocks(&inside, false, 20),
+            "seven pixels in is not a retreat"
+        );
+        let away = geometry::Position::new("eDP-1", 1070.0, 540.0);
+        assert!(
+            !guard.blocks(&away, false, 40),
+            "eight pixels inward re-arm the edge"
+        );
+        assert_eq!(guard.retreat(), 8.0);
+        assert_eq!(guard.axis(), Axis::X);
+        let entry = guard.entry(&entry);
+        assert_eq!(entry.x, 1070.0, "the estimate is placed inside the retreat");
+    }
+
+    /// Standing at the returned edge without pushing into it also re-arms it: the owner does
+    /// not have to retreat, only to stop pressing the edge for a moment.
+    #[test]
+    fn a_pause_without_pushing_rearms_the_returned_edge() {
+        let entry = geometry::Position::new("eDP-1", 1078.0, 540.0);
+        let mut guard = ReturnGuard::after_return(geometry::Edge::Right, &entry, 8.0, 0);
+        let at_edge = geometry::Position::new("eDP-1", 1080.0, 540.0);
+        assert!(
+            guard.blocks(&at_edge, false, 100),
+            "the anti-bounce window is still open"
+        );
+        assert!(
+            !guard.blocks(&at_edge, false, 400),
+            "300 ms of quiet re-arm the edge"
+        );
+        // A fresh push at the edge after that pause is deliberate, not a bounce.
+        assert!(!guard.blocks(&at_edge, true, 3_000));
+    }
+
+    /// A pointer held at (or beyond) a failed crossing's edge keeps that edge disarmed for
+    /// the bounce window; the retreat out of it re-arms it at once.
+    #[test]
+    fn a_held_push_at_the_edge_stays_disarmed_for_the_bounce_window() {
         for (edge, held, further_out, retreat) in [
             (
                 geometry::Edge::Right,
@@ -1711,37 +1820,84 @@ mod tests {
                 geometry::Position::new("dry-0", 960.0, 8.0),
             ),
         ] {
-            let guard = ReturnGuard::after_return(edge, &held, 8.0);
-            assert!(guard.holds(&held));
-            assert!(guard.holds(&further_out));
-            assert!(!guard.holds(&retreat));
+            let mut guard = ReturnGuard::after_return(edge, &held, 8.0, 0);
+            for now in (0..=150).step_by(50) {
+                assert!(
+                    guard.blocks(&held, true, now),
+                    "{edge:?} at the edge at {now} ms is still the bounce"
+                );
+                assert!(
+                    guard.blocks(&further_out, true, now),
+                    "{edge:?} held outward at {now} ms is still the bounce"
+                );
+            }
+            let mut retreating = ReturnGuard::after_return(edge, &held, 8.0, 0);
+            assert!(
+                !retreating.blocks(&retreat, true, 50),
+                "{edge:?} re-arms on the retreat, inside the bounce window too"
+            );
         }
     }
 
-    /// Every endpoint supplies its own inward normal.
+    /// Every endpoint supplies its own inward normal, and the re-arm is symmetric across the
+    /// four edges and both crossing directions (the guard is built from the crossed local
+    /// endpoint whether the pointer left `Local` or came home to it).
     #[test]
-    fn every_edge_arms_its_own_band() {
-        // Up through the bottom edge: inward is -y, the pointer is home at y=1918.
-        let guard = ReturnGuard::after_return(
-            geometry::Edge::Bottom,
-            &geometry::Position::new("eDP-1", 540.0, 1918.0),
-            8.0,
-        );
-        assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 1918.0)));
-        assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 1911.0)));
-        assert!(!guard.holds(&geometry::Position::new("eDP-1", 540.0, 1910.0)));
-        // Down through the top edge: inward is +y, the pointer is home at y=2.
-        let guard = ReturnGuard::after_return(
-            geometry::Edge::Top,
-            &geometry::Position::new("eDP-1", 540.0, 2.0),
-            8.0,
-        );
-        assert!(guard.holds(&geometry::Position::new("eDP-1", 540.0, 0.0)));
-        assert!(!guard.holds(&geometry::Position::new("eDP-1", 540.0, 10.0)));
-        assert_eq!(
-            guard.entry(&geometry::Position::new("eDP-1", 540.0, 2.0)).y,
-            10.0
-        );
+    fn every_edge_rearms_the_same_way() {
+        for (edge, home, away, out) in [
+            (
+                geometry::Edge::Right,
+                (1912.0, 540.0),
+                (1902.0, 540.0),
+                (1920.0, 540.0),
+            ),
+            (
+                geometry::Edge::Left,
+                (8.0, 540.0),
+                (18.0, 540.0),
+                (0.0, 540.0),
+            ),
+            (
+                geometry::Edge::Bottom,
+                (960.0, 1072.0),
+                (960.0, 1062.0),
+                (960.0, 1080.0),
+            ),
+            (
+                geometry::Edge::Top,
+                (960.0, 8.0),
+                (960.0, 18.0),
+                (960.0, 0.0),
+            ),
+        ] {
+            let home = geometry::Position::new("eDP-1", home.0, home.1);
+            let away = geometry::Position::new("eDP-1", away.0, away.1);
+            let out = geometry::Position::new("eDP-1", out.0, out.1);
+            let outward = geometry::Point::new(out.x - home.x, out.y - home.y);
+            let mut guard = ReturnGuard::after_return(edge, &home, 10.0, 0);
+            assert!(
+                guard.pushes_into_edge(outward),
+                "{edge:?}: moving out along the edge's axis is a push"
+            );
+            assert!(guard.blocks(&out, true, 60), "{edge:?}: a push is disarmed");
+            assert!(
+                guard.blocks(&out, true, 150),
+                "{edge:?}: 150 ms of push is still the bounce"
+            );
+            assert!(
+                !guard.blocks(&away, false, 200),
+                "{edge:?}: a ten-pixel retreat re-arms"
+            );
+            let mut paused = ReturnGuard::after_return(edge, &home, 10.0, 0);
+            assert!(
+                paused.blocks(&out, false, 50),
+                "{edge:?}: the window starts at the first sample"
+            );
+            assert!(
+                !paused.blocks(&out, false, 300),
+                "{edge:?}: the same edge re-arms on the pause"
+            );
+        }
     }
 
     /// A coarse return step must cross the entry edge exactly like a fine one.
@@ -2683,20 +2839,25 @@ bidirectional = true
                         geometry::resolve_transition(&active.topology, &owner, &position);
                     assert_eq!(transition.is_some(), along >= start && along <= end);
                     if let Some(transition) = transition {
-                        let guard = ReturnGuard::after_return(
+                        let mut guard = ReturnGuard::after_return(
                             transition.target.edge,
                             &transition.target_position,
                             8.0,
+                            0,
                         );
-                        assert!(guard
-                            .holds_crossing(&transition.target_position, transition.target.edge));
+                        assert!(guard.blocks_crossing(
+                            &transition.target_position,
+                            transition.target.edge,
+                            true,
+                            0,
+                        ));
                         let entry = guard.entry(&transition.target_position);
                         if horizontal {
                             assert_eq!(entry.x, transition.target_position.x);
                         } else {
                             assert_eq!(entry.y, transition.target_position.y);
                         }
-                        assert!(!guard.holds(&entry));
+                        assert!(!guard.blocks(&entry, false, 10));
                     }
                 }
             }
