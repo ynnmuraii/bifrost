@@ -4333,14 +4333,16 @@ const LAYOUT_REQUEST_TTL_MS: u64 = 30_000;
 
 /// Keeps the layout requests a verdict can still arrive for (batch-2 audit).
 ///
-/// Live means the connection that asked is still there (`verdict` open) **and** the request is
-/// younger than [`LAYOUT_REQUEST_TTL_MS`]. Returns how many were dropped.
+/// Age, and only age. A coordinator answers a forwarded edit one hop later, always after the
+/// control channel that asked has already given up (`LAYOUT_VERDICT_TIMEOUT` is two seconds,
+/// the answer is whatever the peer's CAS takes); that late answer is the *only* thing that
+/// releases the pending edit (`deliver_layout_verdict`). Dropping the entry when the waiter
+/// closed — the previous rule — left the user holding a `layout.pending.toml` for a document
+/// the coordinator had already applied, and the next apply on it was refused with
+/// `LAYOUT_CONFLICT`. Returns how many were dropped.
 fn prune_layout_requests(requests: &mut HashMap<u64, LayoutRequest>, now_ms: u64) -> usize {
     let before = requests.len();
-    requests.retain(|_, request| {
-        !request.verdict.is_closed()
-            && now_ms.saturating_sub(request.at_ms) <= LAYOUT_REQUEST_TTL_MS
-    });
+    requests.retain(|_, request| now_ms.saturating_sub(request.at_ms) <= LAYOUT_REQUEST_TTL_MS);
     before - requests.len()
 }
 
@@ -4502,14 +4504,11 @@ mod layout_request_tests {
         )
     }
 
-    /// Batch-2 audit: a layout request whose verdict cannot arrive is dropped, so the map (and
-    /// its copy of the whole document) cannot grow for the life of the process.
-    ///
-    /// The connection giving up (`verdict` closed) and the TTL expiring are both checked: a
-    /// peer that died mid-CAS, or an answer dropped as nobody's, left the entry behind
-    /// forever.
+    /// Batch-2 audit: the map (and its copy of the whole document) cannot grow for the life of
+    /// the process — the TTL alone bounds it, and a request whose waiter gave up is kept until
+    /// then, because a late verdict is still the only thing that releases the pending edit.
     #[test]
-    fn a_layout_request_whose_verdict_cannot_arrive_is_dropped() {
+    fn a_layout_request_survives_its_waiter_up_to_the_ttl() {
         let now = 100_000u64;
         let mut requests = HashMap::new();
         let (fresh, _alive) = request(now - LAYOUT_REQUEST_TTL_MS);
@@ -4522,10 +4521,13 @@ mod layout_request_tests {
 
         assert_eq!(
             prune_layout_requests(&mut requests, now),
-            2,
-            "the stale request and the abandoned one go"
+            1,
+            "only the expired request is dropped"
         );
-        assert_eq!(requests.len(), 1);
+        assert!(
+            requests.contains_key(&3),
+            "the abandoned request still waits for the verdict that releases the edit"
+        );
         assert!(
             requests.contains_key(&1),
             "the request at the ttl boundary is still waiting for its verdict"
