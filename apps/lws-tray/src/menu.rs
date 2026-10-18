@@ -4,6 +4,10 @@ use ui_text::{fill, text, Key, Lang};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Open,
+    /// Directional target: an empty string means Local, otherwise a peer node id.
+    ///
+    /// The tray used to send the active peer on the way home and let the core toggle on the
+    /// state it found, so a press that raced a lease expiry started the transition again.
     Switch(String),
     Stop,
     Exit,
@@ -27,8 +31,9 @@ fn name(member: &MemberStatus, lang: Lang) -> String {
     }
 }
 
-// Mirrors the GUI's transfer decision: remote returns via its active peer; local
-// prefers an online topology neighbour, preserving Status member order on ties.
+// Remote asks for Local by name; local prefers an online topology neighbour, preserving
+// Status member order on ties. Either way the destination is explicit, so a repeated action
+// is a no-op instead of a toggle.
 fn transfer(
     status: &Status,
     topology: Option<&TopologyDoc>,
@@ -60,32 +65,21 @@ fn transfer(
             None
         }
     });
-    let peers: Vec<_> = status
-        .members
-        .iter()
-        .filter(|m| {
-            this.map_or(
-                !(status.is_owner
-                    && !status.owner_node_id.is_empty()
-                    && m.node_id == status.owner_node_id),
-                |id| m.node_id != id,
-            )
-        })
-        .collect();
+    let peers = status.members.iter().filter(|m| {
+        this.map_or(
+            !(status.is_owner
+                && !status.owner_node_id.is_empty()
+                && m.node_id == status.owner_node_id),
+            |id| m.node_id != id,
+        )
+    });
     if status.focus == "REMOTE" {
-        let peer = peers
-            .iter()
-            .find(|m| name(m, lang) == status.active_peer)
-            .or_else(|| peers.first())?;
         let local = this
             .and_then(|id| topology?.members.iter().find(|m| m.node_id == id))
             .map(|m| m.display_name.as_str())
             .filter(|name| !name.is_empty())
             .unwrap_or(text(lang, Key::ThisComputer));
-        return Some((
-            fill(lang, Key::SendInputTo, &[&local]),
-            peer.node_id.clone(),
-        ));
+        return Some((fill(lang, Key::SendInputTo, &[&local]), String::new()));
     }
     if status.focus != "LOCAL" {
         return None;
@@ -95,7 +89,6 @@ fn transfer(
         .map(|(doc, this)| crate::geometry::neighbours(doc, this))
         .unwrap_or_default();
     let peer = peers
-        .iter()
         .filter(|m| m.online)
         .min_by_key(|m| !neighbours.contains(&m.node_id))?;
     Some((
@@ -181,7 +174,7 @@ mod tests {
         assert_eq!(menu.last().unwrap().action, Some(Action::Exit));
     }
     #[test]
-    fn local_and_remote_use_same_peer() {
+    fn the_local_target_is_a_peer_and_the_remote_return_is_local() {
         let mut s = status();
         assert_eq!(
             transfer(&s, None, Lang::Ru),
@@ -191,7 +184,8 @@ mod tests {
         s.active_peer = "Ноутбук".into();
         assert_eq!(
             transfer(&s, None, Lang::Ru),
-            Some(("Передать ввод → этот компьютер".into(), "peer".into()))
+            Some(("Передать ввод → этот компьютер".into(), String::new())),
+            "the way home names Local, not the peer the toggle would have needed"
         );
         s.transition_disabled_reason = "Нет разрешения".into();
         assert_eq!(transfer(&s, None, Lang::Ru), None);
@@ -275,8 +269,29 @@ mod topology_tests {
         };
         assert_eq!(
             transfer(&s, None, Lang::Ru).map(|(_, id)| id),
-            Some("peer-id".into())
+            Some(String::new())
         );
+    }
+
+    /// The return is a destination of its own, so it survives a status with no members at
+    /// all — the case where the old menu item vanished and the user could not come home.
+    #[test]
+    fn remote_return_is_explicit_even_without_a_peer_manifest() {
+        let s = Status {
+            focus: "REMOTE".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            transfer(&s, None, Lang::Ru).map(|(_, id)| id),
+            Some(String::new())
+        );
+        let action = items(Some(&s), None, Lang::Ru)
+            .into_iter()
+            .find_map(|item| match item.action {
+                Some(Action::Switch(target)) => Some(target),
+                _ => None,
+            });
+        assert_eq!(action, Some(String::new()), "an empty target means Local");
     }
 }
 
