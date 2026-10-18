@@ -9,6 +9,7 @@
 - Clipboard settings follow pushed status updates without an extra status request.
 - Accent-coloured small text is now readable in the light theme: the countdown, the «ввод» tag and the map's notices use a darker orange (5.0:1 or better on the light background) while fills, borders and the bridge keep the brand accent.
 - The window writes its own log to `<state>/logs/lws-gui.log`, using the daemon's rotation settings, and records native close requests with their origin, tray readiness and decision, plus show signals and minimized-state changes.
+- Failed two-node integration tests now preserve both computers' status and the tails of their core and agent logs before cleanup, including clipboard and fault-injection timeouts.
 
 ## 0.1.2 — 2026-10-18
 
