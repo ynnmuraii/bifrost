@@ -288,7 +288,7 @@ message GuiFrame {
     RetryAgent retry_agent = 26;
     Shutdown shutdown = 27;               // ask this core to shut down cleanly
     LayoutAuto layout_auto = 28;           // «Расположить автоматически»: rebuild the layout from this desktop
-    SwitchTo switch_to = 29;               // «Передать ввод»: the `switch <peer>` control verb (a second call while Remote returns input)
+    SwitchTo switch_to = 29;               // «Передать ввод»: the destination, not a toggle — an empty peer means Local
     SetHotkey set_hotkey = 31;
     GetClipboardHistory get_clipboard_history = 32;
     GetClipboardHistoryItem get_clipboard_history_item = 33;
@@ -309,7 +309,7 @@ message GuiFrame {
 // on this connection, so a second/reconnecting GUI sees an existing ceremony.
 message GetStatus {}
 message LayoutAuto {} // the core runs the same layout_auto the `layout auto` command does
-message SwitchTo { string peer = 1; } // a node id (hex) or a display name, as `switch <peer>` takes it
+message SwitchTo { string peer = 1; } // a node id (hex) or a display name; empty means Local ("передать ввод домой")
 message ClaimOwnership {}
 message AbandonOwnership {}
 message StartPairing { uint32 window_s = 1; } // max 120
