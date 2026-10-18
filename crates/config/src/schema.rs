@@ -607,7 +607,7 @@ pub struct TimingConfig {
     /// `150..=400`, default 200.
     #[serde(default = "default_prepare_timeout_ms")]
     pub prepare_timeout_ms: u32,
-    /// `300..=1000`, default 500. Every lease deadline derives from this value.
+    /// `300..=1000`, default 1000. Every lease deadline derives from this value.
     #[serde(default = "default_lease_ttl_ms")]
     pub lease_ttl_ms: u32,
     /// `200..=500`, default 300. Carried in `AgentAttach`; the IPC heartbeat is
@@ -635,7 +635,7 @@ fn default_prepare_timeout_ms() -> u32 {
 }
 
 fn default_lease_ttl_ms() -> u32 {
-    500
+    1_000
 }
 
 fn default_agent_core_silence_ms() -> u32 {
@@ -647,10 +647,14 @@ fn default_repeat_guard_ms() -> u32 {
 }
 
 impl TimingConfig {
-    /// The challenge period, `lease_ttl_ms / 5`. Computed, never configured:
-    /// «`challenge = lease_ttl/5` вычисляется, а не задаётся».
+    /// The challenge period, `min(lease_ttl_ms / 5, 100)`. Computed, never configured.
     pub const fn challenge_interval_ms(&self) -> u32 {
-        self.lease_ttl_ms / 5
+        let interval_ms = self.lease_ttl_ms / 5;
+        if interval_ms < 100 {
+            interval_ms
+        } else {
+            100
+        }
     }
 
     /// The IPC heartbeat period, `agent_core_silence_ms / 4`
@@ -668,7 +672,7 @@ impl TimingConfig {
                 400,
                 200,
             ),
-            ("timing.lease_ttl_ms", self.lease_ttl_ms, 300, 1_000, 500),
+            ("timing.lease_ttl_ms", self.lease_ttl_ms, 300, 1_000, 1_000),
             (
                 "timing.agent_core_silence_ms",
                 self.agent_core_silence_ms,

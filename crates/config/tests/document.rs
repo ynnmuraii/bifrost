@@ -23,7 +23,7 @@ fn shipped_example_parses_and_validates() {
     assert_eq!(config.network.port_clipboard, 47902);
     assert_eq!(config.input.hotkeys.emergency_release, "Ctrl+Alt+Shift+F12");
     assert_eq!(config.timing.prepare_timeout_ms, 200);
-    assert_eq!(config.timing.lease_ttl_ms, 500);
+    assert_eq!(config.timing.lease_ttl_ms, 1000);
     assert!(
         !config.topology.links.is_empty(),
         "the example shows a link chain"
@@ -57,7 +57,7 @@ fn a_bare_version_line_fills_every_section_with_its_defaults() {
     assert_eq!(minimal.workspace.claim_grant_timeout_ms, 600);
 
     assert_eq!(minimal.timing.prepare_timeout_ms, 200);
-    assert_eq!(minimal.timing.lease_ttl_ms, 500);
+    assert_eq!(minimal.timing.lease_ttl_ms, 1000);
     assert_eq!(minimal.timing.agent_core_silence_ms, 300);
     assert_eq!(minimal.timing.repeat_guard_ms, 150);
     // Derived, never configured.
@@ -188,13 +188,13 @@ fn unknown_keys_are_rejected_at_every_depth_and_name_the_table() {
 
 #[test]
 fn a_partially_written_section_keeps_the_defaults_of_its_other_fields() {
-    let config = Config::from_str("config_version = 2\n[timing]\nlease_ttl_ms = 1000\n")
+    let config = Config::from_str("config_version = 2\n[timing]\nlease_ttl_ms = 500\n")
         .expect("a partial section is allowed");
-    assert_eq!(config.timing.lease_ttl_ms, 1000);
+    assert_eq!(config.timing.lease_ttl_ms, 500);
     assert_eq!(config.timing.prepare_timeout_ms, 200);
     assert_eq!(config.timing.agent_core_silence_ms, 300);
     assert_eq!(config.timing.repeat_guard_ms, 150);
-    assert_eq!(config.timing.challenge_interval_ms(), 200);
+    assert_eq!(config.timing.challenge_interval_ms(), 100);
 }
 
 #[test]

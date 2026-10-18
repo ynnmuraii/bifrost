@@ -36,7 +36,7 @@ claim_grant_timeout_ms = 600        # после этого claim станови
 
 [timing]                             # пределы проверяются при загрузке
 prepare_timeout_ms = 200             # 150..400
-lease_ttl_ms = 500                   # 300..1000; все дедлайны lease выводятся отсюда, challenge = ttl / 5; повышение для Wi-Fi видно в GUI и диагностике
+lease_ttl_ms = 1000                  # 300..1000; все дедлайны lease выводятся отсюда, challenge = min(ttl / 5, 100 мс)
 agent_core_silence_ms = 300          # 200..500; порог тишины core для агента (передаётся в AgentAttach); IPC-heartbeat = это значение / 4
 repeat_guard_ms = 150                # нет input/renew дольше — receiver прекращает автоповтор (гарантия по времени: лишние символы ~ rate × это значение)
 

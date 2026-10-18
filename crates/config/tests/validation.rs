@@ -204,7 +204,7 @@ fn derived_timing_periods_follow_their_source_values() {
     let config = parse(&format!(
         "{VALID}[timing]\nlease_ttl_ms = 1000\nagent_core_silence_ms = 500\n"
     ));
-    assert_eq!(config.timing.challenge_interval_ms(), 200);
+    assert_eq!(config.timing.challenge_interval_ms(), 100);
     assert_eq!(config.timing.ipc_heartbeat_ms(), 125);
 
     let fastest = parse(&format!(
@@ -216,7 +216,7 @@ fn derived_timing_periods_follow_their_source_values() {
 
 #[test]
 fn the_derived_periods_are_not_configurable() {
-    // «challenge = lease_ttl/5 вычисляется, а не задаётся».
+    // The capped challenge period is computed, never configured.
     let document = format!("{VALID}[timing]\nchallenge_interval_ms = 100\n");
     assert!(matches!(
         Config::from_str(&document),
@@ -483,10 +483,10 @@ fn validate_cannot_tell_self_from_its_own_peer_reference() {
 fn the_pointer_rule_uses_the_documented_challenge_and_heartbeat_only() {
     // Both derived values stay consistent with the documented formulas across
     // the whole legal range of their sources.
-    for lease in [300u32, 500, 999, 1000] {
+    for lease in [300u32, 499, 500, 501, 999, 1000] {
         let config = parse(&format!("{VALID}[timing]\nlease_ttl_ms = {lease}\n"));
         config.validate().expect("in range");
-        assert_eq!(config.timing.challenge_interval_ms(), lease / 5);
+        assert_eq!(config.timing.challenge_interval_ms(), (lease / 5).min(100));
     }
     for silence in [200u32, 300, 499, 500] {
         let config = parse(&format!(
