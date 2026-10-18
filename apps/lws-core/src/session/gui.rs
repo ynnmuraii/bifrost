@@ -327,6 +327,18 @@ impl Session {
                     // and says which display is missing instead of dropping it silently.
                     let missing = missing_display(geometry::EndpointSide::Source, from)
                         .or_else(|| missing_display(geometry::EndpointSide::Target, to));
+                    let missing = missing.or_else(|| {
+                        let authored = self.layout.links.get(index)?;
+                        self.inactive_links
+                            .iter()
+                            .find(|inactive| {
+                                inactive.id.as_str() == authored.id && inactive.missing.is_empty()
+                            })
+                            .map(|_| {
+                                "auto layout link unresolved: a node it names reports no display on that edge"
+                                    .to_owned()
+                            })
+                    });
                     // The whole document is unusable right now (overlapping links, say): no
                     // link works, and the editor must not draw them as if they did.
                     let missing = self.topology_error.clone().or(missing);

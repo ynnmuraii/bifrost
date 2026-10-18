@@ -597,6 +597,34 @@ fn the_applied_links_are_drawn_as_the_whole_desktop_edge_and_survive_untouched()
     assert_eq!(vm.map_model().links[0].state, LinkState::Inactive);
 }
 
+#[test]
+fn unresolved_auto_link_remains_visible_with_a_reason_and_recovers_when_resolved() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    let reason = "auto layout link unresolved: a node it names reports no display on that edge";
+    let mut doc = linked_doc(8);
+    doc.links[0].active = false;
+    doc.links[0].inactive_reason = reason.to_owned();
+    doc.links[0].auto_displays.clear();
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    let model = vm.map_model();
+    assert_eq!(model.links.len(), 1);
+    assert!(model.links[0].whole_desktop);
+    assert_eq!(model.links[0].state, LinkState::Inactive);
+    assert!(vm
+        .inactive_link_lines()
+        .iter()
+        .any(|line| line.contains(reason)));
+    let topology: config::TopologyConfig = toml::from_str(&vm.layout_toml()).expect("parse");
+    assert_eq!(topology.links.len(), 1);
+    assert_eq!(topology.links[0].from.display, config::AUTO_DISPLAY);
+    assert_eq!(topology.links[0].to.display, config::AUTO_DISPLAY);
+
+    vm.apply(event(Msg::TopologyDoc(linked_doc(9))));
+    assert_eq!(vm.map_model().links[0].state, LinkState::Idle);
+    assert!(vm.inactive_link_lines().is_empty());
+}
+
 /// The document as a whole config file, the way `config.example.toml` holds it.
 ///
 /// A TOML header is absolute, so `[[displays]]` inside the section body means a *top-level*
