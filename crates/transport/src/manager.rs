@@ -234,6 +234,21 @@ impl Inner {
             })
     }
 
+    fn lease_challenge_trace(
+        &self,
+        peer: &NodeId,
+        lease_id: fr::LeaseId,
+    ) -> Option<fr::LeaseTraceSnapshot> {
+        self.links
+            .get(peer)
+            .map(|link| link.handle.lease_challenge_trace(lease_id))
+            .or_else(|| {
+                self.last_lease_diagnostics
+                    .get(peer)
+                    .map(|counters| counters.lease_challenge_trace(lease_id))
+            })
+    }
+
     /// Whether a link to `peer` exists, live or still forming.
     fn has_link_to(&self, peer: &NodeId) -> bool {
         self.links.contains_key(peer) || self.pending.values().any(|pending| pending.peer == *peer)
@@ -385,6 +400,22 @@ impl LinkManager {
     /// resets the counters. Sampling does not clone a handle or allocate.
     pub async fn lease_diagnostics(&self, peer: &NodeId) -> Option<LeaseTransportSnapshot> {
         self.inner.lock().await.lease_diagnostics(peer)
+    }
+
+    /// Final bounded lease/nonce trace for the current or last established connection.
+    ///
+    /// Stage times are ages in milliseconds at sampling, not absolute timestamps.
+    /// Survives disconnect until the next established connection replaces diagnostics.
+    /// Sampling allocates only the returned snapshot.
+    pub async fn lease_challenge_trace(
+        &self,
+        peer: &NodeId,
+        lease_id: fr::LeaseId,
+    ) -> Option<fr::LeaseTraceSnapshot> {
+        self.inner
+            .lock()
+            .await
+            .lease_challenge_trace(peer, lease_id)
     }
 
     /// The current members (established links).

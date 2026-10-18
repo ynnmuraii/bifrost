@@ -4,6 +4,146 @@ use focus_router::*;
 use input_model::{CaptureKind, HidKey};
 
 #[test]
+fn nonce_window_covers_every_legal_ttl_and_both_cadence_endpoints() {
+    for ttl_ms in Timing::LEASE_TTL_MIN_MS..=Timing::LEASE_TTL_MAX_MS {
+        let timing = Timing {
+            lease_ttl_ms: ttl_ms,
+            ..Timing::default()
+        };
+        let mut receiver = ReceiverLease::new(L, PEER, 0, 0);
+        receiver.state = ReceiverState::Active;
+        let mut source = SourceLease::new(L, PEER, 0, position(), 0);
+        let mut ids = SequentialIds::default();
+        let mut first = None;
+        for issued_ms in (0..=ttl_ms).step_by(timing.challenge_interval_ms() as usize) {
+            let (nonce, _) = receiver.issue_challenge(&mut ids, issued_ms);
+            first = first.or(Some(nonce));
+            assert!(source.remember_challenge(nonce));
+            assert!(receiver.challenges.len() <= MAX_CHALLENGES);
+            assert!(source.unanswered_challenges.len() <= MAX_CHALLENGES);
+        }
+        let nonce = first.unwrap();
+        assert_eq!(receiver.apply_renew(&nonce, ttl_ms), Some(ttl_ms));
+        assert!(source.take_challenge(&nonce), "TTL {ttl_ms}");
+        assert!(!source.take_challenge(&nonce));
+        assert_eq!(receiver.apply_renew(&nonce, ttl_ms), None);
+    }
+}
+
+#[test]
+fn delayed_850_to_950ms_renew_survives_challenges_but_not_original_issue_ttl() {
+    for delay_ms in 850..=950 {
+        let timing = Timing::default();
+        let mut r = FocusRouter::new(LOCAL, timing, SequentialIds::default(), capabilities())
+            .with_persisted_ownership(1, Some((1, PEER)));
+        r.handle(0, hello(PEER, PEER, 1));
+        r.handle(10, net(prepare(L, 1)));
+        r.handle(11, Input::Agent(AgentEvent::Ready { lease_id: L }));
+        let (nonce, issue_ms) = r.lease().receiver().unwrap().challenges[0];
+        r.handle(12, net(Message::EnterCommit { lease_id: L }));
+        let arrived_ms = issue_ms + delay_ms;
+        for issued_ms in (112..=arrived_ms).step_by(100) {
+            r.handle(issued_ms, Input::TimerExpired(Timer::ReceiverChallenge));
+        }
+        let out = r.handle(arrived_ms, net(Message::LeaseRenew { lease_id: L, nonce }));
+        let deadline_ms = issue_ms + timing.lease_ttl_ms;
+        assert!(out.contains(&status(nonce, true, 0)), "delay {delay_ms}");
+        assert!(out.contains(&arm(Timer::ReceiverLeaseDeadline, deadline_ms)));
+        assert_eq!(r.lease().receiver().unwrap().deadline_ms, deadline_ms);
+
+        // No further source replies: challenges continue, but cannot buy grace.
+        let next_issue_ms = 112 + ((arrived_ms - 112) / 100 + 1) * 100;
+        for issued_ms in (next_issue_ms..deadline_ms).step_by(100) {
+            r.handle(issued_ms, Input::TimerExpired(Timer::ReceiverChallenge));
+            assert_eq!(r.lease().receiver().unwrap().deadline_ms, deadline_ms);
+        }
+        let out = r.handle(
+            deadline_ms,
+            Input::TimerExpired(Timer::ReceiverLeaseDeadline),
+        );
+        assert!(out.contains(&release(L)));
+        assert_eq!(r.focus(), FocusState::Local);
+        let out = r.handle(
+            deadline_ms + 1,
+            net(Message::LeaseRenew { lease_id: L, nonce }),
+        );
+        assert!(out.contains(&status(nonce, false, 0)));
+        assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Expired);
+        assert_eq!(r.lease().receiver().unwrap().deadline_ms, deadline_ms);
+    }
+}
+
+#[test]
+fn delayed_850_to_950ms_status_survives_challenges_but_source_still_dies() {
+    for delay_ms in 850..=950 {
+        let mut r = remote();
+        // Advertise the legal default receiver TTL and acknowledge the fixture nonce.
+        r.handle(
+            15,
+            net(Message::LeaseChallenge {
+                lease_id: id(1),
+                nonce: id(100),
+                ttl_ms: 1000,
+            }),
+        );
+        r.handle(
+            16,
+            net(Message::LeaseStatus {
+                lease_id: id(1),
+                nonce: N,
+                accepted: true,
+                last_input_batch_seq: 0,
+            }),
+        );
+        let arrived_ms = 15 + delay_ms;
+        for issued_ms in (115..=arrived_ms).step_by(100) {
+            let out = r.handle(
+                issued_ms,
+                net(Message::LeaseChallenge {
+                    lease_id: id(1),
+                    nonce: id(issued_ms),
+                    ttl_ms: 1000,
+                }),
+            );
+            assert!(out.contains(&send(Message::LeaseRenew {
+                lease_id: id(1),
+                nonce: id(issued_ms),
+            })));
+        }
+        let delayed_status = Message::LeaseStatus {
+            lease_id: id(1),
+            nonce: id(100),
+            accepted: true,
+            last_input_batch_seq: 0,
+        };
+        let out = r.handle(arrived_ms, net(delayed_status.clone()));
+        let deadline_ms = arrived_ms + 1000;
+        assert!(
+            out.contains(&arm(Timer::SourceLeaseWatchdog, deadline_ms)),
+            "delay {delay_ms}"
+        );
+        // A replay cannot postpone the watchdog. No further accepted status arrives.
+        let out = r.handle(arrived_ms + 1, net(delayed_status.clone()));
+        assert!(!out.iter().any(|output| matches!(
+            output,
+            Output::ArmTimer {
+                timer: Timer::SourceLeaseWatchdog,
+                ..
+            }
+        )));
+        let out = r.handle(deadline_ms, Input::TimerExpired(Timer::SourceLeaseWatchdog));
+        assert!(out.contains(&end(id(1), false)));
+        assert!(out.contains(&Output::CloseLink {
+            peer: PEER,
+            code: ErrorCode::LeaseExpired
+        }));
+        assert_eq!(r.focus(), FocusState::Local);
+        r.handle(deadline_ms + 1, net(delayed_status));
+        assert!(r.lease().is_idle());
+    }
+}
+
+#[test]
 fn default_lease_survives_a_500ms_renew_stall_without_extending_the_death_budget() {
     let timing = Timing::default();
     let mut r = FocusRouter::new(LOCAL, timing, SequentialIds::default(), capabilities())

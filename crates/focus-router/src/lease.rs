@@ -13,12 +13,21 @@
 
 use geometry::{NodeId, Position};
 
+use crate::config::Timing;
 use crate::flow::{FocusState, Identifiers};
 use crate::wire::{LeaseId, LeaveReason, Nonce};
 
-/// How many challenge nonces a receiver keeps, per `docs/05-protocol.md`
-/// («хранить максимум 8»).
-pub const MAX_CHALLENGES: usize = 8;
+/// Bounded nonce window covering the maximum legal TTL at its challenge cadence.
+/// Include both endpoints so issuing a new challenge cannot evict one at the
+/// TTL boundary before the deadline timer is serviced.
+pub const MAX_CHALLENGES: usize = {
+    let timing = Timing {
+        lease_ttl_ms: Timing::LEASE_TTL_MAX_MS,
+        prepare_timeout_ms: 150,
+        claim_grant_timeout_ms: 1,
+    };
+    (timing.lease_ttl_ms / timing.challenge_interval_ms()) as usize + 1
+};
 
 /// The one lease slot of a node.
 #[derive(Debug, Clone, PartialEq)]

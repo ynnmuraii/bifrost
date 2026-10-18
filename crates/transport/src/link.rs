@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -212,6 +212,63 @@ mod tests {
     use std::io;
 
     #[test]
+    fn connection_trace_is_bounded_and_recovers_a_poisoned_diagnostic_lock() {
+        let counters = LeaseTransportCounters::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = counters.trace.ring.lock().unwrap();
+            panic!("poison diagnostic storage");
+        }));
+        for nonce in 0..20u8 {
+            let envelope = wire::Envelope {
+                lease_id: vec![7; 16],
+                payload: Some(wire::envelope::Payload::LeaseRenew(wire::LeaseRenew {
+                    nonce: vec![nonce; 16],
+                })),
+                ..Default::default()
+            };
+            counters.record_trace(&envelope, true, false);
+        }
+        let snapshot = format!("{:?}", counters.lease_challenge_trace([7; 16]));
+        assert_eq!(snapshot.matches("Challenge {").count(), 16);
+        assert!(!snapshot.contains("nonce: [0,"));
+        assert!(snapshot.contains("nonce: [19,"));
+    }
+
+    #[tokio::test]
+    async fn read_loop_records_raw_decode_before_coordinator_dispatch() {
+        for payload in [
+            wire::envelope::Payload::LeaseChallenge(wire::LeaseChallenge {
+                nonce: vec![3; 16],
+                ttl_ms: 1000,
+            }),
+            wire::envelope::Payload::LeaseRenew(wire::LeaseRenew { nonce: vec![3; 16] }),
+        ] {
+            let counters = Arc::new(LeaseTransportCounters::default());
+            let (mut sender, receiver) = tokio::io::duplex(4096);
+            let (reader, _writer) = tokio::io::split(receiver);
+            let (frames_tx, mut frames_rx) = mpsc::channel(1);
+            let task = tokio::spawn(read_loop(reader, frames_tx, Arc::clone(&counters)));
+            let envelope = wire::Envelope {
+                lease_id: vec![7; 16],
+                payload: Some(payload),
+                ..Default::default()
+            };
+            write_frame(&mut sender, &envelope).await.unwrap();
+            let decoded = frames_rx.recv().await.unwrap().unwrap();
+            let raw = format!("{:?}", counters.lease_challenge_trace([7; 16]));
+            let raw_stage = match &decoded.payload {
+                Some(wire::envelope::Payload::LeaseChallenge(_)) => "challenge_raw_decode",
+                _ => "renew_raw_decode",
+            };
+            assert!(raw.contains(raw_stage));
+            assert!(!raw.contains("dispatch"));
+            counters.record_trace(&decoded, false, false);
+            assert!(format!("{:?}", counters.lease_challenge_trace([7; 16])).contains("dispatch"));
+            task.abort();
+        }
+    }
+
+    #[test]
     fn lease_counters_classify_each_direction_and_ignore_other_payloads() {
         use wire::envelope::Payload;
         let counters = LeaseTransportCounters::default();
@@ -382,6 +439,7 @@ pub struct LeaseTransportSnapshot {
 
 #[derive(Debug, Default)]
 pub(crate) struct LeaseTransportCounters {
+    trace: LeaseConnectionTrace,
     challenge_written: AtomicU64,
     renew_written: AtomicU64,
     status_written: AtomicU64,
@@ -392,7 +450,67 @@ pub(crate) struct LeaseTransportCounters {
     input_rx: [AtomicU64; 6],
 }
 
+#[derive(Debug)]
+struct LeaseConnectionTrace {
+    started: tokio::time::Instant,
+    ring: Mutex<fr::LeaseTraceRing>,
+}
+
+impl Default for LeaseConnectionTrace {
+    fn default() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            ring: Mutex::new(fr::LeaseTraceRing::default()),
+        }
+    }
+}
+
 impl LeaseTransportCounters {
+    /// Records only lease challenge/renew stages: unrelated frames never lock the ring.
+    fn record_trace(&self, envelope: &wire::Envelope, raw: bool, written: bool) {
+        use fr::LeaseTraceStage;
+        use wire::envelope::Payload;
+        let (nonce, stage) = match (envelope.payload.as_ref(), raw, written) {
+            (Some(Payload::LeaseChallenge(value)), true, false) => {
+                (&value.nonce, LeaseTraceStage::ChallengeRawDecode)
+            }
+            (Some(Payload::LeaseChallenge(value)), false, false) => {
+                (&value.nonce, LeaseTraceStage::ChallengeDispatch)
+            }
+            (Some(Payload::LeaseRenew(value)), true, false) => {
+                (&value.nonce, LeaseTraceStage::RenewRawDecode)
+            }
+            (Some(Payload::LeaseRenew(value)), false, false) => {
+                (&value.nonce, LeaseTraceStage::RenewDispatch)
+            }
+            (Some(Payload::LeaseRenew(value)), false, true) => {
+                (&value.nonce, LeaseTraceStage::RenewWrite)
+            }
+            _ => return,
+        };
+        let (Ok(lease_id), Ok(nonce)) = (
+            envelope.lease_id.as_slice().try_into(),
+            nonce.as_slice().try_into(),
+        ) else {
+            return;
+        };
+        let now_ms = self.trace.started.elapsed().as_millis() as u64;
+        self.trace
+            .ring
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record(lease_id, nonce, stage, now_ms);
+    }
+
+    pub(crate) fn lease_challenge_trace(&self, lease_id: fr::LeaseId) -> fr::LeaseTraceSnapshot {
+        let now_ms = self.trace.started.elapsed().as_millis() as u64;
+        self.trace
+            .ring
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot(lease_id, now_ms)
+    }
+
     pub(crate) fn record(&self, payload: Option<&wire::envelope::Payload>, written: bool) {
         use wire::envelope::Payload;
         if let Some(Payload::InputBatch(batch)) = payload {
@@ -591,6 +709,12 @@ impl LinkHandle {
         self.lease_diagnostics.snapshot()
     }
 
+    /// Final diagnostic snapshot, with stage ages relative to this connection's clock.
+    /// Retains at most sixteen distinct lease/nonce pairs; sampling may allocate.
+    pub fn lease_challenge_trace(&self, lease_id: fr::LeaseId) -> fr::LeaseTraceSnapshot {
+        self.lease_diagnostics.lease_challenge_trace(lease_id)
+    }
+
     pub(crate) fn lease_diagnostics_counters(&self) -> Arc<LeaseTransportCounters> {
         Arc::clone(&self.lease_diagnostics)
     }
@@ -760,7 +884,7 @@ async fn run(
     let remote = stream.peer_addr().ok();
     let (reader, mut writer) = tokio::io::split(stream);
     let (frames_tx, mut frames_rx) = mpsc::channel::<Result<wire::Envelope, TransportError>>(8);
-    let reader_task = tokio::spawn(read_loop(reader, frames_tx));
+    let reader_task = tokio::spawn(read_loop(reader, frames_tx, Arc::clone(&lease_diagnostics)));
 
     let mut state = LinkState::new(peer, connection_id, key, lease_diagnostics);
     state.remote = remote;
@@ -942,7 +1066,7 @@ impl LinkState {
             tx_seq: 1,
             connection_id,
             announced: false,
-            started: tokio::time::Instant::now(),
+            started: lease_diagnostics.trace.started,
             last_pong_ms: 0,
             last_ping_ms: None,
             ping_nonce: 0,
@@ -1065,6 +1189,7 @@ impl LinkState {
         local_hello: &wire::Hello,
         reports: &mpsc::Sender<LinkReport>,
     ) -> Result<(), LinkDownReason> {
+        self.lease_diagnostics.record_trace(envelope, false, false);
         // «`rx_seq` строго +1. Нарушение приводит к закрытию CONNECTION» counts *every*
         // frame of the peer's direction, and the sender bumps its `tx_seq` for `Ping`
         // and `Pong` as well (they are ordinary envelopes there). Accepting the
@@ -1238,9 +1363,13 @@ impl LinkState {
 async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: ReadHalf<R>,
     frames: mpsc::Sender<Result<wire::Envelope, TransportError>>,
+    lease_diagnostics: Arc<LeaseTransportCounters>,
 ) {
     loop {
         let frame = read_frame(&mut reader).await;
+        if let Ok(envelope) = &frame {
+            lease_diagnostics.record_trace(envelope, true, false);
+        }
         let stop = frame.is_err();
         let queued = frames.send(frame).await;
         if queued.is_err() || stop {
@@ -1429,6 +1558,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
     state.batch_display = batch_display;
     state.tx_seq += 1;
     write_frame(writer, &envelope).await.map_err(reason_from)?;
+    state.lease_diagnostics.record_trace(&envelope, false, true);
     state
         .lease_diagnostics
         .record(envelope.payload.as_ref(), true);

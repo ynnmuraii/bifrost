@@ -6,7 +6,7 @@ fn reports(outputs: &[Output]) -> Vec<LeaseDiagnosticSnapshot> {
     outputs
         .iter()
         .filter_map(|o| match o {
-            Output::LeaseDiagnostic(s) => Some(*s),
+            Output::LeaseDiagnostic(s) => Some(s.clone()),
             _ => None,
         })
         .collect()
@@ -25,7 +25,7 @@ fn source_counts_status_acceptance_and_reports_once_at_expiry() {
     r.handle(20, net(status.clone()));
     r.handle(21, net(status));
     let tick = r.handle(1014, Input::TimerExpired(Timer::LeaseDiagnostic));
-    let s = reports(&tick)[0];
+    let s = &reports(&tick)[0];
     assert!(!s.final_snapshot);
     assert_eq!(s.role, LeaseRole::Source);
     assert_eq!(s.counters.challenge_received, 1);
@@ -63,7 +63,7 @@ fn receiver_counts_accepted_and_replayed_renewals() {
     r.handle(21, net(Message::LeaseRenew { lease_id: L, nonce }));
     let deadline = r.lease().receiver().unwrap().deadline_ms;
     let expired = r.handle(deadline, Input::TimerExpired(Timer::ReceiverLeaseDeadline));
-    let s = reports(&expired)[0];
+    let s = &reports(&expired)[0];
     assert_eq!(s.lease_id, L);
     assert_eq!(s.peer, PEER);
     assert_eq!(s.role, LeaseRole::Receiver);

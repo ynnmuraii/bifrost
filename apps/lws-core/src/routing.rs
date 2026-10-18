@@ -70,7 +70,7 @@ fn effect(output: &fr::Output) -> Effect {
             code: *code,
         },
         fr::Output::Notice(notice) => Effect::Notice(notice.clone()),
-        fr::Output::LeaseDiagnostic(snapshot) => Effect::LeaseDiagnostic(*snapshot),
+        fr::Output::LeaseDiagnostic(snapshot) => Effect::LeaseDiagnostic(snapshot.clone()),
     }
 }
 
