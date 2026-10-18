@@ -1006,7 +1006,10 @@ mod switch_cli_tests {
             ),
             (&["desktop"][..], "switch desktop"),
         ] {
-            assert_eq!(switch_line(&arguments(values)).unwrap(), expected);
+            assert_eq!(
+                switch_line(&arguments(values)).ok().as_deref(),
+                Some(expected)
+            );
         }
         for values in [
             &[][..],
