@@ -1113,6 +1113,82 @@ mod transform_tests {
     }
 
     #[test]
+    fn monitor_pointer_interaction_stays_inside_the_map_clip() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 500.0));
+        let map = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(400.0, 400.0));
+        for (at, pointer, interactive) in [
+            (Pos2::new(50.0, 150.0), Pos2::new(75.0, 200.0), false),
+            (Pos2::new(50.0, 150.0), Pos2::new(150.0, 200.0), true),
+            (Pos2::new(-150.0, 150.0), Pos2::new(25.0, 200.0), false),
+        ] {
+            let ctx = egui::Context::default();
+            super::super::install_fonts(&ctx);
+            let mut st = UiState::new(std::time::Instant::now());
+            let mut node = owner_layout().nodes.remove(0);
+            node.mons.truncate(1);
+            node.mons[0].rect = crate::map::Rect::new(0.0, 0.0, 200.0, 100.0);
+            let pal = Palette::of(Look::default().theme);
+            let xf = Xf {
+                origin: Pos2::ZERO,
+                s: 1.0,
+            };
+            let mut moved = false;
+            for (frame, position, button) in [
+                (0, pointer, None),
+                (1, pointer, None),
+                (2, pointer, Some(true)),
+                (3, pointer + Vec2::new(20.0, 0.0), None),
+                (4, pointer + Vec2::new(20.0, 0.0), Some(false)),
+            ] {
+                let mut events = vec![egui::Event::PointerMoved(position)];
+                if let Some(pressed) = button {
+                    events.push(egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let mut hovered = None;
+                let mut actions = Vec::new();
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(f64::from(frame) * 0.05),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let painter = ui.painter().with_clip_rect(map);
+                        node_ui(
+                            ui,
+                            &painter,
+                            &pal,
+                            &mut st,
+                            &node,
+                            0,
+                            at,
+                            xf,
+                            true,
+                            &mut hovered,
+                            &mut actions,
+                        );
+                    },
+                )
+                .drop_without_applying_deltas();
+                if frame == 1 {
+                    assert_eq!(hovered.is_some(), interactive, "pointer at {pointer:?}");
+                }
+                moved |= actions
+                    .iter()
+                    .any(|action| matches!(action, Action::MoveNode { .. }));
+            }
+            assert_eq!(moved, interactive, "drag starting at {pointer:?}");
+            assert_eq!(st.drag.is_some(), interactive);
+        }
+    }
+
+    #[test]
     fn minimum_paddles_keep_both_resize_ends_and_a_move_grip_at_every_zoom() {
         for scale in [0.315, 0.7, 1.0, 1.5] {
             let points = [
