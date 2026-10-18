@@ -3,6 +3,10 @@
 ## Unreleased
 
 - Register the Wayland app id before portal requests so KDE can attribute emergency shortcuts to Bifrost; report refused or unbound shortcuts with their actual portal reason.
+- Added directional `switch --to local|<peer>` commands; tray returns explicitly to local input rather than toggling against a possibly expired lease.
+- Pairing handshakes abandoned after a window replacement no longer release the new window's pending slot.
+- Late layout verdicts retain their request after its caller disconnects, allowing an applied edit to release the pending slot.
+- Clipboard settings follow pushed status updates without an extra status request.
 
 ## 0.1.2 — 2026-10-18
 
