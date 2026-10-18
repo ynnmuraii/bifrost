@@ -1105,8 +1105,7 @@ mod transform_tests {
         assert!(visible.contains(Pos2::new(150.0, 200.0)));
         assert_eq!(monitor_hit_rect(visible, map), Some(visible));
         for right in [99.0, 100.0] {
-            let outside =
-                Rect::from_min_max(Pos2::new(50.0, 150.0), Pos2::new(right, 250.0));
+            let outside = Rect::from_min_max(Pos2::new(50.0, 150.0), Pos2::new(right, 250.0));
             assert_eq!(monitor_hit_rect(outside, map), None);
         }
         let below = Rect::from_min_max(Pos2::new(150.0, 300.0), Pos2::new(250.0, 350.0));
