@@ -37,6 +37,30 @@ pub const AC_02_BUDGET_MS: u64 = LEASE_TTL_MS + 100;
 /// reported either way, so a real regression is visible even when the assert passes.
 pub const HOST_SLACK_MS: u64 = 100;
 
+/// Preserve both sides' status and log tails before a failed test deletes its roots.
+fn diagnose(context: &str, nodes: &[&Node]) -> String {
+    const TAIL: usize = 80;
+    let mut text = String::from(context);
+    for node in nodes {
+        let status = node.status().map_or_else(
+            |error| format!("<no answer: {error}>"),
+            |status| format!("{status:?}"),
+        );
+        text.push_str(&format!("\n\n=== {} status: {status}\n", node.id));
+        for path in [&node.log, &node.root.join("state/logs/lws-agent.log")] {
+            text.push_str(&format!("=== {} (last {TAIL} lines):\n", path.display()));
+            let log = std::fs::read_to_string(path)
+                .unwrap_or_else(|error| format!("<cannot read log: {error}>"));
+            let skip = log.lines().count().saturating_sub(TAIL);
+            for line in log.lines().skip(skip) {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
 /// The `bifrost` binary under test: every role of it — the daemon, and the agent the
 /// daemon spawns as `bifrost agent …` from its own executable.
 fn core_exe() -> PathBuf {
@@ -1087,6 +1111,9 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", diagnose("two-node test failed", &[&self.a, &self.b]));
+        }
         self.a.stop();
         self.b.stop();
         // `LWS_KEEP_ROOTS=1` leaves the logs behind: a failing fault test is diagnosed
