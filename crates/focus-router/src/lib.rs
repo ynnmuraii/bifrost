@@ -147,7 +147,10 @@ pub mod router;
 pub mod wire;
 
 pub use config::{ConfigError, Timing};
-pub use diagnostics::{LeaseCounters, LeaseDiagnosticSnapshot, LeaseInboundAges, LeaseRole};
+pub use diagnostics::{
+    LeaseCounters, LeaseDiagnosticSnapshot, LeaseInboundAges, LeaseRole, LeaseTraceRing,
+    LeaseTraceSnapshot, LeaseTraceStage,
+};
 pub use flow::{
     AgentCommand, AgentEvent, FocusState, Identifiers, Input, LocalInput, Notice, Output,
     OwnershipState, SequentialIds, SwitchTrigger, Timer, TransitionRefusal,

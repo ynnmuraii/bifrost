@@ -395,7 +395,7 @@ impl<I: Identifiers> FocusRouter<I> {
         let mut applied_status = false;
         for output in out.iter() {
             match output {
-                Output::Send { peer, message } => a.send(*peer, message),
+                Output::Send { peer, message } => a.send(*peer, message, now_ms),
                 Output::ArmTimer {
                     timer: Timer::SourceLeaseWatchdog,
                     deadline_ms,

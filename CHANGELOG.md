@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep all still-valid lease challenge nonces across the supported 300–1000 ms TTL range instead of evicting them after eight challenges. Delayed renew/status responses remain usable for their original TTL window; issue-time deadlines, source watchdog expiry, and terminal receiver expiry are unchanged.
+- Add bounded diagnostics for suspected capture warps and entry-edge returns, and a final per-lease ring of the last 16 challenges across raw decoding, dispatch, renewal writing and acceptance. Diagnostics do not alter input routing, lease deadlines or AC-02.
 - Reduced remote-focus drops during brief TCP stalls: the default input lease is now 1000 ms (configurable from 300–1000 ms), with challenges every min(TTL/5, 100 ms). The fixed budget accommodates a 500 ms stall, not unlimited connection loss; there is no grace period or adaptive extension. Lease deadlines remain anchored to challenge issuance, and default control-return bound is 1100 ms.
 - Wayland display discovery falls back from InputCapture zones to permission-independent xdg-output logical geometry; source selection and failures are logged.
 - Map cards explicitly report when displays are not detected.

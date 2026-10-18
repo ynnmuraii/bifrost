@@ -311,6 +311,17 @@ impl InputDiagnostics {
     }
 }
 
+/// One agent capture frame, not the independently assigned transport envelope sequence.
+#[derive(Clone, Copy, Default)]
+struct CaptureMotionDiagnostics {
+    batch_seq: u64,
+    dx: f64,
+    dy: f64,
+    max_abs_dx: f64,
+    max_abs_dy: f64,
+    large: bool,
+}
+
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
     router: crate::ids::Router,
@@ -1316,6 +1327,13 @@ impl Session {
                     // FSM totals are per lease; socket totals are per connection. Snapshot
                     // before teardown so the final line retains the live transport counters.
                     let transport = self.manager.lease_diagnostics(&snapshot.peer).await;
+                    let transport_challenges = if snapshot.final_snapshot {
+                        self.manager
+                            .lease_challenge_trace(&snapshot.peer, snapshot.lease_id)
+                            .await
+                    } else {
+                        None
+                    };
                     self.input_diagnostics.for_lease(snapshot.lease_id);
                     tracing::info!(
                         peer = %snapshot.peer,
@@ -1327,6 +1345,8 @@ impl Session {
                         fsm = ?snapshot.counters,
                         inbound_ages_ms = ?snapshot.ages,
                         transport_connection = ?transport,
+                        fsm_challenges = ?snapshot.challenge_trace,
+                        transport_challenges = ?transport_challenges,
                         hook_edges = ?self.input_diagnostics.hook,
                         captured_edges = ?self.input_diagnostics.captured,
                         inject_edges = ?self.input_diagnostics.inject,
@@ -2805,6 +2825,61 @@ impl Session {
             }
             AgentSignal::Local(local) => self.feed(fr::Input::Local(local)).await,
             AgentSignal::Captured(batch) => {
+                let mut diagnostic = CaptureMotionDiagnostics {
+                    batch_seq: frame.seq,
+                    ..CaptureMotionDiagnostics::default()
+                };
+                // Observe the unaggregated positions at receive; never feed these values
+                // back into routing. The IPC has absolute samples, not device raw deltas.
+                if let Some((last, bounds)) = self
+                    .local_pointer
+                    .as_ref()
+                    .filter(|_| {
+                        matches!(self.router.lease().source(), Some(lease)
+                        if lease.state == fr::SourceState::Remote)
+                    })
+                    .and_then(|last| {
+                        let bounds = self
+                            .topology
+                            .as_ref()?
+                            .display(&self.node_id, &last.display_id)?
+                            .logical_bounds;
+                        Some((last, bounds))
+                    })
+                {
+                    let mut x = last.x + bounds.x;
+                    let mut y = last.y + bounds.y;
+                    for event in &batch.events {
+                        if let Some(protocol::ipc::local_event::Ev::Pointer(pointer)) = &event.ev {
+                            let dx = pointer.x - x;
+                            let dy = pointer.y - y;
+                            diagnostic.dx += dx;
+                            diagnostic.dy += dy;
+                            diagnostic.max_abs_dx = diagnostic.max_abs_dx.max(dx.abs());
+                            diagnostic.max_abs_dy = diagnostic.max_abs_dy.max(dy.abs());
+                            x = pointer.x;
+                            y = pointer.y;
+                        }
+                    }
+                    diagnostic.large = diagnostic.max_abs_dx > bounds.width / 2.0
+                        || diagnostic.max_abs_dy > bounds.height / 2.0;
+                    if diagnostic.large
+                        || diagnostic.dx.abs() > bounds.width / 2.0
+                        || diagnostic.dy.abs() > bounds.height / 2.0
+                    {
+                        tracing::warn!(
+                            batch_seq = diagnostic.batch_seq,
+                            batch_source_dx = diagnostic.dx,
+                            batch_source_dy = diagnostic.dy,
+                            max_abs_raw_captured_dx = diagnostic.max_abs_dx,
+                            max_abs_raw_captured_dy = diagnostic.max_abs_dy,
+                            source_display = %last.display_id,
+                            source_logical_width = bounds.width,
+                            source_logical_height = bounds.height,
+                            "captured batch delta exceeds half display dimension; suspected warp"
+                        );
+                    }
+                }
                 if let Some(lease) = self.router.lease().source() {
                     if lease.state == fr::SourceState::Remote {
                         self.input_diagnostics.for_lease(lease.lease_id);
@@ -2823,7 +2898,7 @@ impl Session {
                 let events = batch.events;
                 // The tracker needs the display id, which only the wire form has; the
                 // wire itself needs the normalised events.
-                self.track_pointer(&events).await;
+                self.track_pointer(&events, diagnostic).await;
                 let converted: Vec<InputEvent> =
                     events.iter().filter_map(routing::input_event_of).collect();
                 self.forward_captured(converted).await;
@@ -2896,7 +2971,11 @@ impl Session {
     /// фактическую позицию курсора ОС», and a transition is resolved by
     /// `geometry::resolve_motion`, which is also what makes the reverse direction of a
     /// bidirectional link the return edge.
-    async fn track_pointer(&mut self, events: &[protocol::ipc::LocalEvent]) {
+    async fn track_pointer(
+        &mut self,
+        events: &[protocol::ipc::LocalEvent],
+        diagnostic: CaptureMotionDiagnostics,
+    ) {
         // A link the pointer left through while remote waits for the current lease to be
         // released: a chain is two leases, not a relay.
         if matches!(self.router.lease(), fr::LeaseSlot::Idle) {
@@ -2955,7 +3034,7 @@ impl Session {
             };
             self.local_pointer = Some(position.clone());
             if remote {
-                self.track_remote(motion).await;
+                self.track_remote(motion, diagnostic).await;
             } else {
                 self.track_local(position, motion).await;
             }
@@ -3245,7 +3324,11 @@ impl Session {
     /// Remote: the virtual position follows the captured deltas inside the peer's display
     /// until it leaves through the entry edge (the return) or through another link (a
     /// chain).
-    async fn track_remote(&mut self, motion: geometry::Point) {
+    async fn track_remote(
+        &mut self,
+        motion: geometry::Point,
+        diagnostic: CaptureMotionDiagnostics,
+    ) {
         let (Some(node), Some(position), Some(topology)) = (
             self.remote_node,
             self.remote_pointer.clone(),
@@ -3262,11 +3345,44 @@ impl Session {
         let target = transition.target.node;
         let entry_position = transition.target_position;
         let topology_revision = self.router.topology_revision();
+        let attempted_x = position.x + step.x;
+        let attempted_y = position.y + step.y;
         let mut return_effect = None;
         if target == self.node_id {
             // The reverse direction of the link we came in on: back to Local, with the
             // reason the FSM takes from the trigger (`RETURN_EDGE`).
-            tracing::info!("the pointer came back over the entry edge; returning to Local");
+            let bounds = topology
+                .display(&node, &position.display_id)
+                .map(|display| display.logical_bounds);
+            tracing::info!(
+                batch_seq = diagnostic.batch_seq,
+                remote_node = %node,
+                remote_display = %position.display_id,
+                previous_remote_x = position.x,
+                previous_remote_y = position.y,
+                new_remote_x = advanced.x,
+                new_remote_y = advanced.y,
+                attempted_remote_x = attempted_x,
+                attempted_remote_y = attempted_y,
+                source_sample_dx = motion.x,
+                source_sample_dy = motion.y,
+                routed_sample_dx = step.x,
+                routed_sample_dy = step.y,
+                batch_source_dx = diagnostic.dx,
+                batch_source_dy = diagnostic.dy,
+                max_abs_raw_captured_dx = diagnostic.large.then_some(diagnostic.max_abs_dx),
+                max_abs_raw_captured_dy = diagnostic.large.then_some(diagnostic.max_abs_dy),
+                source_edge = ?transition.source.edge,
+                target_edge = ?transition.target.edge,
+                target_display = %entry_position.display_id,
+                target_x = entry_position.x,
+                target_y = entry_position.y,
+                logical_bounds_x = bounds.map(|bounds| bounds.x),
+                logical_bounds_y = bounds.map(|bounds| bounds.y),
+                logical_bounds_width = bounds.map(|bounds| bounds.width),
+                logical_bounds_height = bounds.map(|bounds| bounds.height),
+                "the pointer came back over the entry edge; returning to Local"
+            );
             self.remote_pointer = None;
             self.remote_node = None;
             // Disarm the edge the pointer came home through until it leaves the band: a
