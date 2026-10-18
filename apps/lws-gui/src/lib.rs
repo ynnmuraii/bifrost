@@ -57,9 +57,19 @@ pub const TITLE: &str = "Bifrost";
 /// Everything the window needs before its first frame — the directories, the endpoint,
 /// `config.toml`, the client thread — is resolved by [`app::GuiApp::new`].
 pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
+    // The window's decisions go to a file (`init_logging`): on Windows this role has no
+    // console at all, and "why did the window do that?" is a question about its window.
+    init_logging(&view_model::CliArgs::parse(args.iter().cloned()));
     let instance = match lws_desktop::acquire(lws_desktop::Role::Gui) {
         Ok(lws_desktop::InstanceOutcome::Started(instance)) => instance,
-        Ok(lws_desktop::InstanceOutcome::Existing) => return std::process::ExitCode::SUCCESS,
+        Ok(lws_desktop::InstanceOutcome::Existing) => {
+            // `acquire` has just signalled the window that already exists to show itself.
+            tracing::info!(
+                origin = "single-instance show signal",
+                "another Bifrost window is running: it was asked to show itself"
+            );
+            return std::process::ExitCode::SUCCESS;
+        }
         Err(error) => {
             eprintln!("bifrost gui: single instance: {error}");
             return std::process::ExitCode::FAILURE;
@@ -88,6 +98,10 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
         Box::new(|cc| {
             let ctx = cc.egui_ctx.clone();
             instance.set_show_handler(move || {
+                tracing::info!(
+                    origin = "show signal (tray «Открыть Bifrost», or a second launch)",
+                    "showing the window"
+                );
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -113,6 +127,59 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
             // No console in this role on Windows; the message is for a terminal launch.
             eprintln!("bifrost gui: {error}");
             std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The window's own log: `<state>/logs/lws-gui.log`, rotating as the daemon's does.
+///
+/// On Windows this role is a `windows_subsystem = "windows"` program with no console, so
+/// neither `eprintln!` nor a stderr layer reaches anybody: a person asking "why did the window
+/// do that?" has to be able to open a file. The one thing the window does to its own window —
+/// a close request answered with a minimisation rather than an exit (`app::close_decision`) —
+/// is exactly such a question, and its origin was unknown the last time the owner reported it.
+///
+/// The level and the rotation are `config.toml`'s `[log]` section, read here as the daemon
+/// reads it, so one file of settings covers both roles; `LWS_LOG` overrides either. A host
+/// whose directories cannot be resolved, or whose log directory cannot be opened, keeps
+/// stderr alone rather than refusing to open a window.
+fn init_logging(args: &view_model::CliArgs) {
+    use std::io::IsTerminal;
+
+    let paths = args.resolve().ok();
+    let configured = paths
+        .as_ref()
+        .and_then(|paths| std::fs::read_to_string(paths.config_file()).ok())
+        .and_then(|text| config::Config::from_str(&text).ok());
+    let level = configured
+        .as_ref()
+        .map(|config| match config.log.level {
+            config::LogLevel::Trace => "trace",
+            config::LogLevel::Debug => "debug",
+            config::LogLevel::Info => "info",
+            config::LogLevel::Warn => "warn",
+            config::LogLevel::Error => "error",
+        })
+        .unwrap_or("info");
+    let (max_file_mb, max_files) = configured
+        .as_ref()
+        .map(|config| (config.log.max_file_mb, config.log.max_files))
+        .unwrap_or((5, 5));
+    let sink = paths
+        .as_ref()
+        .and_then(|paths| logging::file_sink(&paths.logs_dir(), "lws-gui", max_file_mb, max_files));
+    let filter = tracing_subscriber::EnvFilter::try_from_env("LWS_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    // The same rule as core and the agent: colour belongs to a stderr terminal, never to the
+    // file (`logging::subscriber`), whose reader is a person or a parser.
+    logging::init(
+        filter,
+        sink.clone().map(logging::file_writer),
+        std::io::stderr().is_terminal(),
+    );
+    if let Some(sink) = sink {
+        if let Ok(path) = sink.lock().map(|file| file.path().to_path_buf()) {
+            tracing::info!(path = %path.display(), "logging to the state directory");
         }
     }
 }

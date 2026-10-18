@@ -897,7 +897,11 @@ fn node_ui(
         (node.os.as_str(), pal.ink2, fam::mono()),
         (
             node.focus.as_str(),
-            if node.target { pal.accent_ink } else { pal.ink2 },
+            if node.target {
+                pal.accent_ink
+            } else {
+                pal.ink2
+            },
             fam::mono_medium(),
         ),
     ] {
