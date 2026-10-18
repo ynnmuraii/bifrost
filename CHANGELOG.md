@@ -1,18 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 — 2026-10-18
 
-- Softened the edge ping-pong guard: an edge the pointer came home through now re-arms after a short retreat (8 logical px) or a pause of ~250 ms without pushing into it, instead of only after leaving a band; a carried-over push is refused for ~180 ms and the guard never outlives the ~250 ms window. Working at the edge no longer locks the crossing out until you move away and wait.
-- Keep all still-valid lease challenge nonces across the supported 300–1000 ms TTL range instead of evicting them after eight challenges. Delayed renew/status responses remain usable for their original TTL window; issue-time deadlines, source watchdog expiry, and terminal receiver expiry are unchanged.
-- Add bounded diagnostics for suspected capture warps and entry-edge returns, and a final per-lease ring of the last 16 challenges across raw decoding, dispatch, renewal writing and acceptance. Diagnostics do not alter input routing, lease deadlines or AC-02.
-- Reduced remote-focus drops during brief TCP stalls: the default input lease is now 1000 ms (configurable from 300–1000 ms), with challenges every min(TTL/5, 100 ms). The fixed budget accommodates a 500 ms stall, not unlimited connection loss; there is no grace period or adaptive extension. Lease deadlines remain anchored to challenge issuance, and default control-return bound is 1100 ms.
-- Wayland display discovery falls back from InputCapture zones to permission-independent xdg-output logical geometry; source selection and failures are logged.
-- Map cards explicitly report when displays are not detected.
-- Paired computers absent from the stored layout now use established-link membership for online status instead of always appearing offline.
-- Core replaces probe estimates with actual agent capture/injection/emergency capabilities. Missing or older InputCapture portals remain receiver-only; Hello advertises source eligibility rather than configuration alone.
-- GUI display queries wait for agent readiness instead of generating a misleading startup `CaptureFailed`.
-- Computers advertise sanitized short OS names; the map keeps OS labels for offline peers.
-- Monitor labels show the native resolution of the current mode plus the scaling percentage (2560x1600 at 150%), while layout and input stay in logical coordinates. Wayland capture zones keep priority and take physical metadata from the matching wl_output/xdg-output output; Windows reports the physical pixels of each monitor with its DPI scale, X11 the RandR monitor rectangle at scale 1. The approximation sign is now left only where the physical size really is unknown.
+- Wayland displays are now detected on GNOME even without screen-capture permission, using the compositor's logical output geometry; failures are reported instead of leaving the map empty.
+- A computer's online status is now the same on both ends of a link, instead of one side showing a paired computer as always offline.
+- Computers that can only receive input (for example GNOME 46, which cannot capture the screen) no longer drop the connection; eligibility is based on the capabilities a computer actually reports.
+- The map labels each computer with its operating system and each monitor with the real resolution and scaling (for example 2560x1600 at 150%), while layout and input stay in logical coordinates.
+- A peer's displays are refreshed after it restarts instead of being treated as stale.
+- The input lease default is raised to 1000 ms (still configurable from 300–1000 ms) and the challenge window is fixed, so brief Wi-Fi stalls no longer end remote control prematurely. This tolerates a short stall, not unlimited connection loss.
+- Returning the pointer across an edge no longer locks that edge out: it re-arms after a short retreat or a brief pause, and a carried-over push is briefly refused.
+- Added diagnostics that record edge returns and lease expiries to help investigate future drops.
 
 ## 0.1.1 — 2026-10-16
 

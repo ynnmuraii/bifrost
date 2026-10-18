@@ -24,11 +24,11 @@ The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–10
 
 ## Download & install
 
-Get **0.1.1** from [Releases](https://github.com/ynnmuraii/MultideskFlow/releases/latest). The release includes `SHA256SUMS.txt` for checking your downloads.
+Get **0.1.2** from [Releases](https://github.com/ynnmuraii/MultideskFlow/releases/latest). The release includes `SHA256SUMS.txt` for checking your downloads.
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.1.1-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.1.2-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable is unsigned. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; computers must be able to reach TCP **47901 and 47902**.
 
@@ -36,10 +36,10 @@ Settings are created automatically in `%APPDATA%\lan-workspace`; logs go to `%LO
 
 ### Linux · x86_64
 
-Download **`bifrost-0.1.1-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.1.2-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.1.1-linux-x86_64.tar.gz
+tar -xzf bifrost-0.1.2-linux-x86_64.tar.gz
 ./install.sh
 ```
 
