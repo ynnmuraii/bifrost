@@ -56,7 +56,7 @@ fn a_claim_from_the_far_node_hands_ownership_over() {
     println!("hand-off: b owns the workspace, old owner released");
 
     // The new owner opens its own lease.
-    cluster.switch(2, 1).expect("the new owner switches");
+    cluster.switch_to(2, 1).expect("the new owner switches");
     cluster
         .node(2)
         .wait_for(
@@ -71,7 +71,7 @@ fn a_claim_from_the_far_node_hands_ownership_over() {
             s.focus == "Remote"
         })
         .expect("the target must receive the lease");
-    cluster.switch(2, 1).expect("and back");
+    cluster.switch_to_local(2).expect("and back");
     for index in [1usize, 2] {
         cluster
             .node(index)
@@ -161,7 +161,7 @@ fn an_offline_node_builds_no_transitions() {
     }
     // Nothing is built towards a node that is not there: a switch is refused, and the
     // refusal is local (no `EnterPrepare` goes anywhere).
-    let refused = cluster.switch(0, 1);
+    let refused = cluster.nodes[0].switch_to(&offline);
     assert!(
         refused.is_err() || refused.as_deref().unwrap_or("").contains("OK"),
         "a switch towards an offline node must not hang: {refused:?}"
@@ -179,17 +179,93 @@ fn an_offline_node_builds_no_transitions() {
     );
 }
 
+/// Directional commands survive repetition and the old observation/return expiry race.
+#[test]
+fn directional_switches_are_idempotent_across_lease_expiry() {
+    let _serial = common::serial();
+    let cluster = Cluster::start("three-directional");
+    cluster.wait_mesh(Duration::from_secs(40));
+
+    let entries_before: Vec<_> = cluster.nodes.iter().map(remote_entries).collect();
+    for _ in 0..2 {
+        cluster
+            .switch_to_local(0)
+            .expect("already Local is a no-op");
+        cluster.assert_idle();
+    }
+    assert_eq!(
+        cluster.nodes.iter().map(remote_entries).collect::<Vec<_>>(),
+        entries_before,
+        "returning while Local must never open a lease"
+    );
+
+    cluster.switch_to(0, 1).expect("enter the receiver");
+    for index in [0, 1] {
+        cluster
+            .node(index)
+            .wait_for("endpoint is Remote", Duration::from_secs(15), |s| {
+                s.focus == "Remote"
+            })
+            .expect("both endpoints enter Remote");
+    }
+    let entries_remote: Vec<_> = cluster.nodes.iter().map(remote_entries).collect();
+    for _ in 0..2 {
+        cluster.switch_to(0, 1).expect("same-peer entry is a no-op");
+        let source = cluster.node(0).status().expect("source status");
+        assert_eq!(source.focus, "Remote", "{source:?}");
+        assert_eq!(source.peer, cluster.node(1).id, "{source:?}");
+    }
+    assert_eq!(
+        cluster.nodes.iter().map(remote_entries).collect::<Vec<_>>(),
+        entries_remote,
+        "repeated entry must preserve the existing lease, not reopen it"
+    );
+
+    // Observe Remote, then force expiry before sending the intended return. The toggling
+    // verb used to reinterpret itself from the state it found and reopen Remote; the
+    // directional one cannot, without any desktop input or timing sleep.
+    let expiry_before = chain_expiries(&cluster);
+    assert_eq!(
+        cluster.node(0).status().expect("observed source").focus,
+        "Remote"
+    );
+    cluster.node(1).suspend().expect("freeze the receiver");
+    let expired = cluster.node(0).wait_for(
+        "source expires the unresponsive receiver",
+        Duration::from_secs(15),
+        |s| s.is_idle(),
+    );
+    cluster.node(1).resume().expect("resume the receiver");
+    expired.expect("the observed Remote lease expires before return");
+    settle_expired_chain(&cluster);
+    assert!(
+        chain_expiries(&cluster) > expiry_before,
+        "the regression must exercise actual lease expiry"
+    );
+    for _ in 0..2 {
+        cluster
+            .switch_to_local(0)
+            .expect("late return remains Local");
+        cluster.assert_idle();
+    }
+    assert_eq!(
+        cluster.nodes.iter().map(remote_entries).collect::<Vec<_>>(),
+        entries_remote,
+        "a late return must not create the replacement lease the old toggle race made"
+    );
+}
+
 /// One walk of the chain: `w` -> `a`, release, `w` -> `b`, release.
 ///
-/// A switch while `Remote` is the *return* edge (`scenarios.rs::s07`), so the second lease
-/// starts from `Local` — which is exactly the shape of the pending-target walk: the
-/// re-target is applied once the first lease is released.
+/// Entry and return are directional: a `switch --to` names the destination, so a lease that
+/// expired between two commands cannot turn a return request into a replacement lease (a
+/// toggling `switch` did exactly that when the harness read a stale status first).
 fn chain_once(cluster: &Cluster) -> bool {
     let expiry_before = chain_expiries(cluster);
     for receiver in [1, 2] {
         let remote_before = remote_entries(cluster.node(receiver));
         cluster
-            .switch(0, receiver)
+            .switch_to(0, receiver)
             .expect("owner switches to receiver");
         let deadline = Instant::now() + Duration::from_secs(15);
         // A CLI Status poll can miss the entire valid lease during a host stall.
@@ -205,7 +281,7 @@ fn chain_once(cluster: &Cluster) -> bool {
         let source = cluster.node(0).status().expect("source status");
         if source.focus == "Remote" {
             cluster
-                .switch(0, receiver)
+                .switch_to_local(0)
                 .expect("owner returns from receiver");
         } else {
             assert!(
@@ -248,18 +324,11 @@ fn chain_expiries(cluster: &Cluster) -> usize {
 }
 
 fn settle_expired_chain(cluster: &Cluster) {
-    // A stall between status and the return toggle can start a replacement lease.
-    let source = cluster.node(0).status().expect("source after expiry");
-    if source.focus == "Remote" {
-        let receiver = cluster
-            .nodes
-            .iter()
-            .position(|node| node.id == source.peer)
-            .expect("replacement lease names a cluster receiver");
-        cluster
-            .switch(0, receiver)
-            .expect("release replacement lease");
-    }
+    // Local remains a return even if another endpoint already expired the lease, and a
+    // directional return cannot start the replacement lease the old toggle could.
+    cluster
+        .switch_to_local(0)
+        .expect("release any remaining lease");
     for node in &cluster.nodes {
         node.wait_for("expired chain safely Local", Duration::from_secs(15), |s| {
             s.is_idle()
