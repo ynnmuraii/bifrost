@@ -280,6 +280,7 @@ impl Wayland {
         restore_tokens: &[protocol::ipc::PortalGrant],
         portal_progress: &tokio::sync::mpsc::UnboundedSender<protocol::ipc::agent_frame::Msg>,
     ) -> Result<(Self, Ready, Vec<Refusal>), Refusal> {
+        platform_wayland::appid::register().await;
         let mut refusals = Vec::new();
 
         let compositor = Compositor::detect().map_err(|error| fatal(&error))?;
@@ -326,16 +327,22 @@ impl Wayland {
         let initial = match portal_trigger(&hotkeys.emergency_release) {
             Ok(trigger) => EmergencyShortcuts::register(&trigger)
                 .await
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error),
+                .map_err(|error| Refusal {
+                    code: portal_code(&error),
+                    detail: error.to_string(),
+                }),
+            Err(error) => Err(Refusal {
+                code: "PORTAL_DENIED",
+                detail: error,
+            }),
         };
         let shortcuts = match initial {
             Ok(shortcuts) => Some(shortcuts),
             Err(error) => {
                 refusals.push(Refusal {
-                    code: "PORTAL_UNAVAILABLE",
+                    code: error.code,
                     detail: format!(
-                        "global shortcuts are not available: {error}; this node cannot be the source while require_emergency_hotkey is true"
+                        "global shortcuts are not available: {}; this node cannot be the source while require_emergency_hotkey is true", error.detail
                     ),
                 });
                 None
@@ -1343,6 +1350,7 @@ fn refine_capabilities(
 /// PORTAL_UNAVAILABLE, PORTAL_SESSION_LOST, PORTAL_FRONTEND_STUCK, …`).
 fn portal_code(error: &WaylandError) -> &'static str {
     match error {
+        WaylandError::HotkeyNotGranted { .. } => "PORTAL_DENIED",
         WaylandError::Portal(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
             "PORTAL_DENIED"
         }
@@ -1382,6 +1390,28 @@ fn fatal(error: &WaylandError) -> Refusal {
 #[cfg(test)]
 mod activation_tests {
     use super::*;
+
+    #[test]
+    fn dismissed_and_unbound_shortcuts_are_denied_not_unavailable() {
+        assert_eq!(
+            portal_code(&WaylandError::Portal(ashpd::Error::Response(
+                ashpd::desktop::ResponseError::Cancelled,
+            ))),
+            "PORTAL_DENIED"
+        );
+        assert_eq!(
+            portal_code(&WaylandError::HotkeyNotGranted {
+                missing: "emergency (CTRL+F12)".to_owned(),
+            }),
+            "PORTAL_DENIED"
+        );
+        assert_eq!(
+            portal_code(&WaylandError::HotkeyUnavailable {
+                portal_interface: platform_wayland::GLOBAL_SHORTCUTS_INTERFACE,
+            }),
+            "PORTAL_UNAVAILABLE"
+        );
+    }
     #[test]
     fn portal_trigger_uses_xdg_modifier_and_keysym_names() {
         assert_eq!(

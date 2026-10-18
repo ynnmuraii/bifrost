@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Register the Wayland app id before portal requests so KDE can attribute emergency shortcuts to Bifrost; report refused or unbound shortcuts with their actual portal reason.
+
 ## 0.1.2 — 2026-10-18
 
 - Wayland displays are now detected on GNOME even without screen-capture permission, using the compositor's logical output geometry; failures are reported instead of leaving the map empty.
