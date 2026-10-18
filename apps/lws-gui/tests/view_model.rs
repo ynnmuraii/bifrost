@@ -788,6 +788,49 @@ fn appearance_toggles_send_both_values_and_follow_authoritative_status() {
 }
 
 #[test]
+fn a_clipboard_toggle_follows_the_pushed_status_without_asking_again() {
+    for push_first in [false, true] {
+        let mut vm = view();
+        let mut initial = status_with("LOCAL");
+        initial.clipboard_enabled = false;
+        vm.apply(event(Msg::Status(initial)));
+
+        vm.local(&Action::SetClipboard(true));
+        let id = vm.begin_request(Request::SetClipboard, Instant::now());
+        let mut status = status_with("LOCAL");
+        status.clipboard_enabled = true;
+        if push_first {
+            // Core commits the toggle and pushes the Status before the OpResult.
+            vm.apply(event(Msg::Status(status.clone())));
+            assert!(
+                vm.settings.clipboard_pending.is_none(),
+                "the pushed status settles the switch on its own"
+            );
+        }
+        vm.apply(answer(
+            id,
+            Msg::OpResult(protocol::ipc::OpResult {
+                ok: true,
+                error_code: String::new(),
+            }),
+        ));
+        assert!(
+            vm.take_outgoing().is_empty(),
+            "the window must not re-query the status it was just pushed"
+        );
+        if !push_first {
+            assert!(
+                !vm.status.as_ref().unwrap().clipboard_enabled,
+                "a bare OpResult announces no value"
+            );
+            vm.apply(event(Msg::Status(status)));
+        }
+        assert!(vm.status.as_ref().unwrap().clipboard_enabled);
+        assert!(vm.settings.clipboard_pending.is_none());
+    }
+}
+
+#[test]
 fn a_clipboard_refusal_is_explained_where_the_switch_is() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
