@@ -694,7 +694,7 @@ pub fn warn(ui: &mut Ui, pal: &Palette, add: impl FnOnce(&mut Ui)) {
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                text(ui, "!", 14.0, fam::pixel(), pal.accent);
+                text(ui, "!", 14.0, fam::pixel(), pal.accent_ink);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
                     add(ui);

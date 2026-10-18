@@ -259,7 +259,7 @@ fn header(
         0.0,
         mono(pal.ink2, fam::mono()),
     );
-    job.append(&bar, 0.0, mono(pal.accent, fam::mono()));
+    job.append(&bar, 0.0, mono(pal.accent_ink, fam::mono()));
     job.append(&pad, 0.0, mono(pal.ink2, fam::mono()));
     job.append("] ", 0.0, mono(pal.ink2, fam::mono()));
     if show_done {

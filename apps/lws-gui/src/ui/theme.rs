@@ -52,8 +52,15 @@ pub struct Palette {
     pub line: Color32,
     /// `--scrim`.
     pub scrim: Color32,
-    /// `--accent`.
+    /// `--accent`, for everything that is a shape: a fill, a border, the bridge, the glow.
     pub accent: Color32,
+    /// The accent as the ink of *text*: the pairing countdown, the «ввод» tag, a map notice.
+    ///
+    /// Small text needs WCAG AA (4.5:1) on what it sits on, and `--accent` reaches ~3:1 on
+    /// the light theme's paper — an accent orange is a light colour, so its own hue has to
+    /// darken to be read at 10 px. The dark theme's near-black is far enough from the accent
+    /// that the same orange is already legible there, and both are one design.
+    pub accent_ink: Color32,
     /// `--accent-soft`.
     pub accent_soft: Color32,
     /// `--glow`.
@@ -99,6 +106,10 @@ impl Palette {
                     line: rgba(17, 17, 14, 0.26),
                     scrim: rgba(250, 250, 248, 0.66),
                     accent: rgb(0xFF5A2E),
+                    // The accent darkened until it is AA on the paper (5.5:1), on a card
+                    // (5.7:1) and on the soft accent chip the «ввод» tag is read in (4.9:1);
+                    // #C2410C, the natural first guess, is 4.47:1 on that chip.
+                    accent_ink: rgb(0xB93A0A),
                     accent_soft: rgba(255, 90, 46, 0.12),
                     glow: rgba(255, 90, 46, 0.2),
                     on_accent: rgb(0x111111),
@@ -122,6 +133,9 @@ impl Palette {
                     line: rgba(238, 236, 228, 0.28),
                     scrim: rgba(8, 8, 8, 0.62),
                     accent: rgb(0xFF5A2E),
+                    // 6.3:1 on the dark page and 6.0:1 on a dark card: the accent itself is
+                    // the theme's legible text orange, so both tokens are one colour.
+                    accent_ink: rgb(0xFF5A2E),
                     accent_soft: rgba(255, 90, 46, 0.13),
                     glow: rgba(255, 90, 46, 0.28),
                     on_accent: rgb(0x0B0B0A),
@@ -283,7 +297,7 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     visuals.window_stroke = Stroke::new(1.0, pal.line);
     visuals.selection.bg_fill = pal.accent_soft;
     visuals.selection.stroke = Stroke::new(1.0, pal.accent);
-    visuals.hyperlink_color = pal.accent;
+    visuals.hyperlink_color = pal.accent_ink;
     visuals.window_corner_radius = pal.rad();
     visuals.menu_corner_radius = pal.rad_sm();
     visuals.striped = false;
@@ -356,6 +370,7 @@ mod tests {
                 self.line,
                 self.scrim,
                 self.accent,
+                self.accent_ink,
                 self.accent_soft,
                 self.glow,
                 self.on_accent,
@@ -404,7 +419,8 @@ mod tests {
     #[test]
     fn the_light_ink_is_legible_on_the_paper_and_the_surface() {
         let light = Palette::of(Theme::Light);
-        // Body text and the dim ink, on the page and on a card laid over it: WCAG AA.
+        // Body text and the dim ink, on the page and on a card laid over it: WCAG AA. The
+        // accent as text has its own test below, in both themes.
         for (name, ink) in [("ink", light.ink), ("ink2", light.ink2)] {
             for (under, surface) in [("bg", light.bg), ("card", light.card)] {
                 let ratio = contrast(ink, surface);
@@ -414,6 +430,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The accent-coloured *text* of both themes, on the page and on a card.
+    ///
+    /// The light theme's `--accent` is a light orange: 2.98:1 on its own paper, which is a
+    /// shape's ratio and not a 10 px label's. `accent_ink` is the token that carries such a
+    /// label, and this test is what keeps it from drifting back.
+    #[test]
+    fn the_accent_ink_is_legible_on_the_page_and_the_surface_in_both_themes() {
+        for theme in [Theme::Light, Theme::Dark] {
+            let pal = Palette::of(theme);
+            for (under, surface) in [("bg", pal.bg), ("card", pal.card)] {
+                let ratio = contrast(pal.accent_ink, surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme:?}'s accent_ink on {under} is {ratio:.2}:1, under WCAG AA's 4.5:1"
+                );
+            }
+        }
+        // The dark theme has no second colour to spend: its accent is already legible on its
+        // near-black. The light theme needs one, and the token is what makes that explicit.
+        let (light, dark) = (Palette::of(Theme::Light), Palette::of(Theme::Dark));
+        assert_eq!(dark.accent_ink, dark.accent);
+        assert_ne!(light.accent_ink, light.accent);
+        assert!(
+            contrast(light.accent_ink, light.bg) > contrast(light.accent, light.bg),
+            "the light theme's accent_ink must be the darker of the two"
+        );
     }
 
     #[test]
