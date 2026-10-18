@@ -204,6 +204,36 @@ fn a_follower_edit_is_applied_by_the_coordinator_and_replicated() {
     harness.b.stop();
 }
 
+#[test]
+fn a_late_applied_verdict_releases_the_abandoned_edit() {
+    let _guard = common::serial();
+    let harness = Harness::start(false, true);
+    harness.wait_linked();
+    let path = edit_file(&harness, "late.toml", "eDP-1");
+
+    harness.a.suspend().expect("pause the coordinator");
+    let reply = harness.b.ctl(&format!("layout edit {path}"));
+    // Keep the coordinator paused past the waiter's timeout and a pruning tick.
+    std::thread::sleep(Duration::from_millis(250));
+    let resumed = harness.a.resume();
+    resumed.expect("resume the coordinator even if the request failed");
+    assert!(
+        reply.unwrap_err().contains("PENDING_VERDICT"),
+        "the waiter must give up before the applied verdict"
+    );
+    wait_layout(&harness.b, "the late verdict releases the edit", |line| {
+        field(line, "pending") == "no"
+    });
+    assert!(!pending_file(&harness.b).exists());
+
+    let path = edit_file(&harness, "next.toml", "next-display");
+    let reply = harness
+        .b
+        .ctl(&format!("layout edit {path}"))
+        .expect("the next edit is not blocked by the abandoned pending slot");
+    assert!(reply.starts_with("OK applied revision="), "{reply}");
+}
+
 /// The partition case: an edit on each side while the link is blackholed, then a heal.
 ///
 /// `docs/03-architecture.md`: «после партиции координатор забирает победившую ревизию у её
