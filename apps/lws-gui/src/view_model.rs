@@ -1324,12 +1324,15 @@ impl ViewModel {
             ));
         }
         self.editor.editable = status.layout_editable;
-        // The status is the truth about the clipboard once no toggle is on the wire.
+        // The pushed status settles the clipboard switch even while its own `SetClipboard`
+        // is still on the wire: core commits the toggle and then answers, so the window must
+        // not wait for the `OpResult` (or ask again) to leave the pending state.
         if self.settings.clipboard_pending.is_some()
-            && !self
-                .inflight
-                .iter()
-                .any(|inflight| inflight.request == Request::SetClipboard)
+            && (self.settings.clipboard_pending == Some(status.clipboard_enabled)
+                || !self
+                    .inflight
+                    .iter()
+                    .any(|inflight| inflight.request == Request::SetClipboard))
         {
             self.settings.clipboard_pending = None;
         }
@@ -1539,11 +1542,6 @@ impl ViewModel {
                     let id = self.begin_request(Request::GetClipboardHistory, Instant::now());
                     self.outgoing
                         .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
-                }
-                Request::SetClipboard if self.settings.clipboard_pending.is_some() => {
-                    // The core has not pushed the new state: ask for it.
-                    let id = self.begin_request(Request::GetStatus, Instant::now());
-                    self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
                 }
                 Request::SetAppearance => {
                     let id = self.begin_request(Request::GetStatus, Instant::now());
