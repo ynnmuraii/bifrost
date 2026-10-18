@@ -54,7 +54,7 @@ pub struct Documents<'a> {
 pub struct InactiveLink {
     /// The authored link id ([`geometry::TransitionLink::id`]).
     pub id: LinkId,
-    /// The endpoints whose display is currently unknown.
+    /// The endpoints whose display is currently unknown; empty for an unresolved auto link.
     pub missing: Vec<MissingDisplay>,
 }
 
@@ -78,7 +78,7 @@ pub struct MissingDisplay {
 pub struct Built {
     /// The document `geometry` resolves against: only links whose endpoints are present.
     pub topology: Topology,
-    /// The configured links left out of `topology`, in document order.
+    /// The configured links left out of `topology`, including unresolved auto links.
     pub inactive: Vec<InactiveLink>,
 }
 
@@ -191,6 +191,14 @@ pub fn build(documents: &Documents<'_>) -> Result<Built, BuildError> {
             "auto layout link unresolved: a node it names reports no display on that edge"
         );
     }
+    let mut inactive: Vec<InactiveLink> = resolution
+        .unresolved
+        .into_iter()
+        .map(|id| InactiveLink {
+            id,
+            missing: Vec::new(),
+        })
+        .collect();
     let Topology {
         revision,
         author,
@@ -200,10 +208,7 @@ pub fn build(documents: &Documents<'_>) -> Result<Built, BuildError> {
     let topology = Topology::new(revision, author, nodes, resolution.links);
 
     match geometry::validate_topology(&topology) {
-        Ok(()) => Ok(Built {
-            topology,
-            inactive: Vec::new(),
-        }),
+        Ok(()) => Ok(Built { topology, inactive }),
         Err(errors) => {
             // `UnknownDisplay` is the only soft error: it names a link that cannot resolve
             // because the monitor is not reported, which says nothing about the rest of the
@@ -230,13 +235,10 @@ pub fn build(documents: &Documents<'_>) -> Result<Built, BuildError> {
                 return Err(BuildError::Invalid(fatal));
             }
 
-            let inactive: Vec<InactiveLink> = missing
-                .iter()
-                .map(|(index, missing)| InactiveLink {
-                    id: topology.links[*index].id.clone(),
-                    missing: missing.clone(),
-                })
-                .collect();
+            inactive.extend(missing.iter().map(|(index, missing)| InactiveLink {
+                id: topology.links[*index].id.clone(),
+                missing: missing.clone(),
+            }));
             let kept = topology
                 .links
                 .into_iter()
@@ -2773,6 +2775,52 @@ bidirectional = true
         )
         .expect("the active link still resolves");
         assert_eq!(transition.target.node, NodeId::new(peer_id()));
+    }
+
+    #[test]
+    fn unresolved_auto_link_stays_inactive_until_both_desktops_report_displays() {
+        let config = auto_layout(&[NodeId::new(peer_id())]).expect("one peer");
+        let local = [info(
+            "eDP-1",
+            [0.0, 0.0, 1920.0, 1080.0],
+            [0, 0, 1920, 1080],
+            true,
+        )];
+        for missing_source in [false, true] {
+            let peers = [(
+                NodeId::new(peer_id()),
+                if missing_source {
+                    vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)]
+                } else {
+                    Vec::new()
+                },
+            )];
+            let built = build(&Documents {
+                local_node_id: local_id(),
+                topology: &config,
+                local_displays: if missing_source { &[] } else { &local },
+                peer_displays: &peers,
+            })
+            .expect("unresolved auto is not fatal");
+            assert!(built.topology.links.is_empty());
+            assert_eq!(built.inactive.len(), 1);
+            assert_eq!(built.inactive[0].id.as_str(), DEFAULT_LINK_ID);
+            assert!(built.inactive[0].missing.is_empty());
+        }
+        let peers = [(
+            NodeId::new(peer_id()),
+            vec![wire_display("DP-1", [0.0, 0.0, 2560.0, 1440.0], true)],
+        )];
+        let built = build(&Documents {
+            local_node_id: local_id(),
+            topology: &config,
+            local_displays: &local,
+            peer_displays: &peers,
+        })
+        .expect("resolved auto");
+        assert!(built.inactive.is_empty());
+        assert_eq!(built.topology.links.len(), 1);
+        assert_eq!(config.links.len(), 1, "the authored link is retained");
     }
 
     #[test]
