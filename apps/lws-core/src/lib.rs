@@ -14,7 +14,7 @@
 //!                   [--listen IP] [--port-input N] [--port-clipboard N]
 //!   peers    [--revoke NODE_ID]
 //!   status
-//!   switch   <peer id|display name>
+//!   switch   <peer id|display name> | [--to local|<peer id|display name>]
 //! ```
 //!
 //! `pair` and `peers` work offline against the configuration directory; `status` and
@@ -137,7 +137,7 @@ COMMANDS:
     pair     pair with a peer: --open (listen) or --dial <ip:port>
     peers    list trusted peers, or --revoke <node id>
     status   ask a running core for its state
-    switch   manual transition: to a peer while local, back to local while remote
+    switch   toggle with <peer>; set the direction with --to local|<peer>
     claim    take ownership of the workspace on this node
     abandon  give up ownership and stay a follower
     layout   the layout document: show | edit <file> | apply | discard
@@ -231,13 +231,7 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
             };
             control(&args.paths, &line)
         }
-        "switch" => {
-            let peer = args
-                .rest
-                .first()
-                .ok_or_else(|| Failure::Usage("switch needs a peer".to_owned()))?;
-            control(&args.paths, &format!("switch {peer}"))
-        }
+        "switch" => control(&args.paths, &switch_line(&args.rest)?),
         // `GuiFrame.ClaimOwnership`/`AbandonOwnership` through the same line protocol the
         // GUI will use; the three-node harness claims from a script with these.
         "claim" => control(&args.paths, "claim"),
@@ -972,6 +966,60 @@ fn control_if_running(paths: &Paths, line: &str) -> Result<bool, Failure> {
     match ctl::Response::parse(&reply) {
         Ok(ctl::Response::Error { code, .. }) => Err(Failure::Run(code)),
         _ => Ok(true),
+    }
+}
+
+/// The control line one `switch` invocation turns into.
+///
+/// Two spellings, one verb: `switch <peer>` keeps toggling on the state the core finds, while
+/// `switch --to local|<peer>` names the destination (`ctl::Request::SwitchTo`). The former's
+/// `--`-prefixed guard keeps a mistyped flag from being dialled as a peer id.
+fn switch_line(arguments: &[String]) -> Result<String, Failure> {
+    match arguments {
+        [flag, target] if flag == "--to" && !target.trim().is_empty() => {
+            Ok(format!("switch --to {target}"))
+        }
+        [peer] if !peer.starts_with("--") && !peer.trim().is_empty() => {
+            Ok(format!("switch {peer}"))
+        }
+        _ => Err(Failure::Usage(
+            "switch takes <peer> or --to local|<peer>".to_owned(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod switch_cli_tests {
+    use super::switch_line;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn accepts_the_direction_and_the_legacy_toggle() {
+        for (values, expected) in [
+            (&["--to", "local"][..], "switch --to local"),
+            (
+                &["--to", "office desktop"][..],
+                "switch --to office desktop",
+            ),
+            (&["desktop"][..], "switch desktop"),
+        ] {
+            assert_eq!(switch_line(&arguments(values)).unwrap(), expected);
+        }
+        for values in [
+            &[][..],
+            &["--to"][..],
+            &["--to", "  "][..],
+            &["peer", "extra"][..],
+            &["--local"][..],
+        ] {
+            assert!(
+                switch_line(&arguments(values)).is_err(),
+                "{values:?} is not a switch invocation"
+            );
+        }
     }
 }
 

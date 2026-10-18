@@ -96,6 +96,12 @@ pub enum Request {
     Status,
     /// Ask for a manual transition to a peer.
     Switch(PeerRef),
+    /// Set the destination without toggling; `None` means local input.
+    ///
+    /// `switch <peer>` decides from the state it finds, so a caller that read the status and
+    /// then issued the verb races the lease: the same command can start *and* return a
+    /// transition. Naming the destination removes the observation entirely.
+    SwitchTo(Option<PeerRef>),
     /// Ask this node to own the workspace (`GuiFrame.ClaimOwnership`): the same path as
     /// the claim hotkey or the GUI button, and the only way a node claims in a test.
     Claim,
@@ -165,6 +171,17 @@ impl Request {
             "quit" if argument.is_empty() => Ok(Request::Quit),
             "reset-portals" if argument.is_empty() => Ok(Request::ResetPortals),
             "reset-portals" => Err("reset-portals takes no argument".to_owned()),
+            "switch" if argument == "--to" => Err("switch --to needs local or a peer".to_owned()),
+            "switch" if argument.starts_with("--to ") => {
+                let target = argument["--to ".len()..].trim();
+                if target.is_empty() {
+                    Err("switch --to needs local or a peer".to_owned())
+                } else {
+                    Ok(Request::SwitchTo(
+                        (target != "local").then(|| PeerRef::new(target)),
+                    ))
+                }
+            }
             "switch" if !argument.is_empty() => Ok(Request::Switch(PeerRef::new(argument))),
             "switch" => Err("switch needs a peer id or display name".to_owned()),
             "pair-open" if argument.is_empty() => Ok(Request::PairOpen(None)),
@@ -462,6 +479,23 @@ mod tests {
             )))
         );
         assert!(Request::parse("switch").is_err());
+        // `switch --to` names the destination instead of toggling on the observed state, and
+        // `local` is the only spelling that means "no peer" — a peer id is never `local`.
+        assert_eq!(
+            Request::parse("switch --to local"),
+            Ok(Request::SwitchTo(None))
+        );
+        assert_eq!(
+            Request::parse("switch --to  office desktop "),
+            Ok(Request::SwitchTo(Some(PeerRef::new("office desktop"))))
+        );
+        assert_eq!(
+            Request::parse("switch --to local"),
+            Ok(Request::SwitchTo(None)),
+            "a repeated directional request must not become a toggle"
+        );
+        assert!(Request::parse("switch --to").is_err());
+        assert!(Request::parse("switch --to   ").is_err());
         // The GUI's two ownership buttons, reachable from the CLI so a harness can claim.
         assert_eq!(Request::parse("claim"), Ok(Request::Claim));
         assert_eq!(Request::parse("  abandon "), Ok(Request::Abandon));

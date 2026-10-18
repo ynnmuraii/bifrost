@@ -541,10 +541,12 @@ impl Session {
                 self.reply_handled(request_id, out, handled).await;
             }
             Msg::SwitchTo(switch) => {
-                // The same path as `lws-core switch <peer>`: one FSM transition, one verdict.
-                let response = self
-                    .switch_to(&crate::command::PeerRef::new(switch.peer))
-                    .await;
+                // «Передать ввод» names its destination: a peer, or nothing at all for the
+                // return home. The tray used to name the active peer on the way back, which
+                // made its own repeated press a toggle (see `Session::switch_direction`).
+                let peer =
+                    (!switch.peer.is_empty()).then(|| crate::command::PeerRef::new(switch.peer));
+                let response = self.switch_direction(peer.as_ref()).await;
                 answer(&out, request_id, Msg::OpResult(op_result(&response))).await;
             }
             Msg::LayoutAuto(_) => {

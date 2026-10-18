@@ -76,6 +76,112 @@ impl LayoutSource {
     }
 }
 
+/// What `switch --to <peer>` must do with the lease as it is right now.
+///
+/// The decision is made where the lease lives (the session loop), never by looking at a
+/// status from somewhere else: `switch` on its own asks the FSM to reinterpret the same
+/// command, so a status that went stale between the two calls turned a "return home" into a
+/// fresh crossing to whichever peer the status had named.
+#[derive(Debug, PartialEq, Eq)]
+enum DirectionalPeerAction {
+    /// No lease, and none being prepared: the transition starts.
+    Start,
+    /// The lease already targets this peer and is past `Preparing`: nothing to do.
+    Stay,
+    /// A lease exists towards somebody else, or one is in flight: refuse instead of toggling.
+    Busy,
+}
+
+fn directional_peer_action(
+    lease: &fr::LeaseSlot,
+    target: NodeId,
+    pending: bool,
+) -> DirectionalPeerAction {
+    match lease {
+        fr::LeaseSlot::Idle if !pending => DirectionalPeerAction::Start,
+        fr::LeaseSlot::Source(lease)
+            if lease.peer == target
+                && !pending
+                && matches!(
+                    lease.state,
+                    fr::SourceState::Preparing | fr::SourceState::Remote
+                ) =>
+        {
+            DirectionalPeerAction::Stay
+        }
+        _ => DirectionalPeerAction::Busy,
+    }
+}
+
+#[cfg(test)]
+mod directional_action_tests {
+    use super::{directional_peer_action, DirectionalPeerAction};
+    use focus_router as fr;
+    use geometry::NodeId;
+
+    fn target() -> NodeId {
+        NodeId::new([1; 32])
+    }
+
+    fn other() -> NodeId {
+        NodeId::new([2; 32])
+    }
+
+    /// The source lease is built by the FSM's own constructor, so the test cannot drift
+    /// from the states the router really produces.
+    fn lease_to(peer: NodeId, state: fr::SourceState) -> fr::LeaseSlot {
+        let mut lease = fr::SourceLease::new(
+            [7; 16],
+            peer,
+            0,
+            geometry::Position::new("d".to_owned(), 0.0, 0.0),
+            0,
+        );
+        lease.state = state;
+        fr::LeaseSlot::Source(Box::new(lease))
+    }
+
+    #[test]
+    fn an_idle_node_starts_towards_the_named_peer() {
+        assert_eq!(
+            directional_peer_action(&fr::LeaseSlot::Idle, target(), false),
+            DirectionalPeerAction::Start
+        );
+    }
+
+    #[test]
+    fn repeating_the_same_destination_stays_instead_of_toggling() {
+        for state in [fr::SourceState::Preparing, fr::SourceState::Remote] {
+            assert_eq!(
+                directional_peer_action(&lease_to(target(), state), target(), false),
+                DirectionalPeerAction::Stay
+            );
+        }
+    }
+
+    #[test]
+    fn another_peer_or_a_lease_in_flight_is_busy() {
+        assert_eq!(
+            directional_peer_action(&lease_to(other(), fr::SourceState::Remote), target(), false),
+            DirectionalPeerAction::Busy
+        );
+        assert_eq!(
+            directional_peer_action(
+                &lease_to(target(), fr::SourceState::Releasing),
+                target(),
+                false
+            ),
+            DirectionalPeerAction::Busy,
+            "a lease on its way out is not a lease to stay in"
+        );
+        assert_eq!(
+            directional_peer_action(&fr::LeaseSlot::Idle, target(), true),
+            DirectionalPeerAction::Busy,
+            "a chained crossing is already on its way to that peer"
+        );
+    }
+}
+
 #[cfg(test)]
 mod layout_source_tests {
     use super::LayoutSource;
@@ -3707,6 +3813,7 @@ impl Session {
                 ctl::Response::Stopping.into()
             }
             ctl::Request::Switch(peer) => self.switch_to(&peer).await.into(),
+            ctl::Request::SwitchTo(peer) => self.switch_direction(peer.as_ref()).await.into(),
             ctl::Request::Revoke(peer) => self.revoke_peer_ref(&peer).await.into(),
             ctl::Request::Claim => self.claim().await.into(),
             ctl::Request::Abandon => self.abandon().await.into(),
@@ -3833,6 +3940,58 @@ impl Session {
                 detail: reason,
             },
             None => ctl::Response::Switched(peer.clone()),
+        }
+    }
+
+    /// `switch --to local|<peer>`: make the *destination* the request, not the transition.
+    ///
+    /// The decision happens here, on the session loop, against the lease this node holds
+    /// right now — never by observing a `status` and then issuing the toggling `switch`.
+    /// That observation is exactly what turned a "return home" into a fresh crossing when the
+    /// lease expired between the two commands (the three-node chain harness reproduced it):
+    /// the old verb reinterprets itself from whatever state it finds.
+    ///
+    /// Repetition is therefore safe: `--to local` while Local, or `--to <peer>` while already
+    /// Remote to that peer, leave the lease alone instead of toggling it back.
+    async fn switch_direction(&mut self, peer: Option<&PeerRef>) -> ctl::Response {
+        let Some(peer) = peer else {
+            self.pending_target = None;
+            let input = match self.router.lease() {
+                fr::LeaseSlot::Idle => None,
+                fr::LeaseSlot::Source(lease) if lease.state == fr::SourceState::Releasing => None,
+                fr::LeaseSlot::Source(lease) if lease.state == fr::SourceState::Remote => {
+                    Some(fr::LocalInput::SwitchRequest {
+                        trigger: fr::SwitchTrigger::Hotkey,
+                        target: lease.peer,
+                        entry_position: lease.entry_position.clone(),
+                        topology_revision: self.router.topology_revision(),
+                    })
+                }
+                // `Preparing` has no committed lease to return from, and a `Receiver` slot is
+                // the peer's lease: the FSM's cancellation is the one verb that ends both.
+                _ => Some(fr::LocalInput::Emergency),
+            };
+            if let Some(input) = input {
+                self.feed(fr::Input::Local(input)).await;
+            }
+            return ctl::Response::Switched(PeerRef::new("local"));
+        };
+        let target = match crate::command::resolve_peer(&self.trust, peer) {
+            Ok(target) => target,
+            Err(detail) => {
+                return ctl::Response::Error {
+                    code: "UNKNOWN_PEER".to_owned(),
+                    detail,
+                }
+            }
+        };
+        match directional_peer_action(self.router.lease(), target, self.pending_target.is_some()) {
+            DirectionalPeerAction::Stay => ctl::Response::Switched(peer.clone()),
+            DirectionalPeerAction::Start => self.switch_to(peer).await,
+            DirectionalPeerAction::Busy => ctl::Response::Error {
+                code: "SWITCH_BUSY".to_owned(),
+                detail: "return to local before selecting another peer".to_owned(),
+            },
         }
     }
 
