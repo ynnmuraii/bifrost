@@ -1180,7 +1180,9 @@ fn the_window_stops_a_core_it_did_not_start() {
 #[test]
 fn unpair_on_either_member_removes_an_offline_third_computer_from_both_maps() {
     let _serial = serial();
-    for revoke_on_owner in [true, false] {
+    for (revoke_on_owner, layout_only) in
+        [(true, false), (false, false), (true, true), (false, true)]
+    {
         let dir = unique_dir("three-member-unpair");
         let roots = [dir.join("a"), dir.join("b"), dir.join("c")];
         let ports = free_ports(6);
@@ -1198,6 +1200,17 @@ fn unpair_on_either_member_removes_an_offline_third_computer_from_both_maps() {
         pair(&roots[0], &roots[2], ports[0], ports[4]);
         pair(&roots[1], &roots[2], ports[2], ports[4]);
         let ids = roots.each_ref().map(|root| node_id(root));
+        let revoker = usize::from(!revoke_on_owner);
+        if layout_only {
+            let path = roots[revoker].join("config/trust.toml");
+            let mut trust: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            trust["peers"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|peer| peer["node_id"].as_str() != Some(ids[2].as_str()));
+            std::fs::write(path, toml::to_string(&trust).unwrap()).unwrap();
+        }
         for index in 0..2 {
             write_topology_revision(&roots[index], &ids[1 - index], true, 1, &ids[0], 1, &ids[0]);
             let path = roots[index].join("config/config.toml");
@@ -1222,9 +1235,11 @@ fn unpair_on_either_member_removes_an_offline_third_computer_from_both_maps() {
                 .then_some(())
             });
         }
-        let revoker = usize::from(!revoke_on_owner);
         let reply = ctl(&roots[revoker], &format!("peers --revoke {}", ids[2]));
         assert!(reply.starts_with("OK "), "{reply}");
+        if layout_only {
+            assert!(reply.starts_with("OK removed from layout "), "{reply}");
+        }
         for bridge in [&mut owner, &mut follower] {
             wait_for(bridge, "third card removed by pushed topology", |view| {
                 (view.editor.nodes.len() == 2
@@ -1232,6 +1247,11 @@ fn unpair_on_either_member_removes_an_offline_third_computer_from_both_maps() {
                 .then_some(())
             });
         }
+        let repeated = ctl(&roots[revoker], &format!("peers --revoke {}", ids[2]));
+        assert!(
+            repeated.starts_with("OK "),
+            "cleanup must be idempotent: {repeated}"
+        );
         let revoked_trust =
             std::fs::read_to_string(roots[revoker].join("config/trust.toml")).unwrap();
         assert!(!revoked_trust.contains(&ids[2]));

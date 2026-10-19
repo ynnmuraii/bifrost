@@ -1287,6 +1287,26 @@ pub fn is_forgotten(layout: &config::TopologyConfig, node: &NodeId) -> bool {
         .any(|text| config::topology::node_id_from_hex(text).as_ref() == Some(node.as_bytes()))
 }
 
+/// A stale map entry can outlive its local trust record; explicit cleanup still applies.
+pub fn layout_has_node(layout: &config::TopologyConfig, node: &NodeId) -> bool {
+    let names_node = |reference: &str| {
+        reference
+            .strip_prefix("peer:")
+            .and_then(config::topology::node_id_from_hex)
+            .as_ref()
+            == Some(node.as_bytes())
+    };
+    is_forgotten(layout, node)
+        || layout
+            .displays
+            .iter()
+            .any(|display| names_node(&display.node))
+        || layout
+            .links
+            .iter()
+            .any(|link| names_node(&link.from.node) || names_node(&link.to.node))
+}
+
 /// Removes the node and all incident links from the next ordinary CAS document.
 pub fn forget_node(layout: &mut config::TopologyConfig, node: NodeId) {
     let names_node = |reference: &str| {
