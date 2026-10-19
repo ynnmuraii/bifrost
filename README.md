@@ -24,11 +24,11 @@ The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–10
 
 ## Download & install
 
-Get **0.1.2** from [Releases](https://github.com/ynnmuraii/MultideskFlow/releases/latest). The release includes `SHA256SUMS.txt` for checking your downloads.
+Get **0.1.3** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` for checking your downloads.
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.1.2-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.1.3-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable is unsigned. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; computers must be able to reach TCP **47901 and 47902**.
 
@@ -36,10 +36,10 @@ Settings are created automatically in `%APPDATA%\lan-workspace`; logs go to `%LO
 
 ### Linux · x86_64
 
-Download **`bifrost-0.1.2-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.1.3-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.1.2-linux-x86_64.tar.gz
+tar -xzf bifrost-0.1.3-linux-x86_64.tar.gz
 ./install.sh
 ```
 
@@ -71,7 +71,7 @@ Existing settings and pairing stay in the `lan-workspace` directories when updat
 - Early software: keep access to a local keyboard and test emergency release before relying on remote input.
 - Binaries are unsigned. Windows may show SmartScreen, and Linux desktops may need explicit portal approval.
 - Wayland shows a desktop-portal permission dialog on first use. Support depends on your compositor and portal backend.
-- The emergency hotkey on Wayland depends on the **GlobalShortcuts portal** and may not register on some setups. Check the emergency-hotkey status in **Keys**; it currently does not register on the developer's KDE setup. Do not assume the shortcut works just because the app is running.
+- The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
 - Clipboard sharing is text-only and is off by default.
 
 ## Build from source

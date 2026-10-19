@@ -1,20 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-10-19
 
-- Unpairing removes the computer and its links through the coordinator's shared layout revision, including on members that retain their own direct trust; stale display reports cannot restore the removed map card. Trust removal stays local and pairing again restores fresh placement. `peers --revoke` requires a running core so removal cannot silently leave the shared map unchanged.
-- Successful portal grants no longer appear as refusals in `status`, and a ready input agent clears stale refusal/degraded details.
-- Repeated cleanup also removes orphaned layout entries whose trust record is already absent; late portal token-store notifications cannot restore a refusal after the input agent is ready.
-- Register the Wayland app id before portal requests so KDE can attribute emergency shortcuts to Bifrost; report refused or unbound shortcuts with their actual portal reason.
-- Added directional `switch --to local|<peer>` commands; tray returns explicitly to local input rather than toggling against a possibly expired lease.
-- Pairing handshakes abandoned after a window replacement no longer release the new window's pending slot.
-- Late layout verdicts retain their request after its caller disconnects, allowing an applied edit to release the pending slot.
-- Clipboard settings follow pushed status updates without an extra status request.
-- Accent-coloured small text is now readable in the light theme: the countdown, the «ввод» tag and the map's notices use a darker orange (5.0:1 or better on the light background) while fills, borders and the bridge keep the brand accent.
-- The window writes its own log to `<state>/logs/lws-gui.log`, using the daemon's rotation settings, and records native close requests with their origin, tray readiness and decision, plus show signals and minimized-state changes.
-- Failed two-node integration tests now preserve both computers' status and the tails of their core and agent logs before cleanup, including clipboard and fault-injection timeouts.
-- Unresolved automatic links are shown inactive with a reason instead of appearing usable.
-- Zoomed or panned monitors only accept pointer input inside the map's visible bounds.
+- Fixed emergency-hotkey registration on KDE Wayland when Bifrost is launched from its desktop entry or an `app-bifrost@….service` unit. Shortcut refusals now show the portal's actual reason; GNOME 46 still has no GlobalShortcuts portal.
+- Added `switch --to local|<peer>` for choosing an input destination explicitly; the tray's return action always selects local input.
+- Unpairing removes the computer and its links from the shared monitor map, including stale entries, without revoking other computers' direct trust. Pair again to restore placement. `peers --revoke` now requires a running core.
+- Fixed pairing and monitor-layout edits getting stuck after their window or caller closes.
+- Successful portal grants and ready input agents clear stale refusal messages.
+- Clipboard settings follow live status updates, and unresolved automatic links show why they are inactive.
+- Small accent-coloured text is easier to read in the light theme, and zoomed or panned monitors only accept clicks inside the visible map.
+- Added rotating window logs at `<state>/logs/lws-gui.log` and better diagnostics for connection and clipboard failures.
 
 ## 0.1.2 — 2026-10-18
 
