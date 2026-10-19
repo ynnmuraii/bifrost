@@ -398,6 +398,22 @@ fn an_older_document_does_not_become_the_editors_base() {
     assert_eq!(vm.editor.revision, 9);
 }
 
+#[test]
+fn unpair_topology_push_removes_the_card_and_preserves_exclusions_in_edits() {
+    let mut vm = view();
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    assert_eq!(vm.map_model().nodes.len(), 2);
+    let mut removed = two_node_doc(8);
+    removed.members.retain(|member| member.node_id == SELF_NODE);
+    removed.links.clear();
+    removed.forgotten_node_ids.push(PEER_NODE.to_owned());
+    vm.apply(event(Msg::TopologyDoc(removed)));
+    assert_eq!(vm.map_model().nodes.len(), 1);
+    assert!(vm.map_model().links.is_empty());
+    let layout: config::TopologyConfig = toml::from_str(&vm.layout_toml()).unwrap();
+    assert_eq!(layout.forgotten_nodes, [PEER_NODE]);
+}
+
 /// Batch-8 audit: the outcome banner is about the core that answered, so losing that core
 /// takes the sentence with it instead of leaving it under a «Служба не запущена» header.
 #[test]
@@ -659,6 +675,7 @@ fn the_document_of_the_first_revision_is_still_a_document() {
     vm.apply(event(Msg::TopologyDoc(protocol::ipc::TopologyDoc {
         revision: 0,
         author_node_id: String::new(),
+        forgotten_node_ids: Vec::new(),
         members: two_node_doc(0).members,
         links: Vec::new(),
     })));

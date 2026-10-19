@@ -140,8 +140,8 @@ pub enum Request {
     },
     /// `pair-with <address>`: dial a peer that opened its window (`GuiFrame.PairWith`).
     PairWith(String),
-    /// `revoke <peer>`: tombstone the trust record, drop the peer's live links and stop its
-    /// dialer — the same path as the GUI's revoke button (`GuiFrame.RevokePeer`).
+    /// `revoke <peer>`: forget local trust, close live links and remove the computer
+    /// through the shared layout CAS — the same path as `GuiFrame.RevokePeer`.
     ///
     /// One implementation, so the file and the running core cannot disagree (audit F16): the
     /// CLI used to edit `trust.toml` behind a running core's back, which kept the peer

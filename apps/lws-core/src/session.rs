@@ -349,8 +349,17 @@ fn next_restart_backoff(current: Duration) -> Duration {
 /// do not look hung.
 const LAYOUT_VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn is_agent_ready(event: &fr::AgentEvent) -> bool {
-    matches!(event, fr::AgentEvent::AgentReady)
+fn accept_agent_ready(
+    event: &fr::AgentEvent,
+    refusal: &mut Option<String>,
+    degraded_reason: &mut String,
+) -> bool {
+    if !matches!(event, fr::AgentEvent::AgentReady) {
+        return false;
+    }
+    *refusal = None;
+    degraded_reason.clear();
+    true
 }
 
 /// The first four bytes of a lease id in hex, for a log line that a human scans.
@@ -1596,9 +1605,19 @@ impl Session {
             return;
         };
         let source = LayoutSource::remote(from, connection_id);
+        if !self
+            .trust
+            .get(&from)
+            .is_some_and(|record| record.is_active())
+        {
+            return;
+        }
 
         match message {
             LayoutMessage::DisplaysChanged { revision, displays } => {
+                if crate::topology::is_forgotten(&self.layout, &from) {
+                    return;
+                }
                 if !display_report_supersedes(self.peer_displays.get(&from), revision, &displays) {
                     return;
                 }
@@ -2296,6 +2315,18 @@ impl Session {
             });
         }
         if !is_coordinator {
+            let document_text = match parse_layout_toml(&document_text).and_then(|mut layout| {
+                crate::topology::qualify_self(&mut layout, self.node_id);
+                toml::to_string_pretty(&layout).map_err(|error| error.to_string())
+            }) {
+                Ok(text) => text,
+                Err(detail) => {
+                    return Handled::Reply(ctl::Response::Error {
+                        code: "INVALID_TOPOLOGY".to_owned(),
+                        detail,
+                    })
+                }
+            };
             // A follower sends the edit to the coordinator and answers with the verdict that
             // comes back; only a partition keeps it pending (`docs/05-protocol.md`).
             let applied = self.layout_state.applied();
@@ -2451,6 +2482,9 @@ impl Session {
                 connection_id,
                 remote,
             } => {
+                if !self.trust.is_trusted(&peer) {
+                    return;
+                }
                 self.layout_connections.insert(peer, connection_id);
                 // A peer string is untrusted: bound it before it is stored or forwarded.
                 let system_name = protocol::sanitize_system_name(&hello.system_name);
@@ -2913,7 +2947,7 @@ impl Session {
         }
         match routing::agent_signal(&message, &mut self.context) {
             AgentSignal::Fsm(event) => {
-                if is_agent_ready(&event) {
+                if accept_agent_ready(&event, &mut self.refusal, &mut self.agent_degraded_reason) {
                     self.agent.mark_ready();
                     self.agent_lost_reported = false;
                     self.agent_restart_due = None;
@@ -4022,7 +4056,13 @@ impl Session {
     /// core's, so the revoke has to happen here — a CLI that edits `trust.toml` behind a
     /// running core leaves the peer trusted in memory and its link up.
     async fn revoke_peer_ref(&mut self, peer: &crate::command::PeerRef) -> ctl::Response {
-        let target = match crate::command::resolve_peer(&self.trust, peer) {
+        let existing = config::topology::node_id_from_hex(peer.as_str())
+            .map(NodeId::new)
+            .filter(|node| self.trust.get(node).is_some());
+        let target = match existing
+            .map(Ok)
+            .unwrap_or_else(|| crate::command::resolve_peer(&self.trust, peer))
+        {
             Ok(target) => target,
             Err(detail) => {
                 return ctl::Response::Error {
@@ -4037,7 +4077,8 @@ impl Session {
         } else {
             ctl::Response::Error {
                 code: result.error_code,
-                detail: "the peer is not in the trust store".to_owned(),
+                detail: "unpair could not complete; inspect the core log and pending layout edit"
+                    .to_owned(),
             }
         }
     }
@@ -4476,12 +4517,19 @@ mod remote_seed_tests {
 /// document; ADR-013 rejected merging rows for exactly that reason).
 ///
 /// The document is the `[topology]` shape, so it parses as the same struct the configuration
-/// uses; a document with neither displays nor links is refused, because an empty layout would
-/// silently disable every transition.
+/// uses. An otherwise empty document is meaningful only when it explicitly forgets
+/// members: removing the last peer must work before any display has been reported.
 fn parse_layout_toml(layout_toml: &str) -> Result<config::TopologyConfig, String> {
     let parsed: config::TopologyConfig =
         toml::from_str(layout_toml).map_err(|error| format!("layout_toml: {error}"))?;
-    if parsed.displays.is_empty() && parsed.links.is_empty() {
+    if parsed
+        .forgotten_nodes
+        .iter()
+        .any(|node| config::topology::node_id_from_hex(node).is_none())
+    {
+        return Err("layout_toml: invalid forgotten node id".to_owned());
+    }
+    if parsed.displays.is_empty() && parsed.links.is_empty() && parsed.forgotten_nodes.is_empty() {
         return Err("layout_toml: a document with neither displays nor links".to_owned());
     }
     Ok(parsed)
@@ -4800,11 +4848,26 @@ mod timer_tests {
         );
     }
     #[test]
-    fn an_agent_ready_event_triggers_a_display_query() {
-        assert!(is_agent_ready(&fr::AgentEvent::AgentReady));
-        assert!(!is_agent_ready(&fr::AgentEvent::Ready {
-            lease_id: [0; 16]
-        }));
+    fn an_agent_ready_event_clears_stale_status_and_triggers_a_display_query() {
+        let mut refusal =
+            Some("portal grant received: org.freedesktop.portal.RemoteDesktop".to_owned());
+        let mut degraded = "previous portal failure".to_owned();
+        assert!(!accept_agent_ready(
+            &fr::AgentEvent::Ready { lease_id: [0; 16] },
+            &mut refusal,
+            &mut degraded,
+        ));
+        assert!(
+            refusal.is_some(),
+            "a lease acknowledgment is not a fresh agent"
+        );
+        assert!(accept_agent_ready(
+            &fr::AgentEvent::AgentReady,
+            &mut refusal,
+            &mut degraded,
+        ));
+        assert!(refusal.is_none());
+        assert!(degraded.is_empty());
     }
 }
 

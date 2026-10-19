@@ -73,6 +73,7 @@ fn document() -> wire::Topology {
             }),
         }],
         author_node_id: node(1),
+        forgotten_node_ids: Vec::new(),
     }
 }
 

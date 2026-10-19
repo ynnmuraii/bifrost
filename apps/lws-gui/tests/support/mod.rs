@@ -120,6 +120,7 @@ pub fn two_node_doc(revision: u64) -> ipc::TopologyDoc {
     ipc::TopologyDoc {
         revision,
         author_node_id: SELF_NODE.to_owned(),
+        forgotten_node_ids: Vec::new(),
         members: vec![
             ipc::MemberTopology {
                 node_id: SELF_NODE.to_owned(),

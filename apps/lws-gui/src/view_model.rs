@@ -534,6 +534,8 @@ pub struct LayoutEditor {
     pub nodes: Vec<EditorNode>,
     /// The applied links, still in wire form: they are rewritten as `[topology]` rows.
     pub links: Vec<ipc::LinkView>,
+    /// Explicit shared map exclusions, retained across GUI edits.
+    pub forgotten_nodes: Vec<String>,
     /// The drawn shape of every member, parallel to `nodes`.
     pub shapes: Vec<crate::map::Shape>,
     /// Where the user has put every member on the stage, parallel to `nodes`.
@@ -1365,6 +1367,7 @@ impl ViewModel {
             ));
             return;
         }
+        self.editor.forgotten_nodes = doc.forgotten_node_ids.clone();
         let same_members = self.editor.nodes.len() == doc.members.len()
             && self
                 .editor
@@ -2074,6 +2077,7 @@ impl ViewModel {
             max_seen_author: author_reference(&self.editor.author, self.editor.revision),
             displays: Vec::new(),
             links: Vec::new(),
+            forgotten_nodes: self.editor.forgotten_nodes.clone(),
         };
         for node in &self.editor.nodes {
             let reference = node_reference(&node.node_id);

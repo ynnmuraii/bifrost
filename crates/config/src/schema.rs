@@ -958,6 +958,9 @@ pub struct TopologyConfig {
     /// Transition graph of any shape.
     #[serde(default)]
     pub links: Vec<LinkConfig>,
+    /// Nodes explicitly removed from the shared map; direct trust remains local.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forgotten_nodes: Vec<String>,
 }
 
 impl TopologyConfig {

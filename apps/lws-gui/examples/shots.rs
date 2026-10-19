@@ -212,6 +212,7 @@ fn placement_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                 let mut doc = ipc::TopologyDoc {
                     revision: 15,
                     author_node_id: WORKSTATION.to_owned(),
+                    forgotten_node_ids: Vec::new(),
                     members: vec![
                         ipc::MemberTopology {
                             node_id: WORKSTATION.to_owned(),
@@ -351,6 +352,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                     vm.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {
                         revision: 16,
                         author_node_id: WORKSTATION.to_owned(),
+                        forgotten_node_ids: Vec::new(),
                         members: vec![
                             ipc::MemberTopology {
                                 node_id: WORKSTATION.to_owned(),
@@ -771,6 +773,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
     vm.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {
         revision: 14,
         author_node_id: WORKSTATION.to_owned(),
+        forgotten_node_ids: Vec::new(),
         members: vec![
             ipc::MemberTopology {
                 node_id: LAPTOP.to_owned(),
@@ -861,6 +864,7 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
     let mut document = ipc::TopologyDoc {
         revision: view.editor.revision,
         author_node_id: view.editor.author.clone(),
+        forgotten_node_ids: view.editor.forgotten_nodes.clone(),
         members: view
             .editor
             .nodes
@@ -920,6 +924,7 @@ fn with_owner_left_peer(view: &ViewModel) -> Option<ViewModel> {
     let document = ipc::TopologyDoc {
         revision: view.editor.revision,
         author_node_id: view.editor.author.clone(),
+        forgotten_node_ids: view.editor.forgotten_nodes.clone(),
         members: view
             .editor
             .nodes

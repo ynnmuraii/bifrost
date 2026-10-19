@@ -881,7 +881,7 @@ fn load_trust(paths: &Paths) -> Result<TrustStore, Failure> {
     }
 }
 
-/// `peers`: list or revoke, offline.
+/// `peers`: list offline, or unpair through the running coordinator-aware core.
 fn peers(args: &Args) -> Result<(), Failure> {
     init_logging(&args.paths);
     let paths = &args.paths;
@@ -891,7 +891,7 @@ fn peers(args: &Args) -> Result<(), Failure> {
         trust_file: paths.trust_file(),
     };
     let (identity, _) = NodeIdentity::load_or_create(&identity_paths)?;
-    let mut trust = load_trust(paths)?;
+    let trust = load_trust(paths)?;
 
     let revoke = match args.rest.as_slice() {
         [] => None,
@@ -905,22 +905,15 @@ fn peers(args: &Args) -> Result<(), Failure> {
 
     if let Some(id) = revoke {
         let reference = command::PeerRef::new(id);
-        // A running core owns the trust store, the pin set its TLS verifiers read and the
-        // peer's live links, so the revoke goes through it — one implementation, and the file
-        // cannot disagree with the running state (audit F16). Only when no core is listening
-        // does the CLI edit the file itself.
+        // The running core owns trust, live pins and the shared layout CAS. Never
+        // remove only trust offline and leave a stale computer in the stored map.
         if control_if_running(paths, &format!("revoke {reference}"))? {
             return Ok(());
         }
-        let node_id = command::resolve_peer(&trust, &reference).map_err(Failure::Run)?;
-        let removed = trust.revoke(&node_id, identity::now_unix_ms());
-        if removed {
-            trust.save(&paths.trust_file())?;
-            println!("revoked {}", command::node_id_hex(&node_id));
-        } else {
-            println!("nothing to revoke for {}", command::node_id_hex(&node_id));
-        }
-        return Ok(());
+        return Err(Failure::Run(
+            "start `bifrost run` before revoking a peer so the shared layout can be updated"
+                .to_owned(),
+        ));
     }
 
     println!("node {}", command::node_id_hex(&identity.node_id()));

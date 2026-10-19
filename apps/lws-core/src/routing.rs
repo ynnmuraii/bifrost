@@ -565,20 +565,7 @@ pub fn agent_note(message: &ipc::agent_frame::Msg) -> Option<String> {
             "restoring portal grant for {} ({})",
             progress.portal_interface, progress.purpose
         ))),
-        Msg::PortalGrant(changed) => {
-            let interface = changed
-                .grant
-                .as_ref()
-                .map(|grant| grant.portal_interface.as_str())
-                .unwrap_or("");
-            Some(if changed.revoked {
-                format!("portal grant revoked: {interface}")
-            } else if changed.grant.is_some() {
-                format!("portal grant received: {interface}")
-            } else {
-                "portal grants cleared".to_owned()
-            })
-        }
+        Msg::PortalGrant(changed) if changed.revoked => Some("portal grant revoked".to_owned()),
         Msg::Error(error) => Some(shorten(&format!("{}: {}", error.code, error.detail.trim()))),
         _ => None,
     }
@@ -1656,5 +1643,23 @@ mod contract_tests {
             }
             other => panic!("expected a pointer event, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod portal_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_successful_portal_grant_is_not_a_refusal() {
+        let message = ipc::agent_frame::Msg::PortalGrant(ipc::PortalGrantChanged {
+            revoked: false,
+            ..Default::default()
+        });
+        assert_eq!(agent_note(&message), None);
+        assert_eq!(
+            agent_note(&ipc::agent_frame::Msg::Ready(ipc::AgentReady::default())),
+            None
+        );
     }
 }
