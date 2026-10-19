@@ -362,6 +362,16 @@ fn accept_agent_ready(
     true
 }
 
+fn record_portal_note(
+    state: crate::command::AgentState,
+    refusal: &mut Option<String>,
+    note: String,
+) {
+    if state != crate::command::AgentState::Ready {
+        *refusal = Some(note);
+    }
+}
+
 /// The first four bytes of a lease id in hex, for a log line that a human scans.
 fn lease_hex(lease_id: &fr::LeaseId) -> String {
     crate::command::hex16(lease_id).chars().take(8).collect()
@@ -4058,7 +4068,10 @@ impl Session {
     async fn revoke_peer_ref(&mut self, peer: &crate::command::PeerRef) -> ctl::Response {
         let existing = config::topology::node_id_from_hex(peer.as_str())
             .map(NodeId::new)
-            .filter(|node| self.trust.get(node).is_some());
+            .filter(|node| {
+                self.trust.get(node).is_some()
+                    || crate::topology::layout_has_node(&self.layout, node)
+            });
         let target = match existing
             .map(Ok)
             .unwrap_or_else(|| crate::command::resolve_peer(&self.trust, peer))
@@ -4071,9 +4084,18 @@ impl Session {
                 }
             }
         };
+        let removed_trust = self.trust.get(&target).is_some();
         let result = self.revoke_peer(target.as_bytes()).await;
         if result.ok {
-            ctl::Response::Status(format!("revoked {}", crate::command::node_id_hex(&target)))
+            let operation = if removed_trust {
+                "revoked"
+            } else {
+                "removed from layout"
+            };
+            ctl::Response::Status(format!(
+                "{operation} {}",
+                crate::command::node_id_hex(&target)
+            ))
         } else {
             ctl::Response::Error {
                 code: result.error_code,
@@ -4170,7 +4192,7 @@ impl Session {
             interfaces = interfaces.as_str(),
             "portal token store updated"
         );
-        self.refusal = Some(note);
+        record_portal_note(self.agent.state(), &mut self.refusal, note);
     }
 
     /// `reset-portals`: forget every stored token, in core and in the agent.
@@ -4868,6 +4890,17 @@ mod timer_tests {
         ));
         assert!(refusal.is_none());
         assert!(degraded.is_empty());
+        for note in ["portal grant received", "portal grant unchanged"] {
+            record_portal_note(
+                crate::command::AgentState::Ready,
+                &mut refusal,
+                note.to_owned(),
+            );
+            assert!(
+                refusal.is_none(),
+                "a grant after Ready must not restore a refusal"
+            );
+        }
     }
 }
 

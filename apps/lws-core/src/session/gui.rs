@@ -1081,13 +1081,21 @@ impl Session {
         let Some(node) = node_id_of(peer) else {
             return bad_request();
         };
-        if !self.trust.forget(&node) {
+        if node == self.node_id {
+            return bad_request();
+        }
+        let removed_trust = self.trust.forget(&node);
+        if !removed_trust && !crate::topology::layout_has_node(&self.layout, &node) {
             return ipc::OpResult {
                 ok: false,
                 error_code: "UNKNOWN_PEER".to_owned(),
             };
         }
-        if let Err(error) = self.trust.save(&self.paths.trust_file()) {
+        if let Err(error) = if removed_trust {
+            self.trust.save(&self.paths.trust_file()).map(|_| ())
+        } else {
+            Ok(())
+        } {
             tracing::warn!(%error, "cannot write the trust record");
             return ipc::OpResult {
                 ok: false,

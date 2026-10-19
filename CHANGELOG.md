@@ -4,6 +4,7 @@
 
 - Unpairing removes the computer and its links through the coordinator's shared layout revision, including on members that retain their own direct trust; stale display reports cannot restore the removed map card. Trust removal stays local and pairing again restores fresh placement. `peers --revoke` requires a running core so removal cannot silently leave the shared map unchanged.
 - Successful portal grants no longer appear as refusals in `status`, and a ready input agent clears stale refusal/degraded details.
+- Repeated cleanup also removes orphaned layout entries whose trust record is already absent; late portal token-store notifications cannot restore a refusal after the input agent is ready.
 - Register the Wayland app id before portal requests so KDE can attribute emergency shortcuts to Bifrost; report refused or unbound shortcuts with their actual portal reason.
 - Added directional `switch --to local|<peer>` commands; tray returns explicitly to local input rather than toggling against a possibly expired lease.
 - Pairing handshakes abandoned after a window replacement no longer release the new window's pending slot.
