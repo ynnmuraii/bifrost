@@ -182,6 +182,7 @@ message Topology {
   repeated NodeDisplays nodes = 2;
   repeated TransitionLink links = 3;
   bytes author_node_id = 4;           // applied order is (revision, author_node_id)
+  repeated bytes forgotten_node_ids = 5; // layout exclusion only; never revokes another member's trust
 }
 message NodeDisplays { bytes node_id = 1; repeated Display displays = 2; bool online = 3; }
 

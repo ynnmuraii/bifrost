@@ -407,6 +407,7 @@ message TopologyDoc {
   string author_node_id = 2;         // author of the applied revision
   repeated MemberTopology members = 3;
   repeated LinkView links = 4;
+  repeated string forgotten_node_ids = 5; // retain layout exclusions when editing the map
 }
 message MemberTopology {
   string node_id = 1;

@@ -330,6 +330,7 @@ pub fn default_layout(
     }
     let mut layout = auto_layout(peers)?;
     layout.displays = document.displays.clone();
+    layout.forgotten_nodes = document.forgotten_nodes.clone();
     Some(layout)
 }
 
@@ -999,6 +1000,11 @@ pub fn validate_wire(document: &wire::Topology) -> Result<(), String> {
         }
         seen.push(node.node_id.as_slice());
     }
+    for node in &document.forgotten_node_ids {
+        if node.len() != 32 || seen.contains(&node.as_slice()) {
+            return Err("invalid or still-present forgotten node".to_owned());
+        }
+    }
     for link in &document.links {
         for (side, endpoint) in [
             ("source", link.source_endpoint.as_ref()),
@@ -1164,6 +1170,11 @@ pub fn wire_document(
             })
             .collect(),
         author_node_id: author.as_bytes().to_vec(),
+        forgotten_node_ids: layout
+            .forgotten_nodes
+            .iter()
+            .filter_map(|node| config::topology::node_id_from_hex(node).map(Vec::from))
+            .collect(),
     }
 }
 
@@ -1224,6 +1235,15 @@ pub fn config_from_wire(
         author: author_hex.clone(),
         max_seen_revision: document.revision,
         max_seen_author: author_hex,
+        forgotten_nodes: document
+            .forgotten_node_ids
+            .iter()
+            .map(|node| {
+                <[u8; 32]>::try_from(node.as_slice())
+                    .map(|node| identity::fingerprint(&NodeId::new(node)))
+                    .map_err(|_| "invalid forgotten node id".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         ..config::TopologyConfig::default()
     };
     for node in &document.nodes {
@@ -1259,6 +1279,58 @@ pub fn config_from_wire(
     Ok(layout)
 }
 
+/// Shared map exclusion, deliberately independent of this machine's trust store.
+pub fn is_forgotten(layout: &config::TopologyConfig, node: &NodeId) -> bool {
+    layout
+        .forgotten_nodes
+        .iter()
+        .any(|text| config::topology::node_id_from_hex(text).as_ref() == Some(node.as_bytes()))
+}
+
+/// Removes the node and all incident links from the next ordinary CAS document.
+pub fn forget_node(layout: &mut config::TopologyConfig, node: NodeId) {
+    let names_node = |reference: &str| {
+        reference
+            .strip_prefix("peer:")
+            .and_then(config::topology::node_id_from_hex)
+            .as_ref()
+            == Some(node.as_bytes())
+    };
+    layout.displays.retain(|display| !names_node(&display.node));
+    layout
+        .links
+        .retain(|link| !names_node(&link.from.node) && !names_node(&link.to.node));
+    if !is_forgotten(layout, &node) {
+        layout.forgotten_nodes.push(identity::fingerprint(&node));
+    }
+}
+
+/// A new direct pairing restores map eligibility, never the old placement or links.
+pub fn rejoin_node(layout: &mut config::TopologyConfig, node: NodeId) {
+    layout
+        .forgotten_nodes
+        .retain(|text| config::topology::node_id_from_hex(text).as_ref() != Some(node.as_bytes()));
+}
+
+/// A forwarded edit must retain the originating machine's meaning of `self`.
+pub fn qualify_self(layout: &mut config::TopologyConfig, local: NodeId) {
+    for reference in layout
+        .displays
+        .iter_mut()
+        .map(|display| &mut display.node)
+        .chain(
+            layout
+                .links
+                .iter_mut()
+                .flat_map(|link| [&mut link.from.node, &mut link.to.node]),
+        )
+    {
+        if reference == "self" {
+            *reference = config::peer_reference(local.as_bytes());
+        }
+    }
+}
+
 /// The manifests `build` runs against: the live agent report when there is one, otherwise the
 /// configured snapshot; peers from their live reports over the configured snapshots.
 /// `None` permits bootstrap fallback; `Some(&[])` is a known empty manifest and must not
@@ -1276,9 +1348,11 @@ pub fn live_inputs(
     );
     let mut peers: BTreeMap<NodeId, Vec<wire::Display>> =
         snapshot_peers(layout, local_node_id).into_iter().collect();
+    peers.retain(|node, _| !is_forgotten(layout, node));
     peers.extend(
         peer_displays
             .iter()
+            .filter(|(node, _)| !is_forgotten(layout, node))
             .map(|(node, (_, displays))| (*node, displays.clone())),
     );
     (local, peers.into_iter().collect())
@@ -3361,5 +3435,76 @@ logical = [0, 0, 800, 600]
         assert_eq!(back.links[0].from.edge, config::Edge::Right);
         assert!(back.links[0].to.is_auto());
         assert_eq!(back.links[0].to.edge, config::Edge::Left);
+    }
+}
+
+#[cfg(test)]
+mod unpair_tests {
+    use super::*;
+    use crate::layout::{Edit, EditOutcome, Layout, Pair, TopologyOutcome};
+
+    #[test]
+    fn coordinator_and_follower_unpair_replicate_without_transitive_trust() {
+        let owner = NodeId::new([1; 32]);
+        let follower = NodeId::new([2; 32]);
+        let removed = NodeId::new([3; 32]);
+        for editor in [owner, follower] {
+            let base = Pair::new(7, owner);
+            let mut states = [Layout::restore(base, base), Layout::restore(base, base)];
+            let mut layout = auto_layout(&[removed]).unwrap();
+            layout.displays.push(config::DisplayConfig {
+                node: config::peer_reference(removed.as_bytes()),
+                id: "screen".to_owned(),
+                logical: [0.0, 0.0, 1920.0, 1080.0],
+                primary: true,
+            });
+            let mut trust = identity::TrustStore::default();
+            trust.trust(identity::TrustedPeer::paired(removed, "removed", None, 0));
+            forget_node(&mut layout, removed);
+            assert!(layout.links.is_empty());
+            assert!(layout.displays.is_empty());
+            let edit = Edit {
+                expected: base,
+                editor,
+                layout_toml: toml::to_string(&layout).unwrap(),
+            };
+            let EditOutcome::Applied(pair) = states[0].apply_edit(&edit, owner, true, |_| Ok(()))
+            else {
+                panic!("unpair must use the coordinator CAS");
+            };
+            assert_eq!(pair.revision, 8);
+            let reports =
+                BTreeMap::from([(follower, (1, Vec::new())), (removed, (999, Vec::new()))]);
+            let (local, peers) = live_inputs(&layout, owner.as_bytes(), None, &reports);
+            let built = build(&Documents {
+                local_node_id: *owner.as_bytes(),
+                topology: &layout,
+                local_displays: &local,
+                peer_displays: &peers,
+            })
+            .unwrap();
+            assert_eq!(built.topology.nodes.len(), 2);
+            let wire = wire_from_live(&built.topology, &layout, pair.revision, owner, owner);
+            assert_eq!(
+                states[1].accept_topology(owner, pair, || validate_wire(&wire)),
+                TopologyOutcome::Applied(pair)
+            );
+            let received = config_from_wire(&wire, follower).unwrap();
+            assert!(is_forgotten(&received, &removed));
+            let (_, peers) = live_inputs(&received, follower.as_bytes(), None, &reports);
+            assert!(!peers.iter().any(|(node, _)| *node == removed));
+            assert!(
+                trust.is_trusted(&removed),
+                "layout exclusion never changes another machine's trust"
+            );
+            let mut repaired = received;
+            rejoin_node(&mut repaired, removed);
+            let (_, peers) = live_inputs(&repaired, follower.as_bytes(), None, &reports);
+            assert!(peers.iter().any(|(node, _)| *node == removed));
+            assert!(
+                repaired.links.is_empty(),
+                "re-pair does not restore old links"
+            );
+        }
     }
 }

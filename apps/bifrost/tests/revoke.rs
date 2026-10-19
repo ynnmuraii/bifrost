@@ -3,10 +3,10 @@
 //! The CLI used to tombstone the trust record in `trust.toml` and return. A running core
 //! keeps its own copy of that store, the pin set its TLS verifiers read for every handshake
 //! and the peer's live links, so the peer stayed trusted in memory, its link stayed up (and
-//! could still inject input) and only a restart made the revocation real. The GUI's revoke
-//! button was already complete (tombstone → save → `remove_peer` → `kill_all`); the CLI now
-//! takes the same path through the control channel, with the file edit left as the
-//! no-core-running fallback.
+//! could still inject input) and only a restart made revocation real. `peers --revoke`
+//! now uses the GUI's core path: forget local trust, close live links, and publish the
+//! map removal through the coordinator CAS. A running core is required; there is no
+//! trust-only offline fallback.
 
 mod common;
 

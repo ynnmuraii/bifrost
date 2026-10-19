@@ -293,6 +293,11 @@ impl Session {
             })
             .collect();
         append_missing_members(&mut members, &self.trust, &self.peer_displays, &online);
+        members.retain(|member| {
+            config::topology::node_id_from_hex(&member.node_id)
+                .map(NodeId::new)
+                .is_none_or(|node| !crate::topology::is_forgotten(&self.layout, &node))
+        });
         for member in &mut members {
             member.system_name = config::topology::node_id_from_hex(&member.node_id)
                 .map(NodeId::new)
@@ -315,6 +320,7 @@ impl Session {
                 .map(|author| crate::command::node_id_hex(&author))
                 .unwrap_or_default(),
             members,
+            forgotten_node_ids: self.layout.forgotten_nodes.clone(),
             links: document
                 .links
                 .iter()
@@ -719,6 +725,7 @@ impl Session {
                         // The same write the CLI's ceremony does: one `TrustedPeer`, atomically,
                         // with the address this side learned (`pairing::peer_address`).
                         let record = peer.trusted_peer(identity::now_unix_ms(), address);
+                        let repaired_node = record.node_id;
                         tracing::info!(
                             peer = crate::command::node_id_hex(&record.node_id).as_str(),
                             "pairing committed"
@@ -729,7 +736,28 @@ impl Session {
                         // success means the other core can connect without a restart.
                         match self.trust.save(&self.paths.trust_file()) {
                             Ok(_) => match self.manager.add_peer(record).await {
-                                Ok(()) => Ok(()),
+                                Ok(()) => {
+                                    if crate::topology::is_forgotten(&self.layout, &repaired_node) {
+                                        let mut layout = self.layout.clone();
+                                        crate::topology::rejoin_node(&mut layout, repaired_node);
+                                        match toml::to_string_pretty(&layout) {
+                                            Ok(text) => {
+                                                let expected = self.layout_state.applied();
+                                                let _ = self
+                                                    .layout_edit_document(
+                                                        text,
+                                                        expected,
+                                                        super::LayoutSource::AUTO,
+                                                    )
+                                                    .await;
+                                            }
+                                            Err(error) => {
+                                                tracing::error!(%error, "cannot render re-pair layout")
+                                            }
+                                        }
+                                    }
+                                    Ok(())
+                                }
                                 Err(error) => {
                                     tracing::warn!(%error, "cannot start the paired peer link");
                                     self.pairing_error = Some("LINK_START".to_owned());
@@ -1053,7 +1081,7 @@ impl Session {
         let Some(node) = node_id_of(peer) else {
             return bad_request();
         };
-        if !self.trust.revoke(&node, identity::now_unix_ms()) {
+        if !self.trust.forget(&node) {
             return ipc::OpResult {
                 ok: false,
                 error_code: "UNKNOWN_PEER".to_owned(),
@@ -1076,6 +1104,29 @@ impl Session {
         // A revoke is the one case where the last known manifest goes away with the peer:
         // a link drop keeps it, so the map still shows the computer offline.
         self.peer_displays.remove(&node);
+        let mut layout = self.layout.clone();
+        crate::topology::forget_node(&mut layout, node);
+        let text = match toml::to_string_pretty(&layout) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::error!(%error, "cannot render unpair layout");
+                return ipc::OpResult {
+                    ok: false,
+                    error_code: "LAYOUT_WRITE".to_owned(),
+                };
+            }
+        };
+        let expected = self.layout_state.applied();
+        let result = self
+            .layout_edit_document(text, expected, super::LayoutSource::AUTO)
+            .await;
+        if let super::Handled::Reply(crate::ctl::Response::Error { code, detail }) = result {
+            tracing::warn!(%code, %detail, "unpair layout edit remains pending");
+            return ipc::OpResult {
+                ok: false,
+                error_code: code,
+            };
+        }
         self.rebuild_topology();
         tracing::info!(
             peer = crate::command::node_id_hex(&node).as_str(),

@@ -1174,3 +1174,77 @@ fn the_window_stops_a_core_it_did_not_start() {
     };
     assert!(exit.success(), "the core exited cleanly: {exit}");
 }
+
+/// Revocation is local trust removal, but the coordinator's map exclusion reaches
+/// the other directly-trusting member even while the removed computer is offline.
+#[test]
+fn unpair_on_either_member_removes_an_offline_third_computer_from_both_maps() {
+    let _serial = serial();
+    for revoke_on_owner in [true, false] {
+        let dir = unique_dir("three-member-unpair");
+        let roots = [dir.join("a"), dir.join("b"), dir.join("c")];
+        let ports = free_ports(6);
+        for (index, root) in roots.iter().enumerate() {
+            std::fs::create_dir_all(root.join("config")).unwrap();
+            write_config(
+                root,
+                ports[index * 2],
+                ports[index * 2 + 1],
+                ["owner", "follower", "offline"][index],
+                index == 0,
+            );
+        }
+        pair(&roots[0], &roots[1], ports[0], ports[2]);
+        pair(&roots[0], &roots[2], ports[0], ports[4]);
+        pair(&roots[1], &roots[2], ports[2], ports[4]);
+        let ids = roots.each_ref().map(|root| node_id(root));
+        for index in 0..2 {
+            write_topology_revision(&roots[index], &ids[1 - index], true, 1, &ids[0], 1, &ids[0]);
+            let path = roots[index].join("config/config.toml");
+            let mut document = std::fs::read_to_string(&path).unwrap();
+            document.push_str(&format!(
+                "\n[[topology.displays]]\nnode = \"peer:{}\"\nid = \"dry-0\"\nlogical = [0.0, 0.0, 1920.0, 1080.0]\nprimary = true\n",
+                ids[2]
+            ));
+            std::fs::write(path, document).unwrap();
+        }
+        let mut a = Core::start(roots[0].clone(), "a", true);
+        let mut b = Core::start(roots[1].clone(), "b", true);
+        let mut owner = bridge_for(&roots[0]);
+        let mut follower = bridge_for(&roots[1]);
+        for bridge in [&mut owner, &mut follower] {
+            wait_for(bridge, "three cards before unpair", |view| {
+                (view.editor.nodes.len() == 3
+                    && view
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.owner_node_id == ids[0] && status.connected))
+                .then_some(())
+            });
+        }
+        let revoker = usize::from(!revoke_on_owner);
+        let reply = ctl(&roots[revoker], &format!("peers --revoke {}", ids[2]));
+        assert!(reply.starts_with("OK "), "{reply}");
+        for bridge in [&mut owner, &mut follower] {
+            wait_for(bridge, "third card removed by pushed topology", |view| {
+                (view.editor.nodes.len() == 2
+                    && view.editor.nodes.iter().all(|node| node.node_id != ids[2]))
+                .then_some(())
+            });
+        }
+        let revoked_trust =
+            std::fs::read_to_string(roots[revoker].join("config/trust.toml")).unwrap();
+        assert!(!revoked_trust.contains(&ids[2]));
+        let retained_trust =
+            std::fs::read_to_string(roots[1 - revoker].join("config/trust.toml")).unwrap();
+        assert!(
+            retained_trust.contains(&ids[2]),
+            "no transitive trust removal"
+        );
+        drop(owner);
+        drop(follower);
+        a.stop();
+        b.stop();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
