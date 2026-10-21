@@ -1,5 +1,5 @@
 //! Updater controls share the settings rows' type, palette and buttons.
-use super::theme::Palette;
+use super::theme::{fam, font, Palette};
 use super::widgets::{self, Kind};
 use crate::updater::{Action as Update, State, RELEASES};
 use crate::view_model::{Action, ViewModel};
@@ -14,7 +14,12 @@ fn button(
     action: Update,
     actions: &mut Vec<Action>,
 ) {
-    if widgets::button(ui, pal, text(vm.look.language, key), Kind::Ghost, true).clicked() {
+    let kind = if matches!(action, Update::Confirm | Update::Install) {
+        Kind::Hot
+    } else {
+        Kind::Plain
+    };
+    if widgets::button(ui, pal, text(vm.look.language, key), kind, true).clicked() {
         actions.push(Action::Update(action));
     }
 }
@@ -29,16 +34,18 @@ pub(super) fn settings(
         vm.update,
         State::Checking | State::Downloading { .. } | State::Restarting
     );
-    if widgets::button(ui, pal, text(lang, Key::CheckUpdates), Kind::Ghost, !busy).clicked() {
-        actions.push(Action::Update(Update::Check));
-    }
-    let mut startup = vm.look.check_updates;
-    if ui
-        .checkbox(&mut startup, text(lang, Key::StartupUpdates))
-        .changed()
-    {
-        actions.push(Action::Update(Update::Startup(startup)));
-    }
+    widgets::duo(ui, |ui| {
+        widgets::text(
+            ui,
+            concat!("Bifrost ", env!("CARGO_PKG_VERSION")),
+            13.0,
+            fam::sans(),
+            pal.ink2,
+        );
+        if widgets::button(ui, pal, text(lang, Key::CheckUpdates), Kind::Plain, !busy).clicked() {
+            actions.push(Action::Update(Update::Check));
+        }
+    });
     match &vm.update {
         State::Idle => {}
         State::Checking => {
@@ -61,18 +68,23 @@ pub(super) fn settings(
                 ),
             );
             if let Some(notes) = &release.body {
-                let short: String = notes.chars().take(280).collect();
-                widgets::hint(ui, pal, &short);
+                ui.add(egui::Label::new(notes_job(
+                    pal,
+                    notes,
+                    ui.available_width(),
+                )));
             }
-            ui.hyperlink_to(text(lang, Key::UpdateDetails), RELEASES);
             if vm.update_confirm {
                 widgets::hint(ui, pal, text(lang, Key::UpdateConfirm));
-                ui.horizontal_wrapped(|ui| {
+                widgets::duo(ui, |ui| {
                     button(ui, pal, vm, Key::InstallUpdate, Update::Install, actions);
                     button(ui, pal, vm, Key::Cancel, Update::Cancel, actions);
                 });
             } else {
-                button(ui, pal, vm, Key::InstallUpdate, Update::Confirm, actions);
+                widgets::duo(ui, |ui| {
+                    ui.hyperlink_to(text(lang, Key::UpdateDetails), RELEASES);
+                    button(ui, pal, vm, Key::InstallUpdate, Update::Confirm, actions);
+                });
             }
         }
         State::Downloading { received, total } => {
@@ -94,6 +106,24 @@ pub(super) fn settings(
             ui.hyperlink_to(text(lang, Key::UpdateDetails), RELEASES);
         }
     }
+}
+
+fn notes_job(pal: &Palette, notes: &str, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width;
+    job.wrap.max_rows = 3;
+    job.wrap.overflow_character = Some('…');
+    job.append(
+        notes.trim(),
+        0.0,
+        egui::text::TextFormat {
+            font_id: font(12.0, fam::sans()),
+            color: pal.ink2,
+            line_height: Some(17.4),
+            ..Default::default()
+        },
+    );
+    job
 }
 pub(super) fn notice(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     if !vm.update_notice {
@@ -128,4 +158,29 @@ pub(super) fn notice(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: 
                     });
                 });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gui_settings::Theme;
+
+    #[test]
+    fn release_notes_elide_after_three_actual_lines_in_both_themes() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        for theme in [Theme::Light, Theme::Dark] {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let galley = ui.painter().layout_job(notes_job(
+                    &Palette::of(theme),
+                    "First line\nSecond line\nThird line\nFourth line\nFifth line",
+                    240.0,
+                ));
+                assert_eq!(galley.rows.len(), 3);
+                assert!(galley.elided);
+                assert_eq!(galley.rows[2].glyphs.last().unwrap().chr, '…');
+            });
+            output.drop_without_applying_deltas();
+        }
+    }
 }

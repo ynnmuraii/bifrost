@@ -393,9 +393,100 @@ fn settings_version_is_a_padded_bottom_row_in_both_languages_and_themes() {
                 );
                 assert!(label.top() > bounds(stop).bottom());
                 assert!(value.left() > label.right());
-                assert!((value.center().y - label.center().y).abs() < 8.0);
+                let check = bounds(ui_text::text(lang, ui_text::Key::CheckUpdates));
+                assert!((value.center().y - check.center().y).abs() < 3.0);
+                assert!(check.left() > value.right());
+                assert!(
+                    frame.rects.iter().any(|rect| {
+                        (rect.height() - 44.0).abs() < 1.0 && rect.contains_rect(check)
+                    }),
+                    "the update check must have the same filled button frame as service controls"
+                );
                 assert!(value.bottom() < size.y - 16.0);
             }
+        }
+    }
+}
+
+#[test]
+fn updater_uses_a_startup_segment_and_aligned_release_actions() {
+    use lws_gui::updater::{Action as Update, Release, State};
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for theme in [Theme::Light, Theme::Dark] {
+            let mut vm = connected();
+            vm.look.language = lang;
+            vm.look.theme = theme;
+            vm.modal = Some(Modal::Settings);
+            let mut release: Release =
+                serde_json::from_str(include_str!("fixtures/latest-release.json")).unwrap();
+            release.tag_name = "v0.1.4".into();
+            release.body = Some("First line\nSecond line\nThird line\nFourth line".into());
+            vm.update = State::Available(release);
+            let mut harness = Harness::new();
+            harness.frame(&vm, false, SIZE, Vec::new());
+            harness.now += Duration::from_millis(500);
+            let frame = harness.settle(&vm, false);
+            let bounds = |needle: &str| {
+                frame
+                    .texts
+                    .iter()
+                    .find(|(text, _)| text == needle)
+                    .unwrap_or_else(|| panic!("missing {needle}"))
+                    .1
+            };
+            let startup = bounds(&ui_text::text(lang, ui_text::Key::StartupUpdates).to_uppercase());
+            let version = bounds(&ui_text::text(lang, ui_text::Key::Version).to_uppercase());
+            let off = frame
+                .texts
+                .iter()
+                .find(|(text, rect)| {
+                    text == ui_text::text(lang, ui_text::Key::Off)
+                        && rect.top() > startup.top()
+                        && rect.bottom() < version.top()
+                })
+                .expect("startup preference uses the existing on/off segmented switch")
+                .1;
+            let startup_on = frame
+                .texts
+                .iter()
+                .find(|(text, rect)| {
+                    text == ui_text::text(lang, ui_text::Key::On)
+                        && rect.top() > startup.top()
+                        && rect.bottom() < version.top()
+                })
+                .unwrap()
+                .1;
+            let autostart_off = frame
+                .texts
+                .iter()
+                .find(|(text, rect)| {
+                    text == ui_text::text(lang, ui_text::Key::Off) && rect.bottom() < startup.top()
+                })
+                .unwrap()
+                .1;
+            for selected in [startup_on, autostart_off] {
+                assert!(
+                    frame.rects.iter().any(|rect| {
+                        (rect.height() - 38.0).abs() < 1.0 && rect.contains_rect(selected)
+                    }),
+                    "the startup and login segments must keep independent selected pills"
+                );
+            }
+            let details = bounds(ui_text::text(lang, ui_text::Key::UpdateDetails));
+            let update = bounds(ui_text::text(lang, ui_text::Key::InstallUpdate));
+            assert!((details.center().y - update.center().y).abs() < 4.0);
+            assert!(update.left() > details.right());
+            assert!(
+                frame.rects.iter().any(|rect| {
+                    (rect.height() - 44.0).abs() < 1.0 && rect.contains_rect(update)
+                }),
+                "the primary update action must have a filled button frame"
+            );
+            let frame = harness.frame(&vm, false, SIZE, click_at(off.center()));
+            assert_eq!(
+                frame.output.actions,
+                vec![Action::Update(Update::Startup(false))]
+            );
         }
     }
 }

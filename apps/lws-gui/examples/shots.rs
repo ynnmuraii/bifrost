@@ -213,7 +213,7 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
     let release = Release {
         tag_name: "v0.1.4".into(),
         name: Some("Bifrost 0.1.4".into()),
-        body: Some("Improved reliability and keyboard sharing.".into()),
+        body: Some("- Improved reliability and keyboard sharing.\n- Downloads are verified before replacing the binary.\n- Configuration and paired computers are preserved.\n- Additional fixes and improvements in this release.".into()),
         html_url: lws_gui::updater::RELEASES.into(),
         assets: Vec::new(),
         draft: false,
