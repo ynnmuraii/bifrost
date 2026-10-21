@@ -1038,14 +1038,20 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::hint(ui, pal, text(lang, Key::TheServiceWillAskForTheGrantsAgain));
         });
     }
+    row(ui, pal, text(lang, Key::StartupUpdates), false, |ui| {
+        // The other on/off segment uses the same labels; keep its animation and hit IDs separate.
+        ui.push_id("startup-updates", |ui| {
+            if let Some(i) = widgets::seg(
+                ui,
+                pal,
+                &[text(lang, Key::On), text(lang, Key::Off)],
+                usize::from(!vm.look.check_updates),
+            ) {
+                actions.push(Action::Update(crate::updater::Action::Startup(i == 0)));
+            }
+        });
+    });
     row(ui, pal, text(lang, Key::Version), true, |ui| {
-        widgets::text(
-            ui,
-            concat!("Bifrost ", env!("CARGO_PKG_VERSION")),
-            13.0,
-            fam::sans(),
-            pal.ink2,
-        );
         super::update::settings(ui, pal, vm, actions);
     });
 }
