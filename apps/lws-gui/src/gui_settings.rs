@@ -82,6 +82,10 @@ pub struct Look {
     pub pan_y: i16,
     /// The pairing dock is open (`false`: only its handle shows).
     pub dock_open: bool,
+    /// Background release checks are opt-out.
+    pub check_updates: bool,
+    /// Stable release deliberately skipped for automatic checks only.
+    pub skipped_update: Option<[u64; 3]>,
 }
 
 /// The furthest the map may be panned, in points.
@@ -109,6 +113,8 @@ impl Default for Look {
             pan_x: 0,
             pan_y: 0,
             dock_open: true,
+            check_updates: true,
+            skipped_update: None,
         }
     }
 }
@@ -147,6 +153,8 @@ struct Stored {
     pan_x: i16,
     pan_y: i16,
     dock_open: bool,
+    check_updates: bool,
+    skipped_update: Option<[u64; 3]>,
     /// The slider, since it replaced the pace.
     speed: Option<f32>,
     /// The pace, as a file written before the slider still says it.
@@ -166,6 +174,8 @@ impl Default for Stored {
             pan_x: look.pan_x,
             pan_y: look.pan_y,
             dock_open: look.dock_open,
+            check_updates: true,
+            skipped_update: None,
             speed: None,
             pace: None,
         }
@@ -189,6 +199,8 @@ impl From<Stored> for Look {
             pan_x: stored.pan_x,
             pan_y: stored.pan_y,
             dock_open: stored.dock_open,
+            check_updates: stored.check_updates,
+            skipped_update: stored.skipped_update,
         }
     }
 }
@@ -251,6 +263,8 @@ mod tests {
         assert_eq!(look.speed, SPEED_DEFAULT);
         assert_eq!(look.speed, 1.0);
         assert!(look.clouds && look.dock_open);
+        assert!(look.check_updates);
+        assert!(look.skipped_update.is_none());
         assert_eq!((look.pan_x, look.pan_y), (0, 0));
     }
 
@@ -269,6 +283,8 @@ mod tests {
             pan_x: -120,
             pan_y: 37,
             dock_open: false,
+            check_updates: false,
+            skipped_update: Some([0, 1, 4]),
         };
         save(&path, &look).expect("the directory is created");
         assert_eq!(load(&path), look);

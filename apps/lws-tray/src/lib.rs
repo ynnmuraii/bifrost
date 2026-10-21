@@ -79,6 +79,13 @@ pub fn run_tray(args: Vec<String>) -> ExitCode {
         }
         let flags: Vec<OsString> = args.into_iter().map(Into::into).collect();
         let (commands, rx) = mpsc::unbounded_channel();
+        let exit_commands = commands.clone();
+        if let Err(error) = _guard.set_show_handler(move || {
+            let _ = exit_commands.send(Action::Exit);
+        }) {
+            eprintln!("bifrost tray: update listener: {error}");
+            return ExitCode::FAILURE;
+        }
         let (state_tx, state) = watch::channel(State {
             local_name,
             look_file,

@@ -21,6 +21,7 @@ accepted = [
     "Ubuntu-font-1.0",
     "BSL-1.0",
     "Unlicense",
+    "CDLA-Permissive-2.0",
 ]
 
 # A shipped binary contains no dev-dependencies, so their notices are not listed — the same rule

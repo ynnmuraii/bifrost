@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added opt-out startup release checks, manual checks beside the version, remembered skipped versions, and Russian/English update notices.
+- Updates download the platform binary over HTTPS with exact-host redirect checks, verify SHA256SUMS, replace it with a backup, and restart all roles after graceful input release. Linux restarts the GUI in place so systemd user units keep their main PID.
+
 ## 0.1.3 — 2026-10-19
 
 - Fixed emergency-hotkey registration on KDE Wayland when Bifrost is launched from its desktop entry or an `app-bifrost@….service` unit. Shortcut refusals now show the portal's actual reason; GNOME 46 still has no GlobalShortcuts portal.
