@@ -156,6 +156,12 @@ impl Runtime {
                     });
                     match result {
                         Ok(state) => {
+                            tracing::info!(
+                                manual,
+                                current_version = env!("CARGO_PKG_VERSION"),
+                                update_available = matches!(state, State::Available(_)),
+                                "release update check completed"
+                            );
                             view.update_notice = !manual && matches!(state, State::Available(_));
                             view.update = state;
                         }
