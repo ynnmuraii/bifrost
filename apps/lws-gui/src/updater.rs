@@ -5,9 +5,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ring::digest::{digest, SHA256};
 use semver::Version;
 use serde::Deserialize;
-use ring::digest::{digest, SHA256};
 
 pub const RELEASES: &str = "https://github.com/ynnmuraii/bifrost/releases";
 pub const LATEST: &str = "https://api.github.com/repos/ynnmuraii/bifrost/releases/latest";
@@ -377,7 +377,8 @@ mod tests {
     }
     #[test]
     fn checksum_decisions() {
-        let sums = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  bifrost.exe\n";
+        let sums =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  bifrost.exe\n";
         assert!(verify(b"", sums, "bifrost.exe").is_ok());
         assert!(verify(b"modified", sums, "bifrost.exe").is_err());
         assert!(verify(b"", sums, "missing").is_err());

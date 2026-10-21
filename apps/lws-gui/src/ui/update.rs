@@ -81,6 +81,7 @@ pub(super) fn settings(
                 ui.add(egui::ProgressBar::new(*received as f32 / total as f32).show_percentage());
             } else {
                 ui.spinner();
+                widgets::hint(ui, pal, &ui_text::clipboard_size(lang, *received));
             }
         }
         State::Restarting => {
