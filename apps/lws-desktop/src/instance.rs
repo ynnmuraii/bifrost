@@ -20,9 +20,6 @@ impl Role {
             Self::Tray => "tray",
         }
     }
-    fn has_show_signal(self) -> bool {
-        self == Self::Gui
-    }
 }
 
 pub enum InstanceOutcome {
@@ -51,7 +48,7 @@ fn acquire_named(role: Role, namespace: &str, signal: bool) -> io::Result<Instan
             listener: Mutex::new(None),
         })),
         None => {
-            if role.has_show_signal() && signal {
+            if role == Role::Gui && signal {
                 signal_named(namespace)?;
             }
             Ok(InstanceOutcome::Existing)
@@ -137,6 +134,14 @@ pub fn start_tray(args: &[OsString], timeout: Duration) -> io::Result<()> {
         "the tray icon did not appear",
     ))
 }
+/// Ask the old tray to remove its icon and exit before an updater restart.
+pub fn stop_tray() -> io::Result<()> {
+    platform::signal_role("multideskflow", Role::Tray)
+}
+/// Probe the instance lock, not icon readiness: an icon can vanish before its process exits.
+pub fn tray_is_running() -> bool {
+    !matches!(platform::acquire(Role::Tray, "multideskflow"), Ok(Some(_)))
+}
 pub fn signal_existing_gui() -> io::Result<()> {
     signal_named("multideskflow")
 }
@@ -144,7 +149,7 @@ fn signal_named(namespace: &str) -> io::Result<()> {
     // A second launch can acquire the existence result before the first launch
     // finishes publishing its endpoint. Bound that startup race to half a second.
     for attempt in 0..50 {
-        match platform::signal(namespace) {
+        match platform::signal_role(namespace, Role::Gui) {
             Ok(()) => return Ok(()),
             Err(error) if attempt == 49 => return Err(error),
             Err(_) => thread::sleep(Duration::from_millis(10)),
@@ -296,8 +301,8 @@ mod platform {
             }
             return Err(error);
         }
-        let socket = if role.has_show_signal() {
-            let path = directory.join("gui.sock");
+        let socket = {
+            let path = directory.join(format!("{}.sock", role.name()));
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -305,8 +310,6 @@ mod platform {
             }
             let listener = UnixListener::bind(&path)?;
             Some((listener, path))
-        } else {
-            None
         };
         let ready = if role == Role::Tray {
             // Holding the lock, so whatever marker is here belongs to a dead tray.
@@ -399,8 +402,9 @@ mod platform {
             || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         Ok(alive && pid > 0)
     }
-    pub fn signal(namespace: &str) -> io::Result<()> {
-        UnixStream::connect(directory(namespace)?.join("gui.sock"))?.write_all(b"show\n")
+    pub fn signal_role(namespace: &str, role: Role) -> io::Result<()> {
+        UnixStream::connect(directory(namespace)?.join(format!("{}.sock", role.name())))?
+            .write_all(b"show\n")
     }
 }
 
@@ -517,13 +521,11 @@ mod platform {
         } else {
             None
         };
-        let event = if role.has_show_signal() {
+        let event = {
             let event_name = name(namespace, role, "show")?;
             Some(Arc::new(handle(unsafe {
                 CreateEventW(null(), 0, 0, event_name.as_ptr())
             })?))
-        } else {
-            None
         };
         Ok(Some(Guard {
             _mutex: mutex,
@@ -585,8 +587,8 @@ mod platform {
         let event = Handle(raw);
         Ok(unsafe { WaitForSingleObject(event.0, 0) } == WAIT_OBJECT_0)
     }
-    pub fn signal(namespace: &str) -> io::Result<()> {
-        let name = name(namespace, Role::Gui, "show")?;
+    pub fn signal_role(namespace: &str, role: Role) -> io::Result<()> {
+        let name = name(namespace, role, "show")?;
         let event = handle(unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) })?;
         // A foreground launcher can grant the existing GUI activation rights.
         // Background launches may lack those rights; showing still must work.
@@ -686,8 +688,6 @@ mod tests {
     #[test]
     fn role_identity_and_existing_instance_decision() {
         assert_ne!(Role::Gui.name(), Role::Tray.name());
-        assert!(Role::Gui.has_show_signal());
-        assert!(!Role::Tray.has_show_signal());
     }
     #[test]
     fn exclusive_roles_release_and_show_headlessly() {

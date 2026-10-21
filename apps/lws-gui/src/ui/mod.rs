@@ -24,6 +24,7 @@ mod field;
 mod map_view;
 mod modal;
 mod theme;
+mod update;
 mod widgets;
 
 use std::time::{Duration, Instant};
@@ -216,6 +217,7 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
     if let Some(relabel) = modal::draw(ui, &pal, vm, st, full, t, &mut out.actions) {
         wants = Some(wants.map_or(relabel, |w| w.min(relabel)));
     }
+    update::notice(ui, &pal, vm, &mut out.actions);
     out.repaint_after = wants;
     out
 }

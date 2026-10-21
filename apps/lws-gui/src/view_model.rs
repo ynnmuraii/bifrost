@@ -836,6 +836,10 @@ pub struct ViewModel {
     pub pairing: Pairing,
     /// The settings screen's state.
     pub settings: Settings,
+    /// GUI-only updater state, also used by offscreen screenshots.
+    pub update: crate::updater::State,
+    pub update_notice: bool,
+    pub update_confirm: bool,
     /// Metadata only; full clipboard text remains in the core.
     pub clipboard_history: Vec<ipc::ClipboardHistoryEntry>,
     /// The last finished operation, shown as a toast until [`TOAST_FOR`] runs out.
@@ -882,6 +886,9 @@ impl ViewModel {
             editor: LayoutEditor::default(),
             pairing: Pairing::default(),
             settings: Settings::default(),
+            update: crate::updater::State::Idle,
+            update_notice: false,
+            update_confirm: false,
             clipboard_history: Vec::new(),
             outcome: None,
             appearance_open: false,
@@ -2297,6 +2304,8 @@ impl ViewModel {
 /// is applied to the view model by the app. [`Action::wire`] is the boundary between them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    /// A GUI-only updater operation; intercepted by the app, never sent to the agent.
+    Update(crate::updater::Action),
     /// Ask the core for its state and the document again.
     Refresh,
     /// Become the owner of input.
@@ -2578,6 +2587,12 @@ impl Bridge {
     /// The client that talks, for the two buttons that need no request of their own.
     pub fn client(&self) -> &GuiClient {
         &self.client
+    }
+
+    /// Updater shutdown never invokes the service UI's force-stop fallback.
+    pub(crate) fn shutdown_for_update(&mut self, now: Instant) {
+        let id = self.view.begin_request(Request::Shutdown, now);
+        self.client.send(id, Msg::Shutdown(ipc::Shutdown {}));
     }
 
     /// Sends one action where it belongs.

@@ -59,6 +59,7 @@ pub struct GuiApp {
     /// The other half of the diagnosis: a window that minimises *without* a
     /// «the window was asked to close» line above it was not this program's close handler.
     reported_minimized: Option<bool>,
+    updater: crate::updater_runtime::Runtime,
 }
 
 impl GuiApp {
@@ -67,7 +68,7 @@ impl GuiApp {
     /// Every failure before the first frame — the directories, the endpoint, a broken
     /// `config.toml` — is carried into the view model and shown in the top bar, because a
     /// window that refuses to open cannot tell its user anything.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, updated: bool) -> Self {
         let (mut view, client) = view_model::boot(view_model::cli_args_from_env());
         ui::install_fonts(&cc.egui_ctx);
         // The client thread repaints the window when — and only when — it has something to say.
@@ -83,7 +84,7 @@ impl GuiApp {
         }
         let saved_look = view.look;
         view.settings.autostart = crate::autostart::enabled();
-        let start_core = view.config.config_was_missing;
+        let start_core = view.config.config_was_missing || updated;
         let mut bridge = Bridge::new(view, client);
         if start_core {
             bridge.dispatch(view_model::Action::StartCore, Instant::now());
@@ -94,6 +95,7 @@ impl GuiApp {
             look_file,
             saved_look,
             reported_minimized: None,
+            updater: crate::updater_runtime::Runtime::new(),
         }
     }
 
@@ -116,8 +118,11 @@ impl eframe::App for GuiApp {
         let now = Instant::now();
         let arrived = self.bridge.pump();
         self.bridge.view_mut().tick(now);
+        self.updater.tick(&mut self.bridge, ui.ctx());
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
-        if close_requested {
+        if close_requested
+            && !crate::updater_runtime::RESTART.load(std::sync::atomic::Ordering::Acquire)
+        {
             // The one place this window is asked to go away, and the one place it decides
             // what "away" means. The origin is the OS (the X, Alt+F4, a taskbar close, a
             // shutdown): nothing in this workspace sends a close request of its own, and the
@@ -165,7 +170,11 @@ impl eframe::App for GuiApp {
 
         let acted = !output.actions.is_empty();
         for action in output.actions {
-            self.bridge.dispatch(action, now);
+            if let view_model::Action::Update(update) = action {
+                self.updater.action(update, &mut self.bridge, ui.ctx());
+            } else {
+                self.bridge.dispatch(action, now);
+            }
         }
         self.save_look();
         // What an action changed is drawn by the next frame; an arrival was folded after the

@@ -31,6 +31,14 @@ ipc = { path = "../../crates/ipc" }
 logging = { path = "../../crates/logging" }
 protocol = { path = "../../crates/protocol" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+# Reuse the TLS stack's existing cryptography rather than add a second digest stack.
+ring = { version = "0.17", default-features = false, features = ["alloc"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
+flate2 = "1"
+tar = "0.4"
 ui-text = { path = "../../crates/ui-text" }
 # The async half of the GUI: one connection task on a dedicated thread, fed by a channel.
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

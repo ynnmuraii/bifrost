@@ -26,6 +26,8 @@ The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–10
 
 Get **0.1.3** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` for checking your downloads.
 
+The app checks for newer stable releases shortly after startup. Turn this off in **Settings → Check for updates on startup**, or check manually next to the version. Updates verify `SHA256SUMS.txt`, keep a binary backup, and ask before restarting all roles; your configuration and pairing are preserved. The first build containing the updater must be installed manually (0.1.3 has no updater). System-wide, non-writable installations must be updated manually.
+
 ### Windows 11 · x86_64
 
 Download **`bifrost-0.1.3-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.

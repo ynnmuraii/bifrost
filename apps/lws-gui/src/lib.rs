@@ -38,6 +38,8 @@ pub mod autostart;
 pub mod gui_settings;
 pub mod map;
 pub mod ui;
+pub mod updater;
+pub mod updater_runtime;
 pub mod view_model;
 
 // The tests draw the screens with the very same `egui` the window uses, so the version is
@@ -56,7 +58,9 @@ pub const TITLE: &str = "Bifrost";
 ///
 /// Everything the window needs before its first frame — the directories, the endpoint,
 /// `config.toml`, the client thread — is resolved by [`app::GuiApp::new`].
-pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
+pub fn run_gui(mut args: Vec<String>) -> std::process::ExitCode {
+    let updated = args.iter().any(|arg| arg == "--updated");
+    args.retain(|arg| arg != "--updated");
     // The window's decisions go to a file (`init_logging`): on Windows this role has no
     // console at all, and "why did the window do that?" is a question about its window.
     init_logging(&view_model::CliArgs::parse(args.iter().cloned()));
@@ -107,9 +111,20 @@ pub fn run_gui(args: Vec<String>) -> std::process::ExitCode {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint();
             })?;
-            Ok(Box::new(app::GuiApp::new(cc)))
+            Ok(Box::new(app::GuiApp::new(cc, updated)))
         }),
     );
+    if updater_runtime::RESTART.load(std::sync::atomic::Ordering::Acquire) {
+        // Release the GUI instance lock before starting (or exec-ing) its replacement.
+        drop(instance);
+        return match updater_runtime::restart(&args) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("bifrost restart: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     match result {
         Ok(()) => {
             // The close handler only lets the window go while the icon is up; this covers a

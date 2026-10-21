@@ -52,6 +52,9 @@ fn main() -> std::process::ExitCode {
             .map(|pair| pair[1].clone())
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    if args.iter().any(|arg| arg == "--updates") {
+        return update_shots(&dir);
+    }
     if args.iter().any(|arg| arg == "--metadata") {
         if let Err(error) = std::fs::create_dir_all(&dir) {
             eprintln!("{error}");
@@ -198,6 +201,51 @@ fn main() -> std::process::ExitCode {
         }
     }
     println!("{written} pictures in {}", dir.display());
+    std::process::ExitCode::SUCCESS
+}
+
+fn update_shots(dir: &Path) -> std::process::ExitCode {
+    use lws_gui::updater::{Release, State};
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let release = Release {
+        tag_name: "v0.1.4".into(),
+        name: Some("Bifrost 0.1.4".into()),
+        body: Some("Improved reliability and keyboard sharing.".into()),
+        html_url: lws_gui::updater::RELEASES.into(),
+        assets: Vec::new(),
+        draft: false,
+        prerelease: false,
+    };
+    for (theme_tag, theme) in [("light", Theme::Light), ("dark", Theme::Dark)] {
+        for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+            for (state_tag, state) in [
+                ("current", State::Current),
+                ("checking", State::Checking),
+                ("available", State::Available(release.clone())),
+                (
+                    "error",
+                    State::Error("GitHub: HTTP 403 (rate limit)".into()),
+                ),
+                ("startup", State::Available(release.clone())),
+            ] {
+                let mut view = mockup(theme, Some(Modal::Settings), lang);
+                view.update = state;
+                if state_tag == "startup" {
+                    view.modal = None;
+                    view.update_notice = true;
+                }
+                let file = dir.join(format!("update-{state_tag}-{lang_tag}-{theme_tag}.png"));
+                if let Err(error) = shoot(view, &file, [1745, 1091], false) {
+                    eprintln!("{error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+                println!("{}", file.display());
+            }
+        }
+    }
     std::process::ExitCode::SUCCESS
 }
 

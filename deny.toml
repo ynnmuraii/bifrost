@@ -42,6 +42,8 @@ allow = [
     "Unlicense",
     # `rustix`, `linux-raw-sys`, `wasi`, `wit-bindgen`.
     "Apache-2.0 WITH LLVM-exception",
+    # Mozilla trust-root data (webpki-roots), permissive redistribution with licence text.
+    "CDLA-Permissive-2.0",
 ]
 
 # Crates whose licence expression offers a permissive alternative are resolved by the `allow`
@@ -66,3 +68,15 @@ include-dev = false
 # distributed separately and need no notice of their own.
 [licenses.private]
 ignore = true
+
+[advisories]
+ignore = [
+    # ttf-parser: unmaintained, transitive via egui/ashpd/accesskit, no compatible release; 2026-10-19.
+    "RUSTSEC-2026-0192",
+    # zvariant: unmaintained, transitive via egui/ashpd/accesskit, no compatible release; 2026-10-19.
+    "RUSTSEC-2026-0370",
+    # zbus_names: unmaintained, transitive via egui/ashpd/accesskit, no compatible release; 2026-10-19.
+    "RUSTSEC-2026-0371",
+    # zvariant_derive: unmaintained, transitive via egui/ashpd/accesskit, no compatible release; 2026-10-19.
+    "RUSTSEC-2026-0372",
+]

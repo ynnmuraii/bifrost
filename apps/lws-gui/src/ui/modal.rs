@@ -1046,6 +1046,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             fam::sans(),
             pal.ink2,
         );
+        super::update::settings(ui, pal, vm, actions);
     });
 }
 
