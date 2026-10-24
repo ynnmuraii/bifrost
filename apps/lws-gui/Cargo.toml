@@ -61,6 +61,7 @@ winit = "0.30.13"
 windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+spki = { version = "0.8", features = ["pem"] }
 # An integration test is a crate of its own: it sees `lws-gui` and these, and not the window's
 # own dependencies. The fixtures are `GuiFrame`s, so the tests read `protocol` directly, and
 # the editor's serialiser is checked against the `config` schema it has to satisfy.
