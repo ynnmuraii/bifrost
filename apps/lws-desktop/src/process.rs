@@ -30,6 +30,18 @@ pub fn process_has_exited(pid: u32) -> io::Result<bool> {
     }
 }
 
+/// Probe a NUL-terminated pipe name without creating a client connection.
+#[cfg(windows)]
+pub fn named_pipe_is_released(name: &[u16]) -> bool {
+    use windows_sys::Win32::{Foundation::ERROR_FILE_NOT_FOUND, System::Pipes::WaitNamedPipeW};
+    if name.last() != Some(&0) {
+        return false;
+    }
+    // SAFETY: the slice is terminated, remains alive for the call, and no pointer is retained.
+    let available = unsafe { WaitNamedPipeW(name.as_ptr(), 1) };
+    available == 0 && io::Error::last_os_error().raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32)
+}
+
 #[cfg(unix)]
 pub fn process_has_exited(pid: u32) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
