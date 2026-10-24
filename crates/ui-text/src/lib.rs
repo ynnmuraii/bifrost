@@ -315,7 +315,7 @@ pub enum Key {
     CouldNotStartTalkingToTheServiceError,
     /// «служба уже запущена и отвечает»
     TheServiceIsAlreadyRunningAndAnswering,
-    /// «{program} не остановил процесс {pid} (код {})»
+    /// «{program} не остановил процесс {pid} (код {code})»
     ProgramDidNotStopProcessPidCode,
     /// «неизвестен»
     Unknown2,
@@ -887,7 +887,7 @@ const fn ru(key: Key) -> &'static str {
         Key::TheSettingsFileWasNotFound => "файл настроек не найден",
         Key::CouldNotStartTalkingToTheServiceError => "не удалось запустить обмен со службой: {error}",
         Key::TheServiceIsAlreadyRunningAndAnswering => "служба уже запущена и отвечает",
-        Key::ProgramDidNotStopProcessPidCode => "{program} не остановил процесс {pid} (код {})",
+        Key::ProgramDidNotStopProcessPidCode => "{program} не остановил процесс {pid} (код {code})",
         Key::Unknown2 => "неизвестен",
         Key::ProgramDidNotStartError => "{program} не запустился: {error}",
         Key::CouldNotWorkOutTheDirectoriesWhy => "не удалось определить каталоги: {why}",
@@ -1241,7 +1241,7 @@ const fn en(key: Key) -> &'static str {
         Key::TheSettingsFileWasNotFound => "the settings file was not found",
         Key::CouldNotStartTalkingToTheServiceError => "could not start talking to the service: {error}",
         Key::TheServiceIsAlreadyRunningAndAnswering => "the service is already running and answering",
-        Key::ProgramDidNotStopProcessPidCode => "{program} did not stop process {pid} (code {})",
+        Key::ProgramDidNotStopProcessPidCode => "{program} did not stop process {pid} (code {code})",
         Key::Unknown2 => "unknown",
         Key::ProgramDidNotStartError => "{program} did not start: {error}",
         Key::CouldNotWorkOutTheDirectoriesWhy => "could not work out the directories: {why}",

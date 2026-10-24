@@ -2307,7 +2307,7 @@ impl ViewModel {
             self.settings.service.line = Some(Outcome::failed(fill_named(
                 lang,
                 Key::CouldNotStopTheServiceWhy2,
-                &[("why", &"")],
+                &[("why", &short_error(&why))],
             )));
         }
     }
@@ -3187,33 +3187,51 @@ pub fn stop_core(pid: u32) -> Result<(), String> {
         .stderr(std::process::Stdio::null());
     match command.status() {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(fill_named(
-            lang,
-            Key::ProgramDidNotStopProcessPidCode,
-            &[
-                (
-                    "program",
-                    &status
-                        .code()
-                        .map_or(text(lang, Key::Unknown2).to_owned(), |code| {
-                            code.to_string()
-                        }),
-                ),
-                (
-                    "pid",
-                    &status
-                        .code()
-                        .map_or(text(lang, Key::Unknown2).to_owned(), |code| {
-                            code.to_string()
-                        }),
-                ),
-            ],
-        )),
+        Ok(status) => Err(stop_core_failure(lang, program, pid, status.code())),
         Err(error) => Err(fill_named(
             lang,
             Key::ProgramDidNotStartError,
             &[("program", &program), ("error", &error)],
         )),
+    }
+}
+
+fn stop_core_failure(lang: Lang, program: &str, pid: u32, code: Option<i32>) -> String {
+    let code = code.map_or_else(
+        || text(lang, Key::Unknown2).to_owned(),
+        |code| code.to_string(),
+    );
+    fill_named(
+        lang,
+        Key::ProgramDidNotStopProcessPidCode,
+        &[("program", &program), ("pid", &pid), ("code", &code)],
+    )
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[test]
+    fn stop_failure_names_the_program_pid_and_exit_code_in_both_languages() {
+        for (lang, expected) in [
+            (Lang::Ru, "taskkill не остановил процесс 4242 (код 5)"),
+            (Lang::En, "taskkill did not stop process 4242 (code 5)"),
+        ] {
+            assert_eq!(stop_core_failure(lang, "taskkill", 4242, Some(5)), expected);
+        }
+    }
+
+    #[test]
+    fn stop_failure_localizes_an_unknown_exit_code() {
+        assert_eq!(
+            stop_core_failure(Lang::Ru, "kill", 4242, None),
+            "kill не остановил процесс 4242 (код неизвестен)"
+        );
+        assert_eq!(
+            stop_core_failure(Lang::En, "kill", 4242, None),
+            "kill did not stop process 4242 (code unknown)"
+        );
     }
 }
 
