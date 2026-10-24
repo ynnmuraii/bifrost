@@ -59,10 +59,10 @@
 //! * Ed25519 keys, because the docs leave the algorithm open and Ed25519 has the smallest
 //!   surface in both `ring` and `rcgen`; the SPKI-derived `node_id` is what is pinned, so
 //!   the choice stays local as long as both peers can parse each other's certificate.
-//! * **Gaps, stated rather than hidden**: the Windows key is a PKCS#8 file under
-//!   `%APPDATA%` with the profile ACL, *not* the documented `identity.dpapi` (DPAPI
-//!   wrapping is a follow-up); Linux uses the documented `0600` file fallback instead of
-//!   the Secret Service. Both are in [`key`]'s module docs.
+//! * **One stated gap**: Linux uses the documented `0600` file fallback instead of the
+//!   Secret Service (D-Bus is not implemented). Windows stores the documented
+//!   `identity.dpapi`, a DPAPI CurrentUser blob under the profile ACL; both are in
+//!   [`key`]'s and [`keystore`]'s module docs.
 //! * This crate does not implement the input/control link itself (framing, `Hello`,
 //!   `seq`, reconnects, queues). `crates/protocol` owns those rules and
 //!   `crates/transport` will own the link; here the pairing channel is the covered path.
