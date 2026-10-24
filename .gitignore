@@ -2,3 +2,5 @@ target/
 node_modules/
 *.zip
 docs/
+.agents/
+skills-lock.json
