@@ -20,7 +20,7 @@ pub(crate) struct Runtime {
     startup: Option<Instant>,
     sender: mpsc::Sender<Event>,
     receiver: mpsc::Receiver<Event>,
-    stopping: Option<Instant>,
+    stopping: Option<crate::core_exit::Wait>,
     busy: bool,
 }
 impl Runtime {
@@ -179,8 +179,7 @@ impl Runtime {
                     bridge.view_mut().update = State::Error(view_model::short_error(&error));
                 }
                 Event::Installed(Ok(())) => {
-                    // Existing Shutdown IPC is graceful: core releases capture/injection and
-                    // waits for its agent before dropping the GUI connection.
+                    // Shutdown may drop the GUI link before core has released its listeners.
                     bridge.shutdown_for_update(now);
                     if let Err(error) = lws_desktop::stop_tray() {
                         if lws_desktop::tray_is_running() {
@@ -190,18 +189,34 @@ impl Runtime {
                         }
                     }
                     bridge.view_mut().update = State::Restarting;
-                    self.stopping = Some(now);
+                    let wait = bridge.view().config.paths.as_ref().ok_or_else(|| {
+                        "Cannot wait for core shutdown: settings directories are unknown".to_owned()
+                    }).and_then(|paths| {
+                        crate::core_exit::Wait::new(
+                            paths,
+                            bridge.view().core.as_ref().and_then(|core| core.pid),
+                            now,
+                        )
+                    });
+                    match wait {
+                        Ok(wait) => self.stopping = Some(wait),
+                        Err(error) => {
+                            self.busy = false;
+                            bridge.view_mut().update = State::Error(error);
+                        }
+                    }
                 }
             }
         }
-        if let Some(since) = self.stopping {
-            if !bridge.view().connection.is_connected()
+        if let Some(wait) = &self.stopping {
+            let step = wait.poll(now);
+            if step == crate::core_exit::Step::Exited
                 && !lws_desktop::tray_is_running()
-                && now.duration_since(since) >= Duration::from_millis(500)
             {
+                self.stopping = None;
                 RESTART.store(true, Ordering::Release);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else if now.duration_since(since) > Duration::from_secs(15) {
+            } else if wait.timed_out(now) {
                 self.stopping = None;
                 self.busy = false;
                 bridge.view_mut().update = State::Error(

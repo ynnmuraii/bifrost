@@ -7,6 +7,10 @@
 - The login-start entry now records the window class and the resolved executable path, matching the desktop entry the installer writes, so desktop environments group the window under Bifrost's icon.
 - The status screen now names this computer on a follower in a workspace of three or more computers, instead of showing its id only while it owned input.
 - Fixed the clipboard being echoed back to the other computer several times when a clipboard manager (Klipper, CopyQ) re-owns the selection after a remote copy.
+- Authenticate release checksums with an Ed25519 signature; unsigned or altered updates are refused.
+- Wait for the old core to exit and release its IPC endpoints before restarting after an update.
+- Show the actual service-stop error, program, process ID, and exit status.
+- Reap GUI-launched core processes on Linux instead of leaving zombies.
 
 ## 0.1.5 — 2026-10-24
 
