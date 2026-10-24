@@ -204,6 +204,13 @@ mod windows_tests {
             "probing must not create a connection for core to accept"
         );
         drop(listener);
-        assert!(lws_desktop::named_pipe_is_released(&name));
+        // Windows completes cancellation of the pending accept on a later runtime turn.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !lws_desktop::named_pipe_is_released(&name) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the name is released after the pending accept is cancelled");
     }
 }
