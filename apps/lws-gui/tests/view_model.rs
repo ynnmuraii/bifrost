@@ -290,6 +290,9 @@ fn nobody_is_in_the_pair_yet() {
     status.connected = false;
     status.is_owner = false;
     status.owner_node_id.clear();
+    // The fixture's core knows its own id; this scenario is a core that has not answered
+    // with one (and predates the field), which is when the window must invent nothing.
+    status.local_node_id.clear();
     vm.apply(event(Msg::Status(status)));
 
     assert_eq!(vm.link_line(), "Нет связи");
