@@ -1,17 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 — 2026-10-24
 
 - Fixed `--root=/path` (and the other path flags) being ignored by the window and the core while the tray honoured it. Every role now accepts both `--root /path` and `--root=/path`, so the window, the tray and the core it starts always agree on their directories.
 - VPN interfaces (Tailscale, WireGuard, ZeroTier, OpenVPN) are listed in the settings address picker instead of being hidden, and an adapter whose name merely contains “tun” or “wg” is no longer dropped. The physical LAN address still ranks first, so the default does not move onto the tunnel.
 - The login-start entry now records the window class and the resolved executable path, matching the desktop entry the installer writes, so desktop environments group the window under Bifrost's icon.
 - The status screen now names this computer on a follower in a workspace of three or more computers, instead of showing its id only while it owned input.
 - Fixed the clipboard being echoed back to the other computer several times when a clipboard manager (Klipper, CopyQ) re-owns the selection after a remote copy.
-- Authenticate release checksums with an Ed25519 signature; unsigned or altered updates are refused.
-- Wait for the old core to exit and release its IPC endpoints before restarting after an update, without opening probe connections to the shutting-down core.
-- Applying a LAN address restarts externally launched cores through graceful IPC and preserves dedicated systemd user-service supervision.
-- Show the actual service-stop error, program, process ID, and exit status.
-- Reap GUI-launched core processes on Linux instead of leaving zombies.
+- Releases now include Ed25519-signed checksums; Bifrost 0.1.6 and newer refuse unsigned or altered updates.
+- Fixed Windows update restarts occasionally failing while the previous service was still shutting down.
+- Applying a LAN address now restarts a service started outside the window and keeps systemd supervision on Linux.
+- Service-stop errors now show the real reason, program, process ID and exit status.
+- GUI-launched services no longer leave zombie processes after exiting on Linux.
 
 ## 0.1.5 — 2026-10-24
 
