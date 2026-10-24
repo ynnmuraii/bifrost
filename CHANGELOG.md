@@ -9,6 +9,7 @@
 - Fixed the clipboard being echoed back to the other computer several times when a clipboard manager (Klipper, CopyQ) re-owns the selection after a remote copy.
 - Authenticate release checksums with an Ed25519 signature; unsigned or altered updates are refused.
 - Wait for the old core to exit and release its IPC endpoints before restarting after an update.
+- Applying a LAN address restarts externally launched cores through graceful IPC and preserves dedicated systemd user-service supervision.
 - Show the actual service-stop error, program, process ID, and exit status.
 - Reap GUI-launched core processes on Linux instead of leaving zombies.
 

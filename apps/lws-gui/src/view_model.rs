@@ -754,8 +754,7 @@ pub struct Service {
 /// What «Перезапустить службу» is waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Restart {
-    /// The stop was sent to the pid this window holds; the window waits for the link to
-    /// drop, which is how it knows the old core is really gone.
+    /// Graceful shutdown was sent; process/listener exit still needs to be observed.
     Stopping {
         /// When the stop was sent, so the wait has an end.
         since: Instant,
@@ -767,9 +766,9 @@ pub enum Restart {
 /// What «Перезапустить службу» is to do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartStep {
-    /// Stop this pid, then wait for the link to drop before anything else.
-    Stop(u32),
-    /// There is nothing to wait for: ask the client for a fresh core right now.
+    /// Send graceful Shutdown IPC, then wait for process/listener exit.
+    Stop,
+    /// No active connection: still check listener ownership before launching.
     Start,
     /// The window must not act; why is already in [`Service::line`].
     Refused,
@@ -945,9 +944,7 @@ impl ViewModel {
     }
 
     /// The link is gone; the last `Status` stays on screen.
-    ///
-    /// Returns `true` while «Перезапустить службу» waits for the core it stopped: a dropped
-    /// link is the proof it was waiting for, and the window then starts the fresh one.
+    /// Restart completion depends on process/listener exit, not this event.
     pub fn on_disconnected(&mut self, why: String) -> bool {
         let lang = self.look.language;
         self.push_log(format!("Связь со службой потеряна: {}", short_error(&why)));
@@ -971,13 +968,6 @@ impl ViewModel {
         if self.settings.service.stopping.take().is_some() {
             self.settings.service.line = Some(Outcome::done(text(lang, Key::TheServiceIsStopped)));
             return false;
-        }
-        if matches!(
-            self.settings.service.restart,
-            Some(Restart::Stopping { .. })
-        ) {
-            self.settings.service.restart = Some(Restart::Starting);
-            return true;
         }
         false
     }
@@ -1028,6 +1018,7 @@ impl ViewModel {
         self.push_log(format!("Служба не запущена: {name} не отправлено"));
         if request == Some(Request::Shutdown) {
             self.settings.service.stopping = None;
+            self.settings.service.restart = None;
             self.settings.service.line = Some(Outcome::failed(
                 "служба перестала отвечать до получения просьбы остановиться",
             ));
@@ -1098,8 +1089,8 @@ impl ViewModel {
         if let Some(since) = self.settings.service.stopping {
             consider(since + SERVICE_STOP_TIMEOUT);
         }
-        if let Some(Restart::Stopping { since }) = &self.settings.service.restart {
-            consider(*since + SERVICE_STOP_TIMEOUT);
+        if let Some(Restart::Stopping { .. }) = &self.settings.service.restart {
+            consider(now + Duration::from_millis(100));
         }
         if let ServiceStart::Starting { since } = self.settings.service.start {
             consider(since + SERVICE_START_TIMEOUT);
@@ -1149,21 +1140,6 @@ impl ViewModel {
                 self.editor.save = Save::default();
                 self.restore_placement();
             }
-        }
-        // «Перезапустить службу» waits for the link to drop, and that wait has an end: past
-        // it the service is left to the user rather than watched from a spinner, because
-        // that is the only thing left that can be said honestly.
-        let seconds = SERVICE_STOP_TIMEOUT.as_secs();
-        let stalled = matches!(
-            &self.settings.service.restart,
-            Some(Restart::Stopping { since }) if now.duration_since(*since) >= SERVICE_STOP_TIMEOUT
-        );
-        if stalled {
-            self.settings.service.restart = None;
-            self.push_log("Служба не остановилась");
-            self.settings.service.line = Some(Outcome::failed(format!(
-                "служба не остановилась за {seconds} c — остановите её сами и нажмите «Перезапустить службу» снова"
-            )));
         }
         // A start that is still unanswered past its timeout is a start that failed: the
         // banner stops waiting, says why, and offers «Ещё раз».
@@ -2256,49 +2232,28 @@ impl ViewModel {
         }
     }
 
-    /// «Перезапустить службу»: stop the core this window started, then start a fresh one.
-    ///
-    /// The pid comes from [`ViewModel::core`] and from nowhere else. A service this window
-    /// did not start — one opened by hand, or by another window — is not the window's to
-    /// stop, so it says so instead of killing a process it only *thinks* it knows.
-    ///
-    /// What to do with the answer is the caller's: stopping a process is the one thing a
-    /// view model cannot be handed back.
+    /// Restart any connected core gracefully; an owned PID is only a timeout fallback.
     pub fn begin_restart(&mut self, now: Instant) -> RestartStep {
-        let lang = self.look.language;
+        if self.settings.service.stopping.is_some() {
+            return RestartStep::Refused;
+        }
         if self.settings.service.restart.is_some() {
             return RestartStep::Refused;
         }
-        let Some(core) = &self.core else {
-            self.settings.service.line = Some(Outcome::failed(text(
-                lang,
-                Key::TheServiceWasNotStartedByThisWindowStopItYourself,
-            )));
-            return RestartStep::Refused;
-        };
-        let Some(pid) = core.pid else {
-            self.settings.service.line = Some(Outcome::failed(text(
-                lang,
-                Key::TheServiceSProcessIdIsUnknownStopItYourself,
-            )));
-            return RestartStep::Refused;
-        };
-        if !self.connection.is_connected() {
-            // No link to break, so nothing to wait for: the fresh core can be started now.
-            self.push_log(format!("Служба перезапускается (pid {pid})"));
-            self.settings.service.restart = Some(Restart::Starting);
-            return RestartStep::Start;
-        }
-        self.push_log(format!("Служба останавливается (pid {pid})"));
+        self.settings.service.line = None;
         self.settings.service.restart = Some(Restart::Stopping { since: now });
-        RestartStep::Stop(pid)
+        self.push_log("Служба перезапускается");
+        if self.connection.is_connected() {
+            RestartStep::Stop
+        } else {
+            RestartStep::Start
+        }
     }
 
     /// What the stop of the core process answered, when it answered at all.
     ///
     /// A stop that failed ends the restart: the window says why, and leaves the service
-    /// alone. A stop that was sent leaves the [`Restart::Stopping`] wait standing, because
-    /// only a dropped link proves the core is gone.
+    /// alone. A sent stop leaves [`Restart::Stopping`] waiting for process/listener exit.
     pub fn on_core_stopped(&mut self, stopped: Result<(), String>) {
         let lang = self.look.language;
         if let Err(why) = stopped {
@@ -2580,12 +2535,23 @@ impl Action {
 pub struct Bridge {
     view: ViewModel,
     client: GuiClient,
+    restart_wait: Option<(crate::core_exit::Wait, bool)>,
+    peer_pid: Option<u32>,
+    core_unit: Option<String>,
+    restart_unit: Option<String>,
 }
 
 impl Bridge {
     /// Wires a view model to the client that serves it.
     pub fn new(view: ViewModel, client: GuiClient) -> Self {
-        Bridge { view, client }
+        Bridge {
+            view,
+            client,
+            restart_wait: None,
+            peer_pid: None,
+            core_unit: None,
+            restart_unit: None,
+        }
     }
 
     /// The state that draws.
@@ -2675,19 +2641,83 @@ impl Bridge {
         }
     }
 
-    /// «Перезапустить службу»: stop the core this window started, then ask for a new one.
-    ///
-    /// Only the pid from [`ViewModel::core`] is eligible for process termination; «Остановить
-    /// службу» first asks the core to exit and uses that pid only after its timeout.
-    /// The wait for the old core to be gone is event-driven — [`Bridge::pump`] starts the
-    /// fresh one when the link drops.
+    /// Graceful IPC works for externally started cores too. Never launch on link loss alone.
     fn restart_core(&mut self, now: Instant) {
-        match self.view.begin_restart(now) {
-            RestartStep::Stop(pid) => self.view.on_core_stopped(stop_core(pid)),
-            RestartStep::Start => {
-                self.client.start_core();
+        let step = self.view.begin_restart(now);
+        if step == RestartStep::Refused {
+            return;
+        }
+        let result = self
+            .view
+            .config
+            .paths
+            .as_ref()
+            .ok_or_else(|| {
+                "Cannot wait for core shutdown: settings directories are unknown".to_owned()
+            })
+            .and_then(|paths| {
+                crate::core_exit::Wait::new(
+                    paths,
+                    self.peer_pid
+                        .or_else(|| self.view.core.as_ref().and_then(|core| core.pid)),
+                    now,
+                )
+            });
+        match result {
+            Ok(wait) => {
+                self.restart_wait = Some((wait, false));
+                self.restart_unit = self.core_unit.clone();
+                if step == RestartStep::Stop {
+                    self.shutdown_for_update(now);
+                }
             }
-            RestartStep::Refused => {}
+            Err(error) => self.view.on_core_stopped(Err(error)),
+        }
+    }
+
+    fn poll_restart(&mut self, now: Instant) {
+        if self.view.settings.service.restart.is_none() {
+            self.restart_wait = None;
+        }
+        let Some((wait, fallback_used)) = &self.restart_wait else {
+            return;
+        };
+        match wait.poll(now) {
+            crate::core_exit::Step::Waiting => {}
+            crate::core_exit::Step::Exited => {
+                self.restart_wait = None;
+                self.view.settings.service.restart = Some(Restart::Starting);
+                self.client.start_core_in_unit(self.restart_unit.take());
+            }
+            crate::core_exit::Step::TimedOut => {
+                // Only terminate a PID this GUI actually launched, and only once.
+                let pid = self.view.core.as_ref().and_then(|core| core.pid);
+                if !fallback_used {
+                    if let Some(pid) = pid {
+                        match stop_core(pid).and_then(|()| {
+                            let paths = self
+                                .view
+                                .config
+                                .paths
+                                .as_ref()
+                                .ok_or("Unknown settings directories")?;
+                            crate::core_exit::Wait::new(paths, Some(pid), now)
+                        }) {
+                            Ok(wait) => {
+                                self.restart_wait = Some((wait, true));
+                                self.view.settings.service.restart =
+                                    Some(Restart::Stopping { since: now });
+                                return;
+                            }
+                            Err(error) => self.view.on_core_stopped(Err(error)),
+                        }
+                    }
+                }
+                self.restart_wait = None;
+                self.view.on_core_stopped(Err(
+                    "Core did not exit or release its IPC endpoints within 10 seconds".into(),
+                ));
+            }
         }
     }
 
@@ -2702,16 +2732,33 @@ impl Bridge {
         for event in self.client.drain() {
             arrived = true;
             match event {
-                GuiEvent::Connected { endpoint } => {
+                GuiEvent::Connected {
+                    endpoint,
+                    pid,
+                    unit,
+                } => {
+                    // systemd Restart= may already have supplied the replacement.
+                    if self.restart_wait.is_some()
+                        && self.restart_unit.is_some()
+                        && pid.is_some()
+                        && pid != self.peer_pid
+                    {
+                        self.restart_wait = None;
+                        self.restart_unit = None;
+                        self.view.settings.service.restart = Some(Restart::Starting);
+                        self.view.on_core_started(Ok(StartedCore {
+                            program: own_program(),
+                            pid: None,
+                        }));
+                    }
+                    self.peer_pid = pid;
+                    self.core_unit = unit;
                     self.view.on_connected(&endpoint);
                     // §4 of the build spec: a fresh link asks for the status and the document.
                     self.dispatch(Action::Refresh, Instant::now());
                 }
                 GuiEvent::Disconnected { why } => {
-                    // A dropped link is how the window knows the core it stopped is gone.
-                    if self.view.on_disconnected(why) {
-                        self.client.start_core();
-                    }
+                    self.view.on_disconnected(why);
                 }
                 GuiEvent::Frame(frame) => {
                     self.view.apply(*frame);
@@ -2724,6 +2771,7 @@ impl Bridge {
         if let Some(pid) = self.view.take_timed_out_shutdown_pid(Instant::now()) {
             self.view.on_shutdown_fallback(stop_core(pid));
         }
+        self.poll_restart(Instant::now());
         arrived
     }
 }
@@ -2737,6 +2785,10 @@ pub enum GuiEvent {
     Connected {
         /// The endpoint, for the log.
         endpoint: String,
+        /// Local peer process, where the OS exposes it.
+        pid: Option<u32>,
+        /// Dedicated systemd user service whose MainPID is the core.
+        unit: Option<String>,
     },
     /// The link is down, with the reason.
     Disconnected {
@@ -2772,7 +2824,7 @@ enum Command {
         message: Box<Msg>,
     },
     /// Start `lws-core run` detached.
-    StartCore,
+    StartCore(Option<String>),
     /// Drop the current wait and dial again.
     ConnectAgain,
 }
@@ -2880,9 +2932,13 @@ impl GuiClient {
 
     /// Asks the thread to start the core process.
     pub fn start_core(&self) -> bool {
+        self.start_core_in_unit(None)
+    }
+
+    fn start_core_in_unit(&self, unit: Option<String>) -> bool {
         self.commands
             .as_ref()
-            .is_some_and(|commands| commands.send(Command::StartCore).is_ok())
+            .is_some_and(|commands| commands.send(Command::StartCore(unit)).is_ok())
     }
 
     /// Asks the thread to dial again now.
@@ -2936,8 +2992,17 @@ async fn worker(
         match ::ipc::transport::connect(&endpoint).await {
             Ok(stream) => {
                 last_failure = None;
+                #[cfg(unix)]
+                let pid = ipc::transport::peer_credentials(&stream)
+                    .ok()
+                    .and_then(|peer| peer.pid);
+                #[cfg(not(unix))]
+                let pid = None;
+                let unit = pid.and_then(crate::core_exit::systemd_unit);
                 let _ = events.send(GuiEvent::Connected {
                     endpoint: endpoint.describe(),
+                    pid,
+                    unit,
                 });
                 let mut link = ::ipc::GuiLink::new(stream);
                 // §4 of the build spec: on connect, ask for the status **and** the document.
@@ -2964,8 +3029,8 @@ async fn worker(
                 command = commands.recv() => match command {
                     None => return,
                     Some(Command::ConnectAgain) => break,
-                    Some(Command::StartCore) => {
-                        let started = launch_core(&launch);
+                    Some(Command::StartCore(unit)) => {
+                        let started = launch_core_in_unit(&launch, unit.as_deref());
                         let _ = events.send(GuiEvent::CoreStarted { started });
                         // The core needs a moment before its endpoint exists; the retry below
                         // covers the rest, and on Windows `connect` already waits for a pipe.
@@ -3028,7 +3093,7 @@ where
                 }
             }
             Step::Command(Some(Command::ConnectAgain)) => return None,
-            Step::Command(Some(Command::StartCore)) => {
+            Step::Command(Some(Command::StartCore(_))) => {
                 // A core is already answering here, so «Запустить» has nothing to do; saying
                 // so beats starting a second daemon.
                 let _ =
@@ -3048,8 +3113,8 @@ fn answer_offline(command: Command, launch: &Launch, events: &Events) {
         Command::Send { id, .. } => {
             let _ = events.send(GuiEvent::NotSent { id });
         }
-        Command::StartCore => {
-            let started = launch_core(launch);
+        Command::StartCore(unit) => {
+            let started = launch_core_in_unit(launch, unit.as_deref());
             let _ = events.send(GuiEvent::CoreStarted { started });
         }
         Command::ConnectAgain => {}
@@ -3244,6 +3309,27 @@ pub fn lan_addresses() -> Vec<String> {
         .into_iter()
         .map(|address| address.to_string())
         .collect()
+}
+
+fn launch_core_in_unit(launch: &Launch, unit: Option<&str>) -> Result<StartedCore, String> {
+    let Some(unit) = unit else {
+        return launch_core(launch);
+    };
+    // Let systemd own the replacement; a detached child would escape its stop/restart policy.
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "start", "--", unit])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl start {unit}: {}",
+            short_error(&String::from_utf8_lossy(&output.stderr))
+        ));
+    }
+    Ok(StartedCore {
+        program: launch.program.clone(),
+        pid: None,
+    })
 }
 
 /// Starts `bifrost run` detached, with the flags the window was given.
