@@ -2991,7 +2991,7 @@ async fn worker(
             Ok(stream) => {
                 last_failure = None;
                 #[cfg(unix)]
-                let pid = ipc::transport::peer_credentials(&stream)
+                let pid = ::ipc::transport::peer_credentials(&stream)
                     .ok()
                     .and_then(|peer| peer.pid);
                 #[cfg(not(unix))]
@@ -3091,15 +3091,17 @@ where
                 }
             }
             Step::Command(Some(Command::ConnectAgain)) => return None,
-            Step::Command(Some(Command::StartCore(_))) => {
-                // A core is already answering here, so «Запустить» has nothing to do; saying
-                // so beats starting a second daemon.
-                let _ =
-                    events.send(GuiEvent::CoreStarted {
-                        started: Err(
-                            text(lang, Key::TheServiceIsAlreadyRunningAndAnswering).to_owned()
-                        ),
-                    });
+            Step::Command(Some(Command::StartCore(unit))) => {
+                // systemd may have restarted the service before this queued start arrived.
+                let started = if unit.is_some() {
+                    Ok(StartedCore {
+                        program: own_program(),
+                        pid: None,
+                    })
+                } else {
+                    Err(text(lang, Key::TheServiceIsAlreadyRunningAndAnswering).to_owned())
+                };
+                let _ = events.send(GuiEvent::CoreStarted { started });
             }
         }
     }
@@ -3714,5 +3716,29 @@ mod restart_tests {
             requests.try_recv().is_err(),
             "one supervised start, never a detached second core"
         );
+    }
+
+    #[tokio::test]
+    async fn systemd_reconnection_before_queued_start_is_success_not_a_second_launch() {
+        let (stream, _peer) = tokio::io::duplex(128);
+        let mut link = ::ipc::GuiLink::new(stream);
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        commands
+            .send(Command::StartCore(Some("fixture.service".into())))
+            .unwrap();
+        drop(commands);
+        let (tx, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let events = Events {
+            tx,
+            wake: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+        assert!(serve(&mut link, &mut requests, &events).await.is_none());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            GuiEvent::CoreStarted {
+                started: Ok(StartedCore { pid: None, .. })
+            }
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 }
