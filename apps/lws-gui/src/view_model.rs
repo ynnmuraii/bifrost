@@ -3661,3 +3661,60 @@ fn failure_text(lang: Lang, request: Request, code: &str) -> String {
 pub fn cli_args_from_env() -> CliArgs {
     CliArgs::parse(std::env::args().skip(1))
 }
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    #[test]
+    fn attached_core_restart_sends_shutdown_and_keeps_systemd_supervision() {
+        let root =
+            std::env::temp_dir().join(format!("bifrost-restart-probe-{}", std::process::id()));
+        let paths = CliArgs::parse(["--root".to_owned(), root.display().to_string()])
+            .resolve()
+            .unwrap();
+        let view = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: "test endpoint".into(),
+            },
+            LocalConfig {
+                paths: Some(paths),
+                ..Default::default()
+            },
+        );
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (_events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client = GuiClient {
+            commands: Some(commands),
+            events: receiver,
+            thread: None,
+            wake: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+        let mut bridge = Bridge::new(view, client);
+        bridge.view.on_connected("test endpoint");
+        bridge.core_unit = Some("app-bifrost@fixture.service".into());
+        let now = Instant::now();
+        bridge.restart_core(now);
+        assert!(matches!(requests.try_recv().unwrap(),
+            Command::Send { message, .. } if matches!(*message, Msg::Shutdown(_))));
+        assert!(
+            requests.try_recv().is_err(),
+            "no immediate process launch or termination"
+        );
+        bridge
+            .view
+            .on_disconnected("old core closed the link".into());
+        assert!(
+            requests.try_recv().is_err(),
+            "link loss alone must not start a core"
+        );
+        // These isolated, nonexistent endpoints are now free. No real service is touched.
+        bridge.poll_restart(now);
+        assert!(matches!(requests.try_recv().unwrap(),
+            Command::StartCore(Some(unit)) if unit == "app-bifrost@fixture.service"));
+        assert!(
+            requests.try_recv().is_err(),
+            "one supervised start, never a detached second core"
+        );
+    }
+}
