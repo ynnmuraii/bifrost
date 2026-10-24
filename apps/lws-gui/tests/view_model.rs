@@ -2058,7 +2058,12 @@ fn the_address_button_through_the_bridge_writes_and_schedules_an_attached_core_r
     );
     let dir = settings_dir("127.0.0.1");
     let view = bridge.view_mut();
-    view.config.paths = Some(paths_of(&dir));
+    view.config.paths = Some(config::Paths::new(
+        dir.join("config"),
+        dir.join("data"),
+        dir.join("state"),
+        Some(dir.join("run")),
+    ));
     view.config.listen_address = "127.0.0.1".to_owned();
     view.settings.lan.candidates = vec!["192.168.1.10".to_owned()];
     let now = Instant::now();
