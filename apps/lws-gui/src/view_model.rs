@@ -945,7 +945,7 @@ impl ViewModel {
 
     /// The link is gone; the last `Status` stays on screen.
     /// Restart completion depends on process/listener exit, not this event.
-    pub fn on_disconnected(&mut self, why: String) -> bool {
+    pub fn on_disconnected(&mut self, why: String) {
         let lang = self.look.language;
         self.push_log(format!("Связь со службой потеряна: {}", short_error(&why)));
         self.connection = Connection::Disconnected { why };
@@ -967,9 +967,7 @@ impl ViewModel {
         self.pairing.prompt = None;
         if self.settings.service.stopping.take().is_some() {
             self.settings.service.line = Some(Outcome::done(text(lang, Key::TheServiceIsStopped)));
-            return false;
         }
-        false
     }
 
     /// Begins stopping a connected core through its graceful GUI request.
