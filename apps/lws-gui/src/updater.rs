@@ -6,12 +6,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ring::digest::{digest, SHA256};
+use ring::signature::{UnparsedPublicKey, ED25519};
 use semver::Version;
 use serde::Deserialize;
 
 pub const RELEASES: &str = "https://github.com/ynnmuraii/bifrost/releases";
 pub const LATEST: &str = "https://api.github.com/repos/ynnmuraii/bifrost/releases/latest";
 const CAP: u64 = 200 * 1024 * 1024;
+// Ed25519 raw public key; the matching PEM is shipped in packaging/.
+const RELEASE_SIGNING_PUBLIC_KEY: [u8; 32] = [
+    0x3c, 0xf6, 0x88, 0xe9, 0xbd, 0xd3, 0x52, 0x36, 0xe2, 0xa5, 0x85, 0xa8, 0xe6, 0xf3, 0x76, 0xf9,
+    0x04, 0x80, 0xc7, 0xb3, 0x32, 0x8a, 0x37, 0x26, 0x37, 0x29, 0xf7, 0x51, 0xda, 0x7a, 0x17, 0x7a,
+];
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum State {
@@ -226,6 +232,29 @@ pub fn verify(bytes: &[u8], sums: &str, filename: &str) -> Result<(), String> {
     }
     Ok(())
 }
+fn signed_checksums(
+    release: &Release,
+    public_key: &[u8],
+    mut fetch: impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let signature = release
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS.txt.sig")
+        .ok_or("Signature verification failed: missing SHA256SUMS.txt.sig")?;
+    let sums = release
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS.txt")
+        .ok_or("Signature verification failed: missing SHA256SUMS.txt")?;
+    let signature = fetch(&signature.browser_download_url, 64)
+        .map_err(|e| format!("Signature verification failed: {e}"))?;
+    let sums = fetch(&sums.browser_download_url, 1024 * 1024)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&sums, &signature)
+        .map_err(|_| "Signature verification failed: invalid SHA256SUMS.txt.sig")?;
+    Ok(sums)
+}
 /// Downloads and authenticates the archive before extracting a single bounded regular file.
 pub fn prepare(
     release: &Release,
@@ -235,12 +264,9 @@ pub fn prepare(
         return Err("Unsupported update architecture".into());
     }
     let asset = release.asset(std::env::consts::OS)?;
-    let sums = release
-        .assets
-        .iter()
-        .find(|a| a.name == "SHA256SUMS.txt")
-        .ok_or("Missing SHA256SUMS.txt")?;
-    let sums = download(&sums.browser_download_url, 1024 * 1024, &mut |_, _| {})?;
+    let sums = signed_checksums(release, &RELEASE_SIGNING_PUBLIC_KEY, |url, cap| {
+        download(url, cap, &mut |_, _| {})
+    })?;
     let sums = std::str::from_utf8(&sums).map_err(|e| e.to_string())?;
     let bytes = download(&asset.browser_download_url, CAP, progress)?;
     verify(&bytes, sums, &asset.name)?;
@@ -383,6 +409,116 @@ mod tests {
         assert!(verify(b"modified", sums, "bifrost.exe").is_err());
         assert!(verify(b"", sums, "missing").is_err());
         assert!(expected_hash("not-a-hash  bifrost.exe", "bifrost.exe").is_err());
+    }
+    fn signing_key() -> ring::signature::Ed25519KeyPair {
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+    fn authenticate(
+        sums: &[u8],
+        signature: Option<&[u8]>,
+        public_key: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let mut release = release();
+        release.assets = vec![Asset {
+            name: "SHA256SUMS.txt".into(),
+            browser_download_url: "https://github.com/sums".into(),
+        }];
+        if signature.is_some() {
+            release.assets.push(Asset {
+                name: "SHA256SUMS.txt.sig".into(),
+                browser_download_url: "https://github.com/signature".into(),
+            });
+        }
+        signed_checksums(&release, public_key, |url, cap| {
+            assert!(allowed_asset_url(url));
+            match url {
+                "https://github.com/signature" => {
+                    assert_eq!(cap, 64);
+                    Ok(signature.unwrap().to_vec())
+                }
+                "https://github.com/sums" => Ok(sums.to_vec()),
+                _ => panic!("Binary must not be downloaded during signature verification"),
+            }
+        })
+    }
+    #[test]
+    fn release_signature_accepts_valid_exact_bytes() {
+        use ring::signature::KeyPair;
+        let key = signing_key();
+        let sums = b"exact checksums bytes\r\n";
+        let signature = key.sign(sums);
+        assert_eq!(
+            authenticate(sums, Some(signature.as_ref()), key.public_key().as_ref()).unwrap(),
+            sums
+        );
+    }
+    #[test]
+    fn release_signature_rejects_tampered_checksums() {
+        use ring::signature::KeyPair;
+        let key = signing_key();
+        let signature = key.sign(b"checksums\n");
+        let error = authenticate(
+            b"checksums\r\n",
+            Some(signature.as_ref()),
+            key.public_key().as_ref(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Signature verification failed:"));
+    }
+    #[test]
+    fn release_signature_rejects_wrong_key() {
+        use ring::signature::KeyPair;
+        let key = signing_key();
+        let other = signing_key();
+        let sums = b"checksums\n";
+        let signature = key.sign(sums);
+        assert!(authenticate(sums, Some(signature.as_ref()), other.public_key().as_ref()).is_err());
+    }
+    #[test]
+    fn release_signature_rejects_missing_asset_before_fetching() {
+        let mut release = release();
+        release.assets.retain(|a| a.name != "SHA256SUMS.txt.sig");
+        let error = signed_checksums(&release, &RELEASE_SIGNING_PUBLIC_KEY, |_, _| {
+            panic!("Missing signature must fail before any download")
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "Signature verification failed: missing SHA256SUMS.txt.sig"
+        );
+    }
+    #[test]
+    fn release_signature_rejects_unavailable_signature_before_checksums() {
+        let mut release = release();
+        release.assets.push(Asset {
+            name: "SHA256SUMS.txt.sig".into(),
+            browser_download_url: "https://github.com/signature".into(),
+        });
+        let error = signed_checksums(&release, &RELEASE_SIGNING_PUBLIC_KEY, |url, cap| {
+            assert_eq!(url, "https://github.com/signature");
+            assert_eq!(cap, 64);
+            Err("HTTP 404".into())
+        })
+        .unwrap_err();
+        assert_eq!(error, "Signature verification failed: HTTP 404");
+    }
+    #[test]
+    fn release_signature_rejects_truncated_and_garbage_signatures() {
+        use ring::signature::KeyPair;
+        let key = signing_key();
+        let sums = b"checksums\n";
+        let signature = key.sign(sums);
+        for invalid in [
+            &[][..],
+            &signature.as_ref()[..63],
+            &[0u8; 64][..],
+            &[0u8; 65][..],
+        ] {
+            let error = authenticate(sums, Some(invalid), key.public_key().as_ref()).unwrap_err();
+            assert!(error.starts_with("Signature verification failed:"));
+        }
     }
     #[test]
     fn url_boundary() {

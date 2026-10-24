@@ -29,6 +29,15 @@ Linux x86_64, glibc >=2.35: распакуйте tar.gz и выполните ./
 X11 поддерживается; Wayland требует xdg-desktop-portal с RemoteDesktop/InputCapture,
 KDE Plasma >=6.1 или GNOME >=45 (GNOME 46 принимает ввод, но не захватывает).
 
+Автообновление проверяет подпись Ed25519 файла SHA256SUMS.txt до загрузки программы.
+Для ручной проверки скачайте SHA256SUMS.txt и SHA256SUMS.txt.sig рядом с архивом/EXE.
+Публичный ключ release-signing-public-key.pem есть в архиве и в репозитории:
+https://github.com/ynnmuraii/bifrost/blob/main/packaging/release-signing-public-key.pem
+Используйте заранее доверенную копию ключа (не ключ из ещё не проверенного архива).
+OpenSSL 3 и sha256sum (Linux или Git Bash), одна команда:
+    openssl pkeyutl -verify -rawin -pubin -inkey release-signing-public-key.pem -in SHA256SUMS.txt -sigfile SHA256SUMS.txt.sig && sha256sum --ignore-missing -c SHA256SUMS.txt
+При ошибке подписи или контрольной суммы не запускайте скачанный файл.
+
 
 3. Настройки при первом запуске создаются сами
 ---------------------------------------------
