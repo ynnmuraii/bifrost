@@ -91,6 +91,14 @@ pub enum Key {
     AReportForTroubleshooting,
     /// «адрес и служба»
     AddressAndService,
+    /// «тема и фон»
+    ThemeAndBackground,
+    /// «Связи» (appearance row).
+    AppearanceLinks,
+    /// «Облака» (appearance row).
+    AppearanceClouds,
+    /// «Курсор» (appearance row).
+    AppearanceCursor,
     /// «Слева»
     Left,
     /// «Справа»
@@ -767,6 +775,10 @@ const fn ru(key: Key) -> &'static str {
         Key::CopyHerePasteThere => "скопировать здесь — вставить там",
         Key::AReportForTroubleshooting => "отчёт для разбора проблем",
         Key::AddressAndService => "адрес и служба",
+        Key::ThemeAndBackground => "тема и фон",
+        Key::AppearanceLinks => "Связи",
+        Key::AppearanceClouds => "Облака",
+        Key::AppearanceCursor => "Курсор",
         Key::Left => "Слева",
         Key::Right => "Справа",
         Key::Top => "Сверху",
@@ -1117,6 +1129,10 @@ const fn en(key: Key) -> &'static str {
         Key::CopyHerePasteThere => "copy here, paste there",
         Key::AReportForTroubleshooting => "a report for troubleshooting",
         Key::AddressAndService => "address and service",
+        Key::ThemeAndBackground => "theme and background",
+        Key::AppearanceLinks => "Links",
+        Key::AppearanceClouds => "Clouds",
+        Key::AppearanceCursor => "Cursor",
         Key::Left => "Left",
         Key::Right => "Right",
         Key::Top => "Top",
@@ -1663,7 +1679,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 343] = [
+    pub const EVERY: [Key; 347] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1674,6 +1690,10 @@ mod tests {
         Key::CopyHerePasteThere,
         Key::AReportForTroubleshooting,
         Key::AddressAndService,
+        Key::ThemeAndBackground,
+        Key::AppearanceLinks,
+        Key::AppearanceClouds,
+        Key::AppearanceCursor,
         Key::Left,
         Key::Right,
         Key::Top,

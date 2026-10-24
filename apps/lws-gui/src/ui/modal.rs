@@ -1,4 +1,4 @@
-//! The five windows of the rail, in the mockup's «terminal load» frame.
+//! The rail's windows, in the mockup's «terminal load» frame.
 //!
 //! The opening is the only animation here: the dialog is revealed top-down in eight steps over
 //! 0.32 s (the mockup's `steps(8)` clip-path), and the next frame is requested only until that
@@ -41,7 +41,11 @@ pub fn draw(
     actions: &mut Vec<Action>,
 ) -> Option<Duration> {
     let lang = vm.look.language;
-    let Some(modal) = vm.modal else {
+    let Some(modal) = (if vm.appearance_open {
+        Some(Modal::Appearance)
+    } else {
+        vm.modal
+    }) else {
         st.modal_open = None;
         st.confirm_clear_history = false;
         ui.ctx().data_mut(|d| {
@@ -151,6 +155,7 @@ pub fn draw(
                 Modal::Clip => clip_body(ui, pal, vm, st, &mut relabel, actions),
                 Modal::Diag => diag_body(ui, pal, vm, actions),
                 Modal::Settings => settings_body(ui, pal, vm, actions),
+                Modal::Appearance => super::appearance::body(ui, pal, vm, actions),
             }
         });
     if foot_h > 0.0 {
@@ -186,7 +191,7 @@ pub fn draw(
                     || Action::OpenConfigFile,
                 );
             }
-            Modal::Clip | Modal::Diag | Modal::Settings => {}
+            Modal::Clip | Modal::Diag | Modal::Settings | Modal::Appearance => {}
         });
     }
     let measured = HEAD_H + used.content_size.y + foot_h;
@@ -309,7 +314,13 @@ fn header(
 }
 
 /// One `.row`: a label column and a content column, with a hairline under it.
-fn row(ui: &mut egui::Ui, pal: &Palette, label: &str, last: bool, add: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    last: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     let left = ui.max_rect().left();
     let right = ui.max_rect().right();
     let top = ui.cursor().min.y + 16.0;

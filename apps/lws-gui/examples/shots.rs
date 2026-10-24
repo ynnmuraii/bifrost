@@ -88,7 +88,7 @@ fn main() -> std::process::ExitCode {
     let zoom = option("--zoom")
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(150)
-        .clamp(70, 150);
+        .clamp(70, 300);
     let ascii = args.iter().any(|arg| arg == "--ascii");
     let snapshot = if real {
         match real_snapshot(CliArgs::parse(args)) {
@@ -582,6 +582,7 @@ fn modal_name(modal: Modal) -> &'static str {
         Modal::Clip => "clip",
         Modal::Diag => "diag",
         Modal::Settings => "settings",
+        Modal::Appearance => "appearance",
     }
 }
 

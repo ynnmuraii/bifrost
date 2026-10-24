@@ -1047,7 +1047,7 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
             _ => None,
         })
         .expect("the + button changes local zoom");
-    assert_eq!(wanted.zoom_percent, 105);
+    assert_eq!(wanted.zoom_percent, 110);
     assert!(frame
         .output
         .actions
@@ -1070,7 +1070,7 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
         zoom_percent: 100,
         ..vm.look
     })));
-    vm.look.zoom_percent = 150;
+    vm.look.zoom_percent = 300;
     let frame = harness.frame(&vm, false, SIZE, wheel(32.0));
     assert!(!frame
         .output
@@ -1115,8 +1115,105 @@ fn removed_layout_controls_stay_absent_and_pairing_close_is_disabled() {
     );
 }
 
-/// The two appearance switches read the service's own answer: a core that has the effects on
-/// shows them on, and flipping one sends the other back exactly as the service reported it.
+#[test]
+fn theme_wave_finishes_reverses_and_skips_unfocused_windows() {
+    fn settle_theme(harness: &mut Harness, vm: &ViewModel) {
+        for _ in 0..2 {
+            let started = Instant::now();
+            harness.frame(vm, true, SIZE, vec![]);
+            harness.now += started.elapsed() + Duration::from_millis(16);
+        }
+    }
+    for source in [Theme::Light, Theme::Dark] {
+        let mut vm = connected();
+        vm.look.theme = source;
+        vm.look.field = FieldMode::Off;
+        vm.look.link_style = lws_gui::gui_settings::LinkStyle::Line;
+        let mut harness = Harness::new();
+        harness.settle(&vm, true);
+        let button = egui::pos2(SIZE.x - 26.0, 30.0);
+        let frame = harness.frame(&vm, true, SIZE, click_at(button));
+        let look = frame
+            .output
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::SetLook(look) => Some(*look),
+                _ => None,
+            })
+            .expect("topbar theme action");
+        assert_eq!(look.theme, source.toggled());
+        assert_eq!(frame.output.repaint_after, Some(Duration::from_millis(16)));
+        vm.look = look;
+        settle_theme(&mut harness, &vm);
+        harness.now += Duration::from_millis(200);
+        let frame = harness.frame(&vm, true, SIZE, vec![]);
+        assert_eq!(frame.output.repaint_after, Some(Duration::from_millis(16)));
+        // Reverse from the current front, not a new full-window flash.
+        let frame = harness.frame(&vm, true, SIZE, click_at(button));
+        for action in &frame.output.actions {
+            vm.local(action);
+        }
+        assert_eq!(vm.look.theme, source);
+        settle_theme(&mut harness, &vm);
+        harness.now += Duration::from_millis(500);
+        let frame = harness.frame(&vm, true, SIZE, vec![]);
+        assert_ne!(frame.output.repaint_after, Some(Duration::from_millis(16)));
+        let frame = harness.frame(&vm, true, SIZE, click_at(button));
+        for action in &frame.output.actions {
+            vm.local(action);
+        }
+        settle_theme(&mut harness, &vm);
+        harness.now += Duration::from_millis(500);
+        let frame = harness.frame(&vm, true, SIZE, vec![]);
+        assert_ne!(frame.output.repaint_after, Some(Duration::from_millis(16)));
+        let frame = harness.frame(&vm, false, SIZE, click_at(button));
+        assert_ne!(frame.output.repaint_after, Some(Duration::from_millis(16)));
+    }
+}
+
+#[test]
+fn appearance_theme_row_starts_the_same_wave() {
+    let mut vm = connected();
+    vm.appearance_open = true;
+    let mut harness = Harness::new();
+    harness.settle(&vm, true);
+    harness.now += Duration::from_millis(500);
+    harness.frame(&vm, true, SIZE, vec![]);
+    let at = text_position(&mut harness, &vm, "Тёмная");
+    let frame = harness.frame(&vm, true, SIZE, click_at(at));
+    assert!(frame
+        .output
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::SetLook(look) if look.theme == Theme::Dark)));
+    assert_eq!(frame.output.repaint_after, Some(Duration::from_millis(16)));
+}
+
+#[test]
+fn appearance_modal_has_localized_rows_and_shared_escape_in_both_themes() {
+    for theme in [Theme::Light, Theme::Dark] {
+        for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+            let mut vm = connected();
+            vm.look.theme = theme;
+            vm.look.language = lang;
+            vm.appearance_open = true;
+            let mut harness = Harness::new();
+            harness.settle(&vm, false);
+            let frame = harness.frame(&vm, false, SIZE, vec![]);
+            let labels = if lang == ui_text::Lang::Ru {
+                ["06", "Внешний вид", "ТЕМА", "СВЯЗИ", "ОБЛАКА", "КУРСОР"]
+            } else {
+                ["06", "Appearance", "THEME", "LINKS", "CLOUDS", "CURSOR"]
+            };
+            expect(&frame, &labels);
+            let frame = harness.frame(&vm, false, SIZE, vec![key(egui::Key::Escape)]);
+            assert!(frame.output.actions.contains(&Action::CloseModal));
+        }
+    }
+}
+
+/// Appearance uses the shared settings modal and preserves the other service-owned value.
 #[test]
 fn the_appearance_switches_show_what_the_service_reports() {
     let mut vm = connected();
@@ -1125,13 +1222,23 @@ fn the_appearance_switches_show_what_the_service_reports() {
         "the fixture's service has the edge effects on"
     );
     vm.appearance_open = true;
+    assert!(vm.can_set_appearance(), "{:?}", vm.inflight);
     let mut harness = Harness::new();
     harness.settle(&vm, false);
-    let at = text_position(
-        &mut harness,
-        &vm,
-        "Прятать курсор, пока ввод на другой машине",
+    harness.now += Duration::from_millis(500);
+    let frame = harness.frame(&vm, false, SIZE, vec![]);
+    expect(
+        &frame,
+        &["06", "Внешний вид", "ТЕМА", "СВЯЗИ", "ОБЛАКА", "КУРСОР"],
     );
+    let at = frame
+        .texts
+        .iter()
+        .filter(|(label, _)| label == "Выключен")
+        .max_by(|(_, a), (_, b)| a.center().y.total_cmp(&b.center().y))
+        .expect("cursor off segment")
+        .1
+        .center();
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(
         frame.output.actions.contains(&Action::SetAppearance {

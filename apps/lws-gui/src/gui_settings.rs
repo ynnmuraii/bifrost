@@ -74,7 +74,7 @@ pub struct Look {
     pub clouds: bool,
     /// How links are drawn.
     pub link_style: LinkStyle,
-    /// Map scale relative to its fitted base, stored as a percentage (70..=150).
+    /// Physical map scale relative to its fitted base (70..=300); not the UI percentage.
     pub zoom_percent: u16,
     /// How far the map was dragged with the right button, in points (`-PAN_MAX..=PAN_MAX`).
     pub pan_x: i16,
@@ -90,6 +90,32 @@ pub struct Look {
 
 /// The furthest the map may be panned, in points.
 pub const PAN_MAX: i16 = 2000;
+
+/// Physical map zoom bounds, kept in the original persisted percentage units.
+pub const ZOOM_MIN: u16 = 70;
+/// Physical 3× zoom is displayed as 200%.
+pub const ZOOM_MAX: u16 = 300;
+
+/// Maps physical zoom onto 50–200%, keeping the default 1× view at 100%.
+pub fn zoom_display_percent(physical: u16) -> f32 {
+    let physical = physical.clamp(ZOOM_MIN, ZOOM_MAX);
+    if physical <= 100 {
+        50.0 + f32::from(physical - ZOOM_MIN) * 50.0 / 30.0
+    } else {
+        100.0 + f32::from(physical - 100) / 2.0
+    }
+}
+
+/// Inverts the piecewise UI mapping, rounding and clamping to physical units.
+pub fn zoom_from_display(display: f32) -> u16 {
+    let display = display.clamp(50.0, 200.0);
+    let physical = if display <= 100.0 {
+        f32::from(ZOOM_MIN) + (display - 50.0) * 30.0 / 50.0
+    } else {
+        100.0 + (display - 100.0) * 2.0
+    };
+    physical.round() as u16
+}
 
 /// The slowest the particles may be told to chase.
 pub const SPEED_MIN: f32 = 0.3;
@@ -226,7 +252,7 @@ pub fn load(path: &Path) -> Look {
         language: Lang::from_system(),
         ..Look::default()
     });
-    look.zoom_percent = look.zoom_percent.clamp(70, 150);
+    look.zoom_percent = look.zoom_percent.clamp(ZOOM_MIN, ZOOM_MAX);
     look.speed = look.speed.clamp(SPEED_MIN, SPEED_MAX);
     look.pan_x = look.pan_x.clamp(-PAN_MAX, PAN_MAX);
     look.pan_y = look.pan_y.clamp(-PAN_MAX, PAN_MAX);
@@ -360,7 +386,7 @@ mod tests {
         let dir = dir("zoom");
         let path = path_in(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        for (stored, expected) in [(0, 70), (105, 105), (65535, 150)] {
+        for (stored, expected) in [(0, 70), (100, 100), (150, 150), (300, 300), (65535, 300)] {
             std::fs::write(&path, format!("zoom_percent = {stored}\n")).expect("write");
             assert_eq!(load(&path).zoom_percent, expected);
         }
@@ -369,5 +395,21 @@ mod tests {
         assert_eq!((look.pan_x, look.pan_y), (PAN_MAX, -PAN_MAX));
         assert!(!dir.join("config.toml").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zoom_mapping_preserves_physical_bounds_default_and_clamping() {
+        for (physical, display) in [(70, 50.0), (100, 100.0), (300, 200.0)] {
+            assert!((zoom_display_percent(physical) - display).abs() < 0.001);
+            assert_eq!(zoom_from_display(display), physical);
+        }
+        assert_eq!(zoom_display_percent(0), 50.0);
+        assert_eq!(zoom_display_percent(u16::MAX), 200.0);
+        assert_eq!(zoom_from_display(-100.0), ZOOM_MIN);
+        assert_eq!(zoom_from_display(500.0), ZOOM_MAX);
+        for display in (50..=200).step_by(5) {
+            let display = display as f32;
+            assert!((zoom_display_percent(zoom_from_display(display)) - display).abs() < 0.001);
+        }
     }
 }

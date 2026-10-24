@@ -11,11 +11,11 @@
 //! frame is due ([`Output::repaint_after`]) and only for things that really change with time:
 //! the particle field (30 fps while the pointer is over the map and it still reports movement,
 //! and no frame at all once the particles have settled into the attracted or repelled state the
-//! pointer holds them in), the pairing countdown (1 Hz, only while a window is open) and the
-//! «10 минут назад» of a clipboard row (once a minute at its next whole minute, hour or day,
-//! and only while the clipboard dialog is open). A window with the field at rest and no pairing
-//! window open draws when the user does something or the service says something, and never
-//! otherwise.
+//! pointer holds them in), the 420 ms theme sweep, the pairing countdown (1 Hz, only while a
+//! window is open) and the «10 минут назад» of a clipboard row (once a minute at its next whole
+//! minute, hour or day, and only while the clipboard dialog is open). A window with the field
+//! at rest, no theme sweep and no pairing window open draws when the user does something or the
+//! service says something, and never otherwise.
 
 mod appearance;
 mod bridge;
@@ -24,6 +24,7 @@ mod field;
 mod map_view;
 mod modal;
 mod theme;
+mod theme_wave;
 mod update;
 mod widgets;
 
@@ -49,8 +50,6 @@ const RAIL_W: f32 = 64.0;
 /// Where the rail's first slot starts, and how far apart the slots are.
 const RAIL_TOP: f32 = 12.0;
 const RAIL_SLOT: f32 = 50.0;
-/// The number the appearance button carries, so it matches the five sections above it.
-const APPEARANCE_NUM: &str = "06";
 /// Below this window width the dock is 2 × 2 and the peer pills are hidden.
 const NARROW: f32 = 1180.0;
 /// How long the field asks to wait between frames. eframe's event loop wakes a little before
@@ -115,6 +114,7 @@ pub struct UiState {
     paddle_hover: Option<String>,
     hover: Option<(usize, usize)>,
     applied: Option<Theme>,
+    theme_wave: Option<theme_wave::Wave>,
     modal_open: Option<(Modal, f32)>,
     confirm_clear_history: bool,
 }
@@ -132,6 +132,7 @@ impl UiState {
             paddle_hover: None,
             hover: None,
             applied: None,
+            theme_wave: None,
             modal_open: None,
             confirm_clear_history: false,
         }
@@ -152,6 +153,7 @@ impl UiState {
 
 /// Draws one frame of the whole window.
 pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Output {
+    let draw_started = Instant::now();
     // The faces are installed by the app before its first frame; a host that draws earlier
     // (a test harness) gets them here, one frame late, instead of a panic.
     if !ui
@@ -163,7 +165,8 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
         return Output::default();
     }
     let pal = Palette::of(vm.look.theme);
-    if st.applied != Some(pal.theme) {
+    let theme_applied = st.applied != Some(pal.theme);
+    if theme_applied {
         theme::apply(ui.ctx(), &pal);
         st.applied = Some(pal.theme);
     }
@@ -188,9 +191,8 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
     let t = st.t(env.now);
     let mut wants = map_view::draw(ui, &pal, vm, st, map, env, t, &mut out.actions);
     dock::draw(ui, &pal, vm, dock_rect, narrow, env.now, &mut out.actions);
-    let appearance_anchor = rail_draw(ui, &pal, vm, rail, &mut out.actions);
+    rail_draw(ui, &pal, vm, rail, &mut out.actions);
     topbar(ui, &pal, vm, top, narrow, &mut out.actions);
-    appearance::draw(ui, &pal, vm, full, appearance_anchor, &mut out.actions);
     if out
         .actions
         .iter()
@@ -218,6 +220,34 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
         wants = Some(wants.map_or(relabel, |w| w.min(relabel)));
     }
     update::notice(ui, &pal, vm, &mut out.actions);
+    if env.animate && ui.style().animation_time > 0.0 {
+        let changed_theme = out.actions.iter().find_map(|action| match action {
+            Action::SetLook(look) if look.theme != vm.look.theme => Some(look.theme),
+            _ => None,
+        });
+        if let Some(mut wave) = st.theme_wave.take() {
+            if changed_theme.is_some() {
+                wave.prepare_retarget(ui, vm.look.theme);
+            }
+            let completed_at = env.now + draw_started.elapsed();
+            if wave.paint(ui, vm.look.theme, full, completed_at, !theme_applied) {
+                st.theme_wave = Some(wave);
+            }
+        }
+        if let Some(theme) = changed_theme {
+            if let Some(wave) = &mut st.theme_wave {
+                wave.retarget(theme);
+            } else {
+                st.theme_wave = Some(theme_wave::Wave::begin(ui, vm.look.theme, full, env.now));
+            }
+        }
+        if st.theme_wave.is_some() {
+            let frame = Duration::from_millis(16);
+            wants = Some(wants.map_or(frame, |w| w.min(frame)));
+        }
+    } else {
+        st.theme_wave = None;
+    }
     out.repaint_after = wants;
     out
 }
@@ -335,7 +365,7 @@ fn rail_draw(
     vm: &ViewModel,
     rect: Rect,
     actions: &mut Vec<Action>,
-) -> Rect {
+) {
     let lang = vm.look.language;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, pal.card);
@@ -378,7 +408,7 @@ fn rail_draw(
         pal,
         appearance,
         Icon::Appearance,
-        APPEARANCE_NUM,
+        Modal::Appearance.num(),
         vm.appearance_open,
         &mut tip,
         text(lang, Key::Appearance),
@@ -407,7 +437,6 @@ fn rail_draw(
             pal.bg,
         );
     }
-    appearance
 }
 
 /// Where the rail's slot `index` is: one column, from the top.
