@@ -47,13 +47,75 @@ pub struct X11 {
     /// # Echo suppression (KVM-041)
     ///
     /// A selection owner has no sequence number to compare, so the mechanism is the text
-    /// itself: the payload this backend last put on CLIPBOARD is remembered in `applied_text`,
-    /// and an observed value equal to it is the echo of our own `set` rather than a user's
-    /// copy. (X11 cannot do better without owning a second selection: the `SelectionNotify`
-    /// for our own ownership carries no identity beyond the content.)
+    /// itself: the payload this backend last put on CLIPBOARD is remembered in `echo`, and an
+    /// observed value equal to it is the echo of our own `set` rather than a user's copy.
+    /// (X11 could do better by owning a second selection and watching its timestamp; the
+    /// adapter here exposes neither the selection timestamp nor the owner window — its
+    /// [`platform_x11::clipboard::Change`] is an empty marker — so the content is what is left.
+    /// Keeping its hash for a short window, instead of forgetting it after the first sighting,
+    /// is what survives a clipboard manager re-owning the selection several times.)
     clipboard: Option<platform_x11::clipboard::Clipboard>,
-    /// The text this backend last applied from core.
-    applied_text: Option<String>,
+    /// The payload this backend last applied from core, for [`EchoSuppressor`].
+    echo: EchoSuppressor,
+}
+
+/// How long an applied payload is treated as our own echo.
+///
+/// Long enough for the several re-owns a clipboard manager makes while it imports the item
+/// (Klipper, CopyQ), short enough that a person pressing «copy» on the same text again is
+/// reported. The clock is [`std::time::Instant`] and the window is passed in
+/// ([`EchoSuppressor::is_echo`]), so the logic is tested without sleeping.
+const ECHO_WINDOW: Duration = Duration::from_millis(400);
+
+/// Remembers the payload this node put on CLIPBOARD so its own notifications are swallowed.
+///
+/// The old rule cleared the memory after the first sighting: a second notification with the
+/// same text (Klipper re-reading the selection) then looked like a fresh local copy and was
+/// sent back to the peer. The hash now stays for [`ECHO_WINDOW`]: repeats inside the window
+/// are echoes, a different text clears the memory, and the same text after the window is a
+/// real re-copy by the user and passes.
+#[derive(Debug, Default)]
+struct EchoSuppressor {
+    applied: Option<(u64, std::time::Instant)>,
+}
+
+impl EchoSuppressor {
+    /// Remembers `text` — the payload just put on the selection — at `now`.
+    fn note(&mut self, text: &str, now: std::time::Instant) {
+        self.applied = if text.is_empty() {
+            None
+        } else {
+            Some((content_hash(text), now))
+        };
+    }
+
+    /// Whether `text`, seen at `now`, is the payload this node applied moments ago.
+    fn is_echo(&mut self, text: &str, now: std::time::Instant) -> bool {
+        let Some((applied, at)) = self.applied else {
+            return false;
+        };
+        if applied != content_hash(text) {
+            // Something else is on the selection now: our payload is gone for good.
+            self.applied = None;
+            return false;
+        }
+        if now.saturating_duration_since(at) <= ECHO_WINDOW {
+            true
+        } else {
+            // The window is over: the same text now is the user copying it again.
+            self.applied = None;
+            false
+        }
+    }
+}
+
+/// A stable hash of the clipboard text: the suppressor remembers the content without
+/// holding a copy of it.
+fn content_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl X11 {
@@ -96,7 +158,7 @@ impl X11 {
             plan,
             repeats: RepeatFilter::new(),
             clipboard,
-            applied_text: None,
+            echo: EchoSuppressor::default(),
         };
         backend.set_hotkeys(&config::HotkeyBindings {
             emergency_release: if emergency_hotkey.trim().is_empty() {
@@ -171,10 +233,7 @@ impl X11 {
             tracing::debug!("the CLIPBOARD selection holds no text");
             return None;
         }
-        if self.applied_text.as_deref() == Some(snapshot.text.as_str()) {
-            // The text this node itself put there. Cleared after one sighting: a *later* copy
-            // of the same text by the user is then reported, which is the safe direction.
-            self.applied_text = None;
+        if self.echo.is_echo(&snapshot.text, std::time::Instant::now()) {
             tracing::debug!(
                 bytes = snapshot.text.len(),
                 "swallowing the CLIPBOARD selection this node applied"
@@ -208,11 +267,7 @@ impl X11 {
         clipboard
             .set(text)
             .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: CLIPBOARD was not taken: {error}"))?;
-        self.applied_text = if text.is_empty() {
-            None
-        } else {
-            Some(text.to_owned())
-        };
+        self.echo.note(text, std::time::Instant::now());
         tracing::info!(
             bytes = text.len(),
             released = text.is_empty(),
@@ -517,6 +572,58 @@ fn release_counts(injector: &mut X11Injector) -> Released {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L3: the applied payload's hash, not a one-shot string, survives a clipboard manager
+    /// re-owning CLIPBOARD several times.
+    #[test]
+    fn repeated_notifications_of_the_applied_text_are_echoes_within_the_window() {
+        let mut echo = EchoSuppressor::default();
+        let t0 = std::time::Instant::now();
+        echo.note("remote payload", t0);
+
+        // Klipper/CopyQ re-reads and re-owns the selection: three notifications, same text.
+        for offset_ms in [0, 5, 120, 399] {
+            assert!(
+                echo.is_echo("remote payload", t0 + Duration::from_millis(offset_ms)),
+                "a re-own at {offset_ms} ms is our own payload"
+            );
+        }
+        // Still the same payload: the memory is not cleared by the repeats.
+        assert!(echo.is_echo("remote payload", t0 + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn a_different_text_is_not_an_echo_and_forgets_the_applied_one() {
+        let mut echo = EchoSuppressor::default();
+        let t0 = std::time::Instant::now();
+        echo.note("remote payload", t0);
+
+        assert!(!echo.is_echo("something the user copied", t0));
+        // Our payload can no longer be on the selection, so an old repeat is a user's copy.
+        assert!(!echo.is_echo("remote payload", t0 + Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn the_same_text_after_the_window_is_a_real_copy() {
+        let mut echo = EchoSuppressor::default();
+        let t0 = std::time::Instant::now();
+        echo.note("remote payload", t0);
+        assert!(!echo.is_echo(
+            "remote payload",
+            t0 + ECHO_WINDOW + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn nothing_is_an_echo_before_anything_was_applied_and_empty_text_clears() {
+        let mut echo = EchoSuppressor::default();
+        let t0 = std::time::Instant::now();
+        assert!(!echo.is_echo("anything", t0));
+
+        echo.note("remote payload", t0);
+        echo.note("", t0);
+        assert!(!echo.is_echo("remote payload", t0));
+    }
 
     /// Batch-3 audit (F13): a queued run of X-server autorepeats must not end the drain.
     ///
