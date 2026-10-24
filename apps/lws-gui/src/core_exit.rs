@@ -1,5 +1,7 @@
 //! A disconnected GUI is not proof that core has released its listeners.
-use ipc::transport::{self, Endpoint};
+use ipc::transport;
+#[cfg(unix)]
+use ipc::transport::Endpoint;
 use std::time::{Duration, Instant};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -14,7 +16,10 @@ pub(crate) enum Step {
 pub(crate) struct Wait {
     since: Instant,
     pid: Option<u32>,
+    #[cfg(unix)]
     endpoints: [Endpoint; 2],
+    #[cfg(windows)]
+    endpoints: [Vec<u16>; 2],
     #[cfg(unix)]
     runtime: tokio::runtime::Runtime,
 }
@@ -25,13 +30,18 @@ impl Wait {
         pid: Option<u32>,
         now: Instant,
     ) -> Result<Self, String> {
+        let endpoints = [
+            transport::ctl_endpoint(paths).map_err(|e| e.to_string())?,
+            transport::gui_endpoint(paths).map_err(|e| e.to_string())?,
+        ];
         Ok(Self {
             since: now,
             pid,
-            endpoints: [
-                transport::ctl_endpoint(paths).map_err(|e| e.to_string())?,
-                transport::gui_endpoint(paths).map_err(|e| e.to_string())?,
-            ],
+            #[cfg(unix)]
+            endpoints,
+            #[cfg(windows)]
+            endpoints: endpoints
+                .map(|endpoint| endpoint.name().encode_utf16().chain([0]).collect()),
             #[cfg(unix)]
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -59,13 +69,8 @@ impl Wait {
     }
 
     #[cfg(windows)]
-    fn endpoint_is_free(&self, endpoint: &Endpoint) -> bool {
-        // A busy pipe still belongs to core, even when it no longer accepts GUIs.
-        // Opening never waits for a busy instance. Only a missing name proves release.
-        matches!(
-            std::fs::OpenOptions::new().read(true).write(true).open(endpoint.name()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
+    fn endpoint_is_free(&self, endpoint: &[u16]) -> bool {
+        lws_desktop::named_pipe_is_released(endpoint)
     }
 
     #[cfg(unix)]
@@ -171,5 +176,34 @@ mod systemd_tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pipe_probe_does_not_connect_and_detects_listener_release() {
+        let endpoint = transport::Endpoint::pipe(format!(
+            r"\\.\pipe\bifrost-exit-probe-test-{}",
+            std::process::id()
+        ));
+        let mut listener = transport::listen(&endpoint).unwrap();
+        let name: Vec<u16> = endpoint.name().encode_utf16().chain([0]).collect();
+        for _ in 0..3 {
+            assert!(!lws_desktop::named_pipe_is_released(&name));
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                listener.accept(&ipc::SameUser::current()),
+            )
+            .await
+            .is_err(),
+            "probing must not create a connection for core to accept"
+        );
+        drop(listener);
+        assert!(lws_desktop::named_pipe_is_released(&name));
     }
 }
