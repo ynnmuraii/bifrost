@@ -1818,6 +1818,25 @@ fn own_core(pid: u32) -> lws_gui::view_model::StartedCore {
 }
 
 #[test]
+fn a_failed_core_stop_reports_the_short_reason_in_both_languages() {
+    for (lang, expected) in [
+        (ui_text::Lang::Ru, "не удалось остановить службу (access denied)"),
+        (ui_text::Lang::En, "could not stop the service (access denied)"),
+    ] {
+        let mut vm = view();
+        vm.look.language = lang;
+        vm.settings.service.restart = Some(Restart::Stopping {
+            since: Instant::now(),
+        });
+        vm.on_core_stopped(Err("  access denied  \nmore details".to_owned()));
+        let line = vm.settings.service.line.as_ref().expect("the failure reason");
+        assert!(!line.ok);
+        assert_eq!(line.text, expected);
+        assert_eq!(vm.settings.service.restart, None);
+    }
+}
+
+#[test]
 fn the_restart_follows_the_pid_the_window_holds_and_says_so_when_it_holds_none() {
     let mut vm = view();
     let now = Instant::now();
