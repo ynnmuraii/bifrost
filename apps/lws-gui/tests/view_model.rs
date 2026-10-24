@@ -1945,6 +1945,30 @@ fn a_restart_with_no_link_starts_the_fresh_core_without_waiting() {
     assert_eq!(vm.settings.service.restart, Some(Restart::Starting));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launched_core_is_reaped_after_it_exits() {
+    // A harmless short-lived stand-in for `bifrost run`: no display or input involved.
+    let started = lws_gui::view_model::launch_core(&Launch {
+        program: std::path::PathBuf::from("/bin/sh"),
+        flags: vec!["-c".into(), "exit 0".into()],
+    })
+    .expect("the child starts");
+    let pid = started.pid.expect("the launched child's pid");
+    assert_eq!(started.program, std::path::PathBuf::from("/bin/sh"));
+
+    // Exited-but-unreaped children still have /proc entries, so exit alone cannot pass.
+    let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "launched child {pid} was not reaped within 5 seconds"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn the_window_really_stops_the_process_it_started() {
     // A process that outlives the test unless it is stopped: `sleep` on Unix, `powershell` on
