@@ -50,7 +50,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out, $stage | Out-Null
           Copy-Item target/release/bifrost.exe "$out/$name.exe"
           Copy-Item target/release/bifrost.exe $stage
-          Copy-Item packaging/README_RU.txt, LICENSE, licenses/THIRD_PARTY_NOTICES.md, crates/config/examples-data/config.example.toml $stage
+          Copy-Item packaging/README_RU.txt, packaging/release-signing-public-key.pem, LICENSE, licenses/THIRD_PARTY_NOTICES.md, crates/config/examples-data/config.example.toml $stage
           Compress-Archive -Path "$stage/*" -DestinationPath "$out/$name.zip"
           $info = (Get-Item "$out/$name.exe").VersionInfo
           if ($info.FileVersion -ne $version -or $info.ProductVersion -ne $version) { throw 'Wrong Windows version metadata' }
@@ -67,7 +67,7 @@ jobs:
           stage="$RUNNER_TEMP/stage"
           mkdir -p "$stage/share/icons/hicolor/scalable/apps" "$RUNNER_TEMP/dist"
           install -m 0755 target/release/bifrost packaging/install.sh "$stage/"
-          cp packaging/README_RU.txt LICENSE licenses/THIRD_PARTY_NOTICES.md crates/config/examples-data/config.example.toml packaging/bifrost.desktop "$stage/"
+          cp packaging/README_RU.txt packaging/release-signing-public-key.pem LICENSE licenses/THIRD_PARTY_NOTICES.md crates/config/examples-data/config.example.toml packaging/bifrost.desktop "$stage/"
           install -m 0644 packaging/bifrost.svg "$stage/share/icons/hicolor/scalable/apps/bifrost.svg"
           for size in 16 20 24 32 40 48 64 256; do
             mkdir -p "$stage/share/icons/hicolor/${size}x${size}/apps"
@@ -99,11 +99,25 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Checksums and release notes
+      - name: Signed checksums and release notes
         shell: bash
+        env:
+          BIFROST_RELEASE_SIGNING_KEY: ${{ secrets.BIFROST_RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "$BIFROST_RELEASE_SIGNING_KEY" ]; then
+            echo 'Missing required secret BIFROST_RELEASE_SIGNING_KEY' >&2
+            exit 1
+          fi
+          umask 077
+          key=$(mktemp "$RUNNER_TEMP/bifrost-release-signing.XXXXXX.pem")
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$BIFROST_RELEASE_SIGNING_KEY" > "$key"
+          unset BIFROST_RELEASE_SIGNING_KEY
           (cd dist && sha256sum bifrost-* > SHA256SUMS.txt)
+          openssl pkeyutl -sign -rawin -inkey "$key" -in dist/SHA256SUMS.txt -out dist/SHA256SUMS.txt.sig
+          test "$(wc -c < dist/SHA256SUMS.txt.sig)" -eq 64
+          openssl pkeyutl -verify -rawin -pubin -inkey packaging/release-signing-public-key.pem -in dist/SHA256SUMS.txt -sigfile dist/SHA256SUMS.txt.sig
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
           awk -v version="$version" '$0 ~ "^## " version " —" { found=1; next } found && /^## / { exit } found { print }' CHANGELOG.md > release-notes.txt
           test -s release-notes.txt
@@ -111,7 +125,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: release-checksums
-          path: dist/SHA256SUMS.txt
+          path: |
+            dist/SHA256SUMS.txt
+            dist/SHA256SUMS.txt.sig
+          if-no-files-found: error
       - name: Publish
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
