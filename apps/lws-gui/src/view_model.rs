@@ -2682,6 +2682,9 @@ impl Bridge {
         };
         match wait.poll(now) {
             crate::core_exit::Step::Waiting => {}
+            // Process exit can precede delivery of the client's EOF event. Do not enqueue
+            // StartCore while its command loop is still serving that old connection.
+            crate::core_exit::Step::Exited if self.view.connection.is_connected() => {}
             crate::core_exit::Step::Exited => {
                 self.restart_wait = None;
                 self.view.settings.service.restart = Some(Restart::Starting);
@@ -3700,6 +3703,11 @@ mod restart_tests {
         assert!(
             requests.try_recv().is_err(),
             "no immediate process launch or termination"
+        );
+        bridge.poll_restart(now);
+        assert!(
+            requests.try_recv().is_err(),
+            "process exit must also wait for the client's old-link disconnect event"
         );
         bridge
             .view
