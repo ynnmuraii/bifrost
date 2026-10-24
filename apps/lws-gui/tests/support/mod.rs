@@ -85,6 +85,7 @@ pub fn status_with(focus: &str) -> ipc::Status {
         agent_restart_circuit_open: false,
         transition_disabled_reason: String::new(),
         is_owner: true,
+        local_node_id: SELF_NODE.to_owned(),
         owner_node_id: SELF_NODE.to_owned(),
         owner_serial: 7,
         members: vec![

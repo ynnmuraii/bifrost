@@ -1855,11 +1855,15 @@ impl ViewModel {
 
     /// The short id of this computer, when the `Status` names it.
     ///
-    /// `Status` has no field for «this node»: `owner_node_id` is the owner's id, and it only
-    /// means this computer while this computer is the owner. The build spec is explicit
-    /// («не выдумывайте id»), so anything else shows the display name alone.
+    /// `Status.local_node_id` is this node's own id and is what the core sends now. A core
+    /// from before the field existed leaves it empty and `owner_node_id` only means this
+    /// computer while this computer is the owner; anything else shows the display name
+    /// alone, because the build spec is explicit («не выдумывайте id»).
     pub fn short_id_of_self(&self) -> Option<String> {
         let status = self.status.as_ref()?;
+        if !status.local_node_id.is_empty() {
+            return Some(short_id(&status.local_node_id));
+        }
         // While this node is the owner, `owner_node_id` is this node's id and the claim is
         // exact; otherwise the field names the *other* computer and showing it as this one's
         // id would be the invented id the build spec forbids.
@@ -2031,13 +2035,18 @@ impl ViewModel {
 
     /// The member this computer is, when the window can tell.
     ///
-    /// `Status` carries no «this node» field, so the window uses what it does carry: while
-    /// this node is the owner, `owner_node_id` is itself; otherwise, with two members and
-    /// exactly one of them marked as the owner, the other one is this computer. Anything
-    /// else — three members, no owner known — is left unknown rather than guessing.
+    /// `Status.local_node_id` names this node outright, which is what makes the answer work
+    /// on a follower in a three-node mesh. Older cores leave the field empty, so the two
+    /// fallbacks stay: while this node is the owner, `owner_node_id` is itself; otherwise,
+    /// with two members and exactly one of them marked as the owner, the other one is this
+    /// computer. Anything else — three members, no owner known, no local id — is left
+    /// unknown rather than guessing.
     pub fn self_node(&self) -> Option<&str> {
         let status = self.status.as_ref()?;
         let known = |node_id: &str| self.editor.nodes.iter().any(|node| node.node_id == node_id);
+        if !status.local_node_id.is_empty() && known(&status.local_node_id) {
+            return Some(status.local_node_id.as_str());
+        }
         if status.is_owner && known(&status.owner_node_id) {
             return Some(status.owner_node_id.as_str());
         }
@@ -3072,90 +3081,17 @@ impl Launch {
     }
 }
 
-/// The global options of the command line, mirroring `lws-core`'s.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CliArgs {
-    /// `--root DIR`.
-    pub root: Option<PathBuf>,
-    /// `--config-dir DIR`.
-    pub config_dir: Option<PathBuf>,
-    /// `--data-dir DIR`.
-    pub data_dir: Option<PathBuf>,
-    /// `--state-dir DIR`.
-    pub state_dir: Option<PathBuf>,
-    /// `--runtime-dir DIR`.
-    pub runtime_dir: Option<PathBuf>,
-}
-
-impl CliArgs {
-    /// Parses the global flags, ignoring what it does not know (a window that refuses to open
-    /// because of a stray argument helps nobody).
-    pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
-        let mut parsed = CliArgs::default();
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            let mut take = |slot: &mut Option<PathBuf>| {
-                if let Some(value) = args.next() {
-                    *slot = Some(PathBuf::from(value));
-                }
-            };
-            match arg.as_str() {
-                "--root" => take(&mut parsed.root),
-                "--config-dir" => take(&mut parsed.config_dir),
-                "--data-dir" => take(&mut parsed.data_dir),
-                "--state-dir" => take(&mut parsed.state_dir),
-                "--runtime-dir" => take(&mut parsed.runtime_dir),
-                _ => {}
-            }
-        }
-        parsed
-    }
-
-    /// The same options as the flags `lws-core` takes, in the order its usage line lists.
-    pub fn flags(&self) -> Vec<String> {
-        let mut flags = Vec::new();
-        for (name, value) in [
-            ("--root", &self.root),
-            ("--config-dir", &self.config_dir),
-            ("--data-dir", &self.data_dir),
-            ("--state-dir", &self.state_dir),
-            ("--runtime-dir", &self.runtime_dir),
-        ] {
-            if let Some(value) = value {
-                flags.push(name.to_owned());
-                flags.push(value.display().to_string());
-            }
-        }
-        flags
-    }
-
-    /// Resolves the directories: the documented defaults, with every flag on top.
-    ///
-    /// The same rule as `apps/lws-core/src/main.rs::resolve_paths`, so the window and the
-    /// core it starts agree on `config/`, `data/`, `state/` and `run/`.
-    pub fn resolve(&self) -> Result<Paths, String> {
-        let defaults = config::default_paths().map_err(|error| error.to_string())?;
-        let under_root = |name: &str| self.root.as_ref().map(|root| root.join(name));
-        Ok(Paths::new(
-            self.config_dir
-                .clone()
-                .or_else(|| under_root("config"))
-                .unwrap_or_else(|| defaults.config_dir().to_path_buf()),
-            self.data_dir
-                .clone()
-                .or_else(|| under_root("data"))
-                .unwrap_or_else(|| defaults.data_dir().to_path_buf()),
-            self.state_dir
-                .clone()
-                .or_else(|| under_root("state"))
-                .unwrap_or_else(|| defaults.state_dir().to_path_buf()),
-            self.runtime_dir
-                .clone()
-                .or_else(|| under_root("run"))
-                .or_else(|| defaults.runtime_dir().map(std::path::Path::to_path_buf)),
-        ))
-    }
-}
+/// The global options of the command line, exactly as `lws-core` reads them.
+///
+/// One parser for every role ([`config::CliPaths`]): the window is started with the
+/// arguments, the tray gets the window's own arguments unchanged, and the core is started by
+/// the window with [`CliArgs::flags`]. Both `--root DIR` and `--root=DIR` therefore name the
+/// same directory everywhere; before the shared parser they did not, and `bifrost
+/// --root=/path` left the window on the default directories while the tray used `/path`.
+///
+/// The window ignores an argument it does not know (a window that refuses to open because of
+/// a stray argument helps nobody); the core's own command-line rules stay in the core.
+pub use config::CliPaths as CliArgs;
 
 /// The endpoint of the core for `paths`, or the reason there is none.
 pub fn resolve_endpoint(paths: &Paths) -> (CoreEndpoint, Option<Endpoint>) {

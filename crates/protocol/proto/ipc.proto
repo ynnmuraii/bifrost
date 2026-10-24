@@ -373,6 +373,7 @@ message Status {
   bool edge_effects = 25;                  // `[appearance].edge_effects`: the ASCII strip at linked edges
   bool hide_remote_cursor = 26;            // `[appearance].hide_remote_cursor`: hide the cursor here while input is elsewhere
   repeated HotkeyBinding hotkeys = 27;
+  string local_node_id = 28;               // this node's own id, hex; empty when the core cannot say
 }
 message MemberStatus {
   string node_id = 1;

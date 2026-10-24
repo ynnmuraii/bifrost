@@ -164,6 +164,7 @@ impl Session {
             capabilities_unavailable: self.unavailable_capabilities(),
             portal_state: self.portal_state.clone(),
             is_owner: self.router.is_owner(),
+            local_node_id: crate::command::node_id_hex(&self.node_id),
             owner_node_id: owner
                 .map_or_else(String::new, |owner| crate::command::node_id_hex(&owner)),
             owner_serial: self.router.serial(),

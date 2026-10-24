@@ -132,6 +132,17 @@ fn generated_wire_and_ipc_messages_round_trip() {
             ..Default::default()
         },
     );
+    // The field the window needs to name this computer on a follower in a 3+ node mesh;
+    // appended as number 28, so a core from before it still decodes every older field.
+    round_trip(
+        Channel::Ipc,
+        ipc::Status {
+            local_node_id: "aa11aa11".repeat(8),
+            owner_node_id: "bb22bb22".repeat(8),
+            is_owner: false,
+            ..Default::default()
+        },
+    );
     assert_eq!(
         encode_message(Channel::InputControl, &wire::Envelope::default()),
         Err(FrameError::Empty)
