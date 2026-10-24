@@ -360,6 +360,28 @@ pub fn replace(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embedded_release_key_matches_packaged_spki() {
+        use spki::der::DecodePem;
+        let public = spki::SubjectPublicKeyInfoOwned::from_pem(include_str!(
+            "../../../packaging/release-signing-public-key.pem"
+        ))
+        .expect("the packaged key must be a PEM-encoded SPKI");
+        assert_eq!(public.algorithm.oid.to_string(), "1.3.101.112", "Ed25519");
+        assert!(
+            public.algorithm.parameters.is_none(),
+            "Ed25519 has no parameters"
+        );
+        assert_eq!(
+            public
+                .subject_public_key
+                .as_bytes()
+                .expect("a byte-aligned key"),
+            RELEASE_SIGNING_PUBLIC_KEY,
+            "the binary pin and the key used by release.yml must not drift apart",
+        );
+    }
+
     fn release() -> Release {
         serde_json::from_str(include_str!("../tests/fixtures/latest-release.json")).unwrap()
     }
