@@ -2684,7 +2684,14 @@ impl Bridge {
             crate::core_exit::Step::Waiting => {}
             // Process exit can precede delivery of the client's EOF event. Do not enqueue
             // StartCore while its command loop is still serving that old connection.
-            crate::core_exit::Step::Exited if self.view.connection.is_connected() => {}
+            crate::core_exit::Step::Exited if self.view.connection.is_connected() => {
+                if wait.timed_out(now) {
+                    self.restart_wait = None;
+                    self.view.on_core_stopped(Err(
+                        "Core IPC client did not disconnect within 10 seconds".into(),
+                    ));
+                }
+            }
             crate::core_exit::Step::Exited => {
                 self.restart_wait = None;
                 self.view.settings.service.restart = Some(Restart::Starting);
@@ -3724,6 +3731,19 @@ mod restart_tests {
             requests.try_recv().is_err(),
             "one supervised start, never a detached second core"
         );
+
+        // Even a client that never reports EOF must not leave the restart spinning.
+        bridge.view.settings.service.restart = None;
+        bridge.view.on_connected("test endpoint");
+        bridge.restart_core(now);
+        assert!(matches!(requests.try_recv().unwrap(), Command::Send { .. }));
+        bridge.poll_restart(now + crate::core_exit::TIMEOUT);
+        assert!(
+            requests.try_recv().is_err(),
+            "timeout never launches a duplicate"
+        );
+        assert!(bridge.view.settings.service.restart.is_none());
+        assert!(!bridge.view.settings.service.line.as_ref().unwrap().ok);
     }
 
     #[tokio::test]
