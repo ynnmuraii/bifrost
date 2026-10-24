@@ -1740,9 +1740,10 @@ fn stopping_a_core_without_owning_its_pid_uses_shutdown_and_reports_disconnect()
     assert!(vm.core.is_none(), "the window owns no pid");
     assert!(vm.settings.service.stopping.is_some());
 
+    vm.on_disconnected("the pipe was closed".to_owned());
     assert!(
-        !vm.on_disconnected("the pipe was closed".to_owned()),
-        "stopping must not launch a replacement core"
+        vm.settings.service.restart.is_none(),
+        "stop never schedules a replacement"
     );
     assert_eq!(vm.connection_label(), "Служба не запущена");
     assert_eq!(
@@ -1867,10 +1868,7 @@ fn restart_uses_graceful_ipc_without_requiring_an_owned_pid() {
             Some(Restart::Stopping { since: now })
         );
         assert_eq!(vm.begin_restart(now), RestartStep::Refused);
-        assert!(
-            !vm.on_disconnected("the pipe was closed".into()),
-            "link loss alone must not launch a replacement"
-        );
+        vm.on_disconnected("the pipe was closed".into());
         assert_eq!(
             vm.settings.service.restart,
             Some(Restart::Stopping { since: now })
