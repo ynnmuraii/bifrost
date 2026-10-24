@@ -2049,10 +2049,9 @@ fn a_machine_that_already_had_its_configuration_says_nothing_about_a_first_run()
 
 // ---------------------------------------------------------------- the bridge
 
-/// «Применить» through the window's own wiring: the file is written, and the address is only
-/// in use once the service behind it is the fresh one — which this window did not start.
+/// Apply writes the file and schedules a graceful restart even without an owned PID.
 #[test]
-fn the_address_button_through_the_bridge_writes_and_says_why_it_cannot_restart() {
+fn the_address_button_through_the_bridge_writes_and_schedules_an_attached_core_restart() {
     let mut bridge = Bridge::new(
         view(),
         GuiClient::start(None, Launch::with_flags(Vec::new())),
@@ -2080,18 +2079,17 @@ fn the_address_button_through_the_bridge_writes_and_says_why_it_cannot_restart()
             .text,
         "Адрес сохранён"
     );
-    // The window holds no service of its own here, so the answer is the honest sentence and
-    // not a process it does not know.
+    assert!(
+        bridge.view().core.is_none(),
+        "this window does not own a PID"
+    );
     assert_eq!(
-        bridge
-            .view()
-            .settings
-            .service
-            .line
-            .as_ref()
-            .expect("a sentence")
-            .text,
-        "служба запущена не этим окном — остановите её сами"
+        bridge.view().settings.service.restart,
+        Some(Restart::Stopping { since: now }),
+    );
+    assert!(
+        bridge.view().settings.service.line.is_none(),
+        "no PID-based refusal"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
