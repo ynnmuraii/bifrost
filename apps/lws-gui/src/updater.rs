@@ -412,7 +412,8 @@ mod tests {
     }
     fn signing_key() -> ring::signature::Ed25519KeyPair {
         let pkcs8 =
-            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
         ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
     }
     fn authenticate(
