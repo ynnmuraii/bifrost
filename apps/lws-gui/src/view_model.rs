@@ -3249,7 +3249,8 @@ pub fn lan_addresses() -> Vec<String> {
 /// Starts `bifrost run` detached, with the flags the window was given.
 ///
 /// `docs/03-architecture.md`: «Закрытие окна GUI не влияет на активный сеанс». The child gets
-/// no inherited standard streams, so its lifetime is its own; it is never waited for.
+/// no inherited standard streams; a background waiter reaps it without tying its lifetime
+/// to the window or blocking the caller.
 pub fn launch_core(launch: &Launch) -> Result<StartedCore, String> {
     let program = launch.program.clone();
     let mut command = std::process::Command::new(&program);
@@ -3268,10 +3269,17 @@ pub fn launch_core(launch: &Launch) -> Result<StartedCore, String> {
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
     match command.spawn() {
-        Ok(child) => Ok(StartedCore {
-            program,
-            pid: Some(child.id()),
-        }),
+        Ok(mut child) => {
+            let pid = child.id();
+            // As with the editor, keep a waiter rather than leave a zombie after exit.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(StartedCore {
+                program,
+                pid: Some(pid),
+            })
+        }
         Err(error) => Err(format!("{}: {error}", program.display())),
     }
 }
