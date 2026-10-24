@@ -127,43 +127,9 @@ pub fn run_tray(args: Vec<String>) -> ExitCode {
 }
 
 fn paths(args: &[String]) -> Result<config::Paths, String> {
-    let mut root = None;
-    let mut config_dir = None;
-    let mut data = None;
-    let mut state = None;
-    let mut runtime = None;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let (flag, inline) = arg
-            .split_once('=')
-            .map_or((arg.as_str(), None), |(a, b)| (a, Some(b)));
-        let slot = match flag {
-            "--root" => &mut root,
-            "--config-dir" => &mut config_dir,
-            "--data-dir" => &mut data,
-            "--state-dir" => &mut state,
-            "--runtime-dir" => &mut runtime,
-            _ => continue,
-        };
-        if let Some(value) = inline.or_else(|| args.next().map(String::as_str)) {
-            *slot = Some(std::path::PathBuf::from(value));
-        }
-    }
-    let defaults = config::default_paths().map_err(|e| e.to_string())?;
-    let under = |name: &str| root.as_ref().map(|root| root.join(name));
-    Ok(config::Paths::new(
-        config_dir
-            .or_else(|| under("config"))
-            .unwrap_or_else(|| defaults.config_dir().to_path_buf()),
-        data.or_else(|| under("data"))
-            .unwrap_or_else(|| defaults.data_dir().to_path_buf()),
-        state
-            .or_else(|| under("state"))
-            .unwrap_or_else(|| defaults.state_dir().to_path_buf()),
-        runtime
-            .or_else(|| under("run"))
-            .or_else(|| defaults.runtime_dir().map(std::path::Path::to_path_buf)),
-    ))
+    // The same parser the window and the core use: the tray is started with the window's own
+    // arguments, and `--root=/path` must name the same directory in both.
+    config::CliPaths::parse(args).resolve()
 }
 
 async fn worker(

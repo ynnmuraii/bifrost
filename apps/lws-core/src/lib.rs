@@ -132,6 +132,8 @@ GLOBAL:
     --runtime-dir DIR   override the runtime directory (control channel)
     --help              print this help
 
+    Every GLOBAL flag also takes the --flag=DIR form.
+
 COMMANDS:
     run      run the daemon: links, focus FSM, agent supervision
     pair     pair with a peer: --open (listen) or --dial <ip:port>
@@ -151,54 +153,15 @@ struct Args {
 }
 
 fn dispatch(argv: &[String]) -> Result<(), Failure> {
-    let mut root: Option<PathBuf> = None;
-    let mut config_dir: Option<PathBuf> = None;
-    let mut data_dir: Option<PathBuf> = None;
-    let mut state_dir: Option<PathBuf> = None;
-    let mut runtime_dir: Option<PathBuf> = None;
-
-    let mut index = 0;
-    let mut command = None;
-    while index < argv.len() {
-        let argument = argv[index].as_str();
-        match argument {
-            "--help" | "-h" => {
-                print!("{USAGE}");
-                return Ok(());
-            }
-            "--root" | "--config-dir" | "--data-dir" | "--state-dir" | "--runtime-dir" => {
-                let value = argv
-                    .get(index + 1)
-                    .ok_or_else(|| Failure::Usage(format!("{argument} needs a value")))?;
-                let path = PathBuf::from(value);
-                match argument {
-                    "--root" => root = Some(path),
-                    "--config-dir" => config_dir = Some(path),
-                    "--data-dir" => data_dir = Some(path),
-                    "--state-dir" => state_dir = Some(path),
-                    "--runtime-dir" => runtime_dir = Some(path),
-                    _ => unreachable!("the match above lists every flag"),
-                }
-                index += 2;
-            }
-            other if other.starts_with('-') => {
-                return Err(Failure::Usage(format!("unknown option {other:?}")));
-            }
-            other => {
-                command = Some(other.to_owned());
-                index += 1;
-                break;
-            }
-        }
-    }
-
-    let command = command.ok_or_else(|| Failure::Usage("no command given".to_owned()))?;
-    let rest = argv[index..].to_vec();
-    let paths = resolve_paths(root, config_dir, data_dir, state_dir, runtime_dir)?;
+    let Some(invocation) = parse_command_line(argv)? else {
+        print!("{USAGE}");
+        return Ok(());
+    };
+    let paths = invocation.flags.resolve().map_err(Failure::Run)?;
     let args = Args {
         paths,
-        command,
-        rest,
+        command: invocation.command,
+        rest: invocation.rest,
     };
 
     // A command that writes must be able to start with an empty root (`--root DIR`
@@ -240,30 +203,102 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
     }
 }
 
-/// Resolves the four directories, honouring `--root` and the documented defaults.
-fn resolve_paths(
-    root: Option<PathBuf>,
-    config_dir: Option<PathBuf>,
-    data_dir: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
-    runtime_dir: Option<PathBuf>,
-) -> Result<Paths, Failure> {
-    let defaults = config::Config::default_paths()?;
-    let under_root = |name: &str| root.as_ref().map(|root| root.join(name));
-    Ok(Paths::new(
-        config_dir
-            .or_else(|| under_root("config"))
-            .unwrap_or_else(|| defaults.config_dir().to_path_buf()),
-        data_dir
-            .or_else(|| under_root("data"))
-            .unwrap_or_else(|| defaults.data_dir().to_path_buf()),
-        state_dir
-            .or_else(|| under_root("state"))
-            .unwrap_or_else(|| defaults.state_dir().to_path_buf()),
-        runtime_dir
-            .or_else(|| under_root("run"))
-            .or_else(|| defaults.runtime_dir().map(std::path::Path::to_path_buf)),
-    ))
+/// What the command line asked for, before the directories are resolved.
+struct Invocation {
+    /// The global path flags, parsed by `config` so every role reads them the same way.
+    flags: config::CliPaths,
+    /// The command word.
+    command: String,
+    /// Everything behind the command word, untouched: these are the command's own options.
+    rest: Vec<String>,
+}
+
+/// Reads the global flags, then the command word and the arguments behind it.
+///
+/// `Ok(None)` is `--help` before any command: the caller prints the usage. Both
+/// `--root DIR` and `--root=DIR` are accepted (the one parser is
+/// [`config::CliPaths`], which the window and the tray use too); an unknown option before
+/// the command stays a usage error, as does a flag with no value.
+fn parse_command_line(argv: &[String]) -> Result<Option<Invocation>, Failure> {
+    let mut flags = config::CliPaths::default();
+    let mut index = 0;
+    let mut command = None;
+    while index < argv.len() {
+        let argument = argv[index].as_str();
+        if matches!(argument, "--help" | "-h") {
+            return Ok(None);
+        }
+        match flags.take(argv, index) {
+            config::Taken::Yes(next) => index = next,
+            config::Taken::MissingValue(flag) => {
+                return Err(Failure::Usage(format!("{flag} needs a value")));
+            }
+            config::Taken::No => {
+                if argument.starts_with('-') {
+                    return Err(Failure::Usage(format!("unknown option {argument:?}")));
+                }
+                command = Some(argument.to_owned());
+                index += 1;
+                break;
+            }
+        }
+    }
+    let command = command.ok_or_else(|| Failure::Usage("no command given".to_owned()))?;
+    Ok(Some(Invocation {
+        flags,
+        command,
+        rest: argv[index..].to_vec(),
+    }))
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::*;
+
+    fn argv(list: &[&str]) -> Vec<String> {
+        list.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn invocation(list: &[&str]) -> Invocation {
+        match parse_command_line(&argv(list)) {
+            Ok(Some(invocation)) => invocation,
+            Ok(None) => panic!("{list:?} is not --help"),
+            Err(failure) => panic!("{list:?}: {}", failure_message(failure)),
+        }
+    }
+
+    #[test]
+    fn both_flag_spellings_reach_the_same_invocation() {
+        let separated = invocation(&["--root", "/work", "--data-dir", "/elsewhere", "run"]);
+        let inline = invocation(&["--root=/work", "--data-dir=/elsewhere", "run"]);
+        assert_eq!(separated.flags, inline.flags);
+        assert_eq!(separated.command, "run");
+        assert_eq!(inline.command, "run");
+        assert_eq!(separated.rest, inline.rest);
+    }
+
+    #[test]
+    fn a_flag_without_a_value_and_an_unknown_option_are_usage_errors() {
+        for list in [
+            vec!["--root"],
+            vec!["--root", "run"], // the command word is the value, so no command is left
+            vec!["--nope", "run"],
+        ] {
+            match parse_command_line(&argv(&list)) {
+                Err(Failure::Usage(_)) => {}
+                _ => panic!("{list:?} must be a usage error"),
+            }
+        }
+        assert!(matches!(parse_command_line(&argv(&["--help"])), Ok(None)));
+    }
+
+    #[test]
+    fn the_command_tail_is_left_to_the_command() {
+        let parsed = invocation(&["--root=/work", "run", "--dry-inject", "--root=/not-a-flag"]);
+        assert_eq!(parsed.command, "run");
+        assert_eq!(parsed.rest, argv(&["--dry-inject", "--root=/not-a-flag"]));
+        assert_eq!(parsed.flags.root, Some(PathBuf::from("/work")));
+    }
 }
 
 /// Starts the logger at the level the configuration asks for, writing to stderr **and** to

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use lws_gui::view_model::layout::LinkState;
 use lws_gui::view_model::{
-    Action, Bridge, GuiClient, Launch, Modal, Request, Restart, RestartStep, ServiceStart, Side,
-    ViewModel, SERVICE_START_TIMEOUT, SERVICE_STOP_TIMEOUT,
+    Action, Bridge, CliArgs, GuiClient, Launch, Modal, Request, Restart, RestartStep, ServiceStart,
+    Side, ViewModel, SERVICE_START_TIMEOUT, SERVICE_STOP_TIMEOUT,
 };
 use protocol::ipc::gui_frame::Msg;
 use support::{
@@ -2391,4 +2391,43 @@ fn a_hostile_operating_system_name_is_bounded_before_the_map_shows_it() {
     assert_eq!(name.chars().count(), 32, "{name:?}");
     assert!(!name.chars().any(char::is_control), "{name:?}");
     assert!(!name.contains(['\u{202e}', '\u{202c}']), "{name:?}");
+}
+
+/// M3: one parser behind the window, the tray and the core.
+///
+/// The window is started with the arguments; the tray gets the window's own arguments
+/// unchanged; the core is started with `CliArgs::flags`. Before the shared parser
+/// `--root=/path` was read by the tray alone, so the window resolved the default directories
+/// and the two processes talked past each other.
+#[test]
+fn both_flag_spellings_name_the_same_directories_in_every_role() {
+    let inline = CliArgs::parse([
+        "--root=/work".to_owned(),
+        "--data-dir=/elsewhere".to_owned(),
+    ]);
+    let separated = CliArgs::parse([
+        "--root".to_owned(),
+        "/work".to_owned(),
+        "--data-dir".to_owned(),
+        "/elsewhere".to_owned(),
+    ]);
+    assert_eq!(inline, separated);
+    assert_eq!(inline.root.as_deref(), Some(std::path::Path::new("/work")));
+
+    // What the window hands the core it starts: the separated form, same values.
+    let forwarded = inline.flags();
+    assert_eq!(forwarded, ["--root", "/work", "--data-dir", "/elsewhere"]);
+    let core = CliArgs::parse(forwarded);
+    assert_eq!(core, inline);
+    // What the tray gets: the window's arguments, unchanged, through the same parser.
+    let tray = CliArgs::parse([
+        "--root=/work".to_owned(),
+        "--data-dir=/elsewhere".to_owned(),
+    ]);
+    assert_eq!(tray, inline);
+
+    let resolved = inline.resolve().expect("the defaults resolve");
+    assert_eq!(core.resolve().expect("the defaults resolve"), resolved);
+    assert_eq!(tray.resolve().expect("the defaults resolve"), resolved);
+    assert_eq!(resolved.config_dir(), std::path::Path::new("/work/config"));
 }
