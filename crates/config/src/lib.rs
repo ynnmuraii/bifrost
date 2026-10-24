@@ -57,6 +57,7 @@
 //!   Unix `getifaddrs`) to choose a `listen_address`, and creates the
 //!   configuration directory itself, `0700` on Unix.
 
+pub mod cli;
 pub mod error;
 pub mod first_run;
 pub mod hotkey;
@@ -68,6 +69,7 @@ pub mod save;
 pub mod schema;
 pub mod topology;
 
+pub use cli::{CliPaths, Taken, PATH_FLAGS};
 pub use error::{ConfigError, ErrorCode};
 pub use first_run::{choose, ensure_config, lan_addresses, set_listen_address, Candidate};
 pub use hotkey::{Hotkey, HotkeyAction, HotkeyBindings, HotkeyError, Modifier};
