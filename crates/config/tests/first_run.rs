@@ -6,7 +6,9 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use config::first_run::{choose, ensure_config, lan_addresses, set_listen_address, Candidate};
+use config::first_run::{
+    choose, ensure_config, lan_addresses, ranked_addresses, set_listen_address, Candidate,
+};
 use config::{Config, Paths};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -105,32 +107,34 @@ fn loopback_and_link_local_and_multicast_are_not_lan_addresses() {
 fn every_documented_virtual_adapter_name_is_filtered() {
     // One physical candidate, so each virtual name is what the choice turns on.
     let physical = || candidate("Ethernet", Ipv4Addr::new(192, 168, 1, 10), true, false);
-    let tunnel = |name: &str| candidate(name, Ipv4Addr::new(10, 7, 0, 2), true, true);
+    let noise = |name: &str| candidate(name, Ipv4Addr::new(10, 7, 0, 2), true, true);
     for name in [
         "vEthernet (WSL)",
         "Hyper-V Virtual Ethernet Adapter",
         "vEthernet (Default Switch)",
         "docker0",
+        "br-1a2b3c4d5e6f",
+        "veth9f0d21",
+        "virbr0",
         "WSL",
         "VirtualBox Host-Only Network",
         "vboxnet0",
         "VMware Network Adapter VMnet8",
         "vmnet1",
-        "TAP-Windows Adapter V9",
-        "tun0",
-        "utun3",
-        "wg0",
-        "tailscale0",
-        "ZeroTier One [a1b2c3d4e5]",
         "Loopback Pseudo-Interface 1",
+        "lo",
         "Bluetooth Network Connection",
         "Npcap Loopback Adapter",
         "Radmin VPN",
     ] {
         assert_eq!(
-            choose(&[tunnel(name), physical()]),
+            choose(&[noise(name), physical()]),
             Some(Ipv4Addr::new(192, 168, 1, 10)),
             "a peer must never be dialled through {name:?}"
+        );
+        assert!(
+            ranked_addresses(&[noise(name)]).is_empty(),
+            "{name:?} is not an address another computer can dial"
         );
     }
     // The same fragments are matched case-insensitively against the platform's
@@ -147,6 +151,66 @@ fn every_documented_virtual_adapter_name_is_filtered() {
 }
 
 #[test]
+fn vpn_and_overlay_interfaces_are_offered_below_the_physical_lan() {
+    // A laptop on a cable and on Tailscale: the settings screen must list both — people do
+    // run Bifrost over a mesh — but the default address stays the cable's, even when the
+    // mesh holds the default route.
+    let tailscale = Ipv4Addr::new(100, 100, 44, 2);
+    let lan = Ipv4Addr::new(192, 168, 1, 10);
+    let candidates = [
+        candidate("tailscale0", tailscale, true, true),
+        candidate("Ethernet", lan, true, false),
+    ];
+    assert_eq!(choose(&candidates), Some(lan));
+    assert_eq!(ranked_addresses(&candidates), vec![lan, tailscale]);
+
+    // The same, for every overlay spelling the platform uses.
+    for name in [
+        "tailscale0",
+        "Tailscale",
+        "wg0",
+        "wireguard",
+        "WireGuard Tunnel",
+        "tun0",
+        "tap0",
+        "utun3",
+        "ZeroTier One [a1b2c3d4e5]",
+        "ztabcdef12345678",
+    ] {
+        let overlay = candidate(name, Ipv4Addr::new(10, 8, 0, 2), true, true);
+        assert_eq!(
+            choose(&[overlay.clone(), candidate("Ethernet", lan, true, false)]),
+            Some(lan),
+            "{name:?} must not take the default from the LAN"
+        );
+        assert_eq!(
+            ranked_addresses(&[overlay.clone()]),
+            vec![Ipv4Addr::new(10, 8, 0, 2)],
+            "{name:?} must stay selectable in the settings screen"
+        );
+    }
+}
+
+#[test]
+fn a_friendly_name_that_merely_contains_a_tunnel_word_is_not_an_overlay() {
+    // The old `contains` rule matched `tun` inside `Tuning` and `wg` at the end of a name,
+    // and quietly dropped a working physical adapter from the list.
+    for name in [
+        "Ethernet (Tuning)",
+        "Office-tuning",
+        "enp3s0_wg",
+        "Tunnelblick Ethernet",
+    ] {
+        let physical = candidate(name, Ipv4Addr::new(192, 168, 1, 10), true, true);
+        assert_eq!(
+            ranked_addresses(&[physical]),
+            vec![Ipv4Addr::new(192, 168, 1, 10)],
+            "{name:?} is a physical adapter"
+        );
+    }
+}
+
+#[test]
 fn a_vpn_holding_the_default_route_does_not_win() {
     // The route the kernel would use goes through the tunnel; the tunnel is still
     // the wrong interface for this node to listen on.
@@ -156,9 +220,9 @@ fn a_vpn_holding_the_default_route_does_not_win() {
     ];
     assert_eq!(choose(&candidates), Some(Ipv4Addr::new(192, 168, 1, 10)));
 
-    // A tunnel the filter cannot recognise (a name without any of the fragments)
-    // gets no special treatment: on merit it wins, which is exactly why the
-    // fragment list is part of the rule and not an optimisation.
+    // A tunnel the filter cannot recognise (a name without an overlay token) gets no
+    // special treatment: on merit it wins, which is exactly why the name rule is part of
+    // the ranking and not an optimisation.
     let plain = [
         candidate("eth0", Ipv4Addr::new(10, 0, 0, 2), true, true),
         candidate("Ethernet", Ipv4Addr::new(192, 168, 1, 10), true, true),

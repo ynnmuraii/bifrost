@@ -63,12 +63,15 @@ pub struct Candidate {
 /// the interface, which is how each of them shows up in practice:
 /// `vEthernet (Default Switch)` and other Hyper-V virtual adapters, `docker0`,
 /// `WSL` (`vEthernet (WSL (Hyper-V firewall))`), `VirtualBox Host-Only Network` /
-/// `vboxnet0`, `VMware Network Adapter VMnet8` / `vmnet1`, TAP-Windows (`tap`,
-/// `tun`), WireGuard (`wg0`), Tailscale (`tailscale0`), ZeroTier's own spelling
-/// (`ZeroTier One [<node id>]`), `loopback` / the `lo`-named interfaces,
-/// `Bluetooth Network Connection`, the Npcap loopback and the Radmin VPN
-/// adapters. A physical `Ethernet`, `enp3s0` or `wlan0` never contains one of
-/// these fragments.
+/// `vboxnet0`, `VMware Network Adapter VMnet8` / `vmnet1`, `loopback` /
+/// the `lo`-named interface, `Bluetooth Network Connection`, the Npcap loopback and
+/// the Radmin adapters. A physical `Ethernet`, `enp3s0` or `wlan0` never contains one
+/// of these fragments.
+///
+/// VPN and overlay interfaces are **not** on this list: people do run Bifrost over
+/// WireGuard, Tailscale and ZeroTier, so those are offered and remain selectable in the
+/// settings screen. They are only *ranked* below the physical LAN ([`is_overlay`]), which
+/// keeps the default address on the cable.
 ///
 /// The match is a *name* rule and nothing more: an adapter whose name carries none
 /// of these fragments — a proxy client's own tunnel, say — is offered by
@@ -83,15 +86,33 @@ const VIRTUAL_ADAPTERS: &[&str] = &[
     "vbox",
     "vmware",
     "vmnet",
-    "tap",
-    "tun",
-    "wg",
-    "tailscale",
-    "zerotier",
     "loopback",
     "bluetooth",
     "npcap",
     "radmin",
+];
+
+/// Adapter-name prefixes of the bridges and veth pairs Linux creates: `br-1a2b3c`,
+/// `veth9f0d`, `virbr0`. Matched as prefixes because the random suffix is what follows.
+const VIRTUAL_PREFIXES: &[&str] = &["br-", "veth", "virbr"];
+
+/// Adapter-name prefixes of VPN and overlay interfaces, matched as tokens (see
+/// [`starts_with_token`]): WireGuard (`wg0`), OpenVPN (`tun0`, `tap0`), macOS/UTUN
+/// (`utun3`), Tailscale (`tailscale0`, the FriendlyName `Tailscale`), ZeroTier (`zt…`
+/// and `ZeroTier One [<node id>]`).
+///
+/// These are kept — a mesh is a working transport for Bifrost — but [`rank`] puts every
+/// physical interface above them, so a laptop with both an Ethernet cable and Tailscale
+/// still listens on the LAN by default.
+const OVERLAY_PREFIXES: &[&str] = &[
+    "tailscale",
+    "wireguard",
+    "zerotier",
+    "wg",
+    "utun",
+    "tun",
+    "tap",
+    "zt",
 ];
 
 /// The address the route probe "connects" to: `192.0.2.1` is TEST-NET-1
@@ -102,12 +123,21 @@ const PROBE_ADDRESS: &str = "192.0.2.1:9";
 /// The machine's LAN IPv4 addresses, best candidate first.
 ///
 /// Loopback, unspecified, link-local, multicast and virtual-adapter addresses are
-/// left out by the same rules [`choose`] uses; when nothing qualifies the vector is
-/// empty and the caller's own fallback applies.
+/// left out by the same rules [`choose`] uses; VPN and overlay interfaces stay, below the
+/// physical ones. When nothing qualifies the vector is empty and the caller's own fallback
+/// applies.
 pub fn lan_addresses() -> Vec<Ipv4Addr> {
     let mut offered = platform_candidates();
     mark_default_route(&mut offered, default_route_address());
-    let mut ranked = ranked(&offered);
+    ranked_addresses(&offered)
+}
+
+/// [`lan_addresses`]'s pure half: `candidates` filtered and ordered, best first.
+///
+/// The same list the settings screen offers, so a test can assert the order — and that an
+/// overlay is still on it — without a network.
+pub fn ranked_addresses(candidates: &[Candidate]) -> Vec<Ipv4Addr> {
+    let mut ranked = ranked(candidates);
     // The same address on two adapters (a reconnected VPN, a stale tunnel) is one
     // address; the better position of the two wins.
     ranked.dedup_by(|first, second| first.address == second.address);
@@ -126,11 +156,12 @@ pub fn lan_addresses() -> Vec<Ipv4Addr> {
 ///    (`169.254.0.0/16`), multicast, and RFC 2544 benchmarking (`198.18.0.0/15`)
 ///    addresses: they are not addresses another node on the LAN could dial;
 /// 2. drop candidates whose name contains a virtual-adapter fragment
-///    ([`VIRTUAL_ADAPTERS`]): a tunnel is a peer's problem, not this node's
-///    listener;
-/// 3. what is left ranks `has_default_route` above `is_up` — the address the
-///    kernel already uses for the default route is the one the peers can reach —
-///    and the first of the highest rank wins.
+///    ([`VIRTUAL_ADAPTERS`]) or starts with a bridge/veth prefix: a Hyper-V switch or a
+///    Docker bridge is not an address another computer reaches this one on;
+/// 3. what is left ranks a physical interface above a VPN/overlay one ([`is_overlay`]),
+///    and inside those two classes `has_default_route` above `is_up` — the address the
+///    kernel already uses for the default route is the one the peers can reach — and the
+///    first of the highest rank wins.
 pub fn choose(candidates: &[Candidate]) -> Option<Ipv4Addr> {
     ranked(candidates)
         .first()
@@ -227,12 +258,19 @@ fn is_benchmarking(address: Ipv4Addr) -> bool {
 
 /// The preference score of one qualifying candidate: higher is better.
 ///
-/// `has_default_route` outranks `is_up`: an up interface the kernel refuses to
-/// route through is still unreachable, and a route the platform cannot see as up
-/// (a tunnel mid-handshake) still carries the traffic. Equal scores are left to
-/// the platform's own order by the stable sort in [`ranked`].
+/// A physical interface outranks every overlay, however the overlay is routed: a laptop
+/// with a cable and a WireGuard tunnel listens on the cable by default, and the tunnel
+/// address stays offered one position down. Inside each class `has_default_route`
+/// outranks `is_up`: an up interface the kernel refuses to route through is still
+/// unreachable, and a route the platform cannot see as up (a tunnel mid-handshake) still
+/// carries the traffic. Equal scores are left to the platform's own order by the stable
+/// sort in [`ranked`].
 fn rank(candidate: &Candidate) -> u8 {
-    let mut score = 0;
+    let mut score = if is_overlay(&candidate.name) {
+        0
+    } else {
+        0b100
+    };
     if candidate.has_default_route {
         score |= 0b10;
     }
@@ -242,12 +280,44 @@ fn rank(candidate: &Candidate) -> u8 {
     score
 }
 
-/// Whether an adapter name names a virtual interface ([`VIRTUAL_ADAPTERS`]).
+/// Whether `name` is an interface nothing outside this machine can reach through:
+/// loopback, a Hyper-V/WSL/VirtualBox/VMware switch, or a Linux bridge/veth pair.
 fn is_virtual(name: &str) -> bool {
-    let lowered = name.to_lowercase();
-    VIRTUAL_ADAPTERS
+    let lowered = name.trim().to_lowercase();
+    lowered == "lo"
+        || VIRTUAL_ADAPTERS
+            .iter()
+            .any(|fragment| lowered.contains(*fragment))
+        || VIRTUAL_PREFIXES
+            .iter()
+            .any(|prefix| lowered.starts_with(*prefix))
+}
+
+/// Whether `name` is a VPN or overlay interface: kept, but ranked below physical ones.
+fn is_overlay(name: &str) -> bool {
+    let lowered = name.trim().to_lowercase();
+    OVERLAY_PREFIXES
         .iter()
-        .any(|fragment| lowered.contains(*fragment))
+        .any(|prefix| starts_with_token(&lowered, prefix))
+}
+
+/// Whether `lowered` starts with `token` as a whole word.
+///
+/// The substring rule this replaces matched `tun` inside `Ethernet (Tuning)` and `wg`
+/// inside `enp3s0_wg`. A token is the word itself (`Tailscale`), the word and a number
+/// (`wg0`, `tun0`, `utun3`, `tailscale0`), ZeroTier's `zt` followed by its hex network id,
+/// or the word and a separator (`WireGuard Tunnel`, `ZeroTier One [<node id>]`). Anything
+/// else is a different word: `tuning` is not `tun`.
+fn starts_with_token(lowered: &str, token: &str) -> bool {
+    let Some(rest) = lowered.strip_prefix(token) else {
+        return false;
+    };
+    match rest.chars().next() {
+        None => true,
+        Some(c) if c.is_ascii_digit() => true,
+        Some(c) if token == "zt" && c.is_ascii_hexdigit() => true,
+        Some(c) => !c.is_alphanumeric(),
+    }
 }
 
 /// The first-run document: the documented ownership defaults and the schema
