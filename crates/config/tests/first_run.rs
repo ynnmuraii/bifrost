@@ -184,7 +184,7 @@ fn vpn_and_overlay_interfaces_are_offered_below_the_physical_lan() {
             "{name:?} must not take the default from the LAN"
         );
         assert_eq!(
-            ranked_addresses(&[overlay.clone()]),
+            ranked_addresses(std::slice::from_ref(&overlay)),
             vec![Ipv4Addr::new(10, 8, 0, 2)],
             "{name:?} must stay selectable in the settings screen"
         );
