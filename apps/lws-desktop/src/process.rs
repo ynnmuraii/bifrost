@@ -64,4 +64,23 @@ mod tests {
     fn current_process_has_not_exited() {
         assert!(!super::process_has_exited(std::process::id()).unwrap());
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_but_unreaped_child_does_not_block_restart() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !super::process_has_exited(child.id()).unwrap() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the exited child must be recognized before its parent reaps it");
+            }
+            std::thread::yield_now();
+        }
+        child.wait().unwrap();
+    }
 }
