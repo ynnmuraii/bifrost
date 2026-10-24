@@ -297,10 +297,6 @@ pub enum Key {
     TheAddressIsSaved,
     /// «адрес не сохранён ({})»
     TheAddressWasNotSaved,
-    /// «служба запущена не этим окном — остановите её сами»
-    TheServiceWasNotStartedByThisWindowStopItYourself,
-    /// «номер процесса службы неизвестен — остановите её сами»
-    TheServiceSProcessIdIsUnknownStopItYourself,
     /// «Служба перезапускается (pid {pid})»
     TheServiceIsRestartingPidPid,
     /// «Служба останавливается (pid {pid})»
@@ -878,8 +874,6 @@ const fn ru(key: Key) -> &'static str {
         Key::ThisComputerSAddressAddress => "Адрес этого компьютера: {address}",
         Key::TheAddressIsSaved => "Адрес сохранён",
         Key::TheAddressWasNotSaved => "адрес не сохранён ({})",
-        Key::TheServiceWasNotStartedByThisWindowStopItYourself => "служба запущена не этим окном — остановите её сами",
-        Key::TheServiceSProcessIdIsUnknownStopItYourself => "номер процесса службы неизвестен — остановите её сами",
         Key::TheServiceIsRestartingPidPid => "Служба перезапускается (pid {pid})",
         Key::TheServiceIsStoppingPidPid => "Служба останавливается (pid {pid})",
         Key::CouldNotStopTheServiceWhy => "Не удалось остановить службу: {why}",
@@ -1232,8 +1226,6 @@ const fn en(key: Key) -> &'static str {
         Key::ThisComputerSAddressAddress => "This computer's address: {address}",
         Key::TheAddressIsSaved => "The address is saved",
         Key::TheAddressWasNotSaved => "the address was not saved ({})",
-        Key::TheServiceWasNotStartedByThisWindowStopItYourself => "the service was not started by this window — stop it yourself",
-        Key::TheServiceSProcessIdIsUnknownStopItYourself => "the service's process id is unknown — stop it yourself",
         Key::TheServiceIsRestartingPidPid => "The service is restarting (pid {pid})",
         Key::TheServiceIsStoppingPidPid => "The service is stopping (pid {pid})",
         Key::CouldNotStopTheServiceWhy => "Could not stop the service: {why}",
@@ -1793,8 +1785,6 @@ mod tests {
         Key::ThisComputerSAddressAddress,
         Key::TheAddressIsSaved,
         Key::TheAddressWasNotSaved,
-        Key::TheServiceWasNotStartedByThisWindowStopItYourself,
-        Key::TheServiceSProcessIdIsUnknownStopItYourself,
         Key::TheServiceIsRestartingPidPid,
         Key::TheServiceIsStoppingPidPid,
         Key::CouldNotStopTheServiceWhy,

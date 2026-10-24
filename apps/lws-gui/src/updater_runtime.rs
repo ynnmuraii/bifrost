@@ -189,15 +189,22 @@ impl Runtime {
                         }
                     }
                     bridge.view_mut().update = State::Restarting;
-                    let wait = bridge.view().config.paths.as_ref().ok_or_else(|| {
-                        "Cannot wait for core shutdown: settings directories are unknown".to_owned()
-                    }).and_then(|paths| {
-                        crate::core_exit::Wait::new(
-                            paths,
-                            bridge.view().core.as_ref().and_then(|core| core.pid),
-                            now,
-                        )
-                    });
+                    let wait = bridge
+                        .view()
+                        .config
+                        .paths
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "Cannot wait for core shutdown: settings directories are unknown"
+                                .to_owned()
+                        })
+                        .and_then(|paths| {
+                            crate::core_exit::Wait::new(
+                                paths,
+                                bridge.view().core.as_ref().and_then(|core| core.pid),
+                                now,
+                            )
+                        });
                     match wait {
                         Ok(wait) => self.stopping = Some(wait),
                         Err(error) => {
@@ -210,9 +217,7 @@ impl Runtime {
         }
         if let Some(wait) = &self.stopping {
             let step = wait.poll(now);
-            if step == crate::core_exit::Step::Exited
-                && !lws_desktop::tray_is_running()
-            {
+            if step == crate::core_exit::Step::Exited && !lws_desktop::tray_is_running() {
                 self.stopping = None;
                 RESTART.store(true, Ordering::Release);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);

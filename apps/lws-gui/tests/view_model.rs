@@ -1820,8 +1820,14 @@ fn own_core(pid: u32) -> lws_gui::view_model::StartedCore {
 #[test]
 fn a_failed_core_stop_reports_the_short_reason_in_both_languages() {
     for (lang, expected) in [
-        (ui_text::Lang::Ru, "не удалось остановить службу (access denied)"),
-        (ui_text::Lang::En, "could not stop the service (access denied)"),
+        (
+            ui_text::Lang::Ru,
+            "не удалось остановить службу (access denied)",
+        ),
+        (
+            ui_text::Lang::En,
+            "could not stop the service (access denied)",
+        ),
     ] {
         let mut vm = view();
         vm.look.language = lang;
@@ -1829,7 +1835,12 @@ fn a_failed_core_stop_reports_the_short_reason_in_both_languages() {
             since: Instant::now(),
         });
         vm.on_core_stopped(Err("  access denied  \nmore details".to_owned()));
-        let line = vm.settings.service.line.as_ref().expect("the failure reason");
+        let line = vm
+            .settings
+            .service
+            .line
+            .as_ref()
+            .expect("the failure reason");
         assert!(!line.ok);
         assert_eq!(line.text, expected);
         assert_eq!(vm.settings.service.restart, None);
@@ -1837,56 +1848,40 @@ fn a_failed_core_stop_reports_the_short_reason_in_both_languages() {
 }
 
 #[test]
-fn the_restart_follows_the_pid_the_window_holds_and_says_so_when_it_holds_none() {
+fn restart_uses_graceful_ipc_without_requiring_an_owned_pid() {
+    for core in [
+        None,
+        Some(own_core(4242)),
+        Some(lws_gui::view_model::StartedCore {
+            program: std::path::PathBuf::from("bifrost"),
+            pid: None,
+        }),
+    ] {
+        let mut vm = view();
+        let now = Instant::now();
+        vm.core = core;
+        vm.on_connected("endpoint");
+        assert_eq!(vm.begin_restart(now), RestartStep::Stop);
+        assert_eq!(
+            vm.settings.service.restart,
+            Some(Restart::Stopping { since: now })
+        );
+        assert_eq!(vm.begin_restart(now), RestartStep::Refused);
+        assert!(
+            !vm.on_disconnected("the pipe was closed".into()),
+            "link loss alone must not launch a replacement"
+        );
+        assert_eq!(
+            vm.settings.service.restart,
+            Some(Restart::Stopping { since: now })
+        );
+    }
+}
+
+#[test]
+fn completed_restart_updates_the_service_and_saved_address_messages() {
     let mut vm = view();
-    let now = Instant::now();
-
-    // No service of the window's own: the honest sentence, and nothing stopped.
-    assert_eq!(vm.begin_restart(now), RestartStep::Refused);
-    assert_eq!(
-        vm.settings
-            .service
-            .line
-            .as_ref()
-            .map(|line| line.text.as_str()),
-        Some("служба запущена не этим окном — остановите её сами")
-    );
-    assert_eq!(vm.settings.service.restart, None);
-
-    // A pid the platform never gave is the same story: a guess is not a service to stop.
-    vm.core = Some(lws_gui::view_model::StartedCore {
-        program: std::path::PathBuf::from("lws-core.exe"),
-        pid: None,
-    });
-    vm.on_connected("endpoint");
-    assert_eq!(vm.begin_restart(now), RestartStep::Refused);
-    assert_eq!(
-        vm.settings
-            .service
-            .line
-            .as_ref()
-            .map(|line| line.text.as_str()),
-        Some("номер процесса службы неизвестен — остановите её сами")
-    );
-
-    // The service the window started itself: that pid, and no other, is the one to stop.
-    vm.core = Some(own_core(4242));
-    assert_eq!(vm.begin_restart(now), RestartStep::Stop(4242));
-    assert_eq!(
-        vm.settings.service.restart,
-        Some(Restart::Stopping { since: now })
-    );
-    // A second press while the wait is standing does nothing: there is one restart at a time.
-    assert_eq!(vm.begin_restart(now), RestartStep::Refused);
-
-    // And the wait is event-driven: the link dropping is the proof, and it is what makes the
-    // window ask for the fresh core.
-    assert!(vm.on_disconnected("the pipe was closed".to_owned()));
-    assert_eq!(vm.settings.service.restart, Some(Restart::Starting));
-    assert!(
-        !vm.on_disconnected("the pipe was closed".to_owned()),
-        "a link that drops while no restart waits is not a restart"
-    );
+    vm.settings.service.restart = Some(Restart::Starting);
 
     // The fresh core coming up is the end of it: the service line says it, and the address
     // sentence «Применить» was waiting for is the one that is left on screen.
@@ -1903,46 +1898,32 @@ fn the_restart_follows_the_pid_the_window_holds_and_says_so_when_it_holds_none()
 }
 
 #[test]
-fn a_restart_that_does_not_wait_for_a_service_gives_up_in_words() {
+fn restart_deadline_is_owned_by_the_exit_probe_not_a_link_timeout() {
     let mut vm = view();
     let now = Instant::now();
-    vm.core = Some(own_core(4242));
     vm.on_connected("endpoint");
     vm.begin_restart(now);
-
-    vm.tick(now + Duration::from_secs(5));
+    vm.tick(now + SERVICE_STOP_TIMEOUT);
     assert_eq!(
         vm.settings.service.restart,
-        Some(Restart::Stopping { since: now }),
-        "the wait is still standing before its deadline"
+        Some(Restart::Stopping { since: now })
     );
-
-    vm.tick(now + SERVICE_STOP_TIMEOUT);
-    assert_eq!(vm.settings.service.restart, None, "the wait has an end");
-    let line = vm
-        .settings
-        .service
-        .line
-        .as_ref()
-        .expect("the honest sentence");
-    assert!(!line.ok);
-    assert!(
-        line.text.contains("служба не остановилась"),
-        "{:?}",
-        line.text
+    assert_eq!(
+        vm.next_wakeup(now + SERVICE_STOP_TIMEOUT),
+        Some(Duration::from_millis(100))
     );
-    assert!(line.text.contains("остановите её сами"), "{:?}", line.text);
 }
 
 #[test]
-fn a_restart_with_no_link_starts_the_fresh_core_without_waiting() {
+fn a_restart_with_no_link_still_waits_for_process_and_listener_exit() {
     let mut vm = view();
     vm.core = Some(own_core(4242));
-
-    // The window has no link to break, so there is nothing to wait for: the stop would
-    // otherwise cost the user the whole wait for a proof that cannot arrive.
-    assert_eq!(vm.begin_restart(Instant::now()), RestartStep::Start);
-    assert_eq!(vm.settings.service.restart, Some(Restart::Starting));
+    let now = Instant::now();
+    assert_eq!(vm.begin_restart(now), RestartStep::Start);
+    assert_eq!(
+        vm.settings.service.restart,
+        Some(Restart::Stopping { since: now })
+    );
 }
 
 #[cfg(target_os = "linux")]

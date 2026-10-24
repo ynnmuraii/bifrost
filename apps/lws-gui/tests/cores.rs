@@ -1114,6 +1114,8 @@ fn the_window_restarts_its_core_and_applies_a_lan_address() {
         Action::SelectLanAddress(address.to_string()),
         Instant::now(),
     );
+    // An attached window has no owned PID; Apply must still shut down gracefully.
+    bridge.view_mut().core = None;
     bridge.dispatch(Action::ApplyLanAddress, Instant::now());
     let saved =
         config::Config::load(root.join("config/config.toml")).expect("Apply writes a valid config");

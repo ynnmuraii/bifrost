@@ -32,6 +32,16 @@ pub fn process_has_exited(pid: u32) -> io::Result<bool> {
 
 #[cfg(unix)]
 pub fn process_has_exited(pid: u32) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // An unreaped child has exited and released its listeners, though kill(0) succeeds.
+        if stat
+            .rsplit_once(')')
+            .is_some_and(|(_, tail)| matches!(tail.split_whitespace().next(), Some("Z" | "X")))
+        {
+            return Ok(true);
+        }
+    }
     let pid = i32::try_from(pid).map_err(|_| io::Error::other("Invalid process id"))?;
     if pid <= 0 {
         return Err(io::Error::other("Invalid process id"));
