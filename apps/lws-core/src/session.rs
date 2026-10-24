@@ -1210,6 +1210,8 @@ impl Session {
     }
 
     /// Stops the agent before this core exits, releasing capture and forwarded input.
+    /// The GUI connection can close first; GUI/control listeners remain owned until
+    /// session teardown after this await. Restarters must wait for process/listener exit.
     pub(crate) async fn shutdown_agent(&mut self) {
         self.stopping = true;
         self.agent.shutdown().await;
