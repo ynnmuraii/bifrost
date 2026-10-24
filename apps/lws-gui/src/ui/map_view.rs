@@ -10,7 +10,9 @@ use super::field::Frame;
 use super::theme::{fam, font, rgba, Palette};
 use super::widgets::{self, Kind};
 use super::{Env, PaddleDrag, PaddleHandle, UiState, FIELD_FRAME};
-use crate::gui_settings::{LinkStyle, Look, PAN_MAX};
+use crate::gui_settings::{
+    zoom_display_percent, zoom_from_display, LinkStyle, Look, PAN_MAX, ZOOM_MAX, ZOOM_MIN,
+};
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
 use crate::view_model::{Action, ViewModel};
@@ -28,7 +30,7 @@ impl Xf {
         let base = (((rect.width() - 48.0) / STAGE_W as f32)
             .min((rect.height() - 190.0) / STAGE_H as f32))
         .clamp(0.45, 1.0);
-        let s = base * f32::from(zoom_percent.clamp(70, 150)) / 100.0;
+        let s = base * f32::from(zoom_percent.clamp(ZOOM_MIN, ZOOM_MAX)) / 100.0;
         Self {
             origin: rect.center() - Vec2::new(STAGE_W as f32, STAGE_H as f32) * (s / 2.0),
             s,
@@ -152,6 +154,28 @@ pub fn draw(
     }
     let mut hovered: Option<(usize, usize)> = None;
     for (i, node) in model.nodes.iter().enumerate() {
+        let bounds = node_rect(shown[i], node, s);
+        let mut caption_clip = Rect::from_min_max(
+            bounds.left_bottom(),
+            Pos2::new(bounds.right(), rect.bottom()),
+        );
+        for (j, other) in model.nodes.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for mon in &other.mons {
+                let obstacle = monitor_rect(shown[j], mon.rect, s);
+                if obstacle.right() > bounds.left()
+                    && obstacle.left() < bounds.right()
+                    && obstacle.bottom() > bounds.bottom()
+                {
+                    caption_clip.max.y = caption_clip
+                        .max
+                        .y
+                        .min((obstacle.top() - 4.0).max(bounds.bottom()));
+                }
+            }
+        }
         node_ui(
             ui,
             &painter,
@@ -161,6 +185,7 @@ pub fn draw(
             i,
             shown[i],
             xf,
+            caption_clip,
             vm.modal.is_none()
                 && !vm.appearance_open
                 && !paddle_hovered
@@ -305,7 +330,8 @@ fn zoom_controls(
     rect: Rect,
     actions: &mut Vec<Action>,
 ) {
-    let current = vm.look.zoom_percent.clamp(70, 150);
+    let current = vm.look.zoom_percent.clamp(ZOOM_MIN, ZOOM_MAX);
+    let display = zoom_display_percent(current);
     let mut wanted = current;
     let mut controls = ui.new_child(
         UiBuilder::new()
@@ -322,15 +348,15 @@ fn zoom_controls(
         pal,
         "−",
         Kind::Ghost,
-        enabled && current > 70,
+        enabled && current > ZOOM_MIN,
     )
     .clicked()
     {
-        wanted = current.saturating_sub(5).max(70);
+        wanted = zoom_from_display(display - 5.0);
     }
     widgets::text(
         &mut controls,
-        &format!("{current}%"),
+        &format!("{display:.0}%"),
         12.0,
         fam::mono(),
         pal.ink2,
@@ -340,34 +366,38 @@ fn zoom_controls(
         pal,
         "+",
         Kind::Ghost,
-        enabled && current < 150,
+        enabled && current < ZOOM_MAX,
     )
     .clicked()
     {
-        wanted = (current + 5).min(150);
+        wanted = zoom_from_display(display + 5.0);
     }
     if enabled {
-        let wheel = ui.input(|input| {
+        let (wheel, pinch) = ui.input(|input| {
             input
                 .pointer
                 .hover_pos()
                 .filter(|point| rect.contains(*point))
-                .map_or(0.0, |_| {
+                .map_or((0.0, 1.0), |_| {
                     input
                         .raw
                         .events
                         .iter()
-                        .filter_map(|event| match event {
-                            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
-                            _ => None,
+                        .fold((0.0, 1.0), |(wheel, pinch), event| match event {
+                            egui::Event::MouseWheel { delta, .. } => (wheel + delta.y, pinch),
+                            egui::Event::Zoom(factor) => (wheel, pinch * factor),
+                            _ => (wheel, pinch),
                         })
-                        .sum::<f32>()
                 })
         });
-        if wheel > 0.0 {
-            wanted = (current + 5).min(150);
+        if (pinch - 1.0).abs() > f32::EPSILON {
+            wanted = (f32::from(current) * pinch)
+                .round()
+                .clamp(f32::from(ZOOM_MIN), f32::from(ZOOM_MAX)) as u16;
+        } else if wheel > 0.0 {
+            wanted = zoom_from_display(display + 5.0);
         } else if wheel < 0.0 {
-            wanted = current.saturating_sub(5).max(70);
+            wanted = zoom_from_display(display - 5.0);
         }
     }
     if wanted != current {
@@ -717,6 +747,7 @@ fn node_ui(
     index: usize,
     at: Pos2,
     xf: Xf,
+    caption_clip: Rect,
     enabled: bool,
     hovered: &mut Option<(usize, usize)>,
     actions: &mut Vec<Action>,
@@ -724,6 +755,9 @@ fn node_ui(
     let s = xf.s;
     let fs = s.clamp(0.8, 1.0);
     let k = if node.online { 1.0 } else { 0.62 };
+    // Use the fitted on-screen scale: small windows need the same decluttering as zooming out.
+    let identifiers = ((s - 0.4) / 0.1).clamp(0.0, 1.0);
+    let details = ((s - 0.75) / 0.15).clamp(0.0, 1.0);
     let system_hot = enabled
         && (ui
             .input(|i| i.pointer.hover_pos())
@@ -850,10 +884,14 @@ fn node_ui(
         }
 
         // Contents: number and tag on the first row, resolution at the bottom.
-        let clipped = painter.with_clip_rect(rect);
-        let num = clipped.layout_no_wrap(mon.num.clone(), font(10.5 * fs, fam::mono()), pal.ink);
-        clipped.galley(rect.min + Vec2::new(9.0 * fs, 7.0 * fs), num, pal.ink);
-        if !mon.tag.is_empty() {
+        let clipped = painter.with_clip_rect(rect.shrink(2.0));
+        let mut numbers = clipped.clone();
+        numbers.multiply_opacity(((s - 0.3) / 0.1).clamp(0.0, 1.0));
+        let num = numbers.layout_no_wrap(mon.num.clone(), font(10.5 * fs, fam::mono()), pal.ink);
+        numbers.galley(rect.min + Vec2::new(9.0 * fs, 7.0 * fs), num, pal.ink);
+        let mut clipped = clipped;
+        clipped.multiply_opacity(details);
+        if details > 0.0 && !mon.tag.is_empty() {
             let (ink, edge, fill) = if node.target {
                 (pal.accent_ink, pal.accent, pal.accent_soft)
             } else {
@@ -874,15 +912,32 @@ fn node_ui(
             );
             clipped.galley(tag_rect.min + Vec2::new(7.0 * fs, 1.0), tag, ink);
         }
-        let res = clipped.layout_no_wrap(mon.res.clone(), font(10.5 * fs, fam::mono()), pal.ink);
-        clipped.galley(
-            Pos2::new(rect.min.x + 9.0 * fs, rect.max.y - 7.0 * fs - res.size().y),
-            res,
-            pal.ink,
-        );
+        if details > 0.0 {
+            let res =
+                clipped.layout_no_wrap(mon.res.clone(), font(10.5 * fs, fam::mono()), pal.ink);
+            clipped.galley(
+                Pos2::new(rect.min.x + 9.0 * fs, rect.max.y - 7.0 * fs - res.size().y),
+                res,
+                pal.ink,
+            );
+        }
     }
 
     // The caption: name, system line, who has the keyboard.
+    if identifiers <= 0.0 {
+        return;
+    }
+    // A long hostname/subtitle must not extend into a neighbouring computer's caption.
+    let caption_rect = Rect::from_min_size(
+        Pos2::new(at.x, at.y + node.h as f32 * s),
+        Vec2::new(node.w as f32 * s, 70.0 * fs),
+    );
+    let mut painter = painter.with_clip_rect(
+        caption_rect
+            .intersect(caption_clip)
+            .intersect(painter.clip_rect()),
+    );
+    painter.multiply_opacity(identifiers);
     let top = at.y + node.h as f32 * s + 10.0 * fs;
     let name = painter.layout_no_wrap(
         node.name.clone(),
@@ -898,6 +953,10 @@ fn node_ui(
     );
     painter.galley(Pos2::new(at.x + 12.0 * fs, y), name, pal.ink);
     y += h + 1.0;
+    if details <= 0.0 {
+        return;
+    }
+    painter.multiply_opacity(details);
     for (text, color, family) in [
         (node.os.as_str(), pal.ink2, fam::mono()),
         (
@@ -1169,6 +1228,7 @@ mod transform_tests {
                             0,
                             at,
                             xf,
+                            map,
                             true,
                             &mut hovered,
                             &mut actions,
@@ -1425,7 +1485,7 @@ mod transform_tests {
     fn zoomed_drag_deltas_round_trip_without_changing_stage_coordinates() {
         for size in [Vec2::new(1200.0, 520.0), Vec2::new(900.0, 360.0)] {
             let rect = Rect::from_min_size(Pos2::new(40.0, 70.0), size);
-            for zoom in [70, 100, 125, 150] {
+            for zoom in [70, 100, 125, 150, 300] {
                 let xf = Xf::new(rect, zoom);
                 let from = xf.p(120.0, -20.0);
                 let to = xf.p(215.0, 140.0);

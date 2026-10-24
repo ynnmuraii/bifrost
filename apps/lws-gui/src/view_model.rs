@@ -75,7 +75,7 @@ const INFLIGHT_LIMIT: usize = 32;
 
 // ---------------------------------------------------------------- small types
 
-/// A window over the map: the five sections of the rail.
+/// A window over the map: the rail's service sections and Appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modal {
     /// «Пары».
@@ -88,10 +88,12 @@ pub enum Modal {
     Diag,
     /// «Настройки».
     Settings,
+    /// «Внешний вид», rendered from the appearance rail's open flag.
+    Appearance,
 }
 
 impl Modal {
-    /// Every section, in the order of the rail.
+    /// The five service sections, in rail order; Appearance uses its dedicated open flag.
     pub const ALL: [Modal; 5] = [
         Modal::Pairs,
         Modal::Keys,
@@ -108,6 +110,7 @@ impl Modal {
             Modal::Clip => "03",
             Modal::Diag => "04",
             Modal::Settings => "05",
+            Modal::Appearance => "06",
         }
     }
 
@@ -119,6 +122,7 @@ impl Modal {
             Modal::Clip => text(lang, Key::Clipboard),
             Modal::Diag => text(lang, Key::Diagnostics),
             Modal::Settings => text(lang, Key::Settings),
+            Modal::Appearance => text(lang, Key::Appearance2),
         }
     }
 
@@ -130,6 +134,7 @@ impl Modal {
             Modal::Clip => "bifrost clip",
             Modal::Diag => "bifrost diag",
             Modal::Settings => "bifrost config",
+            Modal::Appearance => "bifrost theme",
         }
     }
 
@@ -141,6 +146,7 @@ impl Modal {
             Modal::Clip => text(lang, Key::CopyHerePasteThere),
             Modal::Diag => text(lang, Key::AReportForTroubleshooting),
             Modal::Settings => text(lang, Key::AddressAndService),
+            Modal::Appearance => text(lang, Key::ThemeAndBackground),
         }
     }
 }
@@ -844,7 +850,7 @@ pub struct ViewModel {
     pub clipboard_history: Vec<ipc::ClipboardHistoryEntry>,
     /// The last finished operation, shown as a toast until [`TOAST_FOR`] runs out.
     pub outcome: Option<Outcome>,
-    /// The appearance panel at the right edge is open.
+    /// The shared Appearance modal is open; `modal` is empty while this flag is set.
     pub appearance_open: bool,
     /// A quiet note on the map.
     pub flash: Option<Flash>,
@@ -2110,6 +2116,7 @@ impl ViewModel {
     /// typing, where they dragged a rectangle.
     pub fn local(&mut self, action: &Action) {
         match action {
+            Action::ToggleModal(Modal::Appearance) => self.local(&Action::ToggleAppearance),
             Action::ToggleModal(modal) => {
                 self.modal = if self.modal == Some(*modal) {
                     None
@@ -2128,12 +2135,12 @@ impl ViewModel {
                 self.appearance_open = !self.appearance_open;
                 self.modal = None;
             }
-            Action::CloseAppearance => self.appearance_open = false,
             Action::ToggleDock => self.look.dock_open = !self.look.dock_open,
             // «Открыть окно сопряжения»: the window of the rail closes and the dock, which
             // shows the address and the code, is brought out if it was folded.
             Action::StartPairing { .. } => {
                 self.modal = None;
+                self.appearance_open = false;
                 self.look.dock_open = true;
             }
             Action::SetClipboard(enabled) => self.settings.clipboard_pending = Some(*enabled),
@@ -2163,6 +2170,7 @@ impl ViewModel {
             Action::CancelDrag => self.restore_placement(),
             Action::CloseModal => {
                 self.modal = None;
+                self.appearance_open = false;
                 self.settings.revoke = None;
             }
             Action::SetLook(look) => self.look = *look,
@@ -2381,8 +2389,6 @@ pub enum Action {
     HoldToast(bool),
     /// Open or close the appearance panel.
     ToggleAppearance,
-    /// Close the appearance panel.
-    CloseAppearance,
     /// Slide the pairing dock in or out.
     ToggleDock,
     /// A computer drag ended: save the layout it made.

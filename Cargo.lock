@@ -500,7 +500,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bifrost"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "config",
  "ipc",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "clipboard"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ring",
 ]
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "geometry",
  "libc",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "edgefx"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "eframe"
@@ -1351,7 +1351,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "focus-router"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "geometry",
  "input-model",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "geometry"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "gethostname"
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "config",
  "geometry",
@@ -1892,11 +1892,11 @@ dependencies = [
 
 [[package]]
 name = "input-model"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "ipc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "config",
  "libc",
@@ -2167,7 +2167,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "logging"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "lws-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "lws-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clipboard",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "lws-desktop"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "lws-gui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "config",
  "eframe",
@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "lws-tray"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "config",
  "ipc",
@@ -3113,7 +3113,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform-probe"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "x11rb 0.14.0",
  "zbus",
@@ -3121,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "platform-wayland"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ashpd",
  "clipboard",
@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "platform-win"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clipboard",
  "edgefx",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "platform-x11"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clipboard",
  "input-model",
@@ -3353,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "prost",
  "prost-build",
@@ -4415,7 +4415,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clipboard",
  "focus-router",
@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "ui-text"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "toml 1.1.8+spec-1.1.0",

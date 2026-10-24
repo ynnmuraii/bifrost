@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 — 2026-10-24
+
+- Extended physical monitor-map zoom to 3×, shown on a remapped 50–200% control with the default view at 100%; existing saved views keep their scale.
+- Map labels fade out secondary details and then names as zoom decreases, keeping small layouts uncluttered.
+- Appearance now uses the shared settings modal, with consistent rows and controls in both languages and themes.
+- Theme changes sweep across the window in a short, reversible ASCII-cell wave from the top-right theme button.
+
 ## 0.1.4 — 2026-10-21
 
 - Added verified self-updates. Install this version manually once: 0.1.3 has no updater. Later versions can be installed from Settings or the startup update notice.

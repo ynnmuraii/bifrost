@@ -792,6 +792,27 @@ fn shortcut_changes_wait_for_authoritative_registration_feedback() {
 }
 
 #[test]
+fn appearance_and_other_modals_are_mutually_exclusive_and_share_close() {
+    let mut vm = view();
+    vm.local(&Action::ToggleModal(Modal::Settings));
+    vm.local(&Action::ToggleAppearance);
+    assert!(vm.appearance_open);
+    assert_eq!(vm.modal, None);
+    vm.local(&Action::CloseModal);
+    assert!(!vm.appearance_open);
+    vm.local(&Action::ToggleModal(Modal::Appearance));
+    assert!(vm.appearance_open);
+    assert_eq!(vm.modal, None);
+    vm.local(&Action::ToggleModal(Modal::Settings));
+    assert!(!vm.appearance_open);
+    assert_eq!(vm.modal, Some(Modal::Settings));
+    vm.local(&Action::ToggleAppearance);
+    vm.local(&Action::ToggleAppearance);
+    assert!(!vm.appearance_open);
+    assert_eq!(vm.modal, None);
+}
+
+#[test]
 fn appearance_toggles_send_both_values_and_follow_authoritative_status() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("LOCAL"))));
