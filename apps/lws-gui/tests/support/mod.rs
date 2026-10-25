@@ -71,6 +71,7 @@ pub fn status_with(focus: &str) -> ipc::Status {
                     config::HotkeyAction::SwitchNext => 2,
                     config::HotkeyAction::ReturnLocal => 3,
                     config::HotkeyAction::ClaimOwnership => 4,
+                    config::HotkeyAction::GameGuardToggle => 5,
                 },
                 chord: chord.to_owned(),
                 available: true,
@@ -93,6 +94,12 @@ pub fn status_with(focus: &str) -> ipc::Status {
         allow_remote_update: true,
         update_nodes: Vec::new(),
         update_notice: String::new(),
+        game_guard_signals: None,
+        game_guard_mode: "auto".into(),
+        game_guard_reason: String::new(),
+        game_guard_last_app: String::new(),
+        game_guard_block_apps: Vec::new(),
+        game_guard_allow_apps: Vec::new(),
         members: vec![
             ipc::MemberStatus {
                 app_version: String::new(),

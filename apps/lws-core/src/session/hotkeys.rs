@@ -16,6 +16,7 @@ pub(crate) fn bindings(config: &config::HotkeyBindings) -> Vec<ipc::HotkeyBindin
                 config::HotkeyAction::SwitchNext => ipc::HotkeyAction::SwitchNext,
                 config::HotkeyAction::ReturnLocal => ipc::HotkeyAction::ReturnLocal,
                 config::HotkeyAction::ClaimOwnership => ipc::HotkeyAction::ClaimOwnership,
+                config::HotkeyAction::GameGuardToggle => ipc::HotkeyAction::GameGuardToggle,
             } as i32,
             chord: chord.to_owned(),
             available: false,
@@ -74,6 +75,7 @@ impl Session {
                 Ok(ipc::HotkeyAction::SwitchNext) => config::HotkeyAction::SwitchNext,
                 Ok(ipc::HotkeyAction::ReturnLocal) => config::HotkeyAction::ReturnLocal,
                 Ok(ipc::HotkeyAction::ClaimOwnership) => config::HotkeyAction::ClaimOwnership,
+                Ok(ipc::HotkeyAction::GameGuardToggle) => config::HotkeyAction::GameGuardToggle,
                 _ => {
                     self.hotkey_answer(request, false, "Unknown hotkey action")
                         .await;
@@ -200,6 +202,19 @@ impl Session {
 
     pub(super) async fn dispatch_hotkey(&mut self, action: i32) {
         match ipc::HotkeyAction::try_from(action) {
+            Ok(ipc::HotkeyAction::GameGuardToggle) => {
+                let mode = if self.game_guard.mode == config::game_guard::Mode::Always {
+                    "auto"
+                } else {
+                    "always"
+                };
+                self.set_game_guard(ipc::SetGameGuard {
+                    mode: mode.to_owned(),
+                    block_apps: self.game_guard.block_apps.clone(),
+                    allow_apps: self.game_guard.allow_apps.clone(),
+                })
+                .await;
+            }
             Ok(ipc::HotkeyAction::ClaimOwnership) => {
                 self.claim().await;
             }

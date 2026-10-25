@@ -1,6 +1,49 @@
 use protocol::{ipc, validate, wire, *};
 
 #[test]
+fn game_guard_ipc_round_trip_and_append_only_tags() {
+    use prost::Message;
+    let signals = ipc::GameGuardSignals {
+        available: true,
+        fullscreen: true,
+        cursor_confined: true,
+        presentation: true,
+        app: "game.exe".into(),
+    };
+    let frame = ipc::AgentFrame {
+        msg: Some(ipc::agent_frame::Msg::GameGuardSignals(signals.clone())),
+        ..Default::default()
+    };
+    assert_eq!(&frame.encode_to_vec()[..2], &[0xd2, 0x03]);
+    round_trip(Channel::Ipc, frame);
+    round_trip(Channel::Ipc, signals.clone());
+    let set = ipc::SetGameGuard {
+        mode: "auto".into(),
+        block_apps: vec!["game.exe".into()],
+        allow_apps: vec!["player.exe".into()],
+    };
+    let frame = ipc::GuiFrame {
+        msg: Some(ipc::gui_frame::Msg::SetGameGuard(set)),
+        ..Default::default()
+    };
+    assert_eq!(&frame.encode_to_vec()[..2], &[0x8a, 0x03]);
+    round_trip(Channel::Ipc, frame);
+    round_trip(
+        Channel::Ipc,
+        ipc::Status {
+            game_guard_signals: Some(signals),
+            game_guard_reason: "fullscreen".into(),
+            game_guard_mode: "auto".into(),
+            game_guard_last_app: "game.exe".into(),
+            game_guard_block_apps: vec!["game.exe".into()],
+            game_guard_allow_apps: vec![],
+            ..Default::default()
+        },
+    );
+    assert_eq!(ipc::HotkeyAction::GameGuardToggle as i32, 5);
+}
+
+#[test]
 fn discovery_ipc_fields_use_append_only_numbers() {
     use prost::Message;
 

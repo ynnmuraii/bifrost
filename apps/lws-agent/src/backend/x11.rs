@@ -149,7 +149,7 @@ impl X11 {
                 let mut capture =
                     X11Capture::new(CaptureKind::Observe).map_err(|error| error.to_string())?;
                 capture
-                    .set_hotkeys([None; 4])
+                    .set_hotkeys([None; 5])
                     .map_err(|error| error.to_string())?;
                 capture
             }),
@@ -169,6 +169,7 @@ impl X11 {
             switch_next: String::new(),
             return_local: String::new(),
             claim_ownership: String::new(),
+            game_guard_toggle: String::new(),
         })?;
         Ok(backend)
     }
@@ -182,7 +183,7 @@ impl X11 {
             .capture
             .as_mut()
             .ok_or("X11 hotkey connection unavailable")?;
-        let mut compiled = [None; 4];
+        let mut compiled = [None; 5];
         for (index, (_, chord)) in bindings.iter().enumerate() {
             if chord.is_empty() {
                 continue;
@@ -554,6 +555,7 @@ fn hotkey_event(action: u8) -> Event {
         1 => config::HotkeyAction::SwitchNext,
         2 => config::HotkeyAction::ReturnLocal,
         3 => config::HotkeyAction::ClaimOwnership,
+        4 => config::HotkeyAction::GameGuardToggle,
         _ => config::HotkeyAction::EmergencyRelease,
     })
 }

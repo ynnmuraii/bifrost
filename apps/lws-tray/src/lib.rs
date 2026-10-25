@@ -187,6 +187,11 @@ async fn worker(
                                 let allowed = state.borrow().items().iter().any(|item| item.action == Some(Action::Switch(peer.clone())));
                                 allowed.then_some(Msg::SwitchTo(wire::SwitchTo { peer }))
                             }
+                            Some(Action::GameGuardToggle) => state.borrow().status.as_ref().map(|status| Msg::SetGameGuard(wire::SetGameGuard {
+                                mode: if status.game_guard_mode == "always" { "auto" } else { "always" }.to_owned(),
+                                block_apps: status.game_guard_block_apps.clone(),
+                                allow_apps: status.game_guard_allow_apps.clone(),
+                            })),
                             other => { if offline_action(other, &flags) { return; } None }
                         };
                         if let Some(msg) = msg { id += 1; failed = link.send(id, msg).await.is_err(); }

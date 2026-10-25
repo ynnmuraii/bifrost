@@ -96,6 +96,7 @@ pub fn wire_hotkey_action(action: config::HotkeyAction) -> ipc::HotkeyAction {
         config::HotkeyAction::SwitchNext => ipc::HotkeyAction::SwitchNext,
         config::HotkeyAction::ReturnLocal => ipc::HotkeyAction::ReturnLocal,
         config::HotkeyAction::ClaimOwnership => ipc::HotkeyAction::ClaimOwnership,
+        config::HotkeyAction::GameGuardToggle => ipc::HotkeyAction::GameGuardToggle,
     }
 }
 
@@ -103,13 +104,14 @@ pub fn hotkeys_from_wire(
     bindings: &[ipc::HotkeyBinding],
 ) -> Result<config::HotkeyBindings, String> {
     let mut parsed = config::HotkeyBindings::default();
-    let mut seen = [false; 4];
+    let mut seen = [false; 5];
     for binding in bindings {
         let (index, action) = match ipc::HotkeyAction::try_from(binding.action) {
             Ok(ipc::HotkeyAction::EmergencyRelease) => (0, config::HotkeyAction::EmergencyRelease),
             Ok(ipc::HotkeyAction::SwitchNext) => (1, config::HotkeyAction::SwitchNext),
             Ok(ipc::HotkeyAction::ReturnLocal) => (2, config::HotkeyAction::ReturnLocal),
             Ok(ipc::HotkeyAction::ClaimOwnership) => (3, config::HotkeyAction::ClaimOwnership),
+            Ok(ipc::HotkeyAction::GameGuardToggle) => (4, config::HotkeyAction::GameGuardToggle),
             _ => return Err("unknown hotkey action".to_owned()),
         };
         if std::mem::replace(&mut seen[index], true) {
@@ -118,7 +120,7 @@ pub fn hotkeys_from_wire(
         parsed.set(action, binding.chord.clone());
     }
     if seen.iter().any(|present| !present) {
-        return Err("hotkey update must contain all four actions".to_owned());
+        return Err("hotkey update must contain all five actions".to_owned());
     }
     parsed.validate().map_err(|error| error.to_string())?;
     Ok(parsed)
@@ -1402,6 +1404,7 @@ impl Backend {
                                 "2" => Some(config::HotkeyAction::SwitchNext),
                                 "3" => Some(config::HotkeyAction::ReturnLocal),
                                 "4" => Some(config::HotkeyAction::ClaimOwnership),
+                                "5" => Some(config::HotkeyAction::GameGuardToggle),
                                 _ => None,
                             };
                             if let Some(action) = action {

@@ -26,6 +26,7 @@ mod backend;
 mod clipboard_wire;
 mod displays;
 mod events;
+mod game_guard;
 mod launch;
 pub mod netguard;
 mod repeat;

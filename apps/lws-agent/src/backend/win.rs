@@ -183,7 +183,7 @@ impl Win {
     }
 
     pub fn set_hotkeys(&mut self, bindings: &config::HotkeyBindings) -> Result<(), String> {
-        let mut combinations = [None; 4];
+        let mut combinations = [None; 5];
         let mut super_bits = 0;
         for (index, (_, text)) in bindings.iter().enumerate() {
             if text.is_empty() {
@@ -199,7 +199,7 @@ impl Win {
                 shift: chord.modifiers().contains(&config::Modifier::Shift),
             });
             if chord.modifiers().contains(&config::Modifier::Super) {
-                super_bits |= 1u64 << (index * 16 + 11);
+                super_bits |= 1u64 << (index * 12 + 11);
             }
         }
         self.capture
@@ -477,7 +477,7 @@ impl Win {
                 };
                 match Capture::start(config) {
                     Ok(capture) => {
-                        capture.set_hotkeys(platform_win::event::Hotkeys::new([None; 4]));
+                        capture.set_hotkeys(platform_win::event::Hotkeys::new([None; 5]));
                         tracing::info!(
                             threshold_px = plan.threshold_px,
                             "receiver takeover detector armed (observe-only hooks)"
@@ -784,6 +784,7 @@ fn hotkey_event(action: u8) -> Event {
         1 => config::HotkeyAction::SwitchNext,
         2 => config::HotkeyAction::ReturnLocal,
         3 => config::HotkeyAction::ClaimOwnership,
+        4 => config::HotkeyAction::GameGuardToggle,
         _ => config::HotkeyAction::EmergencyRelease,
     })
 }

@@ -477,6 +477,10 @@ pub struct Session {
     appearance: config::AppearanceConfig,
     appearance_path: Option<std::path::PathBuf>,
     hotkeys: config::HotkeyBindings,
+    game_guard: config::game_guard::GameGuardConfig,
+    game_guard_signals: protocol::ipc::GameGuardSignals,
+    game_guard_last_app: String,
+    game_guard_logged: bool,
     hotkey_status: Vec<protocol::ipc::HotkeyBinding>,
     hotkey_pending: Option<hotkeys::Pending>,
     hotkey_queue: std::collections::VecDeque<crate::gui::Request>,
@@ -714,6 +718,10 @@ impl Session {
             appearance: config::AppearanceConfig::default(),
             appearance_path: None,
             hotkeys: config::HotkeyBindings::default(),
+            game_guard: config::game_guard::GameGuardConfig::default(),
+            game_guard_signals: protocol::ipc::GameGuardSignals::default(),
+            game_guard_last_app: String::new(),
+            game_guard_logged: false,
             hotkey_status: Vec::new(),
             hotkey_pending: None,
             hotkey_queue: std::collections::VecDeque::new(),
@@ -1023,6 +1031,23 @@ impl Session {
         };
         let expected = self.layout_state.applied();
         self.layout_edit_document(text, expected, source).await
+    }
+
+    pub fn set_game_guard_source(&mut self, policy: config::game_guard::GameGuardConfig) {
+        self.game_guard = policy;
+    }
+
+    fn suppress_guarded_edge(&mut self) -> bool {
+        let Some(reason) = self.game_guard.reason(&self.game_guard_signals) else {
+            self.game_guard_logged = false;
+            return false;
+        };
+        tracing::debug!(reason, "game guard suppressed edge push");
+        if !self.game_guard_logged {
+            tracing::info!(reason, "game guard suppressed edge push");
+            self.game_guard_logged = true;
+        }
+        true
     }
 
     /// Seeds `[appearance]` and the config path `SetAppearance` saves to (the GUI never
@@ -2913,6 +2938,23 @@ impl Session {
                 self.dispatch_hotkey(pressed.action).await;
                 return Ok(());
             }
+            Msg::GameGuardSignals(signals) => {
+                let old_reason = self.game_guard.reason(&self.game_guard_signals);
+                let new_reason = self.game_guard.reason(signals);
+                if old_reason != new_reason {
+                    tracing::info!(
+                        active = new_reason.is_some(),
+                        reason = new_reason.unwrap_or("none"),
+                        "game guard state"
+                    );
+                    self.game_guard_logged = false;
+                }
+                self.game_guard_signals = signals.clone();
+                if !signals.app.is_empty() {
+                    self.game_guard_last_app = signals.app.clone();
+                }
+                return Ok(());
+            }
             _ => {}
         }
         match (&message, self.router.lease().receiver()) {
@@ -3235,6 +3277,14 @@ impl Session {
         if self.router.is_owner() && self.router.focus() != fr::FocusState::Local {
             return;
         }
+        if self.router.focus() == fr::FocusState::Local && self.suppress_guarded_edge() {
+            self.release_portal_capture(protocol::ipc::EndCapture {
+                lease_id: Vec::new(),
+                replay_buffered_locally: true,
+            })
+            .await;
+            return;
+        }
         match portal_activation_plan(
             self.topology.as_ref(),
             &self.node_id,
@@ -3466,6 +3516,9 @@ impl Session {
         let Some(transition) = step else {
             return;
         };
+        if self.suppress_guarded_edge() {
+            return;
+        }
         if self.edge_guard.as_mut().is_some_and(|guard| {
             guard.blocks_crossing(position, transition.source.edge, pushing, now)
         }) {
@@ -3722,6 +3775,8 @@ impl Session {
                 tracing::warn!(%error, "an agent frame from the tail could not be handled");
             }
         }
+        self.game_guard_signals = protocol::ipc::GameGuardSignals::default();
+        self.game_guard_logged = false;
         self.agent_lost_reported = true;
         self.agent.stop().await;
         self.feed(fr::Input::Agent(fr::AgentEvent::AgentLost)).await;
@@ -4276,7 +4331,7 @@ impl Session {
         // The same pair the GUI's `Status` carries, so a fault-injection run can read live
         // latency with one control verb instead of a screenshot.
         let rtt = self.link_rtt(&self.manager.members().await).await;
-        ctl::status_line(&ctl::StatusInput {
+        let status = ctl::status_line(&ctl::StatusInput {
             focus: focus.as_str(),
             role: if self.router.is_owner() {
                 "owner"
@@ -4298,7 +4353,18 @@ impl Session {
                 disabled.as_str()
             },
             rtt: rtt.is_known().then_some((rtt.p95_us, rtt.jitter_us)),
-        })
+        });
+        let reason = if focus == fr::FocusState::Local {
+            self.game_guard
+                .reason(&self.game_guard_signals)
+                .unwrap_or("none")
+        } else {
+            "none"
+        };
+        format!(
+            "{status} game_guard={} game_guard_reason={reason}",
+            reason != "none"
+        )
     }
 }
 
@@ -5073,5 +5139,69 @@ mod display_report_tests {
         // A newer revision wins, and the first report of a peer is always taken.
         assert!(display_report_supersedes(Some(&stale), 2, &fresh));
         assert!(display_report_supersedes(None, 1, &fresh));
+    }
+}
+
+#[cfg(test)]
+mod game_guard_tests {
+    use super::*;
+
+    #[test]
+    fn suppressed_edge_stays_idle_explicit_switch_prepares_and_emergency_releases() {
+        let node = NodeId::new([1; 32]);
+        let peer = NodeId::new([2; 32]);
+        let caps = fr::Capabilities {
+            capture: true,
+            inject: true,
+            absolute_pointer: true,
+            emergency_hotkey: true,
+        };
+        let mut router = fr::FocusRouter::new(
+            node,
+            fr::Timing::default(),
+            fr::SequentialIds::default(),
+            caps,
+        )
+        .with_persisted_ownership(1, Some((1, node)));
+        router.handle(
+            0,
+            fr::Input::Hello {
+                peer,
+                hello: fr::PeerHello {
+                    can_own: true,
+                    capabilities: caps,
+                    owner_serial: 1,
+                    owner: Some(node),
+                },
+            },
+        );
+        let policy = config::game_guard::GameGuardConfig::default();
+        let signals = protocol::ipc::GameGuardSignals {
+            available: true,
+            fullscreen: true,
+            ..Default::default()
+        };
+        for trigger in [fr::SwitchTrigger::Edge, fr::SwitchTrigger::Hotkey] {
+            if !policy.suppress(&signals, trigger == fr::SwitchTrigger::Edge) {
+                router.handle(
+                    1,
+                    fr::Input::Local(fr::LocalInput::SwitchRequest {
+                        trigger,
+                        target: peer,
+                        entry_position: geometry::Position::new("remote", 2.0, 300.0),
+                        topology_revision: 0,
+                    }),
+                );
+            }
+            if trigger == fr::SwitchTrigger::Edge {
+                assert!(matches!(router.lease(), fr::LeaseSlot::Idle));
+                assert_eq!(router.focus(), fr::FocusState::Local);
+            } else {
+                assert_eq!(router.focus(), fr::FocusState::Preparing);
+            }
+        }
+        router.handle(2, fr::Input::Local(fr::LocalInput::Emergency));
+        assert_eq!(router.focus(), fr::FocusState::Local);
+        assert!(matches!(router.lease(), fr::LeaseSlot::Idle));
     }
 }

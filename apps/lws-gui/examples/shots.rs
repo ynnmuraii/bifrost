@@ -56,6 +56,41 @@ fn main() -> std::process::ExitCode {
             .map(|pair| pair[1].clone())
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    if args.iter().any(|arg| arg == "--game-guard") {
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+        for (theme, theme_tag) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
+            for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+                for (state, modal) in [("map", None), ("settings", Some(Modal::Settings))] {
+                    let mut view = mockup(theme, modal, lang);
+                    if let Some(status) = &mut view.status {
+                        status.focus = "LOCAL".into();
+                        status.local_node_id = WORKSTATION.to_owned();
+                        status.game_guard_mode = "auto".into();
+                        status.game_guard_reason = "fullscreen".into();
+                        status.game_guard_last_app = "example-game.exe".into();
+                        status.game_guard_block_apps = vec!["example-game.exe".into()];
+                        status.game_guard_allow_apps = vec!["example-player.exe".into()];
+                        status.game_guard_signals = Some(ipc::GameGuardSignals {
+                            available: true,
+                            fullscreen: true,
+                            app: "example-game.exe".into(),
+                            ..Default::default()
+                        });
+                    }
+                    let file = dir.join(format!("game-guard-{state}-{lang_tag}-{theme_tag}.png"));
+                    if let Err(error) = shoot(view, &file, [1745, 1091], false) {
+                        eprintln!("{error}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    println!("{}", file.display());
+                }
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
     if args.iter().any(|arg| arg == "--discovery") {
         return discovery_shots(&dir);
     }

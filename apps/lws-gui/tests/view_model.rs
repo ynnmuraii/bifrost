@@ -23,6 +23,51 @@ use support::{
 };
 
 #[test]
+fn game_guard_pill_is_local_and_shows_the_reason_in_both_languages() {
+    let mut vm = view();
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(1))));
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        vm.look.language = lang;
+        for reason in [
+            "fullscreen",
+            "cursor_confined",
+            "presentation",
+            "app_list",
+            "always",
+            "",
+        ] {
+            let mut status = status_with("LOCAL");
+            status.game_guard_reason = reason.into();
+            status.game_guard_mode = "auto".into();
+            vm.apply(event(Msg::Status(status)));
+            let map = vm.map_model();
+            let local = map
+                .nodes
+                .iter()
+                .find(|node| node.node_id == SELF_NODE)
+                .expect("local node");
+            assert_eq!(
+                local.game_guard_badge,
+                ui_text::game_guard_state(lang, reason)
+            );
+            assert!(map
+                .nodes
+                .iter()
+                .filter(|node| node.node_id != SELF_NODE)
+                .all(|node| node.game_guard_badge.is_empty()));
+        }
+    }
+    let set = protocol::ipc::SetGameGuard {
+        mode: "always".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        Action::SetGameGuard(set).wire(),
+        Some((Request::SetGameGuard, Msg::SetGameGuard(_)))
+    ));
+}
+
+#[test]
 fn coordinator_heartbeat_never_overwrites_user_feedback_or_logs() {
     let mut vm = view();
     let id = vm.begin_request(Request::UpdateAll, Instant::now());

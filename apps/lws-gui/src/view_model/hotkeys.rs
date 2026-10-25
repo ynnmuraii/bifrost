@@ -5,11 +5,12 @@ use protocol::ipc;
 use ui_text::{text, Key as TextKey, Lang};
 
 /// Stable wire action, catalogue label, and default chord, in display order.
-pub const ROWS: [(i32, TextKey, &str); 4] = [
+pub const ROWS: [(i32, TextKey, &str); 5] = [
     (1, TextKey::Emergency, "Ctrl+Alt+Shift+F12"),
     (2, TextKey::NextComputer, "Ctrl+Alt+Shift+Right"),
     (3, TextKey::ReturnHere, "Ctrl+Alt+Shift+Left"),
     (4, TextKey::ClaimOwnership, "Ctrl+Alt+Shift+Home"),
+    (5, TextKey::GameMode, "Ctrl+Alt+Shift+G"),
 ];
 
 /// Capture state survives repainting, but never writes a local config file.
@@ -104,6 +105,7 @@ fn config_action(action: i32) -> Option<config::HotkeyAction> {
         2 => Some(config::HotkeyAction::SwitchNext),
         3 => Some(config::HotkeyAction::ReturnLocal),
         4 => Some(config::HotkeyAction::ClaimOwnership),
+        5 => Some(config::HotkeyAction::GameGuardToggle),
         _ => None,
     }
 }

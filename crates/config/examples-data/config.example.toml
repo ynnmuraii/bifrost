@@ -58,6 +58,12 @@ emergency_release = "Ctrl+Alt+Shift+F12"
 switch_next = "Ctrl+Alt+Shift+Right"
 return_local = "Ctrl+Alt+Shift+Left"
 claim_ownership = "Ctrl+Alt+Shift+Home"
+game_guard_toggle = "Ctrl+Alt+Shift+G"
+
+[game_guard]
+mode = "auto"                       # auto | always | off; Wayland: ручной always/off
+block_apps = []                      # до 64 exe basename/WM_CLASS, до 128 bytes, без путей
+allow_apps = []                      # приоритет над block_apps в auto
 
 [clipboard]
 enabled = false                      # opt-in на обеих сторонах; на Wayland доступен только пока жива портальная сессия

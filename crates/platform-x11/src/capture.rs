@@ -184,7 +184,7 @@ impl X11Capture {
     /// Acquires every new passive grab before retiring the old set. On refusal, rolls back additions.
     pub fn set_hotkeys(
         &mut self,
-        bindings: [Option<crate::hotkeys::Hotkey>; 4],
+        bindings: [Option<crate::hotkeys::Hotkey>; 5],
     ) -> Result<(), X11Error> {
         let physical = self.conn.query_keymap()?.reply()?.keys;
         let mut wanted = Vec::new();

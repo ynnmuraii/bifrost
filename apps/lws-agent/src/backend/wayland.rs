@@ -112,6 +112,7 @@ fn shortcut_action(id: &str) -> Option<config::HotkeyAction> {
         "switch_next" => Some(HotkeyAction::SwitchNext),
         "return_local" => Some(HotkeyAction::ReturnLocal),
         "claim_ownership" => Some(HotkeyAction::ClaimOwnership),
+        "game_guard_toggle" => Some(HotkeyAction::GameGuardToggle),
         _ => None,
     }
 }
@@ -140,6 +141,11 @@ async fn register_shortcuts(
             "claim_ownership",
             "Bifrost: claim keyboard and pointer ownership",
             &bindings.claim_ownership,
+        ),
+        (
+            "game_guard_toggle",
+            "Bifrost: toggle game mode",
+            &bindings.game_guard_toggle,
         ),
     ];
     let requested: Vec<_> = requested
@@ -958,6 +964,7 @@ impl Wayland {
                                     config::HotkeyAction::SwitchNext => "switch_next",
                                     config::HotkeyAction::ReturnLocal => "return_local",
                                     config::HotkeyAction::ClaimOwnership => "claim_ownership",
+                                    config::HotkeyAction::GameGuardToggle => "game_guard_toggle",
                                 };
                                 descriptions.push(if chord.trim().is_empty() {
                                     format!("{}: disabled", action.as_str())

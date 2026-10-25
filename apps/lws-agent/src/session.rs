@@ -266,6 +266,11 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
     // A slow tick must not queue up: the clipboard is polled, not scheduled.
     clipboard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let guard_detector =
+        crate::game_guard::Detector::new(&ready.platform, matches!(backend, Backend::Dry(_)));
+    let mut guard_tick = tokio::time::interval(Duration::from_millis(350));
+    guard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_guard = None;
     let poll_ms = backend::POLL_TICK.as_millis() as u64;
     let mut planned_wake_ms = now_ms(started).saturating_add(poll_ms);
 
@@ -283,6 +288,13 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             // services below run once per turn whatever arm won, so the bias cannot
             // starve the deadline (rule 4) either.
             biased;
+            _ = guard_tick.tick() => {
+                let signals = guard_detector.observe();
+                if last_guard.as_ref() != Some(&signals) {
+                    link.send(Msg::GameGuardSignals(signals.clone())).await?;
+                    last_guard = Some(signals);
+                }
+            }
             received = link.recv() => {
                 let frame = match received {
                     Ok(frame) => frame,
@@ -2153,19 +2165,22 @@ mod tests {
                 //    been applied from core yet, so it is the first version on the wire.
                 std::fs::write(&in_path, "typed into the file").expect("in.txt is writable");
                 std::fs::write(dir_join(&in_path, "in.markers"), "kde_secret").expect("in.markers");
-                match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {
-                    Ok(Ok(frame)) => match frame.msg.expect("a payload") {
-                        Msg::ClipboardChanged(changed) => {
-                            assert_eq!(changed.data, b"typed into the file");
-                            assert_eq!(changed.markers, vec!["kde_secret"]);
-                            assert_eq!(changed.origin_version, 1);
-                            assert_eq!(changed.chunk_count, 1);
+                let changed = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let frame = core.recv().await.expect("the link remains open");
+                        match frame.msg.expect("a payload") {
+                            Msg::ClipboardChanged(changed) => break changed,
+                            Msg::GameGuardSignals(signals) => assert!(!signals.available),
+                            other => panic!("expected ClipboardChanged, got {other:?}"),
                         }
-                        other => panic!("expected ClipboardChanged, got {other:?}"),
-                    },
-                    Ok(Err(error)) => panic!("the link ended: {error}"),
-                    Err(_) => panic!("the local copy never reached core"),
-                }
+                    }
+                })
+                .await
+                .expect("the local copy reaches core");
+                assert_eq!(changed.data, b"typed into the file");
+                assert_eq!(changed.markers, vec!["kde_secret"]);
+                assert_eq!(changed.origin_version, 1);
+                assert_eq!(changed.chunk_count, 1);
 
                 // 2. Core applies a payload of its own: it lands on the selection, and the next local
                 //    change is numbered above the version core used.

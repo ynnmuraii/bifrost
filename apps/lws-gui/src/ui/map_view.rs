@@ -972,10 +972,13 @@ fn node_ui(
         return;
     }
     painter.multiply_opacity(details);
-    if !node.update_badge.is_empty() {
+    for badge_text in [&node.game_guard_badge, &node.update_badge]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+    {
         let padding = Vec2::new(6.0 * fs, 2.5 * fs);
         let badge = painter.layout(
-            node.update_badge.clone(),
+            badge_text.clone(),
             font(10.5 * fs, fam::sans()),
             fade(pal.accent_ink, k),
             (painter.clip_rect().width() - padding.x * 2.0).max(1.0),
@@ -1565,6 +1568,7 @@ mod transform_tests {
                 focus: String::new(),
                 app_version: String::new(),
                 update_badge: String::new(),
+                game_guard_badge: String::new(),
                 online: true,
                 target: i == 0,
                 approx: i == 1,

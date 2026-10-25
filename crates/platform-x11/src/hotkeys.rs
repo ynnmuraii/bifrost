@@ -39,7 +39,7 @@ pub struct Hotkey {
 
 #[derive(Clone)]
 pub struct HotkeyState {
-    pub bindings: [Option<Hotkey>; 4],
+    pub bindings: [Option<Hotkey>; 5],
     pressed: [bool; 256],
     swallowed: [bool; 256],
 }
@@ -47,7 +47,7 @@ pub struct HotkeyState {
 impl Default for HotkeyState {
     fn default() -> Self {
         Self {
-            bindings: [None; 4],
+            bindings: [None; 5],
             pressed: [false; 256],
             swallowed: [false; 256],
         }
@@ -145,7 +145,7 @@ mod tests {
         state.edge(37, true);
         state.edge(64, true);
         assert_eq!(state.edge(114, true), (true, Some(1)));
-        state.bindings = [None; 4];
+        state.bindings = [None; 5];
         assert_eq!(state.edge(114, true), (true, None));
         assert_eq!(state.edge(114, false), (true, None));
         assert_eq!(state.edge(114, true), (false, None));

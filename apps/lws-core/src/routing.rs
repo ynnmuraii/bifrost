@@ -731,6 +731,7 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::SetHotkeys(_) => "SetHotkeys",
         Msg::HotkeysResult(_) => "HotkeysResult",
         Msg::HotkeyPressed(_) => "HotkeyPressed",
+        Msg::GameGuardSignals(_) => "GameGuardSignals",
     }
 }
 

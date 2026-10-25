@@ -279,6 +279,7 @@ pub enum Request {
     SetClipboard,
     /// Persist LAN discovery through the core.
     SetDiscovery,
+    SetGameGuard,
     /// Read the in-memory clipboard history.
     GetClipboardHistory,
     /// Copy a history item through the core's local clipboard adapter.
@@ -318,6 +319,7 @@ impl Request {
             Request::RegisterUpdateCoordinator => text(lang, Key::State),
             Request::SetClipboard => text(lang, Key::TheClipboard),
             Request::SetDiscovery => text(lang, Key::LanDiscovery),
+            Request::SetGameGuard => text(lang, Key::GameMode),
             Request::GetClipboardHistory => text(lang, Key::TheClipboardHistory),
             Request::CopyClipboardHistory => text(lang, Key::CopyFromTheHistory),
             Request::ClearClipboardHistory => text(lang, Key::ClearTheClipboardHistory),
@@ -1657,7 +1659,7 @@ impl ViewModel {
                     self.outgoing
                         .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
                 }
-                Request::SetAppearance | Request::SetDiscovery => {
+                Request::SetAppearance | Request::SetDiscovery | Request::SetGameGuard => {
                     let id = self.begin_request(Request::GetStatus, Instant::now());
                     self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
                 }
@@ -2443,6 +2445,7 @@ pub enum Action {
     SetClipboard(bool),
     /// Persist LAN discovery through the core.
     SetDiscovery(bool),
+    SetGameGuard(ipc::SetGameGuard),
     /// Refresh metadata without fetching clipboard contents.
     RefreshClipboardHistory,
     /// Copy a stored item to this computer's clipboard through the core.
@@ -2621,6 +2624,7 @@ impl Action {
                 Request::SetDiscovery,
                 Msg::SetDiscovery(ipc::SetDiscovery { enabled: *enabled }),
             ),
+            Action::SetGameGuard(set) => (Request::SetGameGuard, Msg::SetGameGuard(set.clone())),
             Action::RefreshClipboardHistory => (
                 Request::GetClipboardHistory,
                 Msg::GetClipboardHistory(ipc::GetClipboardHistory {}),
@@ -3747,6 +3751,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
         Msg::SetDiscovery(_) => "SetDiscovery",
+        Msg::SetGameGuard(_) => "SetGameGuard",
         Msg::GetClipboardHistory(_) => "GetClipboardHistory",
         Msg::GetClipboardHistoryItem(_) => "GetClipboardHistoryItem",
         Msg::ClearClipboardHistory(_) => "ClearClipboardHistory",
@@ -3831,6 +3836,7 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::ClearClipboardHistory => text(lang, Key::TheClipboardHistoryIsCleared).to_owned(),
         Request::SetAppearance => text(lang, Key::TheEdgeEffectsWereSwitched).to_owned(),
         Request::SetDiscovery => text(lang, Key::LanDiscovery).to_owned(),
+        Request::SetGameGuard => text(lang, Key::GameMode).to_owned(),
         Request::SetHotkey => text(lang, Key::KeyboardShortcutSaved).to_owned(),
         Request::RevokePeer => text(lang, Key::TheComputerWasRemovedFromThePair).to_owned(),
         Request::ResetPortalGrants => text(lang, Key::ThePortalGrantsWereForgotten).to_owned(),

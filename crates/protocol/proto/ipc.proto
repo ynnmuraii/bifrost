@@ -53,6 +53,7 @@ message AgentFrame {
     PortalPermissionRestoring portal_permission_restoring = 55; // a persisted restore token is being applied; no dialog is expected
     HotkeysResult hotkeys_result = 56;
     HotkeyPressed hotkey_pressed = 57;
+    GameGuardSignals game_guard_signals = 58;
   }
 }
 
@@ -298,6 +299,7 @@ message GuiFrame {
     SetRemoteUpdate set_remote_update = 37;
     UpdateProgress update_progress = 38; // headless updater -> core
     UpdateReady update_ready = 39;       // verified replacement ready for core shutdown
+    SetGameGuard set_game_guard = 49;
 
     Status status = 40;          // response and pushed event
     PairingPrompt pairing_prompt = 41;
@@ -347,6 +349,7 @@ enum HotkeyAction {
   HOTKEY_ACTION_SWITCH_NEXT = 2;
   HOTKEY_ACTION_RETURN_LOCAL = 3;
   HOTKEY_ACTION_CLAIM_OWNERSHIP = 4;
+  HOTKEY_ACTION_GAME_GUARD_TOGGLE = 5;
 }
 message HotkeyBinding {
   HotkeyAction action = 1;
@@ -396,6 +399,12 @@ message Status {
   bool allow_remote_update = 31;
   repeated NodeUpdate update_nodes = 32;
   string update_notice = 33;
+  GameGuardSignals game_guard_signals = 34;
+  string game_guard_reason = 35;
+  string game_guard_mode = 36;
+  repeated string game_guard_block_apps = 37;
+  repeated string game_guard_allow_apps = 38;
+  string game_guard_last_app = 39; // last non-Bifrost foreground app, for Settings after focusing GUI
 }
 // Discovery is not pairing or authentication. Address is the observed IPv4 source
 // plus the advertised input/control port ("<ip>:<port>"), never a beacon-supplied IP.
@@ -415,6 +424,20 @@ message MemberStatus {
   string link_state = 5;   // OFFLINE / CONNECTING / TLS / HELLO / READY / CLOSING
   string app_version = 6;
   bool remote_update = 7;
+}
+
+// Source-local observations only; never sent over the network.
+message GameGuardSignals {
+  bool available = 1;
+  bool fullscreen = 2;
+  bool cursor_confined = 3;
+  bool presentation = 4;
+  string app = 5;
+}
+message SetGameGuard {
+  string mode = 1; // auto | always | off
+  repeated string block_apps = 2;
+  repeated string allow_apps = 3;
 }
 message PairingPrompt { bytes attempt_id = 1; string peer_name = 2; string sas_code = 3; string local_fingerprint = 4; string peer_fingerprint = 5; }
 // Pushed when the pairing window opens or closes, and replayed on GetStatus.

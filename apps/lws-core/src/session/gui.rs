@@ -207,6 +207,24 @@ impl Session {
                 .chain(self.updates.rows.get(&self.node_id).cloned())
                 .collect(),
             update_notice: self.updates.notice.clone(),
+            game_guard_signals: Some(self.game_guard_signals.clone()),
+            game_guard_reason: if self.router.focus() == fr::FocusState::Local {
+                self.game_guard
+                    .reason(&self.game_guard_signals)
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                String::new()
+            },
+            game_guard_mode: match self.game_guard.mode {
+                config::game_guard::Mode::Auto => "auto",
+                config::game_guard::Mode::Always => "always",
+                config::game_guard::Mode::Off => "off",
+            }
+            .to_owned(),
+            game_guard_block_apps: self.game_guard.block_apps.clone(),
+            game_guard_allow_apps: self.game_guard.allow_apps.clone(),
+            game_guard_last_app: self.game_guard_last_app.clone(),
         }
     }
 
@@ -681,6 +699,10 @@ impl Session {
                 let result = self
                     .set_appearance(set.edge_effects, set.hide_remote_cursor)
                     .await;
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::SetGameGuard(set) => {
+                let result = self.set_game_guard(set).await;
                 answer(&out, request_id, Msg::OpResult(result)).await;
             }
             Msg::SetDiscovery(set) => {
@@ -1172,6 +1194,41 @@ impl Session {
         self.gui_status = Some(status.clone());
         self.publish(Msg::Status(status));
         tracing::info!(enabled, "clipboard toggled from the GUI");
+        ok()
+    }
+
+    pub(super) async fn set_game_guard(&mut self, set: ipc::SetGameGuard) -> ipc::OpResult {
+        use config::game_guard::{GameGuardConfig, Mode};
+        let mode = match set.mode.as_str() {
+            "auto" => Mode::Auto,
+            "always" => Mode::Always,
+            "off" => Mode::Off,
+            _ => return bad_request(),
+        };
+        let wanted = GameGuardConfig {
+            mode,
+            block_apps: set.block_apps,
+            allow_apps: set.allow_apps,
+        };
+        if wanted.validate().is_err() {
+            return bad_request();
+        }
+        let Some(path) = self.appearance_path.clone() else {
+            return bad_request();
+        };
+        let persisted = wanted.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            config::lock::update_locked(&path, |config| config.game_guard = persisted)
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            return ipc::OpResult {
+                ok: false,
+                error_code: "GAME_GUARD_WRITE".to_owned(),
+            };
+        }
+        self.game_guard = wanted;
+        self.game_guard_logged = false;
         ok()
     }
 

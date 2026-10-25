@@ -945,6 +945,100 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 
 fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
+    row_with_top_padding(ui, pal, text(lang, Key::GameMode), false, 8.0, |ui| {
+        let Some(status) = &vm.status else {
+            widgets::hint(ui, pal, text(lang, Key::Service));
+            return;
+        };
+        let mut mode = status.game_guard_mode.clone();
+        let selected = match mode.as_str() {
+            "always" => 1,
+            "off" => 2,
+            _ => 0,
+        };
+        if let Some(index) = widgets::seg(
+            ui,
+            pal,
+            &[
+                text(lang, Key::GameGuardAuto),
+                text(lang, Key::GameGuardAlways),
+                text(lang, Key::GameGuardOff),
+            ],
+            selected,
+        ) {
+            mode = ["auto", "always", "off"][index].to_owned();
+            actions.push(Action::SetGameGuard(protocol::ipc::SetGameGuard {
+                mode: mode.clone(),
+                block_apps: status.game_guard_block_apps.clone(),
+                allow_apps: status.game_guard_allow_apps.clone(),
+            }));
+        }
+        if status.backend == "platform-wayland" {
+            widgets::hint(ui, pal, text(lang, Key::GameGuardWayland));
+        }
+        let id = ui.id().with("game_guard_lists");
+        let mut lists = ui
+            .data_mut(|data| data.get_temp::<(String, String)>(id))
+            .unwrap_or_else(|| {
+                (
+                    status.game_guard_block_apps.join(", "),
+                    status.game_guard_allow_apps.join(", "),
+                )
+            });
+        ui.label(text(lang, Key::GameGuardBlockApps));
+        ui.add(
+            egui::TextEdit::singleline(&mut lists.0)
+                .char_limit(8256)
+                .desired_width(f32::INFINITY),
+        );
+        ui.label(text(lang, Key::GameGuardAllowApps));
+        ui.add(
+            egui::TextEdit::singleline(&mut lists.1)
+                .char_limit(8256)
+                .desired_width(f32::INFINITY),
+        );
+        let app = status.game_guard_last_app.as_str();
+        if widgets::button(
+            ui,
+            pal,
+            text(lang, Key::GameGuardAddCurrent),
+            Kind::Plain,
+            !app.is_empty(),
+        )
+        .on_hover_text(app)
+        .clicked()
+        {
+            if !lists.0.trim().is_empty() {
+                lists.0.push_str(", ");
+            }
+            lists.0.push_str(app);
+        }
+        let parse = |value: &str| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let wanted = protocol::ipc::SetGameGuard {
+            mode,
+            block_apps: parse(&lists.0),
+            allow_apps: parse(&lists.1),
+        };
+        let valid = config::game_guard::GameGuardConfig {
+            mode: config::game_guard::Mode::Auto,
+            block_apps: wanted.block_apps.clone(),
+            allow_apps: wanted.allow_apps.clone(),
+        }
+        .validate()
+        .is_ok();
+        if widgets::button(ui, pal, text(lang, Key::GameGuardSave), Kind::Solid, valid).clicked() {
+            actions.push(Action::SetGameGuard(wanted));
+        }
+        ui.data_mut(|data| data.insert_temp(id, lists));
+        widgets::hint(ui, pal, text(lang, Key::GameGuardHelp));
+    });
     // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
     // the change is instant, because every string is drawn from the catalogue each frame.
     row_with_top_padding(ui, pal, text(lang, Key::Language), false, 8.0, |ui| {

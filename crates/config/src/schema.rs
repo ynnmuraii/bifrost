@@ -213,6 +213,9 @@ pub struct Config {
     /// `[appearance]`.
     #[serde(default)]
     pub appearance: AppearanceConfig,
+    /// Source-local edge-switch protection.
+    #[serde(default)]
+    pub game_guard: crate::game_guard::GameGuardConfig,
     /// `[log]`.
     #[serde(default)]
     pub log: LogConfig,
@@ -238,6 +241,7 @@ impl Default for Config {
             clipboard: ClipboardConfig::default(),
             ui: UiConfig::default(),
             appearance: AppearanceConfig::default(),
+            game_guard: crate::game_guard::GameGuardConfig::default(),
             log: LogConfig::default(),
             topology: TopologyConfig::default(),
             update: UpdateConfig::default(),
@@ -359,6 +363,7 @@ impl Config {
 
     /// Run every documented load-validation rule.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.game_guard.validate()?;
         self.network.validate()?;
         self.workspace.validate()?;
         self.timing.validate()?;

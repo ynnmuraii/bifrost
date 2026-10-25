@@ -12,6 +12,7 @@ pub enum HotkeyAction {
     SwitchNext,
     ReturnLocal,
     ClaimOwnership,
+    GameGuardToggle,
 }
 
 impl HotkeyAction {
@@ -22,6 +23,7 @@ impl HotkeyAction {
             Self::SwitchNext => "switch_next",
             Self::ReturnLocal => "return_local",
             Self::ClaimOwnership => "claim_ownership",
+            Self::GameGuardToggle => "game_guard_toggle",
         }
     }
 
@@ -31,6 +33,7 @@ impl HotkeyAction {
             Self::SwitchNext => "input.hotkeys.switch_next",
             Self::ReturnLocal => "input.hotkeys.return_local",
             Self::ClaimOwnership => "input.hotkeys.claim_ownership",
+            Self::GameGuardToggle => "input.hotkeys.game_guard_toggle",
         }
     }
 }
@@ -43,6 +46,7 @@ pub struct HotkeyBindings {
     pub switch_next: String,
     pub return_local: String,
     pub claim_ownership: String,
+    pub game_guard_toggle: String,
 }
 
 impl Default for HotkeyBindings {
@@ -52,6 +56,7 @@ impl Default for HotkeyBindings {
             switch_next: "Ctrl+Alt+Shift+Right".to_owned(),
             return_local: "Ctrl+Alt+Shift+Left".to_owned(),
             claim_ownership: "Ctrl+Alt+Shift+Home".to_owned(),
+            game_guard_toggle: "Ctrl+Alt+Shift+G".to_owned(),
         }
     }
 }
@@ -63,6 +68,7 @@ impl HotkeyBindings {
             HotkeyAction::SwitchNext => &self.switch_next,
             HotkeyAction::ReturnLocal => &self.return_local,
             HotkeyAction::ClaimOwnership => &self.claim_ownership,
+            HotkeyAction::GameGuardToggle => &self.game_guard_toggle,
         }
     }
 
@@ -72,6 +78,7 @@ impl HotkeyBindings {
             HotkeyAction::SwitchNext => &mut self.switch_next,
             HotkeyAction::ReturnLocal => &mut self.return_local,
             HotkeyAction::ClaimOwnership => &mut self.claim_ownership,
+            HotkeyAction::GameGuardToggle => &mut self.game_guard_toggle,
         } = chord;
     }
 
@@ -81,13 +88,14 @@ impl HotkeyBindings {
             HotkeyAction::SwitchNext,
             HotkeyAction::ReturnLocal,
             HotkeyAction::ClaimOwnership,
+            HotkeyAction::GameGuardToggle,
         ]
         .into_iter()
         .map(|action| (action, self.get(action)))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let mut parsed = [None, None, None, None];
+        let mut parsed = [None, None, None, None, None];
         for (index, (action, chord)) in self.iter().enumerate() {
             let field = action.config_key();
             if chord.trim().is_empty() && action != HotkeyAction::EmergencyRelease {

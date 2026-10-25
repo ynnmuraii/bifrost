@@ -44,6 +44,27 @@ impl Lang {
     }
 }
 
+/// Guard feedback shared by the map and tray; no notification while playing.
+pub fn game_guard_state(lang: Lang, reason: &str) -> String {
+    let detail = match (lang, reason) {
+        (_, "") => return String::new(),
+        (Lang::Ru, "fullscreen") => "полноэкранное приложение",
+        (Lang::Ru, "cursor_confined") => "курсор ограничен приложением",
+        (Lang::Ru, "presentation") => "игра или презентация",
+        (Lang::Ru, "app_list") => "приложение в списке",
+        (Lang::Ru, _) => "включён постоянно",
+        (Lang::En, "fullscreen") => "fullscreen application",
+        (Lang::En, "cursor_confined") => "cursor confined",
+        (Lang::En, "presentation") => "game or presentation",
+        (Lang::En, "app_list") => "application list",
+        (Lang::En, _) => "always on",
+    };
+    match lang {
+        Lang::Ru => format!("игровой режим · переход по краю отключён · {detail}"),
+        Lang::En => format!("game mode · edge switching blocked · {detail}"),
+    }
+}
+
 /// The language tag of this system, when it names one.
 #[cfg(windows)]
 fn system_language() -> Option<String> {
@@ -83,6 +104,16 @@ pub enum Key {
     Autostart,
     /// LAN discovery and its pairing list.
     LanDiscovery,
+    GameMode,
+    GameGuardAuto,
+    GameGuardAlways,
+    GameGuardOff,
+    GameGuardBlockApps,
+    GameGuardAllowApps,
+    GameGuardAddCurrent,
+    GameGuardSave,
+    GameGuardWayland,
+    GameGuardHelp,
     NearbyComputers,
     NoNearbyComputers,
     DiscoveryDisabled,
@@ -789,6 +820,16 @@ const fn ru(key: Key) -> &'static str {
         Key::Settings => "Настройки",
         Key::Autostart => "Запускать при входе",
         Key::LanDiscovery => "Поиск в локальной сети",
+        Key::GameMode => "Игровой режим",
+        Key::GameGuardAuto => "Авто",
+        Key::GameGuardAlways => "Всегда",
+        Key::GameGuardOff => "Выкл.",
+        Key::GameGuardBlockApps => "Блокировать для приложений (через запятую)",
+        Key::GameGuardAllowApps => "Разрешать для приложений (через запятую)",
+        Key::GameGuardAddCurrent => "Добавить текущее приложение",
+        Key::GameGuardSave => "Сохранить игровой режим",
+        Key::GameGuardWayland => "Автоопределение недоступно на Wayland",
+        Key::GameGuardHelp => "Отключает только переход по краю. Явное переключение и аварийная комбинация работают всегда. Ctrl+Alt+Shift+G: авто / всегда.",
         Key::NearbyComputers => "Компьютеры в локальной сети",
         Key::NoNearbyComputers => "Новых компьютеров не найдено. Можно подключиться по адресу вручную.",
         Key::DiscoveryDisabled => "Поиск выключен в настройках. Подключение по адресу доступно.",
@@ -1161,6 +1202,16 @@ const fn en(key: Key) -> &'static str {
         Key::Settings => "Settings",
         Key::Autostart => "Start at login",
         Key::LanDiscovery => "LAN discovery",
+        Key::GameMode => "Game mode",
+        Key::GameGuardAuto => "Auto",
+        Key::GameGuardAlways => "Always",
+        Key::GameGuardOff => "Off",
+        Key::GameGuardBlockApps => "Block for apps (comma-separated)",
+        Key::GameGuardAllowApps => "Allow for apps (comma-separated)",
+        Key::GameGuardAddCurrent => "Add current application",
+        Key::GameGuardSave => "Save game mode",
+        Key::GameGuardWayland => "Automatic detection is unavailable on Wayland",
+        Key::GameGuardHelp => "Blocks edge switching only. Explicit switches and emergency release always work. Ctrl+Alt+Shift+G: auto / always.",
         Key::NearbyComputers => "Computers on your network",
         Key::NoNearbyComputers => "No new computers found. You can still connect by address.",
         Key::DiscoveryDisabled => "Discovery is off in Settings. You can still connect by address.",

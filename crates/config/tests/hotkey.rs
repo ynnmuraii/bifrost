@@ -164,7 +164,7 @@ fn bindings_round_trip_and_action_access() {
     let mut bindings = HotkeyBindings::default();
     bindings.set(HotkeyAction::ReturnLocal, "Alt+Left".to_owned());
     assert_eq!(bindings.get(HotkeyAction::ReturnLocal), "Alt+Left");
-    assert_eq!(bindings.iter().count(), 4);
+    assert_eq!(bindings.iter().count(), 5);
     bindings.validate().unwrap();
     let text = toml::to_string(&bindings).unwrap();
     assert_eq!(toml::from_str::<HotkeyBindings>(&text).unwrap(), bindings);

@@ -40,31 +40,30 @@ impl Default for EmergencyCombo {
     }
 }
 
-/// Four action-indexed combinations, published to the hook with one atomic store.
+/// Five action-indexed combinations, published to the hook with one atomic store.
 /// Index zero is the autonomous emergency release; an absent optional key is disabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hotkeys(pub u64);
 
 impl Hotkeys {
-    pub fn new(combinations: [Option<EmergencyCombo>; 4]) -> Self {
+    pub fn new(combinations: [Option<EmergencyCombo>; 5]) -> Self {
         let mut packed = 0;
         for (index, combo) in combinations.into_iter().enumerate() {
             if let Some(combo) = combo {
                 let value = u64::from(combo.vk)
                     | (u64::from(combo.ctrl) << 8)
                     | (u64::from(combo.alt) << 9)
-                    | (u64::from(combo.shift) << 10)
-                    | (1 << 12);
-                packed |= value << (index * 16);
+                    | (u64::from(combo.shift) << 10);
+                packed |= value << (index * 12);
             }
         }
         Self(packed)
     }
 
     pub fn contains_key(self, vk: u16) -> bool {
-        (0..4).any(|index| {
-            let combo = (self.0 >> (index * 16)) & 0xffff;
-            combo & (1 << 12) != 0 && combo & 0xff == u64::from(vk)
+        (0..5).any(|index| {
+            let combo = (self.0 >> (index * 12)) & 0xfff;
+            combo & 0xff != 0 && combo & 0xff == u64::from(vk)
         })
     }
 
@@ -80,9 +79,9 @@ impl Hotkeys {
             | (u64::from(alt) << 9)
             | (u64::from(shift) << 10)
             | (u64::from(super_key) << 11);
-        (0..4).find(|index| {
-            let combo = (self.0 >> (usize::from(*index) * 16)) & 0xffff;
-            combo & (1 << 12) != 0 && (combo & 0xfff) == (u64::from(vk) | modifiers)
+        (0..5).find(|index| {
+            let combo = (self.0 >> (usize::from(*index) * 12)) & 0xfff;
+            combo & 0xff != 0 && combo == (u64::from(vk) | modifiers)
         })
     }
 }
@@ -104,7 +103,7 @@ mod hotkey_tests {
 
     #[test]
     fn exact_matching_and_atomic_replacement() {
-        let first = Hotkeys::new([Some(EmergencyCombo::default()), None, None, None]);
+        let first = Hotkeys::new([Some(EmergencyCombo::default()), None, None, None, None]);
         assert_eq!(first.matching(0x7b, true, true, true, false), Some(0));
         assert_eq!(first.matching(0x7b, true, true, false, false), None);
         let next = Hotkeys::new([
@@ -117,10 +116,18 @@ mod hotkey_tests {
             }),
             None,
             None,
+            Some(EmergencyCombo {
+                vk: 0x47,
+                ctrl: true,
+                alt: true,
+                shift: true,
+            }),
         ]);
         assert_eq!(first.matching(0x27, false, false, false, false), None);
         assert_eq!(next.matching(0x27, false, false, false, false), Some(1));
         assert_eq!(next.matching(0x27, true, false, false, false), None);
+        assert_eq!(next.matching(0x47, true, true, true, false), Some(4));
+        assert!(next.contains_key(0x47));
         let (held, action) = hotkey_transition(false, true, Some(1));
         assert!(held);
         assert_eq!(action, Some(1));

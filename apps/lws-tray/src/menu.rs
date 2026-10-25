@@ -9,6 +9,7 @@ pub(crate) enum Action {
     /// The tray used to send the active peer on the way home and let the core toggle on the
     /// state it found, so a press that raced a lease expiry started the transition again.
     Switch(String),
+    GameGuardToggle,
     Stop,
     Exit,
 }
@@ -107,6 +108,9 @@ pub(crate) fn items(
         action: Some(Action::Open),
     }];
     let label = match status {
+        Some(s) if !s.game_guard_reason.is_empty() => {
+            ui_text::game_guard_state(lang, &s.game_guard_reason)
+        }
         Some(s) if s.focus == "REMOTE" => fill(
             lang,
             Key::Input2,
@@ -129,6 +133,21 @@ pub(crate) fn items(
             action: Some(Action::Switch(peer)),
         });
     }
+    items.push(Item {
+        label: format!(
+            "{}: {}",
+            text(lang, Key::GameMode),
+            text(
+                lang,
+                if status.is_some_and(|s| s.game_guard_mode == "always") {
+                    Key::GameGuardAlways
+                } else {
+                    Key::GameGuardAuto
+                }
+            )
+        ),
+        action: status.map(|_| Action::GameGuardToggle),
+    });
     items.push(Item {
         label: text(lang, Key::StopTheService).into(),
         action: status.map(|_| Action::Stop),

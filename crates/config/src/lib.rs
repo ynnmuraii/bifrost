@@ -60,6 +60,7 @@
 pub mod cli;
 pub mod error;
 pub mod first_run;
+pub mod game_guard;
 pub mod hotkey;
 mod legacy;
 pub mod lock;

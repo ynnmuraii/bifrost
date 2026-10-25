@@ -654,6 +654,7 @@ async fn run_async(
         pairing_gate,
     );
     session.set_appearance_source(paths.config_file(), config.appearance);
+    session.set_game_guard_source(config.game_guard);
     session.set_discovery_source(config.discovery, config.network.clone());
     session.set_hotkeys_source(config.input.hotkeys);
     session.set_update_policy(config.update.allow_remote_request);

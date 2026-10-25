@@ -17,7 +17,24 @@ impl ksni::Tray for Tray {
         "bifrost".into()
     }
     fn title(&self) -> String {
-        "Bifrost".into()
+        self.state
+            .status
+            .as_ref()
+            .filter(|status| !status.game_guard_reason.is_empty())
+            .map(|status| {
+                ui_text::game_guard_state(
+                    super::language_of(self.state.look_file.as_deref()),
+                    &status.game_guard_reason,
+                )
+            })
+            .unwrap_or_else(|| "Bifrost".into())
+    }
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: "Bifrost".into(),
+            description: self.title(),
+            ..Default::default()
+        }
     }
     fn activate(&mut self, _: i32, _: i32) {
         let _ = self.commands.send(Action::Open);

@@ -294,7 +294,7 @@ impl Capture {
             emergency_fired: AtomicBool::new(false),
             modifiers: AtomicU32::new(0),
             hotkeys: AtomicU64::new(
-                crate::event::Hotkeys::new([Some(config.emergency), None, None, None]).0,
+                crate::event::Hotkeys::new([Some(config.emergency), None, None, None, None]).0,
             ),
             swallowed_keys: std::array::from_fn(|_| AtomicU64::new(0)),
             keyboard_hook_events: AtomicU64::new(0),
@@ -1151,6 +1151,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ]);
         shared.hotkeys.store(replacement.0, Ordering::SeqCst);
         assert_ne!(old, shared.hotkeys.load(Ordering::SeqCst));
@@ -1174,7 +1175,14 @@ mod tests {
             emergency_fired: AtomicBool::new(false),
             modifiers: AtomicU32::new(MOD_CTRL | MOD_ALT | MOD_SHIFT),
             hotkeys: AtomicU64::new(
-                crate::event::Hotkeys::new([Some(EmergencyCombo::default()), None, None, None]).0,
+                crate::event::Hotkeys::new([
+                    Some(EmergencyCombo::default()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ])
+                .0,
             ),
             swallowed_keys: std::array::from_fn(|_| AtomicU64::new(0)),
             captured: AtomicU64::new(0),

@@ -129,6 +129,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod event;
+pub mod game_guard;
 pub mod hid;
 pub mod inject_plan;
 pub mod ledger;

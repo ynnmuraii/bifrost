@@ -50,6 +50,7 @@ pub struct MapNode {
     pub app_version: String,
     /// One quiet line, only for a known version below the workspace maximum.
     pub update_badge: String,
+    pub game_guard_badge: String,
     /// In the network, as far as the core knows.
     pub online: bool,
     /// Input goes here now.
@@ -961,6 +962,14 @@ impl ViewModel {
                 },
                 update_badge: if needs_update {
                     fill(lang, Key::UpdateAvailable, &[&highest_version])
+                } else {
+                    String::new()
+                },
+                game_guard_badge: if this == Some(i) {
+                    self.status
+                        .as_ref()
+                        .map(|status| ui_text::game_guard_state(lang, &status.game_guard_reason))
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 },

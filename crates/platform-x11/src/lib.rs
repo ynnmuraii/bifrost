@@ -61,6 +61,8 @@ pub mod capture;
 #[cfg(target_os = "linux")]
 pub mod displays;
 #[cfg(target_os = "linux")]
+pub mod game_guard;
+#[cfg(target_os = "linux")]
 pub mod inject;
 #[cfg(target_os = "linux")]
 pub mod keymap;
