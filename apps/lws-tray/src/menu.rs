@@ -388,7 +388,7 @@ mod labels {
         );
         assert_eq!(
             offline.iter().filter(|item| item.action.is_none()).count(),
-            2
+            3 // service status, unavailable game mode, and unavailable stop action
         );
         let remote = Status {
             focus: "REMOTE".into(),
