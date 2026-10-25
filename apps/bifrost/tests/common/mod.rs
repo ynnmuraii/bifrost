@@ -1631,7 +1631,13 @@ impl Cluster {
                         && status.owner == self.nodes[0].id
                 },
             )
-            .unwrap_or_else(|error| panic!("node {index} never joined: {error}"));
+            .unwrap_or_else(|error| {
+                for (position, member) in self.nodes.iter().enumerate() {
+                    eprintln!("node {position} startup status: {:?}", member.status());
+                    eprintln!("node {position} startup log:\n{}", member.log());
+                }
+                panic!("node {index} never joined: {error}");
+            });
         }
     }
 

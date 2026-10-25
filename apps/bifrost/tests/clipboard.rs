@@ -917,6 +917,11 @@ fn explicit_gui_send_stops_current_carry_but_an_old_row_preserves_it() {
     pc2.wait_for_clipboard(current, SETTLE)
         .expect("old row did not cancel new carry");
     assert_eq!(pc3.clipboard_text().as_deref(), Some(old));
+    cluster
+        .switch_to(0, 2)
+        .expect("enter the earlier explicit destination");
+    pc3.wait_for_clipboard(current, SETTLE)
+        .expect("settling replaces an explicitly sent old row with the current carry");
 }
 
 #[test]
