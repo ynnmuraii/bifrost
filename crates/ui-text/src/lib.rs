@@ -48,20 +48,20 @@ impl Lang {
 pub fn game_guard_state(lang: Lang, reason: &str) -> String {
     let detail = match (lang, reason) {
         (_, "") => return String::new(),
-        (Lang::Ru, "fullscreen") => "полноэкранное приложение",
-        (Lang::Ru, "cursor_confined") => "курсор ограничен приложением",
-        (Lang::Ru, "presentation") => "игра или презентация",
-        (Lang::Ru, "app_list") => "приложение в списке",
-        (Lang::Ru, _) => "включён постоянно",
-        (Lang::En, "fullscreen") => "fullscreen application",
+        (Lang::Ru, "fullscreen") => "полный экран",
+        (Lang::Ru, "cursor_confined") => "курсор ограничен",
+        (Lang::Ru, "presentation") => "презентация",
+        (Lang::Ru, "app_list") => "список приложений",
+        (Lang::Ru, _) => "всегда",
+        (Lang::En, "fullscreen") => "fullscreen",
         (Lang::En, "cursor_confined") => "cursor confined",
-        (Lang::En, "presentation") => "game or presentation",
-        (Lang::En, "app_list") => "application list",
+        (Lang::En, "presentation") => "presentation",
+        (Lang::En, "app_list") => "app list",
         (Lang::En, _) => "always on",
     };
     match lang {
-        Lang::Ru => format!("игровой режим · переход по краю отключён · {detail}"),
-        Lang::En => format!("game mode · edge switching blocked · {detail}"),
+        Lang::Ru => format!("игровой режим · край выкл. · {detail}"),
+        Lang::En => format!("game mode · edge off · {detail}"),
     }
 }
 

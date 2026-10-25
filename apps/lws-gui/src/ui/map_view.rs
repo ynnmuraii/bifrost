@@ -734,7 +734,16 @@ fn node_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
 fn caption_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
     Rect::from_min_size(
         Pos2::new(at.x, at.y + node.h as f32 * scale),
-        Vec2::new(node.w as f32 * scale, 88.0 * scale.clamp(0.8, 1.0)),
+        Vec2::new(
+            node.w as f32 * scale,
+            (88.0
+                + if node.game_guard_badge.is_empty() {
+                    0.0
+                } else {
+                    64.0
+                })
+                * scale.clamp(0.8, 1.0),
+        ),
     )
 }
 
@@ -1818,6 +1827,69 @@ mod transform_tests {
                     }),
                     "Badge needs its own opaque surface and hairline before the text"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn game_guard_pill_remains_visible_under_a_portrait_monitor() {
+        for theme in [
+            crate::gui_settings::Theme::Light,
+            crate::gui_settings::Theme::Dark,
+        ] {
+            for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+                for reason in [
+                    "fullscreen",
+                    "cursor_confined",
+                    "presentation",
+                    "app_list",
+                    "always",
+                ] {
+                    let ctx = egui::Context::default();
+                    super::super::install_fonts(&ctx);
+                    let pal = Palette::of(theme);
+                    let mut st = UiState::new(std::time::Instant::now());
+                    let mut node = owner_layout().nodes.remove(1);
+                    node.w = 86.0;
+                    node.h = 180.0;
+                    node.name = "LOCAL".into();
+                    node.update_badge.clear();
+                    node.game_guard_badge = ui_text::game_guard_state(lang, reason);
+                    let at = Pos2::new(60.0, 60.0);
+                    let caption = caption_rect(at, &node, 1.0);
+                    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        let painter = ui.painter().clone();
+                        node_ui(
+                            ui,
+                            &painter,
+                            &pal,
+                            &mut st,
+                            &node,
+                            0,
+                            at,
+                            Xf {
+                                origin: Pos2::ZERO,
+                                s: 1.0,
+                            },
+                            caption,
+                            false,
+                            &mut None,
+                            &mut Vec::new(),
+                        );
+                    });
+                    output.textures_delta.clear();
+                    let glyphs = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            Shape::Text(text) if text.galley.text() == node.game_guard_badge => {
+                                Some(Rect::from_min_size(text.pos, text.galley.size()))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing portrait guard pill: {lang:?}, {reason}, caption {caption:?}"));
+                    assert!(caption.contains_rect(glyphs));
+                }
             }
         }
     }
