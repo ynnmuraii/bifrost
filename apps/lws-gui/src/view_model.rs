@@ -1733,7 +1733,10 @@ impl ViewModel {
                     self.outgoing
                         .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
                 }
-                Request::SetClipboardPolicy | Request::SetAppearance | Request::SetDiscovery | Request::SetGameGuard => {
+                Request::SetClipboardPolicy
+                | Request::SetAppearance
+                | Request::SetDiscovery
+                | Request::SetGameGuard => {
                     let id = self.begin_request(Request::GetStatus, Instant::now());
                     self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
                 }

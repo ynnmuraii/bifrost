@@ -322,17 +322,36 @@ pub(super) fn row(
     last: bool,
     add: impl FnOnce(&mut egui::Ui),
 ) {
-    row_with_top_padding(ui, pal, label, last, 16.0, add);
+    row_with_padding(ui, pal, label, last, 16.0, 16.0, add);
 }
 
-/// Settings keeps its compact controls visible at desktop heights; application lists expand
-/// only on request. The shared 16 px bottom padding is preserved.
-fn row_with_top_padding(
+/// Compact settings rows keep release actions visible alongside clipboard and game mode.
+/// The final row retains its normal bottom padding.
+fn settings_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    last: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    row_with_padding(
+        ui,
+        pal,
+        label,
+        last,
+        0.0,
+        if last { 16.0 } else { 8.0 },
+        add,
+    );
+}
+
+fn row_with_padding(
     ui: &mut egui::Ui,
     pal: &Palette,
     label: &str,
     last: bool,
     top_padding: f32,
+    bottom_padding: f32,
     add: impl FnOnce(&mut egui::Ui),
 ) {
     let left = ui.max_rect().left();
@@ -365,7 +384,7 @@ fn row_with_top_padding(
             add(ui);
         },
     );
-    let bottom = inner.response.rect.max.y.max(top + 20.0) + 16.0;
+    let bottom = inner.response.rect.max.y.max(top + 20.0) + bottom_padding;
     // The scope already advanced the cursor past its contents, not the row padding.
     ui.add_space((bottom - ui.cursor().min.y).max(0.0));
     if !last {
@@ -992,7 +1011,7 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 
 fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
-    row_with_top_padding(ui, pal, text(lang, Key::GameMode), false, 0.0, |ui| {
+    settings_row(ui, pal, text(lang, Key::GameMode), false, |ui| {
         let Some(status) = &vm.status else {
             widgets::hint(ui, pal, text(lang, Key::Service));
             return;
@@ -1105,7 +1124,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
     });
     // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
     // the change is instant, because every string is drawn from the catalogue each frame.
-    row_with_top_padding(ui, pal, text(lang, Key::Language), false, 0.0, |ui| {
+    settings_row(ui, pal, text(lang, Key::Language), false, |ui| {
         let mut look = vm.look;
         if let Some(i) = widgets::seg(
             ui,
@@ -1117,7 +1136,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             actions.push(Action::SetLook(look));
         }
     });
-    row_with_top_padding(ui, pal, text(lang, Key::Autostart), false, 0.0, |ui| {
+    settings_row(ui, pal, text(lang, Key::Autostart), false, |ui| {
         if let Some(i) = widgets::seg(
             ui,
             pal,
@@ -1130,56 +1149,49 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::wrapped(ui, error, 13.0, fam::sans(), pal.ink);
         }
     });
-    row_with_top_padding(
-        ui,
-        pal,
-        text(lang, Key::ClipboardRouting),
-        false,
-        0.0,
-        |ui| {
-            let status = vm.status.as_ref();
-            let broadcast = status.is_some_and(|status| status.clipboard_policy == "broadcast");
-            let pending = vm
-                .inflight
-                .iter()
-                .any(|request| request.request == crate::view_model::Request::SetClipboardPolicy);
-            let toggle = ui.add_enabled_ui(vm.connection.is_connected() && !pending, |ui| {
-                if let Some(i) = widgets::seg(
-                    ui,
-                    pal,
-                    &[
-                        text(lang, Key::ClipboardFollow),
-                        text(lang, Key::ClipboardBroadcast),
-                    ],
-                    usize::from(broadcast),
-                ) {
-                    let settle_ms = status.map_or(700, |status| {
-                        if status.clipboard_settle_ms == 0 {
-                            700
-                        } else {
-                            status.clipboard_settle_ms.clamp(200, 3000)
-                        }
-                    });
-                    actions.push(Action::SetClipboardPolicy {
-                        policy: if i == 0 { "follow" } else { "broadcast" }.to_owned(),
-                        settle_ms,
-                    });
-                }
-            });
-            toggle.response.on_hover_text(text(
-                lang,
-                if broadcast {
-                    Key::ClipboardBroadcastHint
-                } else {
-                    Key::ClipboardFollowHint
-                },
-            ));
-            if pending {
-                widgets::hint(ui, pal, text(lang, Key::Applying));
+    settings_row(ui, pal, text(lang, Key::ClipboardRouting), false, |ui| {
+        let status = vm.status.as_ref();
+        let broadcast = status.is_some_and(|status| status.clipboard_policy == "broadcast");
+        let pending = vm
+            .inflight
+            .iter()
+            .any(|request| request.request == crate::view_model::Request::SetClipboardPolicy);
+        let toggle = ui.add_enabled_ui(vm.connection.is_connected() && !pending, |ui| {
+            if let Some(i) = widgets::seg(
+                ui,
+                pal,
+                &[
+                    text(lang, Key::ClipboardFollow),
+                    text(lang, Key::ClipboardBroadcast),
+                ],
+                usize::from(broadcast),
+            ) {
+                let settle_ms = status.map_or(700, |status| {
+                    if status.clipboard_settle_ms == 0 {
+                        700
+                    } else {
+                        status.clipboard_settle_ms.clamp(200, 3000)
+                    }
+                });
+                actions.push(Action::SetClipboardPolicy {
+                    policy: if i == 0 { "follow" } else { "broadcast" }.to_owned(),
+                    settle_ms,
+                });
             }
-        },
-    );
-    row_with_top_padding(ui, pal, text(lang, Key::LanDiscovery), false, 0.0, |ui| {
+        });
+        toggle.response.on_hover_text(text(
+            lang,
+            if broadcast {
+                Key::ClipboardBroadcastHint
+            } else {
+                Key::ClipboardFollowHint
+            },
+        ));
+        if pending {
+            widgets::hint(ui, pal, text(lang, Key::Applying));
+        }
+    });
+    settings_row(ui, pal, text(lang, Key::LanDiscovery), false, |ui| {
         let pending = vm.settings.discovery_pending;
         let toggle = ui.add_enabled_ui(vm.connection.is_connected() && pending.is_none(), |ui| {
             if let Some(i) = widgets::seg(
@@ -1200,7 +1212,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
         }
     });
     let current = vm.config.listen_address.clone();
-    row_with_top_padding(ui, pal, text(lang, Key::LANAddress), false, 0.0, |ui| {
+    settings_row(ui, pal, text(lang, Key::LANAddress), false, |ui| {
         let options = vm.settings.lan.options(&current);
         let selected = vm.settings.lan.selected(&current).unwrap_or_default();
         widgets::duo(ui, |ui| {
@@ -1231,7 +1243,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             text(lang, Key::AfterApplyTheServiceRestartsOnTheNewAddress),
         );
     });
-    row_with_top_padding(ui, pal, text(lang, Key::Service), false, 0.0, |ui| {
+    settings_row(ui, pal, text(lang, Key::Service), false, |ui| {
         let busy = vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
         widgets::duo(ui, |ui| {
             act(
@@ -1276,7 +1288,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
     // Portals are a Wayland desktop's, and only a Wayland desktop's: a window on Windows or
     // X11 has nothing to forget and does not show the row at all.
     if vm.uses_portals() {
-        row_with_top_padding(ui, pal, text(lang, Key::Portals), false, 0.0, |ui| {
+        settings_row(ui, pal, text(lang, Key::Portals), false, |ui| {
             act(
                 ui,
                 pal,
@@ -1289,7 +1301,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::hint(ui, pal, text(lang, Key::TheServiceWillAskForTheGrantsAgain));
         });
     }
-    row_with_top_padding(ui, pal, text(lang, Key::StartupUpdates), false, 0.0, |ui| {
+    settings_row(ui, pal, text(lang, Key::StartupUpdates), false, |ui| {
         // The other on/off segment uses the same labels; keep its animation and hit IDs separate.
         ui.push_id("startup-updates", |ui| {
             if let Some(i) = widgets::seg(
@@ -1302,7 +1314,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             }
         });
     });
-    row_with_top_padding(ui, pal, text(lang, Key::Version), true, 0.0, |ui| {
+    settings_row(ui, pal, text(lang, Key::Version), true, |ui| {
         super::update::settings(ui, pal, vm, actions);
     });
 }

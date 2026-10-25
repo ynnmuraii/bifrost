@@ -559,7 +559,7 @@ fn updater_uses_a_startup_segment_and_aligned_release_actions() {
             assert!(discovery.top() >= 0.0 && discovery.bottom() < details.top());
             assert!(
                 details.bottom() < SIZE.y - 16.0,
-                "discovery must not push release actions out of view"
+                "settings rows must not push release actions out of view: {details:?}"
             );
             let update = bounds(ui_text::text(lang, ui_text::Key::InstallUpdate));
             assert!((details.center().y - update.center().y).abs() < 4.0);
