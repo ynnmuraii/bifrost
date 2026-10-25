@@ -172,7 +172,16 @@ pub fn draw(
                 ),
                 pal.accent,
             );
-            st.bridge.paint_latency(&painter, a + (b - a) * 0.5, pal);
+            st.bridge.paint_latency(
+                &painter,
+                a + (b - a) * 0.5,
+                pal,
+                model
+                    .nodes
+                    .iter()
+                    .zip(&shown)
+                    .map(|(node, &at)| node_rect(at, node, s).union(caption_rect(at, node, s))),
+            );
         }
     }
     // Node captions must cover both the field and the bridge glyphs.
@@ -722,6 +731,13 @@ fn node_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
     Rect::from_min_size(at, Vec2::new(node.w as f32 * scale, node.h as f32 * scale))
 }
 
+fn caption_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(at.x, at.y + node.h as f32 * scale),
+        Vec2::new(node.w as f32 * scale, 88.0 * scale.clamp(0.8, 1.0)),
+    )
+}
+
 fn single_peer_rtt(status: &protocol::ipc::Status, local: Option<&str>) -> Option<u32> {
     let local = local?;
     let peers = status
@@ -930,10 +946,7 @@ fn node_ui(
         return;
     }
     // A long hostname/subtitle must not extend into a neighbouring computer's caption.
-    let caption_rect = Rect::from_min_size(
-        Pos2::new(at.x, at.y + node.h as f32 * s),
-        Vec2::new(node.w as f32 * s, 88.0 * fs),
-    );
+    let caption_rect = caption_rect(at, node, s);
     let mut painter = painter.with_clip_rect(
         caption_rect
             .intersect(caption_clip)
@@ -1625,6 +1638,114 @@ mod transform_tests {
         status.members[1].online = false;
         status.rtt_p95_us = 1_500;
         assert_eq!(single_peer_rtt(&status, Some("local")), None);
+    }
+
+    #[test]
+    fn rendered_rtt_pill_never_intersects_horizontal_or_vertical_captions() {
+        for theme in [
+            crate::gui_settings::Theme::Light,
+            crate::gui_settings::Theme::Dark,
+        ] {
+            for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+                for vertical in [false, true] {
+                    let ctx = egui::Context::default();
+                    super::super::install_fonts(&ctx);
+                    let pal = Palette::of(theme);
+                    let mut st = UiState::new(std::time::Instant::now());
+                    let mut model = owner_layout();
+                    for node in &mut model.nodes {
+                        node.w = 200.0;
+                        node.h = 100.0;
+                        node.os = "this computer · Windows 11".into();
+                        node.update_badge = "Version 0.1.7 is available".into();
+                        node.mons.truncate(1);
+                        node.mons[0].rect = crate::map::Rect::new(0.0, 0.0, 200.0, 100.0);
+                    }
+                    let shown = if vertical {
+                        [Pos2::new(300.0, 80.0), Pos2::new(300.0, 252.0)]
+                    } else {
+                        [Pos2::new(100.0, 100.0), Pos2::new(400.0, 100.0)]
+                    };
+                    let center = if vertical {
+                        Pos2::new(400.0, 216.0)
+                    } else {
+                        Pos2::new(350.0, 150.0)
+                    };
+                    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 850.0));
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let painter = ui.painter().clone();
+                            for (index, node) in model.nodes.iter().enumerate() {
+                                node_ui(
+                                    ui,
+                                    &painter,
+                                    &pal,
+                                    &mut st,
+                                    node,
+                                    index,
+                                    shown[index],
+                                    Xf {
+                                        origin: Pos2::ZERO,
+                                        s: 1.0,
+                                    },
+                                    screen,
+                                    false,
+                                    &mut None,
+                                    &mut Vec::new(),
+                                );
+                            }
+                            st.bridge.set_latency(&painter, lang, Some(12_000));
+                            st.bridge.paint_latency(
+                                &painter,
+                                center,
+                                &pal,
+                                model.nodes.iter().zip(&shown).map(|(node, &at)| {
+                                    node_rect(at, node, 1.0).union(caption_rect(at, node, 1.0))
+                                }),
+                            );
+                        },
+                    );
+                    output.textures_delta.clear();
+                    let label = output
+                        .shapes
+                        .iter()
+                        .position(|shape| {
+                            matches!(&shape.shape, Shape::Text(text)
+                                if text.galley.text().starts_with('≈'))
+                        })
+                        .expect("the roomy map has a free spot for the RTT");
+                    let (pill_index, pill) = output.shapes[..label]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, shape)| match &shape.shape {
+                            Shape::Rect(rect) => Some((index, rect.rect)),
+                            _ => None,
+                        })
+                        .expect("RTT backing precedes its label");
+                    for (index, shape) in output.shapes.iter().enumerate() {
+                        if index == label || index == pill_index {
+                            continue;
+                        }
+                        let occupied = match &shape.shape {
+                            Shape::Text(text) => Rect::from_min_size(text.pos, text.galley.size()),
+                            Shape::Rect(rect) => rect.rect,
+                            _ => continue,
+                        }
+                        .intersect(shape.clip_rect);
+                        assert!(
+                            !pill.intersects(occupied),
+                            "RTT {pill:?} overlaps caption/card {occupied:?}, vertical={vertical}"
+                        );
+                    }
+                    assert!(screen.contains_rect(pill));
+                }
+            }
+        }
     }
 
     #[test]

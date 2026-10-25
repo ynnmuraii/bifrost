@@ -285,7 +285,12 @@ fn direct_field() {
                 (120.0, 120.0),
                 pal.accent,
             );
-            bridge.paint_latency(ui.painter(), egui::pos2(500.0, 200.0), &pal);
+            bridge.paint_latency(
+                ui.painter(),
+                egui::pos2(500.0, 200.0),
+                &pal,
+                std::iter::empty(),
+            );
             if n >= 60 {
                 cpu += began.elapsed();
                 allocations += ALLOCS.load(Ordering::Relaxed) - before;

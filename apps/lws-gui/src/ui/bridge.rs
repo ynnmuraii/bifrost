@@ -48,10 +48,18 @@ impl Bridge {
         });
     }
 
-    pub fn paint_latency(&self, painter: &Painter, center: Pos2, pal: &Palette) {
+    pub fn paint_latency(
+        &self,
+        painter: &Painter,
+        center: Pos2,
+        pal: &Palette,
+        occupied: impl Iterator<Item = Rect>,
+    ) {
         let Some(galley) = &self.latency else { return };
         let size = galley.size() + Vec2::new(12.0, 5.0);
-        let rect = Rect::from_center_size(center, size);
+        let Some(rect) = latency_rect(center, size, painter.clip_rect(), occupied) else {
+            return;
+        };
         painter.rect(
             rect,
             (size.y / 2.0) as u8,
@@ -151,6 +159,32 @@ impl Bridge {
     }
 }
 
+fn latency_rect(
+    center: Pos2,
+    size: Vec2,
+    clip: Rect,
+    occupied: impl Iterator<Item = Rect>,
+) -> Option<Rect> {
+    let middle = Rect::from_center_size(center, size);
+    let (mut left, mut right) = (center.x, center.x);
+    let mut blocked = false;
+    for other in occupied {
+        if other.bottom() >= middle.top() && other.top() <= middle.bottom() {
+            blocked |= other.intersects(middle);
+            left = left.min(other.left());
+            right = right.max(other.right());
+        }
+    }
+    if !blocked && clip.contains_rect(middle) {
+        return Some(middle);
+    }
+    // Vertical bridge gaps are also caption space: try either free side of that band.
+    [right + 8.0 + size.x / 2.0, left - 8.0 - size.x / 2.0]
+        .into_iter()
+        .map(|x| Rect::from_center_size(Pos2::new(x, center.y), size))
+        .find(|&rect| clip.contains_rect(rect))
+}
+
 fn latency_label(lang: ui_text::Lang, rtt_us: u32) -> String {
     if rtt_us < 1_000 {
         ui_text::text(lang, ui_text::Key::SubMillisecondLatency).to_owned()
@@ -183,6 +217,23 @@ fn geometry(a: Pos2, b: Pos2, size: f32, horizontal: bool) -> (Pos2, Vec2, usize
 mod tests {
     use super::*;
     use eframe::egui;
+
+    #[test]
+    fn crowded_latency_tries_both_sides_and_hides_without_room() {
+        let clip = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 100.0));
+        let size = Vec2::new(56.0, 19.0);
+        let center = egui::pos2(160.0, 50.0);
+        let caption = Rect::from_min_max(egui::pos2(120.0, 20.0), clip.right_bottom());
+        let pill = latency_rect(center, size, clip, std::iter::once(caption))
+            .expect("the left side is free when the right side is clipped");
+        assert!(pill.right() < caption.left());
+        assert!(clip.contains_rect(pill));
+        assert_eq!(pill.center().y, center.y);
+        assert_eq!(
+            latency_rect(center, size, clip, std::iter::once(clip)),
+            None
+        );
+    }
 
     #[test]
     fn touching_independent_paddles_keep_a_narrow_normal_seam() {
@@ -315,6 +366,7 @@ mod tests {
                     ui.painter(),
                     egui::pos2(80.0, 100.0),
                     &Palette::of(crate::gui_settings::Theme::Dark),
+                    std::iter::empty(),
                 );
             })
         };

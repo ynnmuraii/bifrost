@@ -270,6 +270,7 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                 ("startup", State::Available(release.clone())),
                 ("badge", State::Available(release.clone())),
                 ("badge-live-like", State::Available(release.clone())),
+                ("badge-horizontal", State::Available(release.clone())),
                 ("badge-vertical", State::Available(release.clone())),
                 ("progress", State::Available(release.clone())),
                 ("results", State::Available(release.clone())),
@@ -313,9 +314,13 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                         .collect();
                     }
                 }
-                if matches!(state_tag, "badge-live-like" | "badge-vertical") {
+                if matches!(
+                    state_tag,
+                    "badge-live-like" | "badge-horizontal" | "badge-vertical"
+                ) {
                     // Replay the live monitor shapes and names, with a hypothetical newer release.
                     let vertical = state_tag == "badge-vertical";
+                    let horizontal = state_tag == "badge-horizontal";
                     view.modal = None;
                     view.look.zoom_percent = 175;
                     view.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {
@@ -351,9 +356,9 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                             },
                         ],
                         links: vec![ipc::LinkView {
-                            id: "update-vertical".into(),
-                            from: auto(&WORKSTATION, "BOTTOM"),
-                            to: auto(&LAPTOP, "TOP"),
+                            id: "update-reference".into(),
+                            from: auto(&WORKSTATION, if horizontal { "RIGHT" } else { "BOTTOM" }),
+                            to: auto(&LAPTOP, if horizontal { "LEFT" } else { "TOP" }),
                             bidirectional: true,
                             active: true,
                             ..Default::default()

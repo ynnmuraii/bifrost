@@ -97,7 +97,16 @@ fn active_field_and_ascii_links_allocate_nothing_after_warmup() {
                         (120.0, 120.0),
                         pal.accent,
                     );
-                    bridge.paint_latency(ui.painter(), egui::pos2(500.0, 200.0), &pal);
+                    bridge.paint_latency(
+                        ui.painter(),
+                        egui::pos2(500.0, 200.0),
+                        &pal,
+                        [egui::Rect::from_min_max(
+                            egui::pos2(480.0, 180.0),
+                            egui::pos2(540.0, 260.0),
+                        )]
+                        .into_iter(),
+                    );
                     let allocations = COUNT.replace(None);
                     if let Some(allocations) = allocations {
                         assert_eq!(allocations, 0, "theme={theme:?}, frame={n}");
