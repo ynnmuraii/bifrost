@@ -271,6 +271,7 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                 ("badge", State::Available(release.clone())),
                 ("progress", State::Available(release.clone())),
                 ("results", State::Available(release.clone())),
+                ("confirmation", State::Available(release.clone())),
             ] {
                 let mut view = mockup(theme, Some(Modal::Settings), lang);
                 view.update = state;
@@ -313,6 +314,10 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                 if state_tag == "startup" {
                     view.modal = None;
                     view.update_notice = true;
+                }
+                if state_tag == "confirmation" {
+                    view.update_confirm = true;
+                    view.update_all_confirm = true;
                 }
                 let file = dir.join(format!("update-{state_tag}-{lang_tag}-{theme_tag}.png"));
                 if let Err(error) = shoot(view, &file, [1745, 1091], false) {

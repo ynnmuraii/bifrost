@@ -143,6 +143,21 @@ pub(super) fn settings(
         );
     }
     progress(ui, pal, vm);
+    widgets::hint(ui, pal, text(lang, Key::AllowRemoteUpdates));
+    ui.push_id("remote-updates", |ui| {
+        ui.add_enabled_ui(vm.connection.is_connected(), |ui| {
+            if let Some(status) = &vm.status {
+                if let Some(i) = widgets::seg(
+                    ui,
+                    pal,
+                    &[text(lang, Key::On), text(lang, Key::Off)],
+                    usize::from(!status.allow_remote_update),
+                ) {
+                    actions.push(Action::Update(Update::RemoteEnabled(i == 0)));
+                }
+            }
+        });
+    });
 }
 
 fn mesh_busy(vm: &ViewModel) -> bool {
