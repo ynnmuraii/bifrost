@@ -695,11 +695,11 @@ impl Session {
         ) {
             return response("peer is offline or untrusted".into()).into();
         }
-        let Some(text) = self.clipboard_history.text(id).map(str::to_owned) else {
+        let Some(text) = self.clipboard_history.text(id) else {
             return response("history item not found".into()).into();
         };
         let out = match self.clipboard.as_mut() {
-            Some(endpoint) => endpoint.send_text_to(peer, &text).await,
+            Some(endpoint) => endpoint.send_text_to(peer, text).await,
             None => Err("clipboard is disabled".into()),
         };
         let out = match out {
