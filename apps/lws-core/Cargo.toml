@@ -17,6 +17,7 @@ geometry = { path = "../../crates/geometry" }
 identity = { path = "../../crates/identity" }
 input-model = { path = "../../crates/input-model" }
 ipc = { path = "../../crates/ipc" }
+lws-desktop = { path = "../lws-desktop" }
 platform-probe = { path = "../../crates/platform-probe" }
 protocol = { path = "../../crates/protocol" }
 # `portal-restore.toml` is a small TOML document owned by core (serde + toml are
@@ -40,7 +41,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 transport = { path = "../../crates/transport" }
 
 [target.'cfg(windows)'.dependencies]
-lws-desktop = { path = "../lws-desktop" }
 # Job objects: the agent must not outlive core (see `src/job.rs`).
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

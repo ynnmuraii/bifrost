@@ -73,6 +73,9 @@ pub const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(15);
 /// The oldest requests kept while they wait for an answer.
 const INFLIGHT_LIMIT: usize = 32;
 
+// Coordinator heartbeats are bookkeeping, not user operations or inflight requests.
+const COORDINATOR_REQUEST_ID: u64 = u64::MAX;
+
 // ---------------------------------------------------------------- small types
 
 /// A window over the map: the rail's service sections and Appearance.
@@ -905,7 +908,7 @@ impl ViewModel {
     }
 
     pub fn highest_app_version(&self) -> String {
-        let release = self.checked_release.as_ref().or_else(|| {
+        let release = self.checked_release.as_ref().or({
             if let crate::updater::State::Available(release) = &self.update {
                 Some(release)
             } else {
@@ -1068,6 +1071,9 @@ impl ViewModel {
 
     /// The client could not put a request on the wire (no core is listening).
     pub fn on_not_sent(&mut self, id: u64) {
+        if id == COORDINATOR_REQUEST_ID {
+            return;
+        }
         let lang = self.look.language;
         let request = self.take_inflight(id);
         let name = request.map_or(text(lang, Key::Request), |request| request.label(lang));
@@ -1599,6 +1605,9 @@ impl ViewModel {
 
     /// The verdict of one request.
     fn apply_op_result(&mut self, request_id: u64, result: ipc::OpResult) {
+        if request_id == COORDINATOR_REQUEST_ID {
+            return;
+        }
         let lang = self.look.language;
         let Some(request) = self.take_inflight(request_id) else {
             self.push_log(fill(
@@ -2768,7 +2777,11 @@ impl Bridge {
             return;
         }
         if let Some((request, message)) = action.wire() {
-            let id = self.view.begin_request(request, now);
+            let id = if request == Request::RegisterUpdateCoordinator {
+                COORDINATOR_REQUEST_ID
+            } else {
+                self.view.begin_request(request, now)
+            };
             self.client.send(id, message);
             // «Обновить» on the status screen asks for the document as well as the status.
             if let Some((request, message)) = action.extra_wire() {

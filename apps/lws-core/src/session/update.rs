@@ -4,8 +4,25 @@ use protocol::{ipc, wire};
 const RATE: Duration = Duration::from_secs(600);
 const DEADLINE: Duration = Duration::from_secs(300);
 pub(crate) static REEXEC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static RESTART_TRAY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 pub(crate) static TARGET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+pub(crate) fn desktop_args(paths: &config::Paths) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::with_capacity(8);
+    for (flag, path) in [
+        ("--config-dir", Some(paths.config_dir())),
+        ("--data-dir", Some(paths.data_dir())),
+        ("--state-dir", Some(paths.state_dir())),
+        ("--runtime-dir", paths.runtime_dir()),
+    ] {
+        if let Some(path) = path {
+            args.push(flag.into());
+            args.push(path.as_os_str().to_owned());
+        }
+    }
+    args
+}
 fn worker_exit_error(stopping: bool, status: impl std::fmt::Display) -> Option<String> {
     (!stopping).then(|| format!("Updater exited before restart: {status}"))
 }
@@ -152,6 +169,26 @@ fn admission(
     }
     Ok(())
 }
+fn headless_command(
+    exe: &std::path::Path,
+    target: &str,
+    paths: &config::Paths,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["update", "--to", target])
+        .arg("--config-dir")
+        .arg(paths.config_dir())
+        .arg("--data-dir")
+        .arg(paths.data_dir())
+        .arg("--state-dir")
+        .arg(paths.state_dir());
+    if let Some(runtime) = paths.runtime_dir() {
+        command.arg("--runtime-dir").arg(runtime);
+    }
+    command
+}
+
 impl Session {
     pub(crate) fn set_update_policy(&mut self, allow: bool) {
         self.updates.allow = allow;
@@ -332,18 +369,7 @@ impl Session {
     fn launch_update(&mut self, target: String, requester: Option<NodeId>) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let _ = TARGET.set(exe.clone());
-        let mut command = std::process::Command::new(exe);
-        command
-            .args(["update", "--to", &target])
-            .arg("--config-dir")
-            .arg(self.paths.config_dir())
-            .arg("--data-dir")
-            .arg(self.paths.data_dir())
-            .arg("--state-dir")
-            .arg(self.paths.state_dir());
-        if let Some(runtime) = self.paths.runtime_dir() {
-            command.arg("--runtime-dir").arg(runtime);
-        }
+        let mut command = headless_command(&exe, &target, &self.paths);
         let child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -409,12 +435,41 @@ impl Session {
         if expected != target {
             return false;
         }
-        if let Some(peer) = *requester {
+        let requester = *requester;
+        let coordinator = live_coordinator(self.updates.coordinator, Instant::now(), process_alive);
+        let gui_parent = gui_restart_owner(coordinator);
+        if !gui_parent {
+            let stopped = tokio::task::spawn_blocking(|| {
+                lws_desktop::stop_tray_and_wait(Duration::from_secs(10))
+            })
+            .await;
+            match stopped {
+                Ok(Ok(was_running)) => {
+                    RESTART_TRAY.store(was_running, std::sync::atomic::Ordering::Release)
+                }
+                error => {
+                    let detail = format!("Cannot stop the old tray before update: {error:?}");
+                    self.updates.notice = detail.clone();
+                    if let Some(row) = self.updates.rows.get_mut(&self.node_id) {
+                        row.status = "refused".into();
+                        row.detail = detail.clone();
+                    }
+                    if let Some(peer) = requester {
+                        self.send_update_result(peer, target, "refused", &detail)
+                            .await;
+                    }
+                    return false;
+                }
+            }
+        }
+        // No role may restart while the old agent still owns capture or injected input.
+        self.agent.shutdown().await;
+        if let Some(peer) = requester {
             self.send_update_result(
                 peer,
                 target,
                 "restarting",
-                "Verified replacement installed; releasing capture",
+                "Verified replacement installed; capture released",
             )
             .await;
         }
@@ -422,10 +477,10 @@ impl Session {
             row.status = "restarting".into();
             row.detail = "Verified replacement installed".into();
         }
-        let coordinator = live_coordinator(self.updates.coordinator, Instant::now(), process_alive);
-        let gui_parent = gui_restart_owner(coordinator);
         self.updates.notice = if gui_parent {
             format!("restart-gui:{target}")
+        } else if coordinator.is_some() {
+            format!("restart-gui-core:{target}")
         } else {
             format!("Restarting into {target}")
         };
@@ -531,6 +586,54 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tray_restore_arguments_preserve_all_resolved_paths_and_omit_missing_runtime() {
+        let paths = config::Paths::new("config folder", "data folder", "state folder", None);
+        assert_eq!(
+            desktop_args(&paths),
+            [
+                "--config-dir",
+                "config folder",
+                "--data-dir",
+                "data folder",
+                "--state-dir",
+                "state folder"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+    #[test]
+    fn headless_role_command_preserves_version_and_every_path_without_a_shell() {
+        let paths = config::Paths::new(
+            "config folder",
+            "data folder",
+            "state folder",
+            Some("run folder".into()),
+        );
+        let command = headless_command(
+            std::path::Path::new("binary folder/bifrost"),
+            "0.2.0",
+            &paths,
+        );
+        assert_eq!(command.get_program(), "binary folder/bifrost");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "update",
+                "--to",
+                "0.2.0",
+                "--config-dir",
+                "config folder",
+                "--data-dir",
+                "data folder",
+                "--state-dir",
+                "state folder",
+                "--runtime-dir",
+                "run folder",
+            ]
+        );
+    }
+
     #[test]
     fn acknowledged_worker_exit_never_becomes_a_refusal() {
         assert!(worker_exit_error(true, "exit status: 0").is_none());

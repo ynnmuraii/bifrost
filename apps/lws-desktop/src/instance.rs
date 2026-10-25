@@ -118,10 +118,19 @@ pub const TRAY_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// waits up to `timeout` for the icon. `Err` means there is no icon, and the caller must not
 /// leave the user with nothing (keep its window, say why).
 pub fn start_tray(args: &[OsString], timeout: Duration) -> io::Result<()> {
+    start_tray_from(&std::env::current_exe()?, args, timeout)
+}
+
+/// Start the tray from a verified replacement path, even when the caller's image was unlinked.
+pub fn start_tray_from(
+    exe: &std::path::Path,
+    args: &[OsString],
+    timeout: Duration,
+) -> io::Result<()> {
     if tray_is_ready() {
         return Ok(());
     }
-    spawn_role(Role::Tray, args)?;
+    spawn_role_from(exe, Role::Tray, args)?;
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if tray_is_ready() {
@@ -142,6 +151,28 @@ pub fn stop_tray() -> io::Result<()> {
 pub fn tray_is_running() -> bool {
     !matches!(platform::acquire(Role::Tray, "multideskflow"), Ok(Some(_)))
 }
+/// Stop an existing tray and wait for its instance lock, not only its icon, to disappear.
+pub fn stop_tray_and_wait(timeout: Duration) -> io::Result<bool> {
+    if !tray_is_running() {
+        return Ok(false);
+    }
+    if let Err(error) = stop_tray() {
+        if tray_is_running() {
+            return Err(error);
+        }
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while tray_is_running() {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the old tray did not exit",
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(true)
+}
 pub fn signal_existing_gui() -> io::Result<()> {
     signal_named("multideskflow")
 }
@@ -161,10 +192,18 @@ fn signal_named(namespace: &str) -> io::Result<()> {
 /// Start another role of the current executable without inheriting stdio.
 /// `args` are the original global arguments, not a role subcommand.
 pub fn spawn_role(role: Role, args: &[OsString]) -> io::Result<()> {
-    let mut command = Command::new(std::env::current_exe()?);
+    spawn_role_from(&std::env::current_exe()?, role, args)
+}
+
+fn role_command(exe: &std::path::Path, role: Role, args: &[OsString]) -> Command {
+    let mut command = Command::new(exe);
+    command.arg(role.name()).args(args);
     command
-        .arg(role.name())
-        .args(args)
+}
+
+fn spawn_role_from(exe: &std::path::Path, role: Role, args: &[OsString]) -> io::Result<()> {
+    let mut command = role_command(exe, role, args);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -177,13 +216,18 @@ pub fn spawn_role(role: Role, args: &[OsString]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is async-signal-safe and touches no Rust state.
+        // SAFETY: only async-signal-safe libc calls run in the forked child; no Rust state is touched.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
+                    return Err(io::Error::last_os_error());
+                }
+                match libc::fork() {
+                    -1 => Err(io::Error::last_os_error()),
+                    0 => Ok(()),
+                    // The role is adopted by init. The launching core may exec immediately,
+                    // so it must not own a long-lived child or a Rust reaper thread.
+                    _ => libc::_exit(0),
                 }
             });
         }
@@ -191,9 +235,10 @@ pub fn spawn_role(role: Role, args: &[OsString]) -> io::Result<()> {
     let mut child = command.spawn()?;
     #[cfg(unix)]
     {
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(io::Error::other(format!("role launcher exited: {status}")));
+        }
     }
     #[cfg(not(unix))]
     {
@@ -685,6 +730,17 @@ mod unix_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replacement_role_command_uses_verified_exe_and_preserves_path_arguments() {
+        let exe = std::path::Path::new("new installation/bifrost");
+        let args = [OsString::from("--root"), OsString::from("root folder")];
+        let command = role_command(exe, Role::Tray, &args);
+        assert_eq!(command.get_program(), exe.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["tray", "--root", "root folder"]
+        );
+    }
     #[test]
     fn role_identity_and_existing_instance_decision() {
         assert_ne!(Role::Gui.name(), Role::Tray.name());

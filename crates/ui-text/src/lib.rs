@@ -1733,7 +1733,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 346] = [
+    pub const EVERY: [Key; 357] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,

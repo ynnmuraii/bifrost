@@ -144,7 +144,22 @@ pub fn check() -> Result<Release, String> {
     if bytes.len() > 2 * 1024 * 1024 {
         return Err("Release metadata is too large".into());
     }
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    let release = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    verify_release_manifest(&release, &RELEASE_SIGNING_PUBLIC_KEY, |url, cap| {
+        download(url, cap, &mut |_, _| {})
+    })?;
+    Ok(release)
+}
+
+fn verify_release_manifest(
+    release: &Release,
+    public_key: &[u8],
+    fetch: impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
+) -> Result<(), String> {
+    let asset = release.asset(std::env::consts::OS)?;
+    let sums = signed_checksums(release, public_key, fetch)?;
+    let sums = std::str::from_utf8(&sums).map_err(|e| e.to_string())?;
+    expected_hash(sums, &asset.name).map(|_| ())
 }
 fn download(
     value: &str,
@@ -493,6 +508,47 @@ mod tests {
                 _ => panic!("Binary must not be downloaded during signature verification"),
             }
         })
+    }
+
+    #[test]
+    fn offered_release_requires_a_signed_manifest_entry_for_its_exact_version() {
+        use ring::signature::KeyPair;
+        let key = signing_key();
+        let mut release = release();
+        release
+            .assets
+            .retain(|asset| asset.name.starts_with("bifrost-"));
+        let filename = release.asset(std::env::consts::OS).unwrap().name.clone();
+        release.assets.extend([
+            Asset {
+                name: "SHA256SUMS.txt".into(),
+                browser_download_url: "https://github.com/sums".into(),
+            },
+            Asset {
+                name: "SHA256SUMS.txt.sig".into(),
+                browser_download_url: "https://github.com/sums.sig".into(),
+            },
+        ]);
+        let sums = format!(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  {filename}\n"
+        );
+        let signature = key.sign(sums.as_bytes());
+        let fetch = |url: &str, _cap: u64| {
+            assert!(allowed_asset_url(url));
+            Ok(if url.ends_with(".sig") {
+                signature.as_ref().to_vec()
+            } else {
+                sums.as_bytes().to_vec()
+            })
+        };
+        assert!(verify_release_manifest(&release, key.public_key().as_ref(), fetch).is_ok());
+
+        release.tag_name = "v9.9.9".into();
+        release.assets.push(Asset {
+            name: filename.replace("0.1.3", "9.9.9"),
+            browser_download_url: "https://github.com/binary".into(),
+        });
+        assert!(verify_release_manifest(&release, key.public_key().as_ref(), fetch).is_err());
     }
     #[test]
     fn release_signature_accepts_valid_exact_bytes() {

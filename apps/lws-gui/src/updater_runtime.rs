@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use ui_text::{fill, Key};
 
 pub(crate) static RESTART: AtomicBool = AtomicBool::new(false);
+static START_CORE: AtomicBool = AtomicBool::new(true);
 static TARGET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 enum Event {
     Checked(Result<updater::Release, String>, bool),
@@ -24,6 +25,7 @@ pub(crate) struct Runtime {
     busy: bool,
     install_lock: Option<std::fs::File>,
     coordinator_due: Instant,
+    external_core_restart: Option<Instant>,
 }
 impl Runtime {
     pub fn new() -> Self {
@@ -40,6 +42,7 @@ impl Runtime {
             busy: false,
             install_lock: None,
             coordinator_due: Instant::now(),
+            external_core_restart: None,
         }
     }
     fn check(&mut self, ctx: &egui::Context, manual: bool) {
@@ -183,26 +186,55 @@ impl Runtime {
             self.coordinator_due = now + Duration::from_secs(5);
         }
         ctx.request_repaint_after(self.coordinator_due.saturating_duration_since(now));
+        if self.external_core_restart.is_none()
+            && bridge
+                .view()
+                .status
+                .as_ref()
+                .is_some_and(|status| status.update_notice.starts_with("restart-gui-core:"))
+        {
+            self.external_core_restart = Some(now);
+            self.busy = true;
+            bridge.view_mut().update = State::Restarting;
+        }
+        if let Some(started) = self.external_core_restart {
+            // The old status is retained across disconnect; only the new core clears its notice.
+            if bridge
+                .view()
+                .status
+                .as_ref()
+                .is_some_and(|status| !status.update_notice.starts_with("restart-gui-core:"))
+            {
+                START_CORE.store(false, Ordering::Release);
+                RESTART.store(true, Ordering::Release);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            if now.saturating_duration_since(started) >= Duration::from_secs(30) {
+                self.busy = false;
+                bridge.view_mut().update =
+                    State::Error("Updated core did not reconnect; the window was kept open".into());
+            }
+        }
         if self.stopping.is_none()
             && bridge
                 .view()
                 .status
                 .as_ref()
                 .is_some_and(|status| status.update_notice.starts_with("restart-gui:"))
+            && TARGET.get().is_some()
         {
-            if TARGET.get().is_some() {
-                let paths = bridge.view().config.paths.clone();
-                let pid = bridge.view().core.as_ref().and_then(|core| core.pid);
-                if let Some(paths) = paths {
-                    match crate::core_exit::Wait::new(&paths, pid, now) {
-                        Ok(wait) => {
-                            let _ = lws_desktop::stop_tray();
-                            self.stopping = Some(wait);
-                            self.busy = true;
-                            bridge.view_mut().update = State::Restarting;
-                        }
-                        Err(error) => bridge.view_mut().update = State::Error(error),
+            let paths = bridge.view().config.paths.clone();
+            let pid = bridge.view().core.as_ref().and_then(|core| core.pid);
+            if let Some(paths) = paths {
+                match crate::core_exit::Wait::new(&paths, pid, now) {
+                    Ok(wait) => {
+                        let _ = lws_desktop::stop_tray();
+                        self.stopping = Some(wait);
+                        self.busy = true;
+                        bridge.view_mut().update = State::Restarting;
                     }
+                    Err(error) => bridge.view_mut().update = State::Error(error),
                 }
             }
         }
@@ -241,7 +273,7 @@ impl Runtime {
                         Ok(state) => {
                             tracing::info!(
                                 manual,
-                                current_version = env!("CARGO_PKG_VERSION"),
+                                current_version = protocol::app_version(),
                                 update_available = matches!(state, State::Available(_)),
                                 "release update check completed"
                             );
@@ -259,6 +291,7 @@ impl Runtime {
                 }
                 Event::Installed(Err(error)) => {
                     self.busy = false;
+                    self.install_lock = None;
                     bridge.view_mut().update = State::Error(view_model::short_error(&error));
                 }
                 Event::Installed(Ok(lock)) => {
@@ -268,6 +301,7 @@ impl Runtime {
                     if let Err(error) = lws_desktop::stop_tray() {
                         if lws_desktop::tray_is_running() {
                             self.busy = false;
+                            self.install_lock = None;
                             bridge.view_mut().update = State::Error(error.to_string());
                             continue;
                         }
@@ -293,6 +327,7 @@ impl Runtime {
                         Ok(wait) => self.stopping = Some(wait),
                         Err(error) => {
                             self.busy = false;
+                            self.install_lock = None;
                             bridge.view_mut().update = State::Error(error);
                         }
                     }
@@ -308,6 +343,7 @@ impl Runtime {
             } else if wait.timed_out(now) {
                 self.stopping = None;
                 self.busy = false;
+                self.install_lock = None;
                 bridge.view_mut().update = State::Error(
                     ui_text::text(bridge.view().look.language, Key::UpdateStopFailed).into(),
                 );
@@ -317,17 +353,25 @@ impl Runtime {
     }
 }
 
-/// Preserve every global path override and explicitly start the fresh core in the new GUI.
-pub fn restart_command(exe: &std::path::Path, args: &[String]) -> std::process::Command {
+/// Preserve path overrides; a separately supervised core must not be launched twice.
+pub fn restart_command(
+    exe: &std::path::Path,
+    args: &[String],
+    start_core: bool,
+) -> std::process::Command {
     let mut command = std::process::Command::new(exe);
-    command.arg("gui").arg("--updated").args(args);
+    command.arg("gui");
+    if start_core {
+        command.arg("--updated");
+    }
+    command.args(args);
     command
 }
 pub(crate) fn restart(args: &[String]) -> std::io::Result<()> {
     let exe = TARGET
         .get()
         .ok_or_else(|| std::io::Error::other("No verified replacement target"))?;
-    let mut command = restart_command(exe, args);
+    let mut command = restart_command(exe, args, START_CORE.load(Ordering::Acquire));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -345,10 +389,19 @@ mod tests {
     #[test]
     fn restart_retains_config_flags() {
         let args = vec!["--root".into(), "scratch folder".into()];
-        let command = restart_command(std::path::Path::new("bifrost"), &args);
+        let command = restart_command(std::path::Path::new("bifrost"), &args, true);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["gui", "--updated", "--root", "scratch folder"]
+        );
+    }
+    #[test]
+    fn separately_supervised_core_is_not_started_by_the_replacement_gui() {
+        let args = vec!["--root".into(), "scratch folder".into()];
+        let command = restart_command(std::path::Path::new("bifrost"), &args, false);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["gui", "--root", "scratch folder"]
         );
     }
 }

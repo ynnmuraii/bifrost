@@ -158,7 +158,7 @@ fn mesh_busy(vm: &ViewModel) -> bool {
 }
 
 fn checked_release(vm: &ViewModel) -> Option<&crate::updater::Release> {
-    vm.checked_release.as_ref().or_else(|| match &vm.update {
+    vm.checked_release.as_ref().or(match &vm.update {
         State::Available(release) => Some(release),
         _ => None,
     })
@@ -170,7 +170,7 @@ fn remote_notice(lang: ui_text::Lang, notice: &str) -> String {
         if let (Some(requester), Some(version), Some(detail)) =
             (fields.next(), fields.next(), fields.next())
         {
-            let mut message = fill(lang, Key::RemoteUpdateFromVersion, &[requester, version]);
+            let mut message = fill(lang, Key::RemoteUpdateFromVersion, &[&requester, &version]);
             if !detail.is_empty() {
                 message.push_str(" · ");
                 message.push_str(detail);
@@ -178,13 +178,16 @@ fn remote_notice(lang: ui_text::Lang, notice: &str) -> String {
             return message;
         }
     }
-    fill(lang, Key::RemoteUpdateNotice, &[notice])
+    fill(lang, Key::RemoteUpdateNotice, &[&notice])
 }
 
 fn progress(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
     let Some(status) = &vm.status else { return };
     let lang = vm.look.language;
-    if !status.update_notice.is_empty() && !status.update_notice.starts_with("restart-gui:") {
+    if !status.update_notice.is_empty()
+        && !status.update_notice.starts_with("restart-gui:")
+        && !status.update_notice.starts_with("restart-gui-core:")
+    {
         widgets::hint(ui, pal, &remote_notice(lang, &status.update_notice));
     }
     for node in &status.update_nodes {
@@ -240,7 +243,8 @@ pub(super) fn notice(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: 
     let remote_notice = vm.status.as_ref().is_some_and(|status| {
         !status.update_nodes.is_empty()
             || (!status.update_notice.is_empty()
-                && !status.update_notice.starts_with("restart-gui:"))
+                && !status.update_notice.starts_with("restart-gui:")
+                && !status.update_notice.starts_with("restart-gui-core:"))
     });
     if !vm.update_notice && !remote_notice {
         return;

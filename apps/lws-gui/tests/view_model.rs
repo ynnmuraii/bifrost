@@ -23,6 +23,37 @@ use support::{
 };
 
 #[test]
+fn coordinator_heartbeat_never_overwrites_user_feedback_or_logs() {
+    let mut vm = view();
+    let id = vm.begin_request(Request::UpdateAll, Instant::now());
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: false,
+            error_code: "REMOTE_UPDATES_DISABLED".into(),
+        }),
+    ));
+    let failure = vm.outcome.as_ref().expect("user refusal").text.clone();
+    let log = vm.log.clone();
+
+    // The bridge reserves this ID for out-of-band coordinator heartbeats.
+    vm.apply(answer(
+        u64::MAX,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+    vm.on_not_sent(u64::MAX);
+
+    assert_eq!(
+        vm.outcome.as_ref().expect("user refusal remains").text,
+        failure
+    );
+    assert_eq!(vm.log, log);
+}
+
+#[test]
 fn clipboard_history_actions_map_to_metadata_core_copy_and_clear_requests() {
     assert!(matches!(
         Action::RefreshClipboardHistory.wire(),

@@ -960,38 +960,45 @@ async fn run(
         let sleep = Duration::from_millis(wake.saturating_sub(now_ms).max(1));
 
         enum Step {
-            Frame(Option<Result<wire::Envelope, TransportError>>),
+            Frame,
             Outbound(Option<Outbound>),
             Tick,
             /// `close()` could not use the queue (it was full): the request came out of band.
             Shutdown,
         }
 
+        // Keep the decoded envelope on the stack without inflating every selected event.
+        let mut incoming = None;
         let step = tokio::select! {
-            frame = frames_rx.recv() => Step::Frame(frame),
+            frame = frames_rx.recv() => {
+                incoming = frame;
+                Step::Frame
+            },
             item = outbound.recv() => Step::Outbound(item),
             () = tokio::time::sleep(sleep) => Step::Tick,
             () = shutdown.notified() => Step::Shutdown,
         };
 
         match step {
-            Step::Frame(None) => break LinkDownReason::Io("reader stopped".into()),
-            Step::Frame(Some(Err(error))) => break reason_from(error),
-            Step::Frame(Some(Ok(envelope))) => {
-                match state
-                    .on_frame(
-                        &mut writer,
-                        &mut handshake,
-                        &envelope,
-                        &local_hello,
-                        &reports,
-                    )
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(reason) => break reason,
+            Step::Frame => match incoming {
+                None => break LinkDownReason::Io("reader stopped".into()),
+                Some(Err(error)) => break reason_from(error),
+                Some(Ok(envelope)) => {
+                    match state
+                        .on_frame(
+                            &mut writer,
+                            &mut handshake,
+                            &envelope,
+                            &local_hello,
+                            &reports,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(reason) => break reason,
+                    }
                 }
-            }
+            },
             Step::Outbound(None) => break LinkDownReason::LocalClosed,
             Step::Outbound(Some(first)) => {
                 if let Err(reason) =

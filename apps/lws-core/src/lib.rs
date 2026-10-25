@@ -411,6 +411,16 @@ fn run(args: &Args) -> Result<(), Failure> {
             .get()
             .cloned()
             .ok_or_else(|| Failure::Run("Missing verified update target".into()))?;
+        if session::update::RESTART_TRAY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            if let Err(error) = lws_desktop::start_tray_from(
+                &exe,
+                &session::update::desktop_args(paths),
+                lws_desktop::TRAY_START_TIMEOUT,
+            ) {
+                // Preserve the supervised core even if the desktop tray host is unavailable.
+                tracing::error!(%error, "updated tray did not become ready");
+            }
+        }
         let mut command = std::process::Command::new(exe);
         command.args(std::env::args_os().skip(1));
         #[cfg(unix)]
