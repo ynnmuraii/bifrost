@@ -26,7 +26,7 @@ use input_model::RepeatFilter;
 pub struct X11 {
     ready: Ready,
     capture: Option<X11Capture>,
-    forwarding: bool,
+    source_kind: Option<CaptureKind>,
     pending_hotkeys: std::collections::VecDeque<Event>,
     injector: Option<X11Injector>,
     /// The receiver-takeover detector, when `[input].takeover_detection` armed it.
@@ -143,7 +143,7 @@ impl X11 {
         ready.set_text_clipboard(clipboard.is_some());
         let mut backend = X11 {
             ready,
-            forwarding: false,
+            source_kind: None,
             pending_hotkeys: std::collections::VecDeque::new(),
             capture: Some({
                 let mut capture =
@@ -278,7 +278,7 @@ impl X11 {
     }
 
     pub fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
-        self.forwarding = true;
+        self.source_kind = Some(kind);
         if self.capture.is_none() {
             let capture = X11Capture::new(kind).map_err(|error| error.to_string())?;
             self.capture = Some(capture);
@@ -308,7 +308,7 @@ impl X11 {
     }
 
     pub fn end_capture(&mut self) -> Result<Released, String> {
-        self.forwarding = false;
+        self.source_kind = None;
         if let Some(capture) = &mut self.capture {
             capture.ungrab();
         }
@@ -450,21 +450,15 @@ impl X11 {
             // was seen made the session's `select!` call this again immediately, so a held key
             // — which the X server repeats on its own schedule — spun the poll loop at full CPU
             // instead of its tick.
+            let grab_active = capture.grab_active();
             match drain_capture(
-                || loop {
-                    let event = capture.next_event(Some(Duration::ZERO))?;
-                    if !self.forwarding && matches!(event, Some(CapturedEvent::Input(_))) {
-                        continue;
-                    }
-                    break Ok(event);
+                || {
+                    next_source_capture(self.source_kind, grab_active, || {
+                        capture.next_event(Some(Duration::ZERO))
+                    })
                 },
                 &mut self.repeats,
             ) {
-                // An ungrabbed observation/Temporary edge already reached the
-                // local desktop; never make it a deferred peer input.
-                Ok(Some(Event::Input(
-                    InputEvent::Key { .. } | InputEvent::Button { .. } | InputEvent::Scroll { .. },
-                ))) if !capture.grab_active() => {}
                 Ok(Some(event)) => return Some(event),
                 Ok(None) => {}
                 Err(error) => {
@@ -516,6 +510,35 @@ impl X11 {
             self.injector = Some(injector);
         }
         Ok(self.injector.as_mut().expect("just inserted"))
+    }
+}
+
+/// Armed Observe reports existing raw edges without suppressing or replaying them.
+/// Temporary edges already reached the desktop and must never become deferred peer input.
+fn next_source_capture(
+    kind: Option<CaptureKind>,
+    grab_active: bool,
+    mut next: impl FnMut() -> Result<Option<CapturedEvent>, platform_x11::X11Error>,
+) -> Result<Option<CapturedEvent>, platform_x11::X11Error> {
+    loop {
+        let Some(event) = next()? else {
+            return Ok(None);
+        };
+        if let CapturedEvent::Input(input) = event {
+            if kind.is_none() {
+                continue;
+            }
+            if !grab_active
+                && kind != Some(CaptureKind::Observe)
+                && matches!(
+                    input,
+                    InputEvent::Key { .. } | InputEvent::Button { .. } | InputEvent::Scroll { .. }
+                )
+            {
+                continue;
+            }
+        }
+        return Ok(Some(event));
     }
 }
 
@@ -574,6 +597,75 @@ fn release_counts(injector: &mut X11Injector) -> Released {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn armed_observe_reports_raw_key_and_button_edges_without_a_grab() {
+        let edges = [
+            InputEvent::Key {
+                key: HidKey::keyboard(0x04),
+                state: input_model::KeyState::Down,
+            },
+            InputEvent::Key {
+                key: HidKey::keyboard(0x04),
+                state: input_model::KeyState::Up,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: input_model::KeyState::Down,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: input_model::KeyState::Up,
+            },
+        ];
+        let mut queue = std::collections::VecDeque::from(edges.map(CapturedEvent::Input));
+        let mut repeats = RepeatFilter::new();
+        for expected in edges {
+            let actual = drain_capture(
+                || next_source_capture(Some(CaptureKind::Observe), false, || Ok(queue.pop_front())),
+                &mut repeats,
+            )
+            .expect("raw observation");
+            assert_eq!(actual, Some(Event::Input(expected)));
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn unarmed_and_temporary_raw_edges_cannot_become_peer_input() {
+        for kind in [
+            None,
+            Some(CaptureKind::Temporary),
+            Some(CaptureKind::Remote),
+        ] {
+            let mut queue = std::collections::VecDeque::from([
+                CapturedEvent::Input(InputEvent::Key {
+                    key: HidKey::keyboard(0x04),
+                    state: input_model::KeyState::Down,
+                }),
+                CapturedEvent::Input(InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: input_model::KeyState::Down,
+                }),
+                CapturedEvent::Input(InputEvent::Scroll { h120: 0, v120: 120 }),
+                CapturedEvent::Emergency,
+            ]);
+            assert_eq!(
+                next_source_capture(kind, false, || Ok(queue.pop_front())).unwrap(),
+                Some(CapturedEvent::Emergency),
+            );
+            assert!(queue.is_empty());
+        }
+        let expected = CapturedEvent::Input(InputEvent::Key {
+            key: HidKey::keyboard(0x04),
+            state: input_model::KeyState::Down,
+        });
+        let mut queue = std::collections::VecDeque::from([expected]);
+        assert_eq!(
+            next_source_capture(Some(CaptureKind::Remote), true, || Ok(queue.pop_front())).unwrap(),
+            Some(expected),
+        );
+    }
 
     /// L3: the applied payload's hash, not a one-shot string, survives a clipboard manager
     /// re-owning CLIPBOARD several times.

@@ -34,6 +34,7 @@ use crate::ownership_store::OwnershipStore;
 use crate::routing::{self, AgentSignal, Effect};
 use ipc::clock::{Clock, SuspendDetector, SystemClock};
 
+mod clipboard_follow;
 mod discovery;
 /// The GUI's half of the session: `GuiFrame` requests and the events pushed to the window.
 mod gui;
@@ -90,7 +91,9 @@ enum DirectionalPeerAction {
     Start,
     /// The lease already targets this peer and is past `Preparing`: nothing to do.
     Stay,
-    /// A lease exists towards somebody else, or one is in flight: refuse instead of toggling.
+    /// Return the active source lease, then enter the requested peer without settling locally.
+    Chain,
+    /// A transition is already in flight: refuse instead of replacing it.
     Busy,
 }
 
@@ -110,6 +113,9 @@ fn directional_peer_action(
                 ) =>
         {
             DirectionalPeerAction::Stay
+        }
+        fr::LeaseSlot::Source(lease) if lease.state == fr::SourceState::Remote && !pending => {
+            DirectionalPeerAction::Chain
         }
         _ => DirectionalPeerAction::Busy,
     }
@@ -162,9 +168,21 @@ mod directional_action_tests {
     }
 
     #[test]
-    fn another_peer_or_a_lease_in_flight_is_busy() {
+    fn another_remote_peer_chains_but_a_lease_in_flight_is_busy() {
         assert_eq!(
             directional_peer_action(&lease_to(other(), fr::SourceState::Remote), target(), false),
+            DirectionalPeerAction::Chain
+        );
+        assert_eq!(
+            directional_peer_action(
+                &lease_to(other(), fr::SourceState::Preparing),
+                target(),
+                false
+            ),
+            DirectionalPeerAction::Busy
+        );
+        assert_eq!(
+            directional_peer_action(&lease_to(other(), fr::SourceState::Remote), target(), true),
             DirectionalPeerAction::Busy
         );
         assert_eq!(
@@ -608,6 +626,7 @@ pub struct Session {
     clipboard_links: BTreeMap<NodeId, ([u8; 16], bool, std::net::IpAddr)>,
     /// Session-only transferred texts; never persisted with configuration or diagnostics.
     clipboard_history: crate::clipboard_history::History,
+    clipboard_follow: clipboard_follow::State,
     /// The GUI's endpoint and the fan-out of pushed events.
     gui: crate::gui::Server,
     /// Requests from the connected GUIs, one per turn of the loop.
@@ -773,6 +792,7 @@ impl Session {
             clipboard_source: None,
             clipboard_links: BTreeMap::new(),
             clipboard_history: crate::clipboard_history::History::default(),
+            clipboard_follow: clipboard_follow::State::default(),
             gui: gui_server,
             gui_requests,
             gui_requests_tx,
@@ -1205,6 +1225,7 @@ impl Session {
                 Step::Tick => {
                     self.arm_observation().await;
                     self.clipboard_on_focus().await;
+                    self.service_clipboard_follow(false).await;
                     self.expire_pairing_window();
                     let now = self.now_ms();
                     let expired = prune_layout_requests(&mut self.layout_requests, now);
@@ -1283,6 +1304,10 @@ impl Session {
             tracing::debug!(?timer, "timer expired");
             self.feed(fr::Input::TimerExpired(timer)).await;
         }
+        if self.pending_target.is_some() && matches!(self.router.lease(), fr::LeaseSlot::Idle) {
+            self.track_pointer(&[], CaptureMotionDiagnostics::default())
+                .await;
+        }
 
         if self.agent.is_attached() {
             // Rule 11: `Ping` every `core_silence_ms / 4`, on its own clock.
@@ -1309,6 +1334,9 @@ impl Session {
     /// When the loop must wake next, in `now_ms` millis.
     fn next_deadline(&self, now_ms: u64) -> u64 {
         let mut deadline = now_ms.saturating_add(IDLE_TICK.as_millis() as u64);
+        if let Some(hold) = &self.clipboard_follow.hold {
+            deadline = deadline.min(hold.deadline);
+        }
         if let Some(due) = self.edgefx.due_at() {
             deadline = deadline.min(due.max(now_ms));
         }
@@ -1397,6 +1425,11 @@ impl Session {
 
     /// Performs the side effects of one decision batch, in order.
     async fn apply(&mut self, outputs: Vec<fr::Output>) {
+        if self.router.is_owner() && self.pending_target.is_none() {
+            let target = self.clipboard_destination();
+            let now = self.now_ms();
+            self.clipboard_follow.routing.enter(target, now);
+        }
         for effect in routing::effects(&outputs) {
             match effect {
                 Effect::Send { peer, message } => self.send_to(peer, message).await,
@@ -2541,6 +2574,9 @@ impl Session {
                     .peers
                     .insert(peer, (hello.app_version.clone(), hello.remote_update));
                 self.update_reconnected(peer, &hello.app_version);
+                self.clipboard_follow
+                    .peers
+                    .insert(peer, hello.clipboard_apply_ack);
                 self.layout_connections.insert(peer, connection_id);
                 // A peer string is untrusted: bound it before it is stored or forwarded.
                 let system_name = protocol::sanitize_system_name(&hello.system_name);
@@ -2710,6 +2746,11 @@ impl Session {
                     );
                     let text_clipboard =
                         capabilities.contains(&(protocol::wire::Capability::TextClipboard as i32));
+                    self.clipboard_follow.peers.insert(
+                        peer,
+                        capabilities
+                            .contains(&(protocol::wire::Capability::ClipboardApplyAck as i32)),
+                    );
                     tracing::info!(peer = %peer, text_clipboard, "peer capabilities updated");
                     if let Some((connection_id, previous, remote_ip)) =
                         self.clipboard_links.get_mut(&peer)
@@ -2746,10 +2787,18 @@ impl Session {
                     };
                     self.apply_clipboard(out).await;
                 }
+                transport::convert::Inbound::ClipboardApplied(message) => {
+                    self.on_clipboard_applied(peer, message).await;
+                }
+                transport::convert::Inbound::ClipboardRoute(message) => {
+                    self.on_clipboard_route(peer, message).await;
+                }
             },
             LinkEvent::Down { peer, reason } => {
                 self.layout_connections.remove(&peer);
                 self.clipboard_links.remove(&peer);
+                self.clipboard_follow.peers.remove(&peer);
+                self.clipboard_peer_down(peer, "peer disconnected").await;
                 tracing::warn!(peer = %peer, ?reason, "link down");
                 if let Some(clipboard) = self.clipboard.as_mut() {
                     clipboard.on_link_down(peer).await;
@@ -2824,12 +2873,55 @@ impl Session {
             None => Vec::new(),
         };
         self.apply_clipboard(out).await;
+        if let Some(item) = self.clipboard_follow.routing.carried() {
+            if item.origin == self.node_id {
+                let _ = self
+                    .send_clipboard_route(peer, "carry", item, self.node_id)
+                    .await;
+            }
+        }
     }
 
     /// One event from the clipboard runtime.
     async fn on_clipboard(&mut self, event: crate::clipboard::Inbound) {
+        match &event {
+            crate::clipboard::Inbound::Sent {
+                peer,
+                version,
+                sha256,
+                ..
+            } if !self
+                .clipboard_follow
+                .peers
+                .get(peer)
+                .copied()
+                .unwrap_or(false) =>
+            {
+                self.clipboard_legacy_sent(*peer, *version, *sha256).await;
+            }
+            crate::clipboard::Inbound::Failed {
+                peer,
+                version,
+                sha256,
+                detail,
+            } => {
+                self.finish_clipboard_send(*peer, *version, *sha256, false, detail.clone());
+                self.clipboard_delivery_failed(*peer, *version, *sha256, detail.clone())
+                    .await;
+            }
+            crate::clipboard::Inbound::Down { peer } => {
+                self.clipboard_peer_down(*peer, "clipboard channel disconnected")
+                    .await
+            }
+            _ => {}
+        }
         let out = match (self.clipboard.as_mut(), event) {
-            (_, crate::clipboard::Inbound::Sent { peer, text, secret }) => {
+            (
+                _,
+                crate::clipboard::Inbound::Sent {
+                    peer, text, secret, ..
+                },
+            ) => {
                 vec![crate::clipboard::Out::History {
                     peer,
                     direction: protocol::ipc::ClipboardHistoryDirection::Sent,
@@ -2848,6 +2940,7 @@ impl Session {
                 clipboard.on_channel_down(peer).await;
                 Vec::new()
             }
+            (_, crate::clipboard::Inbound::Failed { .. }) => Vec::new(),
             (None, _) => Vec::new(),
         };
         self.apply_clipboard(out).await;
@@ -2857,6 +2950,39 @@ impl Session {
     async fn apply_clipboard(&mut self, out: Vec<crate::clipboard::Out>) {
         for action in out {
             match action {
+                crate::clipboard::Out::Carried {
+                    origin,
+                    version,
+                    sha256,
+                } => {
+                    self.clipboard_carried(crate::clipboard_routing::Item {
+                        origin,
+                        version,
+                        hash: sha256,
+                    })
+                    .await;
+                }
+                crate::clipboard::Out::CarryCleared => self.clipboard_cleared().await,
+                crate::clipboard::Out::Delivery {
+                    peer,
+                    version,
+                    sha256,
+                } => {
+                    self.clipboard_delivery_started(peer, version, sha256);
+                    let item = crate::clipboard_routing::Item {
+                        origin: self.node_id,
+                        version,
+                        hash: sha256,
+                    };
+                    let _ = self.send_clipboard_route(peer, "deliver", item, peer).await;
+                }
+                crate::clipboard::Out::ApplyPending {
+                    peer,
+                    version,
+                    sha256,
+                } => {
+                    self.clipboard_apply_pending(peer, version, sha256);
+                }
                 crate::clipboard::Out::Grant { peer, message } => {
                     // The grant travels on the input link: the channel it authorises does not
                     // exist until the peer has it.
@@ -2883,7 +3009,8 @@ impl Session {
                             .await;
                     }
                 }
-                crate::clipboard::Out::Agent(frame) => {
+                crate::clipboard::Out::Agent(mut frame) => {
+                    self.prepare_clipboard_agent_frame(&mut frame);
                     if let Err(error) = self.agent.send(frame).await {
                         tracing::warn!(%error, "cannot reach the agent");
                         self.on_agent_lost().await;
@@ -2896,11 +3023,14 @@ impl Session {
                     secret,
                 } => {
                     if !secret {
-                        let name = self
-                            .trust
-                            .get(&peer)
-                            .map(|record| record.display_name.clone())
-                            .unwrap_or_else(|| peer.to_string());
+                        let name = if peer == self.node_id {
+                            self.display_name.clone()
+                        } else {
+                            self.trust
+                                .get(&peer)
+                                .map(|record| record.display_name.clone())
+                                .unwrap_or_else(|| peer.to_string())
+                        };
                         self.clipboard_history.record(direction, name, text, false);
                         self.publish(protocol::ipc::gui_frame::Msg::ClipboardHistory(
                             self.clipboard_history.entries(),
@@ -2977,6 +3107,12 @@ impl Session {
             Msg::Emergency(_) | Msg::LocalInput(_) | Msg::Error(_)
         ) {
             self.disarm_observation();
+            if matches!(&message, Msg::Emergency(_) | Msg::LocalInput(_))
+                || matches!(&message, Msg::Error(error) if matches!(error.code.as_str(),
+                    "CAPTURE_FAILED" | "QUEUE_OVERFLOW" | "INJECTION_FAILED" | "AGENT_LOST"))
+            {
+                self.discard_clipboard_input();
+            }
         }
         static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
         if tracing::enabled!(tracing::Level::DEBUG) && LOG_RATE.allow() {
@@ -3025,6 +3161,10 @@ impl Session {
                 None => Vec::new(),
             };
             self.apply_clipboard(out).await;
+            return Ok(());
+        }
+        if let Msg::ClipboardApplied(applied) = &message {
+            self.on_agent_clipboard_applied(applied).await;
             return Ok(());
         }
         match routing::agent_signal(&message, &mut self.context) {
@@ -3672,8 +3812,13 @@ impl Session {
     /// The FSM does not model captured events: the source integrates them and stamps
     /// them with the lease ([`fr::Message::InputBatch`]), and `transport` owns the
     /// batch sequence (it *is* the envelope `seq`).
-    async fn forward_captured(&mut self, events: Vec<InputEvent>) {
+    async fn forward_captured(&mut self, mut events: Vec<InputEvent>) {
         if events.is_empty() {
+            return;
+        }
+        self.service_clipboard_follow(events.iter().any(clipboard_follow::activation))
+            .await;
+        if self.hold_clipboard_input(&mut events).await {
             return;
         }
         let report = self
@@ -3758,6 +3903,7 @@ impl Session {
         if self.agent_lost_reported {
             return;
         }
+        self.discard_clipboard_input();
         self.hotkeys_agent_lost().await;
         self.edgefx.set_enabled(self.appearance.edge_effects);
         // The agent process is going away with whatever capture it held: a restarted agent
@@ -3777,6 +3923,7 @@ impl Session {
         }
         self.game_guard_signals = protocol::ipc::GameGuardSignals::default();
         self.game_guard_logged = false;
+        self.fail_clipboard_applies().await;
         self.agent_lost_reported = true;
         self.agent.stop().await;
         self.feed(fr::Input::Agent(fr::AgentEvent::AgentLost)).await;
@@ -3897,14 +4044,25 @@ impl Session {
                 }
             }
             Handled::Deferred(verdict) => {
+                let clipboard_send = line.trim_start().starts_with("clipboard-send ");
                 // The loop must not block on a peer: the connection is handed to a writer that
                 // waits for the coordinator's verdict and answers either way. A verdict that
                 // never comes is not invented — `PENDING_VERDICT` says so, and the edit stays
                 // pending on this node.
                 tokio::spawn(async move {
                     let mut stream = stream;
-                    let reply = match tokio::time::timeout(LAYOUT_VERDICT_TIMEOUT, verdict).await {
+                    let timeout = if clipboard_send {
+                        Duration::from_secs(31)
+                    } else {
+                        LAYOUT_VERDICT_TIMEOUT
+                    };
+                    let reply = match tokio::time::timeout(timeout, verdict).await {
                         Ok(Ok(response)) => response.render(),
+                        Ok(Err(_)) | Err(_) if clipboard_send => ctl::Response::Error {
+                            code: "CLIPBOARD_SEND_FAILED".to_owned(),
+                            detail: "clipboard delivery did not complete".to_owned(),
+                        }
+                        .render(),
                         // The request was dropped (core is stopping) or the answer never came:
                         // both mean there is no verdict to report.
                         Ok(Err(_)) | Err(_) => ctl::Response::Error {
@@ -3936,6 +4094,32 @@ impl Session {
         match request {
             ctl::Request::Ping => ctl::Response::Pong.into(),
             ctl::Request::Status => ctl::Response::Status(self.status_line().await).into(),
+            ctl::Request::ClipboardHistory => {
+                let rows = self
+                    .clipboard_history
+                    .entries()
+                    .items
+                    .into_iter()
+                    .map(|row| {
+                        format!(
+                            "id={} direction={} peer={}",
+                            row.id, row.direction, row.peer_name
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                ctl::Response::Status(rows).into()
+            }
+            ctl::Request::ClipboardSend { id, peer } => {
+                match crate::command::resolve_peer(&self.trust, &peer) {
+                    Ok(peer) => self.send_clipboard_history(id, peer).await,
+                    Err(detail) => ctl::Response::Error {
+                        code: "UNKNOWN_PEER".into(),
+                        detail,
+                    }
+                    .into(),
+                }
+            }
             ctl::Request::UpdateAll(target) => match self.start_update_all(target).await {
                 Ok(()) => ctl::Response::Status(self.update_line()),
                 Err(detail) => ctl::Response::Error {
@@ -4045,6 +4229,10 @@ impl Session {
             self.remote_node = Some(target);
         }
         let revision = self.router.topology_revision();
+        let explicit_return =
+            self.router.lease().source().is_some_and(|lease| {
+                lease.state == fr::SourceState::Remote && lease.peer == target
+            });
         let now = self.now_ms();
         let outputs = self.router.handle(
             now,
@@ -4072,6 +4260,9 @@ impl Session {
             _ => None,
         });
         self.apply(outputs).await;
+        if explicit_return && refusal.is_none() {
+            self.service_clipboard_follow(true).await;
+        }
         match refusal {
             Some(reason) => ctl::Response::Error {
                 code: "SWITCH_REFUSED".to_owned(),
@@ -4112,6 +4303,7 @@ impl Session {
             if let Some(input) = input {
                 self.feed(fr::Input::Local(input)).await;
             }
+            self.service_clipboard_follow(true).await;
             return ctl::Response::Switched(PeerRef::new("local"));
         };
         let target = match crate::command::resolve_peer(&self.trust, peer) {
@@ -4126,9 +4318,28 @@ impl Session {
         match directional_peer_action(self.router.lease(), target, self.pending_target.is_some()) {
             DirectionalPeerAction::Stay => ctl::Response::Switched(peer.clone()),
             DirectionalPeerAction::Start => self.switch_to(peer).await,
+            DirectionalPeerAction::Chain => {
+                let lease = self.router.lease().source().expect("active source lease");
+                let returning_peer = lease.peer;
+                let return_position = lease.entry_position.clone();
+                let entry_position = self
+                    .receiver_start_position(target)
+                    .unwrap_or_else(|| geometry::Position::new(String::new(), 0.0, 0.0));
+                self.pending_target = Some((target, entry_position));
+                self.remote_pointer = None;
+                self.remote_node = None;
+                self.feed(fr::Input::Local(fr::LocalInput::SwitchRequest {
+                    trigger: fr::SwitchTrigger::Edge,
+                    target: returning_peer,
+                    entry_position: return_position,
+                    topology_revision: self.router.topology_revision(),
+                }))
+                .await;
+                ctl::Response::Switched(peer.clone())
+            }
             DirectionalPeerAction::Busy => ctl::Response::Error {
                 code: "SWITCH_BUSY".to_owned(),
-                detail: "return to local before selecting another peer".to_owned(),
+                detail: "a destination transition is already in progress".to_owned(),
             },
         }
     }
@@ -4362,8 +4573,10 @@ impl Session {
             "none"
         };
         format!(
-            "{status} game_guard={} game_guard_reason={reason}",
-            reason != "none"
+            "{status} game_guard={} game_guard_reason={reason} clipboard_policy={} clipboard_settle_ms={}",
+            reason != "none",
+            self.clipboard_settings.routing_policy.as_str(),
+            self.clipboard_settings.settle_ms
         )
     }
 }

@@ -71,6 +71,8 @@ skip_secret_marked = true            # маркеры менеджеров па�
 max_bytes = 1048576
 rate_bytes_per_s = 262144
 transfer = "on_offer"                # "on_offer" | "on_focus_enter"
+policy = "follow"                    # "follow": только после перехода ввода; "broadcast": всем узлам
+settle_ms = 700                      # ожидание фокуса; при загрузке ограничивается 200..3000 мс
 
 [ui]
 language = "ru"                      # "ru" | "en"

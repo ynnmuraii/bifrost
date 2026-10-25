@@ -27,6 +27,8 @@
 //! pair-with <address>    -> OK dialing
 //! update-all <version>   -> OK started | ERR <code> <detail>
 //! update-status          -> OK <per-computer progress>
+//! clipboard-history      -> OK <history metadata>
+//! clipboard-send <id> <peer> -> OK sent | ERR <code> <detail>
 //! ```
 //!
 //! `<peer>` is a 64-hex node id or a paired peer's display name. `pair-prompt` and
@@ -100,6 +102,15 @@ pub enum Request {
     UpdateAll(String),
     /// Report the current update batch without starting a check or download.
     UpdateStatus,
+    /// List clipboard history metadata without reading the system selection.
+    ClipboardHistory,
+    /// Address one retained history item to a live trusted computer.
+    ClipboardSend {
+        /// Stable session history identifier.
+        id: u64,
+        /// Trusted target identity or display name.
+        peer: PeerRef,
+    },
     /// Ask for a manual transition to a peer.
     Switch(PeerRef),
     /// Set the destination without toggling; `None` means local input.
@@ -166,6 +177,25 @@ impl Request {
         match verb {
             "status" if argument.is_empty() => Ok(Request::Status),
             "update-status" if argument.is_empty() => Ok(Request::UpdateStatus),
+            "clipboard-history" if argument.is_empty() => Ok(Request::ClipboardHistory),
+            "clipboard-send" => {
+                let (id, peer) = argument
+                    .split_once(char::is_whitespace)
+                    .ok_or_else(|| "clipboard-send needs an item id and peer".to_owned())?;
+                let id = id
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|id| *id != 0)
+                    .ok_or_else(|| "clipboard-send needs a positive item id".to_owned())?;
+                let peer = peer.trim();
+                if peer.is_empty() {
+                    return Err("clipboard-send needs a peer".to_owned());
+                }
+                Ok(Request::ClipboardSend {
+                    id,
+                    peer: PeerRef::new(peer),
+                })
+            }
             "update-all" => {
                 let version = protocol::sanitize_app_version(argument);
                 if version.is_empty() {
@@ -541,6 +571,31 @@ mod tests {
             "update-all 0.2.0 --url https://example.com",
             "update-all 0.2.0; quit",
             "update-status extra",
+        ] {
+            assert!(Request::parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn clipboard_commands_require_a_positive_id_and_destination() {
+        assert_eq!(
+            Request::parse("clipboard-history"),
+            Ok(Request::ClipboardHistory)
+        );
+        assert_eq!(
+            Request::parse("clipboard-send 7 Work laptop"),
+            Ok(Request::ClipboardSend {
+                id: 7,
+                peer: PeerRef::new("Work laptop")
+            })
+        );
+        for line in [
+            "clipboard-history extra",
+            "clipboard-send",
+            "clipboard-send 0 laptop",
+            "clipboard-send invalid laptop",
+            "clipboard-send 7",
+            "clipboard-send 7   ",
         ] {
             assert!(Request::parse(line).is_err(), "{line}");
         }

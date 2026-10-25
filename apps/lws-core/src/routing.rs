@@ -284,7 +284,7 @@ pub fn adopt_capabilities(current: &mut Capabilities, names: &[String]) {
 
 /// The `Hello.capabilities` numbers for the bits the FSM and the product use.
 pub fn capability_bits(capabilities: Capabilities) -> Vec<i32> {
-    let mut bits = Vec::new();
+    let mut bits = vec![wire::Capability::ClipboardApplyAck as i32];
     if capabilities.capture {
         bits.push(wire::Capability::Capture as i32);
     }
@@ -531,7 +531,9 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
         // The clipboard IPC never drives the focus FSM: `ClipboardChanged` is offered to the
         // peers on the clipboard channel and `SetClipboardText` is addressed to the agent, so
         // both are the session loop's business and arrive here only to be classified.
-        Msg::ClipboardChanged(_) | Msg::SetClipboardText(_) => AgentSignal::Ignored,
+        Msg::ClipboardChanged(_) | Msg::SetClipboardText(_) | Msg::ClipboardApplied(_) => {
+            AgentSignal::Ignored
+        }
         // Core → agent frames arriving from the agent are a protocol error; the
         // loop's watchdog still counted the frame as liveness.
         _ => AgentSignal::Fsm(fr::AgentEvent::Error {
@@ -726,6 +728,7 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::PortalGrant(_) => "PortalGrantChanged",
         Msg::SetClipboardText(_) => "SetClipboardText",
         Msg::ClipboardChanged(_) => "ClipboardChanged",
+        Msg::ClipboardApplied(_) => "ClipboardApplied",
         Msg::EdgeFx(_) => "EdgeFx",
         Msg::SetEffects(_) => "SetEffects",
         Msg::SetHotkeys(_) => "SetHotkeys",
@@ -1165,7 +1168,7 @@ mod tests {
             },
         );
         assert_eq!(hello.node_id.len(), 32);
-        assert_eq!(hello.capabilities, vec![1, 2, 3, 10, 11]);
+        assert_eq!(hello.capabilities, vec![12, 1, 2, 3, 10, 11]);
         assert_eq!(hello.app_version, protocol::app_version());
         assert!(hello.can_own);
     }
@@ -1532,7 +1535,7 @@ mod contract_tests {
             emergency_hotkey: true,
         };
 
-        let expected: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let expected: Vec<i32> = vec![12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         assert_eq!(
             capability_bits(capabilities),
             expected,

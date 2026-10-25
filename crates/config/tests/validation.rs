@@ -496,3 +496,32 @@ fn the_pointer_rule_uses_the_documented_challenge_and_heartbeat_only() {
         assert_eq!(config.timing.ipc_heartbeat_ms(), silence / 4);
     }
 }
+
+#[test]
+fn clipboard_routing_defaults_clamps_and_roundtrips() {
+    use config::ClipboardRoutingPolicy;
+
+    let defaults = Config::default();
+    assert_eq!(defaults.clipboard.policy, ClipboardRoutingPolicy::Follow);
+    assert_eq!(defaults.clipboard.settle_ms, 700);
+    let omitted = parse(VALID);
+    assert_eq!(omitted.clipboard, defaults.clipboard);
+
+    for (input, expected) in [
+        (0, 200),
+        (199, 200),
+        (200, 200),
+        (700, 700),
+        (3000, 3000),
+        (3001, 3000),
+        (u32::MAX, 3000),
+    ] {
+        let document = format!("{VALID}[clipboard]\npolicy = \"broadcast\"\nsettle_ms = {input}\n");
+        let config = parse(&document);
+        assert_eq!(config.clipboard.policy, ClipboardRoutingPolicy::Broadcast);
+        assert_eq!(config.clipboard.settle_ms, expected);
+        let encoded = toml::to_string(&config).unwrap();
+        assert_eq!(parse(&encoded).clipboard, config.clipboard);
+    }
+    assert!(Config::from_str(&format!("{VALID}[clipboard]\npolicy = \"unknown\"\n")).is_err());
+}

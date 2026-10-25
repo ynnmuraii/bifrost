@@ -613,7 +613,9 @@ pub enum Key {
     Sent,
     /// «Получено»
     Received,
-    /// «Последние 30 передач текста. Только в памяти; секреты не сохраняются.»
+    /// Local copy, without implying a remote transfer.
+    Copied,
+    /// «Последние 30 текстов. Только в памяти; секреты не сохраняются.»
     TheLast30TextsInMemoryOnlySecretsAreNotKept,
     /// «История пока пуста»
     TheHistoryIsEmptyForNow,
@@ -621,6 +623,14 @@ pub enum Key {
     Transfer,
     /// Direction, peer, age and a localized human-readable size.
     HistoryEntryMetadata,
+    SendClipboardTo,
+    ClipboardSentTo,
+    ClipboardSendFailed,
+    ClipboardRouting,
+    ClipboardFollow,
+    ClipboardBroadcast,
+    ClipboardFollowHint,
+    ClipboardBroadcastHint,
     /// «Очистить историю на этом компьютере?»
     ConfirmClearHistory,
     /// «только что»
@@ -1097,10 +1107,19 @@ const fn ru(key: Key) -> &'static str {
         Key::Copy => "Копировать",
         Key::Sent => "Отправлено",
         Key::Received => "Получено",
-        Key::TheLast30TextsInMemoryOnlySecretsAreNotKept => "Последние 30 передач текста. Только в памяти; секреты не сохраняются.",
+        Key::Copied => "Скопировано",
+        Key::TheLast30TextsInMemoryOnlySecretsAreNotKept => "Последние 30 текстов. Только в памяти; секреты не сохраняются.",
         Key::TheHistoryIsEmptyForNow => "История пока пуста",
         Key::Transfer => "Передача",
         Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age} · {size}",
+        Key::SendClipboardTo => "Отправить на…",
+        Key::ClipboardSentTo => "Текст отправлен на {target}",
+        Key::ClipboardSendFailed => "Не удалось отправить на {target}: {detail}",
+        Key::ClipboardRouting => "Буфер обмена",
+        Key::ClipboardFollow => "За курсором",
+        Key::ClipboardBroadcast => "Всем сразу",
+        Key::ClipboardFollowHint => "Скопированный здесь текст следует за курсором после остановки. Из истории можно отправить его на выбранный компьютер.",
+        Key::ClipboardBroadcastHint => "Скопированный здесь текст отправляется всем подключённым доверенным компьютерам.",
         Key::ConfirmClearHistory => "Очистить историю на этом компьютере?",
         Key::JustNow => "только что",
         Key::AMinuteAgo => "минуту назад",
@@ -1480,10 +1499,19 @@ const fn en(key: Key) -> &'static str {
         Key::Copy => "Copy",
         Key::Sent => "Sent",
         Key::Received => "Received",
+        Key::Copied => "Copied",
         Key::TheLast30TextsInMemoryOnlySecretsAreNotKept => "The last 30 texts. In memory only; secrets are not kept.",
         Key::TheHistoryIsEmptyForNow => "The history is empty for now",
         Key::Transfer => "Transfer",
         Key::HistoryEntryMetadata => "{direction} · {peer_name} · {age} · {size}",
+        Key::SendClipboardTo => "Send to…",
+        Key::ClipboardSentTo => "Text sent to {target}",
+        Key::ClipboardSendFailed => "Could not send to {target}: {detail}",
+        Key::ClipboardRouting => "Clipboard",
+        Key::ClipboardFollow => "Follow cursor",
+        Key::ClipboardBroadcast => "Broadcast",
+        Key::ClipboardFollowHint => "Text copied here follows the cursor when it settles. Send a specific item from history.",
+        Key::ClipboardBroadcastHint => "Text copied here is sent to every connected trusted computer.",
         Key::ConfirmClearHistory => "Clear history on this computer?",
         // English keeps one plural for every count above one, so the three Russian forms read
         // the same here; `plural_form` only ever picks the first and the last of them.
@@ -1787,7 +1815,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 357] = [
+    pub const EVERY: [Key; 366] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -2051,10 +2079,19 @@ mod tests {
         Key::Copy,
         Key::Sent,
         Key::Received,
+        Key::Copied,
         Key::TheLast30TextsInMemoryOnlySecretsAreNotKept,
         Key::TheHistoryIsEmptyForNow,
         Key::Transfer,
         Key::HistoryEntryMetadata,
+        Key::SendClipboardTo,
+        Key::ClipboardSentTo,
+        Key::ClipboardSendFailed,
+        Key::ClipboardRouting,
+        Key::ClipboardFollow,
+        Key::ClipboardBroadcast,
+        Key::ClipboardFollowHint,
+        Key::ClipboardBroadcastHint,
         Key::ConfirmClearHistory,
         Key::JustNow,
         Key::AMinuteAgo,

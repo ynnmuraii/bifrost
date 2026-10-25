@@ -1033,3 +1033,100 @@ fn update_payload_conversion_validates_version_status_and_lease_scope() {
     }));
     assert!(inbound_from_envelope(&envelope).is_err());
 }
+
+#[test]
+fn clipboard_routing_capability_is_optional_in_hello() {
+    let mut hello = wire::Hello {
+        node_id: some_owner().as_bytes().to_vec(),
+        ..Default::default()
+    };
+    assert!(!PeerInfo::from_hello(&hello).unwrap().clipboard_apply_ack);
+    hello
+        .capabilities
+        .push(wire::Capability::ClipboardApplyAck as i32);
+    assert!(PeerInfo::from_hello(&hello).unwrap().clipboard_apply_ack);
+}
+
+#[test]
+fn clipboard_routing_conversion_validates_metadata_and_lease_scope() {
+    use transport::convert::{inbound_from_envelope, Inbound};
+    use wire::envelope::Payload;
+
+    let mut envelope = wire::Envelope {
+        connection_id: vec![1; 16],
+        ..Default::default()
+    };
+    let mut applied = wire::ClipboardApplied {
+        origin_version: 7,
+        sha256: vec![2; 32],
+        ok: true,
+        detail: String::new(),
+    };
+    for ok in [true, false] {
+        applied.ok = ok;
+        envelope.payload = Some(Payload::ClipboardApplied(applied.clone()));
+        assert_eq!(
+            inbound_from_envelope(&envelope).unwrap(),
+            Inbound::ClipboardApplied(applied.clone())
+        );
+    }
+    applied.sha256.pop();
+    envelope.payload = Some(Payload::ClipboardApplied(applied));
+    assert!(inbound_from_envelope(&envelope).is_err());
+
+    for (action, hash_len, target_len, valid) in [
+        ("carry", 32, 0, true),
+        ("clear", 0, 0, true),
+        ("clear", 32, 0, true),
+        ("deliver", 32, 32, true),
+        ("pending", 32, 32, true),
+        ("failed", 32, 32, true),
+        ("addressed", 32, 0, true),
+        ("addressed", 32, 32, true),
+        ("unknown", 32, 0, false),
+        ("carry", 0, 0, false),
+        ("carry", 32, 32, false),
+        ("clear", 0, 32, false),
+        ("deliver", 32, 0, false),
+        ("pending", 32, 0, false),
+        ("pending", 31, 32, false),
+        ("failed", 32, 0, false),
+        ("failed", 31, 32, false),
+        ("addressed", 31, 0, false),
+        ("addressed", 32, 31, false),
+    ] {
+        let route = wire::ClipboardRoute {
+            action: action.into(),
+            origin_node_id: vec![3; 32],
+            origin_version: 7,
+            sha256: vec![2; hash_len],
+            target_node_id: vec![4; target_len],
+        };
+        envelope.payload = Some(Payload::ClipboardRoute(route.clone()));
+        if valid {
+            assert_eq!(
+                inbound_from_envelope(&envelope).unwrap(),
+                Inbound::ClipboardRoute(route)
+            );
+        } else {
+            assert!(inbound_from_envelope(&envelope).is_err());
+        }
+    }
+    let mut route = wire::ClipboardRoute {
+        action: "carry".into(),
+        origin_node_id: vec![3; 31],
+        sha256: vec![2; 32],
+        ..Default::default()
+    };
+    envelope.payload = Some(Payload::ClipboardRoute(route.clone()));
+    assert!(inbound_from_envelope(&envelope).is_err());
+    route.origin_node_id.push(3);
+    envelope.payload = Some(Payload::ClipboardRoute(route));
+    envelope.lease_id = vec![0; 16];
+    assert!(inbound_from_envelope(&envelope).is_err());
+    envelope.payload = Some(Payload::ClipboardApplied(wire::ClipboardApplied {
+        sha256: vec![2; 32],
+        ..Default::default()
+    }));
+    assert!(inbound_from_envelope(&envelope).is_err());
+}

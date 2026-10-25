@@ -646,6 +646,8 @@ impl LinkHandle {
             }
             Outbound::UpdateRequest(request) => self.send_update_request(request).await,
             Outbound::UpdateResult(result) => self.send_update_result(result).await,
+            Outbound::ClipboardApplied(applied) => self.send_clipboard_applied(applied).await,
+            Outbound::ClipboardRoute(route) => self.send_clipboard_route(route).await,
         }
     }
 
@@ -679,6 +681,32 @@ impl LinkHandle {
             .map_err(|error| TransportError::Protocol(error.to_string()))?;
         self.tx
             .send(Outbound::UpdateResult(result))
+            .await
+            .map_err(|_| TransportError::LinkClosed)
+    }
+
+    /// Sends a backend application result; core gates the peer's routing capability.
+    pub async fn send_clipboard_applied(
+        &self,
+        applied: wire::ClipboardApplied,
+    ) -> Result<(), TransportError> {
+        convert::validate_clipboard_applied(&applied)
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        self.tx
+            .send(Outbound::ClipboardApplied(applied))
+            .await
+            .map_err(|_| TransportError::LinkClosed)
+    }
+
+    /// Sends metadata-only routing; core gates the peer's routing capability.
+    pub async fn send_clipboard_route(
+        &self,
+        route: wire::ClipboardRoute,
+    ) -> Result<(), TransportError> {
+        convert::validate_clipboard_route(&route)
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        self.tx
+            .send(Outbound::ClipboardRoute(route))
             .await
             .map_err(|_| TransportError::LinkClosed)
     }
@@ -1345,6 +1373,8 @@ impl LinkState {
             Some(wire::envelope::Payload::CapabilitiesChanged(_))
             | Some(wire::envelope::Payload::UpdateRequest(_))
             | Some(wire::envelope::Payload::UpdateResult(_))
+            | Some(wire::envelope::Payload::ClipboardApplied(_))
+            | Some(wire::envelope::Payload::ClipboardRoute(_))
                 if envelope.connection_id.as_slice() != self.connection_id
                     || envelope.major != protocol::limits::PROTOCOL_MAJOR
                     || !envelope.lease_id.is_empty() =>
@@ -1506,6 +1536,18 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
             Outbound::UpdateResult(result) => {
                 let envelope =
                     state.envelope(wire::envelope::Payload::UpdateResult(result.clone()));
+                write_frame(writer, &envelope).await.map_err(reason_from)?;
+                index += 1;
+            }
+            Outbound::ClipboardApplied(applied) => {
+                let envelope =
+                    state.envelope(wire::envelope::Payload::ClipboardApplied(applied.clone()));
+                write_frame(writer, &envelope).await.map_err(reason_from)?;
+                index += 1;
+            }
+            Outbound::ClipboardRoute(route) => {
+                let envelope =
+                    state.envelope(wire::envelope::Payload::ClipboardRoute(route.clone()));
                 write_frame(writer, &envelope).await.map_err(reason_from)?;
                 index += 1;
             }

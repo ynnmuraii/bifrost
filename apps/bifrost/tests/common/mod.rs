@@ -1486,7 +1486,12 @@ fn spawn_node(
     command
         .arg("--root")
         .arg(&root)
-        .args(["run", "--dry-inject", "--dry-input-events", "4"])
+        .args(["run", "--dry-inject", "--dry-input-events"])
+        .arg(if root.join("run/no-input-events-dry").is_file() {
+            "0"
+        } else {
+            "4"
+        })
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err));

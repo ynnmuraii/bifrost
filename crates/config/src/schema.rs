@@ -133,6 +133,14 @@ closed_enum! {
 }
 
 closed_enum! {
+    /// `clipboard.policy`: follow input focus or broadcast to all clipboard peers.
+    pub enum ClipboardRoutingPolicy {
+        Follow => "follow",
+        Broadcast => "broadcast",
+    } default Follow
+}
+
+closed_enum! {
     /// `ui.language`: the GUI language.
     pub enum Language {
         Ru => "ru",
@@ -883,6 +891,15 @@ pub struct ClipboardConfig {
     /// When an offered payload is requested.
     #[serde(default)]
     pub transfer: ClipboardTransfer,
+    /// Routing policy for newly copied text.
+    #[serde(default)]
+    pub policy: ClipboardRoutingPolicy,
+    /// Focus dwell before following, clamped to 200..=3000 ms while loading.
+    #[serde(
+        default = "default_clipboard_settle_ms",
+        deserialize_with = "deserialize_clipboard_settle_ms"
+    )]
+    pub settle_ms: u32,
 }
 
 impl Default for ClipboardConfig {
@@ -893,6 +910,8 @@ impl Default for ClipboardConfig {
             max_bytes: default_clipboard_max_bytes(),
             rate_bytes_per_s: default_clipboard_rate(),
             transfer: ClipboardTransfer::default(),
+            policy: ClipboardRoutingPolicy::default(),
+            settle_ms: default_clipboard_settle_ms(),
         }
     }
 }
@@ -903,6 +922,16 @@ fn default_clipboard_max_bytes() -> u64 {
 
 fn default_clipboard_rate() -> u64 {
     262_144
+}
+
+fn default_clipboard_settle_ms() -> u32 {
+    700
+}
+
+fn deserialize_clipboard_settle_ms<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    Ok(u32::deserialize(deserializer)?.clamp(200, 3000))
 }
 
 impl ClipboardConfig {

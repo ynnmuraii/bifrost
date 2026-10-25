@@ -117,6 +117,8 @@ pub struct UiState {
     theme_wave: Option<theme_wave::Wave>,
     modal_open: Option<(Modal, f32)>,
     confirm_clear_history: bool,
+    /// History row whose destination menu is expanded.
+    pub clipboard_send_menu: Option<u64>,
 }
 
 impl UiState {
@@ -135,6 +137,7 @@ impl UiState {
             theme_wave: None,
             modal_open: None,
             confirm_clear_history: false,
+            clipboard_send_menu: None,
         }
     }
 

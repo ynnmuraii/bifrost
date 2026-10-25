@@ -1806,3 +1806,65 @@ async fn remote_update_request_and_progress_cross_the_live_control_link_in_order
     b.kill().await;
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn clipboard_routes_and_apply_acks_cross_the_live_control_link() {
+    let root = temp_root("clipboard-routing");
+    let a_identity = Arc::new(identity_at(&root, "a"));
+    let b_identity = Arc::new(identity_at(&root, "b"));
+    let a_id = a_identity.node_id();
+    let b_id = b_identity.node_id();
+    let a_addr = free_address().await;
+    let b_addr = free_address().await;
+    let a = spawn_node("a", a_identity, a_addr, &[(b_id, b_addr)], &[], 4).await;
+    let mut b = spawn_node("b", b_identity, b_addr, &[(a_id, a_addr)], &[a_addr], 4).await;
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+
+    let route = wire::ClipboardRoute {
+        action: "deliver".into(),
+        origin_node_id: a_id.as_bytes().to_vec(),
+        origin_version: 7,
+        sha256: vec![2; 32],
+        target_node_id: b_id.as_bytes().to_vec(),
+    };
+    let applied = wire::ClipboardApplied {
+        origin_version: 7,
+        sha256: vec![2; 32],
+        ok: false,
+        detail: "backend refused selection ownership".into(),
+    };
+    let handle = a.manager.handle(&b_id).await.unwrap();
+    handle.send_clipboard_route(route.clone()).await.unwrap();
+    handle
+        .send_clipboard_applied(applied.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        for expected in [
+            Inbound::ClipboardRoute(route),
+            Inbound::ClipboardApplied(applied),
+        ] {
+            loop {
+                if let LinkEvent::Message { peer, message } =
+                    b.events.recv().await.expect("clipboard routing event")
+                {
+                    if !matches!(
+                        &message,
+                        Inbound::ClipboardRoute(_) | Inbound::ClipboardApplied(_)
+                    ) {
+                        continue;
+                    }
+                    assert_eq!(peer, a_id);
+                    assert_eq!(message, expected);
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("ordered clipboard control messages delivered");
+    a.kill().await;
+    b.kill().await;
+    let _ = std::fs::remove_dir_all(root);
+}

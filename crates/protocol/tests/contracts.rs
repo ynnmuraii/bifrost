@@ -852,3 +852,107 @@ fn update_ipc_fields_are_append_only_and_round_trip() {
         assert_eq!(ipc::GuiFrame::decode(bytes.as_slice()).unwrap(), frame);
     }
 }
+
+#[test]
+fn clipboard_routing_schema_tags_and_roundtrips_are_append_only() {
+    use ipc::gui_frame::Msg;
+    use prost::Message;
+    use wire::envelope::Payload;
+
+    assert_eq!(wire::Capability::ClipboardApplyAck as i32, 12);
+    assert_eq!(protocol::limits::PROTOCOL_MINOR, 3);
+    let ack = ipc::ClipboardApplied {
+        origin_version: 7,
+        sha256: vec![1],
+        ok: true,
+        detail: "d".into(),
+    };
+    let ack_bytes = [8, 7, 18, 1, 1, 24, 1, 34, 1, b'd'];
+    assert_eq!(ack.encode_to_vec(), ack_bytes);
+    let peer_ack = wire::ClipboardApplied {
+        origin_version: ack.origin_version,
+        sha256: ack.sha256.clone(),
+        ok: ack.ok,
+        detail: ack.detail.clone(),
+    };
+    assert_eq!(peer_ack.encode_to_vec(), ack_bytes);
+    let agent = ipc::AgentFrame {
+        msg: Some(ipc::agent_frame::Msg::ClipboardApplied(ack)),
+        ..Default::default()
+    };
+    assert_eq!(&agent.encode_to_vec()[..2], &[0xda, 0x03]); // field 59
+    round_trip(Channel::Ipc, agent);
+
+    let send = ipc::SendClipboardHistoryItem {
+        id: 7,
+        peer_node_id: vec![1],
+    };
+    assert_eq!(send.encode_to_vec(), [8, 7, 18, 1, 1]);
+    let policy = ipc::SetClipboardPolicy {
+        policy: "follow".into(),
+        settle_ms: 700,
+    };
+    assert_eq!(
+        policy.encode_to_vec(),
+        [10, 6, b'f', b'o', b'l', b'l', b'o', b'w', 16, 0xbc, 0x05]
+    );
+    for (msg, tag) in [
+        (Msg::SendClipboardHistoryItem(send), [0x92, 0x03]),
+        (Msg::SetClipboardPolicy(policy), [0x9a, 0x03]),
+    ] {
+        let frame = ipc::GuiFrame {
+            msg: Some(msg),
+            ..Default::default()
+        };
+        assert_eq!(&frame.encode_to_vec()[..2], &tag);
+        round_trip(Channel::Ipc, frame);
+    }
+    let status = ipc::Status {
+        clipboard_policy: "f".into(),
+        clipboard_settle_ms: 700,
+        ..Default::default()
+    };
+    assert_eq!(
+        status.encode_to_vec(),
+        [0xc2, 0x02, 1, b'f', 0xc8, 0x02, 0xbc, 0x05]
+    );
+    round_trip(Channel::Ipc, status);
+
+    let route = wire::ClipboardRoute {
+        action: "carry".into(),
+        origin_node_id: vec![2],
+        origin_version: 7,
+        sha256: vec![3],
+        target_node_id: vec![4],
+    };
+    assert_eq!(
+        route.encode_to_vec(),
+        [10, 5, b'c', b'a', b'r', b'r', b'y', 18, 1, 2, 24, 7, 34, 1, 3, 42, 1, 4]
+    );
+    for (payload, tag) in [
+        (Payload::ClipboardApplied(peer_ack), [0xe2, 0x02]),
+        (Payload::ClipboardRoute(route), [0xea, 0x02]),
+    ] {
+        let envelope = wire::Envelope {
+            payload: Some(payload),
+            ..Default::default()
+        };
+        assert_eq!(&envelope.encode_to_vec()[..2], &tag);
+        round_trip(Channel::InputControl, envelope);
+    }
+}
+
+#[test]
+fn locally_copied_history_direction_is_append_only_and_round_trips() {
+    use prost::Message;
+
+    assert_eq!(ipc::ClipboardHistoryDirection::Sent as i32, 1);
+    assert_eq!(ipc::ClipboardHistoryDirection::Received as i32, 2);
+    assert_eq!(ipc::ClipboardHistoryDirection::Copied as i32, 3);
+    let entry = ipc::ClipboardHistoryEntry {
+        direction: ipc::ClipboardHistoryDirection::Copied as i32,
+        ..Default::default()
+    };
+    assert_eq!(entry.encode_to_vec(), [16, 3]);
+    round_trip(Channel::Ipc, entry);
+}

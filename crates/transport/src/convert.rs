@@ -314,6 +314,10 @@ pub enum Inbound {
     UpdateRequest(wire::UpdateRequest),
     /// Remote update progress or refusal.
     UpdateResult(wire::UpdateResult),
+    /// Backend clipboard application result, scoped by origin version and hash.
+    ClipboardApplied(wire::ClipboardApplied),
+    /// Metadata-only clipboard routing control.
+    ClipboardRoute(wire::ClipboardRoute),
     /// A focus/lease message, already in the FSM's vocabulary.
     Focus(fr::Message),
     /// A layout-document message, in the wire types core works with.
@@ -417,6 +421,22 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
     use wire::envelope::Payload;
 
     match envelope.payload.as_ref() {
+        Some(Payload::ClipboardApplied(applied)) => {
+            validate_clipboard_applied(applied)?;
+            if !envelope.lease_id.is_empty() {
+                return Err(ConvertError::Unsupported(
+                    "clipboard acknowledgement carries a lease",
+                ));
+            }
+            Ok(Inbound::ClipboardApplied(applied.clone()))
+        }
+        Some(Payload::ClipboardRoute(route)) => {
+            validate_clipboard_route(route)?;
+            if !envelope.lease_id.is_empty() {
+                return Err(ConvertError::Unsupported("clipboard route carries a lease"));
+            }
+            Ok(Inbound::ClipboardRoute(route.clone()))
+        }
         Some(Payload::UpdateRequest(request)) => {
             validate_update_version(&request.target_version)?;
             if !envelope.lease_id.is_empty() {
@@ -500,6 +520,43 @@ pub fn validate_update_result(result: &wire::UpdateResult) -> Result<(), Convert
         "pending" | "downloading" | "restarting" | "done" | "refused" | "unreachable"
     ) {
         return Err(ConvertError::Unsupported("unknown update status"));
+    }
+    Ok(())
+}
+
+/// Checks the identity of a completed backend clipboard application.
+pub fn validate_clipboard_applied(applied: &wire::ClipboardApplied) -> Result<(), ConvertError> {
+    if applied.sha256.len() != 32 {
+        return Err(ConvertError::Unsupported(
+            "invalid clipboard acknowledgement hash",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks metadata-only routing before it reaches core's capability and trust policy.
+pub fn validate_clipboard_route(route: &wire::ClipboardRoute) -> Result<(), ConvertError> {
+    if route.origin_node_id.len() != 32 {
+        return Err(ConvertError::Unsupported("invalid clipboard route origin"));
+    }
+    let valid = match route.action.as_str() {
+        "carry" => route.sha256.len() == 32 && route.target_node_id.is_empty(),
+        "clear" => {
+            (route.sha256.is_empty() || route.sha256.len() == 32) && route.target_node_id.is_empty()
+        }
+        "deliver" | "pending" | "failed" => {
+            route.sha256.len() == 32 && route.target_node_id.len() == 32
+        }
+        "addressed" => {
+            route.sha256.len() == 32
+                && (route.target_node_id.is_empty() || route.target_node_id.len() == 32)
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(ConvertError::Unsupported(
+            "invalid clipboard route action, hash or target",
+        ));
     }
     Ok(())
 }
@@ -918,6 +975,8 @@ pub struct PeerInfo {
     pub app_version: String,
     /// Whether the peer advertises support for remote update messages.
     pub remote_update: bool,
+    /// Whether the peer supports addressed routing and backend clipboard application acks.
+    pub clipboard_apply_ack: bool,
     /// `Hello.can_own`.
     pub can_own: bool,
     /// `Hello.owner_serial`.
@@ -958,6 +1017,9 @@ impl PeerInfo {
             remote_update: hello
                 .capabilities
                 .contains(&(wire::Capability::RemoteUpdate as i32)),
+            clipboard_apply_ack: hello
+                .capabilities
+                .contains(&(wire::Capability::ClipboardApplyAck as i32)),
             can_own: hello.can_own,
             owner_serial: hello.owner_serial,
             owner: if hello.owner_node_id.is_empty() {
@@ -1020,7 +1082,8 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::SoftwareRepeat
             | WireCapability::ReceiverTakeover
             | WireCapability::DisplaysChanged
-            | WireCapability::RemoteUpdate => {}
+            | WireCapability::RemoteUpdate
+            | WireCapability::ClipboardApplyAck => {}
         }
     }
     out

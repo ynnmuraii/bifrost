@@ -58,7 +58,8 @@ impl Session {
         };
         for action in actions {
             match action {
-                crate::clipboard::Out::Agent(frame) => {
+                crate::clipboard::Out::Agent(mut frame) => {
+                    self.prepare_clipboard_agent_frame(&mut frame);
                     if let Err(error) = self.agent.send(frame).await {
                         tracing::warn!(%error, "cannot apply clipboard history to the agent");
                         self.on_agent_lost().await;
@@ -81,6 +82,42 @@ impl Session {
                     "a history copy only cancels incoming transfers and sets the agent"
                 ),
             }
+        }
+        ok()
+    }
+    async fn set_clipboard_policy(&mut self, text: &str, settle_ms: u32) -> ipc::OpResult {
+        let policy = match config::ClipboardRoutingPolicy::parse(text) {
+            Ok(policy) => policy,
+            Err(_) => return bad_request(),
+        };
+        let settle_ms = settle_ms.clamp(200, 3000);
+        let path = self.paths.config_file();
+        let saved = tokio::task::spawn_blocking(move || {
+            config::lock::update_locked(&path, |config| {
+                config.clipboard.policy = policy;
+                config.clipboard.settle_ms = settle_ms;
+            })
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            return ipc::OpResult {
+                ok: false,
+                error_code: "CONFIG_SAVE_FAILED".into(),
+            };
+        }
+        self.clipboard_settings.routing_policy = policy;
+        self.clipboard_settings.settle_ms = settle_ms;
+        if let Some(endpoint) = self.clipboard.as_mut() {
+            endpoint.set_routing_policy(policy, settle_ms);
+        }
+        if policy == config::ClipboardRoutingPolicy::Broadcast
+            && self
+                .clipboard_follow
+                .routing
+                .carried()
+                .is_some_and(|item| item.origin == self.node_id)
+        {
+            self.clipboard_cleared().await;
         }
         ok()
     }
@@ -160,6 +197,8 @@ impl Session {
                 .clipboard
                 .as_ref()
                 .is_some_and(crate::clipboard::Clipboard::is_enabled),
+            clipboard_policy: self.clipboard_settings.routing_policy.as_str().to_owned(),
+            clipboard_settle_ms: self.clipboard_settings.settle_ms,
             emergency_hotkey: self.emergency_hotkey.clone(),
             hotkeys: self.hotkey_status.clone(),
             rtt_p95_us: rtt.p95_us,
@@ -633,6 +672,40 @@ impl Session {
             Msg::SetClipboard(set) => {
                 let result = self.set_clipboard(set.enabled).await;
                 answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::SetClipboardPolicy(set) => {
+                let result = self.set_clipboard_policy(&set.policy, set.settle_ms).await;
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::SendClipboardHistoryItem(send) => {
+                let Some(peer) = node_id_of(&send.peer_node_id) else {
+                    return answer(&out, request_id, Msg::OpResult(bad_request())).await;
+                };
+                let handled = self.send_clipboard_history(send.id, peer).await;
+                match handled {
+                    Handled::Reply(response) => {
+                        answer(
+                            &out,
+                            request_id,
+                            Msg::OpResult(clipboard_op_result(response)),
+                        )
+                        .await
+                    }
+                    Handled::Deferred(wait) => {
+                        tokio::spawn(async move {
+                            let response = wait.await.unwrap_or_else(|_| ctl::Response::Error {
+                                code: "CLIPBOARD_SEND_FAILED".into(),
+                                detail: "core stopped before delivery".into(),
+                            });
+                            answer(
+                                &out,
+                                request_id,
+                                Msg::OpResult(clipboard_op_result(response)),
+                            )
+                            .await;
+                        });
+                    }
+                }
             }
             Msg::GetClipboardHistory(_) => {
                 answer(
@@ -1188,6 +1261,9 @@ impl Session {
             let (_, events) = mpsc::channel(1);
             self.clipboard_events = events;
         }
+        if !enabled {
+            self.clipboard_disabled().await;
+        }
         self.clipboard_settings.enabled = enabled;
         self.clipboard_settings.policy.enabled = enabled;
         let status = self.gui_status().await;
@@ -1534,6 +1610,16 @@ fn bad_request() -> ipc::OpResult {
     ipc::OpResult {
         ok: false,
         error_code: "BAD_REQUEST".to_owned(),
+    }
+}
+
+fn clipboard_op_result(response: ctl::Response) -> ipc::OpResult {
+    match response {
+        ctl::Response::Error { code, detail } => ipc::OpResult {
+            ok: false,
+            error_code: format!("{code}: {detail}"),
+        },
+        _ => ok(),
     }
 }
 

@@ -54,6 +54,7 @@ message AgentFrame {
     HotkeysResult hotkeys_result = 56;
     HotkeyPressed hotkey_pressed = 57;
     GameGuardSignals game_guard_signals = 58;
+    ClipboardApplied clipboard_applied = 59;         // sent after validated text reaches the backend
   }
 }
 
@@ -256,8 +257,9 @@ message ClipboardChanged {
                                // no_history | viewer_ignore | kde_secret | portal_secret
   bytes sha256 = 7;            // of the whole payload; present on the last chunk only
 }
+message ClipboardApplied { uint64 origin_version = 1; bytes sha256 = 2; bool ok = 3; string detail = 4; }
 message SetClipboardText {
-  uint64 origin_version = 1;   // the origin node's version, so a payload applied here is not re-offered
+  uint64 origin_version = 1;   // node-local apply sequence; core maps it back to the peer's wire version
   uint32 chunk_index = 2;      // zero-based
   uint32 chunk_count = 3;      // 1..=64; 0 releases the selection and forgets the text
   bytes data = 4;              // UTF-8 text, <= 32768 bytes
@@ -310,6 +312,8 @@ message GuiFrame {
     HotkeysResult hotkeys_result = 46;
     ClipboardHistory clipboard_history = 47;
     ClipboardHistoryItem clipboard_history_item = 48;
+    SendClipboardHistoryItem send_clipboard_history_item = 50;
+    SetClipboardPolicy set_clipboard_policy = 51;
   }
 }
 // Also replays the current open PairingWindow and unanswered PairingPrompt as events
@@ -324,6 +328,7 @@ message PairWith { string address = 1; }
 message PairingAnswer { bytes attempt_id = 1; bool approve = 2; }
 message UpdateTopology { bytes layout_toml = 1; uint64 expected_revision = 2; bytes expected_author = 3; } // any node; coordinator applies (CAS)
 message SetClipboard { bool enabled = 1; }
+message SetClipboardPolicy { string policy = 1; uint32 settle_ms = 2; }
 message SetAppearance { bool edge_effects = 1; bool hide_remote_cursor = 2; } // core saves `[appearance]` under the config lock and pushes SetEffects to the agent at once
 message SetDiscovery { bool enabled = 1; } // core saves under the config lock and updates live discovery
 message RevokePeer { bytes peer_node_id = 1; }
@@ -405,6 +410,8 @@ message Status {
   repeated string game_guard_block_apps = 37;
   repeated string game_guard_allow_apps = 38;
   string game_guard_last_app = 39; // last non-Bifrost foreground app, for Settings after focusing GUI
+  string clipboard_policy = 40;
+  uint32 clipboard_settle_ms = 41;
 }
 // Discovery is not pairing or authentication. Address is the observed IPv4 source
 // plus the advertised input/control port ("<ip>:<port>"), never a beacon-supplied IP.
@@ -529,10 +536,13 @@ message GetClipboardHistory {}
 message GetClipboardHistoryItem { uint64 id = 1; bool copy_to_local = 2; }
 // Returns OpResult; the GUI requests fresh history afterward.
 message ClearClipboardHistory {}
+// Sends directly to an online trusted remote member; returns OpResult, never queues.
+message SendClipboardHistoryItem { uint64 id = 1; bytes peer_node_id = 2; }
 enum ClipboardHistoryDirection {
   CLIPBOARD_HISTORY_DIRECTION_UNSPECIFIED = 0;
   CLIPBOARD_HISTORY_DIRECTION_SENT = 1;
   CLIPBOARD_HISTORY_DIRECTION_RECEIVED = 2;
+  CLIPBOARD_HISTORY_DIRECTION_COPIED = 3; // local copy retained for routing, not yet sent
 }
 message ClipboardHistoryEntry {
   uint64 id = 1;

@@ -11,11 +11,9 @@
 //! 1. The agent reports a local change with `ClipboardChanged` (chunked, ≤32 KiB per frame).
 //!    This module assembles it, asks [`cb::Source`] whether it may be offered, and mints the new
 //!    `origin_version`.
-//! 2. Every member is offered it on **its own** clipboard channel. A channel does not exist yet,
-//!    so the peer first gets a `ClipboardGrant` over the input link — that is the only clipboard
-//!    message the input link carries, because it has to precede the channel it authorises —
-//!    then dials back on `47902` with `ClipboardBind` and receives `ClipboardOffer`, the
-//!    `ClipboardData` chunks and `ClipboardComplete`.
+//! 2. Follow mode carries the offer until the session addresses it to a peer; broadcast mode
+//!    offers it to every member. A peer without a channel first receives `ClipboardGrant`
+//!    over the input link, then dials back with `ClipboardBind`.
 //! 3. A received payload is verified (chunk count, size, SHA-256, UTF-8) and only then handed to
 //!    the agent as `SetClipboardText`. A payload that came from a peer is never offered onward
 //!    ([`cb::Source::apply_from_peer`]), which is what keeps the fan-out from looping.
@@ -54,6 +52,10 @@ pub struct Settings {
     pub enabled: bool,
     /// The pure policy: `skip_secret_marked` and `max_bytes`.
     pub policy: cb::Policy,
+    /// Whether copies follow focus or are offered to every peer.
+    pub routing_policy: config::ClipboardRoutingPolicy,
+    /// Session-owned focus settling delay.
+    pub settle_ms: u32,
     /// `clipboard.rate_bytes_per_s`, handed to the paced sender.
     pub rate_bytes_per_s: u64,
     /// `clipboard.transfer`: ask for an offer as soon as it arrives, or only when focus enters.
@@ -70,6 +72,8 @@ impl Settings {
                 skip_secret_marked: clipboard.skip_secret_marked,
                 max_bytes: clipboard.max_bytes,
             },
+            routing_policy: clipboard.policy,
+            settle_ms: clipboard.settle_ms,
             rate_bytes_per_s: clipboard.rate_bytes_per_s,
             eager: matches!(clipboard.transfer, config::ClipboardTransfer::OnOffer),
         }
@@ -79,6 +83,35 @@ impl Settings {
 /// What the coordinator wants the session to do, in order.
 #[derive(Debug)]
 pub enum Out {
+    /// A validated local copy is available for addressed delivery.
+    Carried {
+        /// Local origin.
+        origin: NodeId,
+        /// Stable source version.
+        version: u64,
+        /// Payload digest.
+        sha256: [u8; 32],
+    },
+    /// A new local copy invalidated the previous carry, even if the new copy was refused.
+    CarryCleared,
+    /// An addressed offer was queued for a peer.
+    Delivery {
+        /// Destination.
+        peer: NodeId,
+        /// Source version used by the offer.
+        version: u64,
+        /// Payload digest used by the completion.
+        sha256: [u8; 32],
+    },
+    /// Associate the following agent apply with its sender before forwarding agent chunks.
+    ApplyPending {
+        /// Sending peer.
+        peer: NodeId,
+        /// Incoming source version.
+        version: u64,
+        /// Verified payload digest.
+        sha256: [u8; 32],
+    },
     /// Send this clipboard message on the **input** link to the peer (a grant).
     Grant {
         /// The peer.
@@ -131,10 +164,25 @@ pub enum Inbound {
     Sent {
         /// The receiving peer.
         peer: NodeId,
+        /// Source version of the addressed offer.
+        version: u64,
+        /// Digest of the sent payload.
+        sha256: [u8; 32],
         /// The original payload, recovered without cloning.
         text: String,
         /// Secret classification captured with the request.
         secret: bool,
+    },
+    /// An addressed transfer could not finish.
+    Failed {
+        /// Destination peer.
+        peer: NodeId,
+        /// Source version of the failed offer.
+        version: u64,
+        /// Digest of the payload.
+        sha256: [u8; 32],
+        /// Failure description without clipboard content.
+        detail: String,
     },
     /// A peer's clipboard channel is accepted, bound and validated; its messages follow.
     Bound {
@@ -175,6 +223,8 @@ pub struct Clipboard {
     offered: BTreeMap<NodeId, (ClipboardMessage, Vec<u8>)>,
     /// The offer a peer made and we held back (`transfer = "on_focus_enter"`).
     pending_request: Option<(NodeId, [u8; 16])>,
+    /// One-shot addressed receive hints, keyed by authenticated sender.
+    directed_request: BTreeMap<NodeId, u64>,
     /// One transfer per offer we asked for, keyed by `offer_id`.
     incoming: BTreeMap<[u8; 16], Incoming>,
     /// Peers whose connection is closed (link down, revoke): frames still queued from them are
@@ -182,9 +232,11 @@ pub struct Clipboard {
     down: BTreeSet<NodeId>,
     /// The agent's chunks for the copy it is currently reporting.
     local: Option<LocalAssembly>,
-    /// The payload of the local clipboard, kept so a member that joins later still gets it.
+    /// Validated local carry; history applies and explicit sends do not replace it.
     payload: Vec<u8>,
-    payload_secret: bool,
+    carried: Option<(cb::Offer, [u8; 32])>,
+    /// Latest addressed delivery per peer, retained through its Request/Cancel.
+    deliveries: BTreeMap<NodeId, ([u8; 16], u64, [u8; 32])>,
     /// The outbound queue capacity a channel runtime is given.
     queue_capacity: usize,
     /// `network.port_clipboard`: the port this node's own listener is bound to, which every
@@ -212,6 +264,7 @@ struct Incoming {
     offer: cb::Offer,
     secret: bool,
     assembler: cb::Assembler,
+    requested: bool,
 }
 
 /// The agent's `ClipboardChanged` chunks, assembled before anything is decided.
@@ -248,11 +301,13 @@ impl Clipboard {
             waiting: BTreeMap::new(),
             offered: BTreeMap::new(),
             pending_request: None,
+            directed_request: BTreeMap::new(),
             incoming: BTreeMap::new(),
             down: BTreeSet::new(),
             local: None,
             payload: Vec::new(),
-            payload_secret: false,
+            carried: None,
+            deliveries: BTreeMap::new(),
             queue_capacity,
             clipboard_port: listen.port(),
         };
@@ -295,6 +350,42 @@ impl Clipboard {
             .await;
     }
 
+    /// Cancels only the addressed wire delivery named by the session.
+    pub async fn cancel_delivery(&mut self, peer: NodeId, wire_version: u64, sha256: [u8; 32]) {
+        let Some(&(offer_id, version, hash)) = self.deliveries.get(&peer) else {
+            return;
+        };
+        if version != wire_version || hash != sha256 {
+            return;
+        }
+        self.deliveries.remove(&peer);
+        for offers in [&mut self.waiting, &mut self.offered] {
+            if offers
+                .get(&peer)
+                .is_some_and(|(offer, _)| offer_id_of(offer) == Some(offer_id))
+            {
+                offers.remove(&peer);
+            }
+        }
+        self.runtime.cancel_transfer(peer, offer_id).await;
+        self.cancel(peer, offer_id, cb::ClipboardError::Superseded)
+            .await;
+    }
+
+    /// Addressing content ends its retained carry without discarding the explicit delivery.
+    pub fn address_carried(&mut self, sha256: [u8; 32]) -> bool {
+        if self
+            .carried
+            .as_ref()
+            .is_none_or(|(_, hash)| *hash != sha256)
+        {
+            return false;
+        }
+        self.carried = None;
+        self.payload.clear();
+        true
+    }
+
     /// Closes the listener and joins every runtime task without changing the OS clipboard.
     ///
     /// Offered and partially received payloads are discarded. The source is returned so the
@@ -314,18 +405,49 @@ impl Clipboard {
         self.settings.enabled
     }
 
+    /// Updates session-owned routing settings without restarting the clipboard runtime.
+    pub fn set_routing_policy(&mut self, policy: config::ClipboardRoutingPolicy, settle_ms: u32) {
+        if self.settings.routing_policy != policy {
+            self.carried = None;
+            self.payload.clear();
+        }
+        self.settings.routing_policy = policy;
+        self.settings.settle_ms = settle_ms;
+    }
+
     /// One `ClipboardChanged` chunk from the agent.
     ///
     /// Nothing is decided — and nothing is offered — until the last chunk arrived with a
     /// matching hash and valid UTF-8.
     pub async fn on_agent_frame(&mut self, message: &ipc::ClipboardChanged) -> Vec<Out> {
+        // Secret chunks must not even enter the local assembly, regardless of legacy policy.
+        let markers = markers_of(&message.markers);
+        if !markers.is_empty() {
+            if message.chunk_index == 0 {
+                tracing::info!(
+                    code = cb::ClipboardError::Secret.code(),
+                    bytes = message.size_bytes,
+                    "clipboard copy not offered"
+                );
+            }
+            self.local = None;
+            return self.clear_carry().await;
+        }
+        let fresh = self.local.as_ref().is_none_or(|assembly| {
+            assembly.version != message.origin_version || assembly.count != message.chunk_count
+        });
         let (payload, markers) = match self.take_chunk(message) {
             Ok(Some(assembled)) => assembled,
-            // Not the last chunk yet: nothing is decided, and nothing is offered.
-            Ok(None) => return Vec::new(),
+            Ok(None) => {
+                return if fresh {
+                    self.clear_carry().await
+                } else {
+                    Vec::new()
+                };
+            }
             Err(error) => {
                 tracing::warn!(?error, "clipboard chunks from the agent refused");
-                return Vec::new();
+                return self.clear_carry().await;
             }
         };
         self.on_local_copy(payload, markers).await
@@ -380,35 +502,24 @@ impl Clipboard {
         Ok(Some((assembly.payload, assembly.markers)))
     }
 
-    /// A local copy: the only path that mints a version, and the only one that offers.
+    /// A local copy supersedes incoming transfers and, when valid, becomes the carry.
     async fn on_local_copy(&mut self, payload: Vec<u8>, markers: Vec<cb::Marker>) -> Vec<Out> {
-        // «Локальное копирование побеждает»: *any* new local copy — even one the policy then
-        // refuses (a password) or a disabled node ignores — supersedes the transfer the wire was
-        // about to deliver, otherwise a late `ClipboardComplete` would apply the peer's payload
-        // over what the user just copied.
-        let mut out: Vec<_> = std::mem::take(&mut self.incoming)
-            .into_iter()
-            .map(|(offer_id, incoming)| Out::Cancel {
-                peer: incoming.peer,
-                offer_id,
-                reason: cb::ClipboardError::Superseded,
-            })
-            .collect();
-        if let Some((peer, offer_id)) = self.pending_request.take() {
-            if !out.iter().any(|event| {
-                matches!(event,
-                    Out::Cancel { peer: p, offer_id: id, .. } if *p == peer && *id == offer_id
-                )
-            }) {
-                out.push(Out::Cancel {
-                    peer,
-                    offer_id,
-                    reason: cb::ClipboardError::Superseded,
-                });
-            }
-        }
-        if !self.settings.enabled {
-            // `CLIPBOARD_DISABLED`: a disabled node never offers anything.
+        let mut out = self.clear_carry().await;
+        let refusal = if !self.settings.enabled {
+            Some(cb::ClipboardError::Disabled)
+        } else if !markers.is_empty() {
+            Some(cb::ClipboardError::Secret)
+        } else if std::str::from_utf8(&payload).is_err() {
+            Some(cb::ClipboardError::Invalid)
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            tracing::info!(
+                code = reason.code(),
+                bytes = payload.len(),
+                "clipboard copy not offered"
+            );
             return out;
         }
         let content = cb::Content {
@@ -439,49 +550,174 @@ impl Clipboard {
             version = offer.version,
             "clipboard offer"
         );
+        let sha256 = cb::sha256(&payload).try_into().expect("SHA-256 length");
+        if matches!(
+            self.settings.routing_policy,
+            config::ClipboardRoutingPolicy::Follow
+        ) {
+            out.push(Out::Carried {
+                origin: offer.origin.into(),
+                version: offer.version,
+                sha256,
+            });
+        }
+        out.push(Out::History {
+            peer: offer.origin.into(),
+            direction: ipc::ClipboardHistoryDirection::Copied,
+            text: std::str::from_utf8(&payload)
+                .expect("validated above")
+                .to_owned(),
+            secret: false,
+        });
         self.payload = payload;
-        self.payload_secret = !markers.is_empty();
-        // «Локальное копирование побеждает» — see the top of this function: the incoming side
-        // was cancelled before the policy ran. The outgoing offers carry the payload this copy
-        // replaced, so they go too.
-        self.offered.clear();
-        out.extend(self.fan_out(offer).await);
+        self.carried = Some((offer.clone(), sha256));
+        if matches!(
+            self.settings.routing_policy,
+            config::ClipboardRoutingPolicy::Broadcast
+        ) {
+            out.extend(self.fan_out(offer).await);
+        }
         out
     }
 
-    /// Offers one copy to every member, opening a channel where there is none.
-    async fn fan_out(&mut self, offer: cb::Offer) -> Vec<Out> {
-        let mut out = Vec::new();
-        for (peer, state) in self.peers.iter_mut() {
-            let peer = *peer;
-            if !state.text_clipboard {
-                // ADR-008 makes the clipboard opt-in **on both sides**: a peer that did not
-                // claim the capability is never offered anything, so the refusal code never has
-                // to travel.
-                tracing::info!(peer = %peer, code = "CLIPBOARD_DISABLED", "clipboard offer skipped");
-                continue;
+    async fn clear_carry(&mut self) -> Vec<Out> {
+        self.payload.clear();
+        self.carried = None;
+        for (peer, (offer_id, _, _)) in std::mem::take(&mut self.deliveries) {
+            self.runtime.cancel_transfer(peer, offer_id).await;
+            self.cancel(peer, offer_id, cb::ClipboardError::Superseded)
+                .await;
+        }
+        self.waiting.clear();
+        self.offered.clear();
+        self.directed_request.clear();
+        // A new local copy wins even while its chunks are still being assembled.
+        // «Локальное копирование побеждает»: *any* new local copy — even one the policy then
+        // refuses (a password) or a disabled node ignores — supersedes the transfer the wire was
+        // about to deliver, otherwise a late `ClipboardComplete` would apply the peer's payload
+        // over what the user just copied.
+        let mut out: Vec<_> = std::mem::take(&mut self.incoming)
+            .into_iter()
+            .map(|(offer_id, incoming)| Out::Cancel {
+                peer: incoming.peer,
+                offer_id,
+                reason: cb::ClipboardError::Superseded,
+            })
+            .collect();
+        if let Some((peer, offer_id)) = self.pending_request.take() {
+            if !out.iter().any(|event| {
+                matches!(event,
+                    Out::Cancel { peer: p, offer_id: id, .. } if *p == peer && *id == offer_id
+                )
+            }) {
+                out.push(Out::Cancel {
+                    peer,
+                    offer_id,
+                    reason: cb::ClipboardError::Superseded,
+                });
             }
-            let message = ClipboardMessage::Offer {
-                offer_id: offer.offer_id,
-                origin_node_id: offer.origin,
-                origin_version: offer.version,
-                mime: cb::MIME.to_owned(),
-                size_bytes: offer.size,
-                secret_marked: self.payload_secret,
-            };
-            if state.channel.is_some() {
-                // A bound channel still follows Offer → Request → Data. Retain this copy
-                // just as on_bound does for the first offer, or its Request has no payload.
-                self.offered
-                    .insert(peer, (message.clone(), self.payload.clone()));
-                let _ = self.runtime.send(peer, message).await;
-                continue;
+        }
+        out.push(Out::CarryCleared);
+        out
+    }
+
+    /// Delivers the logical carry with a fresh wire version, preserving its routing identity.
+    pub async fn deliver_carried(
+        &mut self,
+        peer: NodeId,
+        sha256: [u8; 32],
+    ) -> Result<Vec<Out>, String> {
+        self.require_peer(peer)?;
+        let (_, hash) = self.carried.as_ref().ok_or("no carried clipboard")?;
+        if *hash != sha256 {
+            return Err("carried clipboard changed".to_owned());
+        }
+        let offer = self.mint_delivery_offer(self.payload.len())?;
+        self.offer_to(peer, offer, self.payload.clone(), sha256)
+            .await
+    }
+
+    /// Sends a history item only to the requested peer, preserving the current carry.
+    pub async fn send_text_to(&mut self, peer: NodeId, text: &str) -> Result<Vec<Out>, String> {
+        self.require_peer(peer)?;
+        let offer = self.mint_delivery_offer(text.len())?;
+        let hash = cb::sha256(text.as_bytes())
+            .try_into()
+            .expect("SHA-256 length");
+        self.offer_to(peer, offer, text.as_bytes().to_vec(), hash)
+            .await
+    }
+
+    fn mint_delivery_offer(&mut self, bytes: usize) -> Result<cb::Offer, String> {
+        let offer_id = identity::random16().map_err(|error| error.to_string())?;
+        let from_peer = self.source.applied_from_peer();
+        let offer = self
+            .source
+            .local_copy(
+                &cb::Content::text(bytes as u64),
+                &[],
+                &self.settings.policy,
+                offer_id,
+            )
+            .map_err(|error| format!("clipboard send refused: {error:?}"))?;
+        if from_peer {
+            self.source.apply_from_peer(&offer);
+        }
+        Ok(offer)
+    }
+
+    fn require_peer(&self, peer: NodeId) -> Result<(), String> {
+        if !self.settings.enabled {
+            return Err("clipboard is disabled".to_owned());
+        }
+        if self
+            .peers
+            .get(&peer)
+            .is_none_or(|state| state.parent.is_none() || !state.text_clipboard)
+        {
+            return Err("peer has no live text clipboard link".to_owned());
+        }
+        Ok(())
+    }
+
+    async fn offer_to(
+        &mut self,
+        peer: NodeId,
+        offer: cb::Offer,
+        payload: Vec<u8>,
+        sha256: [u8; 32],
+    ) -> Result<Vec<Out>, String> {
+        self.require_peer(peer)?;
+        if let Some(&(_, version, hash)) = self.deliveries.get(&peer) {
+            self.cancel_delivery(peer, version, hash).await;
+        }
+        let state = &self.peers[&peer];
+        let message = ClipboardMessage::Offer {
+            offer_id: offer.offer_id,
+            origin_node_id: offer.origin,
+            origin_version: offer.version,
+            mime: offer.mime,
+            size_bytes: offer.size,
+            secret_marked: false,
+        };
+        let mut out = vec![Out::Delivery {
+            peer,
+            version: offer.version,
+            sha256,
+        }];
+        self.deliveries
+            .insert(peer, (offer.offer_id, offer.version, sha256));
+        self.waiting.remove(&peer);
+        self.offered.remove(&peer);
+        if state.channel.is_some() {
+            self.offered.insert(peer, (message.clone(), payload));
+            if self.runtime.send(peer, message).await.is_err() {
+                self.offered.remove(&peer);
+                self.deliveries.remove(&peer);
+                return Err("clipboard channel is unavailable".to_owned());
             }
-            let Some(parent) = state.parent else {
-                continue;
-            };
-            // The grant travels on the input link: the peer cannot dial a channel it has not
-            // been told about yet.
+        } else {
+            let parent = state.parent.expect("live peer checked above");
             let (channel_id, token) = self.runtime.issue(parent).await;
             tracing::info!(peer = %peer, "clipboard grant");
             out.push(Out::Grant {
@@ -493,7 +729,29 @@ impl Clipboard {
                     clipboard_port: u32::from(self.clipboard_port),
                 },
             });
-            self.waiting.insert(peer, (message, self.payload.clone()));
+            self.waiting.insert(peer, (message, payload));
+        }
+        Ok(out)
+    }
+
+    /// Offers a local copy to every live clipboard member in broadcast mode.
+    async fn fan_out(&mut self, offer: cb::Offer) -> Vec<Out> {
+        let peers: Vec<_> = self.peers.keys().copied().collect();
+        let hash = self
+            .carried
+            .as_ref()
+            .expect("broadcast carries a local copy")
+            .1;
+        let mut out = Vec::new();
+        for peer in peers {
+            if self.require_peer(peer).is_ok() {
+                if let Ok(events) = self
+                    .offer_to(peer, offer.clone(), self.payload.clone(), hash)
+                    .await
+                {
+                    out.extend(events);
+                }
+            }
         }
         out
     }
@@ -504,7 +762,21 @@ impl Clipboard {
             state.channel = Some(channel_id);
         }
         if let Some((offer, payload)) = self.waiting.remove(&peer) {
-            let _ = self.runtime.send(peer, offer.clone()).await;
+            if self.runtime.send(peer, offer.clone()).await.is_err() {
+                if let Some((_, version, sha256)) = self.deliveries.remove(&peer) {
+                    let _ = self
+                        .runtime
+                        .events
+                        .send(Inbound::Failed {
+                            peer,
+                            version,
+                            sha256,
+                            detail: "clipboard channel is unavailable".to_owned(),
+                        })
+                        .await;
+                }
+                return Vec::new();
+            }
             // The payload waits for the peer's `ClipboardRequest`: Offer → Request → Data is
             // the order `docs/05-protocol.md` fixes, and a receiver under the
             // `on_focus_enter` policy has not asked yet.
@@ -576,23 +848,45 @@ impl Clipboard {
                 );
                 if asked {
                     if let Some((offer, payload)) = self.offered.remove(&peer) {
-                        let secret = matches!(
-                            offer,
-                            ClipboardMessage::Offer {
-                                secret_marked: true,
-                                ..
-                            }
-                        );
-                        let _ = self
+                        let ClipboardMessage::Offer {
+                            origin_version,
+                            secret_marked: secret,
+                            ..
+                        } = offer
+                        else {
+                            unreachable!("only offers are retained");
+                        };
+                        let sha256 = self
+                            .deliveries
+                            .get(&peer)
+                            .filter(|(id, _, _)| *id == offer_id)
+                            .map(|(_, _, hash)| *hash)
+                            .unwrap_or_else(|| {
+                                cb::sha256(&payload).try_into().expect("SHA-256 length")
+                            });
+                        let result = self
                             .runtime
                             .send_transfer(
                                 peer,
                                 offer_id,
+                                (origin_version, sha256),
                                 payload,
                                 self.settings.rate_bytes_per_s,
                                 secret,
                             )
                             .await;
+                        if result.is_err() {
+                            let _ = self
+                                .runtime
+                                .events
+                                .send(Inbound::Failed {
+                                    peer,
+                                    version: origin_version,
+                                    sha256,
+                                    detail: "clipboard channel is unavailable".to_owned(),
+                                })
+                                .await;
+                        }
                     }
                 }
                 Vec::new()
@@ -637,14 +931,23 @@ impl Clipboard {
                         // The payload is now this node's, but it is *not* ours to offer: the
                         // fan-out stops here (ADR-008's echo rule).
                         self.source.apply_from_peer(&incoming.offer);
+                        if self.settings.routing_policy == config::ClipboardRoutingPolicy::Broadcast
+                        {
+                            self.carried = None;
+                            self.payload.clear();
+                        }
                         tracing::info!(
                             peer = %peer,
                             bytes = text.len(),
                             version = incoming.offer.version,
                             "clipboard payload applied"
                         );
-                        self.payload.clear();
-                        let mut out = agent_text_chunks(&text, incoming.offer.version);
+                        let mut out = vec![Out::ApplyPending {
+                            peer,
+                            version: incoming.offer.version,
+                            sha256: sha256.try_into().expect("validated SHA-256 length"),
+                        }];
+                        out.extend(agent_text_chunks(&text, incoming.offer.version));
                         out.push(Out::History {
                             peer,
                             direction: ipc::ClipboardHistoryDirection::Received,
@@ -684,6 +987,23 @@ impl Clipboard {
                     }
                 }
                 self.runtime.cancel_transfer(peer, offer_id).await;
+                if self
+                    .deliveries
+                    .get(&peer)
+                    .is_some_and(|(id, _, _)| *id == offer_id)
+                {
+                    let (_, version, sha256) = self.deliveries.remove(&peer).expect("matched");
+                    let _ = self
+                        .runtime
+                        .events
+                        .send(Inbound::Failed {
+                            peer,
+                            version,
+                            sha256,
+                            detail: format!("clipboard refused: {reason:?}"),
+                        })
+                        .await;
+                }
                 Vec::new()
             }
             ClipboardMessage::Grant { .. } | ClipboardMessage::Bind { .. } => Vec::new(),
@@ -711,7 +1031,7 @@ impl Clipboard {
                 reason: cb::ClipboardError::Disabled,
             }];
         }
-        if secret && self.settings.policy.skip_secret_marked {
+        if secret {
             return vec![Out::Cancel {
                 peer,
                 offer_id,
@@ -762,6 +1082,11 @@ impl Clipboard {
                 reason: cb::ClipboardError::TooLarge,
             }];
         };
+        let directed = self.directed_request.get(&peer) == Some(&origin_version);
+        if directed {
+            self.directed_request.remove(&peer);
+        }
+        let requested = self.settings.eager || directed;
         self.incoming.insert(
             offer_id,
             Incoming {
@@ -769,9 +1094,10 @@ impl Clipboard {
                 offer,
                 secret,
                 assembler,
+                requested,
             },
         );
-        if self.settings.eager {
+        if requested {
             let _ = self
                 .runtime
                 .send(peer, ClipboardMessage::Request { offer_id })
@@ -784,6 +1110,33 @@ impl Clipboard {
         Vec::new()
     }
 
+    /// Requests an addressed delivery regardless of focus, before or after its offer arrives.
+    ///
+    /// The session authenticates the route notice and supplies its actual wire version.
+    pub async fn request_delivery(&mut self, peer: NodeId, wire_version: u64) {
+        if self.require_peer(peer).is_err() {
+            return;
+        }
+        if let Some((&offer_id, incoming)) = self
+            .incoming
+            .iter_mut()
+            .find(|(_, incoming)| incoming.peer == peer && incoming.offer.version == wire_version)
+        {
+            if !incoming.requested {
+                incoming.requested = true;
+                if self.pending_request == Some((peer, offer_id)) {
+                    self.pending_request = None;
+                }
+                let _ = self
+                    .runtime
+                    .send(peer, ClipboardMessage::Request { offer_id })
+                    .await;
+            }
+            return;
+        }
+        self.directed_request.insert(peer, wire_version);
+    }
+
     /// Ask the peer for the offer that was held back, now that focus is here.
     ///
     /// The policy is `[clipboard].transfer`; the caller decides when focus arrived (the
@@ -792,9 +1145,10 @@ impl Clipboard {
         let Some((peer, offer_id)) = self.pending_request.take() else {
             return;
         };
-        if !self.incoming.contains_key(&offer_id) {
+        let Some(incoming) = self.incoming.get_mut(&offer_id) else {
             return;
-        }
+        };
+        incoming.requested = true;
         tracing::info!(peer = %peer, "clipboard request on focus");
         let _ = self
             .runtime
@@ -804,9 +1158,10 @@ impl Clipboard {
 
     /// Applies history locally without minting a network offer, even when sharing is disabled.
     pub(crate) fn history_to_agent(&mut self, text: &str) -> Vec<Out> {
-        self.payload.clear();
-        self.offered.clear();
-        self.waiting.clear();
+        if self.settings.routing_policy == config::ClipboardRoutingPolicy::Broadcast {
+            self.carried = None;
+            self.payload.clear();
+        }
         self.pending_request = None;
         let mut out: Vec<_> = std::mem::take(&mut self.incoming)
             .into_iter()
@@ -820,8 +1175,7 @@ impl Clipboard {
         out
     }
 
-    /// A member's input link came up: remember its connection id and clipboard capability,
-    /// and, if this node holds a payload, offer it so a late joiner converges.
+    /// Remembers a live member; only broadcast mode offers the carry to late joiners.
     pub async fn on_link_up(
         &mut self,
         peer: NodeId,
@@ -834,23 +1188,18 @@ impl Clipboard {
         state.parent = Some(connection_id);
         state.text_clipboard = text_clipboard;
         state.remote_ip = Some(remote_ip);
-        if !self.settings.enabled || self.payload.is_empty() {
+        if !matches!(
+            self.settings.routing_policy,
+            config::ClipboardRoutingPolicy::Broadcast
+        ) {
             return Vec::new();
         }
-        let Ok(offer_id) = identity::random16() else {
+        let Some((offer, hash)) = self.carried.as_ref() else {
             return Vec::new();
         };
-        let content = cb::Content {
-            bytes: self.payload.len() as u64,
-            markers: Vec::new(),
-        };
-        match self
-            .source
-            .local_copy(&content, &[], &self.settings.policy, offer_id)
-        {
-            Ok(offer) => self.fan_out(offer).await,
-            Err(_) => Vec::new(),
-        }
+        self.offer_to(peer, offer.clone(), self.payload.clone(), *hash)
+            .await
+            .unwrap_or_default()
     }
 
     /// A member's input link went down: its clipboard channel goes with it.
@@ -858,6 +1207,8 @@ impl Clipboard {
         self.peers.remove(&peer);
         self.waiting.remove(&peer);
         self.offered.remove(&peer);
+        self.directed_request.remove(&peer);
+        self.deliveries.remove(&peer);
         // What the peer was sending is not delivered after it left (a revoke), even when its
         // last frames are already queued behind this call.
         self.incoming.retain(|_, incoming| incoming.peer != peer);
@@ -873,6 +1224,11 @@ impl Clipboard {
         if let Some(state) = self.peers.get_mut(&peer) {
             state.channel = None;
         }
+        if let Some(&(_, version, sha256)) = self.deliveries.get(&peer) {
+            self.cancel_delivery(peer, version, sha256).await;
+        }
+        self.waiting.remove(&peer);
+        self.offered.remove(&peer);
     }
 }
 
@@ -1222,10 +1578,12 @@ impl Handle {
         &self,
         peer: NodeId,
         offer_id: [u8; 16],
+        identity: (u64, [u8; 32]),
         payload: Vec<u8>,
         rate_bytes_per_s: u64,
         secret: bool,
     ) -> Result<(), ()> {
+        let (version, sha256) = identity;
         let mut inner = self.inner.lock().await;
         let Some(conn) = inner.conns.get_mut(&peer) else {
             return Err(());
@@ -1261,15 +1619,39 @@ impl Handle {
                     .await
                     .is_err()
                 {
+                    let _ = events
+                        .send(Inbound::Failed {
+                            peer,
+                            version,
+                            sha256,
+                            detail: "clipboard channel closed".to_owned(),
+                        })
+                        .await;
                     return;
                 }
                 if !matches!(completion.await, Ok(true)) {
+                    let _ = events
+                        .send(Inbound::Failed {
+                            peer,
+                            version,
+                            sha256,
+                            detail: "clipboard channel write failed".to_owned(),
+                        })
+                        .await;
                     return;
                 }
             }
             tracing::info!(peer = %peer, bytes = size, "clipboard transfer sent");
             if let Ok(text) = String::from_utf8(outgoing.into_payload()) {
-                let _ = events.send(Inbound::Sent { peer, text, secret }).await;
+                let _ = events
+                    .send(Inbound::Sent {
+                        peer,
+                        version,
+                        sha256,
+                        text,
+                        secret,
+                    })
+                    .await;
             }
         });
         if let Some(old) = conn.transfers.insert(offer_id, task.abort_handle()) {
@@ -1544,6 +1926,408 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn cancellation_and_new_local_copy_abort_active_paced_delivery() {
+        for new_copy in [false, true] {
+            let (mut endpoint, root) = started_clipboard("abort-addressed").await;
+            let peer: NodeId = [0x21; 32].into();
+            let offer_id = [0x41; 16];
+            let payload = vec![b'x'; cb::CHUNK_BYTES * 3];
+            let hash = cb::sha256(&payload).try_into().unwrap();
+            let (tx, mut rx) = mpsc::channel::<QueuedMessage>(4);
+            let reader = tokio::spawn(std::future::pending::<()>());
+            let writer = tokio::spawn(std::future::pending::<()>());
+            endpoint.runtime.inner.lock().await.conns.insert(
+                peer,
+                Conn {
+                    generation: 1,
+                    tx,
+                    reader: reader.abort_handle(),
+                    writer: writer.abort_handle(),
+                    transfers: BTreeMap::new(),
+                },
+            );
+            endpoint.deliveries.insert(peer, (offer_id, 1, hash));
+            endpoint
+                .runtime
+                .send_transfer(
+                    peer,
+                    offer_id,
+                    (1, hash),
+                    payload,
+                    cb::CHUNK_BYTES as u64 * 4,
+                    false,
+                )
+                .await
+                .unwrap();
+            let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("first chunk")
+                .expect("channel");
+            assert!(matches!(
+                first.message,
+                ClipboardMessage::Data { chunk_index: 0, .. }
+            ));
+            first.written.unwrap().send(true).unwrap();
+            if new_copy {
+                endpoint
+                    .on_local_copy(b"secret".to_vec(), vec![cb::Marker::ExcludeFromMonitor])
+                    .await;
+            } else {
+                endpoint.cancel_delivery(peer, 1, hash).await;
+            }
+            assert!(!endpoint.runtime.inner.lock().await.conns[&peer]
+                .transfers
+                .contains_key(&offer_id));
+            let cancel = rx.recv().await.expect("peer cancellation");
+            assert!(
+                matches!(cancel.message, ClipboardMessage::Cancel { offer_id: id, .. } if id == offer_id)
+            );
+            assert!(rx.try_recv().is_err(), "no further payload is queued");
+            endpoint.stop().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_delivery_is_exact_and_channel_down_cannot_replay_it() {
+        let (mut endpoint, root) = started_clipboard("cancel-delivery").await;
+        let peer: NodeId = [0x21; 32].into();
+        endpoint
+            .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .await;
+        endpoint
+            .on_local_copy(b"current".to_vec(), Vec::new())
+            .await;
+        let hash = endpoint.carried.as_ref().unwrap().1;
+        endpoint.deliver_carried(peer, hash).await.unwrap();
+        let first_version = endpoint.source.version();
+        endpoint
+            .send_text_to(peer, "new destination text")
+            .await
+            .unwrap();
+        let (_, current_version, current_hash) = endpoint.deliveries[&peer];
+        endpoint.cancel_delivery(peer, first_version, hash).await;
+        assert_eq!(endpoint.waiting[&peer].1, b"new destination text");
+        endpoint
+            .cancel_delivery(peer, current_version, [0; 32])
+            .await;
+        assert!(endpoint.waiting.contains_key(&peer));
+        endpoint
+            .cancel_delivery(peer, current_version, current_hash)
+            .await;
+        assert!(!endpoint.waiting.contains_key(&peer));
+        assert!(!endpoint.offered.contains_key(&peer));
+        assert!(!endpoint.deliveries.contains_key(&peer));
+        endpoint.deliver_carried(peer, hash).await.unwrap();
+        endpoint.on_channel_down(peer).await;
+        assert!(!endpoint.waiting.contains_key(&peer));
+        assert!(!endpoint.offered.contains_key(&peer));
+        assert!(!endpoint.deliveries.contains_key(&peer));
+        endpoint.on_bound(peer, [3; 16]).await;
+        assert!(!endpoint.offered.contains_key(&peer));
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn addressed_receive_hint_handles_both_notice_offer_orders_without_focus() {
+        for hint_first in [true, false] {
+            let (mut endpoint, root) = started_clipboard("directed-receive").await;
+            endpoint.settings.routing_policy = config::ClipboardRoutingPolicy::Broadcast;
+            assert!(!endpoint.settings.eager);
+            let peer: NodeId = [0x21; 32].into();
+            endpoint
+                .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
+                .await;
+            if hint_first {
+                endpoint.request_delivery(peer, 7).await;
+                assert_eq!(endpoint.directed_request.get(&peer), Some(&7));
+            }
+            let offer_id = [0x41; 16];
+            endpoint
+                .on_offer(
+                    peer,
+                    ClipboardMessage::Offer {
+                        offer_id,
+                        origin_node_id: *peer.as_bytes(),
+                        origin_version: 7,
+                        mime: cb::MIME.to_owned(),
+                        size_bytes: 4,
+                        secret_marked: false,
+                    },
+                )
+                .await;
+            if !hint_first {
+                assert_eq!(endpoint.pending_request, Some((peer, offer_id)));
+                endpoint.request_delivery(peer, 7).await;
+            }
+            assert!(endpoint.pending_request.is_none());
+            assert!(
+                endpoint.directed_request.is_empty(),
+                "hint is consumed exactly once"
+            );
+            assert!(endpoint.incoming[&offer_id].requested);
+            // An unrelated offer still follows the configured on-focus policy.
+            endpoint
+                .on_offer(
+                    peer,
+                    ClipboardMessage::Offer {
+                        offer_id: [0x42; 16],
+                        origin_node_id: *peer.as_bytes(),
+                        origin_version: 8,
+                        mime: cb::MIME.to_owned(),
+                        size_bytes: 4,
+                        secret_marked: false,
+                    },
+                )
+                .await;
+            assert_eq!(endpoint.pending_request, Some((peer, [0x42; 16])));
+            assert!(!endpoint.incoming[&[0x42; 16]].requested);
+            endpoint.stop().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn follow_carries_without_fanout_or_late_join_delivery() {
+        let (mut endpoint, root) = started_clipboard("follow-carry").await;
+        let first: NodeId = [0x21; 32].into();
+        let late: NodeId = [0x22; 32].into();
+        endpoint
+            .on_link_up(first, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .await;
+        let out = endpoint.on_local_copy(b"carry".to_vec(), Vec::new()).await;
+        let (offer, hash) = endpoint.carried.clone().expect("carry");
+        assert!(out.iter().any(|event| matches!(event,
+            Out::Carried { origin, version, sha256 }
+                if *origin == NodeId::from(offer.origin) && *version == offer.version && *sha256 == hash
+        )));
+        assert!(out.iter().any(|event| matches!(event,
+            Out::History { direction: ipc::ClipboardHistoryDirection::Copied, text, secret: false, .. }
+                if text == "carry"
+        )));
+        assert!(!out
+            .iter()
+            .any(|event| matches!(event, Out::Grant { .. } | Out::Delivery { .. })));
+        assert!(endpoint.waiting.is_empty());
+        assert!(endpoint.offered.is_empty());
+        assert!(endpoint
+            .on_link_up(late, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .await
+            .is_empty());
+        assert_eq!(endpoint.source.version(), offer.version);
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn broadcast_offers_to_members_and_late_joiners() {
+        let (mut endpoint, root) = started_clipboard("broadcast-carry").await;
+        endpoint.settings.routing_policy = config::ClipboardRoutingPolicy::Broadcast;
+        let first: NodeId = [0x21; 32].into();
+        let late: NodeId = [0x22; 32].into();
+        endpoint
+            .on_link_up(first, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .await;
+        let out = endpoint
+            .on_local_copy(b"broadcast".to_vec(), Vec::new())
+            .await;
+        assert!(out.iter().any(|event| matches!(event, Out::CarryCleared)));
+        assert!(!out.iter().any(|event| matches!(event, Out::Carried { .. })));
+        assert!(out.iter().any(|event| matches!(event,
+            Out::History { direction: ipc::ClipboardHistoryDirection::Copied, text, secret: false, .. }
+                if text == "broadcast"
+        )));
+        assert!(out
+            .iter()
+            .any(|event| matches!(event, Out::Grant { peer, .. } if *peer == first)));
+        assert!(endpoint.waiting.contains_key(&first));
+        let version = endpoint.source.version();
+        let out = endpoint
+            .on_link_up(late, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .await;
+        assert!(out
+            .iter()
+            .any(|event| matches!(event, Out::Grant { peer, .. } if *peer == late)));
+        assert!(endpoint.waiting.contains_key(&late));
+        assert_eq!(endpoint.source.version(), version);
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn addressed_content_cannot_reappear_after_policy_change_and_late_join() {
+        let (mut endpoint, root) = started_clipboard("addressed-lifetime").await;
+        endpoint
+            .on_local_copy(b"current".to_vec(), Vec::new())
+            .await;
+        let hash: [u8; 32] = cb::sha256(b"current").try_into().unwrap();
+        assert!(!endpoint.address_carried([0; 32]));
+        assert!(endpoint.carried.is_some());
+        assert!(endpoint.address_carried(hash));
+        endpoint.settings.routing_policy = config::ClipboardRoutingPolicy::Broadcast;
+        let out = endpoint
+            .on_link_up(
+                [0x21; 32].into(),
+                [1; 16],
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await;
+        assert!(out.is_empty());
+        assert!(endpoint.payload.is_empty());
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn addressed_carry_and_history_send_target_only_one_peer() {
+        let (mut endpoint, root) = started_clipboard("addressed").await;
+        let target: NodeId = [0x21; 32].into();
+        let other: NodeId = [0x22; 32].into();
+        let incapable: NodeId = [0x23; 32].into();
+        for (peer, capable) in [(target, true), (other, true), (incapable, false)] {
+            endpoint
+                .on_link_up(peer, [1; 16], capable, "127.0.0.1".parse().unwrap())
+                .await;
+        }
+        endpoint
+            .on_local_copy(b"current".to_vec(), Vec::new())
+            .await;
+        let (offer, hash) = endpoint.carried.clone().unwrap();
+        assert!(endpoint.deliver_carried(target, [0; 32]).await.is_err());
+        assert!(endpoint.deliver_carried(incapable, hash).await.is_err());
+        let out = endpoint
+            .deliver_carried(target, hash)
+            .await
+            .expect("addressed carry");
+        assert!(out.iter().any(|event| matches!(event,
+            Out::Delivery { peer, version, sha256 } if *peer == target && *version > offer.version && *sha256 == hash
+        )));
+        assert!(endpoint.source.version() > offer.version);
+        assert_eq!(endpoint.waiting.len(), 1);
+        assert_eq!(endpoint.waiting[&target].1, b"current");
+        assert!(!endpoint.waiting.contains_key(&other));
+        endpoint.history_to_agent("local history");
+        assert_eq!(endpoint.payload, b"current");
+        assert_eq!(endpoint.carried, Some((offer.clone(), hash)));
+        assert!(endpoint.source.applied_from_peer());
+        let out = endpoint
+            .send_text_to(target, "old history")
+            .await
+            .expect("history send");
+        assert!(out.iter().any(|event| matches!(event,
+            Out::Delivery { peer, version, .. } if *peer == target && *version > offer.version
+        )));
+        assert_eq!(endpoint.waiting.len(), 1);
+        assert_eq!(endpoint.waiting[&target].1, b"old history");
+        assert_eq!(endpoint.payload, b"current");
+        assert_eq!(endpoint.carried, Some((offer.clone(), hash)));
+        assert!(endpoint.source.applied_from_peer());
+        let history_version = endpoint.source.version();
+        let out = endpoint
+            .deliver_carried(target, hash)
+            .await
+            .expect("carry after old history");
+        assert!(out.iter().any(|event| matches!(event,
+            Out::Delivery { peer, version, sha256 }
+                if *peer == target && *version > history_version && *sha256 == hash
+        )));
+        assert_eq!(endpoint.waiting[&target].1, b"current");
+        assert_eq!(endpoint.carried, Some((offer, hash)));
+        assert!(endpoint.source.applied_from_peer());
+        endpoint.on_link_down(target).await;
+        assert!(endpoint.send_text_to(target, "offline").await.is_err());
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn secret_and_invalid_copies_clear_carry_and_queued_payloads() {
+        let (mut endpoint, root) = started_clipboard("secret-carry").await;
+        endpoint.settings.policy.skip_secret_marked = false;
+        let peer: NodeId = [0x21; 32].into();
+        endpoint
+            .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .await;
+        for secret in [true, false] {
+            endpoint.on_local_copy(b"safe".to_vec(), Vec::new()).await;
+            let hash = endpoint.carried.as_ref().unwrap().1;
+            endpoint.deliver_carried(peer, hash).await.unwrap();
+            let (payload, markers) = if secret {
+                (b"password".to_vec(), vec![cb::Marker::ExcludeFromMonitor])
+            } else {
+                (vec![0xff], Vec::new())
+            };
+            let out = endpoint.on_local_copy(payload, markers).await;
+            assert!(out.iter().any(|event| matches!(event, Out::CarryCleared)));
+            assert!(!out.iter().any(|event| matches!(
+                event,
+                Out::Carried { .. }
+                    | Out::History { .. }
+                    | Out::Grant { .. }
+                    | Out::Delivery { .. }
+            )));
+            assert!(endpoint.carried.is_none());
+            assert!(endpoint.payload.is_empty());
+            assert!(endpoint.waiting.is_empty());
+            assert!(endpoint.offered.is_empty());
+            assert!(endpoint.deliver_carried(peer, hash).await.is_err());
+        }
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn refused_agent_frames_invalidate_carry_before_any_payload_is_stored() {
+        let (mut endpoint, root) = started_clipboard("refused-agent-copy").await;
+        for mode in 0..4 {
+            endpoint
+                .on_local_copy(b"previous carry".to_vec(), Vec::new())
+                .await;
+            let mut changed = ipc::ClipboardChanged {
+                origin_version: 100 + mode,
+                chunk_count: 1,
+                size_bytes: 3,
+                data: b"new".to_vec(),
+                sha256: cb::sha256(b"new"),
+                ..Default::default()
+            };
+            match mode {
+                // An agent-side read refusal or a copy beyond the IPC framing ceiling.
+                0 => {
+                    changed = ipc::ClipboardChanged {
+                        origin_version: changed.origin_version,
+                        ..Default::default()
+                    }
+                }
+                1 => changed.sha256.clear(),
+                2 => changed.markers.push("kde_secret".to_owned()),
+                // Even the first chunk of a new copy makes the previous carry obsolete.
+                3 => {
+                    changed.chunk_count = 2;
+                    changed.size_bytes = 6;
+                    changed.sha256.clear();
+                }
+                _ => unreachable!(),
+            }
+            let out = endpoint.on_agent_frame(&changed).await;
+            assert!(out.iter().any(|event| matches!(event, Out::CarryCleared)));
+            assert!(!out.iter().any(|event| matches!(
+                event,
+                Out::Carried { .. } | Out::History { .. } | Out::Delivery { .. }
+            )));
+            assert!(endpoint.carried.is_none());
+            assert!(endpoint.payload.is_empty());
+            if mode != 3 {
+                assert!(endpoint.local.is_none());
+            }
+        }
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn sent_history_requires_successful_final_write_and_keeps_secret_flag() {
         for (secret, success) in [(false, true), (true, true), (true, false)] {
             let (mut endpoint, root) = started_clipboard("history-sent").await;
@@ -1565,7 +2349,14 @@ mod tests {
             );
             endpoint
                 .runtime
-                .send_transfer(peer, [0x41; 16], b"text".to_vec(), cb::MAX_BYTES, secret)
+                .send_transfer(
+                    peer,
+                    [0x41; 16],
+                    (1, cb::sha256(b"text").try_into().unwrap()),
+                    b"text".to_vec(),
+                    cb::MAX_BYTES,
+                    secret,
+                )
                 .await
                 .expect("sender");
             let data = rx.recv().await.expect("data");
@@ -1588,11 +2379,14 @@ mod tests {
             let event = tokio::time::timeout(Duration::from_millis(100), received.recv()).await;
             if success {
                 assert!(
-                    matches!(event, Ok(Some(Inbound::Sent { peer: sent_peer, text, secret: marked }))
+                    matches!(event, Ok(Some(Inbound::Sent { peer: sent_peer, text, secret: marked, .. }))
                     if sent_peer == peer && text == "text" && marked == secret)
                 );
             } else {
-                assert!(event.is_err(), "a failed final write is never recorded");
+                assert!(matches!(
+                    event,
+                    Ok(Some(Inbound::Failed { version: 1, .. }))
+                ));
             }
             endpoint.stop().await;
             let _ = std::fs::remove_dir_all(root);
@@ -1625,10 +2419,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_received_history_retains_offer_secret_classification() {
-        for secret in [false, true] {
+    async fn verified_received_history_and_apply_metadata_exclude_secrets() {
+        for (policy, secret) in [
+            (config::ClipboardRoutingPolicy::Follow, false),
+            (config::ClipboardRoutingPolicy::Follow, true),
+            (config::ClipboardRoutingPolicy::Broadcast, false),
+            (config::ClipboardRoutingPolicy::Broadcast, true),
+        ] {
             let (mut endpoint, root) = started_clipboard("history-received").await;
             endpoint.settings.policy.skip_secret_marked = false;
+            endpoint.settings.routing_policy = policy;
+            endpoint.on_local_copy(b"local".to_vec(), Vec::new()).await;
             let peer = [0x21; 32].into();
             let offer_id = [0x41; 16];
             endpoint
@@ -1664,10 +2465,24 @@ mod tests {
                     },
                 )
                 .await;
+            if secret {
+                assert!(out.is_empty(), "secret offers are never assembled");
+                assert!(endpoint.incoming.is_empty());
+                endpoint.stop().await;
+                let _ = std::fs::remove_dir_all(root);
+                continue;
+            }
+            assert!(matches!(out.first(), Some(Out::ApplyPending {
+                peer: sender, version: 1, sha256,
+            }) if *sender == peer && sha256.as_slice() == cb::sha256(b"text").as_slice()));
             assert!(out.iter().any(|event| matches!(event, Out::History {
                 peer: sender, direction: ipc::ClipboardHistoryDirection::Received,
                 text, secret: marked,
             } if *sender == peer && text == "text" && *marked == secret)));
+            assert_eq!(
+                endpoint.carried.is_some(),
+                policy == config::ClipboardRoutingPolicy::Follow
+            );
             endpoint.stop().await;
             let _ = std::fs::remove_dir_all(root);
         }
@@ -1707,6 +2522,12 @@ mod tests {
             .send_transfer(
                 peer,
                 offer_id,
+                (
+                    1,
+                    cb::sha256(&vec![b'x'; cb::CHUNK_BYTES * 3])
+                        .try_into()
+                        .unwrap(),
+                ),
                 vec![b'x'; cb::CHUNK_BYTES * 3],
                 cb::CHUNK_BYTES as u64 * 4,
                 false,
@@ -1761,7 +2582,19 @@ mod tests {
         );
         endpoint
             .runtime
-            .send_transfer(peer, offer_id, vec![b'x'; cb::CHUNK_BYTES * 3], 1, false)
+            .send_transfer(
+                peer,
+                offer_id,
+                (
+                    1,
+                    cb::sha256(&vec![b'x'; cb::CHUNK_BYTES * 3])
+                        .try_into()
+                        .unwrap(),
+                ),
+                vec![b'x'; cb::CHUNK_BYTES * 3],
+                1,
+                false,
+            )
             .await
             .expect("another paced transfer");
         endpoint.runtime.close(peer).await;
@@ -2103,6 +2936,8 @@ mod tests {
                 skip_secret_marked: true,
                 max_bytes: cb::MAX_BYTES,
             },
+            routing_policy: config::ClipboardRoutingPolicy::Follow,
+            settle_ms: 700,
             rate_bytes_per_s: 0,
             // `transfer = "on_focus_enter"`: the offer is held, which is the deferred path.
             eager: false,
@@ -2209,6 +3044,8 @@ mod tests {
                 skip_secret_marked: true,
                 max_bytes: cb::MAX_BYTES,
             },
+            routing_policy: config::ClipboardRoutingPolicy::Follow,
+            settle_ms: 700,
             rate_bytes_per_s: 0,
             eager: false,
         };

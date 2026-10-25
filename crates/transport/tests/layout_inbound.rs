@@ -29,6 +29,8 @@ fn round_trip(message: &LayoutMessage) -> LayoutMessage {
         }
         Inbound::UpdateRequest(other) => panic!("expected layout, got update request: {other:?}"),
         Inbound::UpdateResult(other) => panic!("expected layout, got update result: {other:?}"),
+        Inbound::ClipboardApplied(other) => panic!("expected layout, got clipboard ack: {other:?}"),
+        Inbound::ClipboardRoute(other) => panic!("expected layout, got clipboard route: {other:?}"),
     }
 }
 

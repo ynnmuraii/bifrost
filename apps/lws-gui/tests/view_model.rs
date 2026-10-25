@@ -99,6 +99,136 @@ fn coordinator_heartbeat_never_overwrites_user_feedback_or_logs() {
 }
 
 #[test]
+fn clipboard_destinations_are_online_trusted_remote_members_only() {
+    let mut vm = view();
+    let mut status = status_with("LOCAL");
+    status.members.push(protocol::ipc::MemberStatus {
+        node_id: "cc".repeat(32),
+        display_name: "offline".to_owned(),
+        online: false,
+        ..Default::default()
+    });
+    status.discovered_peers.push(protocol::ipc::DiscoveredPeer {
+        node_id: "dd".repeat(32),
+        display_name: "unpaired".to_owned(),
+        ..Default::default()
+    });
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(
+        vm.clipboard_targets()
+            .map(|member| member.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![PEER_NODE],
+    );
+    status.local_node_id.clear();
+    vm.apply(event(Msg::Status(status)));
+    assert_eq!(
+        vm.clipboard_targets().count(),
+        0,
+        "unknown local identity must not become a target"
+    );
+}
+
+#[test]
+fn clipboard_send_waits_for_remote_verdict_without_extending_other_requests() {
+    let mut vm = view();
+    let now = Instant::now();
+    let send = vm.begin_request(Request::SendClipboardHistory, now);
+    let status = vm.begin_request(Request::GetStatus, now);
+    assert_eq!(
+        vm.inflight
+            .iter()
+            .find(|request| request.id == send)
+            .unwrap()
+            .deadline,
+        now + Duration::from_secs(32),
+    );
+    assert_eq!(
+        vm.inflight
+            .iter()
+            .find(|request| request.id == status)
+            .unwrap()
+            .deadline,
+        now + lws_gui::view_model::REQUEST_TIMEOUT,
+    );
+}
+
+#[test]
+fn clipboard_addressed_send_and_policy_requests_preserve_wire_values() {
+    let Some((request, Msg::SendClipboardHistoryItem(item))) = (Action::SendClipboardHistory {
+        id: 42,
+        peer_node_id: PEER_NODE.to_owned(),
+    })
+    .wire() else {
+        panic!("addressed history request");
+    };
+    assert_eq!(request, Request::SendClipboardHistory);
+    assert_eq!(item.id, 42);
+    assert_eq!(
+        item.peer_node_id,
+        lws_gui::view_model::node_id_bytes(PEER_NODE)
+    );
+    for policy in ["follow", "broadcast"] {
+        let Some((request, Msg::SetClipboardPolicy(value))) = (Action::SetClipboardPolicy {
+            policy: policy.to_owned(),
+            settle_ms: 1200,
+        })
+        .wire() else {
+            panic!("persistent routing request");
+        };
+        assert_eq!(request, Request::SetClipboardPolicy);
+        assert_eq!(value.policy, policy);
+        assert_eq!(value.settle_ms, 1200);
+    }
+    let mut vm = view();
+    let id = vm.begin_request(Request::SetClipboardPolicy, Instant::now());
+    verdict(&mut vm, id, None);
+    assert!(vm
+        .take_outgoing()
+        .iter()
+        .any(|(_, msg)| matches!(msg, Msg::GetStatus(_))));
+    let mut status = status_with("LOCAL");
+    status.clipboard_policy = "broadcast".to_owned();
+    status.clipboard_settle_ms = 1200;
+    vm.apply(event(Msg::Status(status)));
+    assert_eq!(vm.status.as_ref().unwrap().clipboard_policy, "broadcast");
+    assert_eq!(vm.status.as_ref().unwrap().clipboard_settle_ms, 1200);
+}
+
+#[test]
+fn clipboard_send_results_keep_destination_name_and_localize_success_and_failure() {
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for ok in [true, false] {
+            let mut vm = view();
+            vm.look.language = lang;
+            vm.apply(event(Msg::Status(status_with("LOCAL"))));
+            let id = vm.begin_clipboard_send(PEER_NODE, Instant::now());
+            let mut changed = status_with("LOCAL");
+            changed.members.clear();
+            vm.apply(event(Msg::Status(changed)));
+            vm.apply(answer(
+                id,
+                Msg::OpResult(protocol::ipc::OpResult {
+                    ok,
+                    error_code: if ok { "" } else { "linux-box: offline" }.to_owned(),
+                }),
+            ));
+            let expected = ui_text::fill_named(
+                lang,
+                if ok {
+                    ui_text::Key::ClipboardSentTo
+                } else {
+                    ui_text::Key::ClipboardSendFailed
+                },
+                &[("target", &"linux-box"), ("detail", &"linux-box: offline")],
+            );
+            assert_eq!(vm.outcome.as_ref().unwrap().text, expected);
+            assert!(vm.inflight.is_empty());
+        }
+    }
+}
+
+#[test]
 fn clipboard_history_actions_map_to_metadata_core_copy_and_clear_requests() {
     assert!(matches!(
         Action::RefreshClipboardHistory.wire(),

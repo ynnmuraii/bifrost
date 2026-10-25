@@ -877,17 +877,17 @@ impl ClipboardState {
 ///
 /// The chunks are assembled by `origin_version`, and the selection is set only after the last
 /// chunk's `sha256` covers the whole payload *and* the bytes are valid UTF-8
-/// (`docs/05-protocol.md`: «проверка sha256 и UTF-8 до установки selection»). Every refusal is
-/// an `AgentError` with a `CLIPBOARD_*` code, and a refusal never touches the selection:
-/// unverified text is never applied. `chunk_count == 0` releases the selection and forgets the
-/// text.
+/// (`docs/05-protocol.md`: «проверка sha256 и UTF-8 до установки selection»). Invalid input
+/// returns `AgentError` without touching the selection. Once validated text reaches the
+/// backend, `ClipboardApplied` reports its result with the same version and hash.
+/// `chunk_count == 0` releases the selection and forgets the text, without an apply ack.
 async fn handle_set_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
     link: &mut AgentLink<S>,
     backend: &mut Backend,
     state: &mut ClipboardState,
     set: &ipc::SetClipboardText,
 ) -> anyhow::Result<()> {
-    if !backend.clipboard_available() {
+    if set.chunk_count == 0 && !backend.clipboard_available() {
         // ADR-008: the clipboard is opt-in on both sides and separate from the KVM, so a node
         // that cannot own a selection says so instead of dropping the frame silently.
         state.inbound = None;
@@ -948,8 +948,23 @@ async fn handle_set_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
                             "clipboard applied from core"
                         );
                         state.applied(set.origin_version);
+                        link.send(Msg::ClipboardApplied(ipc::ClipboardApplied {
+                            origin_version: set.origin_version,
+                            sha256: set.sha256.clone(),
+                            ok: true,
+                            detail: String::new(),
+                        }))
+                        .await?;
                     }
-                    Err(detail) => send_error(link, "CLIPBOARD_APPLY_FAILED", &detail).await?,
+                    Err(detail) => {
+                        link.send(Msg::ClipboardApplied(ipc::ClipboardApplied {
+                            origin_version: set.origin_version,
+                            sha256: set.sha256.clone(),
+                            ok: false,
+                            detail,
+                        }))
+                        .await?;
+                    }
                 },
             }
         }
@@ -965,8 +980,26 @@ async fn report_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
     match change {
         Ok(Some(change)) => send_clipboard_change(link, state, change).await,
         Ok(None) => Ok(()),
-        Err(error) => send_error(link, error.code(), "the local clipboard text was refused").await,
+        Err(error) => {
+            invalidate_clipboard_carry(link, state).await?;
+            send_error(link, error.code(), "the local clipboard text was refused").await
+        }
     }
+}
+
+/// A refused local copy still supersedes the old carry, without disclosing its payload.
+async fn invalidate_clipboard_carry<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentLink<S>,
+    state: &mut ClipboardState,
+) -> anyhow::Result<()> {
+    link.send(Msg::ClipboardChanged(ipc::ClipboardChanged {
+        origin_version: state.next_version(),
+        // Core rejects this non-payload frame and clears the previous carry.
+        chunk_count: 0,
+        ..Default::default()
+    }))
+    .await?;
+    Ok(())
 }
 
 /// Reports one local clipboard change to core, in frames that fit an IPC frame.
@@ -982,8 +1015,8 @@ async fn send_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
     let bytes = change.text.len();
     // The 1 MiB limit is *core's* policy — it is the side that can answer `CLIPBOARD_TOO_LARGE`
     // and that knows `[clipboard].max_bytes` — so a copy over it is still reported. What the
-    // agent owns is the framing: `MAX_CHUNKS` frames of `CHUNK_BYTES` each, beyond which the
-    // payload has no wire form at all and is dropped rather than sent truncated.
+    // agent owns is the framing: beyond `MAX_CHUNKS` frames of `CHUNK_BYTES` each,
+    // only a payload-free invalidation reaches core.
     let ceiling = clipboard_wire::MAX_CHUNKS as usize * clipboard_wire::CHUNK_BYTES;
     if bytes > ceiling {
         tracing::warn!(
@@ -991,7 +1024,7 @@ async fn send_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
             limit = ceiling,
             "clipboard payload beyond the IPC framing ceiling; not offering it"
         );
-        return Ok(());
+        return invalidate_clipboard_carry(link, state).await;
     }
     let version = state.next_version();
     let frames = clipboard_wire::frames(&change.text, version, &change.markers);
@@ -1395,6 +1428,15 @@ mod tests {
         .await
         .expect("refusal is reported");
         match harness.recv().await {
+            Msg::ClipboardChanged(changed) => {
+                assert_eq!(changed.origin_version, 1);
+                assert_eq!(changed.chunk_count, 0);
+                assert!(changed.data.is_empty());
+                assert!(changed.sha256.is_empty());
+            }
+            other => panic!("expected carry invalidation, got {other:?}"),
+        }
+        match harness.recv().await {
             Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_TOO_LARGE"),
             other => panic!("expected clipboard refusal, got {other:?}"),
         }
@@ -1750,6 +1792,66 @@ mod tests {
         std::fs::read_to_string(path).expect("the dry clipboard file must be readable")
     }
 
+    async fn assert_applied(harness: &mut Harness, version: u64, text: &[u8]) {
+        match harness.recv().await {
+            Msg::ClipboardApplied(applied) => {
+                assert_eq!(applied.origin_version, version);
+                assert_eq!(applied.sha256, clipboard::sha256(text));
+                assert!(applied.ok, "{}", applied.detail);
+                assert!(applied.detail.is_empty());
+            }
+            other => panic!("expected ClipboardApplied, got {other:?}"),
+        }
+        harness.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn correctly_hashed_non_utf8_text_is_never_applied_or_acknowledged() {
+        let dir = temp_dir("invalid-utf8");
+        let out_path = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        let data = vec![0xff, 0xfe];
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 44,
+                chunk_index: 0,
+                chunk_count: 1,
+                sha256: clipboard::sha256(&data),
+                data,
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_INVALID"),
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+        assert_eq!(read(&out_path), "");
+        assert_eq!(harness.clipboard.applied_version, 0);
+        harness.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn a_backend_failure_is_acknowledged_without_advancing_the_applied_version() {
+        let dir = temp_dir("apply-failed");
+        let out_path = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        std::fs::remove_file(&out_path).unwrap();
+        std::fs::create_dir(&out_path).unwrap();
+
+        harness.send(set_text(43, "cannot apply")).await;
+        match harness.recv().await {
+            Msg::ClipboardApplied(applied) => {
+                assert_eq!(applied.origin_version, 43);
+                assert_eq!(applied.sha256, clipboard::sha256(b"cannot apply"));
+                assert!(!applied.ok);
+                assert!(!applied.detail.is_empty());
+                assert!(!applied.detail.contains("cannot apply"));
+            }
+            other => panic!("expected ClipboardApplied, got {other:?}"),
+        }
+        assert_eq!(harness.clipboard.applied_version, 0);
+        harness.quiet().await;
+    }
+
     /// A dry session with a clipboard: what core applies lands on the selection, the payload
     /// itself is not reported back as a local copy, and the next user copy is — numbered above
     /// the version core used (ADR-008's echo rule at the agent's edge).
@@ -1772,7 +1874,7 @@ mod tests {
         assert_eq!(read(&out_path), "", "a fresh selection is empty");
 
         harness.send(set_text(41, "from core")).await;
-        harness.quiet().await;
+        assert_applied(&mut harness, 41, b"from core").await;
         assert_eq!(read(&out_path), "from core", "the selection holds it");
         assert_eq!(harness.clipboard.applied_version, 41);
 
@@ -1831,7 +1933,7 @@ mod tests {
         let out_path = dir.join("out.txt");
         let mut harness = Harness::dry(Some(dir)).await;
         harness.send(set_text(5, "held")).await;
-        harness.quiet().await;
+        assert_applied(&mut harness, 5, b"held").await;
         assert_eq!(read(&out_path), "held");
 
         harness
@@ -1885,6 +1987,7 @@ mod tests {
             Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_INVALID"),
             other => panic!("expected an AgentError, got {other:?}"),
         }
+        harness.quiet().await;
         assert_eq!(read(&out_path), "", "nothing out of order is applied");
 
         // The right shape, the wrong hash.
@@ -1902,6 +2005,7 @@ mod tests {
             other => panic!("expected an AgentError, got {other:?}"),
         }
         assert_eq!(read(&out_path), "", "unverified text is never applied");
+        harness.quiet().await;
         assert_eq!(
             harness.clipboard.applied_version, 0,
             "a refused transfer does not move the version"
@@ -1944,15 +2048,15 @@ mod tests {
                 sha256: hash,
             }))
             .await;
-        harness.quiet().await;
+        assert_applied(&mut harness, 10, b"abcdef").await;
         assert_eq!(read(&out_path), "abcdef");
         assert_eq!(harness.clipboard.applied_version, 10);
     }
 
-    /// A session with no clipboard at all answers `CLIPBOARD_DISABLED`, never polls, and
-    /// advertises nothing (ADR-008: opt-in on both sides).
+    /// A session with no clipboard advertises nothing and acknowledges a validated payload
+    /// with the backend's `CLIPBOARD_DISABLED` failure.
     #[tokio::test]
-    async fn without_a_clipboard_the_frame_is_refused_with_clipboard_disabled() {
+    async fn without_a_clipboard_validated_text_receives_a_failure_ack() {
         let mut harness = Harness::new().await;
         assert!(!harness.backend.clipboard_available());
         assert!(
@@ -1974,9 +2078,16 @@ mod tests {
 
         harness.send(set_text(1, "x")).await;
         match harness.recv().await {
-            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_DISABLED"),
-            other => panic!("expected an AgentError, got {other:?}"),
+            Msg::ClipboardApplied(applied) => {
+                assert_eq!(applied.origin_version, 1);
+                assert_eq!(applied.sha256, clipboard::sha256(b"x"));
+                assert!(!applied.ok);
+                assert!(applied.detail.contains("CLIPBOARD_DISABLED"));
+            }
+            other => panic!("expected ClipboardApplied, got {other:?}"),
         }
+        assert_eq!(harness.clipboard.applied_version, 0);
+        harness.quiet().await;
     }
 
     /// Markers travel with every chunk of a multi-chunk payload and the hash only with the
@@ -2038,9 +2149,9 @@ mod tests {
     /// Two different ceilings, deliberately: a payload over the *policy's* 1 MiB is reported
     /// anyway (core is the side that answers `CLIPBOARD_TOO_LARGE`, and it knows
     /// `[clipboard].max_bytes`), while one beyond the *framing* ceiling — `MAX_CHUNKS` frames
-    /// of `CHUNK_BYTES` each — has no wire form at all and is dropped rather than truncated.
+    /// of `CHUNK_BYTES` each — invalidates the old carry without sending its payload.
     #[tokio::test]
-    async fn the_policy_limit_is_reported_and_the_framing_ceiling_is_dropped() {
+    async fn the_policy_limit_is_reported_and_the_framing_ceiling_invalidates_carry() {
         let mut harness = Harness::new().await;
 
         // 1 MiB + 1: over the policy, inside the framing. It goes out whole, so core can name
@@ -2080,7 +2191,7 @@ mod tests {
         }
         assert_eq!(seen, 32, "33 frames, the last one ending the loop");
 
-        // Beyond the framing ceiling: nothing is numbered, so the next change is version 2.
+        // Beyond the framing ceiling: only an invalidation is numbered as version 2.
         let ceiling = clipboard_wire::MAX_CHUNKS as usize * clipboard_wire::CHUNK_BYTES;
         send_clipboard_change(
             &mut harness.agent,
@@ -2091,7 +2202,16 @@ mod tests {
             },
         )
         .await
-        .expect("dropping it is not an error");
+        .expect("invalidating it is not an error");
+        match harness.recv().await {
+            Msg::ClipboardChanged(changed) => {
+                assert_eq!(changed.origin_version, 2);
+                assert_eq!(changed.chunk_count, 0);
+                assert!(changed.data.is_empty());
+                assert!(changed.sha256.is_empty());
+            }
+            other => panic!("expected carry invalidation, got {other:?}"),
+        }
         harness.quiet().await;
         send_clipboard_change(
             &mut harness.agent,
@@ -2104,7 +2224,7 @@ mod tests {
         .await
         .expect("the frame goes out");
         match harness.recv().await {
-            Msg::ClipboardChanged(changed) => assert_eq!(changed.origin_version, 2),
+            Msg::ClipboardChanged(changed) => assert_eq!(changed.origin_version, 3),
             other => panic!("expected ClipboardChanged, got {other:?}"),
         }
     }
@@ -2187,15 +2307,19 @@ mod tests {
                 core.send(set_text(9, "from core"))
                     .await
                     .expect("the frame goes out");
-                let mut applied = false;
-                for _ in 0..100 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    if read(&out_path) == "from core" {
-                        applied = true;
-                        break;
-                    }
+                match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {
+                    Ok(Ok(frame)) => match frame.msg.expect("a payload") {
+                        Msg::ClipboardApplied(applied) => {
+                            assert_eq!(applied.origin_version, 9);
+                            assert_eq!(applied.sha256, clipboard::sha256(b"from core"));
+                            assert!(applied.ok, "{}", applied.detail);
+                            assert_eq!(read(&out_path), "from core");
+                        }
+                        other => panic!("expected ClipboardApplied, got {other:?}"),
+                    },
+                    Ok(Err(error)) => panic!("the link ended: {error}"),
+                    Err(_) => panic!("the backend application was never acknowledged"),
                 }
-                assert!(applied, "the payload core sent lands on the selection");
 
                 std::fs::write(&in_path, "a second copy").expect("in.txt is writable");
                 match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {

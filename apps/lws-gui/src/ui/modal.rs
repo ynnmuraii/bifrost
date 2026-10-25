@@ -48,6 +48,7 @@ pub fn draw(
     }) else {
         st.modal_open = None;
         st.confirm_clear_history = false;
+        st.clipboard_send_menu = None;
         ui.ctx().data_mut(|d| {
             d.remove::<crate::view_model::hotkeys::Editor>(egui::Id::new("hotkey-editor"));
         });
@@ -801,6 +802,9 @@ fn clip_body(
                 let direction =
                     match protocol::ipc::ClipboardHistoryDirection::try_from(entry.direction) {
                         Ok(protocol::ipc::ClipboardHistoryDirection::Sent) => text(lang, Key::Sent),
+                        Ok(protocol::ipc::ClipboardHistoryDirection::Copied) => {
+                            text(lang, Key::Copied)
+                        }
                         Ok(protocol::ipc::ClipboardHistoryDirection::Received) => {
                             text(lang, Key::Received)
                         }
@@ -840,10 +844,53 @@ fn clip_body(
                         if widgets::small_button(ui, pal, text(lang, Key::Copy), connected)
                             .clicked()
                         {
+                            st.clipboard_send_menu = None;
                             actions.push(Action::CopyClipboardHistory(entry.id));
+                        }
+                        let has_targets = vm.clipboard_targets().next().is_some();
+                        if widgets::small_button(
+                            ui,
+                            pal,
+                            text(lang, Key::SendClipboardTo),
+                            connected && has_targets,
+                        )
+                        .clicked()
+                        {
+                            st.clipboard_send_menu =
+                                (st.clipboard_send_menu != Some(entry.id)).then_some(entry.id);
                         }
                     });
                 });
+                if st.clipboard_send_menu == Some(entry.id) {
+                    if connected && vm.clipboard_targets().next().is_some() {
+                        ui.horizontal_wrapped(|ui| {
+                            widgets::hint(ui, pal, text(lang, Key::SendClipboardTo));
+                            for member in vm.clipboard_targets() {
+                                let fallback;
+                                let label = if member.display_name.is_empty() {
+                                    fallback = crate::view_model::short_id(&member.node_id);
+                                    fallback.as_str()
+                                } else {
+                                    member.display_name.as_str()
+                                };
+                                if widgets::small_button(ui, pal, label, true).clicked() {
+                                    actions.push(Action::SendClipboardHistory {
+                                        id: entry.id,
+                                        peer_node_id: member.node_id.clone(),
+                                    });
+                                    st.clipboard_send_menu = None;
+                                }
+                            }
+                            if widgets::small_button(ui, pal, text(lang, Key::Cancel), true)
+                                .clicked()
+                            {
+                                st.clipboard_send_menu = None;
+                            }
+                        });
+                    } else {
+                        st.clipboard_send_menu = None;
+                    }
+                }
                 // Flatten only the displayed preview; Copy still uses the stored entry id.
                 let preview: String = entry
                     .preview
@@ -1083,6 +1130,55 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::wrapped(ui, error, 13.0, fam::sans(), pal.ink);
         }
     });
+    row_with_top_padding(
+        ui,
+        pal,
+        text(lang, Key::ClipboardRouting),
+        false,
+        0.0,
+        |ui| {
+            let status = vm.status.as_ref();
+            let broadcast = status.is_some_and(|status| status.clipboard_policy == "broadcast");
+            let pending = vm
+                .inflight
+                .iter()
+                .any(|request| request.request == crate::view_model::Request::SetClipboardPolicy);
+            let toggle = ui.add_enabled_ui(vm.connection.is_connected() && !pending, |ui| {
+                if let Some(i) = widgets::seg(
+                    ui,
+                    pal,
+                    &[
+                        text(lang, Key::ClipboardFollow),
+                        text(lang, Key::ClipboardBroadcast),
+                    ],
+                    usize::from(broadcast),
+                ) {
+                    let settle_ms = status.map_or(700, |status| {
+                        if status.clipboard_settle_ms == 0 {
+                            700
+                        } else {
+                            status.clipboard_settle_ms.clamp(200, 3000)
+                        }
+                    });
+                    actions.push(Action::SetClipboardPolicy {
+                        policy: if i == 0 { "follow" } else { "broadcast" }.to_owned(),
+                        settle_ms,
+                    });
+                }
+            });
+            toggle.response.on_hover_text(text(
+                lang,
+                if broadcast {
+                    Key::ClipboardBroadcastHint
+                } else {
+                    Key::ClipboardFollowHint
+                },
+            ));
+            if pending {
+                widgets::hint(ui, pal, text(lang, Key::Applying));
+            }
+        },
+    );
     row_with_top_padding(ui, pal, text(lang, Key::LanDiscovery), false, 0.0, |ui| {
         let pending = vm.settings.discovery_pending;
         let toggle = ui.add_enabled_ui(vm.connection.is_connected() && pending.is_none(), |ui| {

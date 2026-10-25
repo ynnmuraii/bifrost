@@ -748,6 +748,30 @@ impl Dry {
 
     async fn poll_control(&mut self) -> Option<InputEvent> {
         let dir = self.control_dir.as_ref()?;
+        // File-only HID input for process tests; the dry backend never installs OS hooks.
+        let keys_path = dir.join("keys");
+        if let Ok(text) = std::fs::read_to_string(&keys_path) {
+            let keys: Option<Vec<_>> = text
+                .lines()
+                .map(|line| {
+                    let (usage, state) = line.split_once(' ')?;
+                    let state = match state {
+                        "down" => input_model::KeyState::Down,
+                        "up" => input_model::KeyState::Up,
+                        _ => return None,
+                    };
+                    Some(InputEvent::Key {
+                        key: HidKey::keyboard(usage.parse().ok()?),
+                        state,
+                    })
+                })
+                .collect();
+            if let Some(keys) = keys {
+                if std::fs::remove_file(keys_path).is_ok() && self.capturing {
+                    self.motion.extend(keys.into_iter().map(Some));
+                }
+            }
+        }
         if std::fs::remove_file(dir.join("click")).is_ok() {
             if self.capturing {
                 self.motion.push_front(Some(InputEvent::Button {
@@ -799,7 +823,9 @@ impl Dry {
         // Drain a control-generated event before generating another held-pointer sample.
         if matches!(
             self.motion.front(),
-            Some(Some(InputEvent::Button { .. } | InputEvent::Scroll { .. }))
+            Some(Some(
+                InputEvent::Button { .. } | InputEvent::Scroll { .. } | InputEvent::Key { .. }
+            ))
         ) {
             return self.motion.pop_front().flatten();
         }
@@ -839,6 +865,8 @@ impl Dry {
         let Some(clipboard) = self.clipboard.as_mut() else {
             return Err("CLIPBOARD_DISABLED: this dry agent has no --dry-clipboard-dir".to_owned());
         };
+        std::fs::write(&clipboard.out_path, text.unwrap_or_default())
+            .map_err(|error| format!("cannot write the dry clipboard selection: {error}"))?;
         match text {
             Some(text) => {
                 clipboard.text = text.to_owned();
@@ -851,7 +879,6 @@ impl Dry {
                 clipboard.applied = None;
             }
         }
-        clipboard.write_out();
         tracing::info!(
             bytes = clipboard.text.len(),
             released = text.is_none(),
@@ -1279,8 +1306,19 @@ impl Backend {
                     // test cannot infer from a balanced pair of edges.
                     let mut buttons = String::new();
                     let mut wheels = String::new();
+                    let mut keys = String::new();
                     for event in events {
                         match event {
+                            InputEvent::Key { key, state } => {
+                                let text =
+                                    dry.clipboard.as_ref().map_or("", |clip| clip.text.as_str());
+                                let _ = writeln!(
+                                    keys,
+                                    "{} {state:?} {:?}",
+                                    key.usage,
+                                    clipboard::sha256(text.as_bytes())
+                                );
+                            }
                             InputEvent::Button { button, state } => {
                                 let _ = writeln!(buttons, "{button:?} {state:?}");
                             }
@@ -1293,6 +1331,7 @@ impl Backend {
                     for (name, lines) in [
                         ("injected-buttons.txt", buttons),
                         ("injected-wheel.txt", wheels),
+                        ("injected-keys.txt", keys),
                     ] {
                         if lines.is_empty() {
                             continue;
@@ -1865,6 +1904,48 @@ mod tests {
         assert!(!dry.capturing, "release precedes emergency delivery");
         assert_eq!(read(&dir.join("capture-mode.txt")), "Observe");
         std::fs::remove_dir_all(dir).expect("remove test controls");
+    }
+
+    #[tokio::test]
+    async fn dry_keys_preserve_edges_and_snapshot_only_the_dry_clipboard() {
+        let dir = temp_dir("key-clipboard-snapshot");
+        let mut dry = dry_with_clipboard(&dir);
+        dry.control_dir = Some(dir.clone());
+        dry.capturing = true;
+        write(&dir.join("keys"), "224 down\n25 down\n25 up\n224 up\n");
+        let mut events = Vec::new();
+        for (usage, state) in [
+            (224, input_model::KeyState::Down),
+            (25, input_model::KeyState::Down),
+            (25, input_model::KeyState::Up),
+            (224, input_model::KeyState::Up),
+        ] {
+            let expected = InputEvent::Key {
+                key: HidKey::keyboard(usage),
+                state,
+            };
+            let event = dry.poll_control().await.expect("file-only key edge");
+            assert_eq!(event, expected);
+            events.push(event);
+        }
+        assert!(!dir.join("keys").exists());
+        dry.set_clipboard(Some("applied before keys"))
+            .expect("dry clipboard");
+        let mut backend = Backend::Dry(Box::new(dry));
+        let result = backend.inject(&events).await;
+        assert_eq!(result.applied, events.len());
+        assert!(result.os_error.is_empty());
+        let hash = clipboard::sha256(b"applied before keys");
+        assert_eq!(
+            read(&dir.join("injected-keys.txt")),
+            format!("224 Down {hash:?}\n25 Down {hash:?}\n25 Up {hash:?}\n224 Up {hash:?}\n"),
+        );
+        assert_eq!(read(&dir.join("out.txt")), "applied before keys");
+        assert!(
+            !dir.join("in.txt").exists(),
+            "no simulated user copy was made"
+        );
+        std::fs::remove_dir_all(dir).expect("remove dry controls");
     }
 
     /// The dry hook: `out.txt` mirrors the selection, a payload applied from core is never

@@ -29,11 +29,19 @@ mod common;
 
 use std::time::Duration;
 
-use common::{enable_clipboard, write_clipboard_rate, Cluster, Harness};
+use common::{write_clipboard_rate, Cluster, Harness};
 
 /// How long a copy may take to settle. The default rate is 256 KiB/s, so a 1 MiB payload
 /// legitimately needs about four seconds on top of the round trip.
 const SETTLE: Duration = Duration::from_secs(60);
+
+/// Legacy fan-out assertions opt into broadcast; shared harness defaults stay follow.
+fn enable_clipboard(root: &std::path::Path) {
+    common::append_config(
+        root,
+        "\n[clipboard]\nenabled = true\npolicy = \"broadcast\"\nskip_secret_marked = true\n",
+    );
+}
 
 /// Two nodes, both with the clipboard enabled and linked.
 fn two_nodes_with_clipboard() -> Harness {
@@ -131,7 +139,11 @@ fn clipboard_address(node: &common::Node) -> std::net::SocketAddr {
 #[test]
 fn gui_opt_in_starts_default_off_clipboards_and_off_closes_the_listener() {
     let _serial = common::serial();
-    let harness = Harness::start(false, false);
+    let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
+        for root in [a_root, b_root] {
+            common::append_config(root, "\n[clipboard]\npolicy = \"broadcast\"\n");
+        }
+    });
     harness.wait_linked();
     let address = clipboard_address(&harness.b);
     assert!(std::net::TcpStream::connect(address).is_err());
@@ -160,7 +172,11 @@ fn gui_opt_in_starts_default_off_clipboards_and_off_closes_the_listener() {
 #[test]
 fn ten_gui_on_off_cycles_release_sockets_and_keep_peer_delivery_working() {
     let _serial = common::serial();
-    let harness = Harness::start(false, false);
+    let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
+        for root in [a_root, b_root] {
+            common::append_config(root, "\n[clipboard]\npolicy = \"broadcast\"\n");
+        }
+    });
     harness.wait_linked();
     toggle_clipboard(&harness.a, true);
     let address = clipboard_address(&harness.b);
@@ -408,6 +424,9 @@ fn a_transition_during_a_mebibyte_transfer_is_not_delayed() {
     let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
         write_clipboard_rate(a_root, 64 * 1024);
         write_clipboard_rate(b_root, 64 * 1024);
+        for root in [a_root, b_root] {
+            common::append_config(root, "policy = \"broadcast\"\n");
+        }
     });
     harness.wait_linked();
 
@@ -566,7 +585,7 @@ fn history_lists_both_directions_reassembles_unicode_mebibyte_and_clears() {
         .b
         .wait_for_clipboard(&large, SETTLE)
         .expect("large transfer");
-    wait_history(&harness.a, 1);
+    wait_history(&harness.a, 2);
     wait_history(&harness.b, 1);
     let reply = "Ответ обратно — café 🙂";
     harness.b.copy_to_clipboard(reply);
@@ -592,7 +611,18 @@ fn history_lists_both_directions_reassembles_unicode_mebibyte_and_clears() {
             ],
         ),
     ] {
-        let items = wait_history(node, 2);
+        let all = wait_history(node, 3);
+        assert_eq!(
+            all.iter()
+                .filter(|item| item.direction == ClipboardHistoryDirection::Copied as i32)
+                .count(),
+            1,
+            "a valid local copy is retained before any completed transfer"
+        );
+        let items: Vec<_> = all
+            .into_iter()
+            .filter(|item| item.direction != ClipboardHistoryDirection::Copied as i32)
+            .collect();
         for (item, direction) in items.iter().zip(directions) {
             assert_eq!(item.direction, direction as i32);
             assert_eq!(item.peer_name, peer);
@@ -614,7 +644,7 @@ fn history_lists_both_directions_reassembles_unicode_mebibyte_and_clears() {
         Msg::ClearClipboardHistory(protocol::ipc::ClearClipboardHistory {}),
     );
     assert!(history(&harness.a).is_empty());
-    assert_eq!(history(&harness.b).len(), 2, "clear is node-local");
+    assert_eq!(history(&harness.b).len(), 3, "clear is node-local");
     assert_eq!(harness.a.clipboard_text().as_deref(), Some(reply));
 }
 
@@ -629,15 +659,15 @@ fn copying_history_is_local_only_with_sharing_enabled_or_disabled() {
         .b
         .wait_for_clipboard(old, SETTLE)
         .expect("first transfer");
-    let entry = wait_history(&harness.a, 1).remove(0);
+    let entry = wait_history(&harness.a, 2).remove(0);
     let current = "peer must keep this newer text";
     harness.b.copy_to_clipboard(current);
     harness
         .a
         .wait_for_clipboard(current, SETTLE)
         .expect("newer transfer");
-    wait_history(&harness.a, 2);
-    wait_history(&harness.b, 2);
+    wait_history(&harness.a, 3);
+    wait_history(&harness.b, 3);
     for enabled in [true, false] {
         if !enabled {
             toggle_clipboard(&harness.a, false);
@@ -675,21 +705,21 @@ fn copying_history_is_local_only_with_sharing_enabled_or_disabled() {
         );
         assert_eq!(
             history(&harness.a).len(),
-            2,
+            3,
             "local copy creates no transfer"
         );
-        assert_eq!(history(&harness.b).len(), 2);
+        assert_eq!(history(&harness.b).len(), 3);
     }
 }
 
 #[test]
-fn transferred_secrets_are_excluded_from_sent_and_received_history() {
+fn secret_override_still_refuses_transfers_and_history() {
     let _serial = common::serial();
     let (harness, ()) = Harness::start_with(false, false, |a_root, b_root| {
         for root in [a_root, b_root] {
             common::append_config(
                 root,
-                "\n[clipboard]\nenabled = true\nskip_secret_marked = false\n",
+                "\n[clipboard]\nenabled = true\npolicy = \"broadcast\"\nskip_secret_marked = false\n",
             );
         }
     });
@@ -698,11 +728,11 @@ fn transferred_secrets_are_excluded_from_sent_and_received_history() {
         (&harness.a, &harness.b, "secret A → B"),
         (&harness.b, &harness.a, "secret B → A"),
     ] {
+        let previous = receiver.clipboard_text();
         sender.copy_to_clipboard_marked(secret, &["kde_secret"]);
-        receiver
-            .wait_for_clipboard(secret, SETTLE)
-            .expect("configured secret transfer");
-        // A subsequent successful transfer is a barrier for the sender's completion event.
+        wait_log(sender, "CLIPBOARD_SECRET");
+        assert_clipboard_stays(receiver, previous.as_deref());
+        // A successful public transfer also proves refusing the secret left the channel usable.
         let ordinary = format!("public after {secret}");
         sender.copy_to_clipboard(&ordinary);
         receiver
@@ -710,11 +740,317 @@ fn transferred_secrets_are_excluded_from_sent_and_received_history() {
             .expect("public transfer");
     }
     for node in [&harness.a, &harness.b] {
-        let items = wait_history(node, 2);
+        let items: Vec<_> = wait_history(node, 3)
+            .into_iter()
+            .filter(|item| {
+                item.direction != protocol::ipc::ClipboardHistoryDirection::Copied as i32
+            })
+            .collect();
         assert_eq!(items[0].preview, "public after secret B → A");
         assert_eq!(items[1].preview, "public after secret A → B");
         for item in items {
             assert!(history_text(node, item.id).starts_with("public after "));
         }
     }
+}
+
+/// No automatic synthetic keys: only file controls can settle a follow destination.
+fn follow_cluster(label: &str) -> Cluster {
+    let (cluster, ()) = Cluster::start_with(label, |roots, _, _| {
+        for root in roots {
+            common::enable_clipboard(root);
+            common::append_config(root, "settle_ms = 3000\n");
+            std::fs::create_dir_all(root.join("run/control-dry")).expect("dry controls");
+            std::fs::write(root.join("run/no-input-events-dry"), b"0")
+                .expect("disable automatic synthetic key edges");
+        }
+    });
+    cluster.wait_mesh(Duration::from_secs(40));
+    cluster
+}
+
+fn send_history(source: &common::Node, id: u64, target: &common::Node) -> protocol::ipc::OpResult {
+    use protocol::ipc::gui_frame::Msg;
+    let target_id = (0..target.id.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&target.id[index..index + 2], 16).expect("node hex"))
+        .collect();
+    let replies = history_exchange(
+        source,
+        Msg::SendClipboardHistoryItem(protocol::ipc::SendClipboardHistoryItem {
+            id,
+            peer_node_id: target_id,
+        }),
+        |frame| matches!(frame.msg, Some(Msg::OpResult(_))),
+    );
+    let Some(Msg::OpResult(result)) = replies.into_iter().last().expect("send reply").msg else {
+        panic!("expected send result");
+    };
+    result
+}
+
+fn wait_log(node: &common::Node, marker: &str) {
+    let deadline = std::time::Instant::now() + SETTLE;
+    while !node.log().contains(marker) {
+        assert!(std::time::Instant::now() < deadline, "missing {marker}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_clipboard_stays(node: &common::Node, expected: Option<&str>) {
+    // A negative delivery assertion must outlast the configured 3 s dwell.
+    let deadline = std::time::Instant::now() + Duration::from_millis(3500);
+    while std::time::Instant::now() < deadline {
+        assert_eq!(node.clipboard_text().as_deref(), expected);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn follow_crosses_three_nodes_without_touching_transit_and_returns_a_remote_copy() {
+    let _serial = common::serial();
+    let cluster = follow_cluster("clipboard-follow-transit");
+    let [pc1, pc2, pc3] = [&cluster.nodes[0], &cluster.nodes[1], &cluster.nodes[2]];
+    let text = "PC1 carried through PC2 to PC3";
+    pc1.copy_to_clipboard(text);
+    let copied = wait_history(pc1, 1);
+    assert_eq!(
+        copied[0].peer_name, "node-w",
+        "local copies name their origin"
+    );
+    assert_eq!(
+        copied[0].direction,
+        protocol::ipc::ClipboardHistoryDirection::Copied as i32,
+        "follow records a local copy before any text transfer"
+    );
+    assert!(pc2.clipboard_text().unwrap_or_default().is_empty());
+    assert!(pc3.clipboard_text().unwrap_or_default().is_empty());
+    let started = std::time::Instant::now();
+    cluster.switch_to(0, 1).expect("PC1 enters PC2");
+    cluster
+        .switch_to(0, 2)
+        .expect("continue directly from PC2 to PC3");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "transit must finish before its dwell, otherwise the scenario measured nothing"
+    );
+    pc3.wait_for_clipboard(text, SETTLE)
+        .expect("destination dwell delivers");
+    assert!(pc2.clipboard_text().unwrap_or_default().is_empty());
+    assert!(history(pc2).is_empty(), "transit creates no text history");
+    let received = wait_history(pc3, 1);
+    assert_eq!(
+        received[0].peer_name, "node-w",
+        "history names original PC1"
+    );
+    assert_eq!(history_text(pc3, received[0].id), text);
+    let applied = pc3.log().matches("clipboard payload applied").count();
+    cluster.switch_to_local(0).expect("return to PC1");
+    cluster
+        .switch_to(0, 2)
+        .expect("re-enter the same destination");
+    assert_clipboard_stays(pc3, Some(text));
+    assert_eq!(
+        pc3.log().matches("clipboard payload applied").count(),
+        applied
+    );
+    assert_eq!(history(pc3).len(), 1, "re-entry is deduplicated");
+
+    let reply = "copy made remotely on PC3";
+    pc3.copy_to_clipboard(reply);
+    wait_history(pc3, 2);
+    assert_eq!(
+        pc1.clipboard_text().as_deref(),
+        Some(text),
+        "copy does not fan out"
+    );
+    cluster
+        .switch_to_local(0)
+        .expect("return carries PC3's copy");
+    pc1.wait_for_clipboard(reply, SETTLE)
+        .expect("return dwell delivers remote copy");
+    assert!(pc2.clipboard_text().unwrap_or_default().is_empty());
+    let items = history(pc1);
+    assert!(items
+        .iter()
+        .any(|item| item.preview == reply && item.peer_name == "node-b"));
+}
+
+#[test]
+fn explicit_gui_send_stops_current_carry_but_an_old_row_preserves_it() {
+    let _serial = common::serial();
+    let cluster = follow_cluster("clipboard-follow-explicit");
+    let [pc1, pc2, pc3] = [&cluster.nodes[0], &cluster.nodes[1], &cluster.nodes[2]];
+    let old = "old row sent explicitly";
+    pc1.copy_to_clipboard(old);
+    let old_id = wait_history(pc1, 1)[0].id;
+    let sent = send_history(pc1, old_id, pc3);
+    assert!(sent.ok, "GUI send refused: {}", sent.error_code);
+    pc3.wait_for_clipboard(old, SETTLE)
+        .expect("explicit send without focus");
+    assert_eq!(wait_history(pc3, 1)[0].peer_name, "node-w");
+    cluster
+        .switch_to(0, 1)
+        .expect("cross after explicit current send");
+    assert_clipboard_stays(pc2, pc2.clipboard_text().as_deref());
+    assert!(pc2.clipboard_text().unwrap_or_default().is_empty());
+    assert!(
+        history(pc2).is_empty(),
+        "explicit current send stops carry globally"
+    );
+    cluster.switch_to_local(0).expect("return");
+    let current = "new copy still carried after sending old row";
+    pc1.copy_to_clipboard(current);
+    let deadline = std::time::Instant::now() + SETTLE;
+    while !history(pc1).iter().any(|item| item.preview == current) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "new copy missing from local history"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let sent = send_history(pc1, old_id, pc3);
+    assert!(sent.ok, "old-row send refused: {}", sent.error_code);
+    cluster
+        .switch_to(0, 1)
+        .expect("cross with current carry intact");
+    pc2.wait_for_clipboard(current, SETTLE)
+        .expect("old row did not cancel new carry");
+    assert_eq!(pc3.clipboard_text().as_deref(), Some(old));
+}
+
+#[test]
+fn explicit_send_refuses_offline_peers_and_secret_copies_stay_out_of_history() {
+    let _serial = common::serial();
+    let cluster = follow_cluster("clipboard-follow-offline-secret");
+    let [pc1, pc2, pc3] = [&cluster.nodes[0], &cluster.nodes[1], &cluster.nodes[2]];
+    pc1.copy_to_clipboard("ordinary local row");
+    let id = wait_history(pc1, 1)[0].id;
+    common::Node::kill_pid(pc3.pid()).expect("stop explicit destination");
+    pc1.wait_for("offline destination removed", SETTLE, |s| s.members == 1)
+        .expect("PC1 observes offline PC3");
+    let refused = send_history(pc1, id, pc3);
+    assert!(!refused.ok, "offline explicit send must fail");
+    let before = history(pc1);
+    let secret = "secret must remain only on PC1";
+    pc1.copy_to_clipboard_marked(secret, &["kde_secret"]);
+    pc1.wait_for_clipboard(secret, SETTLE)
+        .expect("secret remains local");
+    wait_log(pc1, "CLIPBOARD_SECRET");
+    assert_eq!(
+        history(pc1),
+        before,
+        "secret creates no sendable history row"
+    );
+    cluster
+        .switch_to(0, 1)
+        .expect("enter with secret selection");
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_ne!(pc2.clipboard_text().as_deref(), Some(secret));
+    assert!(history(pc2).iter().all(|item| item.preview != secret));
+}
+
+#[test]
+fn follow_enter_then_ctrl_v_injects_keys_only_after_destination_clipboard_apply() {
+    let _serial = common::serial();
+    let cluster = follow_cluster("clipboard-follow-paste-order");
+    let pc1 = cluster.node(0);
+    let pc2 = cluster.node(1);
+    let text = "clipboard must precede Ctrl V";
+    pc1.copy_to_clipboard(text);
+    wait_history(pc1, 1);
+    cluster.switch_to(0, 1).expect("enter destination");
+    pc1.wait_dry_capture("Remote");
+    let dir = pc1.dry_control_dir();
+    std::fs::write(
+        dir.join("keys.writing"),
+        b"224 down\n25 down\n25 up\n224 up\n",
+    )
+    .expect("stage dry Ctrl V");
+    std::fs::rename(dir.join("keys.writing"), dir.join("keys")).expect("publish dry Ctrl V");
+    let expected = [("224", "Down"), ("25", "Down"), ("25", "Up"), ("224", "Up")]
+        .map(|(usage, state)| format!("{usage} {state} {:?}", clipboard::sha256(text.as_bytes())))
+        .join("\n")
+        + "\n";
+    let deadline = std::time::Instant::now() + SETTLE;
+    loop {
+        let actual = std::fs::read_to_string(pc2.dry_control_dir().join("injected-keys.txt"))
+            .unwrap_or_default();
+        if actual.lines().count() >= 4 {
+            assert_eq!(
+                actual, expected,
+                "ordered keys must observe the applied clipboard hash"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dry Ctrl V never reached destination"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pc2.wait_for_clipboard(text, SETTLE)
+        .expect("first key settles clipboard");
+}
+
+#[test]
+fn gui_clipboard_policy_reports_defaults_and_persists_clamped_settle_values() {
+    use protocol::ipc::gui_frame::Msg;
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    let status = |node: &common::Node| {
+        let frames = history_exchange(node, Msg::GetStatus(protocol::ipc::GetStatus {}), |frame| {
+            matches!(frame.msg, Some(Msg::Status(_)))
+        });
+        let Some(Msg::Status(status)) = frames.into_iter().last().expect("status reply").msg else {
+            panic!("expected GUI status");
+        };
+        status
+    };
+    let defaults = status(&harness.a);
+    assert_eq!(defaults.clipboard_policy, "follow");
+    assert_eq!(defaults.clipboard_settle_ms, 700);
+    for (policy, requested, expected) in [("broadcast", 1, 200), ("follow", 9000, 3000)] {
+        history_operation(
+            &harness.a,
+            Msg::SetClipboardPolicy(protocol::ipc::SetClipboardPolicy {
+                policy: policy.into(),
+                settle_ms: requested,
+            }),
+        );
+        let current = status(&harness.a);
+        assert_eq!(current.clipboard_policy, policy);
+        assert_eq!(current.clipboard_settle_ms, expected);
+        let saved = config::Config::load(harness.a.root.join("config/config.toml"))
+            .expect("saved clipboard policy");
+        assert_eq!(saved.clipboard.settle_ms, expected);
+        assert_eq!(
+            saved.clipboard.policy,
+            if policy == "follow" {
+                config::ClipboardRoutingPolicy::Follow
+            } else {
+                config::ClipboardRoutingPolicy::Broadcast
+            }
+        );
+    }
+}
+
+#[test]
+fn follow_first_dry_button_settles_before_the_dwell_deadline() {
+    let _serial = common::serial();
+    let cluster = follow_cluster("clipboard-follow-button");
+    let source = cluster.node(0);
+    let target = cluster.node(1);
+    let text = "first button settles clipboard";
+    source.copy_to_clipboard(text);
+    wait_history(source, 1);
+    cluster.switch_to(0, 1).expect("enter dry receiver");
+    source.wait_dry_capture("Remote");
+    let started = std::time::Instant::now();
+    source.trigger_dry_click();
+    target
+        .wait_for_clipboard(text, Duration::from_secs(2))
+        .expect("button settles before the 3 s dwell");
+    assert!(started.elapsed() < Duration::from_secs(3));
 }

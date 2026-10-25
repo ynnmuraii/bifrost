@@ -15,6 +15,8 @@
 //!   peers    [--revoke NODE_ID]
 //!   status
 //!   switch   <peer id|display name> | [--to local|<peer id|display name>]
+//!   clipboard-history
+//!   clipboard-send <history id> <peer id|display name>
 //! ```
 //!
 //! `pair` and `peers` work offline against the configuration directory; `status` and
@@ -25,6 +27,7 @@
 mod agent;
 mod clipboard;
 mod clipboard_history;
+mod clipboard_routing;
 mod command;
 mod ctl;
 mod discovery;
@@ -141,6 +144,8 @@ COMMANDS:
     peers    list trusted peers, or --revoke <node id>
     status   ask a running core for its state
     switch   toggle with <peer>; set the direction with --to local|<peer>
+    clipboard-history  list session clipboard history metadata
+    clipboard-send ID TARGET  send one history item to an online trusted computer
     claim    take ownership of the workspace on this node
     abandon  give up ownership and stay a follower
     layout   the layout document: show | edit <file> | apply | discard
@@ -185,6 +190,15 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
             control(&args.paths, &format!("update-all {}", args.rest[1]))
         }
         "update-status" => control(&args.paths, "update-status"),
+        "clipboard-history" if args.rest.is_empty() => control(&args.paths, "clipboard-history"),
+        "clipboard-send" => {
+            if args.rest.len() != 2 {
+                return Err(Failure::Usage("clipboard-send ID TARGET".into()));
+            }
+            let line = format!("clipboard-send {} {}", args.rest[0], args.rest[1]);
+            ctl::Request::parse(&line).map_err(Failure::Usage)?;
+            control(&args.paths, &line)
+        }
         // KVM-072: the layout document's CAS surface, until the GUI owns it.
         "layout" => {
             let verb = args.rest.first().ok_or_else(|| {
@@ -1104,8 +1118,14 @@ fn control(paths: &Paths, line: &str) -> Result<(), Failure> {
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start the runtime: {error}"))?;
+    // A full-rate-limit clipboard transfer reports its terminal result, not just enqueueing.
+    let timeout = Duration::from_secs(if line.starts_with("clipboard-send ") {
+        32
+    } else {
+        5
+    });
     let reply = runtime.block_on(async move {
-        tokio::time::timeout(Duration::from_secs(5), ctl::request(&endpoint, line))
+        tokio::time::timeout(timeout, ctl::request(&endpoint, line))
             .await
             .map_err(|_| "the running core did not answer".to_owned())?
             .map_err(|error| error.to_string())

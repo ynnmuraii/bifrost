@@ -339,6 +339,19 @@ fn updates_never_enter_the_coalescible_motion_path() {
             status: "downloading".into(),
             detail: String::new(),
         }),
+        Outbound::ClipboardApplied(protocol::wire::ClipboardApplied {
+            origin_version: 7,
+            sha256: vec![2; 32],
+            ok: true,
+            detail: String::new(),
+        }),
+        Outbound::ClipboardRoute(protocol::wire::ClipboardRoute {
+            action: "carry".into(),
+            origin_node_id: vec![1; 32],
+            origin_version: 7,
+            sha256: vec![2; 32],
+            target_node_id: Vec::new(),
+        }),
     ] {
         assert!(item.motion_events().is_none());
         assert!(item.motion_lease().is_none());

@@ -356,3 +356,23 @@ fn an_unresolvable_node_reference_fails_at_conversion_time() {
     assert_eq!(error.code(), Some(ErrorCode::Topology));
     assert!(error.to_string().contains("topology.links.from"), "{error}");
 }
+
+#[test]
+fn loading_clamps_clipboard_settle_without_rejecting_config() {
+    let root = temp_dir("clipboard-settle");
+    let path = root.join("config.toml");
+    for (configured, expected) in [(0, 200), (700, 700), (5000, 3000)] {
+        let document = format!(
+            "config_version = 2\n[network]\nlisten_address = \"192.168.1.10\"\n\
+             [clipboard]\npolicy = \"broadcast\"\nsettle_ms = {configured}\n"
+        );
+        std::fs::write(&path, document).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            config.clipboard.policy,
+            config::ClipboardRoutingPolicy::Broadcast
+        );
+        assert_eq!(config.clipboard.settle_ms, expected);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

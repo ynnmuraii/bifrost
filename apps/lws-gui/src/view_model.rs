@@ -284,6 +284,10 @@ pub enum Request {
     GetClipboardHistory,
     /// Copy a history item through the core's local clipboard adapter.
     CopyClipboardHistory,
+    /// Send a history item to one online member.
+    SendClipboardHistory,
+    /// Persist clipboard routing policy.
+    SetClipboardPolicy,
     /// Clear the core's in-memory clipboard history.
     ClearClipboardHistory,
     /// `SetAppearance`.
@@ -322,6 +326,8 @@ impl Request {
             Request::SetGameGuard => text(lang, Key::GameMode),
             Request::GetClipboardHistory => text(lang, Key::TheClipboardHistory),
             Request::CopyClipboardHistory => text(lang, Key::CopyFromTheHistory),
+            Request::SendClipboardHistory => text(lang, Key::SendClipboardTo),
+            Request::SetClipboardPolicy => text(lang, Key::ClipboardRouting),
             Request::ClearClipboardHistory => text(lang, Key::ClearTheClipboardHistory),
             Request::SetAppearance => text(lang, Key::TheEdgeEffects),
             Request::SetHotkey => text(lang, Key::KeyboardShortcut),
@@ -631,7 +637,7 @@ impl LayoutEditor {
 // ---------------------------------------------------------------- view model
 
 /// One request waiting for its answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inflight {
     /// The `request_id` the frame carried.
     pub id: u64,
@@ -639,6 +645,8 @@ pub struct Inflight {
     pub request: Request,
     /// When the window stops believing in an answer.
     pub deadline: Instant,
+    /// The destination name at dispatch, retained even if membership changes.
+    pub clipboard_target: Option<String>,
 }
 
 /// The pairing screen's state.
@@ -1064,10 +1072,48 @@ impl ViewModel {
         self.inflight.push(Inflight {
             id,
             request,
-            deadline: now + REQUEST_TIMEOUT,
+            // An addressed send waits for the core's 30-second remote apply verdict.
+            deadline: now
+                + if request == Request::SendClipboardHistory {
+                    Duration::from_secs(32)
+                } else {
+                    REQUEST_TIMEOUT
+                },
+            clipboard_target: None,
         });
         if self.inflight.len() > INFLIGHT_LIMIT {
             self.inflight.remove(0);
+        }
+        id
+    }
+
+    /// Online remote members are the core's trusted membership roster, not discovery results.
+    pub fn clipboard_targets(&self) -> impl Iterator<Item = &ipc::MemberStatus> {
+        self.status.iter().flat_map(|status| {
+            status.members.iter().filter(move |member| {
+                !status.local_node_id.is_empty()
+                    && member.online
+                    && member.node_id != status.local_node_id
+            })
+        })
+    }
+
+    /// Remember the destination independently of subsequent status pushes.
+    pub fn begin_clipboard_send(&mut self, peer_node_id: &str, now: Instant) -> u64 {
+        let target = self
+            .clipboard_targets()
+            .find(|member| member.node_id == peer_node_id)
+            .map(|member| {
+                if member.display_name.is_empty() {
+                    short_id(&member.node_id)
+                } else {
+                    member.display_name.clone()
+                }
+            })
+            .unwrap_or_else(|| short_id(peer_node_id));
+        let id = self.begin_request(Request::SendClipboardHistory, now);
+        if let Some(inflight) = self.inflight.last_mut() {
+            inflight.clipboard_target = Some(target);
         }
         id
     }
@@ -1612,6 +1658,11 @@ impl ViewModel {
             return;
         }
         let lang = self.look.language;
+        let clipboard_target = self
+            .inflight
+            .iter()
+            .find(|inflight| inflight.id == request_id)
+            .and_then(|inflight| inflight.clipboard_target.clone());
         let Some(request) = self.take_inflight(request_id) else {
             self.push_log(fill(
                 lang,
@@ -1620,6 +1671,25 @@ impl ViewModel {
             ));
             return;
         };
+        if request == Request::SendClipboardHistory {
+            let target = clipboard_target.as_deref().unwrap_or("");
+            let line = fill_named(
+                lang,
+                if result.ok {
+                    Key::ClipboardSentTo
+                } else {
+                    Key::ClipboardSendFailed
+                },
+                &[("target", &target), ("detail", &result.error_code)],
+            );
+            self.push_log(line.clone());
+            self.set_outcome(if result.ok {
+                Outcome::done(line)
+            } else {
+                Outcome::failed(line)
+            });
+            return;
+        }
         if request == Request::UpdateTopology {
             // A verdict that arrives late is still the verdict of the one save in flight: it is
             // matched by id, not by time, so it can never leave the draft stuck.
@@ -1640,7 +1710,10 @@ impl ViewModel {
             // A toggle shows its own state; a sentence under it says nothing new.
             if !matches!(
                 request,
-                Request::SetClipboard | Request::SetAppearance | Request::SetDiscovery
+                Request::SetClipboard
+                    | Request::SetClipboardPolicy
+                    | Request::SetAppearance
+                    | Request::SetDiscovery
             ) {
                 self.set_outcome(Outcome::done(line.clone()));
             }
@@ -1660,7 +1733,7 @@ impl ViewModel {
                     self.outgoing
                         .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
                 }
-                Request::SetAppearance | Request::SetDiscovery | Request::SetGameGuard => {
+                Request::SetClipboardPolicy | Request::SetAppearance | Request::SetDiscovery | Request::SetGameGuard => {
                     let id = self.begin_request(Request::GetStatus, Instant::now());
                     self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
                 }
@@ -2447,6 +2520,11 @@ pub enum Action {
     },
     /// Turn the shared clipboard on or off.
     SetClipboard(bool),
+    /// Persist routing mode and the current service-owned settling delay.
+    SetClipboardPolicy {
+        policy: String,
+        settle_ms: u32,
+    },
     /// Persist LAN discovery through the core.
     SetDiscovery(bool),
     SetGameGuard(ipc::SetGameGuard),
@@ -2455,6 +2533,11 @@ pub enum Action {
     RefreshClipboardHistory,
     /// Copy a stored item to this computer's clipboard through the core.
     CopyClipboardHistory(u64),
+    /// Send a stored item to one remote member; never retrieves its text.
+    SendClipboardHistory {
+        id: u64,
+        peer_node_id: String,
+    },
     /// Forget all stored clipboard contents.
     ClearClipboardHistory,
     /// Change the service-owned edge effects and source cursor visibility.
@@ -2625,6 +2708,13 @@ impl Action {
                 Request::SetClipboard,
                 Msg::SetClipboard(ipc::SetClipboard { enabled: *enabled }),
             ),
+            Action::SetClipboardPolicy { policy, settle_ms } => (
+                Request::SetClipboardPolicy,
+                Msg::SetClipboardPolicy(ipc::SetClipboardPolicy {
+                    policy: policy.clone(),
+                    settle_ms: *settle_ms,
+                }),
+            ),
             Action::SetDiscovery(enabled) => (
                 Request::SetDiscovery,
                 Msg::SetDiscovery(ipc::SetDiscovery { enabled: *enabled }),
@@ -2639,6 +2729,13 @@ impl Action {
                 Msg::GetClipboardHistoryItem(ipc::GetClipboardHistoryItem {
                     id: *id,
                     copy_to_local: true,
+                }),
+            ),
+            Action::SendClipboardHistory { id, peer_node_id } => (
+                Request::SendClipboardHistory,
+                Msg::SendClipboardHistoryItem(ipc::SendClipboardHistoryItem {
+                    id: *id,
+                    peer_node_id: node_id_bytes(peer_node_id),
                 }),
             ),
             Action::ClearClipboardHistory => (
@@ -2788,6 +2885,8 @@ impl Bridge {
         if let Some((request, message)) = action.wire() {
             let id = if request == Request::RegisterUpdateCoordinator {
                 COORDINATOR_REQUEST_ID
+            } else if let Action::SendClipboardHistory { peer_node_id, .. } = &action {
+                self.view.begin_clipboard_send(peer_node_id, now)
             } else {
                 self.view.begin_request(request, now)
             };
@@ -3755,6 +3854,8 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::PairingAnswer(_) => "PairingAnswer",
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
+        Msg::SetClipboardPolicy(_) => "SetClipboardPolicy",
+        Msg::SendClipboardHistoryItem(_) => "SendClipboardHistoryItem",
         Msg::SetDiscovery(_) => "SetDiscovery",
         Msg::SetGameGuard(_) => "SetGameGuard",
         Msg::GetClipboardHistory(_) => "GetClipboardHistory",
@@ -3838,6 +3939,8 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::SetClipboard => text(lang, Key::TheClipboardWasSwitched).to_owned(),
         Request::GetClipboardHistory => text(lang, Key::TheClipboardHistoryIsRefreshed).to_owned(),
         Request::CopyClipboardHistory => text(lang, Key::TheTextIsCopied).to_owned(),
+        Request::SendClipboardHistory => text(lang, Key::SendClipboardTo).to_owned(),
+        Request::SetClipboardPolicy => text(lang, Key::ClipboardRouting).to_owned(),
         Request::ClearClipboardHistory => text(lang, Key::TheClipboardHistoryIsCleared).to_owned(),
         Request::SetAppearance => text(lang, Key::TheEdgeEffectsWereSwitched).to_owned(),
         Request::SetDiscovery => text(lang, Key::LanDiscovery).to_owned(),

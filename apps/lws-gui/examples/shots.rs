@@ -22,6 +22,9 @@
 //! member OS names and the native display resolutions the map now labels.
 //! `--discovery` writes two discovered computers and the empty pairing dock in RU/EN,
 //! light/dark, at 1745×1091 and 1280×720. The discovered entries are mock announcements.
+//! `--clipboard-routing` writes the open history destination menu, success/failure toasts,
+//! and both Settings policies in RU/EN and light/dark at all three standard sizes.
+//! These fixtures seed UI state directly and never synthesize desktop input.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -97,6 +100,9 @@ fn main() -> std::process::ExitCode {
     }
     if args.iter().any(|arg| arg == "--updates") {
         return update_shots(&dir);
+    }
+    if args.iter().any(|arg| arg == "--clipboard-routing") {
+        return clipboard_routing_shots(&dir);
     }
     if args.iter().any(|arg| arg == "--metadata") {
         if let Err(error) = std::fs::create_dir_all(&dir) {
@@ -275,6 +281,85 @@ fn main() -> std::process::ExitCode {
         }
     }
     println!("{written} pictures in {}", dir.display());
+    std::process::ExitCode::SUCCESS
+}
+
+fn clipboard_routing_shots(dir: &Path) -> std::process::ExitCode {
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for theme in [Theme::Light, Theme::Dark] {
+            let theme_tag = if theme == Theme::Light {
+                "light"
+            } else {
+                "dark"
+            };
+            for scene in [
+                "send-menu",
+                "sent",
+                "failed",
+                "policy-follow",
+                "policy-broadcast",
+            ] {
+                let settings = scene.starts_with("policy-");
+                let mut vm = mockup(
+                    theme,
+                    Some(if settings {
+                        Modal::Settings
+                    } else {
+                        Modal::Clip
+                    }),
+                    lang,
+                );
+                vm.pairing.prompt = None;
+                if let Some(status) = vm.status.as_mut() {
+                    status.local_node_id = WORKSTATION.to_owned();
+                    status.clipboard_policy = if scene == "policy-broadcast" {
+                        "broadcast"
+                    } else {
+                        "follow"
+                    }
+                    .to_owned();
+                    status.clipboard_settle_ms = 700;
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                for entry in &mut vm.clipboard_history {
+                    entry.time_unix_ms = now_ms.saturating_sub(120_000);
+                }
+                if matches!(scene, "sent" | "failed") {
+                    let id = vm.begin_clipboard_send(&LAPTOP, Instant::now());
+                    vm.apply(GuiFrame {
+                        request_id: id,
+                        ..event(Msg::OpResult(ipc::OpResult {
+                            ok: scene == "sent",
+                            error_code: "LAPTOP: offline".to_owned(),
+                        }))
+                    });
+                }
+                for size in SIZES {
+                    let file = dir.join(format!(
+                        "clipboard-routing-{}-{theme_tag}-{scene}-{}x{}.png",
+                        lang.code(),
+                        size[0],
+                        size[1],
+                    ));
+                    let menu = (scene == "send-menu").then_some(3);
+                    if let Err(error) =
+                        shoot_with_paddle(vm.clone(), &file, size, false, None, menu)
+                    {
+                        eprintln!("cannot render {}: {error}", file.display());
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    println!("{}", file.display());
+                }
+            }
+        }
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -704,7 +789,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
 }
 
 fn shoot_gap(state: ViewModel, file: &Path, drag: Option<(f64, f64)>) -> Result<(), String> {
-    shoot_with_paddle(state, file, [1745, 1091], false, drag)
+    shoot_with_paddle(state, file, [1745, 1091], false, drag, None)
 }
 
 fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
@@ -771,7 +856,7 @@ fn modal_name(modal: Modal) -> &'static str {
 }
 
 fn shoot(state: ViewModel, file: &Path, size: [u32; 2], live: bool) -> Result<(), String> {
-    shoot_with_paddle(state, file, size, live, None)
+    shoot_with_paddle(state, file, size, live, None, None)
 }
 
 fn shoot_with_paddle(
@@ -780,9 +865,11 @@ fn shoot_with_paddle(
     size: [u32; 2],
     live: bool,
     paddle: Option<(f64, f64)>,
+    clipboard_menu: Option<u64>,
 ) -> Result<(), String> {
     let drawn = AssertUnwindSafe(|| {
         let mut ui_state = UiState::new(Instant::now());
+        ui_state.clipboard_send_menu = clipboard_menu;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(size[0] as f32, size[1] as f32))
             .wgpu()
@@ -999,6 +1086,9 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         active_peer: "LAPTOP".to_owned(),
         connected: true,
         clipboard_enabled: true,
+        clipboard_policy: "follow".to_owned(),
+        clipboard_settle_ms: 700,
+        local_node_id: WORKSTATION.to_owned(),
         discovery_enabled: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
         hotkeys: lws_gui::view_model::hotkeys::ROWS
@@ -1035,8 +1125,8 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         items: vec![
             ipc::ClipboardHistoryEntry {
                 id: 3,
-                direction: ipc::ClipboardHistoryDirection::Received as i32,
-                peer_name: "LAPTOP".to_owned(),
+                direction: ipc::ClipboardHistoryDirection::Copied as i32,
+                peer_name: "WORKSTATION".to_owned(),
                 time_unix_ms: now_ms.saturating_sub(12_000),
                 size_bytes: 86,
                 preview: "Release notes — готово ✓".to_owned(),

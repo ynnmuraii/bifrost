@@ -128,6 +128,10 @@ pub enum Outbound {
     UpdateRequest(protocol::wire::UpdateRequest),
     /// Remote update progress: guaranteed, never coalesced or dropped.
     UpdateResult(protocol::wire::UpdateResult),
+    /// Backend clipboard application result: guaranteed control.
+    ClipboardApplied(protocol::wire::ClipboardApplied),
+    /// Metadata-only clipboard routing: guaranteed control.
+    ClipboardRoute(protocol::wire::ClipboardRoute),
     /// A layout-document message: always guaranteed, never coalesced (KVM-072).
     Layout(crate::convert::LayoutMessage),
     /// A clipboard message: always guaranteed, never coalesced, never dropped. The grant is the
@@ -158,6 +162,8 @@ impl Outbound {
             | Outbound::CapabilitiesChanged(_)
             | Outbound::UpdateRequest(_)
             | Outbound::UpdateResult(_)
+            | Outbound::ClipboardApplied(_)
+            | Outbound::ClipboardRoute(_)
             | Outbound::Layout(_)
             | Outbound::Clipboard(_) => None,
         }
@@ -171,6 +177,8 @@ impl Outbound {
             | Outbound::CapabilitiesChanged(_)
             | Outbound::UpdateRequest(_)
             | Outbound::UpdateResult(_)
+            | Outbound::ClipboardApplied(_)
+            | Outbound::ClipboardRoute(_)
             | Outbound::Layout(_)
             | Outbound::Clipboard(_) => None,
         }

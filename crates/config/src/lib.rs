@@ -82,10 +82,10 @@ pub use migrate::migrate_legacy_hotkeys;
 pub use paths::{default_paths, Paths};
 pub use save::save_atomic;
 pub use schema::{
-    AppearanceConfig, Backend, ClipboardConfig, ClipboardTransfer, Config, DiscoveryConfig,
-    DisplayConfig, Edge, EndpointConfig, InputConfig, Language, LinkConfig, LogConfig, LogLevel,
-    NetworkConfig, NodeConfig, PeerConfig, PlatformConfig, RepeatMode, TakeoverDetection,
-    TimingConfig, TopologyConfig, UiConfig, WorkspaceConfig,
+    AppearanceConfig, Backend, ClipboardConfig, ClipboardRoutingPolicy, ClipboardTransfer, Config,
+    DiscoveryConfig, DisplayConfig, Edge, EndpointConfig, InputConfig, Language, LinkConfig,
+    LogConfig, LogLevel, NetworkConfig, NodeConfig, PeerConfig, PlatformConfig, RepeatMode,
+    TakeoverDetection, TimingConfig, TopologyConfig, UiConfig, WorkspaceConfig,
 };
 pub use topology::{node_id_from_hex, parse_node_ref, peer_reference};
 
