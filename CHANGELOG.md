@@ -8,11 +8,17 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Game mode prevents accidental edge switches while a fullscreen or cursor-confined application is active on Windows, or an EWMH fullscreen app is active on X11. Settings include auto/always/off and per-app allow/block lists; explicit switching and emergency release are unaffected.
 - Ctrl+Alt+Shift+G and the tray toggle manual game mode. The local map pill and tray show why edge switching is blocked. Wayland offers manual mode only and clearly reports that automatic detection is unavailable.
+- Clipboard text now follows the cursor by default: passing through a computer does not overwrite its clipboard. A destination settles on the first key/button press or after 700 ms; Settings also offers the previous broadcast policy.
+- Clipboard history can send one item directly to an online trusted computer. Addressing the current copied item stops it following the cursor until the next copy; sending an older item leaves the current carry unchanged.
+- New peers acknowledge clipboard application before routed settling input is released (up to 150 ms); older receivers remain supported without waiting for an acknowledgement. Native local input is not held, so a paste before delivery completes may still use the previous clipboard. Secret-marked text is never carried or retained.
 
 ### Русский
 
 - Игровой режим предотвращает случайный переход по краю из полноэкранных приложений и игр с ограничением курсора на Windows, из EWMH fullscreen-приложений на X11. В настройках: авто/всегда/выкл. и списки исключений; явное переключение и аварийный возврат работают всегда.
 - Ctrl+Alt+Shift+G и пункт трея переключают ручной игровой режим. Метка локального узла и трей показывают причину блокировки. На Wayland доступен только ручной режим с честным предупреждением об отсутствии автоопределения.
+- По умолчанию текстовый буфер следует за курсором: проход через компьютер не перезаписывает его буфер. Назначение определяется первым нажатием клавиши/кнопки или задержкой 700 мс; в настройках можно вернуть прежнюю рассылку всем.
+- Из истории можно отправить одну запись выбранному доверенному компьютеру в сети. Адресная отправка текущего скопированного текста прекращает его перенос до следующего копирования; отправка старой записи не меняет текущий перенос.
+- Новые компьютеры подтверждают применение буфера до передачи первого перенаправленного нажатия (ожидание до 150 мс); старые получатели поддерживаются без ожидания подтверждения. Местный физический ввод не задерживается: вставка до завершения доставки может взять прежний буфер. Помеченные секреты не переносятся и не сохраняются.
 
 ## 0.2.0 — 2026-10-25
 
