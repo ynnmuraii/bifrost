@@ -193,7 +193,7 @@ pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
     /// `[discovery]`: LAN peer discovery; enabled by default for existing files.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DiscoveryConfig::is_default")]
     pub discovery: DiscoveryConfig,
     /// `[workspace]`.
     #[serde(default)]
@@ -437,6 +437,13 @@ pub struct DiscoveryConfig {
     /// Advertise this node while discovery is enabled.
     #[serde(default = "default_true")]
     pub advertise: bool,
+}
+
+impl DiscoveryConfig {
+    /// Default settings need no section, keeping older signed releases loadable.
+    pub fn is_default(&self) -> bool {
+        self.enabled && self.advertise
+    }
 }
 
 impl Default for DiscoveryConfig {

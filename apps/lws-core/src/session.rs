@@ -1112,6 +1112,7 @@ impl Session {
             // The clipboard runtime owns the sender of `clipboard_events`; with the clipboard
             // off there is no runtime, and the arm must not fire on a closed channel.
             let clipboard_enabled = self.clipboard.is_some();
+            let mut gui_request = None;
             let step = {
                 tokio::select! {
                     event = self.link_events.recv() => Step::Link(event),
@@ -1119,7 +1120,10 @@ impl Session {
                     event = self.clipboard_events.recv(), if clipboard_enabled => Step::Clipboard(event),
                     client = self.ctl.accept() => Step::Control(client),
                     client = self.gui.accept() => Step::GuiClient(client),
-                    request = self.gui_requests.recv() => Step::Gui(request),
+                    request = self.gui_requests.recv() => {
+                        gui_request = request;
+                        Step::Gui
+                    },
                     event = self.pairing_events.recv() => Step::Pairing(event),
                     () = tokio::time::sleep_until(deadline) => Step::Tick,
                 }
@@ -1155,12 +1159,14 @@ impl Session {
                 Step::GuiClient(Err(error)) => {
                     tracing::warn!(%error, "GUI channel error");
                 }
-                Step::Gui(Some(request)) => self.on_gui_request(request).await,
-                Step::Gui(None) => {
-                    // Unreachable while `gui_requests_tx` lives here; if it ever closes, the
-                    // loop must not spin on it.
-                    tracing::warn!("the GUI request channel stopped");
-                }
+                Step::Gui => match gui_request {
+                    Some(request) => self.on_gui_request(request).await,
+                    None => {
+                        // Unreachable while `gui_requests_tx` lives here; if it ever closes, the
+                        // loop must not spin on it.
+                        tracing::warn!("the GUI request channel stopped");
+                    }
+                },
                 Step::Pairing(Some(event)) => self.on_pairing_event(event).await,
                 Step::Pairing(None) => {
                     tracing::warn!("the pairing channel stopped");
@@ -4334,7 +4340,7 @@ enum Step {
     /// A GUI connected; its connection gets its own task.
     GuiClient(Result<ipc::transport::ClientStream, ipc::IpcError>),
     /// One request from a connected GUI.
-    Gui(Option<crate::gui::Request>),
+    Gui,
     /// One report from a pairing ceremony.
     Pairing(Option<pairing::Event>),
     /// One event from the clipboard runtime: a bound channel, a message, or a lost channel.

@@ -109,6 +109,9 @@ fn discovery_defaults_and_opt_out_are_backward_compatible() {
         assert_eq!(config.discovery, config::DiscoveryConfig::default());
         assert!(config.discovery.enabled);
         assert!(config.discovery.advertise);
+        let text = config.to_toml().expect("default settings must serialize");
+        assert!(!text.contains("[discovery]"));
+        assert!(!text.contains("[update]"));
     }
     for (settings, enabled, advertise) in [
         ("enabled = false", false, true),
@@ -120,6 +123,10 @@ fn discovery_defaults_and_opt_out_are_backward_compatible() {
         assert_eq!(config.discovery.enabled, enabled);
         assert_eq!(config.discovery.advertise, advertise);
         let text = config.to_toml().expect("discovery settings must serialize");
+        assert!(
+            text.contains("[discovery]"),
+            "opt-outs must remain persisted"
+        );
         assert_eq!(
             Config::from_str(&text).expect("round trip must parse"),
             config

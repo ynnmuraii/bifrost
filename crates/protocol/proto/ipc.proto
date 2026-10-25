@@ -268,7 +268,6 @@ message GuiFrame {
   uint64 seq = 1;
   uint64 request_id = 2; // correlates request/response; 0 for events
   reserved 11; reserved "set_role"; // roles are per-lease in v0.3; the GUI no longer sets a role
-  reserved 35; // discovery, allocated independently
   oneof msg {
     GetStatus get_status = 10;
     StartPairing start_pairing = 12;
