@@ -2616,11 +2616,9 @@ fn local_config_reads_discovery_and_defaults_to_enabled() {
     let dir = settings_dir("192.168.1.10");
     let paths = paths_of(&dir);
     assert!(lws_gui::view_model::LocalConfig::load(&paths).discovery_enabled);
-    std::fs::write(
-        paths.config_file(),
-        "config_version = 2\n[discovery]\nenabled = false\n",
-    )
-    .expect("discovery config");
+    let mut config = config::Config::load(paths.config_file()).expect("valid test config");
+    config.discovery.enabled = false;
+    config.save(paths.config_file()).expect("discovery config");
     assert!(!lws_gui::view_model::LocalConfig::load(&paths).discovery_enabled);
     std::fs::remove_dir_all(dir).expect("remove test config");
 }
