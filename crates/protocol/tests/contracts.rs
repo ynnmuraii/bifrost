@@ -765,8 +765,8 @@ fn remote_update_wire_tags_round_trip_and_old_hello_remains_readable() {
         }
         assert_eq!(OldEnvelope::decode(bytes.as_slice()).unwrap().major, 0);
     }
-    // A future unknown oneof remains absent, preserving the existing invalid-frame policy.
-    let unknown = wire::Envelope::decode(&[0xe2, 0x02, 0x00][..]).unwrap();
+    // Unknown field 4095 stays absent even as new payloads occupy the next append-only tags.
+    let unknown = wire::Envelope::decode(&[0xfa, 0xff, 0x01, 0x00][..]).unwrap();
     assert!(unknown.payload.is_none());
 }
 
