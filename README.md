@@ -20,6 +20,7 @@ Bifrost is a software KVM: share one keyboard, mouse and text clipboard across W
 - Russian and English, light and dark themes.
 - System tray and a per-user **Start at login** toggle in Settings.
 - One executable for the window, core and input agent—no separate service to install.
+- Version badges on the map and coordinated updates of trusted computers, with the requesting computer updated last.
 
 The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–1000 ms). Challenges run every `min(TTL/5, 100 ms)`, or 100 ms by default. This fixed budget accommodates a 500 ms TCP stall when renewals resume in time; it cannot guarantee survival through unlimited loss. There is no grace period or adaptive extension: core and agent deadlines stay anchored to challenge issuance plus TTL. The control-return bound is TTL + 100 ms scheduling allowance (1100 ms by default); repeat guard (150 ms) and agent core-silence timeout (300 ms) are unchanged.
 
@@ -30,6 +31,8 @@ Get **0.1.6** from [Releases](https://github.com/ynnmuraii/bifrost/releases/late
 Versions from **0.1.4** can update from **Settings** or the startup update notice. The app checks for newer stable releases shortly after startup; turn this off in **Settings → Check on startup**, or check manually next to the version. Updates keep a binary backup and ask before restarting all roles; your configuration and pairing are preserved. System-wide, non-writable installations must be updated manually.
 
 **0.1.6 and newer refuse unsigned updates:** the updater verifies the checksum file's Ed25519 signature with its embedded public key before checking the download's SHA-256. For manual OpenSSL verification using a trusted copy of the public key, see [the packaged guide](packaging/README_RU.txt).
+
+Development builds for 0.2.0 add **Update all computers**: connected trusted computers update first, then this computer. Every computer independently fetches the official latest release and verifies its signed checksums; peers cannot supply a download URL or binary. Per-computer progress and refusals stay visible. Disable requests from other computers in **Settings → Allow updates from other computers** (`[update].allow_remote_request = false`). Requests are limited to one per peer every ten minutes. Older computers without this capability must be updated manually once.
 
 ### Windows 11 · x86_64
 

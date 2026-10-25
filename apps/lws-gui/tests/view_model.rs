@@ -2486,6 +2486,27 @@ fn discovered_peer(id: &str, open: bool) -> protocol::ipc::DiscoveredPeer {
 }
 
 #[test]
+fn version_badge_decision_table_uses_semver_precedence_and_hides_unknowns() {
+    for (current, highest, expected) in [
+        ("", "0.1.7", false),
+        ("unknown", "0.1.7", false),
+        ("0.1.5", "", false),
+        ("0.1.5", "0.1.7", true),
+        ("0.1.7", "0.1.7", false),
+        ("0.1.8", "0.1.7", false),
+        ("0.1.7-dev", "0.1.7", true),
+        ("0.1.7+one", "0.1.7+two", false),
+        ("0.1.9", "0.1.10", true),
+    ] {
+        assert_eq!(
+            lws_gui::view_model::version_is_older(current, highest),
+            expected,
+            "{current} / {highest}"
+        );
+    }
+}
+
+#[test]
 fn discovery_hides_paired_members_and_replaces_expired_announcements() {
     let mut vm = view();
     vm.on_connected("test");
@@ -2621,4 +2642,63 @@ fn local_config_reads_discovery_and_defaults_to_enabled() {
     config.save(paths.config_file()).expect("discovery config");
     assert!(!lws_gui::view_model::LocalConfig::load(&paths).discovery_enabled);
     std::fs::remove_dir_all(dir).expect("remove test config");
+}
+
+#[test]
+fn mesh_actions_carry_checked_target_and_remote_policy_to_the_core() {
+    let Some((Request::UpdateAll, Msg::UpdateAll(request))) =
+        Action::UpdateAll("0.1.7".into()).wire()
+    else {
+        panic!("mesh update must reach the core");
+    };
+    assert_eq!(request.target_version, "0.1.7");
+    let Some((Request::SetRemoteUpdate, Msg::SetRemoteUpdate(request))) =
+        Action::SetRemoteUpdate(false).wire()
+    else {
+        panic!("remote policy must reach the core");
+    };
+    assert!(!request.enabled);
+    let Some((Request::RegisterUpdateCoordinator, Msg::UpdateProgress(request))) =
+        Action::RegisterUpdateCoordinator(1234).wire()
+    else {
+        panic!("the runtime must register its real coordinator process");
+    };
+    assert_eq!(request.status, "coordinator");
+    assert_eq!(request.detail, "1234");
+    assert!(request.target_version.is_empty());
+}
+
+#[test]
+fn topology_and_status_versions_feed_badges_without_guessing_unknown_peers() {
+    let mut vm = view();
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    let mut doc = two_node_doc(7);
+    doc.members
+        .iter_mut()
+        .find(|member| member.node_id == PEER_NODE)
+        .unwrap()
+        .app_version = "0.1.5".into();
+    vm.apply(event(Msg::TopologyDoc(doc)));
+    assert_eq!(vm.node_app_version(PEER_NODE), "0.1.5");
+    assert_eq!(
+        vm.node_app_version(SELF_NODE),
+        protocol::sanitize_app_version(protocol::app_version())
+    );
+    let mut status = status_with("LOCAL");
+    status
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == PEER_NODE)
+        .unwrap()
+        .app_version = "0.1.7".into();
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(vm.node_app_version(PEER_NODE), "0.1.7");
+    status
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == PEER_NODE)
+        .unwrap()
+        .app_version = String::new();
+    vm.apply(event(Msg::Status(status)));
+    assert!(!vm.node_needs_update(PEER_NODE));
 }

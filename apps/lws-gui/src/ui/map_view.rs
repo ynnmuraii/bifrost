@@ -785,6 +785,7 @@ fn node_ui(
                 Sense::hover()
             },
         );
+        response.clone().on_hover_text(node.app_version.clone());
         if enabled && (response.hovered() || response.dragged()) {
             ui.ctx().set_cursor_icon(if response.dragged() {
                 egui::CursorIcon::Grabbing
@@ -930,7 +931,7 @@ fn node_ui(
     // A long hostname/subtitle must not extend into a neighbouring computer's caption.
     let caption_rect = Rect::from_min_size(
         Pos2::new(at.x, at.y + node.h as f32 * s),
-        Vec2::new(node.w as f32 * s, 70.0 * fs),
+        Vec2::new(node.w as f32 * s, 88.0 * fs),
     );
     let mut painter = painter.with_clip_rect(
         caption_rect
@@ -958,6 +959,7 @@ fn node_ui(
     }
     painter.multiply_opacity(details);
     for (text, color, family) in [
+        (node.update_badge.as_str(), pal.accent_ink, fam::sans()),
         (node.os.as_str(), pal.ink2, fam::mono()),
         (
             node.focus.as_str(),
@@ -1525,6 +1527,8 @@ mod transform_tests {
                 name: ["WORKSTATION", "LAPTOP"][i].to_owned(),
                 os: String::new(),
                 focus: String::new(),
+                app_version: String::new(),
+                update_badge: String::new(),
                 online: true,
                 target: i == 0,
                 approx: i == 1,

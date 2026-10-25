@@ -266,6 +266,12 @@ pub enum Request {
     PairingAnswer,
     /// `UpdateTopology`.
     UpdateTopology,
+    /// Update the workspace, peers first.
+    UpdateAll,
+    /// Allow or refuse remote update requests.
+    SetRemoteUpdate,
+    /// Register the GUI process that coordinates worker updates.
+    RegisterUpdateCoordinator,
     /// `SetClipboard`.
     SetClipboard,
     /// Persist LAN discovery through the core.
@@ -304,6 +310,9 @@ impl Request {
             Request::PairWith => text(lang, Key::ConnectByAddress),
             Request::PairingAnswer => text(lang, Key::AnswerThePairing),
             Request::UpdateTopology => text(lang, Key::SaveTheLayout),
+            Request::UpdateAll => text(lang, Key::UpdateAllComputers),
+            Request::SetRemoteUpdate => text(lang, Key::AllowRemoteUpdates),
+            Request::RegisterUpdateCoordinator => text(lang, Key::State),
             Request::SetClipboard => text(lang, Key::TheClipboard),
             Request::SetDiscovery => text(lang, Key::LanDiscovery),
             Request::GetClipboardHistory => text(lang, Key::TheClipboardHistory),
@@ -854,6 +863,10 @@ pub struct ViewModel {
     pub update: crate::updater::State,
     pub update_notice: bool,
     pub update_confirm: bool,
+    pub update_all_confirm: bool,
+    pub checked_release: Option<crate::updater::Release>,
+    /// Sanitized versions from topology and live status, keyed by node id.
+    pub app_versions: std::collections::BTreeMap<String, String>,
     /// Metadata only; full clipboard text remains in the core.
     pub clipboard_history: Vec<ipc::ClipboardHistoryEntry>,
     /// The last finished operation, shown as a toast until [`TOAST_FOR`] runs out.
@@ -883,6 +896,38 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    pub fn node_app_version(&self, node_id: &str) -> String {
+        if self.self_node() == Some(node_id) {
+            protocol::sanitize_app_version(protocol::app_version())
+        } else {
+            self.app_versions.get(node_id).cloned().unwrap_or_default()
+        }
+    }
+
+    pub fn highest_app_version(&self) -> String {
+        let release = self.checked_release.as_ref().or_else(|| {
+            if let crate::updater::State::Available(release) = &self.update {
+                Some(release)
+            } else {
+                None
+            }
+        });
+        self.editor
+            .nodes
+            .iter()
+            .filter_map(|node| self.app_versions.get(&node.node_id).map(String::as_str))
+            .chain(std::iter::once(protocol::app_version()))
+            .chain(release.map(|release| release.tag_name.trim_start_matches('v')))
+            .filter_map(|version| semver::Version::parse(version).ok())
+            .max_by(|a, b| a.cmp_precedence(b))
+            .map(|version| version.to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn node_needs_update(&self, node_id: &str) -> bool {
+        version_is_older(&self.node_app_version(node_id), &self.highest_app_version())
+    }
+
     /// A window that knows where the core is and nothing else.
     pub fn new(endpoint: CoreEndpoint, config: LocalConfig) -> Self {
         let lang = Lang::from_system();
@@ -903,6 +948,9 @@ impl ViewModel {
             update: crate::updater::State::Idle,
             update_notice: false,
             update_confirm: false,
+            update_all_confirm: false,
+            checked_release: None,
+            app_versions: Default::default(),
             clipboard_history: Vec::new(),
             outcome: None,
             appearance_open: false,
@@ -1339,6 +1387,12 @@ impl ViewModel {
 
     /// `Status` is a response and an event, and both are the same fold.
     fn apply_status(&mut self, status: ipc::Status) {
+        for member in &status.members {
+            self.app_versions.insert(
+                member.node_id.clone(),
+                protocol::sanitize_app_version(&member.app_version),
+            );
+        }
         let lang = self.look.language;
         if self
             .status
@@ -1387,6 +1441,12 @@ impl ViewModel {
     /// The user's draft survives a push of the revision it was made on (the core pushes the
     /// document on membership changes too); it is replaced only when the revision moves.
     fn apply_topology(&mut self, doc: ipc::TopologyDoc) {
+        for member in &doc.members {
+            self.app_versions.insert(
+                member.node_id.clone(),
+                protocol::sanitize_app_version(&member.app_version),
+            );
+        }
         let reloaded = std::mem::take(&mut self.editor.save.reloading);
         self.fold_topology(doc);
         if reloaded {
@@ -2346,6 +2406,10 @@ impl ViewModel {
 pub enum Action {
     /// A GUI-only updater operation; intercepted by the app, never sent to the agent.
     Update(crate::updater::Action),
+    /// Core orchestrates all peers before replacing this computer.
+    UpdateAll(String),
+    SetRemoteUpdate(bool),
+    RegisterUpdateCoordinator(u32),
     /// Ask the core for its state and the document again.
     Refresh,
     /// Become the owner of input.
@@ -2479,11 +2543,40 @@ pub enum Action {
     SetAutostart(bool),
 }
 
+/// Unknown versions never advertise an update; build metadata does not affect precedence.
+pub fn version_is_older(current: &str, highest: &str) -> bool {
+    match (
+        semver::Version::parse(current),
+        semver::Version::parse(highest),
+    ) {
+        (Ok(current), Ok(highest)) => current.cmp_precedence(&highest).is_lt(),
+        _ => false,
+    }
+}
+
 impl Action {
     /// The request this action puts on the wire, or `None` for a local one.
     pub fn wire(&self) -> Option<(Request, Msg)> {
         let wire = match self {
             Action::Refresh => (Request::GetStatus, Msg::GetStatus(ipc::GetStatus {})),
+            Action::UpdateAll(target_version) => (
+                Request::UpdateAll,
+                Msg::UpdateAll(ipc::UpdateAll {
+                    target_version: target_version.clone(),
+                }),
+            ),
+            Action::SetRemoteUpdate(enabled) => (
+                Request::SetRemoteUpdate,
+                Msg::SetRemoteUpdate(ipc::SetRemoteUpdate { enabled: *enabled }),
+            ),
+            Action::RegisterUpdateCoordinator(pid) => (
+                Request::RegisterUpdateCoordinator,
+                Msg::UpdateProgress(ipc::UpdateProgress {
+                    target_version: String::new(),
+                    status: "coordinator".into(),
+                    detail: pid.to_string(),
+                }),
+            ),
             Action::Claim => (Request::Claim, Msg::ClaimOwnership(ipc::ClaimOwnership {})),
             Action::Abandon => (
                 Request::Abandon,
@@ -3661,6 +3754,10 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::ListPendingEdits(_) => "ListPendingEdits",
         Msg::ApplyPendingEdit(_) => "ApplyPendingEdit",
         Msg::DiscardPendingEdit(_) => "DiscardPendingEdit",
+        Msg::UpdateAll(_) => "UpdateAll",
+        Msg::SetRemoteUpdate(_) => "SetRemoteUpdate",
+        Msg::UpdateProgress(_) => "UpdateProgress",
+        Msg::UpdateReady(_) => "UpdateReady",
         Msg::Status(_) => "Status",
         Msg::PairingPrompt(_) => "PairingPrompt",
         Msg::OpResult(_) => "OpResult",
@@ -3712,6 +3809,9 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::PairWith => text(lang, Key::Connecting).to_owned(),
         Request::PairingAnswer => text(lang, Key::TheAnswerWasSent).to_owned(),
         Request::UpdateTopology => text(lang, Key::TheLayoutIsSaved).to_owned(),
+        Request::UpdateAll => text(lang, Key::UpdatePending).to_owned(),
+        Request::SetRemoteUpdate => text(lang, Key::AllowRemoteUpdates).to_owned(),
+        Request::RegisterUpdateCoordinator => text(lang, Key::TheCoreAnswered).to_owned(),
         Request::SetClipboard => text(lang, Key::TheClipboardWasSwitched).to_owned(),
         Request::GetClipboardHistory => text(lang, Key::TheClipboardHistoryIsRefreshed).to_owned(),
         Request::CopyClipboardHistory => text(lang, Key::TheTextIsCopied).to_owned(),

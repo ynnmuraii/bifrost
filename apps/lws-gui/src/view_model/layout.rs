@@ -46,6 +46,10 @@ pub struct MapNode {
     pub os: String,
     /// Compact connection/input state shown below the computer.
     pub focus: String,
+    /// Sanitized application version, empty for an older peer.
+    pub app_version: String,
+    /// One quiet line, only for a known version below the workspace maximum.
+    pub update_badge: String,
     /// In the network, as far as the core knows.
     pub online: bool,
     /// Input goes here now.
@@ -882,6 +886,7 @@ impl ViewModel {
         let backend = self.backend_label();
         let mut number = 0usize;
         let mut nodes = Vec::with_capacity(editor.nodes.len());
+        let highest_version = self.highest_app_version();
         for (i, node) in editor.nodes.iter().enumerate() {
             let is_target = target == Some(i) && self.status.is_some();
             let single = node.displays.len() == 1;
@@ -940,11 +945,25 @@ impl ViewModel {
             } else {
                 text(lang, Key::Online).to_owned()
             };
+            let version = self.node_app_version(&node.node_id);
+            let needs_update = super::version_is_older(&version, &highest_version);
             nodes.push(MapNode {
                 node_id: node.node_id.clone(),
                 name: node.label(lang),
                 os,
                 focus,
+                app_version: {
+                    if version.is_empty() {
+                        text(lang, Key::VersionUnknown).to_owned()
+                    } else {
+                        format!("Bifrost {version}")
+                    }
+                },
+                update_badge: if needs_update {
+                    fill(lang, Key::UpdateAvailable, &[&highest_version])
+                } else {
+                    String::new()
+                },
                 online: node.online,
                 target: is_target,
                 approx: node.displays.iter().any(|d| !d.native_known),

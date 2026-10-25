@@ -1095,6 +1095,22 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             }
         });
     });
+    row(ui, pal, text(lang, Key::AllowRemoteUpdates), false, |ui| {
+        ui.push_id("remote-updates", |ui| {
+            if let Some(status) = &vm.status {
+                if let Some(i) = widgets::seg(
+                    ui,
+                    pal,
+                    &[text(lang, Key::On), text(lang, Key::Off)],
+                    usize::from(!status.allow_remote_update),
+                ) {
+                    actions.push(Action::Update(crate::updater::Action::RemoteEnabled(
+                        i == 0,
+                    )));
+                }
+            }
+        });
+    });
     row_with_top_padding(ui, pal, text(lang, Key::Version), true, 8.0, |ui| {
         super::update::settings(ui, pal, vm, actions);
     });

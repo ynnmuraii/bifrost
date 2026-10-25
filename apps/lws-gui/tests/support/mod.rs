@@ -90,8 +90,13 @@ pub fn status_with(focus: &str) -> ipc::Status {
         local_node_id: SELF_NODE.to_owned(),
         owner_node_id: SELF_NODE.to_owned(),
         owner_serial: 7,
+        allow_remote_update: true,
+        update_nodes: Vec::new(),
+        update_notice: String::new(),
         members: vec![
             ipc::MemberStatus {
+                app_version: String::new(),
+                remote_update: false,
                 node_id: SELF_NODE.to_owned(),
                 display_name: "Workstation".to_owned(),
                 online: true,
@@ -99,6 +104,8 @@ pub fn status_with(focus: &str) -> ipc::Status {
                 link_state: "READY".to_owned(),
             },
             ipc::MemberStatus {
+                app_version: String::new(),
+                remote_update: false,
                 node_id: PEER_NODE.to_owned(),
                 display_name: "linux-box".to_owned(),
                 online: true,
@@ -126,6 +133,7 @@ pub fn two_node_doc(revision: u64) -> ipc::TopologyDoc {
         forgotten_node_ids: Vec::new(),
         members: vec![
             ipc::MemberTopology {
+                app_version: String::new(),
                 node_id: SELF_NODE.to_owned(),
                 display_name: "Workstation".to_owned(),
                 system_name: String::new(),
@@ -133,6 +141,7 @@ pub fn two_node_doc(revision: u64) -> ipc::TopologyDoc {
                 displays: vec![display("\\\\.\\DISPLAY1", 0.0, 0.0, 1920.0, 1080.0, true)],
             },
             ipc::MemberTopology {
+                app_version: String::new(),
                 node_id: PEER_NODE.to_owned(),
                 display_name: "linux-box".to_owned(),
                 system_name: String::new(),

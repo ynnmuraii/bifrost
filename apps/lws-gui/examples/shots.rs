@@ -7,6 +7,8 @@
 //! snapshot a real core over IPC instead. This mode only queries state; it never
 //! starts a core, applies a layout or sends a pairing decision. Both modes render
 //! offscreen and never open a desktop window.
+//! Add `--check-release` to live mode to fetch official release metadata read-only
+//! for version badges; the IPC-reported versions remain untouched.
 //!
 //! Mock mode writes `polish-<state>-<theme>-<width>x<height>.png` at 1920×1080,
 //! 1745×1091 and 1280×720, including every modal, appearance and disconnected states.
@@ -95,9 +97,40 @@ fn main() -> std::process::ExitCode {
         .unwrap_or(150)
         .clamp(70, 300);
     let ascii = args.iter().any(|arg| arg == "--ascii");
+    let check_release = args.iter().any(|arg| arg == "--check-release");
     let snapshot = if real {
         match real_snapshot(CliArgs::parse(args)) {
-            Ok(view) => Some(view),
+            Ok(mut view) => {
+                if check_release {
+                    match lws_gui::updater::check() {
+                        Ok(release) => {
+                            println!("release_source=GitHub tag={}", release.tag_name);
+                            match lws_gui::updater::offer(
+                                &release,
+                                protocol::app_version(),
+                                None,
+                                true,
+                            ) {
+                                Ok(true) => {
+                                    view.update =
+                                        lws_gui::updater::State::Available(release.clone())
+                                }
+                                Ok(false) => view.update = lws_gui::updater::State::Current,
+                                Err(error) => {
+                                    eprintln!("cannot compare release version: {error}");
+                                    return std::process::ExitCode::FAILURE;
+                                }
+                            }
+                            view.checked_release = Some(release);
+                        }
+                        Err(error) => {
+                            eprintln!("cannot check release: {error}");
+                            return std::process::ExitCode::FAILURE;
+                        }
+                    }
+                }
+                Some(view)
+            }
             Err(error) => {
                 eprintln!("cannot snapshot core: {error}");
                 return std::process::ExitCode::FAILURE;
@@ -216,8 +249,8 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     let release = Release {
-        tag_name: "v0.1.4".into(),
-        name: Some("Bifrost 0.1.4".into()),
+        tag_name: "v0.1.7".into(),
+        name: Some("Bifrost 0.1.7".into()),
         body: Some("- Improved reliability and keyboard sharing.\n- Downloads are verified before replacing the binary.\n- Configuration and paired computers are preserved.\n- Additional fixes and improvements in this release.".into()),
         html_url: lws_gui::updater::RELEASES.into(),
         assets: Vec::new(),
@@ -235,9 +268,48 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                     State::Error("GitHub: HTTP 403 (rate limit)".into()),
                 ),
                 ("startup", State::Available(release.clone())),
+                ("badge", State::Available(release.clone())),
+                ("progress", State::Available(release.clone())),
+                ("results", State::Available(release.clone())),
             ] {
                 let mut view = mockup(theme, Some(Modal::Settings), lang);
                 view.update = state;
+                view.checked_release = Some(release.clone());
+                if matches!(state_tag, "badge" | "progress" | "results") {
+                    view.app_versions.insert(LAPTOP.to_owned(), "0.1.5".into());
+                    view.app_versions
+                        .insert(WORKSTATION.to_owned(), "0.1.6".into());
+                    if state_tag == "badge" {
+                        view.modal = None;
+                    } else if let Some(status) = view.status.as_mut() {
+                        status.allow_remote_update = true;
+                        status.update_notice = "remote-update\tLAPTOP\t0.1.7\t".into();
+                        let states = if state_tag == "progress" {
+                            ["pending", "downloading", "restarting"]
+                        } else {
+                            ["done", "refused", "unreachable"]
+                        };
+                        status.update_nodes = [
+                            (WORKSTATION.to_owned(), "WORKSTATION"),
+                            (LAPTOP.to_owned(), "LAPTOP"),
+                            (HTPC.to_owned(), "HTPC"),
+                        ]
+                        .into_iter()
+                        .zip(states)
+                        .map(|((node_id, name), state)| ipc::NodeUpdate {
+                            node_id,
+                            display_name: name.into(),
+                            target_version: "0.1.7".into(),
+                            status: state.into(),
+                            detail: if state == "refused" {
+                                "Remote updates disabled".into()
+                            } else {
+                                String::new()
+                            },
+                        })
+                        .collect();
+                    }
+                }
                 if state_tag == "startup" {
                     view.modal = None;
                     view.update_notice = true;
@@ -268,6 +340,7 @@ fn placement_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                     forgotten_node_ids: Vec::new(),
                     members: vec![
                         ipc::MemberTopology {
+                            app_version: String::new(),
                             node_id: WORKSTATION.to_owned(),
                             display_name: "WORKSTATION".to_owned(),
                             system_name: "Windows 11".to_owned(),
@@ -278,6 +351,7 @@ fn placement_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                             ],
                         },
                         ipc::MemberTopology {
+                            app_version: String::new(),
                             node_id: LAPTOP.to_owned(),
                             display_name: "LAPTOP".to_owned(),
                             system_name: "CachyOS".to_owned(),
@@ -408,6 +482,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                         forgotten_node_ids: Vec::new(),
                         members: vec![
                             ipc::MemberTopology {
+                                app_version: String::new(),
                                 node_id: WORKSTATION.to_owned(),
                                 display_name: "PC".to_owned(),
                                 system_name: "Windows 11".to_owned(),
@@ -418,6 +493,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
                                 ],
                             },
                             ipc::MemberTopology {
+                                app_version: String::new(),
                                 node_id: LAPTOP.to_owned(),
                                 display_name: "LAPTOP".to_owned(),
                                 system_name: "CachyOS".to_owned(),
@@ -803,6 +879,8 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
     vm.on_connected("pipe");
     vm.settings.lan.candidates = vec!["192.168.1.24".to_owned(), "10.0.0.5".to_owned()];
     let member = |id: &str, name: &str, online: bool, owner: bool| ipc::MemberStatus {
+        app_version: String::new(),
+        remote_update: false,
         node_id: id.to_owned(),
         display_name: name.to_owned(),
         online,
@@ -810,6 +888,9 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         link_state: if online { "READY" } else { "CLOSING" }.to_owned(),
     };
     vm.apply(event(Msg::Status(ipc::Status {
+        allow_remote_update: true,
+        update_nodes: Vec::new(),
+        update_notice: String::new(),
         role: "owner".to_owned(),
         focus: "REMOTE".to_owned(),
         active_peer: "LAPTOP".to_owned(),
@@ -881,6 +962,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         forgotten_node_ids: Vec::new(),
         members: vec![
             ipc::MemberTopology {
+                app_version: String::new(),
                 node_id: LAPTOP.to_owned(),
                 display_name: "LAPTOP".to_owned(),
                 system_name: "CachyOS".to_owned(),
@@ -888,6 +970,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
                 displays: vec![display("eDP-1", 0.0, 0.0, 1745.0, 1091.0, true, true)],
             },
             ipc::MemberTopology {
+                app_version: String::new(),
                 node_id: WORKSTATION.to_owned(),
                 display_name: "WORKSTATION".to_owned(),
                 system_name: "Windows 11".to_owned(),
@@ -898,6 +981,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
                 ],
             },
             ipc::MemberTopology {
+                app_version: String::new(),
                 node_id: HTPC.to_owned(),
                 display_name: "HTPC".to_owned(),
                 system_name: "Ubuntu 24.04".to_owned(),
@@ -975,6 +1059,7 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
             .nodes
             .iter()
             .map(|node| ipc::MemberTopology {
+                app_version: String::new(),
                 system_name: String::new(),
                 node_id: node.node_id.clone(),
                 display_name: node.display_name.clone(),
@@ -985,6 +1070,7 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
         links: view.editor.links.clone(),
     };
     document.members.push(ipc::MemberTopology {
+        app_version: String::new(),
         system_name: String::new(),
         node_id: peer.clone(),
         display_name: "LAPTOP".to_owned(),
@@ -1003,6 +1089,8 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
     view.apply(event(Msg::TopologyDoc(document)));
     if let Some(status) = view.status.as_mut() {
         status.members.push(ipc::MemberStatus {
+            app_version: String::new(),
+            remote_update: false,
             node_id: peer,
             display_name: "LAPTOP".to_owned(),
             online: true,
@@ -1035,6 +1123,7 @@ fn with_owner_left_peer(view: &ViewModel) -> Option<ViewModel> {
             .nodes
             .iter()
             .map(|node| ipc::MemberTopology {
+                app_version: String::new(),
                 system_name: String::new(),
                 node_id: node.node_id.clone(),
                 display_name: node.display_name.clone(),
