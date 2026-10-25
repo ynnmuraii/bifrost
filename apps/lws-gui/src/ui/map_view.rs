@@ -152,6 +152,30 @@ pub fn draw(
             &mut st.field,
         );
     }
+    if bridge_live {
+        for link in model
+            .links
+            .iter()
+            .filter(|link| matches!(link.state, LinkState::Active | LinkState::Idle))
+        {
+            let (a, b) = link_ends(&model, link, &shown, xf);
+            st.bridge.paint(
+                &painter,
+                a,
+                b,
+                link.forward,
+                link.dir == Dir::Horizontal,
+                f32::from(vm.look.zoom_percent) / 100.0,
+                (
+                    (link.a_span.1 - link.a_span.0) as f32 * s,
+                    (link.b_span.1 - link.b_span.0) as f32 * s,
+                ),
+                pal.accent,
+            );
+            st.bridge.paint_latency(&painter, a + (b - a) * 0.5, pal);
+        }
+    }
+    // Node captions must cover both the field and the bridge glyphs.
     let mut hovered: Option<(usize, usize)> = None;
     for (i, node) in model.nodes.iter().enumerate() {
         let bounds = node_rect(shown[i], node, s);
@@ -193,29 +217,6 @@ pub fn draw(
             &mut hovered,
             actions,
         );
-    }
-    if bridge_live {
-        for link in model
-            .links
-            .iter()
-            .filter(|link| matches!(link.state, LinkState::Active | LinkState::Idle))
-        {
-            let (a, b) = link_ends(&model, link, &shown, xf);
-            st.bridge.paint(
-                &painter,
-                a,
-                b,
-                link.forward,
-                link.dir == Dir::Horizontal,
-                f32::from(vm.look.zoom_percent) / 100.0,
-                (
-                    (link.a_span.1 - link.a_span.0) as f32 * s,
-                    (link.b_span.1 - link.b_span.0) as f32 * s,
-                ),
-                pal.accent,
-            );
-            st.bridge.paint_latency(&painter, a + (b - a) * 0.5, pal);
-        }
     }
     let paddle_fading = paint_paddles(&painter, pal, st, &model, &shown, xf, t);
     if simulate && hovered != st.hover {
@@ -958,8 +959,30 @@ fn node_ui(
         return;
     }
     painter.multiply_opacity(details);
+    if !node.update_badge.is_empty() {
+        let padding = Vec2::new(6.0 * fs, 2.5 * fs);
+        let badge = painter.layout(
+            node.update_badge.clone(),
+            font(10.5 * fs, fam::sans()),
+            fade(pal.accent_ink, k),
+            (painter.clip_rect().width() - padding.x * 2.0).max(1.0),
+        );
+        let size = badge.size() + padding * 2.0;
+        let rect = Rect::from_min_size(Pos2::new(at.x, y), size);
+        // A tight vertical stack must not leave half a pill on the next card.
+        if painter.clip_rect().contains_rect(rect) {
+            painter.rect(
+                rect,
+                (size.y / 2.0) as u8,
+                pal.card,
+                Stroke::new(1.0, pal.line),
+                StrokeKind::Inside,
+            );
+            painter.galley(rect.min + padding, badge, pal.accent_ink);
+        }
+        y += size.y + 1.0;
+    }
     for (text, color, family) in [
-        (node.update_badge.as_str(), pal.accent_ink, fam::sans()),
         (node.os.as_str(), pal.ink2, fam::mono()),
         (
             node.focus.as_str(),
@@ -1602,6 +1625,76 @@ mod transform_tests {
         status.members[1].online = false;
         status.rtt_p95_us = 1_500;
         assert_eq!(single_peer_rtt(&status, Some("local")), None);
+    }
+
+    #[test]
+    fn update_badge_has_an_opaque_pill_inside_the_available_caption_gap() {
+        for theme in [
+            crate::gui_settings::Theme::Light,
+            crate::gui_settings::Theme::Dark,
+        ] {
+            for gap in [72.0, 28.0] {
+                let ctx = egui::Context::default();
+                super::super::install_fonts(&ctx);
+                let pal = Palette::of(theme);
+                let mut st = UiState::new(std::time::Instant::now());
+                let mut node = owner_layout().nodes.remove(1);
+                node.update_badge = "Version 0.1.7 is available".into();
+                let at = Pos2::new(100.0, 100.0);
+                let caption = Rect::from_min_size(
+                    at + Vec2::new(0.0, node.h as f32),
+                    Vec2::new(node.w as f32, gap),
+                );
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let painter = ui.painter().clone();
+                    node_ui(
+                        ui,
+                        &painter,
+                        &pal,
+                        &mut st,
+                        &node,
+                        0,
+                        at,
+                        Xf {
+                            origin: Pos2::ZERO,
+                            s: 1.0,
+                        },
+                        caption,
+                        false,
+                        &mut None,
+                        &mut Vec::new(),
+                    );
+                });
+                output.textures_delta.clear();
+                let badge =
+                    output
+                        .shapes
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, shape)| match &shape.shape {
+                            Shape::Text(text) if text.galley.text() == node.update_badge => {
+                                Some((i, Rect::from_min_size(text.pos, text.galley.size())))
+                            }
+                            _ => None,
+                        });
+                if gap < 40.0 {
+                    assert!(badge.is_none(), "Never draw a clipped half-pill");
+                    continue;
+                }
+                let (index, glyphs) = badge.expect("badge fits below the name");
+                assert!(
+                    output.shapes[..index].iter().any(|shape| {
+                        matches!(&shape.shape, Shape::Rect(surface)
+                        if surface.fill == pal.card
+                            && surface.stroke == Stroke::new(1.0, pal.line)
+                            && surface.rect.contains_rect(glyphs)
+                            && caption.contains_rect(surface.rect)
+                            && shape.clip_rect.contains_rect(surface.rect))
+                    }),
+                    "Badge needs its own opaque surface and hairline before the text"
+                );
+            }
+        }
     }
 
     #[test]

@@ -269,6 +269,8 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                 ),
                 ("startup", State::Available(release.clone())),
                 ("badge", State::Available(release.clone())),
+                ("badge-live-like", State::Available(release.clone())),
+                ("badge-vertical", State::Available(release.clone())),
                 ("progress", State::Available(release.clone())),
                 ("results", State::Available(release.clone())),
                 ("confirmation", State::Available(release.clone())),
@@ -310,6 +312,61 @@ fn update_shots(dir: &Path) -> std::process::ExitCode {
                         })
                         .collect();
                     }
+                }
+                if matches!(state_tag, "badge-live-like" | "badge-vertical") {
+                    // Replay the live monitor shapes and names, with a hypothetical newer release.
+                    let vertical = state_tag == "badge-vertical";
+                    view.modal = None;
+                    view.look.zoom_percent = 175;
+                    view.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {
+                        revision: 15,
+                        author_node_id: WORKSTATION.to_owned(),
+                        members: vec![
+                            ipc::MemberTopology {
+                                node_id: WORKSTATION.to_owned(),
+                                display_name: "WORKSTATION".into(),
+                                system_name: "Windows 11".into(),
+                                app_version: "0.1.6".into(),
+                                online: true,
+                                displays: if vertical {
+                                    vec![display("DISPLAY1", 0.0, 0.0, 1920.0, 1080.0, true, true)]
+                                } else {
+                                    vec![
+                                        display("DISPLAY1", 0.0, 247.0, 1920.0, 1080.0, true, true),
+                                        display(
+                                            "DISPLAY2", 1920.0, 0.0, 1080.0, 1920.0, false, true,
+                                        ),
+                                    ]
+                                },
+                            },
+                            ipc::MemberTopology {
+                                node_id: LAPTOP.to_owned(),
+                                display_name: "LAPTOP".into(),
+                                system_name: "CachyOS".into(),
+                                app_version: "0.1.5".into(),
+                                online: true,
+                                displays: vec![display(
+                                    "eDP-1", 0.0, 0.0, 1745.0, 1091.0, true, true,
+                                )],
+                            },
+                        ],
+                        links: vec![ipc::LinkView {
+                            id: "update-vertical".into(),
+                            from: auto(&WORKSTATION, "BOTTOM"),
+                            to: auto(&LAPTOP, "TOP"),
+                            bidirectional: true,
+                            active: true,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })));
+                    if let Some(status) = view.status.as_mut() {
+                        status.members.retain(|member| member.node_id != *HTPC);
+                        status.rtt_p95_us = 12_000;
+                    }
+                    view.app_versions.insert(LAPTOP.to_owned(), "0.1.5".into());
+                    view.app_versions
+                        .insert(WORKSTATION.to_owned(), "0.1.6".into());
                 }
                 if state_tag == "startup" {
                     view.modal = None;
