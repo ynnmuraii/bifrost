@@ -29,7 +29,7 @@ pub fn sanitize_app(app: &str) -> Option<String> {
     {
         return None;
     }
-    Some(app.to_lowercase())
+    Some(app.to_ascii_lowercase())
 }
 
 impl GameGuardConfig {
@@ -157,5 +157,6 @@ mod tests {
         }
         assert_eq!(sanitize_app(" GAME.EXE ").as_deref(), Some("game.exe"));
         assert!(sanitize_app(&"x".repeat(129)).is_none());
+        assert_eq!(sanitize_app(&"İ".repeat(64)).unwrap().len(), 128);
     }
 }
