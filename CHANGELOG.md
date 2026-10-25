@@ -1,15 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-25
 
-- The monitor map now compares application versions across trusted computers and shows a quiet update badge when a known newer version exists. Update all computers coordinates peer updates before the local computer, with per-computer progress and refusal reasons.
-- Remote update requests contain only a version: each computer independently checks the latest official GitHub release and verifies its signed checksums before installation. Remote requests can be disabled in Settings and are limited to one request per peer per ten minutes; older peers require a manual update.
-- Update permissions are grouped with the version controls, keeping release actions visible in shorter Settings windows without overlapping translated labels.
-- Map update badges now use opaque, hairline-bordered pills above the ASCII field and bridge glyphs; vertically stacked cards keep their caption clipping, without partially drawn badges over the next card.
-- Map RTT pills now avoid monitor cards and their captions, moving beside a crowded bridge or staying hidden when no clear position fits.
-- Live latency telemetry: each link now times its own `Ping`/`Pong` pairs and reports the 95th-percentile round trip and the jitter (mean absolute difference of consecutive samples) over the last 30 seconds. The status screen shows «Задержка: N мс, джиттер M мс» and the map's «≈ N мс» pill appears once a link has answered three pings; until then both stay blank instead of showing zero. A reconnected link starts measuring from scratch, and the core's `status` verb prints the same pair as `rtt_us=`/`jitter_us=`.
-- Added LAN peer discovery for pairing, with a Settings toggle and manual-address fallback. Discovery advertises non-secret computer metadata over IPv4 multicast UDP 47902; it does not change Windows Firewall rules automatically.
-- Trusted offline peers can be found after an address change; a new route is accepted only after pinned mTLS verifies the expected peer identity, without replacing live connections.
+### Новое
+
+- Поиск компьютеров в локальной сети и сопряжение одним нажатием; ручной ввод адреса остаётся доступен. Для обнаружения разрешите UDP 47902 в брандмауэре.
+- Живые показатели задержки RTT p95 и джиттера на экране статуса, задержка соединений на карте.
+- Значки доступных обновлений на карте и «Обновить все компьютеры»: сначала обновляются подключённые доверенные компьютеры, затем текущий. Каждый сам проверяет официальный выпуск, подпись Ed25519 и контрольную сумму; ход обновления и причины отказа видны отдельно.
+- Компьютеры с 0.1.x нужно один раз самостоятельно обновить до 0.2.0: 0.1.6 предложит выпуск в настройках или уведомлении при запуске. После этого работает «Обновить все компьютеры».
+
+### Исправления
+
+- Доверенные компьютеры снова находятся после смены IP-адреса; новый адрес принимается только после проверки подлинности.
+- Значки обновлений и задержки больше не перекрывают подписи и соседние экраны на карте.
+- Кнопки обновления остаются доступны в небольшом окне настроек; обновление безопасно дожидается завершения работающих компонентов.
 
 ## 0.1.6 — 2026-10-24
 
