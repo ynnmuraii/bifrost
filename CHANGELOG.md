@@ -2,6 +2,18 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## Unreleased
+
+### English
+
+- Game mode prevents accidental edge switches while a fullscreen or cursor-confined application is active on Windows, or an EWMH fullscreen app is active on X11. Settings include auto/always/off and per-app allow/block lists; explicit switching and emergency release are unaffected.
+- Ctrl+Alt+Shift+G and the tray toggle manual game mode. The local map pill and tray show why edge switching is blocked. Wayland offers manual mode only and clearly reports that automatic detection is unavailable.
+
+### Русский
+
+- Игровой режим предотвращает случайный переход по краю из полноэкранных приложений и игр с ограничением курсора на Windows, из EWMH fullscreen-приложений на X11. В настройках: авто/всегда/выкл. и списки исключений; явное переключение и аварийный возврат работают всегда.
+- Ctrl+Alt+Shift+G и пункт трея переключают ручной игровой режим. Метка локального узла и трей показывают причину блокировки. На Wayland доступен только ручной режим с честным предупреждением об отсутствии автоопределения.
+
 ## 0.2.0 — 2026-10-25
 
 ### English
