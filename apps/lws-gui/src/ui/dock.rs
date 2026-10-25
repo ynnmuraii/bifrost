@@ -22,6 +22,15 @@ const DISCOVERY_H: f32 = 138.0;
 /// How long the core keeps a pairing window open.
 const WINDOW_S: u32 = 120;
 
+/// Empty/disabled discovery reuses the manual-address hint, not the map's height.
+fn discovery_height(vm: &ViewModel) -> f32 {
+    if vm.discovered_peers().next().is_some() {
+        DISCOVERY_H
+    } else {
+        0.0
+    }
+}
+
 /// The height of the dock for the current state.
 pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     // A prompt names the other computer and wraps in a quarter of the window: it needs room.
@@ -41,7 +50,7 @@ pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     } else {
         BASE_H + extra
     };
-    32.0 + (expanded + DISCOVERY_H)
+    32.0 + (expanded + discovery_height(vm))
         * ctx.animate_bool_with_time(egui::Id::new("dock-open"), vm.look.dock_open, 0.18)
 }
 
@@ -98,7 +107,10 @@ pub fn draw(
         return;
     }
     let body_top = rect.min.y + 32.0;
-    let discovery = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - DISCOVERY_H), rect.max);
+    let discovery = Rect::from_min_max(
+        Pos2::new(rect.min.x, rect.max.y - discovery_height(vm)),
+        rect.max,
+    );
     let rect = Rect::from_min_max(
         Pos2::new(rect.min.x, body_top),
         Pos2::new(rect.max.x, discovery.min.y),
@@ -137,7 +149,9 @@ pub fn draw(
             _ => code(&mut child, pal, vm, now, actions),
         }
     }
-    discovered(ui, pal, vm, discovery, actions);
+    if discovery.height() > 0.0 {
+        discovered(ui, pal, vm, discovery, actions);
+    }
 }
 
 fn discovered(
@@ -448,7 +462,16 @@ fn dial(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Acti
     widgets::hint(
         ui,
         pal,
-        text(lang, Key::TheOtherComputerSPairingWindowShowsTheAddress),
+        text(
+            lang,
+            if vm.discovered_peers().next().is_some() {
+                Key::TheOtherComputerSPairingWindowShowsTheAddress
+            } else if vm.discovery_enabled() {
+                Key::NoNearbyComputers
+            } else {
+                Key::DiscoveryDisabled
+            },
+        ),
     );
 }
 
@@ -648,18 +671,48 @@ mod tests {
             LocalConfig::default(),
         );
         let ctx = egui::Context::default();
-        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H + DISCOVERY_H);
-        assert_eq!(height(&ctx, &vm, true), 32.0 + 376.0 + DISCOVERY_H);
+        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H);
+        assert_eq!(height(&ctx, &vm, true), 32.0 + 376.0);
         vm.pairing.details = true;
         assert_eq!(
             height(&ctx, &vm, false),
-            32.0 + BASE_H + DISCOVERY_H,
+            32.0 + BASE_H,
             "no prompt, nothing to show"
         );
         vm.pairing.prompt = Some(protocol::ipc::PairingPrompt::default());
-        assert_eq!(
-            height(&ctx, &vm, false),
-            32.0 + BASE_H + DISCOVERY_H + 40.0 + DETAILS_H
+        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H + 40.0 + DETAILS_H);
+    }
+
+    #[test]
+    fn only_unpaired_announcements_expand_the_dock() {
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
         );
+        vm.on_connected("test");
+        let mut status = protocol::ipc::Status {
+            discovery_enabled: true,
+            discovered_peers: vec![protocol::ipc::DiscoveredPeer {
+                node_id: "cc".repeat(32),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        vm.status = Some(status.clone());
+        assert_eq!(discovery_height(&vm), DISCOVERY_H);
+        status.members.push(protocol::ipc::MemberStatus {
+            node_id: "cc".repeat(32),
+            ..Default::default()
+        });
+        vm.status = Some(status.clone());
+        assert_eq!(discovery_height(&vm), 0.0);
+        status.members.clear();
+        status.discovery_enabled = false;
+        vm.status = Some(status);
+        assert_eq!(discovery_height(&vm), 0.0);
+        vm.on_disconnected("test".to_owned());
+        assert_eq!(discovery_height(&vm), 0.0);
     }
 }

@@ -321,9 +321,22 @@ pub(super) fn row(
     last: bool,
     add: impl FnOnce(&mut egui::Ui),
 ) {
+    row_with_top_padding(ui, pal, label, last, 16.0, add);
+}
+
+/// Settings trades some space above rows for the added discovery control, keeping
+/// the shared 16 px bottom padding and the release actions inside the height budget.
+fn row_with_top_padding(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    last: bool,
+    top_padding: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     let left = ui.max_rect().left();
     let right = ui.max_rect().right();
-    let top = ui.cursor().min.y + 16.0;
+    let top = ui.cursor().min.y + top_padding;
     let content = Rect::from_min_max(
         Pos2::new(left + 20.0 + LABEL_W + 20.0, top),
         Pos2::new(right - 20.0, top + 100_000.0),
@@ -934,7 +947,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
     let lang = vm.look.language;
     // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
     // the change is instant, because every string is drawn from the catalogue each frame.
-    row(ui, pal, text(lang, Key::Language), false, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Language), false, 8.0, |ui| {
         let mut look = vm.look;
         if let Some(i) = widgets::seg(
             ui,
@@ -946,7 +959,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             actions.push(Action::SetLook(look));
         }
     });
-    row(ui, pal, text(lang, Key::Autostart), false, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Autostart), false, 8.0, |ui| {
         if let Some(i) = widgets::seg(
             ui,
             pal,
@@ -959,9 +972,9 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::wrapped(ui, error, 13.0, fam::sans(), pal.ink);
         }
     });
-    row(ui, pal, text(lang, Key::LanDiscovery), false, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::LanDiscovery), false, 8.0, |ui| {
         let pending = vm.settings.discovery_pending;
-        ui.add_enabled_ui(vm.connection.is_connected() && pending.is_none(), |ui| {
+        let toggle = ui.add_enabled_ui(vm.connection.is_connected() && pending.is_none(), |ui| {
             if let Some(i) = widgets::seg(
                 ui,
                 pal,
@@ -971,21 +984,16 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
                 actions.push(Action::SetDiscovery(i == 0));
             }
         });
-        widgets::hint(
-            ui,
-            pal,
-            text(
-                lang,
-                if pending.is_some() {
-                    Key::Applying
-                } else {
-                    Key::DiscoveryExplanation
-                },
-            ),
-        );
+        // Keep this a single-control row so release actions still fit at desktop heights.
+        toggle
+            .response
+            .on_hover_text(text(lang, Key::DiscoveryExplanation));
+        if pending.is_some() {
+            widgets::hint(ui, pal, text(lang, Key::Applying));
+        }
     });
     let current = vm.config.listen_address.clone();
-    row(ui, pal, text(lang, Key::LANAddress), false, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::LANAddress), false, 8.0, |ui| {
         let options = vm.settings.lan.options(&current);
         let selected = vm.settings.lan.selected(&current).unwrap_or_default();
         widgets::duo(ui, |ui| {
@@ -1016,7 +1024,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             text(lang, Key::AfterApplyTheServiceRestartsOnTheNewAddress),
         );
     });
-    row(ui, pal, text(lang, Key::Service), false, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Service), false, 8.0, |ui| {
         let busy = vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
         widgets::duo(ui, |ui| {
             act(
@@ -1061,7 +1069,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
     // Portals are a Wayland desktop's, and only a Wayland desktop's: a window on Windows or
     // X11 has nothing to forget and does not show the row at all.
     if vm.uses_portals() {
-        row(ui, pal, text(lang, Key::Portals), false, |ui| {
+        row_with_top_padding(ui, pal, text(lang, Key::Portals), false, 8.0, |ui| {
             act(
                 ui,
                 pal,
@@ -1074,7 +1082,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::hint(ui, pal, text(lang, Key::TheServiceWillAskForTheGrantsAgain));
         });
     }
-    row(ui, pal, text(lang, Key::StartupUpdates), false, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::StartupUpdates), false, 8.0, |ui| {
         // The other on/off segment uses the same labels; keep its animation and hit IDs separate.
         ui.push_id("startup-updates", |ui| {
             if let Some(i) = widgets::seg(
@@ -1087,7 +1095,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             }
         });
     });
-    row(ui, pal, text(lang, Key::Version), true, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Version), true, 8.0, |ui| {
         super::update::settings(ui, pal, vm, actions);
     });
 }

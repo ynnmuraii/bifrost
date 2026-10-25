@@ -184,6 +184,85 @@ fn the_main_screen_shows_the_top_bar_the_map_the_dock_and_the_rail() {
 }
 
 #[test]
+fn empty_and_disabled_discovery_preserve_map_labels_and_manual_pairing() {
+    for enabled in [true, false] {
+        let mut vm = connected();
+        vm.status.as_mut().unwrap().discovery_enabled = enabled;
+        let mut harness = Harness::new();
+        let frame = harness.settle(&vm, false);
+        expect(
+            &frame,
+            &[
+                "этот компьютер",
+                "1920×1080",
+                "ПОДКЛЮЧИТЬСЯ ПО АДРЕСУ",
+                ui_text::text(
+                    vm.look.language,
+                    if enabled {
+                        ui_text::Key::NoNearbyComputers
+                    } else {
+                        ui_text::Key::DiscoveryDisabled
+                    },
+                ),
+            ],
+        );
+    }
+}
+
+#[test]
+fn discovered_rows_keep_identity_window_state_and_manual_pairing_visible() {
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for size in [egui::vec2(1280.0, 720.0), egui::vec2(1745.0, 1091.0)] {
+                let mut vm = connected();
+                vm.look.language = lang;
+                vm.look.theme = theme;
+                vm.status.as_mut().unwrap().discovered_peers = vec![
+                    ipc::DiscoveredPeer {
+                        node_id: "cc".repeat(32),
+                        display_name: "STUDIO-PC".to_owned(),
+                        address: "192.168.1.37:47901".to_owned(),
+                        system_name: "Windows 11".to_owned(),
+                        pairing_open: true,
+                        protocol_version: 1,
+                    },
+                    ipc::DiscoveredPeer {
+                        node_id: "dd".repeat(32),
+                        display_name: "LINUX-LAPTOP".to_owned(),
+                        address: "192.168.1.42:47901".to_owned(),
+                        system_name: "Linux".to_owned(),
+                        pairing_open: false,
+                        protocol_version: 1,
+                    },
+                ];
+                let mut harness = Harness::new();
+                harness.frame(&vm, false, size, Vec::new());
+                let frame = harness.frame(&vm, false, size, Vec::new());
+                expect(
+                    &frame,
+                    &[
+                        "STUDIO-PC",
+                        "192.168.1.37:47901",
+                        "Windows 11",
+                        "LINUX-LAPTOP",
+                        "192.168.1.42:47901",
+                        "Linux",
+                        ui_text::text(lang, ui_text::Key::PairingWindowOpen),
+                        ui_text::text(lang, ui_text::Key::PairingWindowClosed),
+                        &ui_text::text(lang, ui_text::Key::ConnectByAddress2).to_uppercase(),
+                    ],
+                );
+                for (text, bounds) in &frame.texts {
+                    if text.contains("STUDIO-PC") || text.contains("LINUX-LAPTOP") {
+                        assert!(bounds.top() >= 0.0 && bounds.bottom() < size.y);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_link_whose_display_is_missing_is_named_on_the_map() {
     // Nothing is said while every link names a display that was reported.
     let mut harness = Harness::new();
@@ -473,6 +552,12 @@ fn updater_uses_a_startup_segment_and_aligned_release_actions() {
                 );
             }
             let details = bounds(ui_text::text(lang, ui_text::Key::UpdateDetails));
+            let discovery = bounds(&ui_text::text(lang, ui_text::Key::LanDiscovery).to_uppercase());
+            assert!(discovery.top() >= 0.0 && discovery.bottom() < details.top());
+            assert!(
+                details.bottom() < SIZE.y - 16.0,
+                "discovery must not push release actions out of view"
+            );
             let update = bounds(ui_text::text(lang, ui_text::Key::InstallUpdate));
             assert!((details.center().y - update.center().y).abs() < 4.0);
             assert!(update.left() > details.right());
