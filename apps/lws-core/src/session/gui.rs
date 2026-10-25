@@ -98,16 +98,13 @@ impl Session {
     /// The status of this node, as `GetStatus` answers it and `Status` pushes it.
     ///
     /// Every field is read from what the loop already knows: nothing here measures anything
-    /// on its own, and a value this build does not know is left at its default rather than
-    /// guessed — `rtt_p95_us` is the one such field today, because no link measures its RTT
-    /// yet and the GUI hides a zero.
+    /// on its own. `rtt_p95_us`/`rtt_jitter_us` come from the transport's per-link
+    /// `Ping`/`Pong` measurement ([`status_rtt`] picks which link's numbers the single pair
+    /// reports), and stay at zero — the GUI's «unknown» — until a link has answered enough
+    /// pings.
     pub(crate) async fn gui_status(&mut self) -> ipc::Status {
         let focus = self.router.focus();
-        let lease_peer = match self.router.lease() {
-            fr::LeaseSlot::Source(lease) => Some(lease.peer),
-            fr::LeaseSlot::Receiver(lease) => Some(lease.source),
-            fr::LeaseSlot::Idle => None,
-        };
+        let lease_peer = self.lease_peer();
         let owner = self.router.owner().copied();
         let active_peer = lease_peer
             .and_then(|peer| {
@@ -117,6 +114,10 @@ impl Session {
             })
             .unwrap_or_default();
         let online = self.manager.members().await;
+        // Latency is per connection, and `Status` carries one pair of fields, so
+        // `status_rtt` picks the link that matters; a member's own latency has no field in
+        // `MemberStatus` to travel in.
+        let rtt = self.link_rtt(&online).await;
         let members = self
             .trust
             .peers
@@ -149,8 +150,8 @@ impl Session {
                 .is_some_and(crate::clipboard::Clipboard::is_enabled),
             emergency_hotkey: self.emergency_hotkey.clone(),
             hotkeys: self.hotkey_status.clone(),
-            rtt_p95_us: 0,
-            rtt_jitter_us: 0,
+            rtt_p95_us: rtt.p95_us,
+            rtt_jitter_us: rtt.jitter_us,
             last_error_code: self
                 .pairing_error
                 .clone()
@@ -182,6 +183,28 @@ impl Session {
             transition_disabled_reason: self.transition_disabled_reason(),
             edge_effects: self.appearance.edge_effects,
             hide_remote_cursor: self.appearance.hide_remote_cursor,
+        }
+    }
+
+    /// The latency `Status` reports, out of every link in `online`.
+    ///
+    /// See [`status_rtt`] for which link's numbers the single pair carries.
+    pub(crate) async fn link_rtt(&self, online: &[NodeId]) -> transport::rtt::RttSnapshot {
+        let mut links = Vec::with_capacity(online.len());
+        for peer in online {
+            if let Some(rtt) = self.manager.rtt(peer).await {
+                links.push((*peer, rtt));
+            }
+        }
+        status_rtt(self.router.focus(), self.lease_peer(), &links)
+    }
+
+    /// The peer of the active lease, whichever side of it this node is on.
+    pub(super) fn lease_peer(&self) -> Option<NodeId> {
+        match self.router.lease() {
+            fr::LeaseSlot::Source(lease) => Some(lease.peer),
+            fr::LeaseSlot::Receiver(lease) => Some(lease.source),
+            fr::LeaseSlot::Idle => None,
         }
     }
 
@@ -1532,5 +1555,126 @@ mod presence_tests {
             append_missing_members(&mut members, &trust, &Default::default(), &[]);
             assert!(!members[1].online);
         }
+    }
+}
+
+/// The latency the single `Status` pair reports, out of every connected link's measurement.
+///
+/// `Status` has one `rtt_p95_us`/`rtt_jitter_us` pair and `MemberStatus` carries no latency of
+/// its own, so the line speaks for the one link that matters:
+///
+/// * while focus is remote, the active lease's peer — that is the path the keystrokes take;
+/// * otherwise the worst connected peer, by p95 and then by jitter, so a degraded link is not
+///   hidden behind a healthy one (an average would hide exactly that).
+///
+/// A link with fewer than [`transport::rtt::MIN_SAMPLES`] answered pings is unknown: it never
+/// overrides or wins against a known value, and when every link is unknown the result is the
+/// zero pair the GUI draws as «—».
+fn status_rtt(
+    focus: fr::FocusState,
+    lease_peer: Option<NodeId>,
+    links: &[(NodeId, transport::rtt::RttSnapshot)],
+) -> transport::rtt::RttSnapshot {
+    if focus == fr::FocusState::Remote {
+        if let Some(found) = lease_peer.and_then(|peer| {
+            links
+                .iter()
+                .find(|(other, rtt)| *other == peer && rtt.is_known())
+        }) {
+            return found.1;
+        }
+    }
+    links
+        .iter()
+        .filter(|(_, rtt)| rtt.is_known())
+        .max_by_key(|(_, rtt)| (rtt.p95_us, rtt.jitter_us))
+        .map_or_else(transport::rtt::RttSnapshot::default, |(_, rtt)| *rtt)
+}
+
+#[cfg(test)]
+mod rtt_tests {
+    use super::*;
+    use transport::rtt::RttSnapshot;
+
+    fn sampled(p95_us: u32, jitter_us: u32) -> RttSnapshot {
+        RttSnapshot {
+            p95_us,
+            jitter_us,
+            samples: 5,
+        }
+    }
+
+    fn unknown() -> RttSnapshot {
+        RttSnapshot {
+            samples: 2,
+            ..RttSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn remote_focus_reports_the_active_lease_peer() {
+        let active = NodeId::from([2; 32]);
+        let links = [
+            (active, sampled(4_000, 100)),
+            (NodeId::from([3; 32]), sampled(40_000, 9_000)),
+        ];
+        assert_eq!(
+            status_rtt(fr::FocusState::Remote, Some(active), &links),
+            sampled(4_000, 100),
+            "the path input actually takes, not the worst link"
+        );
+    }
+
+    #[test]
+    fn remote_focus_falls_back_to_the_worst_link_when_the_lease_peer_is_unknown() {
+        let active = NodeId::from([2; 32]);
+        let links = [
+            (active, unknown()),
+            (NodeId::from([3; 32]), sampled(40_000, 9_000)),
+        ];
+        assert_eq!(
+            status_rtt(fr::FocusState::Remote, Some(active), &links),
+            sampled(40_000, 9_000)
+        );
+        assert_eq!(
+            status_rtt(fr::FocusState::Remote, Some(NodeId::from([9; 32])), &links),
+            sampled(40_000, 9_000),
+            "a peer with no live link cannot be reported"
+        );
+    }
+
+    #[test]
+    fn local_focus_reports_the_worst_connected_peer() {
+        let links = [
+            (NodeId::from([1; 32]), sampled(5_000, 200)),
+            (NodeId::from([2; 32]), sampled(5_000, 900)),
+            (NodeId::from([3; 32]), unknown()),
+        ];
+        // Equal p95: the jitterier link is the one worth showing.
+        assert_eq!(
+            status_rtt(fr::FocusState::Local, Some(NodeId::from([1; 32])), &links),
+            sampled(5_000, 900)
+        );
+        // The lease peer is irrelevant while this node has the input.
+        assert_eq!(
+            status_rtt(fr::FocusState::Preparing, None, &links),
+            sampled(5_000, 900)
+        );
+    }
+
+    #[test]
+    fn no_measurement_reports_the_unknown_pair() {
+        assert_eq!(
+            status_rtt(
+                fr::FocusState::Remote,
+                Some(NodeId::from([1; 32])),
+                &[(NodeId::from([1; 32]), unknown())]
+            ),
+            RttSnapshot::default()
+        );
+        assert_eq!(
+            status_rtt(fr::FocusState::Local, None, &[]),
+            RttSnapshot::default()
+        );
     }
 }

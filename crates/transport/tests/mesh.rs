@@ -130,6 +130,19 @@ async fn spawn_node(
     dial: &[SocketAddr],
     max_members: u8,
 ) -> TestNode {
+    spawn_node_with_liveness(name, identity, listen, trusted, dial, max_members, LIVENESS).await
+}
+
+/// The same with an explicit cadence, for the tests that need pings faster than production's.
+async fn spawn_node_with_liveness(
+    name: &'static str,
+    identity: Arc<NodeIdentity>,
+    listen: SocketAddr,
+    trusted: &[(NodeId, SocketAddr)],
+    dial: &[SocketAddr],
+    max_members: u8,
+    liveness: LinkLiveness,
+) -> TestNode {
     let id = identity.node_id();
 
     let mut trust = TrustStore::new();
@@ -150,7 +163,7 @@ async fn spawn_node(
         peers: dial.to_vec(),
         max_members,
         queue_capacity: 64,
-        liveness: LIVENESS,
+        liveness,
         backoff: BackoffBounds::default(),
         pairing: Default::default(),
     };
@@ -1666,4 +1679,63 @@ async fn revoke_drops_only_target_peer_and_preserves_other_links() {
         a.manager.handle(&id_c).await.is_some(),
         "handle to C must be live again"
     );
+}
+
+/// A live link measures its own `Ping`/`Pong` round trip, and the numbers leave with the
+/// socket.
+///
+/// The cadence is sped up to 50 ms so three samples (the minimum for a statistic) arrive in
+/// well under a second; nothing else about the link changes. The integration point is the
+/// manager's `rtt`, exactly what core reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_measures_its_ping_round_trip_and_forgets_it_with_the_connection() {
+    const FAST: LinkLiveness = LinkLiveness {
+        ping_ms: 50,
+        offline_ms: 3_000,
+    };
+
+    let root = temp_root("rtt");
+    let a = Arc::new(identity_at(&root, "a"));
+    let b = Arc::new(identity_at(&root, "b"));
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_addr = free_address().await;
+    let b_addr = free_address().await;
+    let mut a = spawn_node_with_liveness("a", a, a_addr, &[(b_id, b_addr)], &[], 4, FAST).await;
+    let mut b =
+        spawn_node_with_liveness("b", b, b_addr, &[(a_id, a_addr)], &[a_addr], 4, FAST).await;
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await, "a linked");
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await, "b linked");
+    settle(&mut a, Duration::from_millis(50)).await;
+    settle(&mut b, Duration::from_millis(50)).await;
+
+    // Three answered pings at a 50 ms cadence arrive in ~150 ms; poll instead of sleeping the
+    // worst case. Loopback RTT is small but never zero, which is exactly the «known» test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rtt = a.manager.rtt(&b_id).await.expect("a's link to b is up");
+        if rtt.is_known() {
+            assert!(rtt.p95_us > 0, "a measured round trip is never zero");
+            break;
+        }
+        assert!(Instant::now() < deadline, "a measured no latency in 10 s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Both ends measure: the Pong is symmetric, so b's own window is populated too.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rtt = b.manager.rtt(&a_id).await.expect("b's link to a is up");
+        if rtt.is_known() {
+            assert!(rtt.p95_us > 0);
+            break;
+        }
+        assert!(Instant::now() < deadline, "b measured no latency in 10 s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Latency belongs to the connection: once it is gone there is nothing to report, rather
+    // than the last window of a socket that no longer exists.
+    a.kill().await;
+    assert_eq!(a.manager.rtt(&b_id).await, None);
 }

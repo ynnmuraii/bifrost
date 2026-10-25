@@ -7,6 +7,7 @@ pub mod manager;
 pub mod pairing;
 pub mod policy;
 pub mod queue;
+pub mod rtt;
 
 pub use clipboard::{
     dial_clipboard, ClipboardConnection, ClipboardListener, ClipboardMessage, ClipboardReader,
@@ -26,6 +27,7 @@ pub use policy::{
 pub use queue::{
     classify, coalesce_motion, is_motion, merge_motion_batches, MessageClass, Outbound,
 };
+pub use rtt::{RttMeter, RttSnapshot};
 
 pub use geometry::NodeId;
 pub use identity::random16;

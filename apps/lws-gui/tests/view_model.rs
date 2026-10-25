@@ -268,8 +268,22 @@ fn a_status_fills_the_screen_and_the_focus_says_where_input_goes() {
 
     let mut status = status_with("REMOTE");
     status.rtt_p95_us = 12_400;
+    status.rtt_jitter_us = 700;
     vm.apply(event(Msg::Status(status)));
-    assert_eq!(vm.delay_line().as_deref(), Some("Задержка: 12 мс"));
+    assert_eq!(
+        vm.delay_line().as_deref(),
+        Some("Задержка: 12 мс, джиттер 0 мс"),
+        "both numbers come from the core's window; a sub-millisecond jitter rounds down"
+    );
+
+    let mut status = status_with("REMOTE");
+    status.rtt_p95_us = 12_400;
+    status.rtt_jitter_us = 2_600;
+    vm.apply(event(Msg::Status(status)));
+    assert_eq!(
+        vm.delay_line().as_deref(),
+        Some("Задержка: 12 мс, джиттер 2 мс")
+    );
 
     let mut blocked = status_with("BLOCKED");
     blocked.focus = "BLOCKED".to_owned();

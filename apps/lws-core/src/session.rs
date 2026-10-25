@@ -4230,16 +4230,15 @@ impl Session {
 
     async fn status_line(&mut self) -> String {
         let focus = self.router.focus();
-        let lease_peer = match self.router.lease() {
-            fr::LeaseSlot::Source(lease) => Some(lease.peer),
-            fr::LeaseSlot::Receiver(lease) => Some(lease.source),
-            fr::LeaseSlot::Idle => None,
-        };
+        let lease_peer = self.lease_peer();
         let owner = self.router.owner().copied();
         let node_id = crate::command::node_id_hex(&self.node_id);
         let owner_hex = owner.map(|owner| crate::command::node_id_hex(&owner));
         let peer_hex = lease_peer.map(|peer| crate::command::node_id_hex(&peer));
         let disabled = self.transition_disabled_reason();
+        // The same pair the GUI's `Status` carries, so a fault-injection run can read live
+        // latency with one control verb instead of a screenshot.
+        let rtt = self.link_rtt(&self.manager.members().await).await;
         ctl::status_line(&ctl::StatusInput {
             focus: focus.as_str(),
             role: if self.router.is_owner() {
@@ -4261,6 +4260,7 @@ impl Session {
             } else {
                 disabled.as_str()
             },
+            rtt: rtt.is_known().then_some((rtt.p95_us, rtt.jitter_us)),
         })
     }
 }

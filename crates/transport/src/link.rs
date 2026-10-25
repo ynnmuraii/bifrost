@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use crate::convert::{self, PeerInfo};
 use crate::policy::{self, LivenessAction};
 use crate::queue::{self, Outbound};
+use crate::rtt::{RttMeter, RttSnapshot};
 use crate::TransportError;
 
 /// Why a link went down.
@@ -589,6 +590,8 @@ pub struct LinkHandle {
     tx: mpsc::Sender<Outbound>,
     dropped_motion: Arc<AtomicU64>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
+    /// This connection's `Ping`/`Pong` measurements; a reconnect starts a new one.
+    rtt: Arc<Mutex<RttMeter>>,
     /// Ends the link's task without depending on the queue's capacity.
     ///
     /// The bounded outbound queue is the normal path (`close` puts a `Shutdown` in it), but a
@@ -709,6 +712,19 @@ impl LinkHandle {
         self.lease_diagnostics.snapshot()
     }
 
+    /// The latency this connection measured over its last
+    /// [`crate::rtt::WINDOW`], as of now.
+    ///
+    /// Zero fields mean *unknown* (fewer than [`crate::rtt::MIN_SAMPLES`] answered pings), and
+    /// the measurement starts again from nothing when the link reconnects: latency describes a
+    /// connection, not a peer.
+    pub fn rtt(&self) -> RttSnapshot {
+        self.rtt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot(Instant::now())
+    }
+
     /// Final diagnostic snapshot, with stage ages relative to this connection's clock.
     /// Retains at most sixteen distinct lease/nonce pairs; sampling may allocate.
     pub fn lease_challenge_trace(&self, lease_id: fr::LeaseId) -> fr::LeaseTraceSnapshot {
@@ -727,6 +743,7 @@ impl LinkHandle {
             tx,
             dropped_motion: Arc::new(AtomicU64::new(0)),
             lease_diagnostics: Arc::new(LeaseTransportCounters::default()),
+            rtt: Arc::new(Mutex::new(RttMeter::default())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -821,15 +838,17 @@ pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
     let (tx, rx) = mpsc::channel::<Outbound>(config.queue_capacity.max(1));
     let dropped_motion = Arc::new(AtomicU64::new(0));
     let lease_diagnostics = Arc::new(LeaseTransportCounters::default());
+    let rtt = Arc::new(Mutex::new(RttMeter::default()));
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let handle = LinkHandle {
         peer: config.peer,
         tx,
         dropped_motion,
         lease_diagnostics: Arc::clone(&lease_diagnostics),
+        rtt: Arc::clone(&rtt),
         shutdown: Arc::clone(&shutdown),
     };
-    let task = tokio::spawn(run(config, rx, lease_diagnostics, shutdown));
+    let task = tokio::spawn(run(config, rx, lease_diagnostics, rtt, shutdown));
     Ok(Link { handle, task })
 }
 
@@ -837,6 +856,7 @@ async fn run(
     config: LinkConfig,
     outbound: mpsc::Receiver<Outbound>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
+    rtt: Arc<Mutex<RttMeter>>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     let LinkConfig {
@@ -886,7 +906,7 @@ async fn run(
     let (frames_tx, mut frames_rx) = mpsc::channel::<Result<wire::Envelope, TransportError>>(8);
     let reader_task = tokio::spawn(read_loop(reader, frames_tx, Arc::clone(&lease_diagnostics)));
 
-    let mut state = LinkState::new(peer, connection_id, key, lease_diagnostics);
+    let mut state = LinkState::new(peer, connection_id, key, lease_diagnostics, rtt);
     state.remote = remote;
 
     // The dialer speaks first: its `Hello` is the first frame of its direction (`seq = 1`).
@@ -1051,6 +1071,8 @@ struct LinkState {
     last_batch_log: Option<tokio::time::Instant>,
     last_ack_log: Option<tokio::time::Instant>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
+    /// This connection's `Ping`/`Pong` measurement, shared with the handle.
+    rtt: Arc<Mutex<RttMeter>>,
 }
 
 impl LinkState {
@@ -1059,6 +1081,7 @@ impl LinkState {
         connection_id: [u8; 16],
         key: [u8; 16],
         lease_diagnostics: Arc<LeaseTransportCounters>,
+        rtt: Arc<Mutex<RttMeter>>,
     ) -> Self {
         Self {
             peer,
@@ -1076,6 +1099,7 @@ impl LinkState {
             last_batch_log: None,
             last_ack_log: None,
             lease_diagnostics,
+            rtt,
         }
     }
     fn report_input_batch(&mut self, direction: &'static str, seq: u64, events: &[InputEvent]) {
@@ -1164,8 +1188,16 @@ impl LinkState {
         let envelope = self.envelope(wire::envelope::Payload::Ping(wire::Ping {
             nonce: self.ping_nonce,
         }));
+        // The instant is taken before the frame is written, so the measured round trip is
+        // «written, crossed, answered» rather than «already in the socket buffer».
+        let sent_at = Instant::now();
+        write_frame(writer, &envelope).await.map_err(reason_from)?;
         self.last_ping_ms = Some(self.started.elapsed().as_millis() as u64);
-        write_frame(writer, &envelope).await.map_err(reason_from)
+        self.rtt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sent(self.ping_nonce, sent_at);
+        Ok(())
     }
 
     fn envelope(&mut self, payload: wire::envelope::Payload) -> wire::Envelope {
@@ -1210,8 +1242,15 @@ impl LinkState {
                 }));
                 return write_frame(writer, &pong).await.map_err(reason_from);
             }
-            Some(wire::envelope::Payload::Pong(_)) => {
+            Some(wire::envelope::Payload::Pong(pong)) => {
                 self.last_pong_ms = self.started.elapsed().as_millis() as u64;
+                // An unknown, duplicate or late nonce is ignored by the meter itself: only a
+                // `Pong` that pairs with a ping still inside its bounds becomes a sample.
+                let _ = self
+                    .rtt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .received(pong.nonce, Instant::now());
                 return Ok(());
             }
             _ => {}

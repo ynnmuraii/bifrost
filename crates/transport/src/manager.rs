@@ -418,6 +418,22 @@ impl LinkManager {
             .lease_challenge_trace(peer, lease_id)
     }
 
+    /// The latency this link measured from its `Ping`/`Pong` pairs, as of now.
+    ///
+    /// `None` when no link to `peer` is up: latency belongs to a connection, so it is not
+    /// retained after one goes down — a reconnected peer starts from an empty window rather
+    /// than showing the latency of a socket that no longer exists. Zero fields mean the
+    /// connection exists but has not answered enough pings yet
+    /// ([`crate::rtt::MIN_SAMPLES`]).
+    pub async fn rtt(&self, peer: &NodeId) -> Option<crate::rtt::RttSnapshot> {
+        self.inner
+            .lock()
+            .await
+            .links
+            .get(peer)
+            .map(|link| link.handle.rtt())
+    }
+
     /// The current members (established links).
     pub async fn members(&self) -> Vec<NodeId> {
         self.inner.lock().await.links.keys().copied().collect()

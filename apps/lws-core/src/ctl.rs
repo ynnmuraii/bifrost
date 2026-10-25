@@ -395,6 +395,10 @@ pub struct StatusInput<'a> {
     /// code (`PORTAL_DENIED`, `CAPTURE_FAILED`, …) or a portal hint. Empty when the
     /// agent has said nothing of the sort.
     pub refusal: &'a str,
+    /// The link latency `Status` reports — `(p95, jitter)` in microseconds — and `None`
+    /// while no link has answered enough pings to measure one. The same pair the GUI sees,
+    /// so a live check can read it here instead of from a screenshot.
+    pub rtt: Option<(u32, u32)>,
 }
 
 /// Formats the one-line `status` answer.
@@ -420,13 +424,17 @@ pub fn status_line(input: &StatusInput<'_>) -> String {
         input.serial,
         input.pressed,
     );
-    // The refusal is appended only when there is one, so the common line stays short
-    // and the field never looks like an empty setting.
-    if input.refusal.is_empty() {
-        base
-    } else {
-        format!("{base} refusal={}", input.refusal)
+    // The refusal and the latency are appended only when there is something to say, so the
+    // common line stays short and neither field looks like an empty setting.
+    let mut line = base;
+    if !input.refusal.is_empty() {
+        line.push_str(" refusal=");
+        line.push_str(input.refusal);
     }
+    if let Some((p95_us, jitter_us)) = input.rtt {
+        line.push_str(&format!(" rtt_us={p95_us} jitter_us={jitter_us}"));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -541,6 +549,7 @@ mod tests {
             serial: 3,
             pressed: 2,
             refusal: "",
+            rtt: Some((12_400, 300)),
         });
         assert!(line.contains("focus=REMOTE"));
         assert!(line.contains("peer=laptop"));
@@ -553,6 +562,9 @@ mod tests {
             !line.contains("refusal="),
             "nothing to report must not add an empty field: {line}"
         );
+        // Live latency, in the same units the IPC `Status` carries.
+        assert!(line.contains("rtt_us=12400"), "{line}");
+        assert!(line.contains("jitter_us=300"), "{line}");
 
         // An agent refusal is what the GUI has to show next to the node.
         let with_refusal = status_line(&StatusInput {
@@ -567,11 +579,16 @@ mod tests {
             serial: 0,
             pressed: 0,
             refusal: "PORTAL_DENIED: the user dismissed the InputCapture dialog",
+            rtt: None,
         });
         assert!(
             with_refusal.contains("refusal=PORTAL_DENIED"),
             "{with_refusal}"
         );
         assert!(with_refusal.contains("pressed=0"), "{with_refusal}");
+        assert!(
+            !with_refusal.contains("rtt_us="),
+            "an unmeasured link must not print a zero: {with_refusal}"
+        );
     }
 }

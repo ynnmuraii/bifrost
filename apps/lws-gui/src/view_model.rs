@@ -1976,13 +1976,24 @@ impl ViewModel {
     }
 
     /// The latency line, or `None` while nobody measures it.
+    ///
+    /// `rtt_p95_us` is the core's «known» marker: with no answered pings it is zero, and a zero
+    /// line would claim a round trip of «0 мс» instead of saying nothing. Once it is known, the
+    /// jitter is a measurement too (a steady link reports 0), so both travel together.
     pub fn delay_line(&self) -> Option<String> {
         let lang = self.look.language;
         let status = self.status.as_ref()?;
         if status.rtt_p95_us == 0 {
             return None;
         }
-        Some(fill(lang, Key::DelayMs, &[&(status.rtt_p95_us / 1_000)]))
+        Some(fill(
+            lang,
+            Key::DelayJitterMs,
+            &[
+                &(status.rtt_p95_us / 1_000),
+                &(status.rtt_jitter_us / 1_000),
+            ],
+        ))
     }
 
     /// «Открыть файл настроек»: `config.toml` in the system's editor; a failure is a toast.

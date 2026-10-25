@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Live latency telemetry: each link now times its own `Ping`/`Pong` pairs and reports the 95th-percentile round trip and the jitter (mean absolute difference of consecutive samples) over the last 30 seconds. The status screen shows «Задержка: N мс, джиттер M мс» and the map's «≈ N мс» pill appears once a link has answered three pings; until then both stay blank instead of showing zero. A reconnected link starts measuring from scratch, and the core's `status` verb prints the same pair as `rtt_us=`/`jitter_us=`.
+
 ## 0.1.6 — 2026-10-24
 
 - Fixed `--root=/path` (and the other path flags) being ignored by the window and the core while the tray honoured it. Every role now accepts both `--root /path` and `--root=/path`, so the window, the tray and the core it starts always agree on their directories.

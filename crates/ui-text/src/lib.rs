@@ -281,6 +281,8 @@ pub enum Key {
     LastMessage,
     /// «Задержка: {} мс»
     DelayMs,
+    /// «Задержка: {} мс, джиттер {} мс»
+    DelayJitterMs,
     /// «≈ {} мс»
     ApproxLatencyMs,
     /// «<1 мс»
@@ -866,6 +868,7 @@ const fn ru(key: Key) -> &'static str {
         Key::WaylandInputCanOnlyBeCapturedThroughDesktopPortals => "Wayland: перехват ввода возможен только через порталы рабочего стола",
         Key::LastMessage => "Последнее сообщение: {}",
         Key::DelayMs => "Задержка: {} мс",
+        Key::DelayJitterMs => "Задержка: {} мс, джиттер {} мс",
         Key::ApproxLatencyMs => "≈ {} мс",
         Key::SubMillisecondLatency => "<1 мс",
         Key::CouldNotOpenTheSettingsFile => "не удалось открыть файл настроек ({})",
@@ -1218,6 +1221,7 @@ const fn en(key: Key) -> &'static str {
         Key::WaylandInputCanOnlyBeCapturedThroughDesktopPortals => "Wayland: input can only be captured through desktop portals",
         Key::LastMessage => "Last message: {}",
         Key::DelayMs => "Delay: {} ms",
+        Key::DelayJitterMs => "Delay: {} ms, jitter {} ms",
         Key::ApproxLatencyMs => "≈ {} ms",
         Key::SubMillisecondLatency => "<1 ms",
         Key::CouldNotOpenTheSettingsFile => "could not open the settings file ({})",
@@ -1671,7 +1675,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 345] = [
+    pub const EVERY: [Key; 346] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -1777,6 +1781,7 @@ mod tests {
         Key::WaylandInputCanOnlyBeCapturedThroughDesktopPortals,
         Key::LastMessage,
         Key::DelayMs,
+        Key::DelayJitterMs,
         Key::ApproxLatencyMs,
         Key::SubMillisecondLatency,
         Key::CouldNotOpenTheSettingsFile,
