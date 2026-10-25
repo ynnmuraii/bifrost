@@ -1861,8 +1861,8 @@ impl ViewModel {
     /// One line per **other** computer, or the sentence that says there are none.
     ///
     /// This computer is not a peer of itself: listing it here read as a third machine and the
-    /// owner asked why. Who controls the keyboard is said in plain words, «владелец» being
-    /// the core's word and not the owner's.
+    /// user asked why. Who controls the keyboard is said in plain words, «владелец» being
+    /// the core's word and not the reader's.
     pub fn member_lines(&self) -> Vec<String> {
         let lang = self.look.language;
         let Some(status) = &self.status else {

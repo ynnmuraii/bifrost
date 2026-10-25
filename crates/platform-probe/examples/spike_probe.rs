@@ -3,8 +3,8 @@
 //! On Linux: gathers the real snapshot (environment, portal versions, X11
 //! extensions) and prints the decision for each `[platform].backend` override.
 //! On Windows (or with `--synthetic`): runs the same pure decision over synthetic
-//! snapshots for laptop A (CachyOS + KDE Plasma 6.7 Wayland), laptop B (Ubuntu
-//! 24.04.4 + GNOME 46 Wayland), laptop B's Xorg session, Xwayland, wlroots and a
+//! snapshots for a CachyOS + KDE Plasma 6.7 Wayland session, an Ubuntu
+//! 24.04.4 + GNOME 46 Wayland session, that session under Xorg, Xwayland, wlroots and a
 //! portal older than the minimum, so the refusal messages can be reviewed anywhere.
 
 use platform_probe::env::{EnvSnapshot, HostOs, PortalVersions, X11Extensions};

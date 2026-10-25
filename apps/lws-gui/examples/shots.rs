@@ -830,7 +830,7 @@ fn event(msg: Msg) -> GuiFrame {
 
 /// One monitor of a mockup.
 ///
-/// The laptop is the owner's real CachyOS panel: a 1920×1200 mode under KDE's 110 % scale,
+/// The laptop panel is a 1920×1200 mode under a 110 % scale,
 /// so the compositor hands the map the 1745×1091 logical rectangle it draws.
 fn display(
     id: &str,

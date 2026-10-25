@@ -1666,11 +1666,11 @@ fn the_address_list_keeps_the_value_from_the_file_and_adds_what_this_computer_ha
 fn a_loopback_config_value_is_neither_offered_nor_selected() {
     let mut vm = view();
     vm.config.listen_address = "127.0.0.1".to_owned();
-    vm.settings.lan.candidates = vec!["192.168.1.37".to_owned(), "127.0.0.1".to_owned()];
+    vm.settings.lan.candidates = vec!["192.168.1.10".to_owned(), "127.0.0.1".to_owned()];
 
     assert_eq!(
         vm.settings.lan.options(&vm.config.listen_address),
-        vec!["192.168.1.37"],
+        vec!["192.168.1.10"],
         "the LAN picker must never offer loopback, even from a stale config"
     );
     assert_eq!(
@@ -1678,7 +1678,7 @@ fn a_loopback_config_value_is_neither_offered_nor_selected() {
             .lan
             .selected(&vm.config.listen_address)
             .as_deref(),
-        Some("192.168.1.37"),
+        Some("192.168.1.10"),
         "a valid adapter address replaces a stale loopback selection"
     );
 }
@@ -2063,7 +2063,7 @@ fn the_created_config_file_is_reported_once_in_a_session() {
 
 #[test]
 fn connection_after_first_run_reloads_the_created_config_for_settings() {
-    let dir = settings_dir("192.168.1.37");
+    let dir = settings_dir("192.168.1.10");
     let file = dir.join("config/config.toml");
     std::fs::remove_file(&file).expect("start without config");
     let paths = paths_of(&dir);
@@ -2073,12 +2073,12 @@ fn connection_after_first_run_reloads_the_created_config_for_settings() {
 
     std::fs::write(
         &file,
-        "config_version = 2\n\n[network]\nlisten_address = \"192.168.1.37\"\n",
+        "config_version = 2\n\n[network]\nlisten_address = \"192.168.1.10\"\n",
     )
     .expect("the core writes the first-run config before accepting the GUI");
     vm.on_connected("endpoint");
 
-    assert_eq!(vm.config.listen_address, "192.168.1.37");
+    assert_eq!(vm.config.listen_address, "192.168.1.10");
     assert!(!vm.config.config_was_missing);
     assert!(vm.settings.first_run_reported);
     let _ = std::fs::remove_dir_all(dir);
