@@ -141,6 +141,8 @@ pub(crate) fn items(
                 lang,
                 if status.is_some_and(|s| s.game_guard_mode == "always") {
                     Key::GameGuardAlways
+                } else if status.is_some_and(|s| s.game_guard_mode == "off") {
+                    Key::GameGuardOff
                 } else {
                     Key::GameGuardAuto
                 }
@@ -162,6 +164,35 @@ pub(crate) fn items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn game_mode_toggle_reports_all_configured_modes() {
+        for lang in [Lang::Ru, Lang::En] {
+            for (mode, key) in [
+                ("auto", Key::GameGuardAuto),
+                ("always", Key::GameGuardAlways),
+                ("off", Key::GameGuardOff),
+            ] {
+                let s = Status {
+                    game_guard_mode: mode.into(),
+                    game_guard_reason: "fullscreen".into(),
+                    ..status()
+                };
+                let menu = items(Some(&s), None, lang);
+                assert_eq!(menu[1].label, ui_text::game_guard_state(lang, "fullscreen"));
+                assert_eq!(
+                    menu.iter()
+                        .find(|item| item.action == Some(Action::GameGuardToggle))
+                        .unwrap()
+                        .label,
+                    format!("{}: {}", text(lang, Key::GameMode), text(lang, key))
+                );
+                assert!(menu
+                    .iter()
+                    .any(|item| matches!(item.action, Some(Action::Switch(_)))));
+            }
+        }
+    }
+
     fn status() -> Status {
         Status {
             focus: "LOCAL".into(),

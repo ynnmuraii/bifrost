@@ -65,6 +65,7 @@ fn main() -> std::process::ExitCode {
             for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
                 for (state, modal) in [("map", None), ("settings", Some(Modal::Settings))] {
                     let mut view = mockup(theme, modal, lang);
+                    view.settings.game_guard_apps_open = modal == Some(Modal::Settings);
                     if let Some(status) = &mut view.status {
                         status.focus = "LOCAL".into();
                         status.local_node_id = WORKSTATION.to_owned();

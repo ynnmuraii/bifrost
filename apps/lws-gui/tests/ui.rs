@@ -535,11 +535,15 @@ fn updater_uses_a_startup_segment_and_aligned_release_actions() {
                 })
                 .unwrap()
                 .1;
+            let autostart = bounds(&ui_text::text(lang, ui_text::Key::Autostart).to_uppercase());
+            let discovery = bounds(&ui_text::text(lang, ui_text::Key::LanDiscovery).to_uppercase());
             let autostart_off = frame
                 .texts
                 .iter()
                 .find(|(text, rect)| {
-                    text == ui_text::text(lang, ui_text::Key::Off) && rect.bottom() < startup.top()
+                    text == ui_text::text(lang, ui_text::Key::Off)
+                        && rect.top() > autostart.top()
+                        && rect.bottom() < discovery.top()
                 })
                 .unwrap()
                 .1;
@@ -552,7 +556,6 @@ fn updater_uses_a_startup_segment_and_aligned_release_actions() {
                 );
             }
             let details = bounds(ui_text::text(lang, ui_text::Key::UpdateDetails));
-            let discovery = bounds(&ui_text::text(lang, ui_text::Key::LanDiscovery).to_uppercase());
             assert!(discovery.top() >= 0.0 && discovery.bottom() < details.top());
             assert!(
                 details.bottom() < SIZE.y - 16.0,

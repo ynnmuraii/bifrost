@@ -324,8 +324,8 @@ pub(super) fn row(
     row_with_top_padding(ui, pal, label, last, 16.0, add);
 }
 
-/// Settings trades some space above rows for the added discovery control, keeping
-/// the shared 16 px bottom padding and the release actions inside the height budget.
+/// Settings keeps its compact controls visible at desktop heights; application lists expand
+/// only on request. The shared 16 px bottom padding is preserved.
 fn row_with_top_padding(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -945,7 +945,7 @@ fn diag_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
 
 fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
-    row_with_top_padding(ui, pal, text(lang, Key::GameMode), false, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::GameMode), false, 0.0, |ui| {
         let Some(status) = &vm.status else {
             widgets::hint(ui, pal, text(lang, Key::Service));
             return;
@@ -956,25 +956,42 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             "off" => 2,
             _ => 0,
         };
-        if let Some(index) = widgets::seg(
-            ui,
-            pal,
-            &[
-                text(lang, Key::GameGuardAuto),
-                text(lang, Key::GameGuardAlways),
-                text(lang, Key::GameGuardOff),
-            ],
-            selected,
-        ) {
-            mode = ["auto", "always", "off"][index].to_owned();
-            actions.push(Action::SetGameGuard(protocol::ipc::SetGameGuard {
-                mode: mode.clone(),
-                block_apps: status.game_guard_block_apps.clone(),
-                allow_apps: status.game_guard_allow_apps.clone(),
-            }));
-        }
+        widgets::duo(ui, |ui| {
+            if let Some(index) = widgets::seg(
+                ui,
+                pal,
+                &[
+                    text(lang, Key::GameGuardAuto),
+                    text(lang, Key::GameGuardAlways),
+                    text(lang, Key::GameGuardOff),
+                ],
+                selected,
+            ) {
+                mode = ["auto", "always", "off"][index].to_owned();
+                actions.push(Action::SetGameGuard(protocol::ipc::SetGameGuard {
+                    mode: mode.clone(),
+                    block_apps: status.game_guard_block_apps.clone(),
+                    allow_apps: status.game_guard_allow_apps.clone(),
+                }));
+            }
+            if widgets::button(
+                ui,
+                pal,
+                text(lang, Key::GameGuardApps),
+                Kind::Link,
+                vm.connection.is_connected(),
+            )
+            .on_hover_text(text(lang, Key::GameGuardHelp))
+            .clicked()
+            {
+                actions.push(Action::ToggleGameGuardApps);
+            }
+        });
         if status.backend == "platform-wayland" {
             widgets::hint(ui, pal, text(lang, Key::GameGuardWayland));
+        }
+        if !vm.settings.game_guard_apps_open {
+            return;
         }
         let id = ui.id().with("game_guard_lists");
         let mut lists = ui
@@ -1041,7 +1058,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
     });
     // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
     // the change is instant, because every string is drawn from the catalogue each frame.
-    row_with_top_padding(ui, pal, text(lang, Key::Language), false, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Language), false, 0.0, |ui| {
         let mut look = vm.look;
         if let Some(i) = widgets::seg(
             ui,
@@ -1053,7 +1070,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             actions.push(Action::SetLook(look));
         }
     });
-    row_with_top_padding(ui, pal, text(lang, Key::Autostart), false, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Autostart), false, 0.0, |ui| {
         if let Some(i) = widgets::seg(
             ui,
             pal,
@@ -1066,7 +1083,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::wrapped(ui, error, 13.0, fam::sans(), pal.ink);
         }
     });
-    row_with_top_padding(ui, pal, text(lang, Key::LanDiscovery), false, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::LanDiscovery), false, 0.0, |ui| {
         let pending = vm.settings.discovery_pending;
         let toggle = ui.add_enabled_ui(vm.connection.is_connected() && pending.is_none(), |ui| {
             if let Some(i) = widgets::seg(
@@ -1087,7 +1104,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
         }
     });
     let current = vm.config.listen_address.clone();
-    row_with_top_padding(ui, pal, text(lang, Key::LANAddress), false, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::LANAddress), false, 0.0, |ui| {
         let options = vm.settings.lan.options(&current);
         let selected = vm.settings.lan.selected(&current).unwrap_or_default();
         widgets::duo(ui, |ui| {
@@ -1118,7 +1135,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             text(lang, Key::AfterApplyTheServiceRestartsOnTheNewAddress),
         );
     });
-    row_with_top_padding(ui, pal, text(lang, Key::Service), false, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Service), false, 0.0, |ui| {
         let busy = vm.settings.service.restart.is_some() || vm.settings.service.stopping.is_some();
         widgets::duo(ui, |ui| {
             act(
@@ -1163,7 +1180,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
     // Portals are a Wayland desktop's, and only a Wayland desktop's: a window on Windows or
     // X11 has nothing to forget and does not show the row at all.
     if vm.uses_portals() {
-        row_with_top_padding(ui, pal, text(lang, Key::Portals), false, 8.0, |ui| {
+        row_with_top_padding(ui, pal, text(lang, Key::Portals), false, 0.0, |ui| {
             act(
                 ui,
                 pal,
@@ -1176,7 +1193,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::hint(ui, pal, text(lang, Key::TheServiceWillAskForTheGrantsAgain));
         });
     }
-    row_with_top_padding(ui, pal, text(lang, Key::StartupUpdates), false, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::StartupUpdates), false, 0.0, |ui| {
         // The other on/off segment uses the same labels; keep its animation and hit IDs separate.
         ui.push_id("startup-updates", |ui| {
             if let Some(i) = widgets::seg(
@@ -1189,7 +1206,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             }
         });
     });
-    row_with_top_padding(ui, pal, text(lang, Key::Version), true, 8.0, |ui| {
+    row_with_top_padding(ui, pal, text(lang, Key::Version), true, 0.0, |ui| {
         super::update::settings(ui, pal, vm, actions);
     });
 }

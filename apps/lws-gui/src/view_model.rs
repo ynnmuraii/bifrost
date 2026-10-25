@@ -685,6 +685,7 @@ pub struct Settings {
     pub clipboard_pending: Option<bool>,
     /// Requested discovery state until the core publishes it or refuses.
     pub discovery_pending: Option<bool>,
+    pub game_guard_apps_open: bool,
     /// The member «Удалить компьютер из пары» is aimed at.
     pub revoke: Option<String>,
     /// What `ExportDiagnostics` answered.
@@ -2268,6 +2269,9 @@ impl ViewModel {
             }
             Action::SetClipboard(enabled) => self.settings.clipboard_pending = Some(*enabled),
             Action::SetDiscovery(enabled) => self.settings.discovery_pending = Some(*enabled),
+            Action::ToggleGameGuardApps => {
+                self.settings.game_guard_apps_open = !self.settings.game_guard_apps_open
+            }
             Action::HoldToast(hold) => {
                 if *hold != self.outcome_hold {
                     let now = Instant::now();
@@ -2446,6 +2450,7 @@ pub enum Action {
     /// Persist LAN discovery through the core.
     SetDiscovery(bool),
     SetGameGuard(ipc::SetGameGuard),
+    ToggleGameGuardApps,
     /// Refresh metadata without fetching clipboard contents.
     RefreshClipboardHistory,
     /// Copy a stored item to this computer's clipboard through the core.
