@@ -29,13 +29,18 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => {
             console::attach_parent();
-            println!("Bifrost {}", env!("CARGO_PKG_VERSION"));
+            println!("Bifrost {}", lws_gui::app_version());
             ExitCode::SUCCESS
         }
         None => lws_gui::run_gui(args),
         Some("gui") => {
             args.remove(0);
             lws_gui::run_gui(args)
+        }
+        Some("update") => {
+            console::attach_parent();
+            args.remove(0);
+            lws_gui::headless_update::run(args)
         }
         Some("tray") => {
             args.remove(0);

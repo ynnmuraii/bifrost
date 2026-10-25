@@ -219,6 +219,9 @@ pub struct Config {
     /// `[topology]`.
     #[serde(default)]
     pub topology: TopologyConfig,
+    /// `[update]`: permission for trusted peers to request a signed release update.
+    #[serde(default, skip_serializing_if = "UpdateConfig::is_default")]
+    pub update: UpdateConfig,
 }
 
 impl Default for Config {
@@ -237,7 +240,51 @@ impl Default for Config {
             appearance: AppearanceConfig::default(),
             log: LogConfig::default(),
             topology: TopologyConfig::default(),
+            update: UpdateConfig::default(),
         }
+    }
+}
+
+/// Remote requests never supply a download location.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Allow a trusted, connected peer to request a newer official release.
+    pub allow_remote_request: bool,
+}
+
+impl UpdateConfig {
+    /// Omit the default section so older releases still load unchanged settings.
+    pub fn is_default(&self) -> bool {
+        self.allow_remote_request
+    }
+}
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            allow_remote_request: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    #[test]
+    fn update_defaults_allow_and_omit_section_for_older_releases() {
+        let mut config = Config::default();
+        assert!(config.update.allow_remote_request);
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(!encoded.contains("[update]"));
+        config.update.allow_remote_request = false;
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("[update]"));
+        assert!(
+            !Config::from_str(&encoded)
+                .unwrap()
+                .update
+                .allow_remote_request
+        );
     }
 }
 

@@ -14,7 +14,7 @@ static TARGET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::ne
 enum Event {
     Checked(Result<updater::Release, String>, bool),
     Progress(u64, Option<u64>),
-    Installed(Result<(), String>),
+    Installed(Result<std::fs::File, String>),
 }
 pub(crate) struct Runtime {
     startup: Option<Instant>,
@@ -22,12 +22,15 @@ pub(crate) struct Runtime {
     receiver: mpsc::Receiver<Event>,
     stopping: Option<crate::core_exit::Wait>,
     busy: bool,
+    install_lock: Option<std::fs::File>,
+    coordinator_due: Instant,
 }
 impl Runtime {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) {
             updater::clean_old(&exe);
+            let _ = TARGET.set(exe);
         }
         Self {
             startup: Some(Instant::now() + Duration::from_secs(3)),
@@ -35,6 +38,8 @@ impl Runtime {
             receiver,
             stopping: None,
             busy: false,
+            install_lock: None,
+            coordinator_due: Instant::now(),
         }
     }
     fn check(&mut self, ctx: &egui::Context, manual: bool) {
@@ -50,7 +55,47 @@ impl Runtime {
         });
     }
     pub fn action(&mut self, action: Action, bridge: &mut Bridge, ctx: &egui::Context) {
+        let mesh_busy = bridge.view().status.as_ref().is_some_and(|status| {
+            status.update_nodes.iter().any(|row| {
+                matches!(
+                    row.status.as_str(),
+                    "pending" | "downloading" | "restarting"
+                )
+            })
+        });
+        if mesh_busy
+            && matches!(
+                action,
+                Action::Install | Action::InstallAll | Action::Confirm | Action::ConfirmAll
+            )
+        {
+            return;
+        }
         match action {
+            Action::ConfirmAll => {
+                let view = bridge.view_mut();
+                view.update_confirm = true;
+                view.update_all_confirm = true;
+                view.modal = Some(Modal::Settings);
+            }
+            Action::InstallAll => {
+                if self.busy {
+                    return;
+                }
+                if let Some(release) = &bridge.view().checked_release {
+                    if let Ok(version) = release.version() {
+                        bridge.dispatch(
+                            view_model::Action::UpdateAll(version.to_string()),
+                            Instant::now(),
+                        );
+                        bridge.view_mut().update_confirm = false;
+                        bridge.view_mut().update_all_confirm = false;
+                    }
+                }
+            }
+            Action::RemoteEnabled(enabled) => {
+                bridge.dispatch(view_model::Action::SetRemoteUpdate(enabled), Instant::now())
+            }
             Action::Check => {
                 self.startup = None;
                 if !self.busy {
@@ -72,10 +117,14 @@ impl Runtime {
             Action::Confirm => {
                 let view = bridge.view_mut();
                 view.update_notice = false;
+                view.update_all_confirm = false;
                 view.update_confirm = true;
                 view.modal = Some(Modal::Settings);
             }
-            Action::Cancel => bridge.view_mut().update_confirm = false,
+            Action::Cancel => {
+                bridge.view_mut().update_confirm = false;
+                bridge.view_mut().update_all_confirm = false;
+            }
             Action::Install => {
                 if self.busy {
                     return;
@@ -95,13 +144,15 @@ impl Runtime {
                 };
                 std::thread::spawn(move || {
                     let result = (|| {
+                        let exe = std::env::current_exe()
+                            .and_then(std::fs::canonicalize)
+                            .map_err(|e| e.to_string())?;
+                        let lock = updater::install_lock(&exe)?;
                         let bytes = updater::prepare(&release, &mut |received, total| {
                             let _ = sender.send(Event::Progress(received, total));
                             ctx.request_repaint();
                         })?;
-                        let exe = std::env::current_exe()
-                            .and_then(std::fs::canonicalize)
-                            .map_err(|e| e.to_string())?;
+                        // Keep the process lock through the orderly restart handoff.
                         updater::replace(&exe, &bytes).map_err(|error| {
                             if error.kind() == std::io::ErrorKind::PermissionDenied {
                                 fill(
@@ -114,7 +165,7 @@ impl Runtime {
                             }
                         })?;
                         let _ = TARGET.set(exe);
-                        Ok(())
+                        Ok(lock)
                     })();
                     let _ = sender.send(Event::Installed(result));
                     ctx.request_repaint();
@@ -124,6 +175,37 @@ impl Runtime {
     }
     pub fn tick(&mut self, bridge: &mut Bridge, ctx: &egui::Context) {
         let now = Instant::now();
+        if now >= self.coordinator_due {
+            bridge.dispatch(
+                view_model::Action::RegisterUpdateCoordinator(std::process::id()),
+                now,
+            );
+            self.coordinator_due = now + Duration::from_secs(5);
+        }
+        ctx.request_repaint_after(self.coordinator_due.saturating_duration_since(now));
+        if self.stopping.is_none()
+            && bridge
+                .view()
+                .status
+                .as_ref()
+                .is_some_and(|status| status.update_notice.starts_with("restart-gui:"))
+        {
+            if TARGET.get().is_some() {
+                let paths = bridge.view().config.paths.clone();
+                let pid = bridge.view().core.as_ref().and_then(|core| core.pid);
+                if let Some(paths) = paths {
+                    match crate::core_exit::Wait::new(&paths, pid, now) {
+                        Ok(wait) => {
+                            let _ = lws_desktop::stop_tray();
+                            self.stopping = Some(wait);
+                            self.busy = true;
+                            bridge.view_mut().update = State::Restarting;
+                        }
+                        Err(error) => bridge.view_mut().update = State::Error(error),
+                    }
+                }
+            }
+        }
         if let Some(startup) = self.startup {
             if now >= startup {
                 self.startup = None;
@@ -140,9 +222,10 @@ impl Runtime {
                     self.busy = false;
                     let view = bridge.view_mut();
                     let result = result.and_then(|release| {
+                        view.checked_release = Some(release.clone());
                         updater::offer(
                             &release,
-                            env!("CARGO_PKG_VERSION"),
+                            protocol::app_version(),
                             view.look.skipped_update,
                             manual,
                         )
@@ -178,7 +261,8 @@ impl Runtime {
                     self.busy = false;
                     bridge.view_mut().update = State::Error(view_model::short_error(&error));
                 }
-                Event::Installed(Ok(())) => {
+                Event::Installed(Ok(lock)) => {
+                    self.install_lock = Some(lock);
                     // Shutdown may drop the GUI link before core has released its listeners.
                     bridge.shutdown_for_update(now);
                     if let Err(error) = lws_desktop::stop_tray() {

@@ -178,6 +178,13 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
         "pair" => pair::main(&args.paths, &args.rest),
         "peers" => peers(&args),
         "status" => control(&args.paths, "status"),
+        "update-all" => {
+            if args.rest.len() != 2 || args.rest[0] != "--to" {
+                return Err(Failure::Usage("update-all --to VERSION".into()));
+            }
+            control(&args.paths, &format!("update-all {}", args.rest[1]))
+        }
+        "update-status" => control(&args.paths, "update-status"),
         // KVM-072: the layout document's CAS surface, until the GUI owns it.
         "layout" => {
             let verb = args.rest.first().ok_or_else(|| {
@@ -394,9 +401,29 @@ fn run(args: &Args) -> Result<(), Failure> {
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start the runtime: {error}"))?;
-    runtime
+    let result = runtime
         .block_on(async move { run_async(paths, options, config, session).await })
-        .map_err(Failure::Run)
+        .map_err(Failure::Run);
+    drop(runtime);
+    result?;
+    if session::update::REEXEC.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        let exe = session::update::TARGET
+            .get()
+            .cloned()
+            .ok_or_else(|| Failure::Run("Missing verified update target".into()))?;
+        let mut command = std::process::Command::new(exe);
+        command.args(std::env::args_os().skip(1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            return Err(Failure::Run(command.exec().to_string()));
+        }
+        #[cfg(windows)]
+        {
+            command.spawn().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// The daemon's async half, so `run` only owns the runtime and the exit mapping.
@@ -619,6 +646,7 @@ async fn run_async(
     session.set_appearance_source(paths.config_file(), config.appearance);
     session.set_discovery_source(config.discovery, config.network.clone());
     session.set_hotkeys_source(config.input.hotkeys);
+    session.set_update_policy(config.update.allow_remote_request);
     session.run().await.map_err(|error| error.to_string())
 }
 

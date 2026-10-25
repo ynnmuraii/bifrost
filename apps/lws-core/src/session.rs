@@ -41,6 +41,7 @@ pub(crate) mod hotkeys;
 /// The pairing window and its ceremonies (ALPN `pair/1` on the link listener).
 mod pairing;
 mod transition_retry;
+pub(crate) mod update;
 
 /// Attribution belongs to the operation, never to mutable "last requester" state.
 /// GUI/control edits (including their Auto buttons) retain the requesting connection.
@@ -648,6 +649,7 @@ pub struct Session {
     last_input_batch_log: Option<Instant>,
     input_diagnostics: InputDiagnostics,
     discovery: discovery::Discovery,
+    updates: update::Updates,
 }
 
 impl Session {
@@ -725,6 +727,7 @@ impl Session {
             next_layout_nonce: 0,
             layout_connections: HashMap::new(),
             stopping: false,
+            updates: update::Updates::default(),
             agent_restart_due: None,
             agent_restart_circuit: RestartWatch::new(),
             agent_restart_backoff: RESTART_BACKOFF,
@@ -1096,6 +1099,7 @@ impl Session {
         loop {
             self.observe_loop_wake(&mut planned_wake_ms);
             self.service_clock().await;
+            self.service_updates().await;
             if self.stopping {
                 self.shutdown_agent().await;
                 return Ok(());
@@ -1218,6 +1222,7 @@ impl Session {
     pub(crate) async fn shutdown_agent(&mut self) {
         self.stopping = true;
         self.agent.shutdown().await;
+        self.stop_update_worker();
     }
 
     /// Timers, the IPC heartbeat, and the agent restart backoff.
@@ -2501,6 +2506,10 @@ impl Session {
                 if !self.trust.is_trusted(&peer) {
                     return;
                 }
+                self.updates
+                    .peers
+                    .insert(peer, (hello.app_version.clone(), hello.remote_update));
+                self.update_reconnected(peer, &hello.app_version);
                 self.layout_connections.insert(peer, connection_id);
                 // A peer string is untrusted: bound it before it is stored or forwarded.
                 let system_name = protocol::sanitize_system_name(&hello.system_name);
@@ -2615,6 +2624,12 @@ impl Session {
                 }
             }
             LinkEvent::Message { peer, message } => match message {
+                transport::convert::Inbound::UpdateRequest(request) => {
+                    self.remote_update(peer, request).await
+                }
+                transport::convert::Inbound::UpdateResult(result) => {
+                    self.update_result(peer, result)
+                }
                 transport::convert::Inbound::Focus(message) => {
                     static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
                     if tracing::enabled!(tracing::Level::DEBUG)
@@ -2751,6 +2766,9 @@ impl Session {
         });
         self.local_hello.can_own = self.configured_can_own && self.router.can_be_source();
         self.local_hello.capabilities = routing::capability_bits(self.capabilities);
+        self.local_hello
+            .capabilities
+            .push(protocol::wire::Capability::RemoteUpdate as i32);
         self.manager
             .update_local_hello(self.local_hello.clone())
             .await;
@@ -3857,6 +3875,15 @@ impl Session {
         match request {
             ctl::Request::Ping => ctl::Response::Pong.into(),
             ctl::Request::Status => ctl::Response::Status(self.status_line().await).into(),
+            ctl::Request::UpdateAll(target) => match self.start_update_all(target).await {
+                Ok(()) => ctl::Response::Status(self.update_line()),
+                Err(detail) => ctl::Response::Error {
+                    code: "UPDATE_REFUSED".into(),
+                    detail,
+                },
+            }
+            .into(),
+            ctl::Request::UpdateStatus => ctl::Response::Status(self.update_line()).into(),
             ctl::Request::ResetPortals => self.reset_portals().await.into(),
             ctl::Request::Quit => {
                 self.stopping = true;

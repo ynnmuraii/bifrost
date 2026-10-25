@@ -2481,6 +2481,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_shutdown_releases_dry_capture_and_all_lease_clocks() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(4),
+                self_timeout_ms: 400,
+                dev_capture_injected: false,
+            }))
+            .await;
+        harness.recv().await;
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(4),
+                remaining_ms: 400,
+            }))
+            .await;
+        assert!(harness.held.is_some());
+        assert!(harness.self_timeout.is_some());
+        assert!(harness.deadline.is_some());
+
+        harness.send(Msg::Shutdown(ipc::AgentShutdown {})).await;
+
+        assert!(harness.held.is_none());
+        assert!(harness.self_timeout.is_none());
+        assert!(harness.deadline.is_none());
+        assert_eq!(
+            harness.repeat.as_ref().expect("software repeat").holding(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn an_emergency_releases_every_capture_mode_and_discards_pending_input() {
         for kind in [
             ipc::CaptureKind::Observe,

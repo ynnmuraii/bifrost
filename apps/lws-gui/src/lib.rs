@@ -31,12 +31,14 @@
 
 #![forbid(unsafe_code)]
 
+pub use protocol::app_version;
 pub use ui_text;
 
 pub mod app;
 pub mod autostart;
 mod core_exit;
 pub mod gui_settings;
+pub mod headless_update;
 pub mod map;
 pub mod ui;
 pub mod updater;

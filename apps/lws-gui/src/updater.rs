@@ -1,5 +1,5 @@
 //! GitHub release checks and verified, same-directory binary replacement.
-//! This module is GUI-only: the agent has no HTTP dependency.
+//! Shared by the GUI and headless updater roles; the input agent has no HTTP dependency.
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,9 @@ pub enum Action {
     Skip,
     Confirm,
     Install,
+    ConfirmAll,
+    InstallAll,
+    RemoteEnabled(bool),
     Cancel,
 }
 
@@ -309,6 +312,20 @@ pub fn paths(target: &Path) -> (PathBuf, PathBuf) {
 pub fn clean_old(target: &Path) {
     let _ = fs::remove_file(paths(target).1);
 }
+/// One updater owns this executable from preparation through restart. OS locks release on crash.
+pub fn install_lock(target: &Path) -> Result<fs::File, String> {
+    let path = PathBuf::from(format!("{}.update.lock", target.display()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.try_lock()
+        .map_err(|e| format!("Another updater is active: {e}"))?;
+    Ok(file)
+}
 /// Canonicalize at the call site: a symlink install updates its target, not the link.
 pub fn replace(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let (next, old) = paths(target);
@@ -360,6 +377,17 @@ pub fn replace(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn install_lock_excludes_another_updater_until_owner_drops() {
+        let target =
+            std::env::temp_dir().join(format!("bifrost-update-lock-test-{}", std::process::id()));
+        let first = install_lock(&target).unwrap();
+        assert!(install_lock(&target).is_err());
+        drop(first);
+        let second = install_lock(&target).unwrap();
+        drop(second);
+        fs::remove_file(format!("{}.update.lock", target.display())).unwrap();
+    }
     #[test]
     fn embedded_release_key_matches_packaged_spki() {
         use spki::der::DecodePem;

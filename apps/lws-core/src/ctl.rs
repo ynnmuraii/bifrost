@@ -25,6 +25,8 @@
 //! pair-answer <hex> yes  -> OK paired <name> | ERR <code> <detail>
 //! pair-answer <hex> no   -> OK rejected
 //! pair-with <address>    -> OK dialing
+//! update-all <version>   -> OK started | ERR <code> <detail>
+//! update-status          -> OK <per-computer progress>
 //! ```
 //!
 //! `<peer>` is a 64-hex node id or a paired peer's display name. `pair-prompt` and
@@ -94,6 +96,10 @@ fn runtime_tag(runtime_dir: &std::path::Path) -> Option<String> {
 pub enum Request {
     /// Report the current state.
     Status,
+    /// Update trusted peers before this computer, using independently verified releases.
+    UpdateAll(String),
+    /// Report the current update batch without starting a check or download.
+    UpdateStatus,
     /// Ask for a manual transition to a peer.
     Switch(PeerRef),
     /// Set the destination without toggling; `None` means local input.
@@ -159,6 +165,15 @@ impl Request {
         };
         match verb {
             "status" if argument.is_empty() => Ok(Request::Status),
+            "update-status" if argument.is_empty() => Ok(Request::UpdateStatus),
+            "update-all" => {
+                let version = protocol::sanitize_app_version(argument);
+                if version.is_empty() {
+                    Err("update-all needs a semver version of at most 32 characters".to_owned())
+                } else {
+                    Ok(Request::UpdateAll(version))
+                }
+            }
             "layout" if argument.trim() == "show" => Ok(Request::LayoutShow),
             "layout" if argument.starts_with("edit ") => Ok(Request::LayoutEdit(
                 argument["edit ".len()..].trim().to_owned(),
@@ -511,6 +526,24 @@ mod tests {
         assert!(Request::parse("abandon now").is_err());
         assert!(Request::parse("status extra").is_err());
         assert!(Request::parse("frobnicate").is_err());
+    }
+
+    #[test]
+    fn update_commands_accept_only_a_version_and_no_url_or_shell_arguments() {
+        assert_eq!(
+            Request::parse("update-all 0.2.0"),
+            Ok(Request::UpdateAll("0.2.0".to_owned()))
+        );
+        assert_eq!(Request::parse("update-status"), Ok(Request::UpdateStatus));
+        for line in [
+            "update-all",
+            "update-all https://github.com/owner/asset",
+            "update-all 0.2.0 --url https://example.com",
+            "update-all 0.2.0; quit",
+            "update-status extra",
+        ] {
+            assert!(Request::parse(line).is_err(), "{line}");
+        }
     }
 
     #[test]

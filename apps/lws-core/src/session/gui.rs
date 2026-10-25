@@ -131,6 +131,18 @@ impl Session {
                     online: connected,
                     is_owner: owner == Some(record.node_id),
                     link_state: if connected { "READY" } else { "OFFLINE" }.to_owned(),
+                    app_version: self
+                        .updates
+                        .peers
+                        .get(&record.node_id)
+                        .map(|(v, _)| v.clone())
+                        .unwrap_or_default(),
+                    remote_update: connected
+                        && self
+                            .updates
+                            .peers
+                            .get(&record.node_id)
+                            .is_some_and(|(_, capable)| *capable),
                 }
             })
             .collect();
@@ -185,6 +197,16 @@ impl Session {
             hide_remote_cursor: self.appearance.hide_remote_cursor,
             discovered_peers: self.discovery.table.peers(),
             discovery_enabled: self.discovery.enabled,
+            allow_remote_update: self.updates.allow,
+            update_nodes: self
+                .updates
+                .rows
+                .iter()
+                .filter(|(node, _)| **node != self.node_id)
+                .map(|(_, row)| row.clone())
+                .chain(self.updates.rows.get(&self.node_id).cloned())
+                .collect(),
+            update_notice: self.updates.notice.clone(),
         }
     }
 
@@ -304,6 +326,7 @@ impl Session {
             .iter()
             .map(|node| ipc::MemberTopology {
                 system_name: String::new(),
+                app_version: String::new(),
                 node_id: hex(&node.node_id),
                 display_name: if node_id_of(&node.node_id) == Some(self.node_id) {
                     self.display_name.clone()
@@ -318,6 +341,16 @@ impl Session {
                     .is_some_and(|node| node == self.node_id || online.contains(&node)),
             })
             .collect();
+        let local_id = crate::command::node_id_hex(&self.node_id);
+        if !members.iter().any(|member| member.node_id == local_id) {
+            members.push(ipc::MemberTopology {
+                node_id: local_id,
+                display_name: self.display_name.clone(),
+                online: true,
+                app_version: protocol::app_version().to_owned(),
+                ..Default::default()
+            });
+        }
         append_missing_members(&mut members, &self.trust, &self.peer_displays, &online);
         members.retain(|member| {
             config::topology::node_id_from_hex(&member.node_id)
@@ -325,6 +358,20 @@ impl Session {
                 .is_none_or(|node| !crate::topology::is_forgotten(&self.layout, &node))
         });
         for member in &mut members {
+            member.app_version = config::topology::node_id_from_hex(&member.node_id)
+                .map(NodeId::new)
+                .map(|node| {
+                    if node == self.node_id {
+                        protocol::app_version().to_owned()
+                    } else {
+                        self.updates
+                            .peers
+                            .get(&node)
+                            .map(|(version, _)| version.clone())
+                            .unwrap_or_default()
+                    }
+                })
+                .unwrap_or_default();
             member.system_name = config::topology::node_id_from_hex(&member.node_id)
                 .map(NodeId::new)
                 .map(|node| {
@@ -430,6 +477,77 @@ impl Session {
         } = request;
         let source = LayoutSource::local("gui", connection_id);
         match message {
+            Msg::UpdateAll(update) => {
+                let result = self.start_update_all(update.target_version).await;
+                answer(
+                    &out,
+                    request_id,
+                    Msg::OpResult(ipc::OpResult {
+                        ok: result.is_ok(),
+                        error_code: result.err().unwrap_or_default(),
+                    }),
+                )
+                .await;
+            }
+            Msg::SetRemoteUpdate(policy) => {
+                let path = self.paths.config_file();
+                let enabled = policy.enabled;
+                let saved = tokio::task::spawn_blocking(move || {
+                    config::lock::update_locked(&path, |config| {
+                        config.update.allow_remote_request = enabled
+                    })
+                })
+                .await;
+                let ok = matches!(saved, Ok(Ok(())));
+                if ok {
+                    self.updates.allow = enabled;
+                }
+                answer(
+                    &out,
+                    request_id,
+                    Msg::OpResult(ipc::OpResult {
+                        ok,
+                        error_code: if ok {
+                            String::new()
+                        } else {
+                            "CONFIG_SAVE_FAILED".into()
+                        },
+                    }),
+                )
+                .await;
+            }
+            Msg::UpdateProgress(progress) => {
+                let ok = self.update_progress(progress).await;
+                answer(
+                    &out,
+                    request_id,
+                    Msg::OpResult(ipc::OpResult {
+                        ok,
+                        error_code: if ok {
+                            String::new()
+                        } else {
+                            "UPDATE_NOT_ACTIVE".into()
+                        },
+                    }),
+                )
+                .await;
+            }
+            Msg::UpdateReady(ready) => {
+                let ok = self.update_ready(&ready.target_version).await;
+                answer(
+                    &out,
+                    request_id,
+                    Msg::OpResult(ipc::OpResult {
+                        ok,
+                        error_code: if ok {
+                            String::new()
+                        } else {
+                            "UPDATE_NOT_ACTIVE".into()
+                        },
+                    }),
+                )
+                .await;
+            }
             Msg::GetStatus(_) => {
                 let status = self.gui_status().await;
                 self.gui_status = Some(status.clone());
@@ -1522,6 +1640,7 @@ fn append_missing_members(
         }
         members.push(ipc::MemberTopology {
             system_name: String::new(),
+            app_version: String::new(),
             node_id,
             display_name: record.display_name.clone(),
             displays: displays

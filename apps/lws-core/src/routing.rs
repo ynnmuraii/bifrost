@@ -231,7 +231,11 @@ pub fn hello(
         node_id: node_id.as_bytes().to_vec(),
         display_name: display_name.to_owned(),
         system_name: String::new(),
-        capabilities: capability_bits(capabilities),
+        capabilities: {
+            let mut bits = capability_bits(capabilities);
+            bits.push(wire::Capability::RemoteUpdate as i32);
+            bits
+        },
         displays: Vec::new(),
         required_capabilities: Vec::new(),
         session_kind: session_kind as i32,
@@ -244,6 +248,7 @@ pub fn hello(
         can_own,
         topology_revision: gossip.topology_revision,
         topology_author: Vec::new(),
+        app_version: protocol::app_version().to_owned(),
     }
 }
 
@@ -1159,7 +1164,8 @@ mod tests {
             },
         );
         assert_eq!(hello.node_id.len(), 32);
-        assert_eq!(hello.capabilities, vec![1, 2, 3, 10]);
+        assert_eq!(hello.capabilities, vec![1, 2, 3, 10, 11]);
+        assert_eq!(hello.app_version, protocol::app_version());
         assert!(hello.can_own);
     }
 }
