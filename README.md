@@ -12,6 +12,7 @@ Bifrost is a software KVM: share one keyboard, mouse and text clipboard across W
 ## What it does
 
 - Mutual TLS, persistent peer trust and pairing confirmed on both computers.
+- LAN peer discovery for pairing and finding trusted computers after their address changes; manual addresses remain available.
 - A freely arranged monitor map, edge links across gaps and an animated ASCII bridge.
 - Edge glow to show where input is going.
 - Shared **text** clipboard with history (opt-in; no files or images).
@@ -34,7 +35,7 @@ Versions from **0.1.4** can update from **Settings** or the startup update notic
 
 Download **`bifrost-0.1.6-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
-The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; computers must be able to reach TCP **47901 and 47902**.
+The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902** (input/control and clipboard) plus multicast **UDP 47902 (discovery)** (`239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
 Settings are created automatically in `%APPDATA%\lan-workspace`; logs go to `%LOCALAPPDATA%\lan-workspace`. To start Bifrost when you sign in, enable **Settings → Start at login**. It uses the executable's current path: if you move the file later, turn the toggle off and on again.
 
@@ -49,16 +50,20 @@ tar -xzf bifrost-0.1.6-linux-x86_64.tar.gz
 
 No `sudo`: this installs `~/.local/bin/bifrost`, an application-menu entry and icons. Open **Bifrost** from your applications menu, or run `~/.local/bin/bifrost`. To remove the installed application, run `./install.sh --uninstall` from the extracted archive; your `~/.config/lan-workspace` settings and pairing are never removed.
 
-Runtime: X11 works too; Wayland needs `xdg-desktop-portal` with RemoteDesktop/InputCapture and a compatible backend (KDE Plasma ≥6.1 or GNOME ≥45). The GitHub Linux build targets **glibc 2.35 or newer** (Ubuntu 22.04 baseline); older distributions should build from source. Allow TCP **47901 and 47902** on your LAN firewall if needed.
+Runtime: X11 works too; Wayland needs `xdg-desktop-portal` with RemoteDesktop/InputCapture and a compatible backend (KDE Plasma ≥6.1 or GNOME ≥45). The GitHub Linux build targets **glibc 2.35 or newer** (Ubuntu 22.04 baseline); older distributions should build from source. Allow **TCP 47901/47902** plus multicast **UDP 47902 (discovery)** on your LAN firewall. UDP 47902 is separate from TCP 47902 clipboard; discovery does not require enabling clipboard.
 
 ## Quick start
 
 1. Run Bifrost on both computers, on the same trusted LAN. On a fresh setup, the window starts its core and creates the settings automatically.
-2. On one computer, open the pairing window in the pairing panel. On the other, enter the first computer's LAN address (shown in its window), then connect.
+2. On one computer, open the pairing window in the pairing panel. On the other, select it from the discovered LAN computers, or enter the first computer's LAN address (shown in its window), then connect.
 3. Compare the six-digit codes and confirm on **both** computers. Only confirm if the codes match.
 4. Arrange the screens on the map and connect their edges. Take control on the computer whose keyboard you want to use, then move across a linked edge. Enable the shared clipboard if you want it, and test your emergency shortcut first.
 
 Existing settings and pairing stay in the `lan-workspace` directories when updating. Stop your old Bifrost session before replacing the executable.
+
+**Discovery and privacy:** discovery and advertising are on by default (`[discovery] enabled = true`, `advertise = true`). Settings lets you turn discovery off; set `advertise = false` in `config.toml` to search without announcing this computer. Names, node IDs, OS metadata, listen ports and pairing availability are visible to other computers on the selected LAN, not encrypted or proof of trust. No secrets, pairing codes, keystrokes or clipboard content are advertised. Pairing still requires matching codes on both computers; changed addresses are used for trusted peers only after pinned mTLS verifies the expected identity, never to replace a live link.
+
+Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited to selected LAN adapters; VPN adapters are used only when explicitly selected. Wi-Fi multicast filtering, guest/client isolation or separate VLANs may hide computers. **Enter the address manually** if the list is empty; TCP connectivity is still required, so manual entry cannot bypass network isolation.
 
 ## Platform support
 

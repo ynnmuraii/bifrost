@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Live latency telemetry: each link now times its own `Ping`/`Pong` pairs and reports the 95th-percentile round trip and the jitter (mean absolute difference of consecutive samples) over the last 30 seconds. The status screen shows «Задержка: N мс, джиттер M мс» and the map's «≈ N мс» pill appears once a link has answered three pings; until then both stay blank instead of showing zero. A reconnected link starts measuring from scratch, and the core's `status` verb prints the same pair as `rtt_us=`/`jitter_us=`.
+- Added LAN peer discovery for pairing, with a Settings toggle and manual-address fallback. Discovery advertises non-secret computer metadata over IPv4 multicast UDP 47902; it does not change Windows Firewall rules automatically.
+- Trusted offline peers can be found after an address change; a new route is accepted only after pinned mTLS verifies the expected peer identity, without replacing live connections.
 
 ## 0.1.6 — 2026-10-24
 
