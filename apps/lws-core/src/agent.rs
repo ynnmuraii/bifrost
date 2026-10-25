@@ -1002,14 +1002,6 @@ mod launch_tests {
             );
             let endpoint = launch_endpoint(&runtime, 1).expect("endpoint");
             let (started, peer) = tokio::join!(supervisor.start(AgentMode::Normal), async {
-                // join! may poll this branch before start has bound its Unix socket.
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    while !endpoint.path().exists() {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("agent listener ready");
                 let stream = transport::connect(&endpoint).await.expect("connect");
                 let mut peer =
                     AgentLink::new(stream, FRAME_MAJOR, protocol::limits::PROTOCOL_MINOR);
