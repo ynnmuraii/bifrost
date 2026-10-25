@@ -192,6 +192,9 @@ pub struct Config {
     /// `[network]`.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// `[discovery]`: LAN peer discovery; enabled by default for existing files.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
     /// `[workspace]`.
     #[serde(default)]
     pub workspace: WorkspaceConfig,
@@ -225,6 +228,7 @@ impl Default for Config {
             node: NodeConfig::default(),
             platform: PlatformConfig::default(),
             network: NetworkConfig::default(),
+            discovery: DiscoveryConfig::default(),
             workspace: WorkspaceConfig::default(),
             timing: TimingConfig::default(),
             input: InputConfig::default(),
@@ -374,6 +378,27 @@ pub struct PlatformConfig {
     /// (`CONFIG_BACKEND`, checked by the platform layer, not here).
     #[serde(default)]
     pub backend: Backend,
+}
+
+/// `[discovery]`: unauthenticated IPv4 multicast hints, never a source of trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    /// Receive LAN discovery beacons; disabling also stops advertisements.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Advertise this node while discovery is enabled.
+    #[serde(default = "default_true")]
+    pub advertise: bool,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            advertise: true,
+        }
+    }
 }
 
 /// `[network]`.

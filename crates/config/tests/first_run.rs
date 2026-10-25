@@ -42,6 +42,8 @@ fn candidate(name: &str, address: Ipv4Addr, is_up: bool, has_default_route: bool
     Candidate {
         name: name.to_owned(),
         address,
+        index: 1,
+        prefix_len: 24,
         is_up,
         has_default_route,
     }

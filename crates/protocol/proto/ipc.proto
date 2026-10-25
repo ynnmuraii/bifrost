@@ -293,6 +293,7 @@ message GuiFrame {
     GetClipboardHistory get_clipboard_history = 32;
     GetClipboardHistoryItem get_clipboard_history_item = 33;
     ClearClipboardHistory clear_clipboard_history = 34;
+    SetDiscovery set_discovery = 35; // persist `[discovery].enabled` in the core; reply with OpResult
 
     Status status = 40;          // response and pushed event
     PairingPrompt pairing_prompt = 41;
@@ -318,6 +319,7 @@ message PairingAnswer { bytes attempt_id = 1; bool approve = 2; }
 message UpdateTopology { bytes layout_toml = 1; uint64 expected_revision = 2; bytes expected_author = 3; } // any node; coordinator applies (CAS)
 message SetClipboard { bool enabled = 1; }
 message SetAppearance { bool edge_effects = 1; bool hide_remote_cursor = 2; } // core saves `[appearance]` under the config lock and pushes SetEffects to the agent at once
+message SetDiscovery { bool enabled = 1; } // core saves under the config lock and updates live discovery
 message RevokePeer { bytes peer_node_id = 1; }
 message ExportDiagnostics { string target_path = 1; }
 message ResetPortalGrants {} // GUI: drop portal permissions for this node
@@ -374,6 +376,18 @@ message Status {
   bool hide_remote_cursor = 26;            // `[appearance].hide_remote_cursor`: hide the cursor here while input is elsewhere
   repeated HotkeyBinding hotkeys = 27;
   string local_node_id = 28;               // this node's own id, hex; empty when the core cannot say
+  repeated DiscoveredPeer discovered_peers = 29; // untrusted LAN hints; GUI hides ids already in members
+  bool discovery_enabled = 30;             // persisted `[discovery].enabled`, not a GUI-local preference
+}
+// Discovery is not pairing or authentication. Address is the observed IPv4 source
+// plus the advertised input/control port ("<ip>:<port>"), never a beacon-supplied IP.
+message DiscoveredPeer {
+  string node_id = 1;          // 64 hexadecimal digits; an untrusted identity claim
+  string display_name = 2;     // sanitized, at most 32 characters
+  string address = 3;
+  string system_name = 4;      // optional machine label; empty when unavailable
+  bool pairing_open = 5;
+  uint32 protocol_version = 6;
 }
 message MemberStatus {
   string node_id = 1;

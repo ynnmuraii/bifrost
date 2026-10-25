@@ -27,6 +27,7 @@ mod clipboard;
 mod clipboard_history;
 mod command;
 mod ctl;
+mod discovery;
 mod edgefx;
 mod gui;
 mod ids;
@@ -616,6 +617,7 @@ async fn run_async(
         pairing_gate,
     );
     session.set_appearance_source(paths.config_file(), config.appearance);
+    session.set_discovery_source(config.discovery, config.network.clone());
     session.set_hotkeys_source(config.input.hotkeys);
     session.run().await.map_err(|error| error.to_string())
 }

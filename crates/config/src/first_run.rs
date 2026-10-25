@@ -49,6 +49,10 @@ pub struct Candidate {
     pub name: String,
     /// The IPv4 address that adapter carries.
     pub address: Ipv4Addr,
+    /// OS interface index for multicast membership and outgoing-interface selection.
+    pub index: u32,
+    /// IPv4 on-link subnet prefix length, used to reject off-LAN discovery hints.
+    pub prefix_len: u8,
     /// The address the kernel would use to reach the internet, marked by the route
     /// probe ([`default_route_address`]) after the enumeration.
     pub has_default_route: bool,
@@ -130,6 +134,45 @@ pub fn lan_addresses() -> Vec<Ipv4Addr> {
     let mut offered = platform_candidates();
     mark_default_route(&mut offered, default_route_address());
     ranked_addresses(&offered)
+}
+
+/// Eligible, up LAN IPv4 interfaces in the same preference order as [`lan_addresses`].
+///
+/// Preserves each address, OS interface index and adapter name for multicast
+/// discovery. No extra enumeration dependency is needed; unavailable indices and
+/// down interfaces cannot join a group and are omitted.
+pub fn lan_interfaces() -> Vec<Candidate> {
+    let mut offered = platform_candidates();
+    mark_default_route(&mut offered, default_route_address());
+    offered.retain(|candidate| {
+        candidate.is_up
+            && candidate.index != 0
+            && candidate.prefix_len <= 32
+            && qualifies(&candidate)
+    });
+    offered.sort_by_key(|candidate| core::cmp::Reverse(rank(candidate)));
+    offered
+}
+
+/// Discovery interfaces restricted to the configured input/control listener.
+///
+/// An explicit IPv4 address selects only that address; an unspecified listener
+/// selects all eligible LAN interfaces only when `allow_any_interface` permits it.
+/// IPv6 listeners do not participate in IPv4 multicast discovery.
+pub fn discoverable_interfaces(network: &NetworkConfig) -> Vec<Candidate> {
+    let Ok(listen) = network.listen_address.parse::<Ipv4Addr>() else {
+        return Vec::new();
+    };
+    if listen.is_unspecified() && !network.allow_any_interface {
+        return Vec::new();
+    }
+    let mut interfaces = lan_interfaces();
+    if !listen.is_unspecified() {
+        interfaces.retain(|candidate| candidate.address == listen);
+    } else {
+        interfaces.retain(|candidate| !is_overlay(&candidate.name));
+    }
+    interfaces
 }
 
 /// [`lan_addresses`]'s pure half: `candidates` filtered and ordered, best first.
@@ -528,6 +571,8 @@ mod win32 {
                         found.push(Candidate {
                             name: name.clone(),
                             address: ipv4,
+                            index: (*adapter).Anonymous1.Anonymous.IfIndex,
+                            prefix_len: (*address).OnLinkPrefixLength,
                             has_default_route: false,
                             is_up,
                         });
@@ -690,6 +735,16 @@ mod posix {
                     found.push(Candidate {
                         name,
                         address: ipv4,
+                        prefix_len: sockaddr_ipv4((*adapter).ifa_netmask)
+                            .and_then(|mask| {
+                                let mask = u32::from(mask);
+                                let prefix = mask.leading_ones();
+                                (mask == u32::MAX.checked_shl(32 - prefix).unwrap_or(0))
+                                    .then_some(prefix as u8)
+                            })
+                            .unwrap_or(33),
+                        // SAFETY: the live `ifaddrs` entry owns a NUL-terminated name.
+                        index: libc::if_nametoindex((*adapter).ifa_name),
                         has_default_route: false,
                         is_up,
                     });

@@ -1,6 +1,42 @@
 use protocol::{ipc, validate, wire, *};
 
 #[test]
+fn discovery_ipc_fields_use_append_only_numbers() {
+    use prost::Message;
+
+    let peer = ipc::DiscoveredPeer {
+        node_id: "n".into(),
+        display_name: "d".into(),
+        address: "a".into(),
+        system_name: "s".into(),
+        pairing_open: true,
+        protocol_version: 1,
+    };
+    assert_eq!(
+        peer.encode_to_vec(),
+        [10, 1, b'n', 18, 1, b'd', 26, 1, b'a', 34, 1, b's', 40, 1, 48, 1]
+    );
+    let status = ipc::Status {
+        discovered_peers: vec![ipc::DiscoveredPeer::default()],
+        discovery_enabled: true,
+        ..Default::default()
+    };
+    // Status fields 29 (message) and 30 (bool); fields 26..28 already exist.
+    assert_eq!(status.encode_to_vec(), [0xea, 0x01, 0, 0xf0, 0x01, 1]);
+    let frame = ipc::GuiFrame {
+        msg: Some(ipc::gui_frame::Msg::SetDiscovery(ipc::SetDiscovery {
+            enabled: true,
+        })),
+        ..Default::default()
+    };
+    // GuiFrame field 35, containing SetDiscovery.enabled at field 1.
+    assert_eq!(frame.encode_to_vec(), [0x9a, 0x02, 2, 8, 1]);
+    round_trip(Channel::Ipc, peer);
+    round_trip(Channel::Ipc, status);
+    round_trip(Channel::Ipc, frame);
+}
+
+#[test]
 fn capability_refresh_is_append_only_and_preserves_optional_enum_numbers() {
     use prost::Message;
     let envelope = wire::Envelope {

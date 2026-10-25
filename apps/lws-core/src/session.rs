@@ -34,6 +34,7 @@ use crate::ownership_store::OwnershipStore;
 use crate::routing::{self, AgentSignal, Effect};
 use ipc::clock::{Clock, SuspendDetector, SystemClock};
 
+mod discovery;
 /// The GUI's half of the session: `GuiFrame` requests and the events pushed to the window.
 mod gui;
 pub(crate) mod hotkeys;
@@ -646,6 +647,7 @@ pub struct Session {
     /// Last second in which captured input forwarding was logged.
     last_input_batch_log: Option<Instant>,
     input_diagnostics: InputDiagnostics,
+    discovery: discovery::Discovery,
 }
 
 impl Session {
@@ -781,6 +783,7 @@ impl Session {
             pairing_error: None,
             last_input_batch_log: None,
             input_diagnostics: InputDiagnostics::default(),
+            discovery: discovery::Discovery::default(),
         };
         session.rebuild_topology();
         session
@@ -1220,6 +1223,7 @@ impl Session {
     /// Timers, the IPC heartbeat, and the agent restart backoff.
     async fn service_clock(&mut self) {
         let now = self.now_ms();
+        self.service_discovery().await;
 
         // The circuit closes itself so a machine that slept through a bad minute is
         // retried: a breaker only the user can reset leaves the daemon degraded for ever

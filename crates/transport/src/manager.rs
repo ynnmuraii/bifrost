@@ -58,6 +58,26 @@ pub struct ManagerConfig {
     pub pairing: PairingGate,
 }
 
+/// Result of an untrusted discovery hint; only `Verified` may update persisted addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryRoute {
+    Verified,
+    LinkPresent,
+    Unchanged,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryRouteError {
+    #[error("discovery peer is not trusted")]
+    Untrusted,
+    #[error("discovery identity mismatch: expected {expected}, got {actual}")]
+    IdentityMismatch { expected: NodeId, actual: NodeId },
+    #[error("discovery route handshake timed out")]
+    Timeout,
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+}
+
 /// A monotonic millisecond clock.
 ///
 /// `crates/transport` has no clock helper, and the pairing window is bounded in milliseconds
@@ -131,6 +151,8 @@ struct PendingLink {
     /// Compared against a live link's [`LiveLink::up_at_ns`] to tell a simultaneous dial (the
     /// newcomer was already forming) from a late redial (it started afterwards).
     registered_at_ns: u128,
+    /// Discovery never participates in simultaneous-link replacement.
+    replace_existing: bool,
 }
 
 /// Messages from the accept/dial tasks into the manager loop.
@@ -159,6 +181,11 @@ enum ManagerMessage {
     AddPeer { peer: NodeId, address: SocketAddr },
     /// Stops the dialer created for a freshly paired peer.
     RemovePeer { peer: NodeId },
+    /// Moves only the listening socket after a local adapter address change.
+    RebindListener {
+        address: SocketAddr,
+        reply: oneshot::Sender<Result<SocketAddr, TransportError>>,
+    },
 }
 
 /// What a granted dial permit tells the waiting dialer.
@@ -214,6 +241,8 @@ struct Inner {
     dialers: Vec<tokio::task::JoinHandle<()>>,
     /// Dynamic dialers are keyed by peer so re-pairing replaces the old loop.
     peer_dialers: BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
+    /// Only addresses authenticated by discovery; never populated by a beacon alone.
+    discovered_routes: BTreeMap<NodeId, SocketAddr>,
     /// Dial permits not yet granted, per peer: the dialers waiting for that peer's link to go.
     ///
     /// This is what makes a dialer idle while its peer is linked. Without it, a dialer whose
@@ -223,6 +252,24 @@ struct Inner {
 }
 
 impl Inner {
+    fn discovery_decision(
+        &self,
+        pins: &BTreeSet<NodeId>,
+        peer: NodeId,
+        address: SocketAddr,
+    ) -> Result<Option<DiscoveryRoute>, DiscoveryRouteError> {
+        if !pins.contains(&peer) {
+            return Err(DiscoveryRouteError::Untrusted);
+        }
+        if self.has_link_to(&peer) {
+            return Ok(Some(DiscoveryRoute::LinkPresent));
+        }
+        if self.discovered_routes.get(&peer) == Some(&address) {
+            return Ok(Some(DiscoveryRoute::Unchanged));
+        }
+        Ok(None)
+    }
+
     fn lease_diagnostics(&self, peer: &NodeId) -> Option<LeaseTransportSnapshot> {
         self.links
             .get(peer)
@@ -342,6 +389,129 @@ impl LinkManager {
             return Err(TransportError::LinkClosed);
         }
         Ok(())
+    }
+
+    /// Probes one candidate using pinned TLS, requiring the exact advertised identity.
+    ///
+    /// Does not add pins or trust. The caller rate-limits hints and persists `last_address`
+    /// only for `Verified`. Connect + TLS share the normal dial deadline; no attempt is
+    /// spawned until authentication succeeds. A concurrent link always wins.
+    pub async fn refresh_discovered_route(
+        &self,
+        expected: NodeId,
+        candidate: SocketAddr,
+    ) -> Result<DiscoveryRoute, DiscoveryRouteError> {
+        if let Some(outcome) = self.discovery_decision(expected, candidate).await? {
+            return Ok(outcome);
+        }
+        let config = identity::client_config(
+            &self.identity,
+            TrustPolicy::PinnedShared(Arc::clone(&self.trusted_peers)),
+            &identity::LINK_ALPN,
+        )
+        .map_err(TransportError::from)?;
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = tokio::time::timeout(
+            Duration::from_millis(self.settings.liveness.offline_ms),
+            async {
+                let tcp = TcpStream::connect(candidate).await?;
+                tcp.set_nodelay(true)?;
+                connector
+                    .connect(identity::server_name(candidate.ip()), tcp)
+                    .await
+            },
+        )
+        .await
+        .map_err(|_| DiscoveryRouteError::Timeout)?
+        .map_err(TransportError::from)?;
+        let actual = peer_node_id(stream.get_ref().1.peer_certificates().unwrap_or_default())
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        if actual != expected {
+            return Err(DiscoveryRouteError::IdentityMismatch { expected, actual });
+        }
+        let hello = self.local_hello.read().await.clone();
+        let key = identity::random16().map_err(TransportError::from)?;
+        let mut inner = self.inner.lock().await;
+        // Keep the trust read guard through registration, closing the revocation race.
+        let pins = self
+            .trusted_peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(outcome) = inner.discovery_decision(&pins, expected, candidate)? {
+            return Ok(outcome);
+        }
+        let (reports, mut reports_rx) = mpsc::channel(64);
+        let local_capabilities = hello.capabilities.clone();
+        let link = crate::link::spawn(LinkConfig {
+            key,
+            peer: expected,
+            local: self.identity.node_id(),
+            direction: Direction::Outgoing,
+            local_hello: hello,
+            stream: Stream::Client(Box::new(stream)),
+            reports,
+            queue_capacity: self.settings.queue_capacity,
+            liveness: self.settings.liveness,
+        })?;
+        inner.pending.insert(
+            key,
+            PendingLink {
+                handle: link.handle,
+                initiator: self.identity.node_id(),
+                local_capabilities,
+                task: link.task,
+                peer: expected,
+                registered_at_ns: self.clock.now_ns(),
+                replace_existing: false,
+            },
+        );
+        inner.discovered_routes.insert(expected, candidate);
+        let dialer = self.spawn_peer_dialer(expected, candidate);
+        if let Some(previous) = inner.peer_dialers.insert(expected, dialer) {
+            previous.abort();
+        }
+        let messages = self.messages_tx.clone();
+        tokio::spawn(async move {
+            while let Some(report) = reports_rx.recv().await {
+                if messages.send(ManagerMessage::Report(report)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(DiscoveryRoute::Verified)
+    }
+
+    async fn discovery_decision(
+        &self,
+        peer: NodeId,
+        address: SocketAddr,
+    ) -> Result<Option<DiscoveryRoute>, DiscoveryRouteError> {
+        let inner = self.inner.lock().await;
+        let pins = self
+            .trusted_peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.discovery_decision(&pins, peer, address)
+    }
+
+    fn spawn_peer_dialer(&self, peer: NodeId, address: SocketAddr) -> tokio::task::JoinHandle<()> {
+        let messages = self.messages_tx.clone();
+        let identity = Arc::clone(&self.identity);
+        let trusted_peers = Arc::clone(&self.trusted_peers);
+        let local_hello = Arc::clone(&self.local_hello);
+        let settings = self.settings;
+        tokio::spawn(async move {
+            dial_loop(
+                address,
+                Some(peer),
+                identity,
+                trusted_peers,
+                local_hello,
+                messages,
+                settings,
+            )
+            .await;
+        })
     }
 
     /// Removes a peer from the live verifier and stops its dynamic dialer.
@@ -481,6 +651,19 @@ impl LinkManager {
         }
     }
 
+    /// Moves the listener without disturbing links or trust, returning its bound address.
+    ///
+    /// The caller selects the allowed adapter. A failed bind leaves the old listener
+    /// serving; no address is persisted here. Requires the manager's `run` loop.
+    pub async fn rebind_listener(&self, address: SocketAddr) -> Result<SocketAddr, TransportError> {
+        let (reply, result) = oneshot::channel();
+        self.messages_tx
+            .send(ManagerMessage::RebindListener { address, reply })
+            .await
+            .map_err(|_| TransportError::LinkClosed)?;
+        result.await.map_err(|_| TransportError::LinkClosed)?
+    }
+
     /// Runs until the process ends: listens, dials, dedups, supervises.
     pub async fn run(&self) -> Result<(), TransportError> {
         // The verifier reads this shared set for each new certificate, so pairing updates
@@ -491,7 +674,7 @@ impl LinkManager {
             &identity::LINK_ALPN,
         )?);
         let pairing_config = Arc::new(identity::pairing_server_config(&self.identity)?);
-        let listener = bind_listener(self.listen).await?;
+        let mut listener = bind_listener(self.listen).await?;
         let local = self.identity.node_id();
         let settings = self.settings;
 
@@ -550,38 +733,36 @@ impl LinkManager {
                 }
                 message = async { self.messages_rx.lock().await.recv().await } => {
                     let Some(message) = message else { return Ok(()) };
-                    self.on_message(message, local).await;
+                    self.on_message(message, local, &mut listener).await;
                 }
             }
         }
     }
 
-    async fn on_message(&self, message: ManagerMessage, local: NodeId) {
+    async fn on_message(&self, message: ManagerMessage, local: NodeId, listener: &mut TcpListener) {
         match message {
+            ManagerMessage::RebindListener { address, reply } => {
+                let result = async {
+                    if listener.local_addr()? == address {
+                        return Ok(address);
+                    }
+                    let replacement = bind_listener(address).await?;
+                    let bound = replacement.local_addr()?;
+                    *listener = replacement;
+                    Ok(bound)
+                }
+                .await;
+                let _ = reply.send(result);
+            }
             ManagerMessage::AddPeer { peer, address } => {
-                let messages = self.messages_tx.clone();
-                let identity = Arc::clone(&self.identity);
-                let trusted_peers = Arc::clone(&self.trusted_peers);
-                let local_hello = Arc::clone(&self.local_hello);
-                let settings = self.settings;
-                let dialer = tokio::spawn(async move {
-                    dial_loop(
-                        address,
-                        Some(peer),
-                        identity,
-                        trusted_peers,
-                        local_hello,
-                        messages,
-                        settings,
-                    )
-                    .await;
-                });
+                let dialer = self.spawn_peer_dialer(peer, address);
                 if let Some(previous) = self.inner.lock().await.peer_dialers.insert(peer, dialer) {
                     previous.abort();
                 }
             }
             ManagerMessage::RemovePeer { peer } => {
                 let mut inner = self.inner.lock().await;
+                inner.discovered_routes.remove(&peer);
                 if let Some(dialer) = inner.peer_dialers.remove(&peer) {
                     dialer.abort();
                 }
@@ -629,6 +810,7 @@ impl LinkManager {
                         local_capabilities,
                         task,
                         registered_at_ns,
+                        replace_existing: true,
                     },
                 );
             }
@@ -727,7 +909,8 @@ impl LinkManager {
                 Some(existing) if existing.key != key => {
                     let simultaneous =
                         policy::formation_overlap(existing.up_at_ns, pending.registered_at_ns);
-                    let keep_incoming = simultaneous
+                    let keep_incoming = pending.replace_existing
+                        && simultaneous
                         && policy::prefer_incoming(&existing.initiator, &pending.initiator);
                     (Some(existing.key), keep_incoming)
                 }
@@ -1221,6 +1404,244 @@ async fn start_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn discovery_fixture(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        Arc<NodeIdentity>,
+        Arc<NodeIdentity>,
+        Arc<NodeIdentity>,
+    ) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "lws-discovery-{}-{}-{label}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let identity = |name: &str| {
+            Arc::new(
+                NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(root.join(name)))
+                    .expect("identity")
+                    .0,
+            )
+        };
+        let local = identity("local");
+        let expected = identity("expected");
+        let other = identity("other");
+        (root, local, expected, other)
+    }
+
+    fn discovery_manager(local: Arc<NodeIdentity>, peers: &[NodeId]) -> LinkManager {
+        let mut trust = TrustStore::new();
+        for peer in peers {
+            trust.trust(TrustedPeer::paired(*peer, "peer", None, 0));
+        }
+        let id = local.node_id();
+        LinkManager::new(ManagerConfig {
+            identity: local,
+            trust,
+            local_hello: wire::Hello {
+                node_id: id.as_bytes().to_vec(),
+                ..Default::default()
+            },
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: Vec::new(),
+            max_members: 4,
+            queue_capacity: 16,
+            liveness: policy::LinkLiveness::default(),
+            backoff: policy::BackoffBounds::default(),
+            pairing: PairingGate::default(),
+        })
+        .expect("manager")
+        .0
+    }
+
+    fn insert_live(inner: &mut Inner, peer: NodeId) {
+        inner.links.insert(
+            peer,
+            LiveLink {
+                key: [5; 16],
+                handle: LinkHandle::for_counter_test(peer),
+                initiator: peer,
+                up_at_ns: 0,
+                task: tokio::spawn(std::future::pending()),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_rebind_preserves_links_and_keeps_old_listener_on_failure() {
+        let (root, local, peer, _other) = discovery_fixture("rebind");
+        let local_id = local.node_id();
+        let peer_id = peer.node_id();
+        let manager = discovery_manager(local, &[peer_id]);
+        insert_live(&mut *manager.inner.lock().await, peer_id);
+        let mut listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let original = listener.local_addr().unwrap();
+        let occupied = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let blocked_address = occupied.local_addr().unwrap();
+        for target in [blocked_address, "127.0.0.1:0".parse().unwrap()] {
+            let before = listener.local_addr().unwrap();
+            let (result, ()) = tokio::join!(manager.rebind_listener(target), async {
+                let message = manager.messages_rx.lock().await.recv().await.unwrap();
+                manager.on_message(message, local_id, &mut listener).await;
+            },);
+            if target == blocked_address {
+                assert!(matches!(result, Err(TransportError::Io(_))));
+                assert_eq!(listener.local_addr().unwrap(), before);
+            } else {
+                let bound = result.unwrap();
+                assert_ne!(bound, original);
+                assert_eq!(listener.local_addr().unwrap(), bound);
+                let released = bind_listener(original)
+                    .await
+                    .expect("old listening socket released");
+                drop(released);
+            }
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            drop((client, accepted));
+            assert_eq!(manager.inner.lock().await.links[&peer_id].key, [5; 16]);
+            assert_eq!(
+                *manager.trusted_peers.read().unwrap(),
+                BTreeSet::from([peer_id])
+            );
+        }
+        manager.kill_all().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_requires_trusted_different_route_and_down_link() {
+        let peer = NodeId::new([1; 32]);
+        let old = "127.0.0.1:47901".parse().unwrap();
+        let new = "127.0.0.2:47901".parse().unwrap();
+        let mut inner = Inner::default();
+        assert!(matches!(
+            inner.discovery_decision(&BTreeSet::new(), peer, new),
+            Err(DiscoveryRouteError::Untrusted)
+        ));
+        let pins = BTreeSet::from([peer]);
+        inner.discovered_routes.insert(peer, old);
+        assert_eq!(
+            inner.discovery_decision(&pins, peer, old).unwrap(),
+            Some(DiscoveryRoute::Unchanged)
+        );
+        assert_eq!(inner.discovery_decision(&pins, peer, new).unwrap(), None);
+        insert_live(&mut inner, peer);
+        assert_eq!(
+            inner.discovery_decision(&pins, peer, new).unwrap(),
+            Some(DiscoveryRoute::LinkPresent)
+        );
+        assert_eq!(inner.discovered_routes[&peer], old);
+        assert_eq!(inner.links[&peer].key, [5; 16]);
+        inner.links.remove(&peer).unwrap().task.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_authenticates_exact_identity_before_updating_route() {
+        let (root, local, expected, other) = discovery_fixture("identity");
+        let manager = discovery_manager(Arc::clone(&local), &[expected.node_id(), other.node_id()]);
+        for (server, matches_expected) in
+            [(Arc::clone(&other), false), (Arc::clone(&expected), true)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let config = identity::server_config(
+                &server,
+                TrustPolicy::Pinned(BTreeSet::from([local.node_id()])),
+                &identity::LINK_ALPN,
+            )
+            .unwrap();
+            let server_task = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                    .accept(tcp)
+                    .await
+                    .unwrap()
+            });
+            let result = manager
+                .refresh_discovered_route(expected.node_id(), address)
+                .await;
+            let server_stream = server_task.await.unwrap();
+            if matches_expected {
+                assert_eq!(result.unwrap(), DiscoveryRoute::Verified);
+                let inner = manager.inner.lock().await;
+                assert_eq!(inner.discovered_routes[&expected.node_id()], address);
+                assert!(inner.has_link_to(&expected.node_id()));
+                assert!(inner
+                    .pending
+                    .values()
+                    .all(|pending| !pending.replace_existing));
+                assert!(inner.peer_dialers.contains_key(&expected.node_id()));
+            } else {
+                assert!(
+                    matches!(result, Err(DiscoveryRouteError::IdentityMismatch { expected: id, actual })
+                    if id == expected.node_id() && actual == server.node_id())
+                );
+                let inner = manager.inner.lock().await;
+                assert!(inner.discovered_routes.is_empty());
+                assert!(inner.pending.is_empty());
+                assert!(inner.peer_dialers.is_empty());
+            }
+            drop(server_stream);
+        }
+        assert_eq!(
+            *manager.trusted_peers.read().unwrap(),
+            BTreeSet::from([expected.node_id(), other.node_id()])
+        );
+        manager.kill_all().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_rechecks_link_down_after_tls_before_registration() {
+        let (root, local, expected, _other) = discovery_fixture("race");
+        let manager = Arc::new(discovery_manager(Arc::clone(&local), &[expected.node_id()]));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = identity::server_config(
+            &expected,
+            TrustPolicy::Pinned(BTreeSet::from([local.node_id()])),
+            &identity::LINK_ALPN,
+        )
+        .unwrap();
+        let (accepted, connected) = oneshot::channel();
+        let (proceed, ready) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            ready.await.unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                .accept(tcp)
+                .await
+                .unwrap()
+        });
+        let probe_manager = Arc::clone(&manager);
+        let peer = expected.node_id();
+        let probe =
+            tokio::spawn(
+                async move { probe_manager.refresh_discovered_route(peer, address).await },
+            );
+        connected.await.unwrap();
+        insert_live(&mut *manager.inner.lock().await, peer);
+        proceed.send(()).unwrap();
+        assert_eq!(probe.await.unwrap().unwrap(), DiscoveryRoute::LinkPresent);
+        let server_stream = server.await.unwrap();
+        {
+            let inner = manager.inner.lock().await;
+            assert_eq!(inner.links[&peer].key, [5; 16]);
+            assert!(inner.pending.is_empty());
+            assert!(inner.discovered_routes.is_empty());
+            assert!(inner.peer_dialers.is_empty());
+        }
+        manager.kill_all().await;
+        drop(server_stream);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn lease_diagnostics_retain_nonzero_counts_after_link_removal() {

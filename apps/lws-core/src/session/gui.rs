@@ -183,6 +183,8 @@ impl Session {
             transition_disabled_reason: self.transition_disabled_reason(),
             edge_effects: self.appearance.edge_effects,
             hide_remote_cursor: self.appearance.hide_remote_cursor,
+            discovered_peers: self.discovery.table.peers(),
+            discovery_enabled: self.discovery.enabled,
         }
     }
 
@@ -561,6 +563,10 @@ impl Session {
                 let result = self
                     .set_appearance(set.edge_effects, set.hide_remote_cursor)
                     .await;
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::SetDiscovery(set) => {
+                let result = self.set_discovery(set.enabled).await;
                 answer(&out, request_id, Msg::OpResult(result)).await;
             }
             Msg::RevokePeer(revoke) => {

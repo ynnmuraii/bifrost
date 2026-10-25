@@ -48,6 +48,8 @@ fn a_bare_version_line_fills_every_section_with_its_defaults() {
     assert_eq!(minimal.network.max_members, 3);
     assert!(!minimal.network.allow_any_interface);
     assert!(minimal.network.peers.is_empty());
+    assert!(minimal.discovery.enabled);
+    assert!(minimal.discovery.advertise);
 
     assert_eq!(minimal.input.hotkeys.claim_ownership, "Ctrl+Alt+Shift+Home");
     assert_eq!(minimal.workspace.owner_claim_serial, 0);
@@ -97,6 +99,32 @@ fn a_bare_version_line_fills_every_section_with_its_defaults() {
     assert_eq!(minimal.topology.max_seen_author, "");
     assert!(minimal.topology.links.is_empty());
     assert!(minimal.topology.displays.is_empty());
+}
+
+#[test]
+fn discovery_defaults_and_opt_out_are_backward_compatible() {
+    for table in ["", "[discovery]\n"] {
+        let config = Config::from_str(&format!("config_version = 2\n{table}"))
+            .expect("omitted discovery settings must default on");
+        assert_eq!(config.discovery, config::DiscoveryConfig::default());
+        assert!(config.discovery.enabled);
+        assert!(config.discovery.advertise);
+    }
+    for (settings, enabled, advertise) in [
+        ("enabled = false", false, true),
+        ("advertise = false", true, false),
+        ("enabled = false\nadvertise = false", false, false),
+    ] {
+        let config = Config::from_str(&format!("config_version = 2\n[discovery]\n{settings}"))
+            .expect("discovery opt-out must parse");
+        assert_eq!(config.discovery.enabled, enabled);
+        assert_eq!(config.discovery.advertise, advertise);
+        let text = config.to_toml().expect("discovery settings must serialize");
+        assert_eq!(
+            Config::from_str(&text).expect("round trip must parse"),
+            config
+        );
+    }
 }
 
 #[test]
