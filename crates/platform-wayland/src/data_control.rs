@@ -180,8 +180,10 @@ mod glue {
 
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
     use rustix::io::Errno;
+    use tokio::sync::oneshot;
     use wayland_client::backend::{ReadEventsGuard, WaylandError};
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
+    use wayland_client::protocol::wl_callback::{self, WlCallback};
     use wayland_client::protocol::wl_registry::{self, WlRegistry};
     use wayland_client::protocol::wl_seat::WlSeat;
     use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle};
@@ -201,6 +203,8 @@ mod glue {
     const READY_TIMEOUT: Duration = Duration::from_secs(2);
     /// How long the loop blocks on the compositor before checking for a command again.
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    /// Leaves room for the input hold deadline without blocking the agent runtime thread.
+    const APPLY_TIMEOUT: Duration = Duration::from_millis(120);
     /// How long one payload read waits for the source to answer.
     const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
     /// How long the (tiny) hint value waits after the payload.
@@ -211,7 +215,10 @@ mod glue {
     /// One thing the caller asked the thread to do.
     enum Command {
         /// Own the selection with this text (`None`: give the selection up).
-        Set(Option<String>),
+        Set {
+            text: Option<String>,
+            applied: oneshot::Sender<Result<(), String>>,
+        },
         Quit,
     }
 
@@ -266,13 +273,24 @@ mod glue {
 
         /// Owns the selection with `text`, or gives it up with `None`.
         ///
-        /// A closed channel means the thread ended (a dead connection), i.e. this node has no
-        /// clipboard any more; the caller learns that from the next `AgentReady` or error, not
-        /// from a panic here.
-        pub fn set_text(&self, text: Option<&str>) {
-            let command = Command::Set(text.map(str::to_owned));
-            if self.commands.send(command).is_err() {
-                tracing::warn!("the data-control clipboard thread is gone");
+        /// Success requires the compositor's display-sync reply after the selection request,
+        /// not merely enqueueing a command on the worker thread.
+        pub async fn set_text(&self, text: Option<&str>) -> Result<(), String> {
+            let (applied, confirmation) = oneshot::channel();
+            self.commands
+                .send(Command::Set {
+                    text: text.map(str::to_owned),
+                    applied,
+                })
+                .map_err(|_| "the data-control clipboard thread is gone".to_owned())?;
+            match tokio::time::timeout(APPLY_TIMEOUT, confirmation).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => {
+                    Err("the data-control clipboard stopped before confirming selection".to_owned())
+                }
+                Err(_) => {
+                    Err("the compositor did not confirm the clipboard selection in time".to_owned())
+                }
             }
         }
     }
@@ -327,6 +345,8 @@ mod glue {
         applied: Option<String>,
         /// The device is gone (`finished`): the adapter stops serving.
         finished: bool,
+        /// Replies wait for display-sync callbacks ordered after each selection request.
+        pending_applies: Vec<(WlCallback, oneshot::Sender<Result<(), String>>)>,
     }
 
     impl State {
@@ -334,10 +354,46 @@ mod glue {
             let id = object.id();
             self.offers.iter_mut().find(|offer| offer.offer.id() == id)
         }
+
+        fn fail_applies(&mut self, detail: &str) {
+            for (_, applied) in self.pending_applies.drain(..) {
+                let _ = applied.send(Err(detail.to_owned()));
+            }
+        }
     }
 
     delegate_noop!(State: ExtDataControlManagerV1);
     delegate_noop!(State: ignore WlSeat);
+
+    impl Dispatch<WlCallback, ()> for State {
+        fn event(
+            state: &mut Self,
+            callback: &WlCallback,
+            event: wl_callback::Event,
+            (): &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_callback::Event::Done { .. } = event {
+                if let Some(index) = state
+                    .pending_applies
+                    .iter()
+                    .position(|(pending, _)| pending == callback)
+                {
+                    let (_, applied) = state.pending_applies.swap_remove(index);
+                    let result = if state.finished {
+                        Err(
+                            "the data-control device stopped before confirming selection"
+                                .to_owned(),
+                        )
+                    } else {
+                        Ok(())
+                    };
+                    let _ = applied.send(result);
+                }
+            }
+        }
+    }
 
     impl Dispatch<WlRegistry, GlobalListContents> for State {
         fn event(
@@ -453,6 +509,7 @@ mod glue {
     }
 
     struct App {
+        connection: Connection,
         queue: EventQueue<State>,
         qh: QueueHandle<State>,
         state: State,
@@ -475,6 +532,7 @@ mod glue {
             let device = manager.get_data_device(&seat, &qh, ());
             let (served_tx, served_rx) = mpsc::channel();
             Ok(Self {
+                connection,
                 queue,
                 qh,
                 state: State {
@@ -484,6 +542,7 @@ mod glue {
                     owned: None,
                     applied: None,
                     finished: false,
+                    pending_applies: Vec::new(),
                 },
                 manager,
                 device,
@@ -498,7 +557,26 @@ mod glue {
             commands: &Receiver<Command>,
             changes: &Sender<Change>,
         ) -> Result<(), Box<dyn std::error::Error>> {
+            let result = self.serve_loop(commands, changes);
+            let detail = match &result {
+                Ok(()) => {
+                    "the data-control clipboard stopped before confirming selection".to_owned()
+                }
+                Err(error) => format!("the data-control clipboard connection failed: {error}"),
+            };
+            self.state.fail_applies(&detail);
+            result
+        }
+
+        fn serve_loop(
+            &mut self,
+            commands: &Receiver<Command>,
+            changes: &Sender<Change>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
             loop {
+                self.state
+                    .pending_applies
+                    .retain(|(_, applied)| !applied.is_closed());
                 if !self.apply_commands(commands) || self.state.finished {
                     self.release();
                     return Ok(());
@@ -547,7 +625,14 @@ mod glue {
         fn apply_commands(&mut self, commands: &Receiver<Command>) -> bool {
             loop {
                 match commands.try_recv() {
-                    Ok(Command::Set(text)) => self.set_selection(text),
+                    Ok(Command::Set { text, applied }) => {
+                        if applied.is_closed() {
+                            continue;
+                        }
+                        self.set_selection(text);
+                        let callback = self.connection.display().sync(&self.qh, ());
+                        self.state.pending_applies.push((callback, applied));
+                    }
                     Ok(Command::Quit) | Err(TryRecvError::Disconnected) => return false,
                     Err(TryRecvError::Empty) => return true,
                 }
@@ -760,6 +845,75 @@ mod glue {
             Ok(_) => true,
             Err(WaylandError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(_) => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod apply_tests {
+        use super::*;
+
+        fn fake_clipboard() -> (Clipboard, Receiver<Command>) {
+            let (commands, receiver) = mpsc::channel();
+            let (_, changes) = mpsc::channel();
+            (Clipboard { commands, changes }, receiver)
+        }
+
+        #[tokio::test]
+        async fn set_waits_for_worker_confirmation_not_command_enqueue() {
+            let (clipboard, worker) = fake_clipboard();
+            let apply = clipboard.set_text(Some("clipboard fixture"));
+            tokio::pin!(apply);
+            assert!(futures_util::poll!(&mut apply).is_pending());
+            let Command::Set { text, applied } = worker.try_recv().expect("queued command") else {
+                panic!("expected selection command");
+            };
+            assert_eq!(text.as_deref(), Some("clipboard fixture"));
+            assert!(
+                futures_util::poll!(&mut apply).is_pending(),
+                "dequeue is not compositor confirmation"
+            );
+            applied.send(Ok(())).expect("waiting caller");
+            assert_eq!(apply.await, Ok(()));
+        }
+
+        #[tokio::test]
+        async fn set_propagates_worker_failure_and_disconnection() {
+            for explicit_failure in [false, true] {
+                let (clipboard, worker) = fake_clipboard();
+                let apply = clipboard.set_text(None);
+                tokio::pin!(apply);
+                assert!(futures_util::poll!(&mut apply).is_pending());
+                let Command::Set { text, applied } = worker.try_recv().expect("queued command")
+                else {
+                    panic!("expected selection command");
+                };
+                assert!(text.is_none());
+                if explicit_failure {
+                    applied
+                        .send(Err("display connection failed".to_owned()))
+                        .expect("waiting caller");
+                } else {
+                    drop(applied);
+                }
+                assert!(apply.await.is_err());
+            }
+            let (clipboard, worker) = fake_clipboard();
+            drop(worker);
+            assert!(clipboard.set_text(Some("not queued")).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn unconfirmed_selection_times_out_and_cannot_acknowledge_success_later() {
+            let (clipboard, worker) = fake_clipboard();
+            let apply = clipboard.set_text(Some("clipboard fixture"));
+            tokio::pin!(apply);
+            assert!(futures_util::poll!(&mut apply).is_pending());
+            let Command::Set { applied, .. } = worker.try_recv().expect("queued command") else {
+                panic!("expected selection command");
+            };
+            assert!(apply.await.is_err());
+            assert!(applied.is_closed());
+            assert!(applied.send(Ok(())).is_err());
         }
     }
 }

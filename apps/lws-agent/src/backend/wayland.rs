@@ -570,7 +570,9 @@ impl Wayland {
                 "CLIPBOARD_DISABLED: this compositor has no ext_data_control_manager_v1".to_owned(),
             );
         };
-        clipboard.set_text(text);
+        clipboard.set_text(text).await.map_err(|error| {
+            format!("CLIPBOARD_APPLY_FAILED: selection was not confirmed: {error}")
+        })?;
         tracing::info!(
             bytes = text.map_or(0, str::len),
             released = text.is_none(),
