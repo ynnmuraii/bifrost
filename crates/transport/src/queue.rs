@@ -124,6 +124,10 @@ pub enum Outbound {
     Guaranteed(fr::Message),
     /// Replacement capability advertisement: guaranteed control, never coalesced.
     CapabilitiesChanged(Vec<i32>),
+    /// Remote update control: guaranteed, never coalesced or dropped.
+    UpdateRequest(protocol::wire::UpdateRequest),
+    /// Remote update progress: guaranteed, never coalesced or dropped.
+    UpdateResult(protocol::wire::UpdateResult),
     /// A layout-document message: always guaranteed, never coalesced (KVM-072).
     Layout(crate::convert::LayoutMessage),
     /// A clipboard message: always guaranteed, never coalesced, never dropped. The grant is the
@@ -152,6 +156,8 @@ impl Outbound {
             Outbound::Motion { events, .. } => Some(events),
             Outbound::Guaranteed(_)
             | Outbound::CapabilitiesChanged(_)
+            | Outbound::UpdateRequest(_)
+            | Outbound::UpdateResult(_)
             | Outbound::Layout(_)
             | Outbound::Clipboard(_) => None,
         }
@@ -163,6 +169,8 @@ impl Outbound {
             Outbound::Motion { lease_id, .. } => Some(*lease_id),
             Outbound::Guaranteed(_)
             | Outbound::CapabilitiesChanged(_)
+            | Outbound::UpdateRequest(_)
+            | Outbound::UpdateResult(_)
             | Outbound::Layout(_)
             | Outbound::Clipboard(_) => None,
         }

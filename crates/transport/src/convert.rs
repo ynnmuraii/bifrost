@@ -310,6 +310,10 @@ pub fn from_envelope(envelope: &wire::Envelope) -> Result<fr::Message, ConvertEr
 pub enum Inbound {
     /// Replacement advertised capability set; unknown optional enum values remain raw.
     CapabilitiesChanged(Vec<i32>),
+    /// A remote update request, resolved against the receiver's trusted release source.
+    UpdateRequest(wire::UpdateRequest),
+    /// Remote update progress or refusal.
+    UpdateResult(wire::UpdateResult),
     /// A focus/lease message, already in the FSM's vocabulary.
     Focus(fr::Message),
     /// A layout-document message, in the wire types core works with.
@@ -413,6 +417,20 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
     use wire::envelope::Payload;
 
     match envelope.payload.as_ref() {
+        Some(Payload::UpdateRequest(request)) => {
+            validate_update_version(&request.target_version)?;
+            if !envelope.lease_id.is_empty() {
+                return Err(ConvertError::Unsupported("update message carries a lease"));
+            }
+            Ok(Inbound::UpdateRequest(request.clone()))
+        }
+        Some(Payload::UpdateResult(result)) => {
+            validate_update_result(result)?;
+            if !envelope.lease_id.is_empty() {
+                return Err(ConvertError::Unsupported("update message carries a lease"));
+            }
+            Ok(Inbound::UpdateResult(result.clone()))
+        }
         Some(Payload::CapabilitiesChanged(changed)) => {
             Ok(Inbound::CapabilitiesChanged(changed.capabilities.clone()))
         }
@@ -464,6 +482,26 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
         None => Err(ConvertError::Unsupported("empty payload")),
         Some(_) => from_envelope(envelope).map(Inbound::Focus),
     }
+}
+
+/// Checks an update target without accepting URLs, partial versions or unknown metadata.
+pub fn validate_update_version(version: &str) -> Result<(), ConvertError> {
+    if !protocol::is_valid_app_version(version) {
+        return Err(ConvertError::Unsupported("invalid update target version"));
+    }
+    Ok(())
+}
+
+/// Checks the remote update progress vocabulary at the transport boundary.
+pub fn validate_update_result(result: &wire::UpdateResult) -> Result<(), ConvertError> {
+    validate_update_version(&result.target_version)?;
+    if !matches!(
+        result.status.as_str(),
+        "pending" | "downloading" | "restarting" | "done" | "refused" | "unreachable"
+    ) {
+        return Err(ConvertError::Unsupported("unknown update status"));
+    }
+    Ok(())
 }
 
 /// Builds the envelope of a layout message.
@@ -876,6 +914,10 @@ pub struct PeerInfo {
     pub display_name: String,
     /// Sanitized optional OS name/version.
     pub system_name: String,
+    /// Canonical application SemVer, or empty when absent/invalid.
+    pub app_version: String,
+    /// Whether the peer advertises support for remote update messages.
+    pub remote_update: bool,
     /// `Hello.can_own`.
     pub can_own: bool,
     /// `Hello.owner_serial`.
@@ -912,6 +954,10 @@ impl PeerInfo {
             node_id: NodeId::new(node_id),
             display_name: hello.display_name.clone(),
             system_name: protocol::sanitize_system_name(&hello.system_name),
+            app_version: protocol::sanitize_app_version(&hello.app_version),
+            remote_update: hello
+                .capabilities
+                .contains(&(wire::Capability::RemoteUpdate as i32)),
             can_own: hello.can_own,
             owner_serial: hello.owner_serial,
             owner: if hello.owner_node_id.is_empty() {
@@ -973,7 +1019,8 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::NativeRepeat
             | WireCapability::SoftwareRepeat
             | WireCapability::ReceiverTakeover
-            | WireCapability::DisplaysChanged => {}
+            | WireCapability::DisplaysChanged
+            | WireCapability::RemoteUpdate => {}
         }
     }
     out

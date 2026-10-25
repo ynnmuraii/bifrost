@@ -2243,6 +2243,7 @@ dependencies = [
  "input-model",
  "ipc",
  "logging",
+ "lws-desktop",
  "platform-probe",
  "protocol",
  "serde",
@@ -3361,6 +3362,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+ "semver",
 ]
 
 [[package]]

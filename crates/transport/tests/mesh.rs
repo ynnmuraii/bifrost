@@ -1739,3 +1739,70 @@ async fn a_link_measures_its_ping_round_trip_and_forgets_it_with_the_connection(
     a.kill().await;
     assert_eq!(a.manager.rtt(&b_id).await, None);
 }
+
+#[tokio::test]
+async fn remote_update_request_and_progress_cross_the_live_control_link_in_order() {
+    let root = temp_root("remote-update");
+    let a_identity = Arc::new(identity_at(&root, "a"));
+    let b_identity = Arc::new(identity_at(&root, "b"));
+    let a_id = a_identity.node_id();
+    let b_id = b_identity.node_id();
+    let a_addr = free_address().await;
+    let b_addr = free_address().await;
+    let mut a = spawn_node("a", a_identity, a_addr, &[(b_id, b_addr)], &[], 4).await;
+    let mut b = spawn_node("b", b_identity, b_addr, &[(a_id, a_addr)], &[a_addr], 4).await;
+    assert!(wait_for_members(&a, 1, FORM_TIMEOUT).await);
+    assert!(wait_for_members(&b, 1, FORM_TIMEOUT).await);
+    let handle = a.manager.handle(&b_id).await.unwrap();
+    let request = wire::UpdateRequest {
+        target_version: "1.2.3".into(),
+    };
+    handle.send_update_request(request.clone()).await.unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let LinkEvent::Message {
+                peer,
+                message: Inbound::UpdateRequest(received),
+            } = b.events.recv().await.expect("request event")
+            {
+                assert_eq!(peer, a_id);
+                assert_eq!(received, request);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("request delivered");
+    let handle = b.manager.handle(&a_id).await.unwrap();
+    for status in ["pending", "downloading", "restarting", "done"] {
+        handle
+            .send_update_result(wire::UpdateResult {
+                target_version: "1.2.3".into(),
+                status: status.into(),
+                detail: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        for expected in ["pending", "downloading", "restarting", "done"] {
+            loop {
+                if let LinkEvent::Message {
+                    peer,
+                    message: Inbound::UpdateResult(result),
+                } = a.events.recv().await.expect("progress event")
+                {
+                    assert_eq!(peer, b_id);
+                    assert_eq!(result.target_version, "1.2.3");
+                    assert_eq!(result.status, expected);
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("ordered progress delivered");
+    a.kill().await;
+    b.kill().await;
+    let _ = std::fs::remove_dir_all(root);
+}

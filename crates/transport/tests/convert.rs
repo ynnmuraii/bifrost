@@ -952,3 +952,84 @@ fn the_encodable_filter_agrees_with_the_encoder() {
         );
     }
 }
+
+#[test]
+fn peer_versions_are_sanitized_without_refusing_handshake_metadata() {
+    for (version, expected) in [
+        ("1.2.3", "1.2.3"),
+        ("1.2.3-rc.1+smoke", "1.2.3-rc.1+smoke"),
+        ("", ""),
+        ("v1.2.3", ""),
+        ("1.2", ""),
+        ("1.2.3\n", ""),
+    ] {
+        let hello = wire::Hello {
+            node_id: some_owner().as_bytes().to_vec(),
+            app_version: version.into(),
+            capabilities: vec![wire::Capability::RemoteUpdate as i32],
+            ..Default::default()
+        };
+        assert!(protocol::validate::hello(&hello).is_ok());
+        let info = PeerInfo::from_hello(&hello).unwrap();
+        assert_eq!(info.app_version, expected);
+        assert!(info.remote_update);
+    }
+    let old = wire::Hello {
+        node_id: some_owner().as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let info = PeerInfo::from_hello(&old).unwrap();
+    assert!(info.app_version.is_empty());
+    assert!(!info.remote_update);
+}
+
+#[test]
+fn update_payload_conversion_validates_version_status_and_lease_scope() {
+    use transport::convert::{inbound_from_envelope, Inbound};
+    use wire::envelope::Payload;
+    let mut envelope = wire::Envelope {
+        connection_id: vec![1; 16],
+        payload: Some(Payload::UpdateRequest(wire::UpdateRequest {
+            target_version: "1.2.3".into(),
+        })),
+        ..Default::default()
+    };
+    assert!(matches!(
+        inbound_from_envelope(&envelope),
+        Ok(Inbound::UpdateRequest(_))
+    ));
+    for invalid in ["", "1.2", "v1.2.3", "https://example.org/release"] {
+        envelope.payload = Some(Payload::UpdateRequest(wire::UpdateRequest {
+            target_version: invalid.into(),
+        }));
+        assert!(inbound_from_envelope(&envelope).is_err());
+    }
+    for status in [
+        "pending",
+        "downloading",
+        "restarting",
+        "done",
+        "refused",
+        "unreachable",
+    ] {
+        let result = wire::UpdateResult {
+            target_version: "1.2.3".into(),
+            status: status.into(),
+            detail: String::new(),
+        };
+        envelope.payload = Some(Payload::UpdateResult(result.clone()));
+        assert_eq!(
+            inbound_from_envelope(&envelope).unwrap(),
+            Inbound::UpdateResult(result)
+        );
+    }
+    envelope.lease_id = vec![0; 16];
+    assert!(inbound_from_envelope(&envelope).is_err());
+    envelope.lease_id.clear();
+    envelope.payload = Some(Payload::UpdateResult(wire::UpdateResult {
+        target_version: "1.2.3".into(),
+        status: "unexpected".into(),
+        detail: String::new(),
+    }));
+    assert!(inbound_from_envelope(&envelope).is_err());
+}

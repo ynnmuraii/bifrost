@@ -268,6 +268,7 @@ message GuiFrame {
   uint64 seq = 1;
   uint64 request_id = 2; // correlates request/response; 0 for events
   reserved 11; reserved "set_role"; // roles are per-lease in v0.3; the GUI no longer sets a role
+  reserved 35; // discovery, allocated independently
   oneof msg {
     GetStatus get_status = 10;
     StartPairing start_pairing = 12;
@@ -294,6 +295,10 @@ message GuiFrame {
     GetClipboardHistoryItem get_clipboard_history_item = 33;
     ClearClipboardHistory clear_clipboard_history = 34;
     SetDiscovery set_discovery = 35; // persist `[discovery].enabled` in the core; reply with OpResult
+    UpdateAll update_all = 36;
+    SetRemoteUpdate set_remote_update = 37;
+    UpdateProgress update_progress = 38; // headless updater -> core
+    UpdateReady update_ready = 39;       // verified replacement ready for core shutdown
 
     Status status = 40;          // response and pushed event
     PairingPrompt pairing_prompt = 41;
@@ -325,6 +330,17 @@ message ExportDiagnostics { string target_path = 1; }
 message ResetPortalGrants {} // GUI: drop portal permissions for this node
 message RetryAgent {}
 message Shutdown {}
+message UpdateAll { string target_version = 1; }
+message SetRemoteUpdate { bool enabled = 1; }
+message UpdateProgress { string target_version = 1; string status = 2; string detail = 3; }
+message UpdateReady { string target_version = 1; }
+message NodeUpdate {
+  string node_id = 1;
+  string display_name = 2;
+  string target_version = 3;
+  string status = 4; // pending | downloading | restarting | done | refused | unreachable
+  string detail = 5;
+}
 
 enum HotkeyAction {
   HOTKEY_ACTION_UNSPECIFIED = 0;
@@ -378,6 +394,9 @@ message Status {
   string local_node_id = 28;               // this node's own id, hex; empty when the core cannot say
   repeated DiscoveredPeer discovered_peers = 29; // untrusted LAN hints; GUI hides ids already in members
   bool discovery_enabled = 30;             // persisted `[discovery].enabled`, not a GUI-local preference
+  bool allow_remote_update = 31;
+  repeated NodeUpdate update_nodes = 32;
+  string update_notice = 33;
 }
 // Discovery is not pairing or authentication. Address is the observed IPv4 source
 // plus the advertised input/control port ("<ip>:<port>"), never a beacon-supplied IP.
@@ -395,6 +414,8 @@ message MemberStatus {
   bool online = 3;
   bool is_owner = 4;
   string link_state = 5;   // OFFLINE / CONNECTING / TLS / HELLO / READY / CLOSING
+  string app_version = 6;
+  bool remote_update = 7;
 }
 message PairingPrompt { bytes attempt_id = 1; string peer_name = 2; string sas_code = 3; string local_fingerprint = 4; string peer_fingerprint = 5; }
 // Pushed when the pairing window opens or closes, and replayed on GetStatus.
@@ -430,6 +451,7 @@ message MemberTopology {
   bool online = 3;                   // advisory, as NodeDisplays.online
   repeated DisplayView displays = 4;
   string system_name = 5;                  // last known OS name/version, optional
+  string app_version = 6;
 }
 message DisplayView {
   string id = 1;                     // stable display id

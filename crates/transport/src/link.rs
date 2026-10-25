@@ -644,6 +644,8 @@ impl LinkHandle {
             Outbound::CapabilitiesChanged(capabilities) => {
                 self.send_capabilities(capabilities).await
             }
+            Outbound::UpdateRequest(request) => self.send_update_request(request).await,
+            Outbound::UpdateResult(result) => self.send_update_result(result).await,
         }
     }
 
@@ -651,6 +653,32 @@ impl LinkHandle {
     pub async fn send_capabilities(&self, capabilities: Vec<i32>) -> Result<(), TransportError> {
         self.tx
             .send(Outbound::CapabilitiesChanged(capabilities))
+            .await
+            .map_err(|_| TransportError::LinkClosed)
+    }
+
+    /// Sends an update request on the guaranteed queue; core gates the peer capability.
+    pub async fn send_update_request(
+        &self,
+        request: wire::UpdateRequest,
+    ) -> Result<(), TransportError> {
+        convert::validate_update_version(&request.target_version)
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        self.tx
+            .send(Outbound::UpdateRequest(request))
+            .await
+            .map_err(|_| TransportError::LinkClosed)
+    }
+
+    /// Sends update progress on the guaranteed queue; core gates the peer capability.
+    pub async fn send_update_result(
+        &self,
+        result: wire::UpdateResult,
+    ) -> Result<(), TransportError> {
+        convert::validate_update_result(&result)
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        self.tx
+            .send(Outbound::UpdateResult(result))
             .await
             .map_err(|_| TransportError::LinkClosed)
     }
@@ -1308,12 +1336,14 @@ impl LinkState {
             .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
         match &envelope.payload {
             Some(wire::envelope::Payload::CapabilitiesChanged(_))
+            | Some(wire::envelope::Payload::UpdateRequest(_))
+            | Some(wire::envelope::Payload::UpdateResult(_))
                 if envelope.connection_id.as_slice() != self.connection_id
                     || envelope.major != protocol::limits::PROTOCOL_MAJOR
                     || !envelope.lease_id.is_empty() =>
             {
                 return Err(LinkDownReason::Protocol(
-                    "capability update does not belong to this input connection".into(),
+                    "control update does not belong to this input connection".into(),
                 ));
             }
             Some(wire::envelope::Payload::Shutdown(_)) => {
@@ -1457,6 +1487,18 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(
                         capabilities: capabilities.clone(),
                     },
                 ));
+                write_frame(writer, &envelope).await.map_err(reason_from)?;
+                index += 1;
+            }
+            Outbound::UpdateRequest(request) => {
+                let envelope =
+                    state.envelope(wire::envelope::Payload::UpdateRequest(request.clone()));
+                write_frame(writer, &envelope).await.map_err(reason_from)?;
+                index += 1;
+            }
+            Outbound::UpdateResult(result) => {
+                let envelope =
+                    state.envelope(wire::envelope::Payload::UpdateResult(result.clone()));
                 write_frame(writer, &envelope).await.map_err(reason_from)?;
                 index += 1;
             }

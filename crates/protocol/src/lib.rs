@@ -64,6 +64,25 @@ pub use limits::*;
 pub use seq::{SeqError, SeqValidator};
 pub use validate::Violation;
 
+/// Application release version. The override is reserved for smoke builds.
+pub fn app_version() -> &'static str {
+    option_env!("BIFROST_SMOKE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// Accepts only bounded, canonical SemVer; unknown metadata never refuses a handshake.
+pub fn sanitize_app_version(value: &str) -> String {
+    if is_valid_app_version(value) {
+        value.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Checks an update target without allocating a copy of the version string.
+pub fn is_valid_app_version(value: &str) -> bool {
+    value.len() <= 32 && semver::Version::parse(value).is_ok()
+}
+
 /// Bounds non-authoritative OS labels from local probes and untrusted peers.
 pub fn sanitize_system_name(value: &str) -> String {
     value

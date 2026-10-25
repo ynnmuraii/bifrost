@@ -607,3 +607,205 @@ fn typed_errors_map_to_documented_wire_codes() {
         assert_eq!(error.peer_error_code(), code);
     }
 }
+
+#[test]
+fn application_versions_are_strict_bounded_semver() {
+    for version in ["0.1.6", "1.2.3-rc.1", "1.2.3+build.42"] {
+        assert_eq!(protocol::sanitize_app_version(version), version);
+    }
+    for version in [
+        "",
+        "unknown",
+        "v1.2.3",
+        "1.2",
+        "01.2.3",
+        "1.2.3\n",
+        " 1.2.3",
+        "1.2.3-01",
+        "https://example.org/1.2.3",
+    ] {
+        assert_eq!(protocol::sanitize_app_version(version), "", "{version:?}");
+    }
+    let boundary = format!("1.2.3+{}", "a".repeat(26));
+    assert_eq!(boundary.len(), 32);
+    assert_eq!(protocol::sanitize_app_version(&boundary), boundary);
+    assert!(protocol::sanitize_app_version(&(boundary + "a")).is_empty());
+    assert_eq!(
+        protocol::app_version(),
+        option_env!("BIFROST_SMOKE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn application_version_comparison_is_semantic_not_lexical() {
+    use semver::Version;
+    let ordered = [
+        "1.2.3-alpha",
+        "1.2.3-alpha.2",
+        "1.2.3-alpha.10",
+        "1.2.3-rc.1",
+        "1.2.3",
+        "1.2.10",
+        "1.10.0",
+        "2.0.0",
+    ];
+    for pair in ordered.windows(2) {
+        assert!(Version::parse(pair[0]).unwrap() < Version::parse(pair[1]).unwrap());
+    }
+    assert_eq!(
+        Version::parse("1.2.3+one")
+            .unwrap()
+            .cmp_precedence(&Version::parse("1.2.3+two").unwrap()),
+        std::cmp::Ordering::Equal
+    );
+}
+
+#[test]
+fn remote_update_wire_tags_round_trip_and_old_hello_remains_readable() {
+    use prost::Message;
+    use wire::envelope::Payload;
+    assert_eq!(wire::Capability::RemoteUpdate as i32, 11);
+    let hello = wire::Hello {
+        app_version: "1.2.3".into(),
+        ..Default::default()
+    };
+    assert_eq!(hello.encode_to_vec(), b"\x7a\x051.2.3");
+    assert_eq!(
+        wire::Hello::decode(hello.encode_to_vec().as_slice()).unwrap(),
+        hello
+    );
+    assert!(wire::Hello::decode(&[][..]).unwrap().app_version.is_empty());
+    // A pre-version decoder ignores the new field and retains all fields it understands.
+    #[derive(Clone, PartialEq, Message)]
+    struct OldHello {
+        #[prost(string, tag = "2")]
+        display_name: String,
+    }
+    let current = wire::Hello {
+        display_name: "desktop".into(),
+        ..hello
+    };
+    let old = OldHello::decode(current.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(old.display_name, "desktop");
+    assert!(wire::Hello::decode(old.encode_to_vec().as_slice())
+        .unwrap()
+        .app_version
+        .is_empty());
+
+    for (payload, tag) in [
+        (
+            Payload::UpdateRequest(wire::UpdateRequest {
+                target_version: "1.2.3".into(),
+            }),
+            [0xd2, 0x02],
+        ),
+        (
+            Payload::UpdateResult(wire::UpdateResult {
+                target_version: "1.2.3".into(),
+                status: "downloading".into(),
+                detail: "verified source".into(),
+            }),
+            [0xda, 0x02],
+        ),
+    ] {
+        let envelope = wire::Envelope {
+            payload: Some(payload),
+            ..Default::default()
+        };
+        let bytes = envelope.encode_to_vec();
+        assert_eq!(&bytes[..2], &tag);
+        assert_eq!(wire::Envelope::decode(bytes.as_slice()).unwrap(), envelope);
+        #[derive(Clone, PartialEq, Message)]
+        struct OldEnvelope {
+            #[prost(uint32, tag = "1")]
+            major: u32,
+        }
+        assert_eq!(OldEnvelope::decode(bytes.as_slice()).unwrap().major, 0);
+    }
+    // A future unknown oneof remains absent, preserving the existing invalid-frame policy.
+    let unknown = wire::Envelope::decode(&[0xe2, 0x02, 0x00][..]).unwrap();
+    assert!(unknown.payload.is_none());
+}
+
+#[test]
+fn update_ipc_fields_are_append_only_and_round_trip() {
+    use prost::Message;
+    use protocol::ipc;
+    let member = ipc::MemberStatus {
+        app_version: "1.2.3".into(),
+        remote_update: true,
+        ..Default::default()
+    };
+    assert_eq!(member.encode_to_vec(), b"\x32\x051.2.3\x38\x01");
+    assert_eq!(
+        ipc::MemberStatus::decode(member.encode_to_vec().as_slice()).unwrap(),
+        member
+    );
+    let old = ipc::MemberStatus::decode(&[][..]).unwrap();
+    assert!(old.app_version.is_empty());
+    assert!(!old.remote_update);
+    let topology = ipc::MemberTopology {
+        app_version: "1.2.3".into(),
+        ..Default::default()
+    };
+    assert_eq!(topology.encode_to_vec(), b"\x32\x051.2.3");
+    assert_eq!(
+        ipc::MemberTopology::decode(topology.encode_to_vec().as_slice()).unwrap(),
+        topology
+    );
+    let status = ipc::Status {
+        allow_remote_update: true,
+        update_nodes: vec![ipc::NodeUpdate {
+            node_id: "node".into(),
+            display_name: "desktop".into(),
+            target_version: "1.2.3".into(),
+            status: "pending".into(),
+            detail: String::new(),
+        }],
+        update_notice: "update".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        ipc::Status::decode(status.encode_to_vec().as_slice()).unwrap(),
+        status
+    );
+    let status_flag = ipc::Status {
+        allow_remote_update: true,
+        ..Default::default()
+    };
+    assert_eq!(status_flag.encode_to_vec(), [0xf8, 0x01, 0x01]);
+    for (msg, tag) in [
+        (
+            ipc::gui_frame::Msg::UpdateAll(ipc::UpdateAll {
+                target_version: "1.2.3".into(),
+            }),
+            [0xa2, 0x02],
+        ),
+        (
+            ipc::gui_frame::Msg::SetRemoteUpdate(ipc::SetRemoteUpdate { enabled: true }),
+            [0xaa, 0x02],
+        ),
+        (
+            ipc::gui_frame::Msg::UpdateProgress(ipc::UpdateProgress {
+                target_version: "1.2.3".into(),
+                status: "downloading".into(),
+                detail: String::new(),
+            }),
+            [0xb2, 0x02],
+        ),
+        (
+            ipc::gui_frame::Msg::UpdateReady(ipc::UpdateReady {
+                target_version: "1.2.3".into(),
+            }),
+            [0xba, 0x02],
+        ),
+    ] {
+        let frame = ipc::GuiFrame {
+            msg: Some(msg),
+            ..Default::default()
+        };
+        let bytes = frame.encode_to_vec();
+        assert_eq!(&bytes[..2], &tag);
+        assert_eq!(ipc::GuiFrame::decode(bytes.as_slice()).unwrap(), frame);
+    }
+}

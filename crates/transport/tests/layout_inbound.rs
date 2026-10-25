@@ -27,6 +27,8 @@ fn round_trip(message: &LayoutMessage) -> LayoutMessage {
         Inbound::CapabilitiesChanged(other) => {
             panic!("expected a layout message, got capabilities: {other:?}")
         }
+        Inbound::UpdateRequest(other) => panic!("expected layout, got update request: {other:?}"),
+        Inbound::UpdateResult(other) => panic!("expected layout, got update result: {other:?}"),
     }
 }
 

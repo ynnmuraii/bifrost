@@ -327,3 +327,20 @@ fn a_motion_only_batch_keeps_its_lease_through_the_droppable_path() {
         "the rebuilt batch must keep the lease its motion belonged to"
     );
 }
+
+#[test]
+fn updates_never_enter_the_coalescible_motion_path() {
+    for item in [
+        Outbound::UpdateRequest(protocol::wire::UpdateRequest {
+            target_version: "1.2.3".into(),
+        }),
+        Outbound::UpdateResult(protocol::wire::UpdateResult {
+            target_version: "1.2.3".into(),
+            status: "downloading".into(),
+            detail: String::new(),
+        }),
+    ] {
+        assert!(item.motion_events().is_none());
+        assert!(item.motion_lease().is_none());
+    }
+}

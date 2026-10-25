@@ -51,6 +51,8 @@ message Envelope {
     Pong pong = 39;
     ActiveLayout active_layout = 40;         // receiver -> owner: receiver's active keyboard layout
     CapabilitiesChanged capabilities_changed = 41; // member -> all established input links
+    UpdateRequest update_request = 42;       // only to peers advertising REMOTE_UPDATE
+    UpdateResult update_result = 43;         // only to peers advertising REMOTE_UPDATE
   }
 }
 
@@ -73,6 +75,7 @@ enum Capability {
   // Source can always release capture with a local hotkey, without core or network.
   // Absent on a Wayland source whose compositor exposes no GlobalShortcuts backend.
   CAPABILITY_EMERGENCY_HOTKEY = 10;
+  CAPABILITY_REMOTE_UPDATE = 11;
 }
 
 enum SessionKind {
@@ -142,10 +145,19 @@ message Hello {
   uint64 topology_revision = 12;           // applied layout revision
   bytes topology_author = 13;              // author node_id of the applied revision
   string system_name = 14;                 // optional short OS name/version, non-authoritative
+  string app_version = 15;                 // optional canonical semver, <= 32 bytes; invalid => unknown
 }
 
 // Replaces only the sender's advertised capability set, not its identity or Hello.
 message CapabilitiesChanged { repeated Capability capabilities = 1; }
+
+// Only a version is supplied: releases are resolved from the receiver's trusted source.
+message UpdateRequest { string target_version = 1; }
+message UpdateResult {
+  string target_version = 1;
+  string status = 2; // pending | downloading | restarting | done | refused | unreachable
+  string detail = 3;
+}
 
 message Rect { double x = 1; double y = 2; double width = 3; double height = 4; }
 
