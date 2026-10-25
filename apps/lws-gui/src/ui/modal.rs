@@ -959,6 +959,31 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::wrapped(ui, error, 13.0, fam::sans(), pal.ink);
         }
     });
+    row(ui, pal, text(lang, Key::LanDiscovery), false, |ui| {
+        let pending = vm.settings.discovery_pending;
+        ui.add_enabled_ui(vm.connection.is_connected() && pending.is_none(), |ui| {
+            if let Some(i) = widgets::seg(
+                ui,
+                pal,
+                &[text(lang, Key::On), text(lang, Key::Off)],
+                usize::from(!vm.discovery_enabled()),
+            ) {
+                actions.push(Action::SetDiscovery(i == 0));
+            }
+        });
+        widgets::hint(
+            ui,
+            pal,
+            text(
+                lang,
+                if pending.is_some() {
+                    Key::Applying
+                } else {
+                    Key::DiscoveryExplanation
+                },
+            ),
+        );
+    });
     let current = vm.config.listen_address.clone();
     row(ui, pal, text(lang, Key::LANAddress), false, |ui| {
         let options = vm.settings.lan.options(&current);

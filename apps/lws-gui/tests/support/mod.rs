@@ -58,6 +58,8 @@ pub fn status_with(focus: &str) -> ipc::Status {
         },
         connected: true,
         clipboard_enabled: true,
+        discovery_enabled: true,
+        discovered_peers: Vec::new(),
         edge_effects: true,
         hide_remote_cursor: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),

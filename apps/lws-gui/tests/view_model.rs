@@ -2473,3 +2473,154 @@ fn both_flag_spellings_name_the_same_directories_in_every_role() {
     assert_eq!(tray.resolve().expect("the defaults resolve"), resolved);
     assert_eq!(resolved.config_dir(), std::path::Path::new("/work/config"));
 }
+
+fn discovered_peer(id: &str, open: bool) -> protocol::ipc::DiscoveredPeer {
+    protocol::ipc::DiscoveredPeer {
+        node_id: id.to_owned(),
+        display_name: "Nearby laptop".to_owned(),
+        address: "192.168.1.42:47901".to_owned(),
+        system_name: "Linux".to_owned(),
+        pairing_open: open,
+        protocol_version: protocol::PROTOCOL_MAJOR,
+    }
+}
+
+#[test]
+fn discovery_hides_paired_members_and_replaces_expired_announcements() {
+    let mut vm = view();
+    vm.on_connected("test");
+    let new_id = "cc".repeat(32);
+    let mut status = status_with("LOCAL");
+    status.discovered_peers = vec![
+        discovered_peer(SELF_NODE, true),
+        discovered_peer(PEER_NODE, true),
+        discovered_peer(&new_id, false),
+    ];
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(
+        vm.discovered_peers()
+            .map(|peer| peer.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![new_id.as_str()]
+    );
+    status.members.clear();
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(
+        vm.discovered_peers().count(),
+        1,
+        "topology membership also hides paired nodes"
+    );
+    status.discovery_enabled = false;
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(vm.discovered_peers().count(), 0);
+    status.discovery_enabled = true;
+    status.discovered_peers.clear();
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(
+        vm.discovered_peers().count(),
+        0,
+        "expired entries are not retained"
+    );
+    status.discovered_peers.push(discovered_peer(&new_id, true));
+    vm.apply(event(Msg::Status(status)));
+    vm.on_disconnected("test".to_owned());
+    assert_eq!(
+        vm.discovered_peers().count(),
+        0,
+        "offline announcements are stale"
+    );
+}
+
+#[test]
+fn discovered_pairing_uses_the_existing_address_flow_and_still_needs_sas() {
+    let mut vm = view();
+    vm.on_connected("test");
+    let peer = discovered_peer(&"cc".repeat(32), true);
+    let action = Action::PairWith(peer.address.clone());
+    let Some((request, Msg::PairWith(dial))) = action.wire() else {
+        panic!("discovery must use PairWith");
+    };
+    assert_eq!(request, Request::PairWith);
+    assert_eq!(dial.address, peer.address);
+    vm.local(&action);
+    assert!(vm.pairing.dialing);
+    assert!(vm.pairing.paired.is_none());
+    vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
+    assert_eq!(vm.pairing.attempt_id(), Some(attempt_id()));
+    assert!(
+        vm.pairing.paired.is_none(),
+        "announcements and prompts cannot approve SAS"
+    );
+    assert!(vm.take_outgoing().is_empty(), "no automatic pairing answer");
+    assert!(
+        Action::PairWith("10.0.0.2:47901".to_owned())
+            .wire()
+            .is_some(),
+        "manual dial remains available"
+    );
+}
+
+#[test]
+fn discovery_toggle_is_core_owned_and_settles_on_status_or_failure() {
+    let mut vm = view();
+    vm.on_connected("test");
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    let action = Action::SetDiscovery(false);
+    let Some((request, Msg::SetDiscovery(change))) = action.wire() else {
+        panic!("discovery setting must travel through core IPC");
+    };
+    assert!(!change.enabled);
+    assert_eq!(request, Request::SetDiscovery);
+    vm.local(&action);
+    let id = vm.begin_request(request, Instant::now());
+    assert!(!vm.discovery_enabled());
+    assert!(
+        vm.config.discovery_enabled,
+        "GUI must not edit persisted config"
+    );
+    let mut status = status_with("LOCAL");
+    status.discovery_enabled = false;
+    vm.apply(event(Msg::Status(status)));
+    assert_eq!(vm.settings.discovery_pending, None);
+    assert!(!vm.config.discovery_enabled);
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+    assert!(vm
+        .take_outgoing()
+        .iter()
+        .any(|(_, msg)| matches!(msg, Msg::GetStatus(_))));
+    vm.local(&Action::SetDiscovery(true));
+    let id = vm.begin_request(Request::SetDiscovery, Instant::now());
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: false,
+            error_code: "PERSISTENCE_FAILED".to_owned(),
+        }),
+    ));
+    assert_eq!(vm.settings.discovery_pending, None);
+    assert!(!vm.discovery_enabled());
+    vm.local(&Action::SetDiscovery(true));
+    vm.on_disconnected("test".to_owned());
+    assert_eq!(vm.settings.discovery_pending, None);
+}
+
+#[test]
+fn local_config_reads_discovery_and_defaults_to_enabled() {
+    let dir = settings_dir("192.168.1.10");
+    let paths = paths_of(&dir);
+    assert!(lws_gui::view_model::LocalConfig::load(&paths).discovery_enabled);
+    std::fs::write(
+        paths.config_file(),
+        "config_version = 2\n[discovery]\nenabled = false\n",
+    )
+    .expect("discovery config");
+    assert!(!lws_gui::view_model::LocalConfig::load(&paths).discovery_enabled);
+    std::fs::remove_dir_all(dir).expect("remove test config");
+}

@@ -17,6 +17,8 @@ use ui_text::{fill, fill_named, text, Key};
 const BASE_H: f32 = 220.0;
 /// What the open fingerprints add.
 const DETAILS_H: f32 = 96.0;
+/// A bounded list keeps LAN announcements from consuming the map.
+const DISCOVERY_H: f32 = 138.0;
 /// How long the core keeps a pairing window open.
 const WINDOW_S: u32 = 120;
 
@@ -39,7 +41,7 @@ pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     } else {
         BASE_H + extra
     };
-    32.0 + expanded
+    32.0 + (expanded + DISCOVERY_H)
         * ctx.animate_bool_with_time(egui::Id::new("dock-open"), vm.look.dock_open, 0.18)
 }
 
@@ -95,7 +97,12 @@ pub fn draw(
     if rect.height() <= 33.0 {
         return;
     }
-    let rect = Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + 32.0), rect.max);
+    let body_top = rect.min.y + 32.0;
+    let discovery = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - DISCOVERY_H), rect.max);
+    let rect = Rect::from_min_max(
+        Pos2::new(rect.min.x, body_top),
+        Pos2::new(rect.max.x, discovery.min.y),
+    );
     let (cols, rows) = if narrow { (2usize, 2usize) } else { (4, 1) };
     let cw = rect.width() / cols as f32;
     let ch = rect.height() / rows as f32;
@@ -130,6 +137,109 @@ pub fn draw(
             _ => code(&mut child, pal, vm, now, actions),
         }
     }
+    discovered(ui, pal, vm, discovery, actions);
+}
+
+fn discovered(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    rect: Rect,
+    actions: &mut Vec<Action>,
+) {
+    let lang = vm.look.language;
+    ui.painter()
+        .line_segment([rect.left_top(), rect.right_top()], pal.hairline());
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .id_salt("discovered-computers")
+            .max_rect(rect.shrink2(Vec2::new(22.0, 10.0)))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    widgets::text(
+        &mut child,
+        text(lang, Key::NearbyComputers),
+        13.0,
+        fam::sans_medium(),
+        pal.ink,
+    );
+    if vm.discovered_peers().next().is_none() {
+        widgets::hint(
+            &mut child,
+            pal,
+            text(
+                lang,
+                if vm.discovery_enabled() {
+                    Key::NoNearbyComputers
+                } else {
+                    Key::DiscoveryDisabled
+                },
+            ),
+        );
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .max_height(88.0)
+        .show(&mut child, |ui| {
+            for peer in vm.discovered_peers() {
+                ui.push_id(&peer.node_id, |ui| {
+                    ui.horizontal(|ui| {
+                        let name = if peer.display_name.is_empty() {
+                            text(lang, Key::WithoutAName)
+                        } else {
+                            &peer.display_name
+                        };
+                        let system = if peer.system_name.is_empty() {
+                            text(lang, Key::UnknownSystem)
+                        } else {
+                            &peer.system_name
+                        };
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::small_button(
+                                ui,
+                                pal,
+                                text(lang, Key::Connect),
+                                vm.connection.is_connected()
+                                    && peer.pairing_open
+                                    && !vm.pairing.dialing,
+                            )
+                            .clicked()
+                            {
+                                actions.push(Action::PairWith(peer.address.clone()));
+                            }
+                            widgets::text(
+                                ui,
+                                text(
+                                    lang,
+                                    if peer.pairing_open {
+                                        Key::PairingWindowOpen
+                                    } else {
+                                        Key::PairingWindowClosed
+                                    },
+                                ),
+                                11.0,
+                                fam::sans(),
+                                pal.ink2,
+                            );
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "{name} · {} · {system}",
+                                            peer.address
+                                        ))
+                                        .font(font(12.0, fam::sans()))
+                                        .color(pal.ink),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                        });
+                    });
+                });
+            }
+        });
 }
 
 fn cell_head(ui: &mut egui::Ui, pal: &Palette, letter: &str, caption: &str) {
@@ -538,15 +648,18 @@ mod tests {
             LocalConfig::default(),
         );
         let ctx = egui::Context::default();
-        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H);
-        assert_eq!(height(&ctx, &vm, true), 32.0 + 376.0);
+        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H + DISCOVERY_H);
+        assert_eq!(height(&ctx, &vm, true), 32.0 + 376.0 + DISCOVERY_H);
         vm.pairing.details = true;
         assert_eq!(
             height(&ctx, &vm, false),
-            32.0 + BASE_H,
+            32.0 + BASE_H + DISCOVERY_H,
             "no prompt, nothing to show"
         );
         vm.pairing.prompt = Some(protocol::ipc::PairingPrompt::default());
-        assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H + 40.0 + DETAILS_H);
+        assert_eq!(
+            height(&ctx, &vm, false),
+            32.0 + BASE_H + DISCOVERY_H + 40.0 + DETAILS_H
+        );
     }
 }

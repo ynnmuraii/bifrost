@@ -18,6 +18,8 @@
 //! in RU/EN and light/dark, using only mocked topology and real layout actions.
 //! `--metadata` writes only the map at 1745×1091 in RU/EN and light/dark, with the
 //! member OS names and the native display resolutions the map now labels.
+//! `--discovery` writes two discovered computers and the empty pairing dock in RU/EN,
+//! light/dark, at 1745×1091 and 1280×720. The discovered entries are mock announcements.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -52,6 +54,9 @@ fn main() -> std::process::ExitCode {
             .map(|pair| pair[1].clone())
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    if args.iter().any(|arg| arg == "--discovery") {
+        return discovery_shots(&dir);
+    }
     if args.iter().any(|arg| arg == "--updates") {
         return update_shots(&dir);
     }
@@ -727,6 +732,56 @@ fn auto(node: &str, edge: &str) -> Option<ipc::EndpointView> {
     })
 }
 
+fn discovery_shots(dir: &Path) -> std::process::ExitCode {
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    for (theme, theme_tag) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
+        for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+            for empty in [false, true] {
+                let mut vm = mockup(theme, None, lang);
+                vm.look.dock_open = true;
+                vm.pairing.prompt = None;
+                vm.pairing.details = false;
+                if !empty {
+                    vm.status.as_mut().expect("mock status").discovered_peers = vec![
+                        ipc::DiscoveredPeer {
+                            node_id: "dd".repeat(32),
+                            display_name: "STUDIO-PC".to_owned(),
+                            address: "192.168.1.37:47901".to_owned(),
+                            system_name: "Windows 11".to_owned(),
+                            pairing_open: true,
+                            protocol_version: protocol::PROTOCOL_MAJOR,
+                        },
+                        ipc::DiscoveredPeer {
+                            node_id: "ee".repeat(32),
+                            display_name: "LINUX-LAPTOP".to_owned(),
+                            address: "192.168.1.42:47901".to_owned(),
+                            system_name: "Linux".to_owned(),
+                            pairing_open: false,
+                            protocol_version: protocol::PROTOCOL_MAJOR,
+                        },
+                    ];
+                }
+                let state = if empty { "empty" } else { "two" };
+                for size in [[1745, 1091], [1280, 720]] {
+                    let file = dir.join(format!(
+                        "discovery-{state}-{lang_tag}-{theme_tag}-{}x{}.png",
+                        size[0], size[1],
+                    ));
+                    if let Err(error) = shoot(vm.clone(), &file, size, false) {
+                        eprintln!("{error}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    println!("{}", file.display());
+                }
+            }
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 /// The three computers of the mockup: LAPTOP, this WORKSTATION with two displays, an HTPC that
 /// is off; input is on the laptop.
 fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel {
@@ -760,6 +815,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         active_peer: "LAPTOP".to_owned(),
         connected: true,
         clipboard_enabled: true,
+        discovery_enabled: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),
         hotkeys: lws_gui::view_model::hotkeys::ROWS
             .iter()

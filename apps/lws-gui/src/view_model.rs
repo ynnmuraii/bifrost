@@ -268,6 +268,8 @@ pub enum Request {
     UpdateTopology,
     /// `SetClipboard`.
     SetClipboard,
+    /// Persist LAN discovery through the core.
+    SetDiscovery,
     /// Read the in-memory clipboard history.
     GetClipboardHistory,
     /// Copy a history item through the core's local clipboard adapter.
@@ -303,6 +305,7 @@ impl Request {
             Request::PairingAnswer => text(lang, Key::AnswerThePairing),
             Request::UpdateTopology => text(lang, Key::SaveTheLayout),
             Request::SetClipboard => text(lang, Key::TheClipboard),
+            Request::SetDiscovery => text(lang, Key::LanDiscovery),
             Request::GetClipboardHistory => text(lang, Key::TheClipboardHistory),
             Request::CopyClipboardHistory => text(lang, Key::CopyFromTheHistory),
             Request::ClearClipboardHistory => text(lang, Key::ClearTheClipboardHistory),
@@ -376,6 +379,8 @@ pub struct LocalConfig {
     pub port_input: u16,
     /// `[network].listen_address` — «Адрес этого компьютера в локальной сети».
     pub listen_address: String,
+    /// `[discovery].enabled`, until the core publishes its authoritative status.
+    pub discovery_enabled: bool,
     /// `Paths::config_file()`, so a user can be told which file is being shown.
     pub config_file: PathBuf,
     /// `Paths::state_dir()`, where `ExportDiagnostics` writes.
@@ -401,6 +406,7 @@ impl Default for LocalConfig {
             display_name: "Workstation".to_owned(),
             port_input: 47901,
             listen_address: String::new(),
+            discovery_enabled: true,
             config_file: PathBuf::new(),
             state_dir: PathBuf::new(),
             paths: None,
@@ -427,6 +433,7 @@ impl LocalConfig {
                 config.display_name = loaded.node.display_name.clone();
                 config.port_input = loaded.network.port_input;
                 config.listen_address = loaded.network.listen_address.clone();
+                config.discovery_enabled = loaded.discovery.enabled;
             }
             Err(error) => {
                 config.note = Some(fill(
@@ -662,6 +669,8 @@ impl Pairing {
 pub struct Settings {
     /// What a clipboard toggle asked for, until `Status` shows it or the core refuses.
     pub clipboard_pending: Option<bool>,
+    /// Requested discovery state until the core publishes it or refuses.
+    pub discovery_pending: Option<bool>,
     /// The member «Удалить компьютер из пары» is aimed at.
     pub revoke: Option<String>,
     /// What `ExportDiagnostics` answered.
@@ -960,6 +969,7 @@ impl ViewModel {
         // The save in flight died with the link, and a draft nobody can send is not kept.
         self.editor.save = Save::default();
         self.settings.clipboard_pending = None;
+        self.settings.discovery_pending = None;
         self.restore_placement();
         // A pairing window belongs to the connection that opened it; the core closes it on
         // its own timeout, and pretending it is still counting down would be a lie.
@@ -1295,6 +1305,38 @@ impl ViewModel {
         }
     }
 
+    /// Unpaired LAN announcements, never stale entries from a disconnected service.
+    pub fn discovered_peers(&self) -> impl Iterator<Item = &ipc::DiscoveredPeer> {
+        self.status
+            .iter()
+            .filter(|status| self.connection.is_connected() && status.discovery_enabled)
+            .flat_map(|status| &status.discovered_peers)
+            .filter(|peer| {
+                !self
+                    .editor
+                    .nodes
+                    .iter()
+                    .any(|member| member.node_id == peer.node_id)
+                    && !self.status.as_ref().is_some_and(|status| {
+                        status
+                            .members
+                            .iter()
+                            .any(|member| member.node_id == peer.node_id)
+                    })
+            })
+    }
+
+    /// Status owns the setting once connected; config supplies the initial value.
+    pub fn discovery_enabled(&self) -> bool {
+        self.settings.discovery_pending.unwrap_or_else(|| {
+            self.status
+                .as_ref()
+                .map_or(self.config.discovery_enabled, |status| {
+                    status.discovery_enabled
+                })
+        })
+    }
+
     /// `Status` is a response and an event, and both are the same fold.
     fn apply_status(&mut self, status: ipc::Status) {
         let lang = self.look.language;
@@ -1324,6 +1366,16 @@ impl ViewModel {
                     .any(|inflight| inflight.request == Request::SetClipboard))
         {
             self.settings.clipboard_pending = None;
+        }
+        self.config.discovery_enabled = status.discovery_enabled;
+        if self.settings.discovery_pending.is_some()
+            && (self.settings.discovery_pending == Some(status.discovery_enabled)
+                || !self
+                    .inflight
+                    .iter()
+                    .any(|request| request.request == Request::SetDiscovery))
+        {
+            self.settings.discovery_pending = None;
         }
         // A status announces a revision, not its links. Advance the CAS base only when its
         // TopologyDoc arrives; otherwise a queued drop could race ahead on stale geometry.
@@ -1514,7 +1566,10 @@ impl ViewModel {
         if result.ok {
             let line = self.success_text(request);
             // A toggle shows its own state; a sentence under it says nothing new.
-            if !matches!(request, Request::SetClipboard | Request::SetAppearance) {
+            if !matches!(
+                request,
+                Request::SetClipboard | Request::SetAppearance | Request::SetDiscovery
+            ) {
                 self.set_outcome(Outcome::done(line.clone()));
             }
             if request == Request::Shutdown {
@@ -1533,7 +1588,7 @@ impl ViewModel {
                     self.outgoing
                         .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
                 }
-                Request::SetAppearance => {
+                Request::SetAppearance | Request::SetDiscovery => {
                     let id = self.begin_request(Request::GetStatus, Instant::now());
                     self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
                 }
@@ -1547,6 +1602,9 @@ impl ViewModel {
         self.push_log(format!("{}: {}", request.label(lang), failure));
         if request == Request::SetClipboard {
             self.settings.clipboard_pending = None;
+        }
+        if request == Request::SetDiscovery {
+            self.settings.discovery_pending = None;
         }
         if request == Request::Shutdown {
             self.settings.service.stopping = None;
@@ -2138,6 +2196,7 @@ impl ViewModel {
                 self.look.dock_open = true;
             }
             Action::SetClipboard(enabled) => self.settings.clipboard_pending = Some(*enabled),
+            Action::SetDiscovery(enabled) => self.settings.discovery_pending = Some(*enabled),
             Action::HoldToast(hold) => {
                 if *hold != self.outcome_hold {
                     let now = Instant::now();
@@ -2309,6 +2368,8 @@ pub enum Action {
     },
     /// Turn the shared clipboard on or off.
     SetClipboard(bool),
+    /// Persist LAN discovery through the core.
+    SetDiscovery(bool),
     /// Refresh metadata without fetching clipboard contents.
     RefreshClipboardHistory,
     /// Copy a stored item to this computer's clipboard through the core.
@@ -2453,6 +2514,10 @@ impl Action {
             Action::SetClipboard(enabled) => (
                 Request::SetClipboard,
                 Msg::SetClipboard(ipc::SetClipboard { enabled: *enabled }),
+            ),
+            Action::SetDiscovery(enabled) => (
+                Request::SetDiscovery,
+                Msg::SetDiscovery(ipc::SetDiscovery { enabled: *enabled }),
             ),
             Action::RefreshClipboardHistory => (
                 Request::GetClipboardHistory,
@@ -3575,6 +3640,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::PairingAnswer(_) => "PairingAnswer",
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
+        Msg::SetDiscovery(_) => "SetDiscovery",
         Msg::GetClipboardHistory(_) => "GetClipboardHistory",
         Msg::GetClipboardHistoryItem(_) => "GetClipboardHistoryItem",
         Msg::ClearClipboardHistory(_) => "ClearClipboardHistory",
@@ -3651,6 +3717,7 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::CopyClipboardHistory => text(lang, Key::TheTextIsCopied).to_owned(),
         Request::ClearClipboardHistory => text(lang, Key::TheClipboardHistoryIsCleared).to_owned(),
         Request::SetAppearance => text(lang, Key::TheEdgeEffectsWereSwitched).to_owned(),
+        Request::SetDiscovery => text(lang, Key::LanDiscovery).to_owned(),
         Request::SetHotkey => text(lang, Key::KeyboardShortcutSaved).to_owned(),
         Request::RevokePeer => text(lang, Key::TheComputerWasRemovedFromThePair).to_owned(),
         Request::ResetPortalGrants => text(lang, Key::ThePortalGrantsWereForgotten).to_owned(),
