@@ -930,21 +930,24 @@ impl Wayland {
         enum Step {
             Captured(Option<CapturedEvent>),
             Shortcut(Option<config::HotkeyAction>),
-            Updated(Result<HotkeyCandidate, tokio::sync::oneshot::error::RecvError>),
+            Updated,
             Tick,
         }
+        // Keep the infrequent configuration result off the per-input-event discriminant,
+        // without allocating a box whenever shortcuts are replaced.
+        let mut updated = None;
 
         let step = match capture {
             Some(capture) => tokio::select! {
                 biased;
-                result = update => Step::Updated(result),
+                result = update => { updated = Some(result); Step::Updated },
                 action = shortcut => Step::Shortcut(action),
                 event = capture.next_event() => Step::Captured(event),
                 () = tokio::time::sleep(POLL_TICK) => Step::Tick,
             },
             None => tokio::select! {
                 biased;
-                result = update => Step::Updated(result),
+                result = update => { updated = Some(result); Step::Updated },
                 action = shortcut => Step::Shortcut(action),
                 () = tokio::time::sleep(POLL_TICK) => Step::Tick,
             },
@@ -952,7 +955,8 @@ impl Wayland {
 
         match step {
             Step::Tick => None,
-            Step::Updated(result) => {
+            Step::Updated => {
+                let result = updated.expect("the update select arm stored its result");
                 self.hotkey_update = None;
                 match result {
                     Ok((bindings, candidate)) => {

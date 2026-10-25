@@ -97,8 +97,18 @@ pub fn observe() -> windows::core::Result<Observation> {
             queried?;
             let image = String::from_utf16_lossy(&image[..length as usize]);
             let basename = image.rsplit(['\\', '/']).next().unwrap_or("");
-            // GUI and core are separate processes but all Bifrost roles share this name.
-            if basename.eq_ignore_ascii_case("bifrost.exe") {
+            // GUI/core roles have different PIDs; also recognize a renamed executable.
+            static OWN_IMAGE: std::sync::LazyLock<Option<String>> =
+                std::sync::LazyLock::new(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                });
+            if basename.eq_ignore_ascii_case("bifrost.exe")
+                || OWN_IMAGE
+                    .as_ref()
+                    .is_some_and(|own| image.eq_ignore_ascii_case(own))
+            {
                 return Ok(observation);
             }
             observation.app = basename.to_owned();

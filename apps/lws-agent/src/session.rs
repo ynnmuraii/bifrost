@@ -288,13 +288,6 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             // services below run once per turn whatever arm won, so the bias cannot
             // starve the deadline (rule 4) either.
             biased;
-            _ = guard_tick.tick() => {
-                let signals = guard_detector.observe();
-                if last_guard.as_ref() != Some(&signals) {
-                    link.send(Msg::GameGuardSignals(signals.clone())).await?;
-                    last_guard = Some(signals);
-                }
-            }
             received = link.recv() => {
                 let frame = match received {
                     Ok(frame) => frame,
@@ -324,6 +317,13 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                     &mut clipboard, dev_capture_injected, &mut last_inject_log, now,
                 ).await? {
                     return Ok(stop);
+                }
+            }
+            _ = guard_tick.tick() => {
+                let signals = guard_detector.observe();
+                if last_guard.as_ref() != Some(&signals) {
+                    link.send(Msg::GameGuardSignals(signals.clone())).await?;
+                    last_guard = Some(signals);
                 }
             }
             // ADR-008, agent side: a local copy is *polled*, never waited for, so the
