@@ -94,7 +94,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
             updater::replace(&exe, &bytes).map_err(|e| e.to_string())?;
             runtime.block_on(async {
                 tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(30),
                     report(
                         &paths,
                         Msg::UpdateReady(wire::UpdateReady {
