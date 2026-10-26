@@ -337,7 +337,7 @@ fn clipboard_routing_shots(dir: &Path) -> std::process::ExitCode {
                         request_id: id,
                         ..event(Msg::OpResult(ipc::OpResult {
                             ok: scene == "sent",
-                            error_code: "LAPTOP: offline".to_owned(),
+                            error_code: "offline".to_owned(),
                         }))
                     });
                 }

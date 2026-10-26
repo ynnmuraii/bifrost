@@ -15,7 +15,7 @@ use crate::gui_settings::{
 };
 use crate::map::{Dir, STAGE_H, STAGE_W};
 use crate::view_model::layout::{LinkState, MapLink, MapModel, MapNode};
-use crate::view_model::{Action, ViewModel};
+use crate::view_model::{Action, Modal, ViewModel};
 use ui_text::{text, Key};
 
 /// Stage → screen.
@@ -1116,7 +1116,11 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
             y += size.y + 12.0;
         }
     }
-    if let Some(outcome) = &vm.outcome {
+    if let Some(outcome) = vm
+        .outcome
+        .as_ref()
+        .filter(|_| vm.modal != Some(Modal::Clip))
+    {
         let galley = ui.painter().layout(
             outcome.line(lang),
             font(14.0, fam::sans_medium()),

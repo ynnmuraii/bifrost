@@ -1617,3 +1617,97 @@ fn a_history_row_says_how_long_ago_in_words_and_asks_for_the_next_minute() {
         "the next frame is the one that relabels the oldest row: {wait:?}"
     );
 }
+
+#[test]
+fn clipboard_send_result_stays_above_scrolling_history_in_both_languages_and_themes() {
+    let bounds = |frame: &Frame, needle: &str| {
+        frame
+            .texts
+            .iter()
+            .find(|(value, _)| value == needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}"))
+            .1
+    };
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for theme in [Theme::Dark, Theme::Light] {
+            for ok in [true, false] {
+                for size in [egui::vec2(1280.0, 720.0), egui::vec2(1745.0, 1091.0)] {
+                    let mut vm = connected();
+                    vm.look.language = lang;
+                    vm.look.theme = theme;
+                    vm.local(&Action::ToggleModal(Modal::Clip));
+                    vm.apply(event(Msg::ClipboardHistory(ipc::ClipboardHistory {
+                        items: (1..=30)
+                            .map(|id| ipc::ClipboardHistoryEntry {
+                                id,
+                                direction: ipc::ClipboardHistoryDirection::Copied as i32,
+                                peer_name: "source".to_owned(),
+                                time_unix_ms: 0,
+                                size_bytes: 16,
+                                preview: format!("history item {id}"),
+                            })
+                            .collect(),
+                    })));
+                    let request = vm.begin_clipboard_send(PEER_NODE, Instant::now());
+                    vm.apply(ipc::GuiFrame {
+                        request_id: request,
+                        ..event(Msg::OpResult(ipc::OpResult {
+                            ok,
+                            error_code: "offline".to_owned(),
+                        }))
+                    });
+                    let expected = vm.outcome.as_ref().unwrap().text.as_str();
+                    let first_preview = vm.clipboard_history.first().unwrap().preview.as_str();
+                    let mut harness = Harness::new();
+                    harness.frame(&vm, false, size, Vec::new());
+                    harness.now += Duration::from_millis(500);
+                    harness.frame(&vm, false, size, Vec::new());
+                    let frame = harness.frame(&vm, false, size, Vec::new());
+                    let result = bounds(&frame, expected);
+                    let shared = bounds(
+                        &frame,
+                        &ui_text::text(lang, ui_text::Key::SharedClipboard).to_uppercase(),
+                    );
+                    assert!(result.top() > 16.0 && result.bottom() < shared.top());
+                    assert!(result.left() > 16.0 && result.right() < size.x - 16.0);
+                    assert_eq!(
+                        frame
+                            .texts
+                            .iter()
+                            .filter(|(value, _)| value.contains(expected))
+                            .count(),
+                        1,
+                        "feedback belongs to the dialog, not a toast behind its scrim"
+                    );
+                    let first = bounds(&frame, first_preview);
+                    harness.frame(
+                        &vm,
+                        false,
+                        size,
+                        vec![
+                            egui::Event::PointerMoved(egui::pos2(size.x / 2.0, size.y / 2.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -1500.0),
+                                phase: egui::TouchPhase::Move,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                    harness.now += Duration::from_millis(500);
+                    let scrolled = harness.frame(&vm, false, size, Vec::new());
+                    let after = bounds(&scrolled, expected);
+                    assert!((after.top() - result.top()).abs() < 1.0);
+                    assert!(
+                        scrolled
+                            .texts
+                            .iter()
+                            .find(|(value, _)| value == first_preview)
+                            .is_none_or(|(_, rect)| rect.top() < first.top() - 50.0),
+                        "the history scrolled while its result stayed visible"
+                    );
+                }
+            }
+        }
+    }
+}

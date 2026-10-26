@@ -84,6 +84,25 @@ pub fn draw(
     }
 
     let width = (full.width() - 48.0).min(680.0);
+    let clipboard_feedback = vm
+        .outcome
+        .as_ref()
+        .filter(|_| modal == Modal::Clip)
+        .map(|outcome| {
+            (
+                painter.layout(
+                    outcome.text.clone(),
+                    font(13.0, fam::sans_medium()),
+                    pal.ink,
+                    (width - 56.0).max(40.0),
+                ),
+                if outcome.ok { pal.ok } else { pal.accent },
+            )
+        });
+    let feedback_h = clipboard_feedback
+        .as_ref()
+        .map_or(0.0, |(galley, _)| galley.size().y + 24.0);
+    let header_h = HEAD_H + feedback_h;
     let max_h = full.height() - 48.0;
     let height_id = egui::Id::new(("modal-height", modal));
     let known: Option<f32> = ui.ctx().data(|d| d.get_temp(height_id));
@@ -125,15 +144,26 @@ pub fn draw(
     dialog.spacing_mut().item_spacing = Vec2::ZERO;
 
     header(dialog, pal, lang, modal, rect, progress, actions);
+    if let Some((galley, edge)) = clipboard_feedback {
+        let top = rect.top() + HEAD_H;
+        let painter = dialog.painter();
+        painter.circle_filled(
+            Pos2::new(rect.left() + 24.0, top + feedback_h / 2.0),
+            3.0,
+            edge,
+        );
+        painter.galley(Pos2::new(rect.left() + 36.0, top + 12.0), galley, pal.ink);
+        painter.hline(rect.x_range(), top + feedback_h - 0.5, pal.hairline());
+    }
     /// The height of a dialog's footer.
     const FOOT_H: f32 = 72.0;
     // Only the dialogs with an action of their own have a footer; one that held nothing but
     // «Закрыть» is gone, because the × in the header, Escape and a click outside the dialog
     // are all ways out of any of them.
     let foot_h = if has_footer(modal) { FOOT_H } else { 0.0 };
-    let body_h = (height - HEAD_H - foot_h).max(0.0);
+    let body_h = (height - header_h - foot_h).max(0.0);
     let body_rect = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.top() + HEAD_H),
+        Pos2::new(rect.left(), rect.top() + header_h),
         Pos2::new(rect.right(), rect.bottom() - foot_h),
     );
     let mut body = dialog.new_child(
@@ -195,7 +225,7 @@ pub fn draw(
             Modal::Clip | Modal::Diag | Modal::Settings | Modal::Appearance => {}
         });
     }
-    let measured = HEAD_H + used.content_size.y + foot_h;
+    let measured = header_h + used.content_size.y + foot_h;
     if (known.unwrap_or(0.0) - measured).abs() > 0.5 {
         ui.ctx().data_mut(|d| d.insert_temp(height_id, measured));
         ui.ctx().request_repaint();
