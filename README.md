@@ -11,8 +11,8 @@ Bifrost is a software KVM: share one keyboard, mouse and text clipboard across W
 
 ## What it does
 
-- Mutual TLS, persistent peer trust and pairing confirmed on both computers.
-- LAN peer discovery for pairing and finding trusted computers after their address changes; manual addresses remain available.
+- Mutual TLS, pairing requests accepted before six-digit confirmation on both computers, and synchronized unpairing.
+- LAN discovery with dotted, gently animated cards for unpaired computers (**Connect / Hide**), plus rediscovery of trusted computers after address changes; manual addresses remain available.
 - Live RTT p95 and jitter on the status screen, with latency pills on the monitor map.
 - A freely arranged monitor map, edge links across gaps and an animated ASCII bridge.
 - Edge glow to show where input is going.
@@ -30,17 +30,17 @@ The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–10
 
 ## Download & install
 
-Get **0.3.0** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
+Get **0.3.1** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
 
 Versions from **0.1.4** can update from **Settings** or the startup update notice. The app checks for newer stable releases shortly after startup; turn this off in **Settings → Check on startup**, or check manually next to the version. Updates keep a binary backup and ask before restarting all roles; your configuration and pairing are preserved. System-wide, non-writable installations must be updated manually.
 
 **0.1.6 and newer refuse unsigned updates:** the updater verifies the checksum file's Ed25519 signature with its embedded public key before checking the download's SHA-256. For manual OpenSSL verification using a trusted copy of the public key, see [the packaged guide](packaging/README_RU.txt).
 
-**Update all computers** updates connected trusted computers first, then this computer. Every computer independently fetches the official latest release and verifies its signed checksums; peers cannot supply a download URL or binary. Per-computer progress and refusals stay visible. Disable requests from other computers in **Settings → Allow updates from other computers** (`[update].allow_remote_request = false`). Requests are limited to one per peer every ten minutes. Computers running **0.1.x must each update individually to 0.3.0** before update-all works; 0.1.6 offers this release in Settings or the startup notice.
+**Update all computers** updates online trusted computers first and this computer last. Each target independently fetches the official latest release and verifies its signed checksums; peers cannot supply a download URL or binary. Per-computer progress and refusals stay visible. Disable requests from other computers in **Settings → Allow updates from other computers** (`[update].allow_remote_request = false`). Requests are limited to one per peer every ten minutes. Computers running **0.1.x must each update individually to 0.3.1** before update-all works; 0.1.6 offers this release in Settings or the startup notice.
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.3.0-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.3.1-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902 + UDP 47902 (discovery)** (multicast `239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
@@ -48,10 +48,10 @@ Settings are created automatically in `%APPDATA%\lan-workspace`; logs go to `%LO
 
 ### Linux · x86_64
 
-Download **`bifrost-0.3.0-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.3.1-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.3.0-linux-x86_64.tar.gz
+tar -xzf bifrost-0.3.1-linux-x86_64.tar.gz
 ./install.sh
 ```
 
@@ -66,6 +66,8 @@ Runtime: X11 works too; Wayland needs `xdg-desktop-portal` with RemoteDesktop/In
 3. Compare the six-digit codes and confirm on **both** computers. Only confirm if the codes match.
    A request grants no trust. Accept opens a temporary window restricted to the requesting certificate; declining mutes that identity for ten minutes.
 4. Arrange the screens on the map and connect their edges. Take control on the computer whose keyboard you want to use, then move across a linked edge. Enable the shared clipboard if you want it, and test your emergency shortcut first.
+
+Pairing requests and synchronized unpairing require **0.3.1 on both computers**. Unpairing removes trust on the other computer immediately if online, or on its next connection within 30 days. Older versions keep manual pairing windows and may show a manual **Remove** suggestion instead of synchronized removal.
 
 Existing settings and pairing stay in the `lan-workspace` directories when updating. Stop your old Bifrost session before replacing the executable.
 

@@ -2,33 +2,31 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
-## Unreleased
+## 0.3.1 — 2026-10-27
 
 ### English
 
 **New**
 
-- Unpaired LAN computers appear as dashed 1080p placeholders at the same scale as real monitors, with quiet captions below. Connect opens the existing six-digit confirmation flow; Hide remembers up to 64 computers in local GUI settings, with Show again in the pairing dock. Manual address entry is unaffected.
-- Discovered computer placeholders gently shimmer with a full ASCII grid and a clear diagonal sweep; open pairing windows accent only the passing band, and hover highlights the clickable card. Animation pauses when the map or window is inactive.
-- **Pairing requests:** Connect on a discovered computer asks it for permission before the usual six-digit confirmation on both screens. Accept opens a temporary window restricted to the requesting certificate; requests never grant trust. Settings can disable incoming requests, and older computers retain the manual-window flow.
+- Discovered, unpaired LAN computers now appear on the map as dotted cards with a gentle ASCII animation. **Connect** starts pairing; **Hide** removes a card, and **Show again** restores it. Manual address entry remains available.
+- **Connect** now sends a pairing request that the other computer must **Accept** before comparing the six-digit code on both screens. Incoming requests can be disabled with **Settings → Accept pairing requests**. Requests require Bifrost 0.3.1 on both computers; older versions keep the manual pairing-window flow.
 
 **Fixes**
 
-- On compatible versions, unpairing on one computer now removes the pair on the other too: immediately while online, or on its next connection within 30 days. The other computer shows a one-time notice.
-- For peers running older versions, a manual **Remove** suggestion appears after a prolonged offline period and a certificate rejection. Network failures alone never remove a pair automatically.
+- Unpairing now removes the pair on both computers: immediately while online, or on the other computer's next connection within 30 days. Both computers need Bifrost 0.3.1 for synchronized removal.
+- Older versions instead show a manual **Remove** suggestion after a prolonged offline period and a certificate rejection. Network failures alone never remove a pair automatically.
 
 ### Русский
 
 **Новое**
 
-- Найденные в локальной сети несопряжённые компьютеры показаны пунктирными экранами 1080p в том же масштабе, что реальные мониторы, с подписями снизу. «Подключиться» открывает обычное подтверждение шестизначного кода; «Скрыть» запоминает до 64 компьютеров в настройках GUI, а «Показать снова» возвращает их. Ручной ввод адреса работает независимо.
-- На экранах найденных компьютеров мягко переливается сетка ASCII-символов с заметной диагональной волной; открытое окно сопряжения окрашивает только проходящую полосу, а наведение подсвечивает кликабельную карточку. Анимация останавливается, когда карта или окно неактивны.
-- **Запросы сопряжения:** «Подключиться» у найденного компьютера запрашивает разрешение перед обычным подтверждением шестизначного кода на обоих экранах. «Принять» открывает временное окно только для сертификата отправителя; сам запрос не даёт доверия. В настройках можно отключить входящие запросы; для старых компьютеров сохраняется ручное открытие окна.
+- Найденные в локальной сети несопряжённые компьютеры теперь показаны на карте пунктирными карточками с мягкой ASCII-анимацией. **«Подключиться»** начинает сопряжение, **«Скрыть»** убирает карточку, а **«Показать снова»** возвращает её. Ручной ввод адреса остаётся доступен.
+- **«Подключиться»** теперь отправляет запрос сопряжения: другой компьютер должен **«Принять»** его перед сравнением шестизначного кода на обоих экранах. Входящие запросы отключаются переключателем **Настройки → Принимать запросы на сопряжение**. Для запросов на обоих компьютерах нужна Bifrost 0.3.1; со старыми версиями сохраняется ручное открытие окна сопряжения.
 
 **Исправления**
 
-- На совместимых версиях удаление сопряжения на одном компьютере теперь удаляет пару и на другом: сразу при наличии связи или при следующем подключении в течение 30 дней. Другой компьютер показывает однократное уведомление.
-- Для компьютеров со старыми версиями после длительного отсутствия связи и отказа сертификата появляется ручная подсказка **«Удалить»**. Одни лишь сетевые ошибки никогда не удаляют пару автоматически.
+- Удаление сопряжения теперь удаляет пару на обоих компьютерах: сразу при наличии связи или при следующем подключении другого компьютера в течение 30 дней. Для синхронизации удаления на обоих компьютерах нужна Bifrost 0.3.1.
+- Для старых версий вместо этого появляется ручная подсказка **«Удалить»** после длительного отсутствия связи и отказа сертификата. Одни лишь сетевые ошибки никогда не удаляют пару автоматически.
 
 ## 0.3.0 — 2026-10-26
 
