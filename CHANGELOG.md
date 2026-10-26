@@ -2,23 +2,39 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
-## Unreleased
+## 0.3.0 — 2026-10-26
 
 ### English
 
-- Game mode prevents accidental edge switches while a fullscreen or cursor-confined application is active on Windows, or an EWMH fullscreen app is active on X11. Settings include auto/always/off and per-app allow/block lists; explicit switching and emergency release are unaffected.
-- Ctrl+Alt+Shift+G and the tray toggle manual game mode. The local map pill and tray show why edge switching is blocked. Wayland offers manual mode only and clearly reports that automatic detection is unavailable.
-- Clipboard text now follows the cursor by default: passing through a computer does not overwrite its clipboard. A destination settles on the first key/button press or after 700 ms; Settings also offers the previous broadcast policy.
-- Clipboard history can send one item directly to an online trusted computer. Addressing the current copied item stops it following the cursor until the next copy; sending an older item leaves the current carry unchanged.
-- New peers acknowledge clipboard application before routed settling input is released (up to 150 ms); older receivers remain supported without waiting for an acknowledgement. Native local input is not held, so a paste before delivery completes may still use the previous clipboard. Secret-marked text is never carried or retained.
+**New**
+
+- Game mode prevents accidental edge switches in fullscreen applications on Windows/X11 and cursor-confined applications on Windows. Settings offer automatic, always-on and off modes plus per-app exceptions. Ctrl+Alt+Shift+G and the tray toggle manual mode; explicit switching and emergency release still work. Wayland supports manual mode only, without automatic detection.
+- Clipboard history's **Send to…** sends one item to a chosen online trusted computer. Sending the current copied item stops it following the cursor until the next copy; sending an older item leaves the current carry unchanged.
+
+**Changes**
+
+- The text clipboard now **follows the cursor by default**, instead of being sent to every computer at copy time. Passing through a screen does not overwrite its clipboard: delivery starts on the first key/button press or after about 0.7 seconds. To restore the old behaviour, choose **Settings → Clipboard → «всем сразу»** (broadcast), or set `policy = "broadcast"` under `[clipboard]` in the configuration.
+- On returning to a Wayland computer, the very first paste within about 0.7 seconds may still paste the previous content: local key presses may be unavailable, so delivery waits for the cursor to settle.
+
+**Fixes**
+
+- Compatible computers confirm clipboard delivery before the first routed key/button press is released, reducing pastes of stale text. Older computers remain supported; local physical input is not delayed. Secret-marked text is never carried or retained.
 
 ### Русский
 
-- Игровой режим предотвращает случайный переход по краю из полноэкранных приложений и игр с ограничением курсора на Windows, из EWMH fullscreen-приложений на X11. В настройках: авто/всегда/выкл. и списки исключений; явное переключение и аварийный возврат работают всегда.
-- Ctrl+Alt+Shift+G и пункт трея переключают ручной игровой режим. Метка локального узла и трей показывают причину блокировки. На Wayland доступен только ручной режим с честным предупреждением об отсутствии автоопределения.
-- По умолчанию текстовый буфер следует за курсором: проход через компьютер не перезаписывает его буфер. Назначение определяется первым нажатием клавиши/кнопки или задержкой 700 мс; в настройках можно вернуть прежнюю рассылку всем.
-- Из истории можно отправить одну запись выбранному доверенному компьютеру в сети. Адресная отправка текущего скопированного текста прекращает его перенос до следующего копирования; отправка старой записи не меняет текущий перенос.
-- Новые компьютеры подтверждают применение буфера до передачи первого перенаправленного нажатия (ожидание до 150 мс); старые получатели поддерживаются без ожидания подтверждения. Местный физический ввод не задерживается: вставка до завершения доставки может взять прежний буфер. Помеченные секреты не переносятся и не сохраняются.
+**Новое**
+
+- Игровой режим предотвращает случайный переход по краю из полноэкранных приложений на Windows/X11 и приложений с ограничением курсора на Windows. В настройках доступны автоматический, постоянный и выключенный режимы, а также исключения для приложений. Ctrl+Alt+Shift+G и пункт трея переключают ручной режим; явное переключение и аварийный возврат работают всегда. На Wayland доступен только ручной режим, без автоопределения.
+- «Отправить на…» в истории буфера передаёт одну запись выбранному доверенному компьютеру в сети. Отправка текущей копии прекращает её перенос за курсором до следующего копирования; отправка старой записи не меняет текущий перенос.
+
+**Изменения**
+
+- Теперь текстовый буфер **по умолчанию следует за курсором**, а не рассылается всем компьютерам в момент копирования. Проход через экран не перезаписывает его буфер: доставка начинается при первом нажатии клавиши/кнопки или примерно через 0,7 секунды. Чтобы вернуть прежнее поведение, выберите **Настройки → Буфер обмена → «всем сразу»** или укажите `policy = "broadcast"` в разделе `[clipboard]` конфигурации.
+- При возврате на компьютер с Wayland самая первая вставка в течение примерно 0,7 секунды ещё может вставить прежнее содержимое: местные нажатия могут быть недоступны, поэтому доставка ждёт остановки курсора.
+
+**Исправления**
+
+- Совместимые компьютеры подтверждают доставку буфера до передачи первого перенаправленного нажатия клавиши/кнопки, уменьшая вероятность вставки старого текста. Старые компьютеры по-прежнему поддерживаются; местный физический ввод не задерживается. Помеченные секреты не переносятся и не сохраняются.
 
 ## 0.2.0 — 2026-10-25
 
