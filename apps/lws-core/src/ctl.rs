@@ -158,7 +158,7 @@ pub enum Request {
     /// `pair-with <address>`: dial a peer that opened its window (`GuiFrame.PairWith`).
     PairWith(String),
     /// Ask a certificate identity for permission to start the SAS ceremony.
-    PairRequest { address: String, node_id: String },
+    AskToPair { address: String, node_id: String },
     /// Current prompt-only request, without waiting for SAS.
     PairRequestPrompt,
     /// Accept or decline the displayed request.
@@ -267,12 +267,10 @@ impl Request {
             "pair-with" if !argument.is_empty() => Ok(Request::PairWith(argument.to_owned())),
             "pair-with" => Err("pair-with needs an address".to_owned()),
             "pair-request" => match argument.split_once(char::is_whitespace) {
-                Some((address, node_id)) if !node_id.trim().is_empty() => {
-                    Ok(Request::PairRequest {
-                        address: address.into(),
-                        node_id: node_id.trim().into(),
-                    })
-                }
+                Some((address, node_id)) if !node_id.trim().is_empty() => Ok(Request::AskToPair {
+                    address: address.into(),
+                    node_id: node_id.trim().into(),
+                }),
                 _ => Err("pair-request needs address and node id".into()),
             },
             "pair-request-prompt" if argument.is_empty() => Ok(Request::PairRequestPrompt),

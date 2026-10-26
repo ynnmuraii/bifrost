@@ -4201,7 +4201,7 @@ impl Session {
                     .into(),
                 }
             }
-            ctl::Request::PairRequest { address, node_id } => {
+            ctl::Request::AskToPair { address, node_id } => {
                 let result = self.start_pair_request(protocol::ipc::RequestPairing {
                     address,
                     display_name: node_id.clone(),
