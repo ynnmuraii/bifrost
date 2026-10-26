@@ -36,6 +36,8 @@ pub(crate) struct Beacon {
     pub protocol_version: u32,
     pub pairing_open: bool,
     pub system_name: String,
+    #[serde(default)]
+    pub supports_pairing_requests: bool,
 }
 
 impl Beacon {
@@ -113,6 +115,7 @@ impl Table {
                     system_name: received.beacon.system_name.clone(),
                     pairing_open: received.beacon.pairing_open,
                     protocol_version: received.beacon.protocol_version,
+                    supports_pairing_requests: received.beacon.supports_pairing_requests,
                 },
                 seen: now,
             },
@@ -231,6 +234,7 @@ mod tests {
             protocol_version: protocol::PROTOCOL_MAJOR,
             pairing_open: true,
             system_name: "Windows".into(),
+            supports_pairing_requests: true,
         }
     }
 
@@ -253,6 +257,17 @@ mod tests {
         invalid.display_name = format!("\u{202e}\n{}", "я".repeat(80));
         let clean = Beacon::decode(&invalid.encode().unwrap()).unwrap();
         assert_eq!(clean.display_name.chars().count(), 32);
+    }
+
+    #[test]
+    fn legacy_beacons_do_not_claim_request_support() {
+        let mut value = serde_json::to_value(beacon(2)).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("supports_pairing_requests");
+        let old = Beacon::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(!old.supports_pairing_requests);
     }
 
     #[test]

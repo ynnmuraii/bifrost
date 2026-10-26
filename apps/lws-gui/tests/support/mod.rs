@@ -61,6 +61,7 @@ pub fn status_with(focus: &str) -> ipc::Status {
         clipboard_policy: "follow".to_owned(),
         clipboard_settle_ms: 700,
         discovery_enabled: true,
+        accept_pairing_requests: true,
         discovered_peers: Vec::new(),
         edge_effects: true,
         hide_remote_cursor: true,

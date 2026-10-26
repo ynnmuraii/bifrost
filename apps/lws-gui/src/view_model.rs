@@ -265,6 +265,8 @@ pub enum Request {
     StartPairing,
     /// `PairWith`: success acknowledges the dial reaching a prompt, not a completed pair.
     PairWith,
+    PairingRequest,
+    SetPairingRequests,
     /// `PairingAnswer`.
     PairingAnswer,
     /// `UpdateTopology`.
@@ -316,6 +318,8 @@ impl Request {
             Request::Abandon => text(lang, Key::GiveControlBack),
             Request::StartPairing => text(lang, Key::OpenThePairingWindow),
             Request::PairWith => text(lang, Key::ConnectByAddress),
+            Request::PairingRequest => text(lang, Key::PairingRequestIncoming),
+            Request::SetPairingRequests => text(lang, Key::PairingRequests),
             Request::PairingAnswer => text(lang, Key::AnswerThePairing),
             Request::UpdateTopology => text(lang, Key::SaveTheLayout),
             Request::UpdateAll => text(lang, Key::UpdateAllComputers),
@@ -871,6 +875,8 @@ pub struct ViewModel {
     pub editor: LayoutEditor,
     /// The pairing screen's state.
     pub pairing: Pairing,
+    pub incoming_pair_request: Option<ipc::IncomingPairingRequest>,
+    pub outgoing_pair_request: Option<ipc::OutgoingPairingRequest>,
     /// The settings screen's state.
     pub settings: Settings,
     /// GUI-only updater state, also used by offscreen screenshots.
@@ -961,6 +967,8 @@ impl ViewModel {
             hotkeys_error: None,
             editor: LayoutEditor::default(),
             pairing: Pairing::default(),
+            incoming_pair_request: None,
+            outgoing_pair_request: None,
             settings: Settings::default(),
             update: crate::updater::State::Idle,
             update_notice: false,
@@ -1042,6 +1050,8 @@ impl ViewModel {
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
         self.pairing.prompt = None;
+        self.incoming_pair_request = None;
+        self.outgoing_pair_request = None;
         if self.settings.service.stopping.take().is_some() {
             self.settings.service.line = Some(Outcome::done(text(lang, Key::TheServiceIsStopped)));
         }
@@ -1374,6 +1384,15 @@ impl ViewModel {
             Msg::Status(status) => self.apply_status(status),
             Msg::TopologyDoc(doc) => self.apply_topology(doc),
             Msg::PairingWindow(window) => self.apply_pairing_window(window),
+            Msg::IncomingPairingRequest(prompt) => {
+                self.incoming_pair_request = (prompt.seconds_remaining > 0).then_some(prompt);
+                if self.incoming_pair_request.is_some() {
+                    self.look.dock_open = true;
+                }
+            }
+            Msg::OutgoingPairingRequest(request) => {
+                self.outgoing_pair_request = Some(request);
+            }
             Msg::PairingPrompt(prompt) => {
                 self.push_log(fill(
                     lang,
@@ -1744,6 +1763,8 @@ impl ViewModel {
                     | Request::SetClipboardPolicy
                     | Request::SetAppearance
                     | Request::SetDiscovery
+                    | Request::PairingRequest
+                    | Request::SetPairingRequests
             ) {
                 self.set_outcome(Outcome::done(line.clone()));
             }
@@ -1766,6 +1787,7 @@ impl ViewModel {
                 Request::SetClipboardPolicy
                 | Request::SetAppearance
                 | Request::SetDiscovery
+                | Request::SetPairingRequests
                 | Request::SetGameGuard => {
                     let id = self.begin_request(Request::GetStatus, Instant::now());
                     self.outgoing.push((id, Msg::GetStatus(ipc::GetStatus {})));
@@ -2415,6 +2437,12 @@ impl ViewModel {
                 self.look.hidden_discovered.remove(node_id);
             }
             Action::DonePairing => self.pairing.paired = None,
+            Action::RequestPairing(_) => {
+                self.modal = None;
+                self.appearance_open = false;
+                self.look.dock_open = true;
+                self.pairing.paired = None;
+            }
             Action::PairWith(address) => {
                 self.modal = None;
                 self.appearance_open = false;
@@ -2555,6 +2583,13 @@ pub enum Action {
     },
     /// Dial the other computer's pairing address.
     PairWith(String),
+    RequestPairing(ipc::RequestPairing),
+    AnswerPairingRequest {
+        requester_node_id: Vec<u8>,
+        accept: bool,
+    },
+    CancelPairingRequest,
+    SetPairingRequests(bool),
     /// Hide an unpaired LAN identity locally, without trusting or changing the peer.
     HideDiscovered(String),
     /// Restore a locally hidden identity, including one no longer announcing.
@@ -2705,9 +2740,25 @@ pub fn version_is_older(current: &str, highest: &str) -> bool {
 }
 
 impl Action {
+    /// Discovery supplies hints; core verifies the selected TLS certificate identity.
+    pub fn connect_discovered(peer: &ipc::DiscoveredPeer) -> Self {
+        Self::RequestPairing(ipc::RequestPairing {
+            address: peer.address.clone(),
+            node_id: peer.node_id.clone(),
+            display_name: peer.display_name.clone(),
+            supports_requests: peer.supports_pairing_requests,
+        })
+    }
+
     /// The request this action puts on the wire, or `None` for a local one.
     pub fn wire(&self) -> Option<(Request, Msg)> {
         let wire = match self {
+            Action::HideDiscovered(node_id) => (
+                Request::PairingRequest,
+                Msg::MutePairingRequester(ipc::MutePairingRequester {
+                    node_id: node_id.clone(),
+                }),
+            ),
             Action::Refresh => (Request::GetStatus, Msg::GetStatus(ipc::GetStatus {})),
             Action::UpdateAll(target_version) => (
                 Request::UpdateAll,
@@ -2737,6 +2788,28 @@ impl Action {
                 Msg::StartPairing(ipc::StartPairing {
                     window_s: *window_s,
                 }),
+            ),
+            Action::RequestPairing(request) => (
+                Request::PairingRequest,
+                Msg::RequestPairing(request.clone()),
+            ),
+            Action::AnswerPairingRequest {
+                requester_node_id,
+                accept,
+            } => (
+                Request::PairingRequest,
+                Msg::AnswerPairingRequest(ipc::AnswerPairingRequest {
+                    requester_node_id: requester_node_id.clone(),
+                    accept: *accept,
+                }),
+            ),
+            Action::CancelPairingRequest => (
+                Request::PairingRequest,
+                Msg::CancelPairingRequest(ipc::CancelPairingRequest {}),
+            ),
+            Action::SetPairingRequests(enabled) => (
+                Request::SetPairingRequests,
+                Msg::SetPairingRequests(ipc::SetPairingRequests { enabled: *enabled }),
             ),
             Action::PairWith(address) => (
                 Request::PairWith,
@@ -3901,6 +3974,13 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::GetTopology(_) => "GetTopology",
         Msg::StartPairing(_) => "StartPairing",
         Msg::PairWith(_) => "PairWith",
+        Msg::RequestPairing(_) => "RequestPairing",
+        Msg::AnswerPairingRequest(_) => "AnswerPairingRequest",
+        Msg::CancelPairingRequest(_) => "CancelPairingRequest",
+        Msg::SetPairingRequests(_) => "SetPairingRequests",
+        Msg::IncomingPairingRequest(_) => "IncomingPairingRequest",
+        Msg::OutgoingPairingRequest(_) => "OutgoingPairingRequest",
+        Msg::MutePairingRequester(_) => "MutePairingRequester",
         Msg::PairingAnswer(_) => "PairingAnswer",
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
@@ -3982,6 +4062,8 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::Abandon => text(lang, Key::ControlWasGivenBack).to_owned(),
         Request::PairWith => text(lang, Key::Connecting).to_owned(),
         Request::PairingAnswer => text(lang, Key::TheAnswerWasSent).to_owned(),
+        Request::PairingRequest => text(lang, Key::TheAnswerWasSent).to_owned(),
+        Request::SetPairingRequests => text(lang, Key::PairingRequests).to_owned(),
         Request::UpdateTopology => text(lang, Key::TheLayoutIsSaved).to_owned(),
         Request::UpdateAll => text(lang, Key::UpdatePending).to_owned(),
         Request::SetRemoteUpdate => text(lang, Key::AllowRemoteUpdates).to_owned(),

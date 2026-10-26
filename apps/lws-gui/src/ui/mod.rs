@@ -324,6 +324,17 @@ fn topbar(
         runs.push(Run::strong(address, pal.ink));
     }
     widgets::pill(bar, pal, Some(dot), &runs);
+    if vm.incoming_pair_request.is_some() {
+        widgets::pill(
+            bar,
+            pal,
+            None,
+            &[Run::strong(
+                text(lang, Key::PairingRequestIncoming),
+                pal.accent,
+            )],
+        );
+    }
 
     bar.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;

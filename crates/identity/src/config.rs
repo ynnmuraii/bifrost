@@ -145,6 +145,17 @@ pub fn pairing_server_config(identity: &NodeIdentity) -> Result<ServerConfig, Id
     )
 }
 
+/// Client configuration for one prompt-only request, never for a runtime link.
+pub fn pairing_request_client_config(
+    identity: &NodeIdentity,
+) -> Result<ClientConfig, IdentityError> {
+    client_config(
+        identity,
+        TrustPolicy::Pairing,
+        &[protocol::limits::ALPN_PAIR_REQUEST],
+    )
+}
+
 /// The `ServerName` to dial a peer with.
 ///
 /// Identity is the pin, not the name, so an IP address is used as-is and never resolved:
@@ -154,17 +165,29 @@ pub fn server_name(address: std::net::IpAddr) -> ServerName<'static> {
 }
 
 fn check_policy_alpn(policy: &TrustPolicy, alpn: &[&str]) -> Result<(), IdentityError> {
-    let uses_pairing_alpn = alpn.contains(&protocol::limits::ALPN_PAIR);
+    let pairing_only = !alpn.is_empty()
+        && alpn.iter().all(|name| {
+            matches!(
+                *name,
+                protocol::limits::ALPN_PAIR | protocol::limits::ALPN_PAIR_REQUEST
+            )
+        });
+    let uses_pairing = alpn.iter().any(|name| {
+        matches!(
+            *name,
+            protocol::limits::ALPN_PAIR | protocol::limits::ALPN_PAIR_REQUEST
+        )
+    });
     match policy {
-        TrustPolicy::Pairing if !uses_pairing_alpn => Err(IdentityError::Tls(
-            "the pairing trust policy may only be used on lan-workspace/pair/1".into(),
+        TrustPolicy::Pairing if !pairing_only => Err(IdentityError::Tls(
+            "the pairing policy requires exclusively pairing ALPNs".into(),
         )),
-        TrustPolicy::Pinned(_) | TrustPolicy::PinnedShared(_) if uses_pairing_alpn => {
-            Err(IdentityError::Tls(
-                "the pairing channel needs the pairing trust policy: its peer is unknown by definition"
-                    .into(),
-            ))
-        }
+        TrustPolicy::PairingRequester(_) if alpn != [protocol::limits::ALPN_PAIR] => Err(
+            IdentityError::Tls("a restricted pairing window only permits pair/1".into()),
+        ),
+        TrustPolicy::Pinned(_) | TrustPolicy::PinnedShared(_) if uses_pairing => Err(
+            IdentityError::Tls("pairing channels require a pairing policy".into()),
+        ),
         _ => Ok(()),
     }
 }
@@ -179,6 +202,25 @@ mod tests {
 
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    #[test]
+    fn pairing_policies_cannot_escape_to_runtime_channels() {
+        let requester = TrustPolicy::PairingRequester(geometry::NodeId::new([7; 32]));
+        assert!(check_policy_alpn(&requester, &[protocol::ALPN_PAIR]).is_ok());
+        assert!(check_policy_alpn(&requester, &[protocol::ALPN_PAIR_REQUEST]).is_err());
+        assert!(check_policy_alpn(&requester, &[protocol::ALPN_INPUT]).is_err());
+        assert!(check_policy_alpn(&TrustPolicy::Pairing, &[protocol::ALPN_PAIR_REQUEST]).is_ok());
+        assert!(check_policy_alpn(
+            &TrustPolicy::Pairing,
+            &[protocol::ALPN_PAIR, protocol::ALPN_INPUT]
+        )
+        .is_err());
+        assert!(check_policy_alpn(
+            &TrustPolicy::Pinned(Default::default()),
+            &[protocol::ALPN_PAIR_REQUEST]
+        )
+        .is_err());
+    }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -31,6 +31,20 @@ fn discovery_height(vm: &ViewModel) -> f32 {
     }
 }
 
+fn request_height(vm: &ViewModel) -> f32 {
+    if vm.incoming_pair_request.is_some() {
+        126.0
+    } else if vm
+        .outgoing_pair_request
+        .as_ref()
+        .is_some_and(|request| !matches!(request.state.as_str(), "accepted" | "cancelled"))
+    {
+        82.0
+    } else {
+        0.0
+    }
+}
+
 /// The height of the dock for the current state.
 pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     // A prompt names the other computer and wraps in a quarter of the window: it needs room.
@@ -50,7 +64,7 @@ pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     } else {
         BASE_H + extra
     };
-    32.0 + (expanded + discovery_height(vm))
+    32.0 + (expanded + discovery_height(vm) + request_height(vm))
         * ctx.animate_bool_with_time(egui::Id::new("dock-open"), vm.look.dock_open, 0.18)
 }
 
@@ -106,7 +120,20 @@ pub fn draw(
     if rect.height() <= 33.0 {
         return;
     }
-    let body_top = rect.min.y + 32.0;
+    let request_h = request_height(vm);
+    if request_h > 0.0 {
+        request_status(
+            ui,
+            pal,
+            vm,
+            Rect::from_min_size(
+                Pos2::new(rect.min.x, rect.min.y + 32.0),
+                Vec2::new(rect.width(), request_h),
+            ),
+            actions,
+        );
+    }
+    let body_top = rect.min.y + 32.0 + request_h;
     let discovery = Rect::from_min_max(
         Pos2::new(rect.min.x, rect.max.y - discovery_height(vm)),
         rect.max,
@@ -152,6 +179,78 @@ pub fn draw(
     if discovery.height() > 0.0 {
         discovered(ui, pal, vm, discovery, actions);
     }
+}
+
+fn request_status(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    rect: Rect,
+    actions: &mut Vec<Action>,
+) {
+    let lang = vm.look.language;
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .id_salt("pair-request")
+            .max_rect(rect.shrink2(Vec2::new(22.0, 10.0)))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    if let Some(request) = &vm.incoming_pair_request {
+        widgets::text(
+            &mut child,
+            &fill(lang, Key::PairingRequestWants, &[&request.display_name]),
+            15.0,
+            fam::sans_medium(),
+            pal.ink,
+        );
+        widgets::text(
+            &mut child,
+            &request.fingerprint,
+            11.0,
+            fam::mono(),
+            pal.ink2,
+        );
+        child.horizontal(|ui| {
+            for (label, accept) in [
+                (Key::PairingRequestAccept, true),
+                (Key::PairingRequestDecline, false),
+            ] {
+                if widgets::small_button(ui, pal, text(lang, label), vm.connection.is_connected())
+                    .clicked()
+                {
+                    actions.push(Action::AnswerPairingRequest {
+                        requester_node_id: request.requester_node_id.clone(),
+                        accept,
+                    });
+                }
+            }
+        });
+    } else if let Some(request) = &vm.outgoing_pair_request {
+        let line = match request.state.as_str() {
+            "waiting" => fill(lang, Key::PairingRequestWaiting, &[&request.display_name]),
+            "legacy" => fill(lang, Key::PairingRequestLegacy, &[&request.display_name]),
+            "declined" => text(lang, Key::PairingRequestDeclined).into(),
+            "timeout" => text(lang, Key::PairingRequestTimeout).into(),
+            "busy" => text(lang, Key::PairingRequestBusy).into(),
+            "disabled" => text(lang, Key::PairingRequestDisabled).into(),
+            _ => text(lang, Key::PairingRequestFailed).into(),
+        };
+        widgets::text(&mut child, &line, 14.0, fam::sans(), pal.ink);
+        if request.state == "waiting"
+            && widgets::small_button(
+                &mut child,
+                pal,
+                text(lang, Key::Cancel),
+                vm.connection.is_connected(),
+            )
+            .clicked()
+        {
+            actions.push(Action::CancelPairingRequest);
+        }
+    }
+    ui.painter()
+        .line_segment([rect.left_bottom(), rect.right_bottom()], pal.hairline());
 }
 
 fn discovered(
@@ -219,12 +318,15 @@ fn discovered(
                                 pal,
                                 text(lang, Key::Connect),
                                 vm.connection.is_connected()
-                                    && peer.pairing_open
-                                    && !vm.pairing.dialing,
+                                    && !vm.pairing.dialing
+                                    && !vm
+                                        .outgoing_pair_request
+                                        .as_ref()
+                                        .is_some_and(|request| request.state == "waiting"),
                             )
                             .clicked()
                             {
-                                actions.push(Action::PairWith(peer.address.clone()));
+                                actions.push(Action::connect_discovered(peer));
                             }
                             widgets::text(
                                 ui,

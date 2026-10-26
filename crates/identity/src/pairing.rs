@@ -681,6 +681,7 @@ pub struct PairingWindow {
     deadline_ms: u64,
     pending: u32,
     attempts: u32,
+    requester: Option<NodeId>,
 }
 
 impl PairingWindow {
@@ -692,7 +693,18 @@ impl PairingWindow {
             deadline_ms: now_ms.saturating_add(WINDOW_MS),
             pending: 0,
             attempts: 0,
+            requester: None,
         }
+    }
+
+    /// Restricts this window to the certificate identity that requested it.
+    pub fn restrict_to(&mut self, requester: NodeId) {
+        self.requester = Some(requester);
+    }
+
+    /// The only admissible TLS peer, or `None` for a manually opened window.
+    pub const fn requester(&self) -> Option<NodeId> {
+        self.requester
     }
 
     /// The `attempt_id` every `PairingEnvelope` of this window carries.

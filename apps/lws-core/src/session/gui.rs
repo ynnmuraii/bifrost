@@ -253,6 +253,7 @@ impl Session {
             hide_remote_cursor: self.appearance.hide_remote_cursor,
             discovered_peers: self.discovery.table.peers(),
             discovery_enabled: self.discovery.enabled,
+            accept_pairing_requests: self.pair_requests.enabled,
             allow_remote_update: self.updates.allow,
             update_nodes: self
                 .updates
@@ -629,6 +630,12 @@ impl Session {
                 let status = self.gui_status().await;
                 self.gui_status = Some(status.clone());
                 answer(&out, request_id, Msg::Status(status)).await;
+                if let Some(prompt) = self.request_prompt() {
+                    answer(&out, 0, Msg::IncomingPairingRequest(prompt)).await;
+                }
+                if let Some(waiting) = self.outgoing_request() {
+                    answer(&out, 0, Msg::OutgoingPairingRequest(waiting)).await;
+                }
                 // Broadcast events are not history: a second/reconnected GUI needs the
                 // current window and unanswered ceremony as well as the workspace status.
                 if let Some(window) = self.pairing.window() {
@@ -890,6 +897,26 @@ impl Session {
                 };
                 answer(&out, request_id, Msg::OpResult(result)).await;
             }
+            Msg::MutePairingRequester(request) => {
+                let result = self.mute_pair_requester(&request.node_id);
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::RequestPairing(request) => {
+                let result = self.start_pair_request(request);
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::AnswerPairingRequest(request) => {
+                let result = self.answer_pair_request(request);
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::CancelPairingRequest(_) => {
+                self.cancel_pair_request();
+                answer(&out, request_id, Msg::OpResult(ok())).await;
+            }
+            Msg::SetPairingRequests(request) => {
+                let result = self.set_pair_requests(request.enabled).await;
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
             Msg::PairWith(dial) => {
                 let wait = self.pairing.dial_started();
                 self.spawn_pair_dial(dial.address);
@@ -1062,8 +1089,22 @@ impl Session {
         &mut self,
         window_s: u32,
     ) -> Result<pairing::Window, pairing::Refusal> {
+        self.open_pairing_window_for(window_s, None)
+    }
+
+    pub(super) fn open_pairing_window_for(
+        &mut self,
+        window_s: u32,
+        requester: Option<NodeId>,
+    ) -> Result<pairing::Window, pairing::Refusal> {
         let now = self.now_ms();
-        match self.pairing.open(now, window_s, self.listen) {
+        let opened = match requester {
+            Some(requester) => self
+                .pairing
+                .open_for(now, window_s, self.listen, Some(requester)),
+            None => self.pairing.open(now, window_s, self.listen),
+        };
+        match opened {
             Ok(window) => {
                 tracing::info!(
                     address = window.address.as_str(),

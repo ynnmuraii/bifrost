@@ -203,6 +203,9 @@ pub struct Config {
     /// `[discovery]`: LAN peer discovery; enabled by default for existing files.
     #[serde(default, skip_serializing_if = "DiscoveryConfig::is_default")]
     pub discovery: DiscoveryConfig,
+    /// Prompt-only incoming pairing requests.
+    #[serde(default)]
+    pub pairing: PairingConfig,
     /// `[workspace]`.
     #[serde(default)]
     pub workspace: WorkspaceConfig,
@@ -243,6 +246,7 @@ impl Default for Config {
             platform: PlatformConfig::default(),
             network: NetworkConfig::default(),
             discovery: DiscoveryConfig::default(),
+            pairing: PairingConfig::default(),
             workspace: WorkspaceConfig::default(),
             timing: TimingConfig::default(),
             input: InputConfig::default(),
@@ -253,6 +257,20 @@ impl Default for Config {
             log: LogConfig::default(),
             topology: TopologyConfig::default(),
             update: UpdateConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PairingConfig {
+    pub accept_requests: bool,
+}
+
+impl Default for PairingConfig {
+    fn default() -> Self {
+        Self {
+            accept_requests: true,
         }
     }
 }

@@ -1,6 +1,94 @@
 use protocol::{ipc, validate, wire, *};
 
 #[test]
+fn pairing_request_wire_and_ipc_round_trip_append_only_tags() {
+    use prost::Message;
+
+    let request = wire::PairRequest {
+        requester_node_id: vec![1; 32],
+        display_name: "WORKSTATION".into(),
+        system_name: "Windows".into(),
+        app_version: "0.3.1".into(),
+    };
+    let envelope = wire::PairingEnvelope {
+        major: PROTOCOL_MAJOR,
+        minor: PROTOCOL_MINOR,
+        payload: Some(wire::pairing_envelope::Payload::Request(request)),
+        ..Default::default()
+    };
+    // Existing hello/decision/error tags 10..12 remain untouched.
+    assert!(envelope.encode_to_vec().contains(&0x6a));
+    round_trip(Channel::Pairing, envelope);
+    for status in [
+        "pending", "accepted", "declined", "busy", "disabled", "timeout",
+    ] {
+        let ack = wire::PairingEnvelope {
+            payload: Some(wire::pairing_envelope::Payload::RequestAck(
+                wire::PairRequestAck {
+                    status: status.into(),
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(ack.encode_to_vec()[0], 0x72);
+        round_trip(Channel::Pairing, ack);
+    }
+    let messages = [
+        ipc::gui_frame::Msg::RequestPairing(ipc::RequestPairing {
+            address: "192.168.1.2:47901".into(),
+            node_id: "01".repeat(32),
+            display_name: "LAPTOP".into(),
+            supports_requests: true,
+        }),
+        ipc::gui_frame::Msg::AnswerPairingRequest(ipc::AnswerPairingRequest {
+            requester_node_id: vec![1; 32],
+            accept: true,
+        }),
+        ipc::gui_frame::Msg::CancelPairingRequest(ipc::CancelPairingRequest {}),
+        ipc::gui_frame::Msg::SetPairingRequests(ipc::SetPairingRequests { enabled: false }),
+        ipc::gui_frame::Msg::IncomingPairingRequest(ipc::IncomingPairingRequest {
+            requester_node_id: vec![1; 32],
+            display_name: "WORKSTATION".into(),
+            system_name: "Windows".into(),
+            fingerprint: "01".repeat(32),
+            seconds_remaining: 60,
+        }),
+        ipc::gui_frame::Msg::OutgoingPairingRequest(ipc::OutgoingPairingRequest {
+            node_id: "01".repeat(32),
+            display_name: "LAPTOP".into(),
+            state: "waiting".into(),
+        }),
+        ipc::gui_frame::Msg::MutePairingRequester(ipc::MutePairingRequester {
+            node_id: "01".repeat(32),
+        }),
+    ];
+    for (index, msg) in messages.into_iter().enumerate() {
+        let frame = ipc::GuiFrame {
+            msg: Some(msg),
+            ..Default::default()
+        };
+        let tag = ((52 + index) << 3) | 2;
+        assert_eq!(
+            &frame.encode_to_vec()[..2],
+            &[(tag as u8) | 0x80, (tag >> 7) as u8]
+        );
+        round_trip(Channel::Ipc, frame);
+    }
+    let status = ipc::Status {
+        accept_pairing_requests: true,
+        ..Default::default()
+    };
+    assert_eq!(status.encode_to_vec(), [0xe8, 0x02, 1]);
+    round_trip(Channel::Ipc, status);
+    let peer = ipc::DiscoveredPeer {
+        supports_pairing_requests: true,
+        ..Default::default()
+    };
+    assert_eq!(peer.encode_to_vec(), [0x38, 1]);
+    round_trip(Channel::Ipc, peer);
+}
+
+#[test]
 fn game_guard_ipc_round_trip_and_append_only_tags() {
     use prost::Message;
     let signals = ipc::GameGuardSignals {
@@ -54,6 +142,7 @@ fn discovery_ipc_fields_use_append_only_numbers() {
         system_name: "s".into(),
         pairing_open: true,
         protocol_version: 1,
+        supports_pairing_requests: false,
     };
     assert_eq!(
         peer.encode_to_vec(),

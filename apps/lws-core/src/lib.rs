@@ -190,6 +190,24 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
             control(&args.paths, &format!("update-all {}", args.rest[1]))
         }
         "update-status" => control(&args.paths, "update-status"),
+        command @ ("pair-request"
+        | "pair-request-prompt"
+        | "pair-request-answer"
+        | "pair-request-cancel"
+        | "pair-request-status"
+        | "pair-prompt"
+        | "pair-answer") => {
+            let mut line = String::with_capacity(
+                command.len() + args.rest.iter().map(|arg| arg.len() + 1).sum::<usize>(),
+            );
+            line.push_str(command);
+            for argument in &args.rest {
+                line.push(' ');
+                line.push_str(argument);
+            }
+            ctl::Request::parse(&line).map_err(Failure::Usage)?;
+            control(&args.paths, &line)
+        }
         "clipboard-history" if args.rest.is_empty() => control(&args.paths, "clipboard-history"),
         "clipboard-send" => {
             if args.rest.len() != 2 {
@@ -415,9 +433,9 @@ fn run(args: &Args) -> Result<(), Failure> {
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start the runtime: {error}"))?;
-    let result = runtime
-        .block_on(async move { run_async(paths, options, config, session).await })
-        .map_err(Failure::Run);
+    let future = run_async(paths, options, config, session);
+    // Own the long-lived session on the heap, not in Tokio's synchronous poll stack.
+    let result = runtime.block_on(Box::pin(future)).map_err(Failure::Run);
     drop(runtime);
     result?;
     if session::update::REEXEC.swap(false, std::sync::atomic::Ordering::AcqRel) {
@@ -674,6 +692,7 @@ async fn run_async(
     session.set_appearance_source(paths.config_file(), config.appearance);
     session.set_game_guard_source(config.game_guard);
     session.set_discovery_source(config.discovery, config.network.clone());
+    session.set_pairing_request_source(config.pairing);
     session.set_hotkeys_source(config.input.hotkeys);
     session.set_update_policy(config.update.allow_remote_request);
     session.run().await.map_err(|error| error.to_string())

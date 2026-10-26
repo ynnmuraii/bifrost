@@ -767,10 +767,15 @@ impl LinkManager {
             TrustPolicy::PinnedShared(Arc::clone(&self.trusted_peers)),
             &identity::LINK_ALPN,
         )?);
-        let pairing_config = Arc::new(identity::pairing_server_config(&self.identity)?);
+        let pairing_config = Arc::new(identity::server_config(
+            &self.identity,
+            TrustPolicy::Pairing,
+            &[limits::ALPN_PAIR, limits::ALPN_PAIR_REQUEST],
+        )?);
         let mut listener = bind_listener(self.listen).await?;
         let local = self.identity.node_id();
         let settings = self.settings;
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(32));
 
         // One dialer per configured peer.
         let mut dialers = Vec::with_capacity(self.peers.len());
@@ -798,6 +803,9 @@ impl LinkManager {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (tcp, address) = accepted?;
+                    let Ok(permit) = Arc::clone(&handshakes).try_acquire_owned() else {
+                        continue;
+                    };
                     // Lease frames must not wait for a delayed TCP ACK during idle input.
                     tcp.set_nodelay(true)?;
                     let messages = self.messages_tx.clone();
@@ -811,6 +819,7 @@ impl LinkManager {
                     let pending_unpairs = Arc::clone(&self.pending_unpairs);
                     let trusted_peers = Arc::clone(&self.trusted_peers);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         serve_connection(
                             tcp,
                             address,
@@ -1255,6 +1264,35 @@ async fn serve_connection(
         .client_hello()
         .alpn()
         .is_some_and(|mut alpn| alpn.any(|protocol| protocol == limits::ALPN_PAIR.as_bytes()));
+    let wants_request = start.client_hello().alpn().is_some_and(|mut alpn| {
+        alpn.any(|protocol| protocol == limits::ALPN_PAIR_REQUEST.as_bytes())
+    });
+    // The TLS config prefers pair/1 when a client offers both; dispatch must agree.
+    if wants_request && !wants_pairing {
+        let stream = match tokio::time::timeout(
+            handshake_timeout,
+            start.into_stream(pairing_config),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            _ => return,
+        };
+        let Ok(peer) = peer_node_id(stream.get_ref().1.peer_certificates().unwrap_or_default())
+        else {
+            return;
+        };
+        let _ = events
+            .send(LinkEvent::PairingRequest(Box::new(
+                crate::pairing::RequestConnection {
+                    stream,
+                    address,
+                    peer,
+                },
+            )))
+            .await;
+        return;
+    }
 
     if wants_pairing {
         // Resolve the gate before the handshake: an error here is the documented refusal.
@@ -1266,6 +1304,18 @@ async fn serve_connection(
         // actually handed to the application disarms it, because only then does a ceremony
         // own it and call `PairingGate::finish`.
         let guard = gate.admit_guard(*window.attempt_id());
+        let pairing_config = if let Some(requester) = window.requester() {
+            match identity::server_config(
+                &identity,
+                TrustPolicy::PairingRequester(requester),
+                &[limits::ALPN_PAIR],
+            ) {
+                Ok(config) => Arc::new(config),
+                Err(_) => return,
+            }
+        } else {
+            pairing_config
+        };
         let stream = match tokio::time::timeout(
             handshake_timeout,
             start.into_stream(pairing_config),

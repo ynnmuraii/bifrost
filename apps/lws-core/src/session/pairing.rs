@@ -196,6 +196,16 @@ impl Pairing {
         window_s: u32,
         listen: SocketAddr,
     ) -> Result<Window, (String, String)> {
+        self.open_for(now_ms, window_s, listen, None)
+    }
+
+    pub fn open_for(
+        &mut self,
+        now_ms: u64,
+        window_s: u32,
+        listen: SocketAddr,
+        requester: Option<geometry::NodeId>,
+    ) -> Result<Window, (String, String)> {
         let seconds = window_s.clamp(1, 120);
         if self
             .window
@@ -209,8 +219,11 @@ impl Pairing {
                 "a pairing window is already open".to_owned(),
             ));
         }
-        let opened = identity::open_window(now_ms)
+        let mut opened = identity::open_window(now_ms)
             .map_err(|error| ("PAIRING_FAILED".to_owned(), error.to_string()))?;
+        if let Some(requester) = requester {
+            opened.restrict_to(requester);
+        }
         let attempt_id = *opened.attempt_id();
         self.gate.open(opened);
         let window = Window {

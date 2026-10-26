@@ -19,6 +19,63 @@ use support::{event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE,
 const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
 
 #[test]
+fn pairing_request_prompt_buttons_send_the_selected_certificate_identity() {
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for (key, accept) in [
+            (ui_text::Key::PairingRequestAccept, true),
+            (ui_text::Key::PairingRequestDecline, false),
+        ] {
+            let mut vm = connected();
+            vm.look.language = lang;
+            vm.apply(event(Msg::IncomingPairingRequest(
+                ipc::IncomingPairingRequest {
+                    requester_node_id: vec![7; 32],
+                    display_name: "WORKSTATION".into(),
+                    fingerprint: "0707 0707".into(),
+                    seconds_remaining: 60,
+                    ..Default::default()
+                },
+            )));
+            let mut harness = Harness::new();
+            let frame = harness.settle(&vm, false);
+            assert!(frame
+                .texts
+                .iter()
+                .any(|(label, _)| label.contains("WORKSTATION")));
+            let at = text_position(&mut harness, &vm, ui_text::text(lang, key));
+            let frame = harness.frame(&vm, false, SIZE, click_at(at));
+            assert!(frame
+                .output
+                .actions
+                .contains(&Action::AnswerPairingRequest {
+                    requester_node_id: vec![7; 32],
+                    accept
+                }));
+        }
+    }
+}
+
+#[test]
+fn outgoing_request_wait_has_a_real_cancel_action() {
+    let mut vm = connected();
+    vm.outgoing_pair_request = Some(ipc::OutgoingPairingRequest {
+        display_name: "WORKSTATION".into(),
+        state: "waiting".into(),
+        ..Default::default()
+    });
+    vm.look.dock_open = true;
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    let at = text_position(
+        &mut harness,
+        &vm,
+        ui_text::text(vm.look.language, ui_text::Key::Cancel),
+    );
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(frame.output.actions.contains(&Action::CancelPairingRequest));
+}
+
+#[test]
 fn remote_unpair_notice_is_localized_and_dismisses_without_reappearing() {
     for (lang, label, close) in [
         (
@@ -299,6 +356,7 @@ fn discovered_rows_keep_identity_window_state_and_manual_pairing_visible() {
                         system_name: "Windows 11".to_owned(),
                         pairing_open: true,
                         protocol_version: 1,
+                        supports_pairing_requests: true,
                     },
                     ipc::DiscoveredPeer {
                         node_id: "dd".repeat(32),
@@ -307,6 +365,7 @@ fn discovered_rows_keep_identity_window_state_and_manual_pairing_visible() {
                         system_name: "Linux".to_owned(),
                         pairing_open: false,
                         protocol_version: 1,
+                        supports_pairing_requests: true,
                     },
                 ];
                 let mut harness = Harness::new();

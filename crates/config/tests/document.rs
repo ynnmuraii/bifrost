@@ -317,3 +317,15 @@ fn shared_protocol_constants_are_not_duplicated_here() {
         Config::default().network.port_clipboard
     );
 }
+
+#[test]
+fn pairing_requests_default_on_and_persist_an_explicit_opt_out() {
+    let minimal = Config::from_str("config_version = 2").unwrap();
+    assert!(minimal.pairing.accept_requests);
+    let disabled =
+        Config::from_str("config_version = 2\n[pairing]\naccept_requests = false\n").unwrap();
+    assert!(!disabled.pairing.accept_requests);
+    let serialized = toml::to_string(&disabled).unwrap();
+    assert_eq!(Config::from_str(&serialized).unwrap(), disabled);
+    assert!(Config::from_str("config_version = 2\n[pairing]\nunknown = true\n").is_err());
+}

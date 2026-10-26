@@ -42,9 +42,11 @@ pub enum TrustPolicy {
     Pinned(BTreeSet<NodeId>),
     /// A pinned set updated while a link manager is running.
     PinnedShared(Arc<RwLock<BTreeSet<NodeId>>>),
-    /// Any well-formed peer certificate; only for `lan-workspace/pair/1`, where the SAS
-    /// code is the authentication step.
+    /// Any well-formed certificate on a pairing or prompt-only request channel.
+    /// Only the bilateral SAS ceremony can turn it into trust.
     Pairing,
+    /// A pairing window restricted to the certificate that requested it.
+    PairingRequester(NodeId),
 }
 
 impl PartialEq for TrustPolicy {
@@ -55,6 +57,9 @@ impl PartialEq for TrustPolicy {
                 Arc::ptr_eq(left, right)
             }
             (TrustPolicy::Pairing, TrustPolicy::Pairing) => true,
+            (TrustPolicy::PairingRequester(left), TrustPolicy::PairingRequester(right)) => {
+                left == right
+            }
             _ => false,
         }
     }
@@ -72,6 +77,7 @@ impl TrustPolicy {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             TrustPolicy::Pairing => BTreeSet::new(),
+            TrustPolicy::PairingRequester(node_id) => BTreeSet::from([*node_id]),
         }
     }
 
@@ -88,6 +94,7 @@ impl TrustPolicy {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(node_id),
             TrustPolicy::Pairing => true,
+            TrustPolicy::PairingRequester(requester) => requester == node_id,
         }
     }
 }

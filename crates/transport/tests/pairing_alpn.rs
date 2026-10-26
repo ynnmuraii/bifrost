@@ -20,7 +20,7 @@ use protocol::wire;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use transport::{BackoffBounds, LinkEvent, LinkLiveness, LinkManager, ManagerConfig, PairingGate};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -449,4 +449,124 @@ async fn a_silent_client_hello_is_closed_after_the_timeout() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_channel_authenticates_certificate_without_opening_pairing() {
+    let root = temp_root("request-closed");
+    let a = Arc::new(identity_at(&root, "a"));
+    let b = identity_at(&root, "b");
+    let address = free_address().await;
+    let mut node = spawn_node(
+        "a",
+        Arc::clone(&a),
+        address,
+        &[],
+        &[],
+        PairingGate::closed(),
+    )
+    .await;
+    drop(connect_when_listening(address).await);
+    let stream = transport::pairing::dial_request(&b, address, a.node_id())
+        .await
+        .expect("request TLS");
+    let event = wait_for_event(
+        &mut node.events,
+        |event| matches!(event, LinkEvent::PairingRequest(_)),
+        TIMEOUT,
+    )
+    .await
+    .expect("request only");
+    match event {
+        LinkEvent::PairingRequest(connection) => assert_eq!(connection.peer, b.node_id()),
+        other => panic!("unexpected {other:?}"),
+    }
+    drop(stream);
+    let mismatch = transport::pairing::dial_request(&b, address, NodeId::new([0; 32]))
+        .await
+        .expect_err("different discovery identity");
+    assert_ne!(
+        mismatch.kind(),
+        std::io::ErrorKind::Unsupported,
+        "certificate mismatch must not downgrade"
+    );
+    drop(node);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restricted_window_never_hands_a_different_certificate_to_sas() {
+    let root = temp_root("restricted");
+    let a = Arc::new(identity_at(&root, "a"));
+    let b = identity_at(&root, "b");
+    let other = identity_at(&root, "other");
+    let gate = PairingGate::closed();
+    let mut window = PairingWindow::open(0, [7; 16]);
+    window.restrict_to(b.node_id());
+    gate.open(window);
+    let address = free_address().await;
+    let mut node = spawn_node("a", a, address, &[], &[], gate).await;
+    let tcp = connect_when_listening(address).await;
+    let connector = TlsConnector::from(Arc::new(identity::pairing_client_config(&other).unwrap()));
+    let _wrong = connector
+        .connect(identity::server_name(address.ip()), tcp)
+        .await;
+    assert!(wait_for_event(
+        &mut node.events,
+        |event| matches!(event, LinkEvent::Pairing(_)),
+        QUIET
+    )
+    .await
+    .is_none());
+    let tcp = connect_when_listening(address).await;
+    let connector = TlsConnector::from(Arc::new(identity::pairing_client_config(&b).unwrap()));
+    let _right = connector
+        .connect(identity::server_name(address.ip()), tcp)
+        .await
+        .expect("requester allowed");
+    assert!(wait_for_event(
+        &mut node.events,
+        |event| matches!(event, LinkEvent::Pairing(_)),
+        TIMEOUT
+    )
+    .await
+    .is_some());
+    drop(node);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn an_explicit_legacy_alpn_refusal_is_distinct_from_network_or_identity_errors() {
+    let root = temp_root("request-legacy");
+    let target = identity_at(&root, "target");
+    let requester = identity_at(&root, "requester");
+    let target_id = target.node_id();
+    let config = identity::pairing_server_config(&target).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        assert!(TlsAcceptor::from(Arc::new(config))
+            .accept(tcp)
+            .await
+            .is_err());
+    });
+    let error = tokio::time::timeout(
+        TIMEOUT,
+        transport::pairing::dial_request(&requester, address, target_id),
+    )
+    .await
+    .expect("bounded TLS handshake")
+    .expect_err("old target has only pair/1");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    server.await.unwrap();
+    let error = transport::pairing::dial_request(&requester, address, target_id)
+        .await
+        .unwrap_err();
+    assert_ne!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported,
+        "closed TCP port must not trigger a legacy downgrade"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }

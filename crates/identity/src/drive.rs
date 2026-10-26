@@ -472,6 +472,12 @@ async fn opener_ceremony(
     fsm.handle(PairingInput::PeerAdmitted);
 
     let peer_node_id = presented_node_id(&stream)?;
+    if window
+        .requester()
+        .is_some_and(|expected| expected != peer_node_id)
+    {
+        return Err(PairError::Rejected(RejectionReason::NodeIdMismatch));
+    }
     let sas = SasCode::from_exporter_bytes(stream.export_attempt_material(&attempt_id)?);
 
     let outputs = fsm.handle(PairingInput::HandshakeEstablished { peer_node_id });

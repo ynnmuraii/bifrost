@@ -64,6 +64,8 @@ pub enum LinkEvent {
     /// [`crate::PairingGate::admit`]; the application runs [`identity::accept_stream`] on
     /// the stream and calls [`crate::PairingGate::finish`] once the ceremony concludes.
     Pairing(Box<crate::pairing::PairingConnection>),
+    /// A prompt-only request channel; never registered as a normal link.
+    PairingRequest(Box<crate::pairing::RequestConnection>),
     /// The remote TLS endpoint explicitly rejected our certificate as unknown.
     PeerRejected { peer: NodeId },
     /// TLS and the `Hello` exchange finished.

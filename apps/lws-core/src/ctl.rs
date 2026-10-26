@@ -157,6 +157,16 @@ pub enum Request {
     },
     /// `pair-with <address>`: dial a peer that opened its window (`GuiFrame.PairWith`).
     PairWith(String),
+    /// Ask a certificate identity for permission to start the SAS ceremony.
+    PairRequest { address: String, node_id: String },
+    /// Current prompt-only request, without waiting for SAS.
+    PairRequestPrompt,
+    /// Accept or decline the displayed request.
+    PairRequestAnswer { node_id: String, accept: bool },
+    /// Cancel an outgoing request.
+    PairRequestCancel,
+    /// Current outgoing request decision.
+    PairRequestStatus,
     /// `revoke <peer>`: forget local trust, close live links and remove the computer
     /// through the shared layout CAS — the same path as `GuiFrame.RevokePeer`.
     ///
@@ -256,6 +266,32 @@ impl Request {
             },
             "pair-with" if !argument.is_empty() => Ok(Request::PairWith(argument.to_owned())),
             "pair-with" => Err("pair-with needs an address".to_owned()),
+            "pair-request" => match argument.split_once(char::is_whitespace) {
+                Some((address, node_id)) if !node_id.trim().is_empty() => {
+                    Ok(Request::PairRequest {
+                        address: address.into(),
+                        node_id: node_id.trim().into(),
+                    })
+                }
+                _ => Err("pair-request needs address and node id".into()),
+            },
+            "pair-request-prompt" if argument.is_empty() => Ok(Request::PairRequestPrompt),
+            "pair-request-status" if argument.is_empty() => Ok(Request::PairRequestStatus),
+            "pair-request-cancel" if argument.is_empty() => Ok(Request::PairRequestCancel),
+            "pair-request-answer" => match argument.split_once(char::is_whitespace) {
+                Some((node_id, answer)) => match answer.trim() {
+                    "accept" => Ok(Request::PairRequestAnswer {
+                        node_id: node_id.into(),
+                        accept: true,
+                    }),
+                    "decline" => Ok(Request::PairRequestAnswer {
+                        node_id: node_id.into(),
+                        accept: false,
+                    }),
+                    _ => Err("pair-request-answer needs accept or decline".into()),
+                },
+                _ => Err("pair-request-answer needs node id and accept or decline".into()),
+            },
             "revoke" if !argument.is_empty() => Ok(Request::Revoke(PeerRef::new(argument))),
             "revoke" => Err("revoke needs a peer id or display name".to_owned()),
             "claim" if argument.is_empty() => Ok(Request::Claim),

@@ -945,11 +945,16 @@ fn phantom_ui(
             ui,
             pal,
             text(lang, Key::Connect),
-            vm.connection.is_connected() && peer.pairing_open && !vm.pairing.dialing,
+            vm.connection.is_connected()
+                && !vm.pairing.dialing
+                && !vm
+                    .outgoing_pair_request
+                    .as_ref()
+                    .is_some_and(|request| request.state == "waiting"),
         )
         .clicked()
         {
-            actions.push(Action::PairWith(peer.address.clone()));
+            actions.push(Action::connect_discovered(peer));
             ui.close();
         }
         if widgets::small_button(ui, pal, text(lang, Key::HideDiscovered), true).clicked() {
@@ -1663,7 +1668,7 @@ mod transform_tests {
             );
             output.drop_without_applying_deltas();
         }
-        assert_eq!(actions, vec![Action::PairWith(peer.address)]);
+        assert_eq!(actions, vec![Action::connect_discovered(&peer)]);
     }
 
     #[test]

@@ -77,6 +77,7 @@ impl Session {
                 protocol_version: protocol::PROTOCOL_MAJOR,
                 pairing_open: self.pairing.window().is_some(),
                 system_name: protocol::sanitize_system_name(&self.local_hello.system_name),
+                supports_pairing_requests: true,
             },
         }
     }

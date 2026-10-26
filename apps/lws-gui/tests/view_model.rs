@@ -2802,6 +2802,7 @@ fn discovered_peer(id: &str, open: bool) -> protocol::ipc::DiscoveredPeer {
         system_name: "Linux".to_owned(),
         pairing_open: open,
         protocol_version: protocol::PROTOCOL_MAJOR,
+        supports_pairing_requests: true,
     }
 }
 
@@ -2918,7 +2919,10 @@ fn hidden_discovery_is_local_reversible_and_follows_current_status() {
     vm.apply(event(Msg::Status(status.clone())));
     let before_editor = vm.editor.nodes.clone();
     let hide = Action::HideDiscovered(hidden.clone());
-    assert!(hide.wire().is_none());
+    assert!(matches!(
+        hide.wire(),
+        Some((_, Msg::MutePairingRequester(_)))
+    ));
     vm.local(&hide);
     vm.local(&hide);
     vm.local(&Action::HideDiscovered("not-an-identity".into()));
@@ -3007,15 +3011,15 @@ fn hidden_discovery_is_local_reversible_and_follows_current_status() {
 }
 
 #[test]
-fn discovered_pairing_uses_the_existing_address_flow_and_still_needs_sas() {
+fn discovered_pairing_requests_permission_and_still_needs_sas() {
     let mut vm = view();
     vm.on_connected("test");
     let peer = discovered_peer(&"cc".repeat(32), true);
-    let action = Action::PairWith(peer.address.clone());
-    let Some((request, Msg::PairWith(dial))) = action.wire() else {
-        panic!("discovery must use PairWith");
+    let action = Action::connect_discovered(&peer);
+    let Some((request, Msg::RequestPairing(dial))) = action.wire() else {
+        panic!("discovery must send a pairing request");
     };
-    assert_eq!(request, Request::PairWith);
+    assert_eq!(request, Request::PairingRequest);
     assert_eq!(dial.address, peer.address);
     vm.look.dock_open = false;
     vm.modal = Some(Modal::Pairs);
@@ -3027,8 +3031,10 @@ fn discovered_pairing_uses_the_existing_address_flow_and_still_needs_sas() {
     );
     assert!(vm.modal.is_none());
     assert!(!vm.appearance_open);
-    assert_eq!(vm.pairing.address, peer.address);
-    assert!(vm.pairing.dialing);
+    assert!(
+        !vm.pairing.dialing,
+        "waiting for permission is not yet a SAS ceremony"
+    );
     assert!(vm.pairing.paired.is_none());
     vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
     assert_eq!(vm.pairing.attempt_id(), Some(attempt_id()));
@@ -3164,4 +3170,59 @@ fn topology_and_status_versions_feed_badges_without_guessing_unknown_peers() {
         .app_version = String::new();
     vm.apply(event(Msg::Status(status)));
     assert!(!vm.node_needs_update(PEER_NODE));
+}
+
+#[test]
+fn incoming_request_reopens_dock_and_buttons_name_the_exact_requester() {
+    let mut vm = view();
+    vm.look.dock_open = false;
+    let prompt = protocol::ipc::IncomingPairingRequest {
+        requester_node_id: vec![7; 32],
+        display_name: "WORKSTATION".into(),
+        fingerprint: "0707".into(),
+        seconds_remaining: 60,
+        ..Default::default()
+    };
+    vm.apply(event(Msg::IncomingPairingRequest(prompt.clone())));
+    assert!(vm.look.dock_open);
+    assert_eq!(vm.incoming_pair_request, Some(prompt.clone()));
+    for accept in [true, false] {
+        let action = Action::AnswerPairingRequest {
+            requester_node_id: prompt.requester_node_id.clone(),
+            accept,
+        };
+        let Some((Request::PairingRequest, Msg::AnswerPairingRequest(answer))) = action.wire()
+        else {
+            panic!("request decision");
+        };
+        assert_eq!(answer.requester_node_id, prompt.requester_node_id);
+        assert_eq!(answer.accept, accept);
+    }
+    assert!(matches!(
+        Action::CancelPairingRequest.wire(),
+        Some((_, Msg::CancelPairingRequest(_)))
+    ));
+    assert!(
+        matches!(Action::SetPairingRequests(false).wire(), Some((Request::SetPairingRequests, Msg::SetPairingRequests(set))) if !set.enabled)
+    );
+    vm.apply(event(Msg::IncomingPairingRequest(Default::default())));
+    assert!(vm.incoming_pair_request.is_none());
+    assert!(
+        vm.pairing.paired.is_none(),
+        "prompt-only acceptance never creates trust"
+    );
+}
+
+#[test]
+fn discovery_fallback_and_hidden_mute_are_explicit_wire_actions() {
+    let peer = protocol::ipc::DiscoveredPeer {
+        node_id: "ab".repeat(32),
+        ..Default::default()
+    };
+    assert!(
+        matches!(Action::connect_discovered(&peer).wire(), Some((_, Msg::RequestPairing(request))) if !request.supports_requests)
+    );
+    assert!(
+        matches!(Action::HideDiscovered(peer.node_id.clone()).wire(), Some((_, Msg::MutePairingRequester(request))) if request.node_id == peer.node_id)
+    );
 }

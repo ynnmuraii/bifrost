@@ -33,10 +33,10 @@
 //!
 //! # Invariants
 //!
-//! 1. **Unknown peers are only allowed on the pairing channel.** [`config`] refuses to
-//!    build a [`verify::TrustPolicy::Pairing`] configuration for any ALPN other than
-//!    `lan-workspace/pair/1`, so an unpaired node cannot reach the input or clipboard
-//!    channels; the input verifier refuses it during the handshake, before any `Hello`.
+//! 1. **Unknown peers are only allowed on pairing channels.** [`config`] limits
+//!    [`verify::TrustPolicy::Pairing`] to `pair/1` and prompt-only `pair-request/1`.
+//!    A restricted window pins the requester certificate without granting session trust.
+//!    Unpaired nodes cannot complete an input or clipboard handshake.
 //! 2. **A revoked peer cannot establish a runtime session.** [`trust::TrustStore::pinned`]
 //!    excludes revoked records. Transport's separate bounded pending-notice pins permit
 //!    only a capability-checked `Hello`/`Unpaired` exchange, never membership or clipboard.
@@ -99,8 +99,8 @@ pub mod verify;
 
 pub use config::{
     client_config, clipboard_client_config, clipboard_server_config, pairing_client_config,
-    pairing_server_config, ring_provider, server_config, server_name, trusted_client_config,
-    trusted_server_config, LINK_ALPN,
+    pairing_request_client_config, pairing_server_config, ring_provider, server_config,
+    server_name, trusted_client_config, trusted_server_config, LINK_ALPN,
 };
 pub use drive::{
     accept_one, accept_stream, bind, dial, open_window, PairError, PairedPeer, PairingDriver,

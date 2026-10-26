@@ -392,6 +392,8 @@ message PairingEnvelope {
     PairHello hello = 10;      // the node that opened the pairing window (TLS server) sends first; the dialer replies
     PairDecision decision = 11;
     ProtocolError error = 12;
+    PairRequest request = 13; // request ALPN only; never grants trust
+    PairRequestAck request_ack = 14;
   }
 }
 message PairHello {
@@ -404,4 +406,15 @@ message PairHello {
 message PairDecision {
   bool approved = 1;           // only after local user decision
   bytes peer_node_id = 2;
+}
+
+// Separate request ALPN uses the same bounded framing, not a trusted session.
+message PairRequest {
+  bytes requester_node_id = 1;
+  string display_name = 2;
+  string system_name = 3;
+  string app_version = 4;
+}
+message PairRequestAck {
+  string status = 1; // pending | accepted | declined | busy | disabled | timeout
 }

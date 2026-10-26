@@ -314,6 +314,13 @@ message GuiFrame {
     ClipboardHistoryItem clipboard_history_item = 48;
     SendClipboardHistoryItem send_clipboard_history_item = 50;
     SetClipboardPolicy set_clipboard_policy = 51;
+    RequestPairing request_pairing = 52;
+    AnswerPairingRequest answer_pairing_request = 53;
+    CancelPairingRequest cancel_pairing_request = 54;
+    SetPairingRequests set_pairing_requests = 55;
+    IncomingPairingRequest incoming_pairing_request = 56;
+    OutgoingPairingRequest outgoing_pairing_request = 57;
+    MutePairingRequester mute_pairing_requester = 58;
   }
 }
 // Also replays the current open PairingWindow and unanswered PairingPrompt as events
@@ -326,6 +333,23 @@ message AbandonOwnership {}
 message StartPairing { uint32 window_s = 1; } // max 120
 message PairWith { string address = 1; }
 message PairingAnswer { bytes attempt_id = 1; bool approve = 2; }
+message RequestPairing { string address = 1; string node_id = 2; string display_name = 3; bool supports_requests = 4; }
+message AnswerPairingRequest { bytes requester_node_id = 1; bool accept = 2; }
+message CancelPairingRequest {}
+message SetPairingRequests { bool enabled = 1; }
+message MutePairingRequester { string node_id = 1; } // locally hidden discovery identity; muted for 10 min
+message IncomingPairingRequest {
+  bytes requester_node_id = 1;
+  string display_name = 2;
+  string system_name = 3;
+  string fingerprint = 4;
+  uint32 seconds_remaining = 5;
+}
+message OutgoingPairingRequest {
+  string node_id = 1;
+  string display_name = 2;
+  string state = 3; // waiting | accepted | declined | timeout | cancelled | busy | disabled | legacy | error
+}
 message UpdateTopology { bytes layout_toml = 1; uint64 expected_revision = 2; bytes expected_author = 3; } // any node; coordinator applies (CAS)
 message SetClipboard { bool enabled = 1; }
 message SetClipboardPolicy { string policy = 1; uint32 settle_ms = 2; }
@@ -415,6 +439,7 @@ message Status {
   repeated PendingUnpairNotice pending_unpairs = 42;
   string unpair_notice = 43; // display name of the peer that removed this pairing
   uint64 unpair_notice_id = 44; // monotonically increasing; 0 means no notice
+  bool accept_pairing_requests = 45;
 }
 message PendingUnpairNotice {
   string node_id = 1;
@@ -429,6 +454,7 @@ message DiscoveredPeer {
   string system_name = 4;      // optional machine label; empty when unavailable
   bool pairing_open = 5;
   uint32 protocol_version = 6;
+  bool supports_pairing_requests = 7;
 }
 message MemberStatus {
   string node_id = 1;

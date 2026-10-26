@@ -40,6 +40,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 transport = { path = "../../crates/transport" }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 # Job objects: the agent must not outlive core (see `src/job.rs`).
 windows-sys = { workspace = true, features = [

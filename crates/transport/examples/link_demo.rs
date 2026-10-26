@@ -116,7 +116,7 @@ async fn spawn_node(
                     println!("  [{label}] peer {peer} no longer recognizes this identity")
                 }
                 // The demo opens no pairing window, so this never arrives.
-                LinkEvent::Pairing(_) => {}
+                LinkEvent::Pairing(_) | LinkEvent::PairingRequest(_) => {}
             }
         }
     });

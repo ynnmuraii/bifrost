@@ -39,6 +39,7 @@ mod discovery;
 /// The GUI's half of the session: `GuiFrame` requests and the events pushed to the window.
 mod gui;
 pub(crate) mod hotkeys;
+mod pair_requests;
 /// The pairing window and its ceremonies (ALPN `pair/1` on the link listener).
 mod pairing;
 mod transition_retry;
@@ -646,6 +647,7 @@ pub struct Session {
     paths: config::Paths,
     /// The pairing window the link listener serves by ALPN (docs/05-protocol.md).
     pairing: pairing::Pairing,
+    pair_requests: pair_requests::Requests,
     /// Reports from the ceremony tasks.
     pairing_events: mpsc::Receiver<pairing::Event>,
     /// A second handle on the same channel, so a spawned ceremony can report back.
@@ -807,6 +809,7 @@ impl Session {
             identity,
             paths,
             pairing: pairing::Pairing::new(pairing_gate),
+            pair_requests: pair_requests::Requests::default(),
             pairing_events,
             pairing_events_tx,
             listen,
@@ -1154,6 +1157,7 @@ impl Session {
             self.observe_loop_wake(&mut planned_wake_ms);
             self.service_clock().await;
             self.service_updates().await;
+            self.service_pair_requests();
             if self.stopping {
                 self.shutdown_agent().await;
                 return Ok(());
@@ -2564,6 +2568,7 @@ impl Session {
             // `pair/1` on the link listener: the listener admitted the dialer through the
             // pairing gate, and the ceremony itself runs in a task of its own so a peer that
             // never answers cannot stall this loop.
+            LinkEvent::PairingRequest(connection) => self.receive_pair_request(*connection),
             LinkEvent::Pairing(connection) => {
                 tracing::info!(
                     peer = %connection.address,
@@ -4179,9 +4184,10 @@ impl Session {
                 }
                 .into()
             }
-            ctl::Request::PairPrompt => {
-                Handled::Deferred(prompt_of(self.pairing.wait_for_prompt()))
-            }
+            ctl::Request::PairPrompt => match self.pairing.pending_prompt(self.now_ms()) {
+                Some(prompt) => prompt_response(prompt).into(),
+                None => Handled::Deferred(prompt_of(self.pairing.wait_for_prompt())),
+            },
             ctl::Request::PairAnswer { attempt, approve } => {
                 match crate::command::hex16_decode(&attempt) {
                     Some(attempt) => match self.pairing.answer(&attempt, approve) {
@@ -4194,6 +4200,54 @@ impl Session {
                     }
                     .into(),
                 }
+            }
+            ctl::Request::PairRequest { address, node_id } => {
+                let result = self.start_pair_request(protocol::ipc::RequestPairing {
+                    address,
+                    display_name: node_id.clone(),
+                    node_id,
+                    supports_requests: true,
+                });
+                request_result(result).into()
+            }
+            ctl::Request::PairRequestPrompt => ctl::Response::Status(match self.request_prompt() {
+                Some(prompt) => format!(
+                    "requester={} name={} seconds={}",
+                    crate::command::node_id_hex(&NodeId::new(
+                        prompt
+                            .requester_node_id
+                            .as_slice()
+                            .try_into()
+                            .expect("validated request id")
+                    )),
+                    prompt.display_name,
+                    prompt.seconds_remaining
+                ),
+                None => "none".into(),
+            })
+            .into(),
+            ctl::Request::PairRequestStatus => ctl::Response::Status(
+                self.outgoing_request()
+                    .map(|request| request.state)
+                    .unwrap_or_else(|| "none".into()),
+            )
+            .into(),
+            ctl::Request::PairRequestAnswer { node_id, accept } => {
+                let result = match pair_requests::parse_node(&node_id) {
+                    Some(node) => self.answer_pair_request(protocol::ipc::AnswerPairingRequest {
+                        requester_node_id: node.as_bytes().to_vec(),
+                        accept,
+                    }),
+                    None => protocol::ipc::OpResult {
+                        ok: false,
+                        error_code: "BAD_NODE_ID".into(),
+                    },
+                };
+                request_result(result).into()
+            }
+            ctl::Request::PairRequestCancel => {
+                self.cancel_pair_request();
+                ctl::Response::Status("cancelled".into()).into()
             }
             ctl::Request::PairWith(address) => {
                 let wait = self.pairing.dial_started();
@@ -4692,13 +4746,7 @@ fn prompt_of(prompt: oneshot::Receiver<pairing::Prompt>) -> oneshot::Receiver<ct
     let (sender, receiver) = oneshot::channel();
     tokio::spawn(async move {
         let response = match prompt.await {
-            Ok(prompt) => ctl::Response::Status(format!(
-                "sas={} peer={} ceremony={} address={}",
-                prompt.sas_code,
-                prompt.peer_name,
-                crate::command::hex16(&prompt.ceremony_id),
-                prompt.address.unwrap_or_default()
-            )),
+            Ok(prompt) => prompt_response(&prompt),
             Err(_) => ctl::Response::Error {
                 code: "PAIRING_GONE".to_owned(),
                 detail: "the window closed before a peer appeared".to_owned(),
@@ -4707,6 +4755,16 @@ fn prompt_of(prompt: oneshot::Receiver<pairing::Prompt>) -> oneshot::Receiver<ct
         let _ = sender.send(response);
     });
     receiver
+}
+
+fn prompt_response(prompt: &pairing::Prompt) -> ctl::Response {
+    ctl::Response::Status(format!(
+        "sas={} peer={} ceremony={} address={}",
+        prompt.sas_code,
+        prompt.peer_name,
+        crate::command::hex16(&prompt.ceremony_id),
+        prompt.address.as_deref().unwrap_or_default()
+    ))
 }
 
 /// A `layout edit`/`layout apply` on a follower is not answered by the node that read the
@@ -5452,5 +5510,16 @@ mod game_guard_tests {
         router.handle(2, fr::Input::Local(fr::LocalInput::Emergency));
         assert_eq!(router.focus(), fr::FocusState::Local);
         assert!(matches!(router.lease(), fr::LeaseSlot::Idle));
+    }
+}
+
+fn request_result(result: protocol::ipc::OpResult) -> ctl::Response {
+    if result.ok {
+        ctl::Response::Status("ok".into())
+    } else {
+        ctl::Response::Error {
+            code: result.error_code,
+            detail: String::new(),
+        }
     }
 }

@@ -31,6 +31,9 @@ address = "192.168.1.11"            # пусто = адрес ещё неизв�
 enabled = true                      # false отключает приём и отправку beacon
 advertise = true                    # false оставляет приём, но скрывает этот узел
 
+[pairing]
+accept_requests = true              # только запрос разрешения; доверие требует кода на обоих экранах
+
 [workspace]                         # владение вводом и координация layout
 owner_claim_serial = 0              # персистится: последний известный serial владения
 owner_node_id = ""                  # персистится: последний известный owner

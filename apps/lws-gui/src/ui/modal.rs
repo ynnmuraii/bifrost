@@ -1258,6 +1258,22 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
             widgets::hint(ui, pal, text(lang, Key::Applying));
         }
     });
+    settings_row(ui, pal, text(lang, Key::PairingRequests), false, |ui| {
+        let enabled = vm
+            .status
+            .as_ref()
+            .is_none_or(|status| status.accept_pairing_requests);
+        ui.add_enabled_ui(vm.connection.is_connected(), |ui| {
+            if let Some(i) = widgets::seg(
+                ui,
+                pal,
+                &[text(lang, Key::On), text(lang, Key::Off)],
+                usize::from(!enabled),
+            ) {
+                actions.push(Action::SetPairingRequests(i == 0));
+            }
+        });
+    });
     let current = vm.config.listen_address.clone();
     settings_row(ui, pal, text(lang, Key::LANAddress), false, |ui| {
         let options = vm.settings.lan.options(&current);

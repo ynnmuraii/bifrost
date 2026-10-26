@@ -63,6 +63,52 @@ fn main() -> std::process::ExitCode {
             .map(|pair| pair[1].clone())
     };
     let dir = option("--output").map_or_else(|| PathBuf::from(OUT_DIR), PathBuf::from);
+    if args.iter().any(|arg| arg == "--pair-requests") {
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+        for (theme, theme_tag) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
+            for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+                for state in ["prompt", "waiting", "declined", "settings"] {
+                    let mut view = mockup(
+                        theme,
+                        (state == "settings").then_some(Modal::Settings),
+                        lang,
+                    );
+                    view.look.dock_open = state != "settings";
+                    if let Some(status) = &mut view.status {
+                        status.accept_pairing_requests = true;
+                    }
+                    if state == "prompt" {
+                        view.incoming_pair_request = Some(ipc::IncomingPairingRequest {
+                            requester_node_id: vec![1; 32], display_name: "WORKSTATION".into(),
+                            system_name: "Windows".into(), fingerprint: "0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101".into(),
+                            seconds_remaining: 60,
+                        });
+                    } else if state != "settings" {
+                        view.outgoing_pair_request = Some(ipc::OutgoingPairingRequest {
+                            node_id: WORKSTATION.to_owned(),
+                            display_name: "WORKSTATION".into(),
+                            state: if state == "waiting" {
+                                "waiting"
+                            } else {
+                                "declined"
+                            }
+                            .into(),
+                        });
+                    }
+                    let file = dir.join(format!("pair-request-{state}-{lang_tag}-{theme_tag}.png"));
+                    if let Err(error) = shoot(view, &file, [1745, 1091], false) {
+                        eprintln!("{error}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    println!("{}", file.display());
+                }
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
     if args.iter().any(|arg| arg == "--game-guard") {
         if let Err(error) = std::fs::create_dir_all(&dir) {
             eprintln!("{error}");
@@ -1080,6 +1126,7 @@ fn discovery_shots(dir: &Path) -> std::process::ExitCode {
                             system_name: "Windows 11".to_owned(),
                             pairing_open: true,
                             protocol_version: protocol::PROTOCOL_MAJOR,
+                            supports_pairing_requests: true,
                         },
                         ipc::DiscoveredPeer {
                             node_id: "ee".repeat(32),
@@ -1088,6 +1135,7 @@ fn discovery_shots(dir: &Path) -> std::process::ExitCode {
                             system_name: "Linux".to_owned(),
                             pairing_open: false,
                             protocol_version: protocol::PROTOCOL_MAJOR,
+                            supports_pairing_requests: true,
                         },
                     ];
                 }
@@ -1264,6 +1312,7 @@ fn phantom_mockup(theme: Theme, lang: ui_text::Lang, vertical: bool) -> ViewMode
             system_name: "Windows 11".to_owned(),
             pairing_open: true,
             protocol_version: protocol::PROTOCOL_MAJOR,
+            supports_pairing_requests: true,
         },
         ipc::DiscoveredPeer {
             node_id: "ee".repeat(32),
@@ -1272,6 +1321,7 @@ fn phantom_mockup(theme: Theme, lang: ui_text::Lang, vertical: bool) -> ViewMode
             system_name: "Linux".to_owned(),
             pairing_open: false,
             protocol_version: protocol::PROTOCOL_MAJOR,
+            supports_pairing_requests: true,
         },
     ];
     vm.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {

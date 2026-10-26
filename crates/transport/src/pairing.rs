@@ -14,10 +14,10 @@
 //!   time-bounded ([`identity::PairingWindow`] carries the deadline);
 //! * «не более 3 ожидающих peers, rate limit handshakes» — [`PairingGate::admit`] delegates
 //!   the cap to [`identity::PairingWindow::admit`];
-//! * «Пока ключ неизвестен, allowlist разрешает только `PairHello` и статус» — the
-//!   listener only reaches the unknown-peer [`identity::pairing_server_config`] while a
-//!   window is open; with no window open a `pair/1` ClientHello is refused *before* the
-//!   handshake, and an unknown peer on `input/1` stays refused by the pin.
+//! * `pair/1` is admitted only while a window is open; with no window its ClientHello
+//!   is refused before the handshake. `pair-request/1` is a separate prompt-only channel
+//!   and cannot become a ceremony, a trusted session, or an input link.
+//!   Unknown peers on `input/1` stay refused by the pin.
 //!
 //! The gate is a shared cell: the application opens the window (via
 //! [`PairingGate::open`]) and the manager's accept task reads it. The application keeps a
@@ -141,6 +141,57 @@ impl Drop for PendingGuard {
             self.gate.release(&self.attempt_id);
         }
     }
+}
+
+/// A certificate-authenticated but untrusted, prompt-only channel.
+#[derive(Debug)]
+pub struct RequestConnection {
+    pub stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    pub address: SocketAddr,
+    pub peer: geometry::NodeId,
+}
+
+/// Dials the request-only channel and checks the selected discovery identity.
+/// `ErrorKind::Unsupported` means an explicit legacy ALPN refusal, not a network failure.
+pub async fn dial_request(
+    identity: &identity::NodeIdentity,
+    address: SocketAddr,
+    expected: geometry::NodeId,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let config =
+        identity::pairing_request_client_config(identity).map_err(std::io::Error::other)?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(address).await?;
+    let stream = connector
+        .connect(identity::server_name(address.ip()), tcp)
+        .await
+        .map_err(|error| {
+            if error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<rustls::Error>())
+                .is_some_and(|cause| {
+                    matches!(
+                        cause,
+                        rustls::Error::NoApplicationProtocol
+                            | rustls::Error::AlertReceived(
+                                rustls::AlertDescription::NoApplicationProtocol
+                            )
+                    )
+                })
+            {
+                std::io::Error::new(std::io::ErrorKind::Unsupported, error)
+            } else {
+                error
+            }
+        })?;
+    let actual = identity::peer_node_id(stream.get_ref().1.peer_certificates().unwrap_or_default())
+        .map_err(std::io::Error::other)?;
+    if actual != expected {
+        return Err(std::io::Error::other(
+            "pairing request target certificate mismatch",
+        ));
+    }
+    Ok(stream)
 }
 
 /// An accepted `pair/1` connection handed to the application, which runs the ceremony

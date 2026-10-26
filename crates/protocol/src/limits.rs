@@ -35,6 +35,8 @@ pub const ALPN_INPUT: &str = "lan-workspace/input/1";
 pub const ALPN_CLIPBOARD: &str = "lan-workspace/clipboard/1";
 /// ALPN for the pairing channel; carries no runtime payload. `05-protocol.md`.
 pub const ALPN_PAIR: &str = "lan-workspace/pair/1";
+/// Prompt-only pairing requests; never permits runtime traffic or trust changes.
+pub const ALPN_PAIR_REQUEST: &str = "lan-workspace/pair-request/1";
 
 /// Wire major version ("Сетевой протокол v0.3"). Both Hello versions must be
 /// equal in `major`; the negotiated `minor` is `min` of both sides.
