@@ -1177,7 +1177,7 @@ fn the_window_stops_a_core_it_did_not_start() {
     assert!(exit.success(), "the core exited cleanly: {exit}");
 }
 
-/// Revocation is local trust removal, but the coordinator's map exclusion reaches
+/// Revocation removes local active trust, but the coordinator's map exclusion reaches
 /// the other directly-trusting member even while the removed computer is offline.
 #[test]
 fn unpair_on_either_member_removes_an_offline_third_computer_from_both_maps() {
@@ -1256,11 +1256,26 @@ fn unpair_on_either_member_removes_an_offline_third_computer_from_both_maps() {
         );
         let revoked_trust =
             std::fs::read_to_string(roots[revoker].join("config/trust.toml")).unwrap();
-        assert!(!revoked_trust.contains(&ids[2]));
+        let trusts = |text: &str, id: &str| {
+            let store: toml::Value = toml::from_str(text).unwrap();
+            store
+                .get("peers")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|peers| {
+                    peers.iter().any(|peer| {
+                        peer["node_id"].as_str() == Some(id)
+                            && peer.get("revoked_at_unix_ms").is_none()
+                    })
+                })
+        };
+        assert!(
+            !trusts(&revoked_trust, &ids[2]),
+            "revoked trust must not remain active"
+        );
         let retained_trust =
             std::fs::read_to_string(roots[1 - revoker].join("config/trust.toml")).unwrap();
         assert!(
-            retained_trust.contains(&ids[2]),
+            trusts(&retained_trust, &ids[2]),
             "no transitive trust removal"
         );
         drop(owner);
