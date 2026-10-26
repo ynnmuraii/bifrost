@@ -86,6 +86,7 @@ enum Event {
         request: wire::PairRequest,
         decisions: mpsc::Sender<&'static str>,
     },
+    // Only final worker results; waiting is published synchronously when the request starts.
     Outgoing {
         generation: u64,
         state: String,
@@ -281,20 +282,20 @@ impl Session {
                     if generation != self.pair_requests.generation {
                         continue;
                     }
+                    let accepted = state == "accepted";
+                    let start_pairing = accepted || state == "legacy";
                     if let Some(outgoing) = &mut self.pair_requests.outgoing {
-                        outgoing.state = state.clone();
+                        outgoing.state = state;
                         let event = outgoing.clone();
                         self.publish(ipc::gui_frame::Msg::OutgoingPairingRequest(event));
                     }
-                    if state == "accepted" {
+                    if accepted {
                         tracing::info!("pairing request: accepted; starting SAS");
                     }
-                    if matches!(state.as_str(), "accepted" | "legacy") {
+                    if start_pairing {
                         self.spawn_pair_dial(address);
                     }
-                    if state != "waiting" {
-                        self.pair_requests.outgoing_task = None;
-                    }
+                    self.pair_requests.outgoing_task = None;
                 }
             }
         }

@@ -68,8 +68,45 @@ fn main() -> std::process::ExitCode {
             eprintln!("{error}");
             return std::process::ExitCode::FAILURE;
         }
+        let filter = option("--shot-filter");
+        if filter.is_none() {
+            let executable = match std::env::current_exe() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            // Match the animation captures: release GPU devices between small batches.
+            for lang in ["ru", "en"] {
+                for theme in ["light", "dark"] {
+                    let status = std::process::Command::new(&executable)
+                        .arg("--pair-requests")
+                        .arg("--output")
+                        .arg(&dir)
+                        .arg("--shot-filter")
+                        .arg(format!("{lang}-{theme}"))
+                        .status();
+                    match status {
+                        Ok(status) if status.success() => {}
+                        result => {
+                            eprintln!("Pairing request capture failed: {result:?}");
+                            return std::process::ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
         for (theme, theme_tag) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
             for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+                let scenario = format!("{lang_tag}-{theme_tag}");
+                if filter
+                    .as_deref()
+                    .is_some_and(|filter| !scenario.contains(filter))
+                {
+                    continue;
+                }
                 for state in ["prompt", "waiting", "declined", "settings"] {
                     let mut view = mockup(
                         theme,
