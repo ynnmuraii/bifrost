@@ -67,6 +67,8 @@ fn offline_unpair_fallback_removes_the_peer_in_one_click() {
     vm.apply(event(Msg::Status(status)));
     vm.local(&Action::ToggleModal(Modal::Pairs));
     let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    harness.now += Duration::from_secs(1);
     let frame = harness.settle(&vm, false);
     assert!(frame.texts.iter().any(|(text, _)| {
         text == "возможно, сопряжение удалено на том компьютере"
