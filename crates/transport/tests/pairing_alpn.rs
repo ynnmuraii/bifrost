@@ -485,9 +485,8 @@ async fn request_channel_authenticates_certificate_without_opening_pairing() {
     let mismatch = transport::pairing::dial_request(&b, address, NodeId::new([0; 32]))
         .await
         .expect_err("different discovery identity");
-    assert_ne!(
-        mismatch.kind(),
-        std::io::ErrorKind::Unsupported,
+    assert!(
+        !transport::pairing::request_alpn_unsupported(&mismatch),
         "certificate mismatch must not downgrade"
     );
     drop(node);
@@ -558,14 +557,13 @@ async fn an_explicit_legacy_alpn_refusal_is_distinct_from_network_or_identity_er
     .await
     .expect("bounded TLS handshake")
     .expect_err("old target has only pair/1");
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(transport::pairing::request_alpn_unsupported(&error));
     server.await.unwrap();
     let error = transport::pairing::dial_request(&requester, address, target_id)
         .await
         .unwrap_err();
-    assert_ne!(
-        error.kind(),
-        std::io::ErrorKind::Unsupported,
+    assert!(
+        !transport::pairing::request_alpn_unsupported(&error),
         "closed TCP port must not trigger a legacy downgrade"
     );
     let _ = std::fs::remove_dir_all(root);

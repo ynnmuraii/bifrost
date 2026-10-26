@@ -152,7 +152,7 @@ pub struct RequestConnection {
 }
 
 /// Dials the request-only channel and checks the selected discovery identity.
-/// `ErrorKind::Unsupported` means an explicit legacy ALPN refusal, not a network failure.
+/// Only [`request_alpn_unsupported`] permits falling back to the manual pairing flow.
 pub async fn dial_request(
     identity: &identity::NodeIdentity,
     address: SocketAddr,
@@ -164,26 +164,7 @@ pub async fn dial_request(
     let tcp = tokio::net::TcpStream::connect(address).await?;
     let stream = connector
         .connect(identity::server_name(address.ip()), tcp)
-        .await
-        .map_err(|error| {
-            if error
-                .get_ref()
-                .and_then(|cause| cause.downcast_ref::<rustls::Error>())
-                .is_some_and(|cause| {
-                    matches!(
-                        cause,
-                        rustls::Error::NoApplicationProtocol
-                            | rustls::Error::AlertReceived(
-                                rustls::AlertDescription::NoApplicationProtocol
-                            )
-                    )
-                })
-            {
-                std::io::Error::new(std::io::ErrorKind::Unsupported, error)
-            } else {
-                error
-            }
-        })?;
+        .await?;
     let actual = identity::peer_node_id(stream.get_ref().1.peer_certificates().unwrap_or_default())
         .map_err(std::io::Error::other)?;
     if actual != expected {
@@ -192,6 +173,20 @@ pub async fn dial_request(
         ));
     }
     Ok(stream)
+}
+
+/// Recognizes an explicit TLS ALPN refusal without downgrading network or pin failures.
+pub fn request_alpn_unsupported(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<rustls::Error>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                rustls::Error::NoApplicationProtocol
+                    | rustls::Error::AlertReceived(rustls::AlertDescription::NoApplicationProtocol)
+            )
+        })
 }
 
 /// An accepted `pair/1` connection handed to the application, which runs the ceremony

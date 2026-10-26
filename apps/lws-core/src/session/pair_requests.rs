@@ -425,7 +425,7 @@ impl Session {
             };
             let state = match tokio::time::timeout(WAIT, operation).await {
                 Ok(Ok(state)) => state,
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::Unsupported => {
+                Ok(Err(error)) if transport::pairing::request_alpn_unsupported(&error) => {
                     "legacy".into()
                 }
                 Ok(Err(error)) => {
