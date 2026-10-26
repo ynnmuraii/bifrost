@@ -9,6 +9,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **New**
 
 - Unpaired LAN computers appear as dashed 1080p placeholders at the same scale as real monitors, with quiet captions below. Connect opens the existing six-digit confirmation flow; Hide remembers up to 64 computers in local GUI settings, with Show again in the pairing dock. Manual address entry is unaffected.
+- Discovered computer placeholders gently shimmer with sparse ASCII glyphs; open pairing windows add a quiet accent, and hover highlights the clickable card. Animation pauses when the map or window is inactive.
 
 **Fixes**
 
@@ -20,6 +21,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Новое**
 
 - Найденные в локальной сети несопряжённые компьютеры показаны пунктирными экранами 1080p в том же масштабе, что реальные мониторы, с подписями снизу. «Подключиться» открывает обычное подтверждение шестизначного кода; «Скрыть» запоминает до 64 компьютеров в настройках GUI, а «Показать снова» возвращает их. Ручной ввод адреса работает независимо.
+- На экранах найденных компьютеров мягко переливаются редкие ASCII-символы; открытое окно сопряжения отмечено спокойным акцентом, а наведение подсвечивает кликабельную карточку. Анимация останавливается, когда карта или окно неактивны.
 
 **Исправления**
 

@@ -227,7 +227,19 @@ pub fn draw(
             actions,
         );
     }
-    draw_phantoms(ui, &painter, pal, vm, &model, &shown, xf, actions);
+    let phantom_visible = draw_phantoms(
+        ui,
+        &painter,
+        pal,
+        vm,
+        &model,
+        &shown,
+        xf,
+        &mut st.phantom_art,
+        actions,
+    );
+    let phantom_live = env.animate && vm.modal.is_none() && !vm.appearance_open && phantom_visible;
+    st.phantom_art.tick(t, phantom_live);
     let paddle_fading = paint_paddles(&painter, pal, st, &model, &shown, xf, t);
     if simulate && hovered != st.hover {
         match hovered {
@@ -273,8 +285,8 @@ pub fn draw(
     }
     banner(ui, pal, vm, rect, actions);
     // A bridge has its own clock: a static or settled background must not stop its flow.
-    // Both layers freeze without scheduling frames when the map/window is inactive.
-    (moving || paddle_fading || (simulate && bridge_live)).then_some(FIELD_FRAME)
+    // Animated layers freeze without scheduling frames when the map/window is inactive.
+    (moving || paddle_fading || (simulate && bridge_live) || phantom_live).then_some(FIELD_FRAME)
 }
 
 fn pan(ui: &egui::Ui, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) -> Vec2 {
@@ -801,8 +813,9 @@ fn draw_phantoms(
     model: &MapModel,
     shown: &[Pos2],
     xf: Xf,
+    art: &mut super::phantom::PhantomArt,
     actions: &mut Vec<Action>,
-) {
+) -> bool {
     let mut peers: Vec<_> = vm.discovered_peers().collect();
     peers.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
     let display_scale = if vm.editor.scale > 0.0 {
@@ -818,9 +831,12 @@ fn draw_phantoms(
         painter.clip_rect(),
         peers.len(),
     );
+    let mut visible = false;
     for (peer, rect) in peers.into_iter().zip(bounds) {
-        phantom_ui(ui, painter, pal, vm, peer, rect, xf.s, actions);
+        visible |= monitor_hit_rect(rect, painter.clip_rect()).is_some();
+        phantom_ui(ui, painter, pal, vm, peer, rect, xf.s, art, actions);
     }
+    visible
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -832,6 +848,7 @@ fn phantom_ui(
     peer: &protocol::ipc::DiscoveredPeer,
     rect: Rect,
     scale: f32,
+    art: &mut super::phantom::PhantomArt,
     actions: &mut Vec<Action>,
 ) {
     let caption = phantom_caption_rect(rect, scale);
@@ -848,7 +865,19 @@ fn phantom_ui(
             Sense::hover()
         },
     );
+    let hovered = enabled && response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     painter.rect_filled(rect, 8.0, pal.bg2);
+    art.paint(
+        painter,
+        rect,
+        pal,
+        &peer.node_id,
+        peer.pairing_open,
+        hovered,
+    );
     let corners = [
         rect.left_top(),
         rect.right_top(),
@@ -858,7 +887,7 @@ fn phantom_ui(
     ];
     painter.extend(Shape::dashed_line(
         &corners,
-        Stroke::new(1.0, pal.line),
+        Stroke::new(1.0, if hovered { pal.ink2 } else { pal.line }),
         5.0,
         5.0,
     ));
@@ -1444,6 +1473,56 @@ mod transform_tests {
     }
 
     #[test]
+    fn phantom_repaint_requires_a_visible_card_and_active_window() {
+        use crate::view_model::{CoreEndpoint, LocalConfig};
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
+        );
+        vm.on_connected("test");
+        vm.look.field = crate::gui_settings::FieldMode::Off;
+        vm.status = Some(protocol::ipc::Status {
+            discovery_enabled: true,
+            discovered_peers: vec![protocol::ipc::DiscoveredPeer {
+                node_id: "cc".repeat(32),
+                display_name: "HTPC".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        for (visible, active) in [(true, true), (true, false), (false, true), (false, false)] {
+            let ctx = egui::Context::default();
+            super::super::install_fonts(&ctx);
+            let now = std::time::Instant::now();
+            let mut state = UiState::new(now);
+            vm.look.hidden_discovered = Default::default();
+            if !visible {
+                vm.look.hidden_discovered.insert(&"cc".repeat(32));
+            }
+            let mut repaint = None;
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                repaint = draw(
+                    ui,
+                    &Palette::of(vm.look.theme),
+                    &vm,
+                    &mut state,
+                    Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 720.0)),
+                    Env {
+                        now,
+                        animate: active,
+                    },
+                    0.0,
+                    &mut Vec::new(),
+                );
+            });
+            output.drop_without_applying_deltas();
+            assert_eq!(repaint, (visible && active).then_some(FIELD_FRAME));
+        }
+    }
+
+    #[test]
     fn phantom_placeholder_matches_a_real_1080p_display_at_every_map_scale() {
         for display_scale in [crate::map::BASE_SCALE, crate::map::BASE_SCALE / 3.0] {
             for zoom in [0.45, 0.8, 1.0, 1.5, 3.0] {
@@ -1516,12 +1595,32 @@ mod transform_tests {
         let mut actions = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let painter = ui.painter().clone();
-            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 1.0, &mut actions);
+            phantom_ui(
+                ui,
+                &painter,
+                &pal,
+                &vm,
+                &peer,
+                rect,
+                1.0,
+                &mut super::super::phantom::PhantomArt::default(),
+                &mut actions,
+            );
         });
         output.drop_without_applying_deltas();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let painter = ui.painter().clone();
-            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 1.0, &mut actions);
+            phantom_ui(
+                ui,
+                &painter,
+                &pal,
+                &vm,
+                &peer,
+                rect,
+                1.0,
+                &mut super::super::phantom::PhantomArt::default(),
+                &mut actions,
+            );
         });
         let connect = output.shapes.iter().find_map(|shape| {
             if let Shape::Text(label) = &shape.shape {
@@ -1549,7 +1648,17 @@ mod transform_tests {
                 },
                 |ui| {
                     let painter = ui.painter().clone();
-                    phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 1.0, &mut actions);
+                    phantom_ui(
+                        ui,
+                        &painter,
+                        &pal,
+                        &vm,
+                        &peer,
+                        rect,
+                        1.0,
+                        &mut super::super::phantom::PhantomArt::default(),
+                        &mut actions,
+                    );
                 },
             );
             output.drop_without_applying_deltas();
@@ -1595,6 +1704,7 @@ mod transform_tests {
                     origin: Pos2::ZERO,
                     s: 1.0,
                 },
+                &mut super::super::phantom::PhantomArt::default(),
                 &mut Vec::new(),
             );
         });
@@ -1699,14 +1809,25 @@ mod transform_tests {
                     let pal = Palette::of(theme);
                     let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                         let painter = ui.painter().clone();
-                        phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 0.45, &mut Vec::new());
+                        phantom_ui(
+                            ui,
+                            &painter,
+                            &pal,
+                            &vm,
+                            &peer,
+                            rect,
+                            0.45,
+                            &mut super::super::phantom::PhantomArt::default(),
+                            &mut Vec::new(),
+                        );
                     });
                     let texts: Vec<_> = output
                         .shapes
                         .iter()
                         .filter_map(|shape| {
                             if let Shape::Text(text) = &shape.shape {
-                                Some(Rect::from_min_size(text.pos, text.galley.size()))
+                                (text.pos.y >= caption.top())
+                                    .then(|| Rect::from_min_size(text.pos, text.galley.size()))
                             } else {
                                 None
                             }

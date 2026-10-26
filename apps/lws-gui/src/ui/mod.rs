@@ -23,6 +23,7 @@ mod dock;
 mod field;
 mod map_view;
 mod modal;
+mod phantom;
 mod theme;
 mod theme_wave;
 mod update;
@@ -108,6 +109,7 @@ pub struct UiState {
     /// The particle field.
     pub field: Field,
     bridge: bridge::Bridge,
+    phantom_art: phantom::PhantomArt,
     drag: Option<Drag>,
     pub paddle_drag: Option<PaddleDrag>,
     paddle_reveals: std::collections::HashMap<String, f32>,
@@ -128,6 +130,7 @@ impl UiState {
             started: now,
             field: Field::new(),
             bridge: bridge::Bridge::default(),
+            phantom_art: phantom::PhantomArt::default(),
             drag: None,
             paddle_drag: None,
             paddle_reveals: std::collections::HashMap::new(),

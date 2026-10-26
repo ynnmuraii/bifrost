@@ -25,6 +25,7 @@
 //! `--phantoms` writes horizontal/vertical two-computer layouts with one/two discovered
 //! peers, their action popup and the hidden dock, in RU/EN and light/dark at both sizes.
 //! Its default output is `docs/work/phantom-shots`; `--output DIR` overrides it.
+//! `--phantom-animation` captures deterministic shimmer phases and hover variants.
 //! `--clipboard-routing` writes the open history destination menu, success/failure toasts,
 //! and both Settings policies in RU/EN and light/dark at all three standard sizes.
 //! These fixtures seed UI state directly and never synthesize desktop input.
@@ -97,6 +98,13 @@ fn main() -> std::process::ExitCode {
             }
         }
         return std::process::ExitCode::SUCCESS;
+    }
+    if args.iter().any(|arg| arg == "--phantom-animation") {
+        let dir = option("--output").map_or_else(
+            || PathBuf::from("docs/work/phantom-anim-shots"),
+            PathBuf::from,
+        );
+        return phantom_animation_shots(&dir, option("--shot-filter").as_deref());
     }
     if args.iter().any(|arg| arg == "--phantoms") {
         let dir = option("--output")
@@ -876,17 +884,45 @@ fn shoot_with_paddle(
     clipboard_menu: Option<u64>,
     phantom_menu: Option<String>,
 ) -> Result<(), String> {
+    shoot_frame(
+        state,
+        file,
+        size,
+        live,
+        paddle,
+        clipboard_menu,
+        phantom_menu,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shoot_frame(
+    state: ViewModel,
+    file: &Path,
+    size: [u32; 2],
+    live: bool,
+    paddle: Option<(f64, f64)>,
+    clipboard_menu: Option<u64>,
+    phantom_menu: Option<String>,
+    preview: Option<(f32, bool)>,
+) -> Result<(), String> {
     let drawn = AssertUnwindSafe(|| {
-        let mut ui_state = UiState::new(Instant::now());
+        let started = Instant::now();
+        let mut ui_state = UiState::new(started);
+        let mut frame = 0_u32;
         ui_state.clipboard_send_menu = clipboard_menu;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(size[0] as f32, size[1] as f32))
             .wgpu()
             .build_ui(move |ui| {
                 let env = Env {
-                    now: Instant::now(),
-                    animate: live,
+                    now: preview.map_or_else(Instant::now, |(time, _)| {
+                        started + Duration::from_secs_f32((frame as f32 * 0.05).min(time))
+                    }),
+                    animate: live || preview.is_some(),
                 };
+                frame += 1;
                 if let Some(span) = paddle {
                     if ui.input(|input| input.pointer.primary_down()) {
                         ui_state.paddle_drag = Some(ui::PaddleDrag {
@@ -907,6 +943,16 @@ fn shoot_with_paddle(
                 let _ = ui::draw(ui, &state, &mut ui_state, env);
             });
         ui::install_fonts(&harness.ctx);
+        if let Some((time, hover)) = preview {
+            harness.run_steps((time / 0.05).ceil() as usize + 6);
+            if hover {
+                let response = harness
+                    .ctx
+                    .read_response(egui::Id::new(("phantom", "dd".repeat(32))))
+                    .expect("visible phantom fixture");
+                harness.event(egui::Event::PointerMoved(response.rect.center()));
+            }
+        }
         if paddle.is_some() {
             // Hold only the harness pointer: the actual map paints its dragged accent.
             let pos = egui::pos2(900.0, 450.0);
@@ -1061,6 +1107,88 @@ fn discovery_shots(dir: &Path) -> std::process::ExitCode {
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+fn phantom_animation_shots(dir: &Path, filter: Option<&str>) -> std::process::ExitCode {
+    let render = || -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        if filter.is_none() {
+            // Release each offscreen GPU device before the next batch on small adapters.
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            for lang in ["ru", "en"] {
+                for theme in ["light", "dark"] {
+                    for layout in ["horizontal", "vertical"] {
+                        let status = std::process::Command::new(&executable)
+                            .arg("--phantom-animation")
+                            .arg("--output")
+                            .arg(dir)
+                            .arg("--shot-filter")
+                            .arg(format!("{layout}-{lang}-{theme}"))
+                            .status()
+                            .map_err(|error| error.to_string())?;
+                        if !status.success() {
+                            return Err(format!("Phantom capture failed: {status}"));
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+            for (theme_tag, theme) in [("light", Theme::Light), ("dark", Theme::Dark)] {
+                for (layout, vertical) in [("horizontal", false), ("vertical", true)] {
+                    let scenario = format!("{layout}-{lang_tag}-{theme_tag}");
+                    if filter.is_some_and(|filter| !scenario.contains(filter)) {
+                        continue;
+                    }
+                    for (index, time) in [0.0, 1.3, 2.7].into_iter().enumerate() {
+                        for hover in [false, true] {
+                            let mut vm = phantom_mockup(theme, lang, vertical);
+                            for (peer, name) in vm
+                                .status
+                                .as_mut()
+                                .expect("mock status")
+                                .discovered_peers
+                                .iter_mut()
+                                .zip(["HTPC", "LAPTOP"])
+                            {
+                                peer.display_name = name.to_owned();
+                            }
+                            if !vertical {
+                                vm.status
+                                    .as_mut()
+                                    .expect("mock status")
+                                    .discovered_peers
+                                    .truncate(1);
+                            }
+                            let file = dir.join(format!(
+                                "phantom-{layout}-{lang_tag}-{theme_tag}-t{index}-hover{hover}.png"
+                            ));
+                            shoot_frame(
+                                vm,
+                                &file,
+                                [1745, 1091],
+                                false,
+                                None,
+                                None,
+                                None,
+                                Some((time, hover)),
+                            )?;
+                            println!("{}", file.display());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    match render() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 fn phantom_shots(dir: &Path) -> std::process::ExitCode {
