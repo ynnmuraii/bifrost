@@ -22,6 +22,9 @@
 //! member OS names and the native display resolutions the map now labels.
 //! `--discovery` writes two discovered computers and the empty pairing dock in RU/EN,
 //! light/dark, at 1745×1091 and 1280×720. The discovered entries are mock announcements.
+//! `--phantoms` writes horizontal/vertical two-computer layouts with one/two discovered
+//! peers, their action popup and the hidden dock, in RU/EN and light/dark at both sizes.
+//! Its default output is `docs/work/phantom-shots`; `--output DIR` overrides it.
 //! `--clipboard-routing` writes the open history destination menu, success/failure toasts,
 //! and both Settings policies in RU/EN and light/dark at all three standard sizes.
 //! These fixtures seed UI state directly and never synthesize desktop input.
@@ -94,6 +97,11 @@ fn main() -> std::process::ExitCode {
             }
         }
         return std::process::ExitCode::SUCCESS;
+    }
+    if args.iter().any(|arg| arg == "--phantoms") {
+        let dir = option("--output")
+            .map_or_else(|| PathBuf::from("docs/work/phantom-shots"), PathBuf::from);
+        return phantom_shots(&dir);
     }
     if args.iter().any(|arg| arg == "--discovery") {
         return discovery_shots(&dir);
@@ -350,7 +358,7 @@ fn clipboard_routing_shots(dir: &Path) -> std::process::ExitCode {
                     ));
                     let menu = (scene == "send-menu").then_some(3);
                     if let Err(error) =
-                        shoot_with_paddle(vm.clone(), &file, size, false, None, menu)
+                        shoot_with_paddle(vm.clone(), &file, size, false, None, menu, None)
                     {
                         eprintln!("cannot render {}: {error}", file.display());
                         return std::process::ExitCode::FAILURE;
@@ -789,7 +797,7 @@ fn gap_link_shots(dir: &Path, prefix: &str) -> std::process::ExitCode {
 }
 
 fn shoot_gap(state: ViewModel, file: &Path, drag: Option<(f64, f64)>) -> Result<(), String> {
-    shoot_with_paddle(state, file, [1745, 1091], false, drag, None)
+    shoot_with_paddle(state, file, [1745, 1091], false, drag, None, None)
 }
 
 fn real_snapshot(args: CliArgs) -> Result<ViewModel, String> {
@@ -856,7 +864,7 @@ fn modal_name(modal: Modal) -> &'static str {
 }
 
 fn shoot(state: ViewModel, file: &Path, size: [u32; 2], live: bool) -> Result<(), String> {
-    shoot_with_paddle(state, file, size, live, None, None)
+    shoot_with_paddle(state, file, size, live, None, None, None)
 }
 
 fn shoot_with_paddle(
@@ -866,6 +874,7 @@ fn shoot_with_paddle(
     live: bool,
     paddle: Option<(f64, f64)>,
     clipboard_menu: Option<u64>,
+    phantom_menu: Option<String>,
 ) -> Result<(), String> {
     let drawn = AssertUnwindSafe(|| {
         let mut ui_state = UiState::new(Instant::now());
@@ -888,6 +897,12 @@ fn shoot_with_paddle(
                             handle: ui::PaddleHandle::Move,
                         });
                     }
+                }
+                if let Some(node_id) = &phantom_menu {
+                    egui::Popup::open_id(
+                        ui.ctx(),
+                        egui::Id::new(("phantom", node_id)).with("popup"),
+                    );
                 }
                 let _ = ui::draw(ui, &state, &mut ui_state, env);
             });
@@ -1046,6 +1061,150 @@ fn discovery_shots(dir: &Path) -> std::process::ExitCode {
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+fn phantom_shots(dir: &Path) -> std::process::ExitCode {
+    let render = || -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        for (lang_tag, lang) in [("ru", ui_text::Lang::Ru), ("en", ui_text::Lang::En)] {
+            for (theme_tag, theme) in [("light", Theme::Light), ("dark", Theme::Dark)] {
+                for (layout_tag, vertical) in [("horizontal", false), ("vertical", true)] {
+                    for phase in ["one", "two", "popup", "hidden"] {
+                        let mut vm = phantom_mockup(theme, lang, vertical);
+                        if phase == "one" {
+                            vm.status
+                                .as_mut()
+                                .expect("mock status")
+                                .discovered_peers
+                                .truncate(1);
+                        }
+                        if phase == "hidden" {
+                            vm.local(&Action::HideDiscovered("dd".repeat(32)));
+                            vm.local(&Action::HideDiscovered("ee".repeat(32)));
+                            // A saved entry stays recoverable even after its beacon disappears.
+                            vm.look.hidden_discovered.insert(&"ff".repeat(32));
+                            assert_eq!(vm.look.hidden_discovered.len(), 3);
+                            assert_eq!(vm.discovered_peers().count(), 0);
+                            assert_eq!(vm.hidden_discovered_peers().count(), 2);
+                        }
+                        for size in [[1745, 1091], [1280, 720]] {
+                            let file = dir.join(format!(
+                                "phantom-{layout_tag}-{phase}-{lang_tag}-{theme_tag}-{}x{}.png",
+                                size[0], size[1],
+                            ));
+                            shoot_with_paddle(
+                                vm.clone(),
+                                &file,
+                                size,
+                                false,
+                                None,
+                                None,
+                                (phase == "popup").then(|| "dd".repeat(32)),
+                            )?;
+                            println!("{}", file.display());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    match render() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn phantom_mockup(theme: Theme, lang: ui_text::Lang, vertical: bool) -> ViewModel {
+    let mut vm = mockup(theme, None, lang);
+    vm.look.dock_open = true;
+    vm.look.zoom_percent = 100;
+    vm.look.pan_x = 0;
+    vm.look.pan_y = 0;
+    vm.pairing.prompt = None;
+    vm.pairing.details = false;
+    let status = vm.status.as_mut().expect("mock status");
+    status.members.retain(|member| member.node_id != *HTPC);
+    status.discovered_peers = vec![
+        ipc::DiscoveredPeer {
+            node_id: "dd".repeat(32),
+            display_name: "STUDIO-PC".to_owned(),
+            address: "192.168.1.37:47901".to_owned(),
+            system_name: "Windows 11".to_owned(),
+            pairing_open: true,
+            protocol_version: protocol::PROTOCOL_MAJOR,
+        },
+        ipc::DiscoveredPeer {
+            node_id: "ee".repeat(32),
+            display_name: "LINUX-LAPTOP".to_owned(),
+            address: "192.168.1.42:47901".to_owned(),
+            system_name: "Linux".to_owned(),
+            pairing_open: false,
+            protocol_version: protocol::PROTOCOL_MAJOR,
+        },
+    ];
+    vm.apply(event(Msg::TopologyDoc(ipc::TopologyDoc {
+        revision: 16,
+        author_node_id: WORKSTATION.to_owned(),
+        forgotten_node_ids: Vec::new(),
+        members: vec![
+            ipc::MemberTopology {
+                app_version: String::new(),
+                node_id: WORKSTATION.to_owned(),
+                display_name: "WORKSTATION".to_owned(),
+                system_name: "Windows 11".to_owned(),
+                online: true,
+                displays: vec![display("DISPLAY1", 0.0, 0.0, 1920.0, 1080.0, true, true)],
+            },
+            ipc::MemberTopology {
+                app_version: String::new(),
+                node_id: LAPTOP.to_owned(),
+                display_name: "LAPTOP".to_owned(),
+                system_name: "CachyOS".to_owned(),
+                online: true,
+                displays: vec![display("eDP-1", 0.0, 0.0, 1745.0, 1091.0, true, true)],
+            },
+        ],
+        links: vec![ipc::LinkView {
+            id: "phantom-fixture-link".to_owned(),
+            from: auto(&WORKSTATION, if vertical { "BOTTOM" } else { "RIGHT" }),
+            to: auto(&LAPTOP, if vertical { "TOP" } else { "LEFT" }),
+            bidirectional: true,
+            active: true,
+            inactive_reason: String::new(),
+            auto_displays: Vec::new(),
+        }],
+    })));
+    let scale = vm.editor.scale;
+    let width = if vertical {
+        1920.0 * scale
+    } else {
+        3665.0 * scale + 72.0
+    };
+    let height = if vertical {
+        2171.0 * scale + 72.0
+    } else {
+        1091.0 * scale
+    };
+    let origin = lws_gui::map::Pt::new(
+        (lws_gui::map::STAGE_W - width) / 2.0,
+        (lws_gui::map::STAGE_H - height) / 2.0,
+    );
+    for (index, node) in vm.editor.nodes.iter().enumerate() {
+        vm.editor.placement[index] = if node.node_id == *WORKSTATION {
+            origin
+        } else if vertical {
+            lws_gui::map::Pt::new(origin.x, origin.y + 1080.0 * scale + 72.0)
+        } else {
+            lws_gui::map::Pt::new(origin.x + 1920.0 * scale + 72.0, origin.y)
+        };
+    }
+    assert_eq!(vm.editor.nodes.len(), 2);
+    assert_eq!(vm.discovered_peers().count(), 2);
+    vm
 }
 
 /// The three computers of the mockup: LAPTOP, this WORKSTATION with two displays, an HTPC that
