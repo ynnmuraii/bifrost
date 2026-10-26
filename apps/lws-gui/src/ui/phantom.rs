@@ -1,4 +1,4 @@
-//! Quiet materialisation: fixed sparse glyphs, revealed by a slow travelling wave.
+//! Quiet materialisation: a full ASCII grid revealed by a slow travelling wave.
 use std::sync::Arc;
 
 use eframe::egui::{Color32, Galley, Painter, Pos2, Rect};
@@ -6,7 +6,8 @@ use eframe::epaint::TextShape;
 
 use super::theme::{fam, font, font_epoch, Palette};
 
-const GLYPHS: &str = ".,:-+·";
+const GLYPHS: &str = ".:-=+*·#";
+const BAND_GLYPHS: [usize; 4] = [4, 5, 7, 3]; // + * # =
 const PERIOD: f32 = 3.8;
 
 #[derive(Default)]
@@ -26,7 +27,11 @@ fn cell(seed: u32, x: u32, y: u32) -> u32 {
 
 fn shimmer(time: f32, phase: f32) -> f32 {
     let wave = ((time / PERIOD - phase) * std::f32::consts::TAU).cos();
-    0.16 + 0.32 * ((wave + 1.0) * 0.5).powi(4)
+    ((wave + 1.0) * 0.5).powi(4)
+}
+
+fn glyph_alpha(band: f32, hovered: bool) -> f32 {
+    0.22 + 0.43 * band + if hovered { 0.1 } else { 0.0 }
 }
 
 impl PhantomArt {
@@ -78,33 +83,44 @@ impl PhantomArt {
             return;
         }
         let clipped = painter.with_clip_rect(inner.intersect(painter.clip_rect()));
-        let cols = 12_u32;
-        let rows = 5_u32;
+        let cols = (inner.width() / size).floor().max(1.0) as u32;
+        let rows = (inner.height() / size).floor().max(1.0) as u32;
+        let glyphs = &self.glyphs;
+        let clock = self.clock;
         clipped.extend(
             (0..rows)
                 .flat_map(|y| (0..cols).map(move |x| (x, y)))
-                .filter_map(|(x, y)| {
+                .flat_map(|(x, y)| {
                     let hash = cell(seed, x, y);
-                    if !hash.is_multiple_of(4) {
-                        return None;
-                    }
                     let u = (x as f32 + 0.5) / cols as f32;
                     let v = (y as f32 + 0.5) / rows as f32;
-                    let alpha = shimmer(
-                        self.clock,
-                        u * 0.65 + v * 0.15 + (seed % 100) as f32 / 100.0,
-                    ) * if hovered { 1.4 } else { 1.0 };
-                    let color = if open && hash.is_multiple_of(3) {
-                        pal.accent_ink
-                    } else {
-                        pal.ink2
-                    };
-                    let galley = &self.glyphs[(hash / 4) as usize % self.glyphs.len()];
-                    let at = Pos2::new(
+                    let band = shimmer(clock, u * 0.65 + v * 0.15 + (seed % 100) as f32 / 100.0);
+                    let alpha = glyph_alpha(band, hovered);
+                    let center = Pos2::new(
                         inner.left() + u * inner.width(),
                         inner.top() + v * inner.height(),
-                    ) - galley.size() * 0.5;
-                    Some(TextShape::new(at, Arc::clone(galley), color.gamma_multiply(alpha)).into())
+                    );
+                    // Crossfade instead of swapping characters abruptly as the band passes.
+                    [
+                        (
+                            hash as usize % 7,
+                            pal.ink.gamma_multiply(alpha * (1.0 - band)),
+                        ),
+                        (
+                            BAND_GLYPHS[(hash >> 8) as usize % BAND_GLYPHS.len()],
+                            (if open { pal.accent_ink } else { pal.ink })
+                                .gamma_multiply(alpha * band),
+                        ),
+                    ]
+                    .into_iter()
+                    .filter_map(move |(index, color)| {
+                        if color.a() == 0 {
+                            return None;
+                        }
+                        let galley = &glyphs[index];
+                        let at = center - galley.size() * 0.5;
+                        Some(TextShape::new(at, Arc::clone(galley), color).into())
+                    })
                 }),
         );
     }
@@ -136,16 +152,41 @@ mod tests {
                         false,
                     );
                 });
-                let clips: Vec<_> = output
+                let painted: Vec<_> = output
                     .shapes
                     .iter()
                     .filter_map(|shape| {
-                        matches!(&shape.shape, Shape::Text(_)).then_some(shape.clip_rect)
+                        if let Shape::Text(text) = &shape.shape {
+                            Some((shape.clip_rect, text.pos + text.galley.size() * 0.5))
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 output.drop_without_applying_deltas();
-                assert!(!clips.is_empty(), "Glyphs survive zoom {zoom}");
-                assert!(clips.iter().all(|clip| card.contains_rect(*clip)));
+                let size = (card.width() / 16.0)
+                    .clamp(6.0, 18.0)
+                    .min(card.height() * 0.25);
+                let inner = card.shrink(size);
+                let cols = (inner.width() / size).floor().max(1.0) as u32;
+                let rows = (inner.height() / size).floor().max(1.0) as u32;
+                let occupied: std::collections::HashSet<_> = painted
+                    .iter()
+                    .map(|(_, center)| {
+                        (
+                            ((center.x - inner.left()) / inner.width() * cols as f32).floor()
+                                as u32,
+                            ((center.y - inner.top()) / inner.height() * rows as f32).floor()
+                                as u32,
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    occupied.len(),
+                    (cols * rows) as usize,
+                    "Every cell is populated at zoom {zoom}"
+                );
+                assert!(painted.iter().all(|(clip, _)| card.contains_rect(*clip)));
             }
         }
     }
@@ -157,9 +198,12 @@ mod tests {
                 for y in 0..7 {
                     assert_eq!(cell(seed, x, y), cell(seed, x, y));
                     for time in [0.0, 1.3, 2.7, 1000.0] {
-                        let alpha = shimmer(time, x as f32 / 16.0);
-                        assert!((0.16..=0.48).contains(&alpha));
-                        assert_eq!(alpha, shimmer(time, x as f32 / 16.0));
+                        let band = shimmer(time, x as f32 / 16.0);
+                        assert!((0.0..=1.0).contains(&band));
+                        assert_eq!(band, shimmer(time, x as f32 / 16.0));
+                        let alpha = glyph_alpha(band, false);
+                        assert!((0.22..=0.65).contains(&alpha));
+                        assert!((glyph_alpha(band, true) - alpha - 0.1).abs() < 0.00001);
                     }
                 }
             }
