@@ -621,6 +621,58 @@ fn settings_version_is_a_padded_bottom_row_in_both_languages_and_themes() {
 }
 
 #[test]
+fn pairing_request_setting_keeps_its_label_clear_of_the_toggle() {
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for theme in [Theme::Dark, Theme::Light] {
+            for size in [egui::vec2(1280.0, 720.0), egui::vec2(1745.0, 1091.0)] {
+                let mut vm = connected();
+                vm.look.language = lang;
+                vm.look.theme = theme;
+                vm.status.as_mut().unwrap().accept_pairing_requests = true;
+                vm.local(&Action::ToggleModal(Modal::Settings));
+                let mut harness = Harness::new();
+                harness.frame(&vm, false, size, Vec::new());
+                harness.now += Duration::from_millis(500);
+                let frame = harness.frame(&vm, false, size, Vec::new());
+                let label_text = ui_text::text(lang, ui_text::Key::PairingRequests).to_uppercase();
+                let label = frame
+                    .texts
+                    .iter()
+                    .find(|(text, _)| text == &label_text)
+                    .expect("pairing request setting label")
+                    .1;
+                let control = |key| {
+                    frame
+                        .texts
+                        .iter()
+                        .find(|(text, rect)| {
+                            text == ui_text::text(lang, key)
+                                && rect.left() > label.left()
+                                && (rect.center().y - label.center().y).abs() < 20.0
+                        })
+                        .expect("pairing request setting toggle")
+                        .1
+                };
+                assert!(
+                    label.right() < control(ui_text::Key::On).left(),
+                    "setting label overlaps the toggle: {label:?}"
+                );
+                let off = control(ui_text::Key::Off);
+                let clicked = harness.frame(&vm, false, size, click_at(off.center()));
+                assert!(
+                    clicked
+                        .output
+                        .actions
+                        .contains(&Action::SetPairingRequests(false)),
+                    "{:?}",
+                    clicked.output.actions
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn updater_uses_a_startup_segment_and_aligned_release_actions() {
     use lws_gui::updater::{Action as Update, Release, State};
     for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {

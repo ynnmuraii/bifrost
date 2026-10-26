@@ -403,7 +403,9 @@ fn row_with_padding(
             ..Default::default()
         },
     );
+    job.wrap.max_width = LABEL_W;
     let galley = painter.layout_job(job);
+    let label_bottom = top + 4.0 + galley.size().y;
     painter.galley(Pos2::new(left + 20.0, top + 4.0), galley, pal.ink2);
     let inner = ui.scope_builder(
         UiBuilder::new()
@@ -414,7 +416,7 @@ fn row_with_padding(
             add(ui);
         },
     );
-    let bottom = inner.response.rect.max.y.max(top + 20.0) + bottom_padding;
+    let bottom = inner.response.rect.max.y.max(label_bottom).max(top + 20.0) + bottom_padding;
     // The scope already advanced the cursor past its contents, not the row padding.
     ui.add_space((bottom - ui.cursor().min.y).max(0.0));
     if !last {
