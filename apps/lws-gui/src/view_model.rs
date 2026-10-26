@@ -405,6 +405,8 @@ pub struct LocalConfig {
     pub listen_address: String,
     /// `[discovery].enabled`, until the core publishes its authoritative status.
     pub discovery_enabled: bool,
+    /// `[pairing].accept_requests`, until core publishes authoritative status.
+    pub accept_pairing_requests: bool,
     /// `Paths::config_file()`, so a user can be told which file is being shown.
     pub config_file: PathBuf,
     /// `Paths::state_dir()`, where `ExportDiagnostics` writes.
@@ -431,6 +433,7 @@ impl Default for LocalConfig {
             port_input: 47901,
             listen_address: String::new(),
             discovery_enabled: true,
+            accept_pairing_requests: true,
             config_file: PathBuf::new(),
             state_dir: PathBuf::new(),
             paths: None,
@@ -458,6 +461,7 @@ impl LocalConfig {
                 config.port_input = loaded.network.port_input;
                 config.listen_address = loaded.network.listen_address.clone();
                 config.discovery_enabled = loaded.discovery.enabled;
+                config.accept_pairing_requests = loaded.pairing.accept_requests;
             }
             Err(error) => {
                 config.note = Some(fill(
@@ -1526,6 +1530,7 @@ impl ViewModel {
             self.settings.clipboard_pending = None;
         }
         self.config.discovery_enabled = status.discovery_enabled;
+        self.config.accept_pairing_requests = status.accept_pairing_requests;
         if self.settings.discovery_pending.is_some()
             && (self.settings.discovery_pending == Some(status.discovery_enabled)
                 || !self

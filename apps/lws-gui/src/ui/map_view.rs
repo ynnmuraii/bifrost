@@ -1574,7 +1574,7 @@ mod transform_tests {
     }
 
     #[test]
-    fn phantom_connect_click_uses_the_dock_pair_with_command() {
+    fn phantom_connect_click_uses_the_shared_pairing_request_command() {
         use crate::view_model::{CoreEndpoint, LocalConfig};
         let mut vm = ViewModel::new(
             CoreEndpoint::Ready {

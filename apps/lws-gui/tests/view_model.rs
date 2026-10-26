@@ -3226,3 +3226,23 @@ fn discovery_fallback_and_hidden_mute_are_explicit_wire_actions() {
         matches!(Action::HideDiscovered(peer.node_id.clone()).wire(), Some((_, Msg::MutePairingRequester(request))) if request.node_id == peer.node_id)
     );
 }
+
+#[test]
+fn pairing_request_setting_uses_saved_config_until_core_status_arrives() {
+    let dir = settings_dir("192.168.1.10");
+    let paths = paths_of(&dir);
+    assert!(lws_gui::view_model::LocalConfig::load(&paths).accept_pairing_requests);
+    let mut config = config::Config::load(paths.config_file()).unwrap();
+    config.pairing.accept_requests = false;
+    config.save(paths.config_file()).unwrap();
+    let mut vm = view();
+    vm.config = lws_gui::view_model::LocalConfig::load(&paths);
+    assert!(!vm.config.accept_pairing_requests);
+    let mut status = status_with("LOCAL");
+    status.accept_pairing_requests = true;
+    vm.apply(event(Msg::Status(status)));
+    assert!(vm.config.accept_pairing_requests);
+    vm.on_disconnected("test".into());
+    assert!(vm.config.accept_pairing_requests);
+    std::fs::remove_dir_all(dir).unwrap();
+}

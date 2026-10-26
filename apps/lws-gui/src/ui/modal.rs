@@ -1262,7 +1262,9 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
         let enabled = vm
             .status
             .as_ref()
-            .is_none_or(|status| status.accept_pairing_requests);
+            .map_or(vm.config.accept_pairing_requests, |status| {
+                status.accept_pairing_requests
+            });
         ui.add_enabled_ui(vm.connection.is_connected(), |ui| {
             if let Some(i) = widgets::seg(
                 ui,
