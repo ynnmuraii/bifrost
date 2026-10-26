@@ -748,12 +748,21 @@ fn caption_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
     )
 }
 
+fn phantom_caption_rect(card: Rect, scale: f32) -> Rect {
+    let fs = scale.clamp(0.8, 1.0);
+    Rect::from_min_size(
+        card.left_bottom(),
+        Vec2::new(card.width().max(192.0 * fs), 88.0 * fs),
+    )
+}
+
 /// Discovery is a view overlay, never a node in the editable layout or its fit bounds.
 /// Keep real monitors at their chosen scale: a distant beacon must not shrink the workspace.
 fn phantom_rects(
     model: &MapModel,
     shown: &[Pos2],
     scale: f32,
+    display_scale: f64,
     viewport: Rect,
     count: usize,
 ) -> impl Iterator<Item = Rect> {
@@ -764,18 +773,23 @@ fn phantom_rects(
         .map(|(node, &at)| node_rect(at, node, scale).union(caption_rect(at, node, scale)))
         .reduce(|a, b| a.union(b))
         .unwrap_or_else(|| Rect::from_min_size(Pos2::new(72.0, 100.0), Vec2::ZERO));
-    let size = Vec2::new(240.0 * scale.max(0.8), 135.0 * scale.max(0.8));
+    let size = Vec2::new(1920.0, 1080.0) * (display_scale as f32 * scale);
+    let caption = phantom_caption_rect(Rect::from_min_size(Pos2::ZERO, size), scale);
     let gap = 24.0;
     // Prefer a row below; an expanded pairing dock may leave room only on the right.
     let start = if occupied.height() <= occupied.width()
-        && occupied.bottom() + gap + size.y <= viewport.bottom()
+        && occupied.bottom() + gap + size.y + caption.height() <= viewport.bottom()
     {
         occupied.left_bottom() + Vec2::new(0.0, gap)
     } else {
         occupied.right_top() + Vec2::new(gap, 0.0)
     };
-    (0..count)
-        .map(move |i| Rect::from_min_size(start + Vec2::new(i as f32 * (size.x + gap), 0.0), size))
+    (0..count).map(move |i| {
+        Rect::from_min_size(
+            start + Vec2::new(i as f32 * (caption.width() + gap), 0.0),
+            size,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -791,12 +805,25 @@ fn draw_phantoms(
 ) {
     let mut peers: Vec<_> = vm.discovered_peers().collect();
     peers.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
-    let bounds = phantom_rects(model, shown, xf.s, painter.clip_rect(), peers.len());
+    let display_scale = if vm.editor.scale > 0.0 {
+        vm.editor.scale
+    } else {
+        crate::map::BASE_SCALE
+    };
+    let bounds = phantom_rects(
+        model,
+        shown,
+        xf.s,
+        display_scale,
+        painter.clip_rect(),
+        peers.len(),
+    );
     for (peer, rect) in peers.into_iter().zip(bounds) {
-        phantom_ui(ui, painter, pal, vm, peer, rect, actions);
+        phantom_ui(ui, painter, pal, vm, peer, rect, xf.s, actions);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn phantom_ui(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -804,9 +831,11 @@ fn phantom_ui(
     vm: &ViewModel,
     peer: &protocol::ipc::DiscoveredPeer,
     rect: Rect,
+    scale: f32,
     actions: &mut Vec<Action>,
 ) {
-    let Some(hit) = monitor_hit_rect(rect, painter.clip_rect()) else {
+    let caption = phantom_caption_rect(rect, scale);
+    let Some(hit) = monitor_hit_rect(rect.union(caption), painter.clip_rect()) else {
         return;
     };
     let enabled = vm.modal.is_none() && !vm.appearance_open;
@@ -866,20 +895,21 @@ fn phantom_ui(
             },
         ),
     ];
-    let clipped = painter.with_clip_rect(rect.shrink(10.0).intersect(painter.clip_rect()));
-    let mut y = rect.top() + 12.0;
+    let fs = scale.clamp(0.8, 1.0);
+    let clipped = painter.with_clip_rect(caption.intersect(painter.clip_rect()));
+    let mut y = caption.top() + 10.0 * fs;
     for (label, size, color) in rows {
         let mut job = egui::text::LayoutJob::simple(
             label,
-            font(size, fam::sans()),
+            font(size * fs, fam::sans()),
             color,
-            rect.width() - 24.0,
+            caption.width(),
         );
         job.wrap.max_rows = 1;
         let galley = clipped.layout_job(job);
         let height = galley.size().y;
-        clipped.galley(Pos2::new(rect.left() + 12.0, y), galley, color);
-        y += height + 5.0;
+        clipped.galley(Pos2::new(caption.left(), y), galley, color);
+        y += height + fs;
     }
     egui::Popup::menu(&response).show(|ui| {
         if widgets::small_button(
@@ -1359,6 +1389,86 @@ mod transform_tests {
     use super::*;
 
     #[test]
+    fn real_name_caption_clipping_is_independent_of_phantom_placement() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let mut node = owner_layout().nodes.remove(0);
+        node.name = "WORKSTATION".into();
+        node.w = 144.0;
+        node.h = 81.0;
+        let at = Pos2::new(530.0, 180.0);
+        let scale = 0.45;
+        let card = node_rect(at, &node, scale);
+        let caption = caption_rect(at, &node, scale);
+        let mut st = UiState::new(std::time::Instant::now());
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            node_ui(
+                ui,
+                &painter,
+                &Palette::of(crate::gui_settings::Theme::Dark),
+                &mut st,
+                &node,
+                0,
+                at,
+                Xf {
+                    origin: Pos2::ZERO,
+                    s: scale,
+                },
+                caption,
+                false,
+                &mut None,
+                &mut Vec::new(),
+            );
+        });
+        let clipped_name = output.shapes.iter().find_map(|shape| {
+            if let Shape::Text(label) = &shape.shape {
+                (label.galley.text() == node.name).then(|| {
+                    (
+                        shape.clip_rect,
+                        Rect::from_min_size(label.pos, label.galley.size()),
+                    )
+                })
+            } else {
+                None
+            }
+        });
+        output.drop_without_applying_deltas();
+        let (clip, glyphs) =
+            clipped_name.expect("Real name is drawn without any discovery overlay");
+        assert_eq!(clip.right(), card.right());
+        assert!(
+            glyphs.right() > clip.right(),
+            "Existing real caption clips at its monitor width"
+        );
+    }
+
+    #[test]
+    fn phantom_placeholder_matches_a_real_1080p_display_at_every_map_scale() {
+        for display_scale in [crate::map::BASE_SCALE, crate::map::BASE_SCALE / 3.0] {
+            for zoom in [0.45, 0.8, 1.0, 1.5, 3.0] {
+                let phantom = phantom_rects(
+                    &MapModel::default(),
+                    &[],
+                    zoom,
+                    display_scale,
+                    Rect::EVERYTHING,
+                    1,
+                )
+                .next()
+                .unwrap();
+                let real = monitor_rect(
+                    Pos2::ZERO,
+                    crate::map::Rect::new(0.0, 0.0, 1920.0 * display_scale, 1080.0 * display_scale),
+                    zoom,
+                );
+                assert!((phantom.width() - real.width()).abs() < 0.001);
+                assert!((phantom.height() - real.height()).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
     fn expanded_pairing_dock_parks_phantoms_in_visible_space_to_the_right() {
         let mut model = owner_layout();
         for node in &mut model.nodes {
@@ -1367,8 +1477,10 @@ mod transform_tests {
         }
         let shown = [Pos2::new(530.0, 180.0), Pos2::new(627.0, 180.0)];
         let viewport = Rect::from_min_max(Pos2::new(0.0, 60.0), Pos2::new(1216.0, 330.0));
-        let phantoms: Vec<_> = phantom_rects(&model, &shown, 0.45, viewport, 2).collect();
+        let phantoms: Vec<_> =
+            phantom_rects(&model, &shown, 0.45, crate::map::BASE_SCALE, viewport, 2).collect();
         for phantom in phantoms {
+            let phantom = phantom.union(phantom_caption_rect(phantom, 0.45));
             assert!(viewport.contains_rect(phantom));
             for (node, &at) in model.nodes.iter().zip(&shown) {
                 assert!(!phantom.intersects(node_rect(at, node, 0.45)));
@@ -1404,12 +1516,12 @@ mod transform_tests {
         let mut actions = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let painter = ui.painter().clone();
-            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut actions);
+            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 1.0, &mut actions);
         });
         output.drop_without_applying_deltas();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let painter = ui.painter().clone();
-            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut actions);
+            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 1.0, &mut actions);
         });
         let connect = output.shapes.iter().find_map(|shape| {
             if let Shape::Text(label) = &shape.shape {
@@ -1437,7 +1549,7 @@ mod transform_tests {
                 },
                 |ui| {
                     let painter = ui.painter().clone();
-                    phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut actions);
+                    phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 1.0, &mut actions);
                 },
             );
             output.drop_without_applying_deltas();
@@ -1532,19 +1644,23 @@ mod transform_tests {
                     let before = model.clone();
                     let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 720.0));
                     let phantoms: Vec<_> =
-                        phantom_rects(&model, &shown, scale, viewport, 4).collect();
+                        phantom_rects(&model, &shown, scale, crate::map::BASE_SCALE, viewport, 4)
+                            .collect();
                     assert_eq!(
                         phantoms,
-                        phantom_rects(&model, &shown, scale, viewport, 4).collect::<Vec<_>>()
+                        phantom_rects(&model, &shown, scale, crate::map::BASE_SCALE, viewport, 4)
+                            .collect::<Vec<_>>()
                     );
                     assert_eq!(before, model, "Discovery cannot mutate real nodes or links");
                     for (i, phantom) in phantoms.iter().enumerate() {
+                        let phantom = phantom.union(phantom_caption_rect(*phantom, scale));
                         for (node, &at) in model.nodes.iter().zip(&shown) {
                             assert!(!phantom.intersects(node_rect(at, node, scale)));
                             assert!(!phantom.intersects(caption_rect(at, node, scale)));
                         }
                         for other in &phantoms[..i] {
-                            assert!(!phantom.intersects(*other));
+                            assert!(!phantom
+                                .intersects(other.union(phantom_caption_rect(*other, scale))));
                         }
                     }
                 }
@@ -1578,11 +1694,12 @@ mod transform_tests {
                     };
                     let ctx = egui::Context::default();
                     super::super::install_fonts(&ctx);
-                    let rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(192.0, 108.0));
+                    let rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(64.8, 36.45));
+                    let caption = phantom_caption_rect(rect, 0.45);
                     let pal = Palette::of(theme);
                     let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                         let painter = ui.painter().clone();
-                        phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut Vec::new());
+                        phantom_ui(ui, &painter, &pal, &vm, &peer, rect, 0.45, &mut Vec::new());
                     });
                     let texts: Vec<_> = output
                         .shapes
@@ -1597,7 +1714,8 @@ mod transform_tests {
                         .collect();
                     assert_eq!(texts.len(), 4);
                     for (i, text) in texts.iter().enumerate() {
-                        assert!(rect.contains_rect(*text));
+                        assert!(caption.contains_rect(*text));
+                        assert!(!rect.intersects(*text));
                         for other in &texts[..i] {
                             assert!(!text.intersects(*other));
                         }
