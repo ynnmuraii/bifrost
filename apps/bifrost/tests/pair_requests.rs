@@ -56,6 +56,12 @@ fn request_accept_requires_both_sas_decisions_before_trust() {
         .ctl(&format!("pair-request-answer {} accept", two.b_id))
         .expect("accept prompt");
     wait_line(&two.b, "pair-request-status", "accepted");
+    assert_eq!(two.b.ctl("pair-request-cancel").unwrap(), "OK not waiting");
+    assert_eq!(
+        two.b.ctl("pair-request-status").unwrap(),
+        "OK accepted",
+        "a late Cancel must not relabel a ceremony that already entered SAS"
+    );
     let a = two.a.ctl("pair-prompt").expect("target SAS");
     let b = two.b.ctl("pair-prompt").expect("requester SAS");
     assert_eq!(field(&a, "sas="), field(&b, "sas="));

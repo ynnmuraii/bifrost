@@ -108,25 +108,25 @@ fn main() -> std::process::ExitCode {
                     continue;
                 }
                 for state in ["prompt", "waiting", "declined", "settings"] {
-                    let mut view = mockup(
-                        theme,
-                        (state == "settings").then_some(Modal::Settings),
-                        lang,
-                    );
+                    let mut view = phantom_mockup(theme, lang, false);
+                    view.pairing = Default::default();
+                    view.modal = (state == "settings").then_some(Modal::Settings);
                     view.look.dock_open = state != "settings";
                     if let Some(status) = &mut view.status {
                         status.accept_pairing_requests = true;
                     }
                     if state == "prompt" {
                         view.incoming_pair_request = Some(ipc::IncomingPairingRequest {
-                            requester_node_id: vec![1; 32], display_name: "WORKSTATION".into(),
-                            system_name: "Windows".into(), fingerprint: "0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101 0101".into(),
+                            requester_node_id: vec![0xdd; 32],
+                            display_name: "STUDIO-PC".into(),
+                            system_name: "Windows 11".into(),
+                            fingerprint: ["dddd"; 16].join(" "),
                             seconds_remaining: 60,
                         });
                     } else if state != "settings" {
                         view.outgoing_pair_request = Some(ipc::OutgoingPairingRequest {
-                            node_id: WORKSTATION.to_owned(),
-                            display_name: "WORKSTATION".into(),
+                            node_id: "dd".repeat(32),
+                            display_name: "STUDIO-PC".into(),
                             state: if state == "waiting" {
                                 "waiting"
                             } else {

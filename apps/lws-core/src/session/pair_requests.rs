@@ -354,16 +354,18 @@ impl Session {
         result(true, "")
     }
 
-    pub(super) fn cancel_pair_request(&mut self) {
-        if let Some(task) = self.pair_requests.outgoing_task.take() {
-            task.abort();
-        }
+    pub(super) fn cancel_pair_request(&mut self) -> bool {
+        let Some(task) = self.pair_requests.outgoing_task.take() else {
+            return false;
+        };
+        task.abort();
         self.pair_requests.generation = self.pair_requests.generation.wrapping_add(1);
         if let Some(outgoing) = &mut self.pair_requests.outgoing {
             outgoing.state = "cancelled".into();
             let event = outgoing.clone();
             self.publish(ipc::gui_frame::Msg::OutgoingPairingRequest(event));
         }
+        true
     }
 
     pub(super) fn start_pair_request(&mut self, request: ipc::RequestPairing) -> ipc::OpResult {

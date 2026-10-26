@@ -3176,6 +3176,8 @@ fn topology_and_status_versions_feed_badges_without_guessing_unknown_peers() {
 fn incoming_request_reopens_dock_and_buttons_name_the_exact_requester() {
     let mut vm = view();
     vm.look.dock_open = false;
+    vm.modal = Some(Modal::Settings);
+    vm.appearance_open = true;
     let prompt = protocol::ipc::IncomingPairingRequest {
         requester_node_id: vec![7; 32],
         display_name: "WORKSTATION".into(),
@@ -3185,6 +3187,8 @@ fn incoming_request_reopens_dock_and_buttons_name_the_exact_requester() {
     };
     vm.apply(event(Msg::IncomingPairingRequest(prompt.clone())));
     assert!(vm.look.dock_open);
+    assert!(vm.modal.is_none());
+    assert!(!vm.appearance_open);
     assert_eq!(vm.incoming_pair_request, Some(prompt.clone()));
     for accept in [true, false] {
         let action = Action::AnswerPairingRequest {

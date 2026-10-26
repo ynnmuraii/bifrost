@@ -4246,8 +4246,16 @@ impl Session {
                 request_result(result).into()
             }
             ctl::Request::PairRequestCancel => {
-                self.cancel_pair_request();
-                ctl::Response::Status("cancelled".into()).into()
+                let cancelled = self.cancel_pair_request();
+                ctl::Response::Status(
+                    if cancelled {
+                        "cancelled"
+                    } else {
+                        "not waiting"
+                    }
+                    .into(),
+                )
+                .into()
             }
             ctl::Request::PairWith(address) => {
                 let wait = self.pairing.dial_started();

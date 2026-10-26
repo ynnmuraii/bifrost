@@ -1391,6 +1391,8 @@ impl ViewModel {
             Msg::IncomingPairingRequest(prompt) => {
                 self.incoming_pair_request = (prompt.seconds_remaining > 0).then_some(prompt);
                 if self.incoming_pair_request.is_some() {
+                    self.modal = None;
+                    self.appearance_open = false;
                     self.look.dock_open = true;
                 }
             }
