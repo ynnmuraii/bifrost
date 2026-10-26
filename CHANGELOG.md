@@ -10,6 +10,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Unpaired LAN computers appear as dashed 1080p placeholders at the same scale as real monitors, with quiet captions below. Connect opens the existing six-digit confirmation flow; Hide remembers up to 64 computers in local GUI settings, with Show again in the pairing dock. Manual address entry is unaffected.
 - Discovered computer placeholders gently shimmer with a full ASCII grid and a clear diagonal sweep; open pairing windows accent only the passing band, and hover highlights the clickable card. Animation pauses when the map or window is inactive.
+- **Pairing requests:** Connect on a discovered computer asks it for permission before the usual six-digit confirmation on both screens. Accept opens a temporary window restricted to the requesting certificate; requests never grant trust. Settings can disable incoming requests, and older computers retain the manual-window flow.
 
 **Fixes**
 
@@ -22,6 +23,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Найденные в локальной сети несопряжённые компьютеры показаны пунктирными экранами 1080p в том же масштабе, что реальные мониторы, с подписями снизу. «Подключиться» открывает обычное подтверждение шестизначного кода; «Скрыть» запоминает до 64 компьютеров в настройках GUI, а «Показать снова» возвращает их. Ручной ввод адреса работает независимо.
 - На экранах найденных компьютеров мягко переливается сетка ASCII-символов с заметной диагональной волной; открытое окно сопряжения окрашивает только проходящую полосу, а наведение подсвечивает кликабельную карточку. Анимация останавливается, когда карта или окно неактивны.
+- **Запросы сопряжения:** «Подключиться» у найденного компьютера запрашивает разрешение перед обычным подтверждением шестизначного кода на обоих экранах. «Принять» открывает временное окно только для сертификата отправителя; сам запрос не даёт доверия. В настройках можно отключить входящие запросы; для старых компьютеров сохраняется ручное открытие окна.
 
 **Исправления**
 

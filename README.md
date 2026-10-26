@@ -62,8 +62,9 @@ Runtime: X11 works too; Wayland needs `xdg-desktop-portal` with RemoteDesktop/In
 ## Quick start
 
 1. Run Bifrost on both computers, on the same trusted LAN. On a fresh setup, the window starts its core and creates the settings automatically.
-2. On one computer, open the pairing window in the pairing panel. On the other, select it from the discovered LAN computers, or enter the first computer's LAN address (shown in its window), then connect.
+2. Select a discovered computer and click **Connect**, then **Accept** its pairing request on the other screen. Incoming requests can be disabled in **Settings → Accept pairing requests** (`[pairing] accept_requests = false`). With older versions or a manual address, first open the pairing window on the other computer, then connect as before.
 3. Compare the six-digit codes and confirm on **both** computers. Only confirm if the codes match.
+   A request grants no trust. Accept opens a temporary window restricted to the requesting certificate; declining mutes that identity for ten minutes.
 4. Arrange the screens on the map and connect their edges. Take control on the computer whose keyboard you want to use, then move across a linked edge. Enable the shared clipboard if you want it, and test your emergency shortcut first.
 
 Existing settings and pairing stay in the `lan-workspace` directories when updating. Stop your old Bifrost session before replacing the executable.
