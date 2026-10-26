@@ -1171,7 +1171,7 @@ mod tests {
             },
         );
         assert_eq!(hello.node_id.len(), 32);
-        assert_eq!(hello.capabilities, vec![12, 1, 2, 3, 10, 11]);
+        assert_eq!(hello.capabilities, vec![12, 13, 1, 2, 3, 10, 11]);
         assert_eq!(hello.app_version, protocol::app_version());
         assert!(hello.can_own);
     }
@@ -1538,7 +1538,7 @@ mod contract_tests {
             emergency_hotkey: true,
         };
 
-        let expected: Vec<i32> = vec![12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let expected: Vec<i32> = vec![12, 13, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         assert_eq!(
             capability_bits(capabilities),
             expected,
