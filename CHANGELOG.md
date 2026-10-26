@@ -2,6 +2,22 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## Unreleased
+
+### English
+
+**Fixes**
+
+- On compatible versions, unpairing on one computer now removes the pair on the other too: immediately while online, or on its next connection within 30 days. The other computer shows a one-time notice.
+- For peers running older versions, a manual **Remove** suggestion appears after a prolonged offline period and a certificate rejection. Network failures alone never remove a pair automatically.
+
+### Русский
+
+**Исправления**
+
+- На совместимых версиях удаление сопряжения на одном компьютере теперь удаляет пару и на другом: сразу при наличии связи или при следующем подключении в течение 30 дней. Другой компьютер показывает однократное уведомление.
+- Для компьютеров со старыми версиями после длительного отсутствия связи и отказа сертификата появляется ручная подсказка **«Удалить»**. Одни лишь сетевые ошибки никогда не удаляют пару автоматически.
+
 ## 0.3.0 — 2026-10-26
 
 ### English
