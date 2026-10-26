@@ -11,7 +11,7 @@ use ui_text::{text, Key};
 
 pub(super) fn body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
-    let mut look = vm.look;
+    let mut look = vm.look.clone();
     row(ui, pal, text(lang, Key::Theme), false, |ui| {
         if let Some(i) = widgets::seg(
             ui,

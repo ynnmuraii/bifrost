@@ -1413,11 +1413,26 @@ impl ViewModel {
         }
     }
 
-    /// Unpaired LAN announcements, never stale entries from a disconnected service.
+    /// Visible unpaired LAN announcements in status order; callers may sort for placement.
     pub fn discovered_peers(&self) -> impl Iterator<Item = &ipc::DiscoveredPeer> {
+        self.unpaired_discovered_peers()
+            .filter(|peer| !self.look.hidden_discovered.contains(&peer.node_id))
+    }
+
+    /// Currently announcing hidden peers, excluding paired nodes and disabled discovery.
+    pub fn hidden_discovered_peers(&self) -> impl Iterator<Item = &ipc::DiscoveredPeer> {
+        self.unpaired_discovered_peers()
+            .filter(|peer| self.look.hidden_discovered.contains(&peer.node_id))
+    }
+
+    fn unpaired_discovered_peers(&self) -> impl Iterator<Item = &ipc::DiscoveredPeer> {
         self.status
             .iter()
-            .filter(|status| self.connection.is_connected() && status.discovery_enabled)
+            .filter(|status| {
+                self.connection.is_connected()
+                    && status.discovery_enabled
+                    && self.discovery_enabled()
+            })
             .flat_map(|status| &status.discovered_peers)
             .filter(|peer| {
                 !self
@@ -2392,9 +2407,19 @@ impl ViewModel {
                 self.appearance_open = false;
                 self.settings.revoke = None;
             }
-            Action::SetLook(look) => self.look = *look,
+            Action::SetLook(look) => self.look = look.clone(),
+            Action::HideDiscovered(node_id) => {
+                self.look.hidden_discovered.hide(node_id);
+            }
+            Action::ShowDiscovered(node_id) => {
+                self.look.hidden_discovered.remove(node_id);
+            }
             Action::DonePairing => self.pairing.paired = None,
-            Action::PairWith(_) => {
+            Action::PairWith(address) => {
+                self.modal = None;
+                self.appearance_open = false;
+                self.look.dock_open = true;
+                self.pairing.address = address.clone();
                 self.pairing.dialing = true;
                 self.pairing.paired = None;
             }
@@ -2530,6 +2555,10 @@ pub enum Action {
     },
     /// Dial the other computer's pairing address.
     PairWith(String),
+    /// Hide an unpaired LAN identity locally, without trusting or changing the peer.
+    HideDiscovered(String),
+    /// Restore a locally hidden identity, including one no longer announcing.
+    ShowDiscovered(String),
     /// Answer the six-digit confirmation.
     Answer {
         /// The attempt the prompt named.

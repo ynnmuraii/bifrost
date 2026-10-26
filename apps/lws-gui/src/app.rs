@@ -82,7 +82,7 @@ impl GuiApp {
         if let Some(file) = &look_file {
             view.look = gui_settings::load(file);
         }
-        let saved_look = view.look;
+        let saved_look = view.look.clone();
         view.settings.autostart = crate::autostart::enabled();
         let start_core = view.config.config_was_missing || updated;
         let mut bridge = Bridge::new(view, client);
@@ -101,14 +101,14 @@ impl GuiApp {
 
     /// Writes `gui.toml` when the look changed.
     fn save_look(&mut self) {
-        let look = self.bridge.view().look;
-        if look == self.saved_look {
+        let look = &self.bridge.view().look;
+        if look == &self.saved_look {
             return;
         }
-        self.saved_look = look;
+        self.saved_look = look.clone();
         if let Some(file) = &self.look_file {
             // A look that cannot be remembered is not worth an error dialog.
-            let _ = gui_settings::save(file, &look);
+            let _ = gui_settings::save(file, look);
         }
     }
 }

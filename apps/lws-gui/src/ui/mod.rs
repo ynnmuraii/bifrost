@@ -353,7 +353,7 @@ fn topbar(
             if hover { pal.bg } else { pal.ink },
         );
         if response.on_hover_text(label).clicked() {
-            let mut look = vm.look;
+            let mut look = vm.look.clone();
             look.theme = look.theme.toggled();
             actions.push(Action::SetLook(look));
         }

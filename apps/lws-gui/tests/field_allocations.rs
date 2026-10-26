@@ -70,7 +70,7 @@ fn active_field_and_ascii_links_allocate_nothing_after_warmup() {
                     let frame = FieldFrame {
                         map: ui.ctx().content_rect(),
                         pal: &pal,
-                        look,
+                        look: &look,
                         simulate: true,
                         t,
                         pointer,

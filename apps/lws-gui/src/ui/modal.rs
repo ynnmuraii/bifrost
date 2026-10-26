@@ -1172,7 +1172,7 @@ fn settings_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut
     // The window's own language. The tray reads the same `gui.toml`, so it follows the choice;
     // the change is instant, because every string is drawn from the catalogue each frame.
     settings_row(ui, pal, text(lang, Key::Language), false, |ui| {
-        let mut look = vm.look;
+        let mut look = vm.look.clone();
         if let Some(i) = widgets::seg(
             ui,
             pal,

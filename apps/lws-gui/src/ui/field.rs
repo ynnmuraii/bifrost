@@ -130,7 +130,7 @@ pub struct Frame<'a> {
     /// The tokens of the theme.
     pub pal: &'a Palette,
     /// The look.
-    pub look: Look,
+    pub look: &'a Look,
     /// `true` while the field simulates this frame: the window is visible and focused, the
     /// field is not «Без движения» and the pointer is over the map. The pointer is what moves
     /// the particles, so without one the field rests where it is.
@@ -679,7 +679,7 @@ mod tests {
         ctx: &egui::Context,
         field: &mut Field,
         pal: &Palette,
-        look: Look,
+        look: &Look,
         pointer: Pos2,
         t: f32,
     ) -> bool {
@@ -713,8 +713,8 @@ mod tests {
             let mut control = Field::new();
             for n in 0..=8 {
                 let t = n as f32 / 32.0;
-                held_frame(&ctx, &mut paused, &pal, look, pointer, t);
-                held_frame(&ctx, &mut control, &pal, look, pointer, t);
+                held_frame(&ctx, &mut paused, &pal, &look, pointer, t);
+                held_frame(&ctx, &mut control, &pal, &look, pointer, t);
             }
             let particles = paused.parts.clone();
             let clouds = paused.cells.clone();
@@ -732,7 +732,7 @@ mod tests {
                         &Frame {
                             map: ui.ctx().content_rect(),
                             pal: &pal,
-                            look,
+                            look: &look,
                             simulate: false,
                             t,
                             pointer: paused_pointer,
@@ -751,13 +751,13 @@ mod tests {
                 assert_eq!(paused.animation_t, animation_t);
             }
 
-            assert!(held_frame(&ctx, &mut paused, &pal, look, pointer, 64.25));
+            assert!(held_frame(&ctx, &mut paused, &pal, &look, pointer, 64.25));
             assert_eq!(paused.parts, particles);
             assert_eq!(paused.cells, clouds);
             assert_eq!(paused.animation_t, animation_t);
             // The next tick matches uninterrupted animation, not elapsed wall time.
-            held_frame(&ctx, &mut paused, &pal, look, pointer, 64.28125);
-            held_frame(&ctx, &mut control, &pal, look, pointer, 0.28125);
+            held_frame(&ctx, &mut paused, &pal, &look, pointer, 64.28125);
+            held_frame(&ctx, &mut control, &pal, &look, pointer, 0.28125);
             assert_eq!(paused.parts, control.parts);
             assert_eq!(paused.cells, control.cells);
             assert_eq!(paused.animation_t, control.animation_t);
@@ -787,7 +787,7 @@ mod tests {
         // does not.
         for n in 0..=150 {
             let t = n as f32 / 30.0;
-            let moving = held_frame(&ctx, &mut field, &pal, look, pointer, t);
+            let moving = held_frame(&ctx, &mut field, &pal, &look, pointer, t);
             if n >= 30 {
                 // Well past the point where the old window faded the pointer out at 1.5 s and
                 // snapped every particle back to its own place.
@@ -810,7 +810,7 @@ mod tests {
         for n in 151..=200 {
             let t = n as f32 / 30.0;
             assert!(
-                !held_frame(&ctx, &mut field, &pal, look, pointer, t),
+                !held_frame(&ctx, &mut field, &pal, &look, pointer, t),
                 "a settled field asks for no more frames: {t} s"
             );
         }
@@ -830,7 +830,7 @@ mod tests {
                 &Frame {
                     map: ui.ctx().content_rect(),
                     pal: &pal,
-                    look,
+                    look: &look,
                     simulate: false,
                     t: 7.0,
                     pointer: None,
@@ -855,7 +855,7 @@ mod tests {
             let pal = Palette::of(look.theme);
             let mut field = Field::new();
             for n in 0..=10 {
-                held_frame(&ctx, &mut field, &pal, look, pointer, n as f32 / 30.0);
+                held_frame(&ctx, &mut field, &pal, &look, pointer, n as f32 / 30.0);
             }
             mean_displacement(&field)
         };
@@ -881,7 +881,7 @@ mod tests {
                 &Frame {
                     map: ui.ctx().content_rect(),
                     pal: &pal,
-                    look,
+                    look: &look,
                     // Still: the particles stay at home as '·' and cannot be mistaken for a
                     // glyph of the link.
                     simulate: false,

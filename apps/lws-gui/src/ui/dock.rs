@@ -24,7 +24,7 @@ const WINDOW_S: u32 = 120;
 
 /// Empty/disabled discovery reuses the manual-address hint, not the map's height.
 fn discovery_height(vm: &ViewModel) -> f32 {
-    if vm.discovered_peers().next().is_some() {
+    if vm.discovered_peers().next().is_some() || !vm.look.hidden_discovered.is_empty() {
         DISCOVERY_H
     } else {
         0.0
@@ -178,7 +178,7 @@ fn discovered(
         fam::sans_medium(),
         pal.ink,
     );
-    if vm.discovered_peers().next().is_none() {
+    if vm.discovered_peers().next().is_none() && vm.look.hidden_discovered.is_empty() {
         widgets::hint(
             &mut child,
             pal,
@@ -191,7 +191,6 @@ fn discovered(
                 },
             ),
         );
-        return;
     }
     egui::ScrollArea::vertical()
         .max_height(88.0)
@@ -210,6 +209,11 @@ fn discovered(
                             &peer.system_name
                         };
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::small_button(ui, pal, text(lang, Key::HideDiscovered), true)
+                                .clicked()
+                            {
+                                actions.push(Action::HideDiscovered(peer.node_id.clone()));
+                            }
                             if widgets::small_button(
                                 ui,
                                 pal,
@@ -251,6 +255,56 @@ fn discovered(
                             });
                         });
                     });
+                });
+            }
+            if !vm.look.hidden_discovered.is_empty() {
+                egui::CollapsingHeader::new(
+                    egui::RichText::new(format!(
+                        "{}: {}",
+                        text(lang, Key::HiddenDiscovered),
+                        vm.look.hidden_discovered.len()
+                    ))
+                    .font(font(11.0, fam::sans_medium()))
+                    .color(pal.accent_ink),
+                )
+                .id_salt("hidden-discovered")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for node_id in vm.look.hidden_discovered.iter() {
+                        ui.push_id(node_id, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if widgets::small_button(
+                                        ui,
+                                        pal,
+                                        text(lang, Key::ShowDiscovered),
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        actions.push(Action::ShowDiscovered(node_id.to_owned()));
+                                    }
+                                    let peer = vm
+                                        .hidden_discovered_peers()
+                                        .find(|peer| peer.node_id == node_id);
+                                    let name = peer
+                                        .map(|peer| peer.display_name.as_str())
+                                        .filter(|name| !name.is_empty())
+                                        .unwrap_or(node_id);
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(name)
+                                                    .font(font(12.0, fam::sans()))
+                                                    .color(pal.ink2),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                });
+                            });
+                        });
+                    }
                 });
             }
         });

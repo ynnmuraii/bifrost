@@ -6,12 +6,20 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 ### English
 
+**New**
+
+- Unpaired LAN computers appear as dashed 1080p placeholders at the same scale as real monitors, with quiet captions below. Connect opens the existing six-digit confirmation flow; Hide remembers up to 64 computers in local GUI settings, with Show again in the pairing dock. Manual address entry is unaffected.
+
 **Fixes**
 
 - On compatible versions, unpairing on one computer now removes the pair on the other too: immediately while online, or on its next connection within 30 days. The other computer shows a one-time notice.
 - For peers running older versions, a manual **Remove** suggestion appears after a prolonged offline period and a certificate rejection. Network failures alone never remove a pair automatically.
 
 ### Русский
+
+**Новое**
+
+- Найденные в локальной сети несопряжённые компьютеры показаны пунктирными экранами 1080p в том же масштабе, что реальные мониторы, с подписями снизу. «Подключиться» открывает обычное подтверждение шестизначного кода; «Скрыть» запоминает до 64 компьютеров в настройках GUI, а «Показать снова» возвращает их. Ручной ввод адреса работает независимо.
 
 **Исправления**
 

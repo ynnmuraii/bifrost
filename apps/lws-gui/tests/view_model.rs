@@ -2874,6 +2874,139 @@ fn discovery_hides_paired_members_and_replaces_expired_announcements() {
 }
 
 #[test]
+fn hiding_at_capacity_keeps_the_new_choice_and_evicts_only_the_oldest() {
+    let mut vm = view();
+    let limit = lws_gui::gui_settings::HIDDEN_DISCOVERED_LIMIT;
+    for n in 0..limit {
+        vm.local(&Action::HideDiscovered(format!("{n:064x}")));
+    }
+    let saved = vm.look.clone();
+    vm.local(&Action::HideDiscovered(format!("{:064x}", 1)));
+    vm.local(&Action::HideDiscovered("invalid".into()));
+    assert_eq!(
+        vm.look, saved,
+        "duplicates and invalid IDs never evict choices"
+    );
+    let newest = "ff".repeat(32);
+    vm.local(&Action::HideDiscovered(newest.clone()));
+    assert_eq!(vm.look.hidden_discovered.len(), limit);
+    assert!(!vm.look.hidden_discovered.contains(&format!("{:064x}", 0)));
+    assert!(vm.look.hidden_discovered.contains(&format!("{:064x}", 1)));
+    assert!(vm.look.hidden_discovered.contains(&newest));
+    assert!(
+        !saved.hidden_discovered.contains(&newest),
+        "snapshots stay unchanged"
+    );
+    assert!(saved.hidden_discovered.contains(&format!("{:064x}", 0)));
+    vm.local(&Action::ShowDiscovered(newest));
+    assert_eq!(vm.look.hidden_discovered.len(), limit - 1);
+    assert!(vm.take_outgoing().is_empty());
+}
+
+#[test]
+fn hidden_discovery_is_local_reversible_and_follows_current_status() {
+    let mut vm = view();
+    vm.on_connected("test");
+    let visible = "cc".repeat(32);
+    let hidden = "dd".repeat(32);
+    let mut status = status_with("LOCAL");
+    status.discovered_peers = vec![
+        discovered_peer(PEER_NODE, true),
+        discovered_peer(&visible, false),
+        discovered_peer(&hidden, true),
+    ];
+    vm.apply(event(Msg::Status(status.clone())));
+    let before_editor = vm.editor.nodes.clone();
+    let hide = Action::HideDiscovered(hidden.clone());
+    assert!(hide.wire().is_none());
+    vm.local(&hide);
+    vm.local(&hide);
+    vm.local(&Action::HideDiscovered("not-an-identity".into()));
+    assert_eq!(vm.look.hidden_discovered.len(), 1);
+    assert_eq!(
+        vm.discovered_peers()
+            .map(|peer| peer.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![visible.as_str()]
+    );
+    assert_eq!(
+        vm.hidden_discovered_peers()
+            .map(|peer| peer.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![hidden.as_str()]
+    );
+    assert_eq!(vm.editor.nodes, before_editor);
+    assert_eq!(vm.status.as_ref(), Some(&status));
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "hiding never changes trust or topology"
+    );
+
+    let show = Action::ShowDiscovered(hidden.clone());
+    assert!(show.wire().is_none());
+    vm.local(&show);
+    assert_eq!(vm.discovered_peers().count(), 2);
+    assert_eq!(vm.hidden_discovered_peers().count(), 0);
+    vm.local(&hide);
+
+    vm.local(&Action::SetDiscovery(false));
+    assert_eq!(
+        vm.discovered_peers().count(),
+        0,
+        "pending discovery-off hides immediately"
+    );
+    assert_eq!(vm.hidden_discovered_peers().count(), 0);
+    status.discovery_enabled = false;
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(vm.discovered_peers().count(), 0);
+    assert_eq!(vm.hidden_discovered_peers().count(), 0);
+    status.discovery_enabled = true;
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(vm.hidden_discovered_peers().count(), 1);
+
+    status.members.push(protocol::ipc::MemberStatus {
+        node_id: hidden.clone(),
+        ..Default::default()
+    });
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(
+        vm.hidden_discovered_peers().count(),
+        0,
+        "paired identities are never phantoms"
+    );
+    status.members.retain(|member| member.node_id != hidden);
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(vm.hidden_discovered_peers().count(), 1);
+
+    status.discovered_peers.clear();
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(vm.discovered_peers().count(), 0);
+    assert_eq!(
+        vm.hidden_discovered_peers().count(),
+        0,
+        "TTL removal is authoritative"
+    );
+    assert!(
+        vm.look.hidden_discovered.contains(&hidden),
+        "TTL does not forget user choices"
+    );
+    status.discovered_peers.push(discovered_peer(&hidden, true));
+    vm.apply(event(Msg::Status(status)));
+    assert_eq!(
+        vm.hidden_discovered_peers().count(),
+        1,
+        "reannouncement remains hidden"
+    );
+    vm.on_disconnected("test".into());
+    assert_eq!(vm.hidden_discovered_peers().count(), 0);
+    vm.local(&show);
+    assert!(
+        vm.look.hidden_discovered.is_empty(),
+        "offline identities can be restored"
+    );
+}
+
+#[test]
 fn discovered_pairing_uses_the_existing_address_flow_and_still_needs_sas() {
     let mut vm = view();
     vm.on_connected("test");
@@ -2884,7 +3017,17 @@ fn discovered_pairing_uses_the_existing_address_flow_and_still_needs_sas() {
     };
     assert_eq!(request, Request::PairWith);
     assert_eq!(dial.address, peer.address);
+    vm.look.dock_open = false;
+    vm.modal = Some(Modal::Pairs);
+    vm.appearance_open = true;
     vm.local(&action);
+    assert!(
+        vm.look.dock_open,
+        "map and dock use the same action handler"
+    );
+    assert!(vm.modal.is_none());
+    assert!(!vm.appearance_open);
+    assert_eq!(vm.pairing.address, peer.address);
     assert!(vm.pairing.dialing);
     assert!(vm.pairing.paired.is_none());
     vm.apply(event(Msg::PairingPrompt(pairing_prompt())));

@@ -1205,7 +1205,7 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
         .actions
         .iter()
         .find_map(|action| match action {
-            Action::SetLook(look) => Some(*look),
+            Action::SetLook(look) => Some(look.clone()),
             _ => None,
         })
         .expect("the + button changes local zoom");
@@ -1230,7 +1230,7 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
     let frame = harness.frame(&vm, false, SIZE, wheel(-32.0));
     assert!(frame.output.actions.contains(&Action::SetLook(Look {
         zoom_percent: 100,
-        ..vm.look
+        ..vm.look.clone()
     })));
     vm.look.zoom_percent = 300;
     let frame = harness.frame(&vm, false, SIZE, wheel(32.0));
@@ -1300,7 +1300,7 @@ fn theme_wave_finishes_reverses_and_skips_unfocused_windows() {
             .actions
             .iter()
             .find_map(|action| match action {
-                Action::SetLook(look) => Some(*look),
+                Action::SetLook(look) => Some(look.clone()),
                 _ => None,
             })
             .expect("topbar theme action");
@@ -1441,7 +1441,7 @@ fn the_language_switch_changes_the_window_and_is_stored() {
         frame.output.actions,
         vec![Action::SetLook(Look {
             language: ui_text::Lang::En,
-            ..vm.look
+            ..vm.look.clone()
         })],
         "the switch asks for English"
     );
@@ -1450,7 +1450,7 @@ fn the_language_switch_changes_the_window_and_is_stored() {
     let dir = std::env::temp_dir().join(format!("lws-gui-language-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let path = lws_gui::gui_settings::path_in(&dir);
-    let mut look = vm.look;
+    let mut look = vm.look.clone();
     look.language = ui_text::Lang::En;
     lws_gui::gui_settings::save(&path, &look).expect("the directory is created");
     assert_eq!(

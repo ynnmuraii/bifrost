@@ -6,6 +6,7 @@
 //! look that cannot be remembered must not become an error dialog.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use ui_text::Lang;
@@ -59,8 +60,106 @@ pub enum LinkStyle {
     Line,
 }
 
+/// Maximum number of locally hidden LAN identities remembered across restarts.
+pub const HIDDEN_DISCOVERED_LIMIT: usize = 64;
+
+/// Bounded canonical node IDs shared by cheap appearance snapshots.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HiddenDiscovered {
+    ids: Arc<Vec<String>>,
+}
+
+impl HiddenDiscovered {
+    /// The number of hidden identities, including computers no longer announcing.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether no identities are hidden.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Canonical lowercase hexadecimal IDs in insertion order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.ids.iter().map(String::as_str)
+    }
+
+    /// Whether this valid identity is hidden, independent of hexadecimal case.
+    pub fn contains(&self, node_id: &str) -> bool {
+        self.iter().any(|id| id.eq_ignore_ascii_case(node_id))
+    }
+
+    /// Remember a valid identity once; a full list leaves existing choices intact.
+    pub fn insert(&mut self, node_id: &str) -> bool {
+        if config::node_id_from_hex(node_id).is_none()
+            || self.contains(node_id)
+            || self.len() == HIDDEN_DISCOVERED_LIMIT
+        {
+            return false;
+        }
+        Arc::make_mut(&mut self.ids).push(node_id.to_ascii_lowercase());
+        true
+    }
+
+    /// Explicitly hide a valid identity, evicting the oldest choice at capacity.
+    pub fn hide(&mut self, node_id: &str) -> bool {
+        if config::node_id_from_hex(node_id).is_none() || self.contains(node_id) {
+            return false;
+        }
+        let ids = Arc::make_mut(&mut self.ids);
+        if ids.len() == HIDDEN_DISCOVERED_LIMIT {
+            ids.remove(0);
+        }
+        ids.push(node_id.to_ascii_lowercase());
+        true
+    }
+
+    /// Restore an identity, even when its last LAN announcement has expired.
+    pub fn remove(&mut self, node_id: &str) -> bool {
+        let Some(index) = self.iter().position(|id| id.eq_ignore_ascii_case(node_id)) else {
+            return false;
+        };
+        Arc::make_mut(&mut self.ids).remove(index);
+        true
+    }
+}
+
+impl Serialize for HiddenDiscovered {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for HiddenDiscovered {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Ids;
+
+        impl<'de> serde::de::Visitor<'de> for Ids {
+            type Value = HiddenDiscovered;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a list of hidden node IDs")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut ids = HiddenDiscovered::default();
+                while let Some(id) = seq.next_element::<String>()? {
+                    ids.insert(&id);
+                }
+                Ok(ids)
+            }
+        }
+
+        deserializer.deserialize_seq(Ids)
+    }
+}
+
 /// The look of the window.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Look {
     /// The language of the window, and of the tray that reads the same file.
     pub language: Lang,
@@ -86,6 +185,8 @@ pub struct Look {
     pub check_updates: bool,
     /// Stable release deliberately skipped for automatic checks only.
     pub skipped_update: Option<[u64; 3]>,
+    /// Locally hidden unpaired LAN identities, never written to the core configuration.
+    pub hidden_discovered: HiddenDiscovered,
 }
 
 /// The furthest the map may be panned, in points.
@@ -141,6 +242,7 @@ impl Default for Look {
             dock_open: true,
             check_updates: true,
             skipped_update: None,
+            hidden_discovered: HiddenDiscovered::default(),
         }
     }
 }
@@ -181,6 +283,7 @@ struct Stored {
     dock_open: bool,
     check_updates: bool,
     skipped_update: Option<[u64; 3]>,
+    hidden_discovered: HiddenDiscovered,
     /// The slider, since it replaced the pace.
     speed: Option<f32>,
     /// The pace, as a file written before the slider still says it.
@@ -202,6 +305,7 @@ impl Default for Stored {
             dock_open: look.dock_open,
             check_updates: true,
             skipped_update: None,
+            hidden_discovered: HiddenDiscovered::default(),
             speed: None,
             pace: None,
         }
@@ -227,6 +331,7 @@ impl From<Stored> for Look {
             dock_open: stored.dock_open,
             check_updates: stored.check_updates,
             skipped_update: stored.skipped_update,
+            hidden_discovered: stored.hidden_discovered,
         }
     }
 }
@@ -311,8 +416,16 @@ mod tests {
             dock_open: false,
             check_updates: false,
             skipped_update: Some([0, 1, 4]),
+            hidden_discovered: {
+                let mut ids = HiddenDiscovered::default();
+                ids.insert(&"ab".repeat(32));
+                ids
+            },
         };
         save(&path, &look).expect("the directory is created");
+        let stored = std::fs::read_to_string(&path).expect("read settings");
+        assert!(stored.contains("hidden_discovered = ["));
+        assert!(stored.contains(&"ab".repeat(32)));
         assert_eq!(load(&path), look);
         assert!(!path.with_extension("toml.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -393,6 +506,71 @@ mod tests {
         std::fs::write(&path, "pan_x = 30000\npan_y = -30000\n").expect("write");
         let look = load(&path);
         assert_eq!((look.pan_x, look.pan_y), (PAN_MAX, -PAN_MAX));
+        assert!(!dir.join("config.toml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hidden_id_storage_is_validated_deduplicated_bounded_and_cheap_to_clone() {
+        assert!(std::mem::size_of::<Look>() < 128);
+        let mut ids = HiddenDiscovered::default();
+        assert!(ids.is_empty());
+        for invalid in ["", "nearby-laptop", &"a".repeat(63), &"g".repeat(64)] {
+            assert!(!ids.insert(invalid));
+        }
+        let first = "AB".repeat(32);
+        assert!(ids.insert(&first));
+        assert!(!ids.insert(&first.to_ascii_lowercase()));
+        assert!(ids.contains(&first));
+        assert_eq!(ids.iter().next(), Some("ab".repeat(32).as_str()));
+        for n in 0..HIDDEN_DISCOVERED_LIMIT - 1 {
+            assert!(ids.insert(&format!("{n:064x}")));
+        }
+        assert_eq!(ids.len(), HIDDEN_DISCOVERED_LIMIT);
+        assert!(!ids.insert(&"ff".repeat(32)));
+        let copied = ids.clone();
+        assert!(ids.remove(&first));
+        assert!(!ids.remove(&first));
+        assert_eq!(ids.len(), HIDDEN_DISCOVERED_LIMIT - 1);
+        assert!(copied.contains(&first));
+        assert!(ids.insert(&"ff".repeat(32)));
+        assert_eq!(ids.iter().last(), Some("ff".repeat(32).as_str()));
+    }
+
+    #[test]
+    fn stored_hidden_ids_keep_only_the_first_64_valid_unique_identities() {
+        let dir = dir("hidden-ids");
+        let path = path_in(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut values = vec![
+            "\"invalid\"".to_owned(),
+            format!("\"{}\"", "AB".repeat(32)),
+            format!("\"{}\"", "ab".repeat(32)),
+        ];
+        values.extend((0..70).map(|n| format!("\"{n:064x}\"")));
+        std::fs::write(
+            &path,
+            format!(
+                "theme = \"dark\"\nhidden_discovered = [{}]\n",
+                values.join(",")
+            ),
+        )
+        .expect("write");
+        let mut look = load(&path);
+        assert_eq!(
+            look.theme,
+            Theme::Dark,
+            "invalid IDs do not reset other settings"
+        );
+        assert_eq!(look.hidden_discovered.len(), HIDDEN_DISCOVERED_LIMIT);
+        assert_eq!(
+            look.hidden_discovered.iter().next(),
+            Some("ab".repeat(32).as_str())
+        );
+        assert!(!look.hidden_discovered.contains(&format!("{:064x}", 69)));
+        assert!(look.hidden_discovered.remove(&"AB".repeat(32)));
+        save(&path, &look).expect("save unhide");
+        assert_eq!(load(&path), look);
         assert!(!dir.join("config.toml").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

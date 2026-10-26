@@ -130,7 +130,7 @@ pub fn draw(
         &Frame {
             map: rect,
             pal,
-            look: vm.look,
+            look: &vm.look,
             simulate,
             t,
             pointer,
@@ -227,6 +227,7 @@ pub fn draw(
             actions,
         );
     }
+    draw_phantoms(ui, &painter, pal, vm, &model, &shown, xf, actions);
     let paddle_fading = paint_paddles(&painter, pal, st, &model, &shown, xf, t);
     if simulate && hovered != st.hover {
         match hovered {
@@ -307,7 +308,7 @@ fn pan(ui: &egui::Ui, vm: &ViewModel, rect: Rect, actions: &mut Vec<Action>) -> 
             let look = Look {
                 pan_x: offset.x.round() as i16,
                 pan_y: offset.y.round() as i16,
-                ..vm.look
+                ..vm.look.clone()
             };
             if look != vm.look {
                 actions.push(Action::SetLook(look));
@@ -413,7 +414,7 @@ fn zoom_controls(
     if wanted != current {
         actions.push(Action::SetLook(Look {
             zoom_percent: wanted,
-            ..vm.look
+            ..vm.look.clone()
         }));
     }
 }
@@ -745,6 +746,158 @@ fn caption_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
                 * scale.clamp(0.8, 1.0),
         ),
     )
+}
+
+/// Discovery is a view overlay, never a node in the editable layout or its fit bounds.
+/// Keep real monitors at their chosen scale: a distant beacon must not shrink the workspace.
+fn phantom_rects(
+    model: &MapModel,
+    shown: &[Pos2],
+    scale: f32,
+    viewport: Rect,
+    count: usize,
+) -> impl Iterator<Item = Rect> {
+    let occupied = model
+        .nodes
+        .iter()
+        .zip(shown)
+        .map(|(node, &at)| node_rect(at, node, scale).union(caption_rect(at, node, scale)))
+        .reduce(|a, b| a.union(b))
+        .unwrap_or_else(|| Rect::from_min_size(Pos2::new(72.0, 100.0), Vec2::ZERO));
+    let size = Vec2::new(240.0 * scale.max(0.8), 135.0 * scale.max(0.8));
+    let gap = 24.0;
+    // Prefer a row below; an expanded pairing dock may leave room only on the right.
+    let start = if occupied.height() <= occupied.width()
+        && occupied.bottom() + gap + size.y <= viewport.bottom()
+    {
+        occupied.left_bottom() + Vec2::new(0.0, gap)
+    } else {
+        occupied.right_top() + Vec2::new(gap, 0.0)
+    };
+    (0..count)
+        .map(move |i| Rect::from_min_size(start + Vec2::new(i as f32 * (size.x + gap), 0.0), size))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_phantoms(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    pal: &Palette,
+    vm: &ViewModel,
+    model: &MapModel,
+    shown: &[Pos2],
+    xf: Xf,
+    actions: &mut Vec<Action>,
+) {
+    let mut peers: Vec<_> = vm.discovered_peers().collect();
+    peers.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+    let bounds = phantom_rects(model, shown, xf.s, painter.clip_rect(), peers.len());
+    for (peer, rect) in peers.into_iter().zip(bounds) {
+        phantom_ui(ui, painter, pal, vm, peer, rect, actions);
+    }
+}
+
+fn phantom_ui(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    pal: &Palette,
+    vm: &ViewModel,
+    peer: &protocol::ipc::DiscoveredPeer,
+    rect: Rect,
+    actions: &mut Vec<Action>,
+) {
+    let Some(hit) = monitor_hit_rect(rect, painter.clip_rect()) else {
+        return;
+    };
+    let enabled = vm.modal.is_none() && !vm.appearance_open;
+    let response = ui.interact(
+        hit,
+        egui::Id::new(("phantom", &peer.node_id)),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    painter.rect_filled(rect, 8.0, pal.bg2);
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    painter.extend(Shape::dashed_line(
+        &corners,
+        Stroke::new(1.0, pal.line),
+        5.0,
+        5.0,
+    ));
+    let lang = vm.look.language;
+    let name = if peer.display_name.is_empty() {
+        text(lang, Key::WithoutAName)
+    } else {
+        &peer.display_name
+    };
+    let system = if peer.system_name.is_empty() {
+        text(lang, Key::UnknownSystem)
+    } else {
+        &peer.system_name
+    };
+    let rows = [
+        (name.to_owned(), 13.0, pal.ink2),
+        (format!("{} · {system}", peer.address), 11.0, pal.ink2),
+        (text(lang, Key::PhantomNotPaired).to_owned(), 11.0, pal.ink2),
+        (
+            text(
+                lang,
+                if peer.pairing_open {
+                    Key::PairingWindowOpen
+                } else {
+                    Key::PhantomDisplaysUnknown
+                },
+            )
+            .to_owned(),
+            10.5,
+            if peer.pairing_open {
+                pal.accent_ink
+            } else {
+                pal.ink2
+            },
+        ),
+    ];
+    let clipped = painter.with_clip_rect(rect.shrink(10.0).intersect(painter.clip_rect()));
+    let mut y = rect.top() + 12.0;
+    for (label, size, color) in rows {
+        let mut job = egui::text::LayoutJob::simple(
+            label,
+            font(size, fam::sans()),
+            color,
+            rect.width() - 24.0,
+        );
+        job.wrap.max_rows = 1;
+        let galley = clipped.layout_job(job);
+        let height = galley.size().y;
+        clipped.galley(Pos2::new(rect.left() + 12.0, y), galley, color);
+        y += height + 5.0;
+    }
+    egui::Popup::menu(&response).show(|ui| {
+        if widgets::small_button(
+            ui,
+            pal,
+            text(lang, Key::Connect),
+            vm.connection.is_connected() && peer.pairing_open && !vm.pairing.dialing,
+        )
+        .clicked()
+        {
+            actions.push(Action::PairWith(peer.address.clone()));
+            ui.close();
+        }
+        if widgets::small_button(ui, pal, text(lang, Key::HideDiscovered), true).clicked() {
+            actions.push(Action::HideDiscovered(peer.node_id.clone()));
+            ui.close();
+        }
+    });
 }
 
 fn single_peer_rtt(status: &protocol::ipc::Status, local: Option<&str>) -> Option<u32> {
@@ -1204,6 +1357,256 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
 #[cfg(test)]
 mod transform_tests {
     use super::*;
+
+    #[test]
+    fn expanded_pairing_dock_parks_phantoms_in_visible_space_to_the_right() {
+        let mut model = owner_layout();
+        for node in &mut model.nodes {
+            node.w = 140.0;
+            node.h = 80.0;
+        }
+        let shown = [Pos2::new(530.0, 180.0), Pos2::new(627.0, 180.0)];
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 60.0), Pos2::new(1216.0, 330.0));
+        let phantoms: Vec<_> = phantom_rects(&model, &shown, 0.45, viewport, 2).collect();
+        for phantom in phantoms {
+            assert!(viewport.contains_rect(phantom));
+            for (node, &at) in model.nodes.iter().zip(&shown) {
+                assert!(!phantom.intersects(node_rect(at, node, 0.45)));
+                assert!(!phantom.intersects(caption_rect(at, node, 0.45)));
+            }
+        }
+    }
+
+    #[test]
+    fn phantom_connect_click_uses_the_dock_pair_with_command() {
+        use crate::view_model::{CoreEndpoint, LocalConfig};
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
+        );
+        vm.on_connected("test");
+        vm.look.language = ui_text::Lang::En;
+        let peer = protocol::ipc::DiscoveredPeer {
+            node_id: "cc".repeat(32),
+            display_name: "HTPC".into(),
+            address: "192.168.1.123:24800".into(),
+            pairing_open: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let rect = Rect::from_min_size(Pos2::new(30.0, 30.0), Vec2::new(240.0, 135.0));
+        let pal = Palette::of(vm.look.theme);
+        let popup = egui::Id::new(("phantom", &peer.node_id)).with("popup");
+        egui::Popup::open_id(&ctx, popup);
+        let mut actions = Vec::new();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut actions);
+        });
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut actions);
+        });
+        let connect = output.shapes.iter().find_map(|shape| {
+            if let Shape::Text(label) = &shape.shape {
+                (label.galley.text() == "Connect")
+                    .then(|| Rect::from_min_size(label.pos, label.galley.size()).center())
+            } else {
+                None
+            }
+        });
+        output.drop_without_applying_deltas();
+        let connect = connect.expect("The phantom action popup offers Connect");
+        for pressed in [true, false] {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(connect),
+                        egui::Event::PointerButton {
+                            pos: connect,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    let painter = ui.painter().clone();
+                    phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut actions);
+                },
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(actions, vec![Action::PairWith(peer.address)]);
+    }
+
+    #[test]
+    fn phantom_order_is_node_id_order_not_beacon_arrival_order() {
+        use crate::view_model::{CoreEndpoint, LocalConfig};
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
+        );
+        vm.on_connected("test");
+        vm.status = Some(protocol::ipc::Status {
+            discovery_enabled: true,
+            discovered_peers: ["bb", "aa"]
+                .map(|id| protocol::ipc::DiscoveredPeer {
+                    node_id: id.repeat(32),
+                    display_name: id.to_owned(),
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        });
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let model = vm.map_model();
+        let before = model.clone();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            draw_phantoms(
+                ui,
+                &painter,
+                &Palette::of(vm.look.theme),
+                &vm,
+                &model,
+                &[],
+                Xf {
+                    origin: Pos2::ZERO,
+                    s: 1.0,
+                },
+                &mut Vec::new(),
+            );
+        });
+        let names: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let Shape::Text(label) = &shape.shape {
+                    ["aa", "bb"]
+                        .contains(&label.galley.text())
+                        .then(|| (label.galley.text().to_owned(), label.pos))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].0, "aa");
+        assert_eq!(names[1].0, "bb");
+        assert!(names[0].1.x < names[1].1.x);
+        assert_eq!(model, before);
+        assert!(model.nodes.is_empty() && model.links.is_empty());
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn phantom_placement_avoids_real_monitors_and_captions_in_every_orientation() {
+        for vertical in [false, true] {
+            for count in [2, 3] {
+                let mut model = owner_layout();
+                while model.nodes.len() < count {
+                    model.nodes.push(model.nodes[0].clone());
+                }
+                for (i, node) in model.nodes.iter_mut().enumerate() {
+                    node.at = if vertical {
+                        crate::map::Pt::new(100.0, i as f64 * 300.0)
+                    } else {
+                        crate::map::Pt::new(i as f64 * 400.0, 100.0)
+                    };
+                }
+                for scale in [0.45, 0.8, 1.0, 1.5, 3.0] {
+                    let shown: Vec<_> = model
+                        .nodes
+                        .iter()
+                        .map(|n| Pos2::new(n.at.x as f32 * scale, n.at.y as f32 * scale))
+                        .collect();
+                    let before = model.clone();
+                    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 720.0));
+                    let phantoms: Vec<_> =
+                        phantom_rects(&model, &shown, scale, viewport, 4).collect();
+                    assert_eq!(
+                        phantoms,
+                        phantom_rects(&model, &shown, scale, viewport, 4).collect::<Vec<_>>()
+                    );
+                    assert_eq!(before, model, "Discovery cannot mutate real nodes or links");
+                    for (i, phantom) in phantoms.iter().enumerate() {
+                        for (node, &at) in model.nodes.iter().zip(&shown) {
+                            assert!(!phantom.intersects(node_rect(at, node, scale)));
+                            assert!(!phantom.intersects(caption_rect(at, node, scale)));
+                        }
+                        for other in &phantoms[..i] {
+                            assert!(!phantom.intersects(*other));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phantom_caption_rows_never_overlap_in_either_language_or_theme() {
+        use crate::view_model::{CoreEndpoint, LocalConfig};
+        for theme in [
+            crate::gui_settings::Theme::Light,
+            crate::gui_settings::Theme::Dark,
+        ] {
+            for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+                for pairing_open in [false, true] {
+                    let mut vm = ViewModel::new(
+                        CoreEndpoint::Ready {
+                            description: String::new(),
+                        },
+                        LocalConfig::default(),
+                    );
+                    vm.look.language = lang;
+                    let peer = protocol::ipc::DiscoveredPeer {
+                        node_id: "cc".repeat(32),
+                        display_name: "A deliberately very long discovered computer name".into(),
+                        address: "192.168.1.123:24800".into(),
+                        system_name: "A deliberately very long operating system caption".into(),
+                        pairing_open,
+                        ..Default::default()
+                    };
+                    let ctx = egui::Context::default();
+                    super::super::install_fonts(&ctx);
+                    let rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(192.0, 108.0));
+                    let pal = Palette::of(theme);
+                    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        let painter = ui.painter().clone();
+                        phantom_ui(ui, &painter, &pal, &vm, &peer, rect, &mut Vec::new());
+                    });
+                    let texts: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| {
+                            if let Shape::Text(text) = &shape.shape {
+                                Some(Rect::from_min_size(text.pos, text.galley.size()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    assert_eq!(texts.len(), 4);
+                    for (i, text) in texts.iter().enumerate() {
+                        assert!(rect.contains_rect(*text));
+                        for other in &texts[..i] {
+                            assert!(!text.intersects(*other));
+                        }
+                    }
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
+    }
 
     #[test]
     fn monitor_hit_rect_excludes_clipped_and_empty_monitor_areas() {
@@ -1949,7 +2352,7 @@ mod transform_tests {
                         &Frame {
                             map: ui.ctx().content_rect(),
                             pal: &pal,
-                            look,
+                            look: &look,
                             simulate: false,
                             t: 0.0,
                             pointer: None,

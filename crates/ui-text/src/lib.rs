@@ -122,6 +122,11 @@ pub enum Key {
     PairingWindowOpen,
     PairingWindowClosed,
     UnknownSystem,
+    PhantomNotPaired,
+    PhantomDisplaysUnknown,
+    HideDiscovered,
+    HiddenDiscovered,
+    ShowDiscovered,
     /// «кому доверяет этот компьютер»
     WhoThisComputerTrusts,
     /// «горячие клавиши службы ввода»
@@ -851,6 +856,11 @@ const fn ru(key: Key) -> &'static str {
         Key::PairingWindowOpen => "Окно сопряжения открыто",
         Key::PairingWindowClosed => "Откройте окно сопряжения",
         Key::UnknownSystem => "ОС не указана",
+        Key::PhantomNotPaired => "Не сопряжён",
+        Key::PhantomDisplaysUnknown => "Дисплеи пока неизвестны",
+        Key::HideDiscovered => "Скрыть",
+        Key::HiddenDiscovered => "Скрытые",
+        Key::ShowDiscovered => "Показать снова",
         Key::WhoThisComputerTrusts => "кому доверяет этот компьютер",
         Key::TheInputServiceSHotkeys => "горячие клавиши службы ввода",
         Key::CopyHerePasteThere => "скопировать здесь — вставить там",
@@ -1245,6 +1255,11 @@ const fn en(key: Key) -> &'static str {
         Key::PairingWindowOpen => "Pairing window open",
         Key::PairingWindowClosed => "Open the pairing window",
         Key::UnknownSystem => "OS not reported",
+        Key::PhantomNotPaired => "Not paired",
+        Key::PhantomDisplaysUnknown => "Displays not yet known",
+        Key::HideDiscovered => "Hide",
+        Key::HiddenDiscovered => "Hidden",
+        Key::ShowDiscovered => "Show again",
         Key::WhoThisComputerTrusts => "who this computer trusts",
         Key::TheInputServiceSHotkeys => "the input service's hotkeys",
         Key::CopyHerePasteThere => "copy here, paste there",
@@ -1821,12 +1836,17 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 368] = [
+    pub const EVERY: [Key; 373] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
         Key::Diagnostics,
         Key::Settings,
+        Key::PhantomNotPaired,
+        Key::PhantomDisplaysUnknown,
+        Key::HideDiscovered,
+        Key::HiddenDiscovered,
+        Key::ShowDiscovered,
         Key::WhoThisComputerTrusts,
         Key::TheInputServiceSHotkeys,
         Key::CopyHerePasteThere,
