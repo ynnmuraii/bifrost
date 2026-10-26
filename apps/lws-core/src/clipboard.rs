@@ -25,7 +25,7 @@
 //! sender runs on a task of its own and the session only ever hands it a payload. Everything
 //! this module does *inside* the session loop is bookkeeping.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -214,18 +214,14 @@ pub struct Clipboard {
     /// Per member: the input link's connection id (the parent of its channel) and, once it is
     /// bound, the channel.
     peers: BTreeMap<NodeId, Peer>,
-    /// The offer we are waiting to hand to a peer once it binds.
-    waiting: BTreeMap<NodeId, (ClipboardMessage, Vec<u8>)>,
-    /// What we have offered a peer and it has not asked for yet, keyed by peer.
-    ///
-    /// `docs/05-protocol.md` fixes Offer → Request → Data, so the payload waits for the
-    /// `ClipboardRequest` and a peer that never asks is never flooded.
-    offered: BTreeMap<NodeId, (ClipboardMessage, Vec<u8>)>,
+    /// Offers waiting for their authorized channel to bind.
+    waiting: BTreeMap<NodeId, PendingOffer>,
+    /// Offered payloads not started yet: broadcasts wait for Request; addressed deliveries
+    /// start after the session has bound their application acknowledgement.
+    offered: BTreeMap<NodeId, PendingOffer>,
     /// The offer a peer made and we held back (`transfer = "on_focus_enter"`).
     pending_request: Option<(NodeId, [u8; 16])>,
-    /// One-shot addressed receive hints, keyed by authenticated sender.
-    directed_request: BTreeMap<NodeId, u64>,
-    /// One transfer per offer we asked for, keyed by `offer_id`.
+    /// One validated offer per incoming transfer, keyed by `offer_id`.
     incoming: BTreeMap<[u8; 16], Incoming>,
     /// Peers whose connection is closed (link down, revoke): frames still queued from them are
     /// dropped. Cleared when the peer's link comes up again.
@@ -235,7 +231,7 @@ pub struct Clipboard {
     /// Validated local carry; history applies and explicit sends do not replace it.
     payload: Vec<u8>,
     carried: Option<(cb::Offer, [u8; 32])>,
-    /// Latest addressed delivery per peer, retained through its Request/Cancel.
+    /// Latest outbound wire transfer per peer, retained through its Request/Cancel.
     deliveries: BTreeMap<NodeId, ([u8; 16], u64, [u8; 32])>,
     /// The outbound queue capacity a channel runtime is given.
     queue_capacity: usize,
@@ -257,14 +253,19 @@ struct Peer {
     remote_ip: Option<std::net::IpAddr>,
 }
 
-/// A payload we asked a peer for.
+struct PendingOffer {
+    message: ClipboardMessage,
+    payload: Vec<u8>,
+    immediate: bool,
+}
+
+/// A validated payload a peer offered.
 struct Incoming {
     /// Who is sending it: only that peer may complete it, and it ends with that peer's link.
     peer: NodeId,
     offer: cb::Offer,
     secret: bool,
     assembler: cb::Assembler,
-    requested: bool,
 }
 
 /// The agent's `ClipboardChanged` chunks, assembled before anything is decided.
@@ -301,7 +302,6 @@ impl Clipboard {
             waiting: BTreeMap::new(),
             offered: BTreeMap::new(),
             pending_request: None,
-            directed_request: BTreeMap::new(),
             incoming: BTreeMap::new(),
             down: BTreeSet::new(),
             local: None,
@@ -350,7 +350,7 @@ impl Clipboard {
             .await;
     }
 
-    /// Cancels only the addressed wire delivery named by the session.
+    /// Cancels only the wire delivery named by the session.
     pub async fn cancel_delivery(&mut self, peer: NodeId, wire_version: u64, sha256: [u8; 32]) {
         let Some(&(offer_id, version, hash)) = self.deliveries.get(&peer) else {
             return;
@@ -362,7 +362,7 @@ impl Clipboard {
         for offers in [&mut self.waiting, &mut self.offered] {
             if offers
                 .get(&peer)
-                .is_some_and(|(offer, _)| offer_id_of(offer) == Some(offer_id))
+                .is_some_and(|offer| offer_id_of(&offer.message) == Some(offer_id))
             {
                 offers.remove(&peer);
             }
@@ -590,7 +590,6 @@ impl Clipboard {
         }
         self.waiting.clear();
         self.offered.clear();
-        self.directed_request.clear();
         // A new local copy wins even while its chunks are still being assembled.
         // «Локальное копирование побеждает»: *any* new local copy — even one the policy then
         // refuses (a password) or a disabled node ignores — supersedes the transfer the wire was
@@ -633,7 +632,7 @@ impl Clipboard {
             return Err("carried clipboard changed".to_owned());
         }
         let offer = self.mint_delivery_offer(self.payload.len())?;
-        self.offer_to(peer, offer, self.payload.clone(), sha256)
+        self.offer_to(peer, offer, self.payload.clone(), sha256, true)
             .await
     }
 
@@ -644,7 +643,7 @@ impl Clipboard {
         let hash = cb::sha256(text.as_bytes())
             .try_into()
             .expect("SHA-256 length");
-        self.offer_to(peer, offer, text.as_bytes().to_vec(), hash)
+        self.offer_to(peer, offer, text.as_bytes().to_vec(), hash, true)
             .await
     }
 
@@ -686,6 +685,7 @@ impl Clipboard {
         offer: cb::Offer,
         payload: Vec<u8>,
         sha256: [u8; 32],
+        immediate: bool,
     ) -> Result<Vec<Out>, String> {
         self.require_peer(peer)?;
         if let Some(&(_, version, hash)) = self.deliveries.get(&peer) {
@@ -700,17 +700,28 @@ impl Clipboard {
             size_bytes: offer.size,
             secret_marked: false,
         };
-        let mut out = vec![Out::Delivery {
-            peer,
-            version: offer.version,
-            sha256,
-        }];
+        let mut out =
+            Vec::with_capacity(usize::from(immediate) + usize::from(state.channel.is_none()));
+        if immediate {
+            out.push(Out::Delivery {
+                peer,
+                version: offer.version,
+                sha256,
+            });
+        }
         self.deliveries
             .insert(peer, (offer.offer_id, offer.version, sha256));
         self.waiting.remove(&peer);
         self.offered.remove(&peer);
         if state.channel.is_some() {
-            self.offered.insert(peer, (message.clone(), payload));
+            self.offered.insert(
+                peer,
+                PendingOffer {
+                    message: message.clone(),
+                    payload,
+                    immediate,
+                },
+            );
             if self.runtime.send(peer, message).await.is_err() {
                 self.offered.remove(&peer);
                 self.deliveries.remove(&peer);
@@ -729,9 +740,67 @@ impl Clipboard {
                     clipboard_port: u32::from(self.clipboard_port),
                 },
             });
-            self.waiting.insert(peer, (message, payload));
+            self.waiting.insert(
+                peer,
+                PendingOffer {
+                    message,
+                    payload,
+                    immediate,
+                },
+            );
         }
         Ok(out)
+    }
+
+    async fn send_offered(&mut self, peer: NodeId, offer_id: [u8; 16]) {
+        let Entry::Occupied(entry) = self.offered.entry(peer) else {
+            return;
+        };
+        if offer_id_of(&entry.get().message) != Some(offer_id) {
+            return;
+        }
+        let PendingOffer {
+            message: offer,
+            payload,
+            ..
+        } = entry.remove();
+        let ClipboardMessage::Offer {
+            origin_version,
+            secret_marked: secret,
+            ..
+        } = offer
+        else {
+            unreachable!("only offers are retained");
+        };
+        let sha256 = self
+            .deliveries
+            .get(&peer)
+            .filter(|(id, _, _)| *id == offer_id)
+            .map(|(_, _, hash)| *hash)
+            .unwrap_or_else(|| cb::sha256(&payload).try_into().expect("SHA-256 length"));
+        let result = self
+            .runtime
+            .send_transfer(
+                peer,
+                offer_id,
+                (origin_version, sha256),
+                payload,
+                self.settings.rate_bytes_per_s,
+                secret,
+            )
+            .await;
+        if result.is_err() {
+            let _ = self
+                .runtime
+                .events
+                .send(Inbound::Failed {
+                    peer,
+                    version: origin_version,
+                    sha256,
+                    detail: "clipboard channel is unavailable".to_owned(),
+                })
+                .await;
+        }
     }
 
     /// Offers a local copy to every live clipboard member in broadcast mode.
@@ -746,7 +815,7 @@ impl Clipboard {
         for peer in peers {
             if self.require_peer(peer).is_ok() {
                 if let Ok(events) = self
-                    .offer_to(peer, offer.clone(), self.payload.clone(), hash)
+                    .offer_to(peer, offer.clone(), self.payload.clone(), hash, false)
                     .await
                 {
                     out.extend(events);
@@ -761,8 +830,13 @@ impl Clipboard {
         if let Some(state) = self.peers.get_mut(&peer) {
             state.channel = Some(channel_id);
         }
-        if let Some((offer, payload)) = self.waiting.remove(&peer) {
-            if self.runtime.send(peer, offer.clone()).await.is_err() {
+        if let Some(offer) = self.waiting.remove(&peer) {
+            if self
+                .runtime
+                .send(peer, offer.message.clone())
+                .await
+                .is_err()
+            {
                 if let Some((_, version, sha256)) = self.deliveries.remove(&peer) {
                     let _ = self
                         .runtime
@@ -777,10 +851,12 @@ impl Clipboard {
                 }
                 return Vec::new();
             }
-            // The payload waits for the peer's `ClipboardRequest`: Offer → Request → Data is
-            // the order `docs/05-protocol.md` fixes, and a receiver under the
-            // `on_focus_enter` policy has not asked yet.
-            self.offered.insert(peer, (offer, payload));
+            let offer_id = offer_id_of(&offer.message).expect("only offers are retained");
+            let immediate = offer.immediate;
+            self.offered.insert(peer, offer);
+            if immediate {
+                self.send_offered(peer, offer_id).await;
+            }
         }
         Vec::new()
     }
@@ -842,53 +918,7 @@ impl Clipboard {
         match message {
             offer @ ClipboardMessage::Offer { .. } => self.on_offer(peer, offer).await,
             ClipboardMessage::Request { offer_id } => {
-                let asked = matches!(
-                    self.offered.get(&peer),
-                    Some((offer, _)) if offer_id_of(offer) == Some(offer_id)
-                );
-                if asked {
-                    if let Some((offer, payload)) = self.offered.remove(&peer) {
-                        let ClipboardMessage::Offer {
-                            origin_version,
-                            secret_marked: secret,
-                            ..
-                        } = offer
-                        else {
-                            unreachable!("only offers are retained");
-                        };
-                        let sha256 = self
-                            .deliveries
-                            .get(&peer)
-                            .filter(|(id, _, _)| *id == offer_id)
-                            .map(|(_, _, hash)| *hash)
-                            .unwrap_or_else(|| {
-                                cb::sha256(&payload).try_into().expect("SHA-256 length")
-                            });
-                        let result = self
-                            .runtime
-                            .send_transfer(
-                                peer,
-                                offer_id,
-                                (origin_version, sha256),
-                                payload,
-                                self.settings.rate_bytes_per_s,
-                                secret,
-                            )
-                            .await;
-                        if result.is_err() {
-                            let _ = self
-                                .runtime
-                                .events
-                                .send(Inbound::Failed {
-                                    peer,
-                                    version: origin_version,
-                                    sha256,
-                                    detail: "clipboard channel is unavailable".to_owned(),
-                                })
-                                .await;
-                        }
-                    }
-                }
+                self.send_offered(peer, offer_id).await;
                 Vec::new()
             }
             ClipboardMessage::Data {
@@ -922,6 +952,9 @@ impl Clipboard {
             ClipboardMessage::Complete { offer_id, sha256 } => {
                 if self.incoming.get(&offer_id).is_none_or(|i| i.peer != peer) {
                     return Vec::new();
+                }
+                if self.pending_request == Some((peer, offer_id)) {
+                    self.pending_request = None;
                 }
                 let Some(incoming) = self.incoming.remove(&offer_id) else {
                     return Vec::new();
@@ -981,7 +1014,7 @@ impl Clipboard {
                 for offers in [&mut self.offered, &mut self.waiting] {
                     if offers
                         .get(&peer)
-                        .is_some_and(|(offer, _)| offer_id_of(offer) == Some(offer_id))
+                        .is_some_and(|offer| offer_id_of(&offer.message) == Some(offer_id))
                     {
                         offers.remove(&peer);
                     }
@@ -1082,11 +1115,6 @@ impl Clipboard {
                 reason: cb::ClipboardError::TooLarge,
             }];
         };
-        let directed = self.directed_request.get(&peer) == Some(&origin_version);
-        if directed {
-            self.directed_request.remove(&peer);
-        }
-        let requested = self.settings.eager || directed;
         self.incoming.insert(
             offer_id,
             Incoming {
@@ -1094,10 +1122,9 @@ impl Clipboard {
                 offer,
                 secret,
                 assembler,
-                requested,
             },
         );
-        if requested {
+        if self.settings.eager {
             let _ = self
                 .runtime
                 .send(peer, ClipboardMessage::Request { offer_id })
@@ -1110,31 +1137,17 @@ impl Clipboard {
         Vec::new()
     }
 
-    /// Requests an addressed delivery regardless of focus, before or after its offer arrives.
-    ///
-    /// The session authenticates the route notice and supplies its actual wire version.
-    pub async fn request_delivery(&mut self, peer: NodeId, wire_version: u64) {
-        if self.require_peer(peer).is_err() {
+    /// Starts an addressed transfer after the session binds its ACK and notifies any owner.
+    /// Data follows Offer directly: legacy on-focus receivers already accept that sequence.
+    pub async fn start_delivery(&mut self, peer: NodeId, version: u64, hash: [u8; 32]) {
+        if !self.offered.get(&peer).is_some_and(|offer| offer.immediate) {
             return;
         }
-        if let Some((&offer_id, incoming)) = self
-            .incoming
-            .iter_mut()
-            .find(|(_, incoming)| incoming.peer == peer && incoming.offer.version == wire_version)
-        {
-            if !incoming.requested {
-                incoming.requested = true;
-                if self.pending_request == Some((peer, offer_id)) {
-                    self.pending_request = None;
-                }
-                let _ = self
-                    .runtime
-                    .send(peer, ClipboardMessage::Request { offer_id })
-                    .await;
+        if let Some(&(offer_id, current_version, current_hash)) = self.deliveries.get(&peer) {
+            if version == current_version && hash == current_hash {
+                self.send_offered(peer, offer_id).await;
             }
-            return;
         }
-        self.directed_request.insert(peer, wire_version);
     }
 
     /// Ask the peer for the offer that was held back, now that focus is here.
@@ -1145,10 +1158,9 @@ impl Clipboard {
         let Some((peer, offer_id)) = self.pending_request.take() else {
             return;
         };
-        let Some(incoming) = self.incoming.get_mut(&offer_id) else {
+        if !self.incoming.contains_key(&offer_id) {
             return;
-        };
-        incoming.requested = true;
+        }
         tracing::info!(peer = %peer, "clipboard request on focus");
         let _ = self
             .runtime
@@ -1197,7 +1209,7 @@ impl Clipboard {
         let Some((offer, hash)) = self.carried.as_ref() else {
             return Vec::new();
         };
-        self.offer_to(peer, offer.clone(), self.payload.clone(), *hash)
+        self.offer_to(peer, offer.clone(), self.payload.clone(), *hash, false)
             .await
             .unwrap_or_default()
     }
@@ -1207,7 +1219,6 @@ impl Clipboard {
         self.peers.remove(&peer);
         self.waiting.remove(&peer);
         self.offered.remove(&peer);
-        self.directed_request.remove(&peer);
         self.deliveries.remove(&peer);
         // What the peer was sending is not delivered after it left (a revoke), even when its
         // last frames are already queued behind this call.
@@ -2007,7 +2018,7 @@ mod tests {
             .unwrap();
         let (_, current_version, current_hash) = endpoint.deliveries[&peer];
         endpoint.cancel_delivery(peer, first_version, hash).await;
-        assert_eq!(endpoint.waiting[&peer].1, b"new destination text");
+        assert_eq!(endpoint.waiting[&peer].payload, b"new destination text");
         endpoint
             .cancel_delivery(peer, current_version, [0; 32])
             .await;
@@ -2030,61 +2041,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn addressed_receive_hint_handles_both_notice_offer_orders_without_focus() {
-        for hint_first in [true, false] {
-            let (mut endpoint, root) = started_clipboard("directed-receive").await;
-            endpoint.settings.routing_policy = config::ClipboardRoutingPolicy::Broadcast;
-            assert!(!endpoint.settings.eager);
-            let peer: NodeId = [0x21; 32].into();
-            endpoint
-                .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
-                .await;
-            if hint_first {
-                endpoint.request_delivery(peer, 7).await;
-                assert_eq!(endpoint.directed_request.get(&peer), Some(&7));
-            }
-            let offer_id = [0x41; 16];
-            endpoint
-                .on_offer(
+    async fn addressed_push_and_broadcast_request_support_deferred_legacy_receivers() {
+        for immediate in [true, false] {
+            for bound in [true, false] {
+                let (mut sender, root) = started_clipboard("addressed-no-request").await;
+                sender.settings.rate_bytes_per_s = cb::CHUNK_BYTES as u64 * 4;
+                sender.settings.routing_policy = if immediate {
+                    config::ClipboardRoutingPolicy::Follow
+                } else {
+                    config::ClipboardRoutingPolicy::Broadcast
+                };
+                let (mut receiver, receiver_root) = started_clipboard("deferred-receiver").await;
+                assert!(!receiver.settings.eager);
+                let peer: NodeId = [0x21; 32].into();
+                receiver.source = cb::Source::new(*peer.as_bytes());
+                sender
+                    .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
+                    .await;
+                if bound {
+                    sender.peers.get_mut(&peer).unwrap().channel = Some([3; 16]);
+                }
+                let (tx, mut rx) = mpsc::channel::<QueuedMessage>(4);
+                let reader = tokio::spawn(std::future::pending::<()>());
+                let writer = tokio::spawn(std::future::pending::<()>());
+                sender.runtime.inner.lock().await.conns.insert(
                     peer,
-                    ClipboardMessage::Offer {
-                        offer_id,
-                        origin_node_id: *peer.as_bytes(),
-                        origin_version: 7,
-                        mime: cb::MIME.to_owned(),
-                        size_bytes: 4,
-                        secret_marked: false,
+                    Conn {
+                        generation: 1,
+                        tx,
+                        reader: reader.abort_handle(),
+                        writer: writer.abort_handle(),
+                        transfers: BTreeMap::new(),
                     },
-                )
-                .await;
-            if !hint_first {
-                assert_eq!(endpoint.pending_request, Some((peer, offer_id)));
-                endpoint.request_delivery(peer, 7).await;
+                );
+                let out = if immediate {
+                    sender.send_text_to(peer, "text").await.unwrap()
+                } else {
+                    sender.on_local_copy(b"text".to_vec(), Vec::new()).await
+                };
+                assert_eq!(
+                    out.iter()
+                        .any(|event| matches!(event, Out::Delivery { .. })),
+                    immediate
+                );
+                let (_, version, hash) = sender.deliveries[&peer];
+                assert!(sender.runtime.inner.lock().await.conns[&peer]
+                    .transfers
+                    .is_empty());
+                sender.start_delivery(peer, version, hash).await;
+                if !bound {
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "data waits for the authorized channel"
+                    );
+                    sender.on_bound(peer, [3; 16]).await;
+                }
+                let offer = rx.recv().await.expect("offer precedes data");
+                let ClipboardMessage::Offer {
+                    origin_node_id,
+                    offer_id,
+                    ..
+                } = &offer.message
+                else {
+                    panic!("expected offer");
+                };
+                let origin: NodeId = (*origin_node_id).into();
+                let offer_id = *offer_id;
+                receiver
+                    .on_link_up(origin, [1; 16], true, "127.0.0.1".parse().unwrap())
+                    .await;
+                receiver.on_peer_message(origin, offer.message).await;
+                assert_eq!(receiver.pending_request, Some((origin, offer_id)));
+                if !immediate {
+                    assert!(
+                        sender.runtime.inner.lock().await.conns[&peer]
+                            .transfers
+                            .is_empty(),
+                        "broadcast still waits for receiver intent"
+                    );
+                    receiver.on_focus().await;
+                    sender
+                        .on_peer_message(peer, ClipboardMessage::Request { offer_id })
+                        .await;
+                }
+                loop {
+                    let queued = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                        .await
+                        .expect("wire data starts after delivery intent")
+                        .expect("channel");
+                    let complete = matches!(&queued.message, ClipboardMessage::Complete { .. });
+                    let applied = receiver.on_peer_message(origin, queued.message).await;
+                    if let Some(written) = queued.written {
+                        written.send(true).unwrap();
+                    }
+                    if complete {
+                        assert!(applied.iter().any(|event| matches!(
+                            event,
+                            Out::Agent(ipc::agent_frame::Msg::SetClipboardText(_))
+                        )));
+                        assert!(applied.iter().any(|event| matches!(
+                        event,
+                        Out::History { text, direction: ipc::ClipboardHistoryDirection::Received, .. }
+                            if text == "text"
+                    )));
+                        assert!(receiver.pending_request.is_none());
+                        break;
+                    }
+                }
+                sender
+                    .on_peer_message(peer, ClipboardMessage::Request { offer_id })
+                    .await;
+                assert!(
+                    rx.try_recv().is_err(),
+                    "a late request cannot duplicate the transfer"
+                );
+                receiver.on_focus().await;
+                assert!(receiver.pending_request.is_none());
+                sender.stop().await;
+                receiver.stop().await;
+                let _ = std::fs::remove_dir_all(root);
+                let _ = std::fs::remove_dir_all(receiver_root);
             }
-            assert!(endpoint.pending_request.is_none());
-            assert!(
-                endpoint.directed_request.is_empty(),
-                "hint is consumed exactly once"
-            );
-            assert!(endpoint.incoming[&offer_id].requested);
-            // An unrelated offer still follows the configured on-focus policy.
-            endpoint
-                .on_offer(
-                    peer,
-                    ClipboardMessage::Offer {
-                        offer_id: [0x42; 16],
-                        origin_node_id: *peer.as_bytes(),
-                        origin_version: 8,
-                        mime: cb::MIME.to_owned(),
-                        size_bytes: 4,
-                        secret_marked: false,
-                    },
-                )
-                .await;
-            assert_eq!(endpoint.pending_request, Some((peer, [0x42; 16])));
-            assert!(!endpoint.incoming[&[0x42; 16]].requested);
-            endpoint.stop().await;
-            let _ = std::fs::remove_dir_all(root);
         }
     }
 
@@ -2206,7 +2283,7 @@ mod tests {
         )));
         assert!(endpoint.source.version() > offer.version);
         assert_eq!(endpoint.waiting.len(), 1);
-        assert_eq!(endpoint.waiting[&target].1, b"current");
+        assert_eq!(endpoint.waiting[&target].payload, b"current");
         assert!(!endpoint.waiting.contains_key(&other));
         endpoint.history_to_agent("local history");
         assert_eq!(endpoint.payload, b"current");
@@ -2220,7 +2297,7 @@ mod tests {
             Out::Delivery { peer, version, .. } if *peer == target && *version > offer.version
         )));
         assert_eq!(endpoint.waiting.len(), 1);
-        assert_eq!(endpoint.waiting[&target].1, b"old history");
+        assert_eq!(endpoint.waiting[&target].payload, b"old history");
         assert_eq!(endpoint.payload, b"current");
         assert_eq!(endpoint.carried, Some((offer.clone(), hash)));
         assert!(endpoint.source.applied_from_peer());
@@ -2233,7 +2310,7 @@ mod tests {
             Out::Delivery { peer, version, sha256 }
                 if *peer == target && *version > history_version && *sha256 == hash
         )));
-        assert_eq!(endpoint.waiting[&target].1, b"current");
+        assert_eq!(endpoint.waiting[&target].payload, b"current");
         assert_eq!(endpoint.carried, Some((offer, hash)));
         assert!(endpoint.source.applied_from_peer());
         endpoint.on_link_down(target).await;
@@ -2515,8 +2592,22 @@ mod tests {
             size_bytes: (cb::CHUNK_BYTES * 3) as u64,
             secret_marked: false,
         };
-        endpoint.offered.insert(peer, (offer.clone(), Vec::new()));
-        endpoint.waiting.insert(peer, (offer, Vec::new()));
+        endpoint.offered.insert(
+            peer,
+            PendingOffer {
+                message: offer.clone(),
+                payload: Vec::new(),
+                immediate: false,
+            },
+        );
+        endpoint.waiting.insert(
+            peer,
+            PendingOffer {
+                message: offer,
+                payload: Vec::new(),
+                immediate: false,
+            },
+        );
         endpoint
             .runtime
             .send_transfer(

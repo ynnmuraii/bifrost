@@ -2969,12 +2969,9 @@ impl Session {
                     sha256,
                 } => {
                     self.clipboard_delivery_started(peer, version, sha256);
-                    let item = crate::clipboard_routing::Item {
-                        origin: self.node_id,
-                        version,
-                        hash: sha256,
-                    };
-                    let _ = self.send_clipboard_route(peer, "deliver", item, peer).await;
+                    if let Some(endpoint) = self.clipboard.as_mut() {
+                        endpoint.start_delivery(peer, version, sha256).await;
+                    }
                 }
                 crate::clipboard::Out::ApplyPending {
                     peer,

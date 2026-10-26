@@ -287,14 +287,6 @@ impl Session {
                 }
             }
             "deliver"
-                if item.origin == peer
-                    && message.target_node_id.as_slice() == self.node_id.as_bytes() =>
-            {
-                if let Some(endpoint) = self.clipboard.as_mut() {
-                    endpoint.request_delivery(peer, item.version).await;
-                }
-            }
-            "deliver"
                 if self.router.owner().copied() == Some(peer) && item.origin == self.node_id =>
             {
                 let Ok(bytes) = <[u8; 32]>::try_from(message.target_node_id.as_slice()) else {
@@ -326,6 +318,9 @@ impl Session {
                                 .await
                                 .is_err()
                             {
+                                if let Some(endpoint) = self.clipboard.as_mut() {
+                                    endpoint.cancel_delivery(target, version, item.hash).await;
+                                }
                                 let _ = self
                                     .send_clipboard_route(peer, "failed", item, target)
                                     .await;
