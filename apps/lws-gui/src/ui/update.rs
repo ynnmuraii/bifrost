@@ -261,7 +261,7 @@ pub(super) fn notice(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: 
                 && !status.update_notice.starts_with("restart-gui:")
                 && !status.update_notice.starts_with("restart-gui-core:"))
     });
-    if !vm.update_notice && !remote_notice {
+    if !vm.update_notice && !remote_notice && vm.unpair_notice.is_none() {
         return;
     }
     let release = if vm.update_notice {
@@ -279,6 +279,24 @@ pub(super) fn notice(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: 
                 .inner_margin(16.0)
                 .show(ui, |ui| {
                     ui.set_max_width(420.0);
+                    if let Some(name) = &vm.unpair_notice {
+                        widgets::hint(
+                            ui,
+                            pal,
+                            &fill(vm.look.language, Key::RemoteUnpairNotice, &[name]),
+                        );
+                        if widgets::button(
+                            ui,
+                            pal,
+                            text(vm.look.language, Key::Understood),
+                            Kind::Plain,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            actions.push(Action::DismissUnpairNotice);
+                        }
+                    }
                     if let Some(release) = release {
                         widgets::hint(
                             ui,

@@ -1071,6 +1071,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
     let member = |id: &str, name: &str, online: bool, owner: bool| ipc::MemberStatus {
         app_version: String::new(),
         remote_update: false,
+        pairing_maybe_removed: false,
         node_id: id.to_owned(),
         display_name: name.to_owned(),
         online,
@@ -1284,6 +1285,7 @@ fn with_vertical_peer(view: &ViewModel) -> Option<ViewModel> {
         status.members.push(ipc::MemberStatus {
             app_version: String::new(),
             remote_update: false,
+            pairing_maybe_removed: false,
             node_id: peer,
             display_name: "LAPTOP".to_owned(),
             online: true,

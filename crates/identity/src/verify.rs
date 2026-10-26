@@ -164,12 +164,16 @@ impl PinCheck {
     }
 }
 
-/// Wraps a [`PinError`] in the rustls error type, so a caller can still recognise it.
+/// Maps unknown pins to UnknownCA; retains typed metadata for malformed certificates.
 fn refuse(error: PinError) -> Error {
+    if matches!(error, PinError::NotPinned(_)) {
+        // Only an unknown pin emits UnknownCA; malformed certificates keep their own class.
+        return Error::InvalidCertificate(CertificateError::UnknownIssuer);
+    }
     Error::InvalidCertificate(CertificateError::Other(rustls::OtherError(Arc::new(error))))
 }
 
-/// Recognises a pin refusal inside a rustls error, for the pairing driver and the GUI.
+/// Recognises malformed-certificate pin metadata; unknown pins are `UnknownIssuer`.
 pub fn pin_error(error: &Error) -> Option<&PinError> {
     match error {
         Error::InvalidCertificate(CertificateError::Other(other)) => {
@@ -305,5 +309,18 @@ impl ClientCertVerifier for PinnedClientVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_pin_uses_the_specific_unknown_issuer_alert_class() {
+        assert!(matches!(
+            refuse(PinError::NotPinned("untrusted-key".into())),
+            Error::InvalidCertificate(CertificateError::UnknownIssuer)
+        ));
     }
 }

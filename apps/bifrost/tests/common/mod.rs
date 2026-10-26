@@ -682,6 +682,26 @@ impl Node {
                 .ok_or_else(|| "kill -CONT failed".to_owned())
         }
     }
+    /// Restarts a stopped input-free core, retaining its identity, ports and state.
+    pub fn restart_without_input(&mut self) {
+        self.stop();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .expect("restart log");
+        let err = file.try_clone().expect("restart stderr");
+        self.child = Command::new(core_exe())
+            .arg("--root")
+            .arg(&self.root)
+            .args(["run", "--dry-inject", "--dry-input-events", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(file))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("restart isolated core");
+        self.pid = self.child.id();
+    }
 
     /// Stops the core the documented way (`quit`), falling back to a kill.
     pub fn stop(&mut self) {

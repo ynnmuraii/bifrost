@@ -33,6 +33,7 @@ fn a_third_node_mesh_names_this_computer_from_the_local_id() {
     status.members.push(ipc::MemberStatus {
         app_version: String::new(),
         remote_update: false,
+        pairing_maybe_removed: false,
         node_id: OWNER.to_owned(),
         display_name: "htpc".to_owned(),
         online: true,

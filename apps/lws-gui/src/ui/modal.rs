@@ -547,6 +547,23 @@ fn pairs_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Ve
             actions.push(Action::SelectRevoke(Some(peer.node_id.clone())));
         }
         ui.allocate_space(Vec2::new(right - left, 14.0 + 44.0 + 16.0));
+        if peer.pairing_maybe_removed {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(20.0);
+                widgets::hint(ui, pal, text(lang, Key::PairingMaybeRemoved));
+                widgets::hint(ui, pal, "·");
+                act(
+                    ui,
+                    pal,
+                    text(lang, Key::Remove),
+                    Kind::Plain,
+                    true,
+                    actions,
+                    || Action::RevokePeer(crate::view_model::node_id_bytes(&peer.node_id)),
+                );
+            });
+            ui.add_space(8.0);
+        }
         if asking {
             let id = peer.node_id.clone();
             ui.horizontal(|ui| {

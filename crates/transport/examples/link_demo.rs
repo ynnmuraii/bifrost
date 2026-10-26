@@ -112,6 +112,9 @@ async fn spawn_node(
                 LinkEvent::Down { peer, reason } => {
                     println!("  [{label}] link down with {peer}: {reason:?}")
                 }
+                LinkEvent::PeerRejected { peer } => {
+                    println!("  [{label}] peer {peer} no longer recognizes this identity")
+                }
                 // The demo opens no pairing window, so this never arrives.
                 LinkEvent::Pairing(_) => {}
             }

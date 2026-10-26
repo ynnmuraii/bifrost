@@ -284,7 +284,10 @@ pub fn adopt_capabilities(current: &mut Capabilities, names: &[String]) {
 
 /// The `Hello.capabilities` numbers for the bits the FSM and the product use.
 pub fn capability_bits(capabilities: Capabilities) -> Vec<i32> {
-    let mut bits = vec![wire::Capability::ClipboardApplyAck as i32];
+    let mut bits = vec![
+        wire::Capability::ClipboardApplyAck as i32,
+        wire::Capability::UnpairNotice as i32,
+    ];
     if capabilities.capture {
         bits.push(wire::Capability::Capture as i32);
     }

@@ -504,6 +504,7 @@ version = "0.3.0"
 dependencies = [
  "clipboard",
  "config",
+ "identity",
  "ipc",
  "lws-agent",
  "lws-core",
@@ -4431,10 +4432,12 @@ dependencies = [
  "logging",
  "protocol",
  "rustls",
+ "serde",
  "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
  "windows-sys 0.61.2",
 ]

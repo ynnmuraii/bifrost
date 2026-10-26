@@ -1325,6 +1325,13 @@ pub fn forget_node(layout: &mut config::TopologyConfig, node: NodeId) {
     }
 }
 
+/// A local trust tombstone wins over a stale shared layout, even without a coordinator.
+pub fn forget_revoked_nodes(layout: &mut config::TopologyConfig, trust: &identity::TrustStore) {
+    for record in trust.peers.iter().filter(|record| !record.is_active()) {
+        forget_node(layout, record.node_id);
+    }
+}
+
 /// A new direct pairing restores map eligibility, never the old placement or links.
 pub fn rejoin_node(layout: &mut config::TopologyConfig, node: NodeId) {
     layout
@@ -3462,6 +3469,29 @@ logical = [0, 0, 800, 600]
 mod unpair_tests {
     use super::*;
     use crate::layout::{Edit, EditOutcome, Layout, Pair, TopologyOutcome};
+
+    #[test]
+    fn durable_local_revocation_overrides_stale_shared_reports_without_changing_other_pairs() {
+        let local = NodeId::new([1; 32]);
+        let removed = NodeId::new([2; 32]);
+        let other = NodeId::new([3; 32]);
+        let mut trust = identity::TrustStore::new();
+        for peer in [removed, other] {
+            trust.trust(identity::TrustedPeer::paired(peer, "PEER", None, 0));
+        }
+        assert!(trust.revoke(&removed, 1));
+        let restored = identity::TrustStore::from_toml(&trust.to_toml().unwrap()).unwrap();
+        let mut stale = auto_layout(&[removed]).unwrap();
+        forget_revoked_nodes(&mut stale, &restored);
+        assert!(is_forgotten(&stale, &removed));
+        assert!(!is_forgotten(&stale, &other));
+        let reports = BTreeMap::from([(removed, (999, Vec::new())), (other, (1, Vec::new()))]);
+        let (_, peers) = live_inputs(&stale, local.as_bytes(), None, &reports);
+        assert!(!peers.iter().any(|(peer, _)| *peer == removed));
+        assert!(peers.iter().any(|(peer, _)| *peer == other));
+        assert!(restored.is_trusted(&other));
+        assert!(!restored.is_trusted(&removed));
+    }
 
     #[test]
     fn coordinator_and_follower_unpair_replicate_without_transitive_trust() {

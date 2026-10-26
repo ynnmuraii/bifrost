@@ -140,6 +140,17 @@ impl Session {
     /// reports), and stay at zero — the GUI's «unknown» — until a link has answered enough
     /// pings.
     pub(crate) async fn gui_status(&mut self) -> ipc::Status {
+        // Finish awaits before constructing the large protobuf reply.
+        let pending_unpairs = self
+            .manager
+            .pending_unpairs()
+            .await
+            .into_iter()
+            .map(|notice| ipc::PendingUnpairNotice {
+                node_id: crate::command::node_id_hex(&notice.peer),
+                created_unix_secs: notice.created_unix_secs,
+            })
+            .collect();
         let focus = self.router.focus();
         let lease_peer = self.lease_peer();
         let owner = self.router.owner().copied();
@@ -180,6 +191,12 @@ impl Session {
                             .peers
                             .get(&record.node_id)
                             .is_some_and(|(_, capable)| *capable),
+                    pairing_maybe_removed: pairing_maybe_removed(
+                        connected,
+                        self.peer_rejected_since
+                            .get(&record.node_id)
+                            .map(std::time::Instant::elapsed),
+                    ),
                 }
             })
             .collect();
@@ -264,6 +281,9 @@ impl Session {
             game_guard_block_apps: self.game_guard.block_apps.clone(),
             game_guard_allow_apps: self.game_guard.allow_apps.clone(),
             game_guard_last_app: self.game_guard_last_app.clone(),
+            pending_unpairs,
+            unpair_notice: self.unpair_notice.clone(),
+            unpair_notice_id: self.unpair_notice_id,
         }
     }
 
@@ -1355,9 +1375,7 @@ impl Session {
         ok()
     }
 
-    /// `RevokePeer`: remove trust from new handshakes, then close current links.
-    ///
-    /// The manager shares this pin set with its live TLS verifiers.
+    /// A local revoke persists the restricted retry before dropping ordinary trust.
     pub(crate) async fn revoke_peer(&mut self, peer: &[u8]) -> ipc::OpResult {
         let Some(node) = node_id_of(peer) else {
             return bad_request();
@@ -1365,7 +1383,44 @@ impl Session {
         if node == self.node_id {
             return bad_request();
         }
-        let removed_trust = self.trust.forget(&node);
+        if self.trust.is_trusted(&node) {
+            let state = self.paths.state_dir().join("pending-unpairs.toml");
+            if let Err(error) = self.manager.queue_unpair(node, &state).await {
+                tracing::warn!(%error, "cannot persist the pending unpair notice");
+                return ipc::OpResult {
+                    ok: false,
+                    error_code: "UNPAIR_NOTICE_WRITE".to_owned(),
+                };
+            }
+        }
+        self.forget_peer(node).await
+    }
+
+    /// A link can remove trust only in its own authenticated identity.
+    pub(super) async fn receive_unpaired(
+        &mut self,
+        peer: NodeId,
+        notice: protocol::wire::Unpaired,
+    ) {
+        if node_id_of(&notice.requester_node_id) != Some(peer) || !self.trust.is_trusted(&peer) {
+            return;
+        }
+        let name = self
+            .trust
+            .get(&peer)
+            .map(|record| record.display_name.clone());
+        let result = self.forget_peer(peer).await;
+        if result.ok {
+            self.unpair_notice = name.unwrap_or_default();
+            self.unpair_notice_id = self.unpair_notice_id.saturating_add(1);
+            tracing::info!(%peer, "peer removed pairing with this computer");
+        }
+    }
+
+    /// Both removal paths share the same trust and stale-layout tombstones.
+    async fn forget_peer(&mut self, node: NodeId) -> ipc::OpResult {
+        let mut trust = self.trust.clone();
+        let removed_trust = trust.revoke(&node, identity::trust::now_unix_ms());
         if !removed_trust && !crate::topology::layout_has_node(&self.layout, &node) {
             return ipc::OpResult {
                 ok: false,
@@ -1373,16 +1428,22 @@ impl Session {
             };
         }
         if let Err(error) = if removed_trust {
-            self.trust.save(&self.paths.trust_file()).map(|_| ())
+            trust.save(&self.paths.trust_file()).map(|_| ())
         } else {
             Ok(())
         } {
             tracing::warn!(%error, "cannot write the trust record");
+            let state = self.paths.state_dir().join("pending-unpairs.toml");
+            if let Err(error) = self.manager.load_pending_unpairs(&state).await {
+                tracing::warn!(%error, "cannot discard the uncommitted unpair notice");
+            }
             return ipc::OpResult {
                 ok: false,
                 error_code: "TRUST_WRITE".to_owned(),
             };
         }
+        self.trust = trust;
+        self.peer_rejected_since.remove(&node);
         if let Err(error) = self.manager.remove_peer(&node).await {
             tracing::warn!(%error, "cannot remove the live peer pin");
         }
@@ -1393,8 +1454,12 @@ impl Session {
         // A revoke is the one case where the last known manifest goes away with the peer:
         // a link drop keeps it, so the map still shows the computer offline.
         self.peer_displays.remove(&node);
+        self.pending_default_layout = None;
+        self.display_id_migration = None;
         let mut layout = self.layout.clone();
         crate::topology::forget_node(&mut layout, node);
+        self.layout = layout.clone();
+        self.rebuild_topology();
         let text = match toml::to_string_pretty(&layout) {
             Ok(text) => text,
             Err(error) => {
@@ -1411,10 +1476,12 @@ impl Session {
             .await;
         if let super::Handled::Reply(crate::ctl::Response::Error { code, detail }) = result {
             tracing::warn!(%code, %detail, "unpair layout edit remains pending");
-            return ipc::OpResult {
-                ok: false,
-                error_code: code,
-            };
+            if code != "NO_COORDINATOR" {
+                return ipc::OpResult {
+                    ok: false,
+                    error_code: code,
+                };
+            }
         }
         self.rebuild_topology();
         tracing::info!(
@@ -1576,6 +1643,10 @@ async fn answer(out: &mpsc::Sender<Outgoing>, request_id: u64, message: Msg) {
         Ok(Err(_)) => tracing::debug!("a GUI connection went away before its answer"),
         Err(_) => tracing::warn!("a GUI did not take its answer; dropping it"),
     }
+}
+
+fn pairing_maybe_removed(online: bool, rejected_for: Option<std::time::Duration>) -> bool {
+    !online && rejected_for.is_some_and(|elapsed| elapsed >= std::time::Duration::from_secs(300))
 }
 
 /// The focus state in the words `docs/ipc.proto` fixes for `Status.focus` («LOCAL / PREPARING
@@ -1944,5 +2015,25 @@ mod rtt_tests {
             status_rtt(fr::FocusState::Local, None, &[]),
             RttSnapshot::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod unpair_tests {
+    use super::pairing_maybe_removed;
+    use std::time::Duration;
+
+    #[test]
+    fn fallback_requires_a_long_explicit_rejection_and_an_offline_peer() {
+        assert!(
+            !pairing_maybe_removed(false, None),
+            "network failure is not evidence"
+        );
+        assert!(!pairing_maybe_removed(
+            false,
+            Some(Duration::from_secs(299))
+        ));
+        assert!(pairing_maybe_removed(false, Some(Duration::from_secs(300))));
+        assert!(!pairing_maybe_removed(true, Some(Duration::from_secs(600))));
     }
 }

@@ -22,14 +22,15 @@
 //! Two integrity rules are enforced here:
 //!
 //! * «TRUSTED_PEER с `revoked_at` не может открыть сеанс» — [`TrustStore::is_trusted`]
-//!   and [`TrustStore::pinned`] ignore revoked records, so a revoked peer fails the
-//!   pinned handshake instead of reaching `Hello`.
+//!   and [`TrustStore::pinned`] ignore revoked records. Transport may retain a separate,
+//!   expiring pin solely to deliver `Unpaired`; it cannot establish a runtime session.
 //! * «повторное сопряжение создаёт новую запись» — [`TrustStore::trust`] removes any
 //!   previous record for that `node_id` and appends a fresh one, so a changed key always
 //!   yields a new `paired_at` and never silently un-revokes by accident.
 //!
-//! Trust is pairwise and local: nothing here is exchanged with other members
-//! (ADR-011: «Отзыв — локальный ... но не рассылает отзыв другим членам»).
+//! Trust stays pairwise, never transitive: an authenticated `Unpaired` can revoke only
+//! its sender's own pairing, not another member. Revoked records remain as local tombstones
+//! so core can exclude removed peers even when an older shared layout reappears.
 
 use std::collections::BTreeSet;
 use std::path::Path;

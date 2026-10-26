@@ -64,6 +64,8 @@ pub enum LinkEvent {
     /// [`crate::PairingGate::admit`]; the application runs [`identity::accept_stream`] on
     /// the stream and calls [`crate::PairingGate::finish`] once the ceremony concludes.
     Pairing(Box<crate::pairing::PairingConnection>),
+    /// The remote TLS endpoint explicitly rejected our certificate as unknown.
+    PeerRejected { peer: NodeId },
     /// TLS and the `Hello` exchange finished.
     Up {
         /// The peer.
@@ -588,6 +590,7 @@ fn edge_snapshot(counters: &[AtomicU64; 6]) -> input_model::EdgeCounters {
 pub struct LinkHandle {
     peer: NodeId,
     tx: mpsc::Sender<Outbound>,
+    unpair_tx: mpsc::Sender<(wire::Unpaired, tokio::sync::oneshot::Sender<bool>)>,
     dropped_motion: Arc<AtomicU64>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
     /// This connection's `Ping`/`Pong` measurements; a reconnect starts a new one.
@@ -602,6 +605,20 @@ pub struct LinkHandle {
 }
 
 impl LinkHandle {
+    /// Completes only after the notice has been flushed, and closes this link gracefully.
+    pub async fn send_unpaired(&self, notice: wire::Unpaired) -> Result<(), TransportError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.unpair_tx
+            .send((notice, reply))
+            .await
+            .map_err(|_| TransportError::LinkClosed)?;
+        if result.await.unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(TransportError::LinkClosed)
+        }
+    }
+
     /// The peer this handle talks to.
     pub const fn peer(&self) -> &NodeId {
         &self.peer
@@ -794,9 +811,11 @@ impl LinkHandle {
     #[cfg(test)]
     pub(crate) fn for_counter_test(peer: NodeId) -> Self {
         let (tx, _rx) = mpsc::channel(1);
+        let (unpair_tx, _unpair_rx) = mpsc::channel(1);
         Self {
             peer,
             tx,
+            unpair_tx,
             dropped_motion: Arc::new(AtomicU64::new(0)),
             lease_diagnostics: Arc::new(LeaseTransportCounters::default()),
             rtt: Arc::new(Mutex::new(RttMeter::default())),
@@ -830,6 +849,8 @@ pub struct Link {
 /// Where a link reports to (the manager's internal channel).
 #[derive(Debug)]
 pub enum LinkReport {
+    /// An exact unknown-peer TLS alert, not a generic handshake failure.
+    PeerRejected { peer: NodeId },
     /// Handshake done.
     Up {
         /// The key the manager gave this link (see [`LinkConfig::key`]).
@@ -892,6 +913,7 @@ pub struct LinkConfig {
 /// Spawns a link and returns its handle and task.
 pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
     let (tx, rx) = mpsc::channel::<Outbound>(config.queue_capacity.max(1));
+    let (unpair_tx, unpair_rx) = mpsc::channel(1);
     let dropped_motion = Arc::new(AtomicU64::new(0));
     let lease_diagnostics = Arc::new(LeaseTransportCounters::default());
     let rtt = Arc::new(Mutex::new(RttMeter::default()));
@@ -899,12 +921,13 @@ pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
     let handle = LinkHandle {
         peer: config.peer,
         tx,
+        unpair_tx,
         dropped_motion,
         lease_diagnostics: Arc::clone(&lease_diagnostics),
         rtt: Arc::clone(&rtt),
         shutdown: Arc::clone(&shutdown),
     };
-    let task = tokio::spawn(run(config, rx, lease_diagnostics, rtt, shutdown));
+    let task = tokio::spawn(run(config, rx, lease_diagnostics, rtt, shutdown, unpair_rx));
     Ok(Link { handle, task })
 }
 
@@ -914,6 +937,7 @@ async fn run(
     lease_diagnostics: Arc<LeaseTransportCounters>,
     rtt: Arc<Mutex<RttMeter>>,
     shutdown: Arc<tokio::sync::Notify>,
+    mut unpair_rx: mpsc::Receiver<(wire::Unpaired, tokio::sync::oneshot::Sender<bool>)>,
 ) {
     let LinkConfig {
         key,
@@ -981,6 +1005,7 @@ async fn run(
     }
 
     let mut outbound = outbound;
+    let mut unpair_reply = None;
     let reason = loop {
         let now_ms = state.started.elapsed().as_millis() as u64;
         let wake =
@@ -990,6 +1015,7 @@ async fn run(
         enum Step {
             Frame,
             Outbound(Option<Outbound>),
+            Unpair(wire::Unpaired, tokio::sync::oneshot::Sender<bool>),
             Tick,
             /// `close()` could not use the queue (it was full): the request came out of band.
             Shutdown,
@@ -1003,14 +1029,37 @@ async fn run(
                 Step::Frame
             },
             item = outbound.recv() => Step::Outbound(item),
+            Some((notice, reply)) = unpair_rx.recv() => Step::Unpair(notice, reply),
             () = tokio::time::sleep(sleep) => Step::Tick,
             () = shutdown.notified() => Step::Shutdown,
         };
 
         match step {
+            Step::Unpair(notice, reply) => {
+                let sent = state.announced
+                    && state.unpair_notice
+                    && notice.requester_node_id == local_hello.node_id;
+                let sent = if sent {
+                    let envelope = state.envelope(wire::envelope::Payload::Unpaired(notice));
+                    write_frame(&mut writer, &envelope).await.is_ok()
+                } else {
+                    false
+                };
+                if sent {
+                    unpair_reply = Some(reply);
+                    break LinkDownReason::LocalClosed;
+                }
+                let _ = reply.send(false);
+            }
             Step::Frame => match incoming {
                 None => break LinkDownReason::Io("reader stopped".into()),
-                Some(Err(error)) => break reason_from(error),
+                Some(Err(error)) => {
+                    if matches!(&error, TransportError::Io(error) if crate::unpair::unknown_peer_alert(error))
+                    {
+                        let _ = reports.send(LinkReport::PeerRejected { peer }).await;
+                    }
+                    break reason_from(error);
+                }
                 Some(Ok(envelope)) => {
                     match state
                         .on_frame(
@@ -1102,6 +1151,9 @@ async fn run(
         .await;
     }
     reader_task.abort();
+    if let Some(reply) = unpair_reply {
+        let _ = reply.send(true);
+    }
     report_down(&reports, key, peer, reason).await;
 }
 
@@ -1119,6 +1171,7 @@ struct LinkState {
     tx_seq: u64,
     connection_id: [u8; 16],
     announced: bool,
+    unpair_notice: bool,
     started: tokio::time::Instant,
     last_pong_ms: u64,
     last_ping_ms: Option<u64>,
@@ -1152,6 +1205,7 @@ impl LinkState {
             tx_seq: 1,
             connection_id,
             announced: false,
+            unpair_notice: false,
             started: lease_diagnostics.trace.started,
             last_pong_ms: 0,
             last_ping_ms: None,
@@ -1340,6 +1394,12 @@ impl LinkState {
                 .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
             self.connection_id = negotiated.connection_id;
             self.announced = true;
+            self.unpair_notice = hello
+                .capabilities
+                .contains(&(wire::Capability::UnpairNotice as i32))
+                && local_hello
+                    .capabilities
+                    .contains(&(wire::Capability::UnpairNotice as i32));
             // The `Hello` is the first frame of the peer's direction, and
             // `on_remote_hello` already rejected anything but `seq = 1`; prime the validator
             // with it so the next frame (which is `seq = 2`) is accepted.
@@ -1370,6 +1430,18 @@ impl LinkState {
         validate::envelope(envelope)
             .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
         match &envelope.payload {
+            Some(wire::envelope::Payload::Unpaired(notice)) => {
+                if !self.unpair_notice
+                    || !crate::unpair::authenticated_notice(
+                        envelope,
+                        self.peer,
+                        self.connection_id,
+                        notice,
+                    )
+                {
+                    return Ok(());
+                }
+            }
             Some(wire::envelope::Payload::CapabilitiesChanged(_))
             | Some(wire::envelope::Payload::UpdateRequest(_))
             | Some(wire::envelope::Payload::UpdateResult(_))

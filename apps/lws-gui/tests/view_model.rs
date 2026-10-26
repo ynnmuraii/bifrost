@@ -23,6 +23,120 @@ use support::{
 };
 
 #[test]
+fn remote_unpair_notice_is_deduplicated_by_monotonic_id_not_name() {
+    let mut vm = view();
+    let mut status = status_with("LOCAL");
+    status.unpair_notice = "Peer".into();
+    vm.apply(event(Msg::Status(status.clone())));
+    assert!(vm.unpair_notice.is_none(), "zero is not a notice");
+
+    status.unpair_notice_id = 7;
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(vm.unpair_notice.as_deref(), Some("Peer"));
+    vm.local(&Action::DismissUnpairNotice);
+    vm.apply(event(Msg::Status(status.clone())));
+    assert!(
+        vm.unpair_notice.is_none(),
+        "a push must not reopen a dismissed notice"
+    );
+
+    status.unpair_notice_id = 6;
+    status.unpair_notice = "Other peer".into();
+    vm.apply(event(Msg::Status(status.clone())));
+    assert!(
+        vm.unpair_notice.is_none(),
+        "older notices stay acknowledged"
+    );
+
+    vm.on_connected("test");
+    status.unpair_notice_id = 7;
+    vm.apply(event(Msg::Status(status.clone())));
+    assert!(
+        vm.unpair_notice.is_none(),
+        "reconnect retains the high-water mark"
+    );
+    status.unpair_notice_id = 8;
+    status.unpair_notice = "Peer".into();
+    vm.apply(event(Msg::Status(status.clone())));
+    assert_eq!(
+        vm.unpair_notice.as_deref(),
+        Some("Peer"),
+        "same name, new event"
+    );
+    vm.local(&Action::DismissUnpairNotice);
+    status.unpair_notice_id = 9;
+    status.unpair_notice.clear();
+    vm.apply(event(Msg::Status(status)));
+    assert!(vm.unpair_notice.is_none(), "empty notices are not shown");
+
+    let mut restarted = status_with("LOCAL");
+    vm.apply(event(Msg::Status(restarted.clone())));
+    assert!(vm.unpair_notice.is_none());
+    restarted.unpair_notice_id = 1;
+    restarted.unpair_notice = "Peer".into();
+    vm.apply(event(Msg::Status(restarted)));
+    assert_eq!(
+        vm.unpair_notice.as_deref(),
+        Some("Peer"),
+        "restarted core has a fresh sequence"
+    );
+
+    for (lang, expected) in [
+        (
+            ui_text::Lang::Ru,
+            "Peer удалил сопряжение с этим компьютером",
+        ),
+        (ui_text::Lang::En, "Peer removed pairing with this computer"),
+    ] {
+        assert_eq!(
+            ui_text::fill(lang, ui_text::Key::RemoteUnpairNotice, &[&"Peer"]),
+            expected
+        );
+    }
+}
+
+#[test]
+fn suspected_unpair_requires_an_offline_flagged_member_and_uses_local_revoke() {
+    let mut vm = view();
+    for (online, flagged, expected) in [
+        (true, false, false),
+        (true, true, false),
+        (false, false, false),
+        (false, true, true),
+    ] {
+        let mut status = status_with("LOCAL");
+        let peer = status
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == PEER_NODE)
+            .unwrap();
+        peer.online = online;
+        peer.pairing_maybe_removed = flagged;
+        vm.apply(event(Msg::Status(status)));
+        let peers = vm.peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].pairing_maybe_removed, expected);
+        assert_eq!(peers[0].node_id, PEER_NODE);
+    }
+    let action = Action::RevokePeer(lws_gui::view_model::node_id_bytes(PEER_NODE));
+    let Some((Request::RevokePeer, Msg::RevokePeer(revoke))) = action.wire() else {
+        panic!("fallback must use the existing local revoke");
+    };
+    assert_eq!(
+        revoke.peer_node_id,
+        lws_gui::view_model::node_id_bytes(PEER_NODE)
+    );
+    assert_eq!(
+        ui_text::text(ui_text::Lang::Ru, ui_text::Key::PairingMaybeRemoved),
+        "возможно, сопряжение удалено на том компьютере"
+    );
+    assert_eq!(
+        ui_text::text(ui_text::Lang::En, ui_text::Key::PairingMaybeRemoved),
+        "pairing may have been removed on that computer"
+    );
+}
+
+#[test]
 fn game_guard_pill_is_local_and_shows_the_reason_in_both_languages() {
     let mut vm = view();
     vm.apply(event(Msg::TopologyDoc(two_node_doc(1))));

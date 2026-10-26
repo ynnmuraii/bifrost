@@ -532,6 +532,10 @@ async fn run_async(
     };
     let (manager, link_events) =
         LinkManager::new(manager_config).map_err(|error| format!("link manager: {error}"))?;
+    manager
+        .load_pending_unpairs(&paths.state_dir().join("pending-unpairs.toml"))
+        .await
+        .map_err(|error| format!("pending unpair notices: {error}"))?;
     let manager = Arc::new(manager);
     let runner = Arc::clone(&manager);
     tokio::spawn(async move {

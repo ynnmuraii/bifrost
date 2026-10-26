@@ -8,6 +8,8 @@ pub mod pairing;
 pub mod policy;
 pub mod queue;
 pub mod rtt;
+mod unpair;
+pub use unpair::PendingUnpairNotice;
 
 pub use clipboard::{
     dial_clipboard, ClipboardConnection, ClipboardListener, ClipboardMessage, ClipboardReader,

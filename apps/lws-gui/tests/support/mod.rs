@@ -96,6 +96,9 @@ pub fn status_with(focus: &str) -> ipc::Status {
         allow_remote_update: true,
         update_nodes: Vec::new(),
         update_notice: String::new(),
+        pending_unpairs: Vec::new(),
+        unpair_notice: String::new(),
+        unpair_notice_id: 0,
         game_guard_signals: None,
         game_guard_mode: "auto".into(),
         game_guard_reason: String::new(),
@@ -106,6 +109,7 @@ pub fn status_with(focus: &str) -> ipc::Status {
             ipc::MemberStatus {
                 app_version: String::new(),
                 remote_update: false,
+                pairing_maybe_removed: false,
                 node_id: SELF_NODE.to_owned(),
                 display_name: "Workstation".to_owned(),
                 online: true,
@@ -115,6 +119,7 @@ pub fn status_with(focus: &str) -> ipc::Status {
             ipc::MemberStatus {
                 app_version: String::new(),
                 remote_update: false,
+                pairing_maybe_removed: false,
                 node_id: PEER_NODE.to_owned(),
                 display_name: "linux-box".to_owned(),
                 online: true,

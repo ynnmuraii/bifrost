@@ -666,6 +666,11 @@ pub struct Session {
     active_layout: String,
     /// The last pairing refusal, for `Status.last_error_code`.
     pairing_error: Option<String>,
+    /// Latest authenticated remote removal, replayed to the GUI with a deduplication id.
+    unpair_notice: String,
+    unpair_notice_id: u64,
+    /// Only an explicit unknown-peer TLS alert starts the conservative fallback timer.
+    peer_rejected_since: BTreeMap<NodeId, Instant>,
     /// Last second in which an input batch was logged at the agent boundary.
     last_agent_inject_log: Option<Instant>,
     /// Last second in which captured input forwarding was logged.
@@ -812,6 +817,9 @@ impl Session {
             active_layout: String::new(),
             last_agent_inject_log: None,
             pairing_error: None,
+            unpair_notice: String::new(),
+            unpair_notice_id: 0,
+            peer_rejected_since: BTreeMap::new(),
             last_input_batch_log: None,
             input_diagnostics: InputDiagnostics::default(),
             discovery: discovery::Discovery::default(),
@@ -843,6 +851,7 @@ impl Session {
     /// Assembles the layout using the configured snapshot until a non-empty live report
     /// arrives for a member.
     fn rebuild_topology(&mut self) {
+        crate::topology::forget_revoked_nodes(&mut self.layout, &self.trust);
         let (displays, peers) = crate::topology::live_inputs(
             &self.layout,
             self.node_id.as_bytes(),
@@ -1205,7 +1214,8 @@ impl Session {
                     tracing::warn!(%error, "GUI channel error");
                 }
                 Step::Gui => match gui_request {
-                    Some(request) => self.on_gui_request(request).await,
+                    // Complete GUI replies must not enlarge the input loop's debug poll stack.
+                    Some(request) => Box::pin(self.on_gui_request(request)).await,
                     None => {
                         // Unreachable while `gui_requests_tx` lives here; if it ever closes, the
                         // loop must not spin on it.
@@ -2570,6 +2580,7 @@ impl Session {
                 if !self.trust.is_trusted(&peer) {
                     return;
                 }
+                self.peer_rejected_since.remove(&peer);
                 self.updates
                     .peers
                     .insert(peer, (hello.app_version.clone(), hello.remote_update));
@@ -2690,110 +2701,125 @@ impl Session {
                     .await;
                 }
             }
-            LinkEvent::Message { peer, message } => match message {
-                transport::convert::Inbound::UpdateRequest(request) => {
-                    self.remote_update(peer, request).await
+            LinkEvent::Message { peer, message } => {
+                if !self.trust.is_trusted(&peer) {
+                    return;
                 }
-                transport::convert::Inbound::UpdateResult(result) => {
-                    self.update_result(peer, result)
-                }
-                transport::convert::Inbound::Focus(message) => {
-                    static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
-                    if tracing::enabled!(tracing::Level::DEBUG)
-                        && !matches!(
+                match message {
+                    transport::convert::Inbound::Unpaired(notice) => {
+                        self.receive_unpaired(peer, notice).await;
+                    }
+                    transport::convert::Inbound::UpdateRequest(request) => {
+                        self.remote_update(peer, request).await
+                    }
+                    transport::convert::Inbound::UpdateResult(result) => {
+                        self.update_result(peer, result)
+                    }
+                    transport::convert::Inbound::Focus(message) => {
+                        static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
+                        if tracing::enabled!(tracing::Level::DEBUG)
+                            && !matches!(
+                                message,
+                                fr::Message::LeaseChallenge { .. }
+                                    | fr::Message::LeaseRenew { .. }
+                                    | fr::Message::LeaseStatus { .. }
+                            )
+                            && LOG_RATE.allow()
+                        {
+                            tracing::debug!(
+                                peer = %peer,
+                                message = routing::message_name(&message),
+                                "peer -> core"
+                            );
+                        }
+                        // Dry fault injection only: a live link whose receiver refuses
+                        // every prepare, without touching desktop input.
+                        if self.agent.is_dry()
+                            && std::env::var_os("LWS_DRY_REFUSE_PREPARE").is_some()
+                            && matches!(message, fr::Message::EnterPrepare { .. })
+                        {
+                            self.send_to(
+                                peer,
+                                fr::Message::ProtocolError {
+                                    code: fr::ErrorCode::CaptureFailed,
+                                    related_seq: 0,
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                        self.feed(fr::Input::Net {
+                            from: peer,
                             message,
-                            fr::Message::LeaseChallenge { .. }
-                                | fr::Message::LeaseRenew { .. }
-                                | fr::Message::LeaseStatus { .. }
-                        )
-                        && LOG_RATE.allow()
-                    {
-                        tracing::debug!(
-                            peer = %peer,
-                            message = routing::message_name(&message),
-                            "peer -> core"
-                        );
-                    }
-                    // Dry fault injection only: a live link whose receiver refuses
-                    // every prepare, without touching desktop input.
-                    if self.agent.is_dry()
-                        && std::env::var_os("LWS_DRY_REFUSE_PREPARE").is_some()
-                        && matches!(message, fr::Message::EnterPrepare { .. })
-                    {
-                        self.send_to(
-                            peer,
-                            fr::Message::ProtocolError {
-                                code: fr::ErrorCode::CaptureFailed,
-                                related_seq: 0,
-                            },
-                        )
+                        })
                         .await;
-                        return;
                     }
-                    self.feed(fr::Input::Net {
-                        from: peer,
-                        message,
-                    })
-                    .await;
-                }
-                transport::convert::Inbound::Layout(message) => {
-                    self.on_layout(peer, message).await;
-                }
-                transport::convert::Inbound::CapabilitiesChanged(capabilities) => {
-                    self.router.set_peer_capabilities(
-                        peer,
-                        transport::convert::capabilities_from_wire(&capabilities),
-                    );
-                    let text_clipboard =
-                        capabilities.contains(&(protocol::wire::Capability::TextClipboard as i32));
-                    self.clipboard_follow.peers.insert(
-                        peer,
-                        capabilities
-                            .contains(&(protocol::wire::Capability::ClipboardApplyAck as i32)),
-                    );
-                    tracing::info!(peer = %peer, text_clipboard, "peer capabilities updated");
-                    if let Some((connection_id, previous, remote_ip)) =
-                        self.clipboard_links.get_mut(&peer)
-                    {
-                        if *previous != text_clipboard {
-                            *previous = text_clipboard;
-                            let out = match self.clipboard.as_mut() {
-                                Some(clipboard) => {
-                                    clipboard
-                                        .on_link_up(
-                                            peer,
-                                            *connection_id,
-                                            text_clipboard,
-                                            *remote_ip,
-                                        )
-                                        .await
-                                }
-                                None => Vec::new(),
-                            };
-                            self.apply_clipboard(out).await;
+                    transport::convert::Inbound::Layout(message) => {
+                        self.on_layout(peer, message).await;
+                    }
+                    transport::convert::Inbound::CapabilitiesChanged(capabilities) => {
+                        self.router.set_peer_capabilities(
+                            peer,
+                            transport::convert::capabilities_from_wire(&capabilities),
+                        );
+                        let text_clipboard = capabilities
+                            .contains(&(protocol::wire::Capability::TextClipboard as i32));
+                        self.clipboard_follow.peers.insert(
+                            peer,
+                            capabilities
+                                .contains(&(protocol::wire::Capability::ClipboardApplyAck as i32)),
+                        );
+                        tracing::info!(peer = %peer, text_clipboard, "peer capabilities updated");
+                        if let Some((connection_id, previous, remote_ip)) =
+                            self.clipboard_links.get_mut(&peer)
+                        {
+                            if *previous != text_clipboard {
+                                *previous = text_clipboard;
+                                let out = match self.clipboard.as_mut() {
+                                    Some(clipboard) => {
+                                        clipboard
+                                            .on_link_up(
+                                                peer,
+                                                *connection_id,
+                                                text_clipboard,
+                                                *remote_ip,
+                                            )
+                                            .await
+                                    }
+                                    None => Vec::new(),
+                                };
+                                self.apply_clipboard(out).await;
+                            }
                         }
                     }
+                    transport::convert::Inbound::Clipboard {
+                        message,
+                        connection_id,
+                    } => {
+                        // A grant is the only clipboard message the input link carries, and it has
+                        // to arrive before the channel it authorises can exist.
+                        tracing::info!(peer = %peer, "clipboard grant");
+                        let out = match self.clipboard.as_mut() {
+                            Some(clipboard) => clipboard.on_grant(peer, connection_id, &message),
+                            None => Vec::new(),
+                        };
+                        self.apply_clipboard(out).await;
+                    }
+                    transport::convert::Inbound::ClipboardApplied(message) => {
+                        self.on_clipboard_applied(peer, message).await;
+                    }
+                    transport::convert::Inbound::ClipboardRoute(message) => {
+                        self.on_clipboard_route(peer, message).await;
+                    }
                 }
-                transport::convert::Inbound::Clipboard {
-                    message,
-                    connection_id,
-                } => {
-                    // A grant is the only clipboard message the input link carries, and it has
-                    // to arrive before the channel it authorises can exist.
-                    tracing::info!(peer = %peer, "clipboard grant");
-                    let out = match self.clipboard.as_mut() {
-                        Some(clipboard) => clipboard.on_grant(peer, connection_id, &message),
-                        None => Vec::new(),
-                    };
-                    self.apply_clipboard(out).await;
+            }
+            LinkEvent::PeerRejected { peer } => {
+                if self.trust.is_trusted(&peer) {
+                    self.peer_rejected_since
+                        .entry(peer)
+                        .or_insert_with(Instant::now);
                 }
-                transport::convert::Inbound::ClipboardApplied(message) => {
-                    self.on_clipboard_applied(peer, message).await;
-                }
-                transport::convert::Inbound::ClipboardRoute(message) => {
-                    self.on_clipboard_route(peer, message).await;
-                }
-            },
+            }
             LinkEvent::Down { peer, reason } => {
                 self.layout_connections.remove(&peer);
                 self.clipboard_links.remove(&peer);
@@ -4569,11 +4595,24 @@ impl Session {
         } else {
             "none"
         };
+        let notices = self.manager.pending_unpairs().await;
+        let pending = notices
+            .iter()
+            .map(|notice| {
+                format!(
+                    "{}:{}",
+                    crate::command::node_id_hex(&notice.peer),
+                    notice.created_unix_secs
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{status} game_guard={} game_guard_reason={reason} clipboard_policy={} clipboard_settle_ms={}",
+            "{status} game_guard={} game_guard_reason={reason} clipboard_policy={} clipboard_settle_ms={} pending_unpairs={}",
             reason != "none",
             self.clipboard_settings.routing_policy.as_str(),
-            self.clipboard_settings.settle_ms
+            self.clipboard_settings.settle_ms,
+            if pending.is_empty() { "-" } else { &pending }
         )
     }
 }

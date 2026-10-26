@@ -876,6 +876,9 @@ pub struct ViewModel {
     /// GUI-only updater state, also used by offscreen screenshots.
     pub update: crate::updater::State,
     pub update_notice: bool,
+    /// Remote unpair notice awaiting dismissal; repeated status pushes do not reopen it.
+    pub unpair_notice: Option<String>,
+    unpair_notice_seen: u64,
     pub update_confirm: bool,
     pub update_all_confirm: bool,
     pub checked_release: Option<crate::updater::Release>,
@@ -961,6 +964,8 @@ impl ViewModel {
             settings: Settings::default(),
             update: crate::updater::State::Idle,
             update_notice: false,
+            unpair_notice: None,
+            unpair_notice_seen: 0,
             update_confirm: false,
             update_all_confirm: false,
             checked_release: None,
@@ -1449,6 +1454,16 @@ impl ViewModel {
             );
         }
         let lang = self.look.language;
+        if status.unpair_notice_id == 0 {
+            // A restarted core has no notice yet and begins a fresh sequence.
+            self.unpair_notice_seen = 0;
+            self.unpair_notice = None;
+        } else if status.unpair_notice_id > self.unpair_notice_seen {
+            self.unpair_notice_seen = status.unpair_notice_id;
+            if !status.unpair_notice.is_empty() {
+                self.unpair_notice = Some(status.unpair_notice.clone());
+            }
+        }
         if self
             .status
             .as_ref()
@@ -2387,6 +2402,7 @@ impl ViewModel {
                 self.outcome = None;
                 self.outcome_hold = false;
             }
+            Action::DismissUnpairNotice => self.unpair_notice = None,
             Action::SetAddress(address) => self.pairing.address = address.clone(),
             Action::ToggleDetails(open) => self.pairing.details = *open,
             Action::MoveNode { node_id, x, y } => {
@@ -2586,6 +2602,8 @@ pub enum Action {
     DonePairing,
     /// Forget the last finished operation.
     DismissOutcome,
+    /// Acknowledge the remote unpair notice without reopening it on another status.
+    DismissUnpairNotice,
     /// The pointer is on (`true`) or left (`false`) the toast: its timer waits.
     HoldToast(bool),
     /// Open or close the appearance panel.

@@ -55,6 +55,7 @@ message Envelope {
     UpdateResult update_result = 43;         // only to peers advertising REMOTE_UPDATE
     ClipboardApplied clipboard_applied = 44; // only to peers advertising CLIPBOARD_APPLY_ACK
     ClipboardRoute clipboard_route = 45;     // metadata-only routing; same capability gate
+    Unpaired unpaired = 46; // authenticated sender revokes only its own pairing
   }
 }
 
@@ -79,6 +80,7 @@ enum Capability {
   CAPABILITY_EMERGENCY_HOTKEY = 10;
   CAPABILITY_REMOTE_UPDATE = 11;
   CAPABILITY_CLIPBOARD_APPLY_ACK = 12;
+  CAPABILITY_UNPAIR_NOTICE = 13;
 }
 
 enum SessionKind {
@@ -160,6 +162,11 @@ message UpdateResult {
   string target_version = 1;
   string status = 2; // pending | downloading | restarting | done | refused | unreachable
   string detail = 3;
+}
+
+message Unpaired {
+  bytes requester_node_id = 1; // exactly 32; must match the mTLS sender
+  string reason = 2; // informational only, at most 128 UTF-8 bytes
 }
 
 message Rect { double x = 1; double y = 2; double width = 3; double height = 4; }

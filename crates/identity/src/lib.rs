@@ -37,9 +37,9 @@
 //!    build a [`verify::TrustPolicy::Pairing`] configuration for any ALPN other than
 //!    `lan-workspace/pair/1`, so an unpaired node cannot reach the input or clipboard
 //!    channels; the input verifier refuses it during the handshake, before any `Hello`.
-//! 2. **A revoked peer cannot reconnect.** [`trust::TrustStore::pinned`] excludes revoked
-//!    records, so a revoke takes effect at the next handshake by construction
-//!    («TRUSTED_PEER с `revoked_at` не может открыть сеанс»).
+//! 2. **A revoked peer cannot establish a runtime session.** [`trust::TrustStore::pinned`]
+//!    excludes revoked records. Transport's separate bounded pending-notice pins permit
+//!    only a capability-checked `Hello`/`Unpaired` exchange, never membership or clipboard.
 //! 3. **The comparison code is a function of the TLS session.** It is derived from the
 //!    RFC 8446 §7.5 exporter with `attempt_id` as the context, so a MITM that terminates
 //!    two sessions cannot make the two codes agree («MITM держит два разных TLS-сеанса,

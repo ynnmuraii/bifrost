@@ -126,6 +126,8 @@ pub struct PeerRow {
     pub meta: String,
     /// In the network.
     pub online: bool,
+    /// Offline fallback supplied by the core, never inferred from discovery.
+    pub pairing_maybe_removed: bool,
 }
 
 /// The singular/few/many form of a Russian noun for `n`.
@@ -1154,6 +1156,7 @@ impl ViewModel {
                     name,
                     meta,
                     online: m.online,
+                    pairing_maybe_removed: !m.online && m.pairing_maybe_removed,
                 }
             })
             .collect()

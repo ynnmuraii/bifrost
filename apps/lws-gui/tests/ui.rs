@@ -18,6 +18,78 @@ use support::{event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE,
 
 const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
 
+#[test]
+fn remote_unpair_notice_is_localized_and_dismisses_without_reappearing() {
+    for (lang, label, close) in [
+        (
+            ui_text::Lang::Ru,
+            "Peer удалил сопряжение с этим компьютером",
+            "Понятно",
+        ),
+        (
+            ui_text::Lang::En,
+            "Peer removed pairing with this computer",
+            "Understood",
+        ),
+    ] {
+        let mut vm = connected();
+        vm.look.language = lang;
+        let mut status = status_with("LOCAL");
+        status.unpair_notice = "Peer".into();
+        status.unpair_notice_id = 1;
+        vm.apply(event(Msg::Status(status.clone())));
+        let mut harness = Harness::new();
+        let frame = harness.settle(&vm, false);
+        assert!(frame.texts.iter().any(|(text, _)| text == label));
+        let at = text_position(&mut harness, &vm, close);
+        let frame = harness.frame(&vm, false, SIZE, click_at(at));
+        assert!(frame.output.actions.contains(&Action::DismissUnpairNotice));
+        for action in &frame.output.actions {
+            vm.local(action);
+        }
+        vm.apply(event(Msg::Status(status)));
+        let frame = harness.settle(&vm, false);
+        assert!(!frame.texts.iter().any(|(text, _)| text == label));
+    }
+}
+
+#[test]
+fn offline_unpair_fallback_removes_the_peer_in_one_click() {
+    let mut vm = connected();
+    let mut status = status_with("LOCAL");
+    let peer = status
+        .members
+        .iter_mut()
+        .find(|m| m.node_id == PEER_NODE)
+        .unwrap();
+    peer.online = false;
+    peer.pairing_maybe_removed = true;
+    vm.apply(event(Msg::Status(status)));
+    vm.local(&Action::ToggleModal(Modal::Pairs));
+    let mut harness = Harness::new();
+    let frame = harness.settle(&vm, false);
+    assert!(frame.texts.iter().any(|(text, _)| {
+        text == "возможно, сопряжение удалено на том компьютере"
+    }));
+    let remove = frame
+        .texts
+        .iter()
+        .filter(|(text, _)| text == "Удалить")
+        .max_by(|(_, a), (_, b)| a.center().y.total_cmp(&b.center().y))
+        .expect("fallback remove button")
+        .1
+        .center();
+    let frame = harness.frame(&vm, false, SIZE, click_at(remove));
+    assert!(frame.output.actions.contains(&Action::RevokePeer(
+        lws_gui::view_model::node_id_bytes(PEER_NODE)
+    )));
+    assert!(!frame
+        .output
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::SelectRevoke(_))));
+}
+
 /// One frame of the window: the text it painted (with the tight box around each glyph's ink, in
 /// the frame's own coordinates), the rectangles it filled, and what it produced.
 struct Frame {

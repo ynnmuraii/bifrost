@@ -34,6 +34,7 @@ winres = "0.1"
 # processes, and read the cores' answers through the same crates the window uses.
 clipboard = { path = "../../crates/clipboard" }
 config = { path = "../../crates/config" }
+identity = { path = "../../crates/identity" }
 ipc = { path = "../../crates/ipc" }
 protocol = { path = "../../crates/protocol" }
 tokio = { version = "1", features = ["rt", "time"] }

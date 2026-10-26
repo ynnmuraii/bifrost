@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -157,6 +158,9 @@ struct PendingLink {
 
 /// Messages from the accept/dial tasks into the manager loop.
 enum ManagerMessage {
+    PeerRejected {
+        peer: NodeId,
+    },
     /// A link was spawned; the manager takes ownership of its handle.
     Register {
         key: [u8; 16],
@@ -178,9 +182,14 @@ enum ManagerMessage {
         reply: oneshot::Sender<DialTurn>,
     },
     /// A freshly paired peer to trust and dial without restarting the manager.
-    AddPeer { peer: NodeId, address: SocketAddr },
+    AddPeer {
+        peer: NodeId,
+        address: SocketAddr,
+    },
     /// Stops the dialer created for a freshly paired peer.
-    RemovePeer { peer: NodeId },
+    RemovePeer {
+        peer: NodeId,
+    },
     /// Moves only the listening socket after a local adapter address change.
     RebindListener {
         address: SocketAddr,
@@ -215,6 +224,7 @@ pub struct LinkManager {
     messages_rx: Mutex<mpsc::Receiver<ManagerMessage>>,
     events_tx: mpsc::Sender<LinkEvent>,
     inner: Arc<Mutex<Inner>>,
+    pending_unpairs: Arc<Mutex<crate::unpair::PendingUnpairs>>,
     /// The monotonic origin the pairing window's millisecond deadline is measured against.
     clock: Clock,
 }
@@ -357,10 +367,71 @@ impl LinkManager {
                 messages_rx: Mutex::new(messages_rx),
                 events_tx,
                 inner: Arc::new(Mutex::new(Inner::default())),
+                pending_unpairs: Arc::new(Mutex::new(crate::unpair::PendingUnpairs::default())),
                 clock: Clock::new(),
             },
             events_rx,
         ))
+    }
+
+    /// Loads bounded persisted notify-only pins before the listener starts.
+    pub async fn load_pending_unpairs(&self, state_path: &Path) -> Result<(), TransportError> {
+        let mut pending =
+            crate::unpair::PendingUnpairs::load(state_path, crate::unpair::now_secs())?;
+        let pins = self
+            .trusted_peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        pending.discard_trusted(&pins)?;
+        *self.pending_unpairs.lock().await = pending;
+        Ok(())
+    }
+
+    /// Returns unexpired pending notices without granting membership.
+    pub async fn pending_unpairs(&self) -> Vec<crate::PendingUnpairNotice> {
+        self.pending_unpairs
+            .lock()
+            .await
+            .records(crate::unpair::now_secs())
+    }
+
+    /// Persists the captured SPKI pin; remove_peer sends only after trust was saved.
+    pub async fn queue_unpair(
+        &self,
+        peer: NodeId,
+        state_path: &Path,
+    ) -> Result<(), TransportError> {
+        let created = crate::unpair::now_secs();
+        if !self
+            .trusted_peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&peer)
+        {
+            return Err(TransportError::Protocol(
+                "cannot queue a notice for an untrusted peer".into(),
+            ));
+        }
+        self.pending_unpairs
+            .lock()
+            .await
+            .queue(peer, state_path, created)
+    }
+
+    async fn flush_unpair(&self, peer: NodeId, created: u64) {
+        if let Some(handle) = self.handle(&peer).await {
+            let sent = tokio::time::timeout(
+                Duration::from_millis(self.settings.liveness.offline_ms.max(1)),
+                handle.send_unpaired(crate::unpair::notice(self.identity.node_id())),
+            )
+            .await;
+            if matches!(sent, Ok(Ok(()))) {
+                if let Err(error) = self.pending_unpairs.lock().await.complete(peer, created) {
+                    tracing::warn!(%error, "could not persist completed unpair notice");
+                }
+            }
+        }
     }
 
     /// Adds the newly committed trust pin and starts dialing its recorded address.
@@ -371,6 +442,19 @@ impl LinkManager {
         let address = raw_address.parse::<SocketAddr>().map_err(|error| {
             TransportError::InvalidPeerAddress(format!("{raw_address}: {error}"))
         })?;
+        let pending = self
+            .pending_unpairs
+            .lock()
+            .await
+            .records(crate::unpair::now_secs())
+            .into_iter()
+            .find(|notice| notice.peer == peer.node_id);
+        if let Some(notice) = pending {
+            self.pending_unpairs
+                .lock()
+                .await
+                .complete(notice.peer, notice.created_unix_secs)?;
+        }
         let peer_id = peer.node_id;
         self.trusted_peers
             .write()
@@ -516,6 +600,16 @@ impl LinkManager {
 
     /// Removes a peer from the live verifier and stops its dynamic dialer.
     pub async fn remove_peer(&self, peer: &NodeId) -> Result<(), TransportError> {
+        let pending = self
+            .pending_unpairs
+            .lock()
+            .await
+            .records(crate::unpair::now_secs())
+            .into_iter()
+            .find(|notice| notice.peer == *peer);
+        if let Some(notice) = pending {
+            self.flush_unpair(*peer, notice.created_unix_secs).await;
+        }
         self.remove_pin(peer);
         self.messages_tx
             .send(ManagerMessage::RemovePeer { peer: *peer })
@@ -714,6 +808,8 @@ impl LinkManager {
                     let gate = self.pairing.clone();
                     let hello = self.local_hello.read().await.clone();
                     let clock = self.clock;
+                    let pending_unpairs = Arc::clone(&self.pending_unpairs);
+                    let trusted_peers = Arc::clone(&self.trusted_peers);
                     tokio::spawn(async move {
                         serve_connection(
                             tcp,
@@ -727,6 +823,8 @@ impl LinkManager {
                             messages,
                             settings,
                             clock,
+                            pending_unpairs,
+                            trusted_peers,
                         )
                         .await;
                     });
@@ -741,6 +839,9 @@ impl LinkManager {
 
     async fn on_message(&self, message: ManagerMessage, local: NodeId, listener: &mut TcpListener) {
         match message {
+            ManagerMessage::PeerRejected { peer } => {
+                let _ = self.events_tx.send(LinkEvent::PeerRejected { peer }).await;
+            }
             ManagerMessage::RebindListener { address, reply } => {
                 let result = async {
                     if listener.local_addr()? == address {
@@ -823,6 +924,9 @@ impl LinkManager {
                 }
             }
             ManagerMessage::Report(report) => match report {
+                LinkReport::PeerRejected { peer } => {
+                    let _ = self.events_tx.send(LinkEvent::PeerRejected { peer }).await;
+                }
                 LinkReport::Up {
                     key,
                     peer,
@@ -1136,6 +1240,8 @@ async fn serve_connection(
     messages: mpsc::Sender<ManagerMessage>,
     settings: LinkSettings,
     clock: Clock,
+    pending_unpairs: Arc<Mutex<crate::unpair::PendingUnpairs>>,
+    trusted_peers: Arc<StdRwLock<BTreeSet<NodeId>>>,
 ) {
     let handshake_timeout = Duration::from_millis(settings.liveness.offline_ms.max(1));
     let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp);
@@ -1180,11 +1286,71 @@ async fn serve_connection(
         return;
     }
 
+    // Pending pins are admitted only here, never by shared_pins or clipboard TLS.
+    let notices = pending_unpairs
+        .lock()
+        .await
+        .records(crate::unpair::now_secs());
+    let link_config = if notices.is_empty() {
+        link_config
+    } else {
+        let mut pins = trusted_peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        pins.extend(notices.iter().map(|notice| notice.peer));
+        let Ok(config) =
+            identity::server_config(&identity, TrustPolicy::Pinned(pins), &identity::LINK_ALPN)
+        else {
+            return;
+        };
+        Arc::new(config)
+    };
     let stream = match tokio::time::timeout(handshake_timeout, start.into_stream(link_config)).await
     {
         Ok(Ok(stream)) => stream,
         _ => return,
     };
+    let Ok(peer) = peer_node_id(stream.get_ref().1.peer_certificates().unwrap_or_default()) else {
+        return;
+    };
+    let notice = pending_unpairs
+        .lock()
+        .await
+        .records(crate::unpair::now_secs())
+        .into_iter()
+        .find(|notice| {
+            notice.peer == peer
+                && !trusted_peers
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&peer)
+        });
+    if let Some(notice) = notice {
+        let mut stream = stream;
+        let sent = tokio::time::timeout(
+            handshake_timeout,
+            crate::unpair::notify_only(&mut stream, peer, hello),
+        )
+        .await;
+        if matches!(sent, Ok(Ok(()))) {
+            if let Err(error) = pending_unpairs
+                .lock()
+                .await
+                .complete(peer, notice.created_unix_secs)
+            {
+                tracing::warn!(%error, "could not persist completed unpair notice");
+            }
+        }
+        return;
+    }
+    if !trusted_peers
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&peer)
+    {
+        return;
+    }
     accept_one(stream, identity, hello, messages, settings).await;
 }
 
@@ -1281,10 +1447,20 @@ async fn dial_loop(
         let connected = tokio::time::timeout(dial_timeout, async {
             let tcp = TcpStream::connect(address).await.ok()?;
             tcp.set_nodelay(true).ok()?;
-            connector
+            match connector
                 .connect(identity::server_name(address.ip()), tcp)
                 .await
-                .ok()
+            {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    if crate::unpair::unknown_peer_alert(&error) {
+                        if let Some(peer) = peer {
+                            let _ = messages.send(ManagerMessage::PeerRejected { peer }).await;
+                        }
+                    }
+                    None
+                }
+            }
         })
         .await
         .ok()

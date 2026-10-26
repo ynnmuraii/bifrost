@@ -571,6 +571,8 @@ pub enum Key {
     UpdatePeersFirst,
     RemoteUpdateNotice,
     RemoteUpdateFromVersion,
+    RemoteUnpairNotice,
+    PairingMaybeRemoved,
     CheckingUpdates,
     UpToDate,
     UpdateAvailable,
@@ -1080,6 +1082,8 @@ const fn ru(key: Key) -> &'static str {
         Key::UpdatePeersFirst => "Сначала обновятся другие компьютеры, затем этот. Bifrost перезапустится; ввод вернётся сюда.",
         Key::RemoteUpdateNotice => "Запрос обновления с другого компьютера: {}",
         Key::RemoteUpdateFromVersion => "{} запросил обновление до версии {}",
+        Key::RemoteUnpairNotice => "{} удалил сопряжение с этим компьютером",
+        Key::PairingMaybeRemoved => "возможно, сопряжение удалено на том компьютере",
         Key::CheckingUpdates => "Проверяем обновления…",
         Key::UpToDate => "У вас последняя версия",
         Key::UpdateAvailable => "Доступна версия {}",
@@ -1472,6 +1476,8 @@ const fn en(key: Key) -> &'static str {
         Key::UpdatePeersFirst => "Other computers update first, then this one. Bifrost will restart; input will return here.",
         Key::RemoteUpdateNotice => "Update request from another computer: {}",
         Key::RemoteUpdateFromVersion => "{} requested an update to version {}",
+        Key::RemoteUnpairNotice => "{} removed pairing with this computer",
+        Key::PairingMaybeRemoved => "pairing may have been removed on that computer",
         Key::CheckingUpdates => "Checking for updates…",
         Key::UpToDate => "You are up to date",
         Key::UpdateAvailable => "Version {} is available",
@@ -1815,7 +1821,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 366] = [
+    pub const EVERY: [Key; 368] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -2052,6 +2058,8 @@ mod tests {
         Key::UpdatePeersFirst,
         Key::RemoteUpdateNotice,
         Key::RemoteUpdateFromVersion,
+        Key::RemoteUnpairNotice,
+        Key::PairingMaybeRemoved,
         Key::CheckingUpdates,
         Key::UpToDate,
         Key::UpdateAvailable,

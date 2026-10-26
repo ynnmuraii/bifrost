@@ -412,6 +412,13 @@ message Status {
   string game_guard_last_app = 39; // last non-Bifrost foreground app, for Settings after focusing GUI
   string clipboard_policy = 40;
   uint32 clipboard_settle_ms = 41;
+  repeated PendingUnpairNotice pending_unpairs = 42;
+  string unpair_notice = 43; // display name of the peer that removed this pairing
+  uint64 unpair_notice_id = 44; // monotonically increasing; 0 means no notice
+}
+message PendingUnpairNotice {
+  string node_id = 1;
+  uint64 created_unix_secs = 2;
 }
 // Discovery is not pairing or authentication. Address is the observed IPv4 source
 // plus the advertised input/control port ("<ip>:<port>"), never a beacon-supplied IP.
@@ -431,6 +438,7 @@ message MemberStatus {
   string link_state = 5;   // OFFLINE / CONNECTING / TLS / HELLO / READY / CLOSING
   string app_version = 6;
   bool remote_update = 7;
+  bool pairing_maybe_removed = 8; // offline peer may have removed this pairing
 }
 
 // Source-local observations only; never sent over the network.

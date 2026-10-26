@@ -308,6 +308,8 @@ pub fn from_envelope(envelope: &wire::Envelope) -> Result<fr::Message, ConvertEr
 /// mirror instead of being forced into it. Core is the only consumer of both.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inbound {
+    /// Authenticated self-only pairing revocation.
+    Unpaired(wire::Unpaired),
     /// Replacement advertised capability set; unknown optional enum values remain raw.
     CapabilitiesChanged(Vec<i32>),
     /// A remote update request, resolved against the receiver's trusted release source.
@@ -421,6 +423,7 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
     use wire::envelope::Payload;
 
     match envelope.payload.as_ref() {
+        Some(Payload::Unpaired(notice)) => Ok(Inbound::Unpaired(notice.clone())),
         Some(Payload::ClipboardApplied(applied)) => {
             validate_clipboard_applied(applied)?;
             if !envelope.lease_id.is_empty() {
@@ -1055,8 +1058,8 @@ impl PeerInfo {
 
 /// The four `focus_router::Capabilities` flags carried by `Hello.capabilities`.
 ///
-/// The wire enum has ten bits; the FSM only models `CAPTURE`, `INJECT`, `ABSOLUTE_POINTER`
-/// and `EMERGENCY_HOTKEY`, so the other bits are informational for this layer and are
+/// The FSM only models `CAPTURE`, `INJECT`, `ABSOLUTE_POINTER` and `EMERGENCY_HOTKEY`;
+/// the remaining wire capabilities are informational for this layer and are
 /// dropped rather than guessed at. The numbers are read through the generated
 /// `protocol::wire::Capability`, never as bare literals, and the match below is exhaustive
 /// over that enum: a bit added to the `.proto` fails the build until its mapping is
@@ -1083,7 +1086,8 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::ReceiverTakeover
             | WireCapability::DisplaysChanged
             | WireCapability::RemoteUpdate
-            | WireCapability::ClipboardApplyAck => {}
+            | WireCapability::ClipboardApplyAck
+            | WireCapability::UnpairNotice => {}
         }
     }
     out
