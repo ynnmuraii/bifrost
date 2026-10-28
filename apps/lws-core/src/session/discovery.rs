@@ -137,7 +137,8 @@ impl Session {
             let Some(selected) = adapters.first() else {
                 return;
             };
-            let address = SocketAddr::new(selected.address.into(), self.listen.port());
+            let (address, clipboard_address) =
+                selected_listener_addresses(selected.address, self.listen, self.clipboard_listen);
             if address != self.listen {
                 match self.manager.rebind_listener(address).await {
                     Ok(bound) => self.listen = bound,
@@ -161,6 +162,24 @@ impl Session {
                 if let Some(network) = self.discovery.network.as_mut() {
                     network.listen_address = value;
                 }
+            }
+            if clipboard_address != self.clipboard_listen {
+                if let Some(clipboard) = self.clipboard.as_mut() {
+                    match clipboard.rebind_listener(clipboard_address).await {
+                        Ok(events) => self.clipboard_events = events,
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot rebind clipboard to selected DHCP adapter");
+                            return;
+                        }
+                    }
+                    let mut out = Vec::new();
+                    for (&peer, &(parent, supported, remote, epoch)) in &self.clipboard_links {
+                        clipboard.set_peer_session(peer, parent, epoch);
+                        out.extend(clipboard.on_link_up(peer, parent, supported, remote).await);
+                    }
+                    self.apply_clipboard(out).await;
+                }
+                self.clipboard_listen = clipboard_address;
             }
         }
         self.discovery.adapters = adapters;
@@ -296,6 +315,17 @@ fn warning_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(30))
 }
 
+fn selected_listener_addresses(
+    selected: Ipv4Addr,
+    input: SocketAddr,
+    clipboard: SocketAddr,
+) -> (SocketAddr, SocketAddr) {
+    (
+        SocketAddr::new(selected.into(), input.port()),
+        SocketAddr::new(selected.into(), clipboard.port()),
+    )
+}
+
 fn follow_selected_adapters(
     selected: &[config::Candidate],
     available: &[config::Candidate],
@@ -323,6 +353,19 @@ fn follow_selected_adapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_dhcp_address_moves_both_listeners_and_preserves_their_ports() {
+        let old_input = "192.168.1.5:47901".parse().unwrap();
+        let old_clipboard = "192.168.1.5:47902".parse().unwrap();
+        let (input, clipboard) = selected_listener_addresses(
+            "192.168.1.6".parse().unwrap(),
+            old_input,
+            old_clipboard,
+        );
+        assert_eq!(input, "192.168.1.6:47901".parse().unwrap());
+        assert_eq!(clipboard, "192.168.1.6:47902".parse().unwrap());
+    }
 
     #[test]
     fn rejected_route_warns_once_per_thirty_seconds() {
