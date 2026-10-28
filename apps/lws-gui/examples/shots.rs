@@ -1459,6 +1459,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         role: "owner".to_owned(),
         focus: "REMOTE".to_owned(),
         active_peer: "LAPTOP".to_owned(),
+        active_peer_node_id: LAPTOP.to_owned(),
         connected: true,
         clipboard_enabled: true,
         clipboard_policy: "follow".to_owned(),

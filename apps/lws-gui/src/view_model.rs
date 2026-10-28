@@ -1040,6 +1040,7 @@ impl ViewModel {
         if let Some(status) = &mut self.status {
             status.focus.clear();
             status.active_peer.clear();
+            status.active_peer_node_id.clear();
             status.active_layout.clear();
         }
         self.inflight.clear();

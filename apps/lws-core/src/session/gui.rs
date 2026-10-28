@@ -209,6 +209,9 @@ impl Session {
             },
             focus: focus_word(focus.as_str()).to_owned(),
             active_peer,
+            active_peer_node_id: lease_peer
+                .map(|peer| crate::command::node_id_hex(&peer))
+                .unwrap_or_default(),
             connected: !online.is_empty(),
             clipboard_enabled: self
                 .clipboard

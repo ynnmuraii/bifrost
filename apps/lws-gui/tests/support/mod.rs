@@ -56,6 +56,11 @@ pub fn status_with(focus: &str) -> ipc::Status {
         } else {
             String::new()
         },
+        active_peer_node_id: if focus == "REMOTE" {
+            PEER_NODE.to_owned()
+        } else {
+            String::new()
+        },
         connected: true,
         clipboard_enabled: true,
         clipboard_policy: "follow".to_owned(),

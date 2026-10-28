@@ -441,6 +441,7 @@ message Status {
   string unpair_notice = 43; // display name of the peer that removed this pairing
   uint64 unpair_notice_id = 44; // monotonically increasing; 0 means no notice
   bool accept_pairing_requests = 45;
+  string active_peer_node_id = 46; // authoritative input target, hex NodeId; empty when local/unknown
 }
 message PendingUnpairNotice {
   string node_id = 1;

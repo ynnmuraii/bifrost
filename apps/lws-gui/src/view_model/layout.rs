@@ -833,12 +833,17 @@ impl ViewModel {
         let this = self.self_node().and_then(|id| self.index_of(id));
         match status.focus.as_str() {
             "" => None,
-            "REMOTE" | "PREPARING" if !status.active_peer.is_empty() => self
-                .editor
-                .nodes
-                .iter()
-                .position(|n| n.display_name == status.active_peer)
-                .or(this),
+            "REMOTE" | "PREPARING" => {
+                if !status.active_peer_node_id.is_empty() {
+                    return self.index_of(&status.active_peer_node_id);
+                }
+                // An older core only sends a name. Never guess between duplicate names.
+                let mut matches = self.editor.nodes.iter().enumerate().filter(|(_, node)| {
+                    !status.active_peer.is_empty() && node.display_name == status.active_peer
+                });
+                let (index, _) = matches.next()?;
+                matches.next().is_none().then_some(index)
+            }
             _ => this,
         }
     }
