@@ -81,14 +81,20 @@ pub fn hex16(bytes: &[u8; 16]) -> String {
     text
 }
 
-/// The 16 bytes a [`hex16`] string names; `None` when it is not one.
+/// The 16 bytes a [`hex16`] string names; rejects non-ASCII and malformed ids.
 pub fn hex16_decode(text: &str) -> Option<[u8; 16]> {
     if text.len() != 32 {
         return None;
     }
     let mut bytes = [0u8; 16];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        let nibble = |value| match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        };
+        *byte = nibble(pair[0])? << 4 | nibble(pair[1])?;
     }
     Some(bytes)
 }
@@ -142,6 +148,26 @@ mod tests {
         assert_eq!(hex16_decode(""), None);
         assert_eq!(hex16_decode(&text[..31]), None);
         assert_eq!(hex16_decode(&format!("{}zz", &text[..30])), None);
+    }
+
+    #[test]
+    fn hex16_rejects_non_ascii_without_panicking() {
+        for text in [
+            format!("0é{}", "0".repeat(29)),
+            format!("{}€", "0".repeat(29)),
+            "é".repeat(16),
+            format!("{}🦀", "0".repeat(28)),
+        ] {
+            assert_eq!(text.len(), 32);
+            assert_eq!(hex16_decode(&text), None);
+        }
+        assert_eq!(
+            hex16_decode("00112233445566778899AaBbCcDdEeFf"),
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ])
+        );
     }
 
     #[test]
