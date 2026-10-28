@@ -220,9 +220,12 @@ fn failed_trust_save_is_retried_and_revocation_survives_restart() {
     let mut harness = input_free_pair();
     harness.wait_linked();
     harness.b.stop();
-    harness.a.wait_for("peer offline", Duration::from_secs(10), |status| {
-        status.members == 0
-    }).expect("peer disconnects");
+    harness
+        .a
+        .wait_for("peer offline", Duration::from_secs(10), |status| {
+            status.members == 0
+        })
+        .expect("peer disconnects");
     let before = trust_text(&harness.a);
     // A directory at the temporary-file path deterministically rejects File::create
     // on both OSes, including privileged test runners. The primary stays readable.
@@ -230,18 +233,26 @@ fn failed_trust_save_is_retried_and_revocation_survives_restart() {
     std::fs::create_dir(&blocker).expect("block only trust persistence");
     let revoke_once = || {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_bifrost"))
-            .arg("--root").arg(&harness.a.root)
+            .arg("--root")
+            .arg(&harness.a.root)
             .args(["peers", "--revoke", &harness.b.id])
-            .output().expect("single revoke request");
-        format!("{}{}", String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr))
+            .output()
+            .expect("single revoke request");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
     };
     let first = revoke_once();
     assert!(first.contains("TRUST_WRITE"), "{first}");
     assert_eq!(trust_text(&harness.a), before);
     assert!(trusts(&harness.a, &harness.b.id));
     let retry = revoke_once();
-    assert!(retry.contains("TRUST_WRITE"), "retry must attempt persistence: {retry}");
+    assert!(
+        retry.contains("TRUST_WRITE"),
+        "retry must attempt persistence: {retry}"
+    );
     assert_eq!(trust_text(&harness.a), before);
     assert!(trusts(&harness.a, &harness.b.id));
     std::fs::remove_dir(&blocker).expect("restore trust persistence");
@@ -249,8 +260,16 @@ fn failed_trust_save_is_retried_and_revocation_survives_restart() {
     assert!(saved.starts_with("OK revoked"), "{saved}");
     assert!(!trusts(&harness.a, &harness.b.id));
     harness.a.restart_without_input();
-    harness.a.wait_for("core restarted", Duration::from_secs(10), |_| true)
+    harness
+        .a
+        .wait_for("core restarted", Duration::from_secs(10), |_| true)
         .expect("core answers after restart");
-    assert!(!trusts(&harness.a, &harness.b.id), "revocation must survive restart");
-    assert!(gui_status(&harness.a).members.iter().all(|peer| peer.node_id != harness.b.id));
+    assert!(
+        !trusts(&harness.a, &harness.b.id),
+        "revocation must survive restart"
+    );
+    assert!(gui_status(&harness.a)
+        .members
+        .iter()
+        .all(|peer| peer.node_id != harness.b.id));
 }

@@ -55,10 +55,7 @@ impl AcceptBackoff {
 }
 
 /// Resource errors are local to accepting: established links and manager messages stay live.
-pub(crate) async fn accept_with_backoff<T, F, Fut>(
-    mut accept: F,
-    backoff: &mut AcceptBackoff,
-) -> T
+pub(crate) async fn accept_with_backoff<T, F, Fut>(mut accept: F, backoff: &mut AcceptBackoff) -> T
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::io::Result<T>>,
@@ -1728,7 +1725,11 @@ mod tests {
             .await;
             assert!(result.is_err());
         }
-        assert_eq!(attempts.get(), 0, "cancellation must not bypass the deadline");
+        assert_eq!(
+            attempts.get(),
+            0,
+            "cancellation must not bypass the deadline"
+        );
     }
 
     #[tokio::test]
@@ -1754,11 +1755,8 @@ mod tests {
         for mut client in clients {
             readers.spawn(async move {
                 let mut byte = [0];
-                let result = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    client.read(&mut byte),
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte)).await;
                 (client, matches!(result, Ok(Ok(0)) | Ok(Err(_))))
             });
         }
@@ -1769,15 +1767,15 @@ mod tests {
             closed += usize::from(was_closed);
             clients.push(client);
         }
-        assert_eq!(closed, 8, "only 32 stalled input sockets may remain admitted");
         assert_eq!(
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                manager.rebind_listener(address),
-            )
-            .await
-            .expect("saturation must not block manager commands")
-            .unwrap(),
+            closed, 8,
+            "only 32 stalled input sockets may remain admitted"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), manager.rebind_listener(address),)
+                .await
+                .expect("saturation must not block manager commands")
+                .unwrap(),
             address
         );
         drop(clients);

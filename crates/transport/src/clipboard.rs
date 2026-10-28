@@ -1183,13 +1183,10 @@ mod tests {
                 .expect("identity")
                 .0,
         );
-        let mut listener = ClipboardListener::bind(
-            identity,
-            TrustStore::new(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .await
-        .unwrap();
+        let mut listener =
+            ClipboardListener::bind(identity, TrustStore::new(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
         let mut clients = Vec::new();
         for _ in 0..40 {
             clients.push(TcpStream::connect(listener.local_addr()).await.unwrap());

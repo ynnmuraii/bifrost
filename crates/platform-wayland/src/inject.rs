@@ -1133,11 +1133,7 @@ mod tests {
     struct CapturedDiagnostics(std::sync::Arc<std::sync::Mutex<String>>);
 
     impl tracing::field::Visit for CapturedDiagnostics {
-        fn record_debug(
-            &mut self,
-            field: &tracing::field::Field,
-            value: &dyn std::fmt::Debug,
-        ) {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             use std::fmt::Write;
             writeln!(self.0.lock().unwrap(), "{}={value:?}", field.name()).unwrap();
         }
@@ -1267,7 +1263,10 @@ mod tests {
             "43981",
             "Some((7, 4, Some(30)))",
         ] {
-            assert!(!output.contains(private), "private key diagnostic: {private}");
+            assert!(
+                !output.contains(private),
+                "private key diagnostic: {private}"
+            );
         }
         let edge = |button, state| InputEvent::Button { button, state };
         let click = [

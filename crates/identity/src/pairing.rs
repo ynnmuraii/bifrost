@@ -49,7 +49,7 @@ pub const MAX_PENDING_PEERS: u32 = 3;
 pub const MAX_ATTEMPTS: u32 = 3;
 
 /// `attempt_id`: random bytes16 from the window opener, carried by every
-/// `PairingEnvelope` and used as the TLS exporter context.
+/// `PairingEnvelope` and bound into the SAS transcript (exporter context for legacy).
 pub type AttemptId = [u8; 16];
 
 /// Which end of the ceremony this session is.
@@ -512,7 +512,7 @@ impl PairingFsm {
         if node_id != expected {
             return self.reject(RejectionReason::NodeIdMismatch);
         }
-        // The attempt id binds the exporter context to this window.
+        // Every envelope belongs to this window, including commitment reveals.
         match self.role {
             PairingRole::WindowOpener => {
                 if attempt_id != self.attempt_id {

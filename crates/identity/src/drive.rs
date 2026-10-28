@@ -166,10 +166,14 @@ impl Stream {
         let output = [0; 32];
         let result = match self {
             Stream::Server(stream) => stream.get_ref().1.export_keying_material(
-                output, COMMITMENT_EXPORTER_LABEL, Some(&[]),
+                output,
+                COMMITMENT_EXPORTER_LABEL,
+                Some(&[]),
             ),
             Stream::Client(stream) => stream.get_ref().1.export_keying_material(
-                output, COMMITMENT_EXPORTER_LABEL, Some(&[]),
+                output,
+                COMMITMENT_EXPORTER_LABEL,
+                Some(&[]),
             ),
         };
         result.map_err(|_| PairError::Protocol("SAS channel exporter failed".into()))
@@ -510,7 +514,14 @@ async fn opener_ceremony(
     let local = SasContribution::fresh()?;
     let commitment = context.commitment(true, &local);
     let outputs = fsm.handle(PairingInput::HandshakeEstablished { peer_node_id });
-    run_outputs(&mut stream, &mut fsm, outputs, listen_port, Some(&commitment)).await?;
+    run_outputs(
+        &mut stream,
+        &mut fsm,
+        outputs,
+        listen_port,
+        Some(&commitment),
+    )
+    .await?;
 
     let envelope = stream.read_frame().await?;
     let remote = hello_of(&envelope)?;
@@ -575,7 +586,14 @@ async fn dialer_ceremony(
         display_name: remote.display_name,
         supports_sas: remote.supports_sas,
     });
-    run_outputs(&mut stream, &mut fsm, outputs, listen_port, commitment.as_ref()).await?;
+    run_outputs(
+        &mut stream,
+        &mut fsm,
+        outputs,
+        listen_port,
+        commitment.as_ref(),
+    )
+    .await?;
     let sas = if let Some(remote_commitment) = remote.commitment {
         let revealed = read_reveal(&mut stream, &context, true, &remote_commitment).await?;
         write_reveal(&mut stream, &fsm, &local).await?;
@@ -603,12 +621,13 @@ async fn write_reveal(
     fsm: &PairingFsm,
     contribution: &SasContribution,
 ) -> Result<(), PairError> {
-    let mut envelope = envelope_of(fsm, pairing_envelope::Payload::Reveal(
-        protocol::wire::PairReveal {
+    let mut envelope = envelope_of(
+        fsm,
+        pairing_envelope::Payload::Reveal(protocol::wire::PairReveal {
             contribution_id: contribution.attempt_id.to_vec(),
             nonce: contribution.nonce.to_vec(),
-        },
-    ));
+        }),
+    );
     envelope.seq = 2;
     stream.write_frame(&envelope).await
 }
@@ -623,19 +642,29 @@ fn reveal_of(
         || envelope.major != protocol::limits::PROTOCOL_MAJOR
         || envelope.attempt_id.as_slice() != context.window_attempt
     {
-        return Err(PairError::Protocol("invalid SAS reveal sequence or attempt".into()));
+        return Err(PairError::Protocol(
+            "invalid SAS reveal sequence or attempt".into(),
+        ));
     }
     let Some(pairing_envelope::Payload::Reveal(reveal)) = &envelope.payload else {
         return Err(PairError::Protocol("expected SAS reveal".into()));
     };
     let contribution = SasContribution {
-        attempt_id: reveal.contribution_id.as_slice().try_into()
+        attempt_id: reveal
+            .contribution_id
+            .as_slice()
+            .try_into()
             .map_err(|_| PairError::Protocol("invalid SAS contribution length".into()))?,
-        nonce: reveal.nonce.as_slice().try_into()
+        nonce: reveal
+            .nonce
+            .as_slice()
+            .try_into()
             .map_err(|_| PairError::Protocol("invalid SAS nonce length".into()))?,
     };
     if !context.verify(opener, commitment, &contribution) {
-        return Err(PairError::Protocol("SAS commitment verification failed".into()));
+        return Err(PairError::Protocol(
+            "SAS commitment verification failed".into(),
+        ));
     }
     Ok(contribution)
 }
@@ -715,7 +744,11 @@ async fn run_outputs(
                         display_name,
                         supports_sas,
                         listen_port: u32::from(listen_port),
-                        sas_ceremony_version: if commitment.is_some() { COMMITMENT_VERSION } else { 0 },
+                        sas_ceremony_version: if commitment.is_some() {
+                            COMMITMENT_VERSION
+                        } else {
+                            0
+                        },
                         sas_commitment: commitment.map_or_else(Vec::new, |value| value.to_vec()),
                     }),
                 );
@@ -766,15 +799,24 @@ struct RemoteHello {
 
 fn hello_of(envelope: &PairingEnvelope) -> Result<RemoteHello, PairError> {
     if envelope.seq != 1 || envelope.major != protocol::limits::PROTOCOL_MAJOR {
-        return Err(PairError::Protocol("invalid Hello sequence or version".into()));
+        return Err(PairError::Protocol(
+            "invalid Hello sequence or version".into(),
+        ));
     }
     match &envelope.payload {
         Some(pairing_envelope::Payload::Hello(hello)) => {
             let commitment = match hello.sas_ceremony_version {
                 0 if hello.sas_commitment.is_empty() => None,
-                COMMITMENT_VERSION => Some(hello.sas_commitment.as_slice().try_into()
-                    .map_err(|_| PairError::Protocol("SAS commitment must be 32 bytes".into()))?),
-                _ => return Err(PairError::Protocol("unsupported SAS ceremony version".into())),
+                COMMITMENT_VERSION => {
+                    Some(hello.sas_commitment.as_slice().try_into().map_err(|_| {
+                        PairError::Protocol("SAS commitment must be 32 bytes".into())
+                    })?)
+                }
+                _ => {
+                    return Err(PairError::Protocol(
+                        "unsupported SAS ceremony version".into(),
+                    ))
+                }
             };
             let attempt_id: AttemptId = envelope
                 .attempt_id
@@ -857,17 +899,22 @@ mod commitment_tests {
             attempt_id: context.window_attempt.to_vec(),
             major: protocol::limits::PROTOCOL_MAJOR,
             minor: protocol::limits::PROTOCOL_MINOR,
-            payload: Some(pairing_envelope::Payload::Reveal(protocol::wire::PairReveal {
-                contribution_id: vec![5; 16],
-                nonce: vec![6; 32],
-            })),
+            payload: Some(pairing_envelope::Payload::Reveal(
+                protocol::wire::PairReveal {
+                    contribution_id: vec![5; 16],
+                    nonce: vec![6; 32],
+                },
+            )),
         }
     }
 
     #[test]
     fn wrong_reordered_and_replayed_reveals_are_rejected() {
         let context = context();
-        let contribution = SasContribution { attempt_id: [5; 16], nonce: [6; 32] };
+        let contribution = SasContribution {
+            attempt_id: [5; 16],
+            nonce: [6; 32],
+        };
         let commitment = context.commitment(true, &contribution);
         let original = reveal(&context);
         assert!(reveal_of(&original, &context, true, &commitment).is_ok());
@@ -935,6 +982,9 @@ mod commitment_tests {
         if let Some(pairing_envelope::Payload::Hello(hello)) = &mut envelope.payload {
             hello.sas_ceremony_version = 0;
         }
-        assert!(hello_of(&envelope).is_err(), "never downgrade a malformed commitment");
+        assert!(
+            hello_of(&envelope).is_err(),
+            "never downgrade a malformed commitment"
+        );
     }
 }

@@ -126,8 +126,14 @@ async fn a_loopback_pairing_commits_on_both_sides_with_one_code() {
 
     // Both sides derive the code from their own exporter, and they must agree.
     assert_eq!(opener.sas(), dialer.sas());
-    assert_eq!(opener.sas_ceremony_version(), identity::sas::COMMITMENT_VERSION);
-    assert_eq!(dialer.sas_ceremony_version(), identity::sas::COMMITMENT_VERSION);
+    assert_eq!(
+        opener.sas_ceremony_version(),
+        identity::sas::COMMITMENT_VERSION
+    );
+    assert_eq!(
+        dialer.sas_ceremony_version(),
+        identity::sas::COMMITMENT_VERSION
+    );
     assert_eq!(opener.peer_node_id(), &b.node_id());
     assert_eq!(dialer.peer_node_id(), &a.node_id());
     // `PairHello.display_name` carries the *configured* name of the sender, which is the only
@@ -377,9 +383,13 @@ async fn legacy_read(
     assert!((1..=protocol::limits::MAX_FRAME_PAIRING).contains(&length));
     let mut framed = vec![0; 4 + length];
     framed[..4].copy_from_slice(&prefix);
-    stream.read_exact(&mut framed[4..]).await.expect("frame body");
+    stream
+        .read_exact(&mut framed[4..])
+        .await
+        .expect("frame body");
     protocol::frame::decode_message(protocol::frame::Channel::Pairing, &framed)
-        .expect("decode").expect("frame")
+        .expect("decode")
+        .expect("frame")
 }
 
 async fn legacy_write(
@@ -402,8 +412,8 @@ async fn legacy_write(
             },
         )),
     };
-    let bytes = protocol::frame::encode_message(protocol::frame::Channel::Pairing, &hello)
-        .expect("encode");
+    let bytes =
+        protocol::frame::encode_message(protocol::frame::Channel::Pairing, &hello).expect("encode");
     stream.write_all(&bytes).await.expect("write");
 }
 
@@ -412,7 +422,9 @@ async fn new_dialer_explicitly_negotiates_legacy_opener() {
     let root = temp_dir("legacy-opener");
     let a = identity_at(&root, "WORKSTATION");
     let b = identity_at(&root, "LAPTOP");
-    let listener = bind("127.0.0.1:0".parse().expect("address")).await.expect("bind");
+    let listener = bind("127.0.0.1:0".parse().expect("address"))
+        .await
+        .expect("bind");
     let address = listener.local_addr().expect("address");
     let opener = tokio::spawn(async move {
         let acceptor = TlsAcceptor::from(Arc::new(
@@ -428,11 +440,17 @@ async fn new_dialer_explicitly_negotiates_legacy_opener() {
         };
         assert_eq!(hello.sas_ceremony_version, 0);
         assert!(hello.sas_commitment.is_empty());
-        identity::SasCode::from_exporter_bytes(stream.get_ref().1.export_keying_material(
-            [0; 4], identity::EXPORTER_LABEL, Some(&attempt),
-        ).expect("exporter"))
+        identity::SasCode::from_exporter_bytes(
+            stream
+                .get_ref()
+                .1
+                .export_keying_material([0; 4], identity::EXPORTER_LABEL, Some(&attempt))
+                .expect("exporter"),
+        )
     });
-    let driver = dial(address, &b, DIAL_TIMEOUT, 47901, "LAPTOP").await.expect("legacy fallback");
+    let driver = dial(address, &b, DIAL_TIMEOUT, 47901, "LAPTOP")
+        .await
+        .expect("legacy fallback");
     assert_eq!(driver.sas_ceremony_version(), 0);
     assert_eq!(driver.sas(), opener.await.expect("opener"));
     drop(driver);
@@ -444,26 +462,39 @@ async fn new_opener_explicitly_negotiates_legacy_dialer() {
     let root = temp_dir("legacy-dialer");
     let a = identity_at(&root, "WORKSTATION");
     let b = identity_at(&root, "LAPTOP");
-    let listener = bind("127.0.0.1:0".parse().expect("address")).await.expect("bind");
+    let listener = bind("127.0.0.1:0".parse().expect("address"))
+        .await
+        .expect("bind");
     let address = listener.local_addr().expect("address");
     let opener = tokio::spawn(async move {
         let mut window = open_window(0).expect("window");
-        accept_one(&listener, &a, &mut window, 0, 47901, "WORKSTATION").await
+        accept_one(&listener, &a, &mut window, 0, 47901, "WORKSTATION")
+            .await
             .expect("legacy fallback")
     });
     let connector = TlsConnector::from(Arc::new(pairing_client_config(&b).expect("config")));
     let tcp = TcpStream::connect(address).await.expect("connect");
-    let mut stream = connector.connect(identity::server_name(address.ip()), tcp).await.expect("TLS");
+    let mut stream = connector
+        .connect(identity::server_name(address.ip()), tcp)
+        .await
+        .expect("TLS");
     let hello = legacy_read(&mut stream).await;
     let Some(protocol::wire::pairing_envelope::Payload::Hello(remote)) = &hello.payload else {
         panic!("new opener Hello");
     };
-    assert_eq!(remote.sas_ceremony_version, identity::sas::COMMITMENT_VERSION);
+    assert_eq!(
+        remote.sas_ceremony_version,
+        identity::sas::COMMITMENT_VERSION
+    );
     assert_eq!(remote.sas_commitment.len(), 32);
     legacy_write(&mut stream, b.node_id(), hello.attempt_id.clone()).await;
-    let expected = identity::SasCode::from_exporter_bytes(stream.get_ref().1.export_keying_material(
-        [0; 4], identity::EXPORTER_LABEL, Some(&hello.attempt_id),
-    ).expect("exporter"));
+    let expected = identity::SasCode::from_exporter_bytes(
+        stream
+            .get_ref()
+            .1
+            .export_keying_material([0; 4], identity::EXPORTER_LABEL, Some(&hello.attempt_id))
+            .expect("exporter"),
+    );
     let driver = opener.await.expect("opener");
     assert_eq!(driver.sas_ceremony_version(), 0);
     assert_eq!(driver.sas(), expected);

@@ -2829,7 +2829,10 @@ mod tests {
         assert!(output.contains("repeat guard: software repeat stopped"));
         assert!(output.contains("repeats=0"));
         for private in ["key=", "HidKey", "page", "usage", "evdev"] {
-            assert!(!output.contains(private), "private key diagnostic: {private}");
+            assert!(
+                !output.contains(private),
+                "private key diagnostic: {private}"
+            );
         }
         let engine = harness.repeat.as_mut().expect("software mode");
         assert_eq!(engine.holding(), None);

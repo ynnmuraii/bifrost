@@ -9,12 +9,18 @@ fn exporter(channel: &[u8], context: &[u8]) -> [u8; 4] {
 }
 
 fn contribution(value: u8) -> SasContribution {
-    SasContribution { attempt_id: [value; 16], nonce: [value; 32] }
+    SasContribution {
+        attempt_id: [value; 16],
+        nonce: [value; 32],
+    }
 }
 
 fn context(channel: u8) -> SasContext {
     SasContext {
-        opener: [1; 32], dialer: [2; 32], window_attempt: [3; 16], channel: [channel; 32],
+        opener: [1; 32],
+        dialer: [2; 32],
+        window_attempt: [3; 16],
+        channel: [channel; 32],
     }
 }
 
@@ -31,8 +37,12 @@ fn preserved_legacy_model_allows_offline_context_grinding() {
 
 #[test]
 fn fixed_commitments_prevent_adaptive_two_channel_grinding() {
-    let first = context(4);
-    let second = context(5);
+    // Honest A is the opener on one channel; the same MITM identity opens the
+    // second channel to honest B. All three certificate identities are distinct.
+    let mut first = context(4);
+    first.dialer = [9; 32];
+    let mut second = context(5);
+    second.opener = [9; 32];
     let honest_opener = contribution(6);
     let honest_dialer = contribution(7);
     let attacker_opener = contribution(8);
@@ -46,11 +56,13 @@ fn fixed_commitments_prevent_adaptive_two_channel_grinding() {
     assert!(second.verify(true, &opener_commitment, &attacker_opener));
     // After learning both honest nonces the attacker can find another SAS, but
     // cannot open the commitment it already sent with that adaptive contribution.
-    let collision = (0u64..10_000_000).find(|candidate| {
-        let mut adaptive = contribution(8);
-        adaptive.attempt_id[..8].copy_from_slice(&candidate.to_be_bytes());
-        second.code(&adaptive, &honest_dialer) == target
-    }).expect("the six-digit output itself is intentionally small");
+    let collision = (0u64..10_000_000)
+        .find(|candidate| {
+            let mut adaptive = contribution(8);
+            adaptive.attempt_id[..8].copy_from_slice(&candidate.to_be_bytes());
+            second.code(&adaptive, &honest_dialer) == target
+        })
+        .expect("the six-digit output itself is intentionally small");
     let mut adaptive = contribution(8);
     adaptive.attempt_id[..8].copy_from_slice(&collision.to_be_bytes());
     assert_eq!(second.code(&adaptive, &honest_dialer), target);

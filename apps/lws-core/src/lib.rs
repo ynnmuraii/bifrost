@@ -737,23 +737,23 @@ mod network_tests {
         })
         .unwrap();
         let manager = Arc::new(manager);
-        assert!(manager.run().await.is_err(), "occupied listener must fail to bind");
+        assert!(
+            manager.run().await.is_err(),
+            "occupied listener must fail to bind"
+        );
         let supervisor = tokio::spawn(supervise_link_manager(Arc::clone(&manager)));
         // The manager must not process commands while binding is failing.
-        assert!(tokio::time::timeout(
-            Duration::from_millis(25),
-            manager.rebind_listener(address),
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), manager.rebind_listener(address),)
+                .await
+                .is_err()
+        );
         drop(occupied);
-        let rebound = tokio::time::timeout(
-            Duration::from_secs(3),
-            manager.rebind_listener(address),
-        )
-        .await
-        .expect("supervisor must restart the manager")
-        .expect("manager remains responsive");
+        let rebound =
+            tokio::time::timeout(Duration::from_secs(3), manager.rebind_listener(address))
+                .await
+                .expect("supervisor must restart the manager")
+                .expect("manager remains responsive");
         assert_eq!(rebound, address);
         supervisor.abort();
         let _ = supervisor.await;

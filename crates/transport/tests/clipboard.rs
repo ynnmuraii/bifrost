@@ -257,11 +257,16 @@ async fn a_transfer_round_trips_in_chunks() {
 
     let sender = tokio::spawn(async move {
         client_conn
-            .send(ClipboardMessage::Offer { offer_id,
-            origin_node_id: origin,
-            origin_version: 1,
-            mime: clipboard::MIME.to_owned(),
-            size_bytes: payload_len, secret_marked: true, sender_epoch: Vec::new(), relayed: false })
+            .send(ClipboardMessage::Offer {
+                offer_id,
+                origin_node_id: origin,
+                origin_version: 1,
+                mime: clipboard::MIME.to_owned(),
+                size_bytes: payload_len,
+                secret_marked: true,
+                sender_epoch: Vec::new(),
+                relayed: false,
+            })
             .await
             .expect("offer");
         match client_conn.recv().await.expect("request") {
@@ -359,7 +364,16 @@ fn every_limit_is_refused() {
     let id = [1u8; 16];
     let node = [2u8; 32];
 
-    let too_large = ClipboardMessage::Offer { offer_id: id, origin_node_id: node, origin_version: 0, mime: clipboard::MIME.to_owned(), size_bytes: 1024 * 1024 + 1, secret_marked: false, sender_epoch: Vec::new(), relayed: false };
+    let too_large = ClipboardMessage::Offer {
+        offer_id: id,
+        origin_node_id: node,
+        origin_version: 0,
+        mime: clipboard::MIME.to_owned(),
+        size_bytes: 1024 * 1024 + 1,
+        secret_marked: false,
+        sender_epoch: Vec::new(),
+        relayed: false,
+    };
     assert_eq!(too_large.validate(), Err(ClipboardViolation::TooLarge));
 
     let big_chunk = ClipboardMessage::Data {
@@ -384,7 +398,16 @@ fn every_limit_is_refused() {
     };
     assert_eq!(bad_hash.validate(), Err(ClipboardViolation::BadHash));
 
-    let bad_mime = ClipboardMessage::Offer { offer_id: id, origin_node_id: node, origin_version: 0, mime: "text/html".to_owned(), size_bytes: 10, secret_marked: false, sender_epoch: Vec::new(), relayed: false };
+    let bad_mime = ClipboardMessage::Offer {
+        offer_id: id,
+        origin_node_id: node,
+        origin_version: 0,
+        mime: "text/html".to_owned(),
+        size_bytes: 10,
+        secret_marked: false,
+        sender_epoch: Vec::new(),
+        relayed: false,
+    };
     assert_eq!(bad_mime.validate(), Err(ClipboardViolation::BadMime));
 
     // `BadId` is unreachable from `validate`: every identifier is a fixed-size array in the
@@ -495,7 +518,16 @@ async fn the_first_frame_must_be_a_bind() {
     // driven in one join: the bad task signals after writing its `Offer`, and the good task
     // waits for that signal before dialing.
     let bad_parent = [1u8; 16];
-    let offer = ClipboardMessage::Offer { offer_id: [2u8; 16], origin_node_id: [3u8; 32], origin_version: 0, mime: clipboard::MIME.to_owned(), size_bytes: 10, secret_marked: false, sender_epoch: Vec::new(), relayed: false };
+    let offer = ClipboardMessage::Offer {
+        offer_id: [2u8; 16],
+        origin_node_id: [3u8; 32],
+        origin_version: 0,
+        mime: clipboard::MIME.to_owned(),
+        size_bytes: 10,
+        secret_marked: false,
+        sender_epoch: Vec::new(),
+        relayed: false,
+    };
     let envelope = offer.to_envelope(1, &bad_parent).expect("envelope");
     let frame = encode_message(Channel::Clipboard, &envelope).expect("frame");
     let config = identity::clipboard_client_config(&client, &client_trust).expect("config");

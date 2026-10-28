@@ -1025,10 +1025,15 @@ impl PeerInfo {
             clipboard_apply_ack: hello
                 .capabilities
                 .contains(&(wire::Capability::ClipboardApplyAck as i32)),
-            clipboard_epoch: if hello.capabilities.contains(&(wire::Capability::ClipboardSession as i32)) {
-                Some(hello.clipboard_epoch.as_slice().try_into().map_err(|_| {
-                    ConvertError::Unsupported("clipboard_epoch is not 16 bytes")
-                })?)
+            clipboard_epoch: if hello
+                .capabilities
+                .contains(&(wire::Capability::ClipboardSession as i32))
+            {
+                Some(
+                    hello.clipboard_epoch.as_slice().try_into().map_err(|_| {
+                        ConvertError::Unsupported("clipboard_epoch is not 16 bytes")
+                    })?,
+                )
             } else {
                 None
             },

@@ -1055,8 +1055,13 @@ fn clipboard_session_epoch_is_capability_gated_and_exactly_sixteen_bytes() {
         ..Default::default()
     };
     assert_eq!(PeerInfo::from_hello(&hello).unwrap().clipboard_epoch, None);
-    hello.capabilities.push(wire::Capability::ClipboardSession as i32);
-    assert_eq!(PeerInfo::from_hello(&hello).unwrap().clipboard_epoch, Some([7; 16]));
+    hello
+        .capabilities
+        .push(wire::Capability::ClipboardSession as i32);
+    assert_eq!(
+        PeerInfo::from_hello(&hello).unwrap().clipboard_epoch,
+        Some([7; 16])
+    );
     for size in [0, 15, 17] {
         hello.clipboard_epoch = vec![7; size];
         assert!(PeerInfo::from_hello(&hello).is_err());
