@@ -401,6 +401,32 @@ impl Clipboard {
         self.source = source;
     }
 
+    /// Moves the listener without losing source versions, authenticated replay state or carry.
+    /// Bind first so an unavailable replacement address leaves the existing runtime intact.
+    pub async fn rebind_listener(
+        &mut self,
+        listen: SocketAddr,
+    ) -> Result<mpsc::Receiver<Inbound>, String> {
+        let (replacement, events) = Handle::start(
+            Arc::clone(&self.runtime.identity),
+            Arc::clone(&self.runtime.trusted_peers),
+            listen,
+            self.queue_capacity,
+        ).await?;
+        self.runtime.stop().await;
+        self.runtime = replacement;
+        self.clipboard_port = listen.port();
+        self.incoming.clear();
+        self.pending_request = None;
+        self.waiting.clear();
+        self.offered.clear();
+        self.deliveries.clear();
+        for state in self.peers.values_mut() {
+            state.channel = None;
+        }
+        Ok(events)
+    }
+
     /// Whether clipboard transfers are on, for `Status.clipboard_enabled`.
     pub const fn is_enabled(&self) -> bool {
         self.settings.enabled
