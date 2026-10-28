@@ -279,7 +279,6 @@ struct Incoming {
     /// Who is sending it: only that peer may complete it, and it ends with that peer's link.
     peer: NodeId,
     offer: cb::Offer,
-    secret: bool,
     assembler: cb::Assembler,
     deadline: Instant,
 }
@@ -1092,7 +1091,7 @@ impl Clipboard {
                             peer,
                             direction: ipc::ClipboardHistoryDirection::Received,
                             text,
-                            secret: incoming.secret,
+                            secret: false,
                         });
                         out
                     }
@@ -1275,7 +1274,6 @@ impl Clipboard {
             Incoming {
                 peer,
                 offer,
-                secret,
                 assembler,
                 deadline: Instant::now() + cb::INCOMING_TTL,
             },

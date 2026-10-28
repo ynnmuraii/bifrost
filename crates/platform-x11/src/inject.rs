@@ -270,11 +270,19 @@ impl X11Injector {
     /// ConfigureNotify keeps the clamp current without a round trip per input batch.
     fn refresh_geometry(&mut self) -> Result<(), X11Error> {
         while let Some(event) = self.conn.poll_for_event()? {
-            if let x11rb::protocol::Event::ConfigureNotify(configure) = event {
-                if configure.window == self.root {
+            match event {
+                x11rb::protocol::Event::ConfigureNotify(configure)
+                    if configure.window == self.root =>
+                {
                     self.root_width = configure.width;
                     self.root_height = configure.height;
                 }
+                x11rb::protocol::Event::Error(error) => {
+                    return Err(x11rb::errors::ReplyError::X11Error(error).into());
+                }
+                // This private connection selects only root STRUCTURE_NOTIFY; capture
+                // and clipboard own separate connections, so no input/selection is lost.
+                _ => {}
             }
         }
         Ok(())
@@ -523,6 +531,26 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
+    }
+
+    #[test]
+    fn geometry_refresh_reports_unchecked_request_errors_without_input() {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let Ok(mut injector) = super::X11Injector::new() else {
+            eprintln!("requires an isolated Xvfb display");
+            return;
+        };
+        let nonexistent_window = injector.conn.generate_id().unwrap();
+        // An unchecked request puts its asynchronous protocol error in the event queue.
+        injector.conn.destroy_window(nonexistent_window).unwrap();
+        injector.conn.get_input_focus().unwrap().reply().unwrap();
+        let result = injector.inject(&[]);
+        assert_eq!(result.applied_count, 0);
+        assert!(
+            result.os_error.is_some(),
+            "protocol errors must not be discarded"
+        );
     }
 
     #[test]
