@@ -10,6 +10,7 @@
 //! transitions and the membership gate.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -31,6 +32,53 @@ use crate::link::{
 use crate::pairing::{PairingConnection, PairingGate};
 use crate::policy;
 use crate::TransportError;
+
+/// Bound unauthenticated work independently on each network listener.
+pub(crate) const MAX_PENDING_HANDSHAKES: usize = 32;
+
+/// Kept outside the accept future so cancellation by `select!` cannot skip a retry delay.
+#[derive(Default)]
+pub(crate) struct AcceptBackoff {
+    retry_at: Option<tokio::time::Instant>,
+    delay: Duration,
+}
+
+impl AcceptBackoff {
+    fn failed(&mut self) {
+        self.delay = if self.delay.is_zero() {
+            Duration::from_millis(25)
+        } else {
+            (self.delay * 2).min(Duration::from_secs(1))
+        };
+        self.retry_at = Some(tokio::time::Instant::now() + self.delay);
+    }
+}
+
+/// Resource errors are local to accepting: established links and manager messages stay live.
+pub(crate) async fn accept_with_backoff<T, F, Fut>(
+    mut accept: F,
+    backoff: &mut AcceptBackoff,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    loop {
+        if let Some(deadline) = backoff.retry_at {
+            tokio::time::sleep_until(deadline).await;
+        }
+        match accept().await {
+            Ok(connection) => {
+                *backoff = AcceptBackoff::default();
+                return connection;
+            }
+            Err(error) => {
+                backoff.failed();
+                tracing::warn!(kind = ?error.kind(), "listener accept failed; retrying with backoff");
+            }
+        }
+    }
+}
 
 /// How a manager is configured.
 pub struct ManagerConfig {
@@ -775,7 +823,8 @@ impl LinkManager {
         let mut listener = bind_listener(self.listen).await?;
         let local = self.identity.node_id();
         let settings = self.settings;
-        let handshakes = Arc::new(tokio::sync::Semaphore::new(32));
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+        let mut accept_backoff = AcceptBackoff::default();
 
         // One dialer per configured peer.
         let mut dialers = Vec::with_capacity(self.peers.len());
@@ -801,13 +850,15 @@ impl LinkManager {
 
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
-                    let (tcp, address) = accepted?;
+                (tcp, address) = accept_with_backoff(|| listener.accept(), &mut accept_backoff) => {
                     let Ok(permit) = Arc::clone(&handshakes).try_acquire_owned() else {
                         continue;
                     };
                     // Lease frames must not wait for a delayed TCP ACK during idle input.
-                    tcp.set_nodelay(true)?;
+                    if let Err(error) = tcp.set_nodelay(true) {
+                        tracing::warn!(kind = ?error.kind(), "could not configure accepted socket");
+                        continue;
+                    }
                     let messages = self.messages_tx.clone();
                     let events = self.events_tx.clone();
                     let identity = Arc::clone(&self.identity);
@@ -1630,6 +1681,111 @@ async fn start_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accept_errors_back_off_and_recover() {
+        let attempts = std::cell::Cell::new(0);
+        let mut backoff = AcceptBackoff::default();
+        let result = accept_with_backoff(
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(if attempts.get() <= 2 {
+                    Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
+                } else {
+                    Ok(7)
+                })
+            },
+            &mut backoff,
+        )
+        .await;
+        assert_eq!(result, 7);
+        assert_eq!(attempts.get(), 3);
+        assert!(backoff.delay.is_zero(), "success resets the failure streak");
+        assert!(backoff.retry_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_backoff_survives_select_cancellation_and_is_capped() {
+        let mut backoff = AcceptBackoff::default();
+        for expected_ms in [25, 50, 100, 200, 400, 800, 1000, 1000] {
+            backoff.failed();
+            assert_eq!(backoff.delay, Duration::from_millis(expected_ms));
+        }
+        let attempts = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            let result = tokio::time::timeout(
+                Duration::from_millis(1),
+                accept_with_backoff(
+                    || {
+                        attempts.set(attempts.get() + 1);
+                        std::future::ready(Err::<(), _>(std::io::Error::from(
+                            std::io::ErrorKind::OutOfMemory,
+                        )))
+                    },
+                    &mut backoff,
+                ),
+            )
+            .await;
+            assert!(result.is_err());
+        }
+        assert_eq!(attempts.get(), 0, "cancellation must not bypass the deadline");
+    }
+
+    #[tokio::test]
+    async fn input_admission_is_bounded_and_manager_stays_responsive() {
+        use tokio::io::AsyncReadExt;
+
+        let (root, local, _, _) = discovery_fixture("input-admission");
+        let manager = Arc::new(discovery_manager(local, &[]));
+        let runner = Arc::clone(&manager);
+        let task = tokio::spawn(async move { runner.run().await });
+        let address = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.rebind_listener("127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..40 {
+            clients.push(TcpStream::connect(address).await.unwrap());
+        }
+        let mut readers = tokio::task::JoinSet::new();
+        for mut client in clients {
+            readers.spawn(async move {
+                let mut byte = [0];
+                let result = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    client.read(&mut byte),
+                )
+                .await;
+                (client, matches!(result, Ok(Ok(0)) | Ok(Err(_))))
+            });
+        }
+        let mut closed = 0;
+        let mut clients = Vec::new();
+        while let Some(result) = readers.join_next().await {
+            let (client, was_closed) = result.unwrap();
+            closed += usize::from(was_closed);
+            clients.push(client);
+        }
+        assert_eq!(closed, 8, "only 32 stalled input sockets may remain admitted");
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                manager.rebind_listener(address),
+            )
+            .await
+            .expect("saturation must not block manager commands")
+            .unwrap(),
+            address
+        );
+        drop(clients);
+        task.abort();
+        let _ = task.await;
+        manager.kill_all().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn discovery_fixture(
         label: &str,

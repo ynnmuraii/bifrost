@@ -556,11 +556,7 @@ async fn run_async(
         .map_err(|error| format!("pending unpair notices: {error}"))?;
     let manager = Arc::new(manager);
     let runner = Arc::clone(&manager);
-    tokio::spawn(async move {
-        if let Err(error) = runner.run().await {
-            tracing::error!(%error, "the link manager stopped");
-        }
-    });
+    tokio::spawn(supervise_link_manager(runner));
 
     // `[clipboard]`: the second channel (ADR-008) exists only when the setting is on. It has a
     // listener of its own on `network.port_clipboard` and a dial list of its own, because
@@ -696,6 +692,74 @@ async fn run_async(
     session.set_hotkeys_source(config.input.hotkeys);
     session.set_update_policy(config.update.allow_remote_request);
     session.run().await.map_err(|error| error.to_string())
+}
+
+/// Binding can fail temporarily (for example under local socket pressure).
+/// Keep retrying instead of leaving an otherwise healthy core permanently offline.
+async fn supervise_link_manager(manager: Arc<LinkManager>) {
+    loop {
+        match manager.run().await {
+            Ok(()) => tracing::warn!("the link manager stopped; restarting"),
+            Err(error) => tracing::error!(%error, "the link manager stopped; restarting"),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn manager_supervision_recovers_after_bind_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "lws-network-recovery-{:x}",
+            u128::from_le_bytes(identity::random16().unwrap())
+        ));
+        let identity = Arc::new(
+            NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&root))
+                .unwrap()
+                .0,
+        );
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        let (manager, _events) = LinkManager::new(ManagerConfig {
+            identity,
+            trust: TrustStore::new(),
+            local_hello: protocol::wire::Hello::default(),
+            listen: address,
+            peers: Vec::new(),
+            max_members: 4,
+            queue_capacity: 16,
+            liveness: LinkLiveness::default(),
+            backoff: BackoffBounds::default(),
+            pairing: transport::PairingGate::closed(),
+        })
+        .unwrap();
+        let manager = Arc::new(manager);
+        assert!(manager.run().await.is_err(), "occupied listener must fail to bind");
+        let supervisor = tokio::spawn(supervise_link_manager(Arc::clone(&manager)));
+        // The manager must not process commands while binding is failing.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            manager.rebind_listener(address),
+        )
+        .await
+        .is_err());
+        drop(occupied);
+        let rebound = tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.rebind_listener(address),
+        )
+        .await
+        .expect("supervisor must restart the manager")
+        .expect("manager remains responsive");
+        assert_eq!(rebound, address);
+        supervisor.abort();
+        let _ = supervisor.await;
+        manager.kill_all().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// The `run`-only options.

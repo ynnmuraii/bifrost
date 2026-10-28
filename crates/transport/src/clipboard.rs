@@ -777,14 +777,15 @@ pub async fn dial_clipboard(
 /// waiting), and returns the connection together with that `Bind`. Validation against
 /// [`Grants`] belongs to the caller (core), so the listener stays policy-free.
 ///
-/// Each accepted socket is handshaked in a task of its own with a deadline ([`ACCEPT_TIMEOUT`]),
-/// so a peer that connects and then stalls — a claim on the TLS handshake, or a connection
-/// that never sends its `Bind` — cannot hold up the connections behind it (head-of-line DoS).
+/// At most 32 accepted sockets are handshaked concurrently, each with a deadline
+/// ([`ACCEPT_TIMEOUT`]); excess connections wait in the OS backlog. Resource errors retry
+/// with capped backoff while pending handshakes continue to complete.
 pub struct ClipboardListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     /// The connections currently being handshaked, one task each.
     pending: JoinSet<Option<(ClipboardConnection, ClipboardMessage)>>,
+    accept_backoff: crate::manager::AcceptBackoff,
 }
 
 /// How long one clipboard TLS handshake (or its first `Bind`) may take.
@@ -807,6 +808,7 @@ impl ClipboardListener {
             listener,
             acceptor,
             pending: JoinSet::new(),
+            accept_backoff: crate::manager::AcceptBackoff::default(),
         })
     }
 
@@ -823,6 +825,7 @@ impl ClipboardListener {
             listener,
             acceptor: _,
             mut pending,
+            accept_backoff: _,
         } = self;
         drop(listener);
         pending.shutdown().await;
@@ -839,9 +842,14 @@ impl ClipboardListener {
     ) -> Result<(ClipboardConnection, ClipboardMessage), TransportError> {
         loop {
             tokio::select! {
-                accepted = self.listener.accept() => {
-                    let (tcp, _address) = accepted?;
-                    tcp.set_nodelay(true)?;
+                (tcp, _address) = crate::manager::accept_with_backoff(
+                    || self.listener.accept(),
+                    &mut self.accept_backoff,
+                ), if self.pending.len() < crate::manager::MAX_PENDING_HANDSHAKES => {
+                    if let Err(error) = tcp.set_nodelay(true) {
+                        tracing::warn!(kind = ?error.kind(), "could not configure clipboard socket");
+                        continue;
+                    }
                     let acceptor = self.acceptor.clone();
                     self.pending
                         .spawn(async move { handshake_clipboard(acceptor, tcp).await });
@@ -1139,6 +1147,43 @@ mod tests {
             !dialer_session_has_queued_records(&dialed),
             "a sent frame must not stay queued in the TLS session"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn admission_caps_stalled_handshakes() {
+        let root = std::env::temp_dir().join(format!(
+            "lws-clipboard-cap-{:x}",
+            u128::from_le_bytes(identity::random16().expect("entropy"))
+        ));
+        let identity = Arc::new(
+            NodeIdentity::load_or_create(&IdentityPaths::rooted_at(&root))
+                .expect("identity")
+                .0,
+        );
+        let mut listener = ClipboardListener::bind(
+            identity,
+            TrustStore::new(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..40 {
+            clients.push(TcpStream::connect(listener.local_addr()).await.unwrap());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            listener.pending.len(),
+            32,
+            "stalled handshakes must be bounded"
+        );
+        listener.shutdown().await;
+        drop(clients);
         let _ = std::fs::remove_dir_all(root);
     }
 
