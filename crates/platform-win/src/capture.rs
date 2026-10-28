@@ -233,6 +233,8 @@ struct Shared {
     recenters: AtomicU64,
     emergencies: AtomicU64,
     overflowed: AtomicBool,
+    overflow_pending: AtomicBool,
+    emergency_pending: AtomicBool,
     raw_input_ok: AtomicBool,
     hook_calls: AtomicU64,
     capture_injected: AtomicBool,
@@ -320,6 +322,8 @@ impl Capture {
             recenters: AtomicU64::new(0),
             emergencies: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
+            overflow_pending: AtomicBool::new(false),
+            emergency_pending: AtomicBool::new(false),
             raw_input_ok: AtomicBool::new(false),
             hook_calls: AtomicU64::new(0),
         });
@@ -366,12 +370,26 @@ impl Capture {
 
     /// Wait up to `timeout` for the next event.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, RecvTimeoutError> {
+        if let Some(control) = self.take_control() {
+            return Ok(control);
+        }
         self.rx.recv_timeout(timeout)
     }
 
     /// Non-blocking poll.
     pub fn try_recv(&self) -> Option<CaptureEvent> {
-        self.rx.try_recv().ok()
+        self.take_control().or_else(|| self.rx.try_recv().ok())
+    }
+
+    /// Safety signals never compete with input for bounded queue capacity.
+    fn take_control(&self) -> Option<CaptureEvent> {
+        if self.shared.emergency_pending.swap(false, Ordering::SeqCst) {
+            Some(CaptureEvent::Emergency)
+        } else if self.shared.overflow_pending.swap(false, Ordering::SeqCst) {
+            Some(CaptureEvent::QueueOverflow)
+        } else {
+            None
+        }
     }
 
     /// Current mode.
@@ -704,9 +722,11 @@ fn push(shared: &Shared, event: InputEvent) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             shared.dropped.fetch_add(1, Ordering::Relaxed);
-            if !shared.overflowed.swap(true, Ordering::Relaxed) {
-                let _ = shared.tx.try_send(CaptureEvent::QueueOverflow);
-            }
+            shared.overflowed.store(true, Ordering::Relaxed);
+            // Restore local suppression immediately, even if the consumer is stalled.
+            shared.mode.store(CaptureKind::Observe as u8, Ordering::SeqCst);
+            shared.hold_valid.store(false, Ordering::SeqCst);
+            shared.overflow_pending.store(true, Ordering::SeqCst);
         }
         Err(TrySendError::Disconnected(_)) => {
             shared.dropped.fetch_add(1, Ordering::Relaxed);
@@ -786,8 +806,7 @@ fn physical_modifiers() -> u32 {
 }
 
 /// Restore local mode unconditionally. This is the one path that must work even
-/// if everything else in the agent is stuck: it is an atomic store plus a
-/// best-effort queue push.
+/// if everything else in the agent is stuck: atomic stores and a separate control flag.
 fn fire_emergency(shared: &Shared) {
     shared
         .mode
@@ -795,7 +814,7 @@ fn fire_emergency(shared: &Shared) {
     shared.hold_valid.store(false, Ordering::SeqCst);
     if !shared.emergency_fired.swap(true, Ordering::SeqCst) {
         shared.emergencies.fetch_add(1, Ordering::Relaxed);
-        let _ = shared.tx.try_send(CaptureEvent::Emergency);
+        shared.emergency_pending.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1136,6 +1155,45 @@ mod tests {
     use super::should_capture_event;
 
     #[test]
+    fn full_queue_delivers_overflow_before_queued_input() {
+        use super::*;
+        let (mut shared, _) = hook_state(CaptureKind::Remote);
+        let (tx, rx) = mpsc::sync_channel(1);
+        shared.tx = tx;
+        let capture = Capture {
+            rx,
+            shared: Arc::new(shared),
+            thread: None,
+            thread_id: Arc::new(AtomicU32::new(0)),
+        };
+        for _ in 0..2 {
+            push(&capture.shared, InputEvent::Scroll { h120: 0, v120: 120 });
+        }
+        assert_eq!(capture.shared.dropped.load(Ordering::Relaxed), 1);
+        assert!(matches!(capture.try_recv(), Some(CaptureEvent::QueueOverflow)));
+        assert_eq!(capture.mode(), CaptureKind::Observe);
+        assert!(!capture.shared.hold_valid.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn emergency_is_observed_even_when_capture_queue_is_full() {
+        use super::*;
+        let (mut shared, _) = hook_state(CaptureKind::Remote);
+        let (tx, rx) = mpsc::sync_channel(1);
+        shared.tx = tx;
+        let capture = Capture {
+            rx,
+            shared: Arc::new(shared),
+            thread: None,
+            thread_id: Arc::new(AtomicU32::new(0)),
+        };
+        push(&capture.shared, InputEvent::Scroll { h120: 0, v120: 120 });
+        fire_emergency(&capture.shared);
+        assert!(matches!(capture.try_recv(), Some(CaptureEvent::Emergency)));
+        assert_eq!(capture.mode(), CaptureKind::Observe);
+    }
+
+    #[test]
     fn lifetime_hook_publishes_complete_set_without_resetting_swallowed_keys() {
         use super::*;
         let (shared, _) = hook_state(CaptureKind::Observe);
@@ -1196,6 +1254,8 @@ mod tests {
             recenters: AtomicU64::new(0),
             emergencies: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
+            overflow_pending: AtomicBool::new(false),
+            emergency_pending: AtomicBool::new(false),
             raw_input_ok: AtomicBool::new(false),
             hook_calls: AtomicU64::new(0),
             capture_injected: AtomicBool::new(false),
@@ -1240,7 +1300,8 @@ mod tests {
             assert_eq!(press(&shared, WM_KEYDOWN), Some(true));
             assert_eq!(capture_kind(&shared), CaptureKind::Observe);
             assert!(!shared.hold_valid.load(Ordering::SeqCst));
-            assert!(matches!(rx.try_recv(), Ok(CaptureEvent::Emergency)));
+            assert!(shared.emergency_pending.load(Ordering::SeqCst));
+            assert!(rx.try_recv().is_err());
             assert!(!remote(&shared));
             assert_eq!(press(&shared, WM_KEYUP), Some(true));
         }

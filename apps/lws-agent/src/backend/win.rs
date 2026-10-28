@@ -658,11 +658,7 @@ impl Win {
                 // is the only place it can be seen while the source capture is not running.
                 Some(CaptureEvent::Emergency) => return Some(Event::Emergency),
                 Some(CaptureEvent::HotkeyPressed(action)) => return Some(hotkey_event(action)),
-                Some(CaptureEvent::QueueOverflow) => {
-                    // The detector's queue is a counter, not a stream: a dropped batch can
-                    // miss a takeover, but ending the session over it would be worse.
-                    tracing::debug!("receiver takeover detector queue overflowed");
-                }
+                Some(CaptureEvent::QueueOverflow) => return Some(Event::QueueOverflow),
                 None => {}
             }
         }
