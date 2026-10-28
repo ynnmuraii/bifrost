@@ -55,6 +55,7 @@ pub struct X11 {
     /// Keeping its hash for a short window, instead of forgetting it after the first sighting,
     /// is what survives a clipboard manager re-owning the selection several times.)
     clipboard: Option<platform_x11::clipboard::Clipboard>,
+    pending_clipboard_read: Option<platform_x11::clipboard::PendingRead>,
     /// The payload this backend last applied from core, for [`EchoSuppressor`].
     echo: EchoSuppressor,
 }
@@ -158,6 +159,7 @@ impl X11 {
             plan,
             repeats: RepeatFilter::new(),
             clipboard,
+            pending_clipboard_read: None,
             echo: EchoSuppressor::default(),
         };
         backend.set_hotkeys(&config::HotkeyBindings {
@@ -216,20 +218,30 @@ impl X11 {
 
     /// The next clipboard change the *user* made, if the selection informed us of one.
     ///
-    /// Non-blocking on purpose: the session polls this from its own tick, and its watchdog and
-    /// deadline live on that tick too. The X work itself already lives on the selection's own
-    /// thread (`platform_x11::clipboard::Clipboard` dispatches commands to it), so the
-    /// runtime thread only waits for that thread's reply.
+    /// Non-blocking: selection reads stay on the existing clipboard actor and are polled
+    /// across ticks, so a stalled owner cannot hold up input or the heartbeat.
     pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
         let clipboard = self.clipboard.as_ref()?;
-        clipboard.wait(Duration::ZERO)?;
-        let snapshot = match clipboard.read() {
-            Ok(snapshot) => snapshot,
+        if self.pending_clipboard_read.is_none() {
+            clipboard.wait(Duration::ZERO)?;
+            match clipboard.start_read() {
+                Ok(pending) => self.pending_clipboard_read = Some(pending),
+                Err(error) => {
+                    tracing::warn!(%error, "the CLIPBOARD selection read could not start");
+                    return None;
+                }
+            }
+        }
+        let snapshot = match self.pending_clipboard_read.as_ref()?.poll() {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return None,
             Err(error) => {
+                self.pending_clipboard_read = None;
                 tracing::warn!(%error, "the CLIPBOARD selection could not be read");
                 return None;
             }
         };
+        self.pending_clipboard_read = None;
         if !snapshot.has_text {
             tracing::debug!("the CLIPBOARD selection holds no text");
             return None;
@@ -261,6 +273,7 @@ impl X11 {
     /// Async for the session's sake: the X round-trips ride the selection's own thread, and
     /// the runtime thread must stay free for the poll tick and the heartbeat.
     pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+        self.pending_clipboard_read = None;
         let Some(clipboard) = self.clipboard.as_ref() else {
             return Err("CLIPBOARD_DISABLED: this session has no CLIPBOARD selection".to_owned());
         };
@@ -597,6 +610,111 @@ fn release_counts(injector: &mut X11Injector) -> Released {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_clipboard_owner_does_not_block_backend_poll_or_later_apply() {
+        if std::env::var_os("LWS_X11_TEST_ISOLATED").is_none() {
+            eprintln!("requires LWS_X11_TEST_ISOLATED=1 under Xvfb");
+            return;
+        }
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+        let clipboard = platform_x11::clipboard::Clipboard::connect().unwrap();
+        let (owner, screen) = x11rb::connect(None).unwrap();
+        let window = owner.generate_id().unwrap();
+        owner
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                owner.setup().roots[screen].root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let selection = owner
+            .intern_atom(false, b"CLIPBOARD")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        owner
+            .set_selection_owner(window, selection, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(clipboard.wait(Duration::from_secs(2)).is_some());
+        let mut backend = X11 {
+            ready: Ready::degraded("fixture", "platform-x11", "x11"),
+            capture: None,
+            source_kind: None,
+            pending_hotkeys: Default::default(),
+            injector: None,
+            detector: None,
+            plan: None,
+            repeats: RepeatFilter::new(),
+            clipboard: Some(clipboard),
+            pending_clipboard_read: None,
+            echo: EchoSuppressor::default(),
+        };
+        // Queue another owner notification for the actual backend poll.
+        owner
+            .set_selection_owner(window, selection, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut elapsed = Duration::ZERO;
+        loop {
+            let started = std::time::Instant::now();
+            assert!(backend.clipboard_change().await.is_none());
+            elapsed = elapsed.max(started.elapsed());
+            if matches!(
+                owner.poll_for_event().unwrap(),
+                Some(x11rb::protocol::Event::SelectionRequest(_))
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owner never received a read request"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The owner has received the request and deliberately never answers it.
+        let started = std::time::Instant::now();
+        assert!(backend.clipboard_change().await.is_none());
+        let second_elapsed = started.elapsed();
+        let apply_started = std::time::Instant::now();
+        backend
+            .set_clipboard(Some("worker remains usable"))
+            .await
+            .unwrap();
+        let apply_elapsed = apply_started.elapsed();
+        assert_eq!(
+            backend.clipboard.as_ref().unwrap().read().unwrap().text,
+            "worker remains usable"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "first poll took {elapsed:?}"
+        );
+        assert!(
+            second_elapsed < Duration::from_millis(50),
+            "pending poll took {second_elapsed:?}"
+        );
+        assert!(
+            apply_elapsed < Duration::from_millis(100),
+            "cancelling read and applying took {apply_elapsed:?}"
+        );
+    }
 
     #[test]
     fn armed_observe_reports_raw_key_and_button_edges_without_a_grab() {

@@ -194,7 +194,9 @@ pub fn decode_text_payload(bytes: &[u8]) -> Option<String> {
 #[cfg(target_os = "linux")]
 mod x11_impl {
     use std::fmt;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+    use std::sync::Arc;
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
@@ -256,6 +258,8 @@ mod x11_impl {
         Reply(x11rb::errors::ReplyError),
         /// The other side did not answer in time.
         Timeout,
+        /// A newer operation or shutdown cancelled this read.
+        Cancelled,
         /// The server lacks something this adapter requires.
         Unsupported(String),
         /// The adapter reached a state it cannot continue from.
@@ -271,6 +275,7 @@ mod x11_impl {
                 ClipboardError::Timeout => {
                     f.write_str("the selection owner did not answer in time")
                 }
+                ClipboardError::Cancelled => f.write_str("the clipboard read was cancelled"),
                 ClipboardError::Unsupported(what) => write!(f, "unsupported X server: {what}"),
                 ClipboardError::Internal(what) => write!(f, "clipboard adapter error: {what}"),
             }
@@ -284,6 +289,7 @@ mod x11_impl {
                 ClipboardError::Connection(err) => Some(err),
                 ClipboardError::Reply(err) => Some(err),
                 ClipboardError::Timeout
+                | ClipboardError::Cancelled
                 | ClipboardError::Unsupported(_)
                 | ClipboardError::Internal(_) => None,
             }
@@ -318,7 +324,7 @@ mod x11_impl {
 
     /// What the caller sends the background thread.
     enum Command {
-        Read(ReadReply),
+        Read(ReadReply, u64),
         Set(String, SetReply),
         Shutdown,
     }
@@ -358,6 +364,8 @@ mod x11_impl {
         ownership_time: Timestamp,
         /// The `INCR` transfer currently in flight, if any.
         active: Option<ActiveOwner>,
+        generation: Arc<AtomicU64>,
+        operation: u64,
     }
 
     /// The CLIPBOARD selection owner + observer for one X connection.
@@ -365,6 +373,36 @@ mod x11_impl {
         commands: Sender<Command>,
         changes: Receiver<Change>,
         thread: Option<JoinHandle<()>>,
+        generation: Arc<AtomicU64>,
+    }
+
+    /// A cancellable clipboard read; polling never waits for the selection owner.
+    pub struct PendingRead {
+        reply: Receiver<Result<Snapshot, ClipboardError>>,
+        generation: Arc<AtomicU64>,
+        operation: u64,
+    }
+
+    impl PendingRead {
+        /// Returns the completed snapshot, or `None` while the actor is still reading.
+        pub fn poll(&self) -> Result<Option<Snapshot>, ClipboardError> {
+            match self.reply.try_recv() {
+                Ok(result) => result.map(Some),
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Disconnected) => Err(gone()),
+            }
+        }
+    }
+
+    impl Drop for PendingRead {
+        fn drop(&mut self) {
+            let _ = self.generation.compare_exchange(
+                self.operation,
+                self.operation.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
     }
 
     impl Clipboard {
@@ -426,9 +464,20 @@ mod x11_impl {
 
             let (command_tx, command_rx) = mpsc::channel();
             let (change_tx, change_rx) = mpsc::channel();
+            let generation = Arc::new(AtomicU64::new(0));
+            let worker_generation = Arc::clone(&generation);
             let thread = std::thread::Builder::new()
                 .name("lws-x11-clipboard".to_owned())
-                .spawn(move || run(conn, window, atoms, change_tx, command_rx))
+                .spawn(move || {
+                    run(
+                        conn,
+                        window,
+                        atoms,
+                        change_tx,
+                        command_rx,
+                        worker_generation,
+                    )
+                })
                 .map_err(|err| {
                     ClipboardError::Internal(format!("cannot start the clipboard thread: {err}"))
                 })?;
@@ -437,6 +486,7 @@ mod x11_impl {
                 commands: command_tx,
                 changes: change_rx,
                 thread: Some(thread),
+                generation,
             })
         }
 
@@ -451,14 +501,29 @@ mod x11_impl {
         /// Reads the CURRENT CLIPBOARD owner's text, including a real `INCR` transfer, and
         /// classifies the KDE secret hint.
         pub fn read(&self) -> Result<Snapshot, ClipboardError> {
-            let (tx, rx) = mpsc::channel();
-            self.send(Command::Read(tx))?;
-            rx.recv().map_err(|_| gone())?
+            let pending = self.start_read()?;
+            pending.reply.recv().map_err(|_| gone())?
+        }
+
+        /// Starts a read on the existing actor without blocking the caller.
+        pub fn start_read(&self) -> Result<PendingRead, ClipboardError> {
+            let operation = self
+                .generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+            let (tx, reply) = mpsc::channel();
+            self.send(Command::Read(tx, operation))?;
+            Ok(PendingRead {
+                reply,
+                generation: Arc::clone(&self.generation),
+                operation,
+            })
         }
 
         /// Takes CLIPBOARD ownership and serves `TARGETS` / `TIMESTAMP` / `UTF8_STRING` /
         /// `TEXT` for `text`, using the `INCR` dance for large payloads.
         pub fn set(&self, text: &str) -> Result<(), ClipboardError> {
+            self.generation.fetch_add(1, Ordering::SeqCst);
             let (tx, rx) = mpsc::channel();
             self.send(Command::Set(text.to_owned(), tx))?;
             rx.recv().map_err(|_| gone())?
@@ -473,6 +538,7 @@ mod x11_impl {
         fn drop(&mut self) {
             // Tell the thread to release the selection and end. It never blocks for long:
             // the pump wakes on a 20 ms tick even when the connection stays quiet.
+            self.generation.fetch_add(1, Ordering::SeqCst);
             let _ = self.commands.send(Command::Shutdown);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -504,11 +570,14 @@ mod x11_impl {
         atoms: Atoms,
         changes: Sender<Change>,
         commands: Receiver<Command>,
+        generation: Arc<AtomicU64>,
     ) {
         let mut state = State {
             owned: None,
             ownership_time: 0,
             active: None,
+            operation: generation.load(Ordering::SeqCst),
+            generation,
         };
         loop {
             // Serve everything already queued first: a paste must not wait for the command
@@ -536,11 +605,13 @@ mod x11_impl {
             }
 
             match commands.try_recv() {
-                Ok(Command::Read(reply)) => {
+                Ok(Command::Read(reply, operation)) => {
+                    state.operation = operation;
                     let result = read_selection(&mut conn, window, &atoms, &mut state, &changes);
                     let _ = reply.send(result);
                 }
                 Ok(Command::Set(text, reply)) => {
+                    state.operation = state.generation.load(Ordering::SeqCst);
                     let result =
                         take_ownership(&mut conn, window, &atoms, &mut state, &changes, text);
                     let _ = reply.send(result);
@@ -1031,6 +1102,9 @@ mod x11_impl {
         F: Fn(&Event) -> bool,
     {
         loop {
+            if state.operation != state.generation.load(Ordering::SeqCst) {
+                return Err(ClipboardError::Cancelled);
+            }
             if let Some(event) = conn.poll_for_event()? {
                 if matches(&event) {
                     return Ok(event);
@@ -1070,10 +1144,34 @@ mod x11_impl {
         let word: [u8; 4] = property.get(..4)?.try_into().ok()?;
         Some(u32::from_ne_bytes(word) as usize)
     }
+
+    #[cfg(test)]
+    mod pending_read_tests {
+        use super::*;
+
+        #[test]
+        fn dropping_an_old_read_cannot_cancel_a_newer_operation() {
+            let generation = Arc::new(AtomicU64::new(2));
+            let old = PendingRead {
+                reply: mpsc::channel().1,
+                generation: Arc::clone(&generation),
+                operation: 1,
+            };
+            drop(old);
+            assert_eq!(generation.load(Ordering::SeqCst), 2);
+            let current = PendingRead {
+                reply: mpsc::channel().1,
+                generation: Arc::clone(&generation),
+                operation: 2,
+            };
+            drop(current);
+            assert_eq!(generation.load(Ordering::SeqCst), 3);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use x11_impl::{Change, Clipboard, ClipboardError, Snapshot};
+pub use x11_impl::{Change, Clipboard, ClipboardError, PendingRead, Snapshot};
 
 #[cfg(test)]
 mod tests {
