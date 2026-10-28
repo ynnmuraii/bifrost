@@ -175,7 +175,10 @@ mod glue {
 
     use std::io::{Read, Write};
     use std::os::fd::{AsFd, OwnedFd};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
@@ -347,6 +350,8 @@ mod glue {
         finished: bool,
         /// Replies wait for display-sync callbacks ordered after each selection request.
         pending_applies: Vec<(WlCallback, oneshot::Sender<Result<(), String>>)>,
+        /// Serves paste requests without holding up Wayland dispatch.
+        writer: TransferWriter,
     }
 
     impl State {
@@ -426,28 +431,36 @@ mod glue {
         }
     }
 
-    impl Dispatch<ExtDataControlSourceV1, String> for State {
+    impl Dispatch<ExtDataControlSourceV1, Arc<str>> for State {
         fn event(
             state: &mut Self,
             source: &ExtDataControlSourceV1,
             event: ext_data_control_source_v1::Event,
-            text: &String,
+            text: &Arc<str>,
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
             match event {
                 ext_data_control_source_v1::Event::Send { fd, .. } => {
-                    // The peer may not read for a long time, so this must not run on the loop's
-                    // thread: the text and the write end go to a helper thread.
-                    serve(fd, text);
+                    if state
+                        .owned
+                        .as_ref()
+                        .is_some_and(|owned| owned.id() == source.id())
+                    {
+                        state.writer.send(fd, text);
+                    }
                 }
                 ext_data_control_source_v1::Event::Cancelled => {
-                    // The protocol asks for a destroy here; `owned` is taken so that the next
-                    // `Set` does not destroy the same source twice.
-                    if let Some(replaced) = state.owned.take() {
-                        replaced.destroy();
+                    if state
+                        .owned
+                        .as_ref()
+                        .is_some_and(|owned| owned.id() == source.id())
+                    {
+                        state.writer.cancel();
+                        if let Some(replaced) = state.owned.take() {
+                            replaced.destroy();
+                        }
                     }
-                    let _ = source;
                 }
                 _ => {}
             }
@@ -543,6 +556,7 @@ mod glue {
                     applied: None,
                     finished: false,
                     pending_applies: Vec::new(),
+                    writer: TransferWriter::new()?,
                 },
                 manager,
                 device,
@@ -641,6 +655,7 @@ mod glue {
 
         /// Takes the selection for `text`, or gives it up.
         fn set_selection(&mut self, text: Option<String>) {
+            self.state.writer.cancel();
             // A source is single-use: `set_selection` with a source that was already given
             // once is the `used_source` protocol error, so every `Set` creates a new one and
             // the previous one is destroyed here (`Cancelled` may have taken it already).
@@ -649,7 +664,9 @@ mod glue {
             }
             match text {
                 Some(text) => {
-                    let source = self.manager.create_data_source(&self.qh, text.clone());
+                    let source = self
+                        .manager
+                        .create_data_source(&self.qh, Arc::<str>::from(text.as_str()));
                     source.offer(TEXT_MIME.to_owned());
                     self.device.set_selection(Some(&source));
                     self.state.owned = Some(source);
@@ -664,6 +681,7 @@ mod glue {
 
         /// Gives the selection back and drops the objects this adapter created.
         fn release(&mut self) {
+            self.state.writer.cancel();
             if let Some(source) = self.state.owned.take() {
                 source.destroy();
             }
@@ -803,17 +821,113 @@ mod glue {
         }
     }
 
-    /// Writes the text this adapter owns to the pipe the compositor handed us, on its own
-    /// thread: the reader on the other side may be slow, and the loop must not wait for it.
-    fn serve(fd: OwnedFd, text: &str) {
+    struct Transfer {
+        fd: OwnedFd,
+        text: Arc<str>,
+        generation: u64,
+    }
+
+    /// One bounded, cancellable paste worker, joined when the Wayland state is dropped.
+    struct TransferWriter {
+        requests: SyncSender<Transfer>,
+        stopping: Arc<AtomicBool>,
+        generation: Arc<AtomicU64>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl TransferWriter {
+        fn new() -> std::io::Result<Self> {
+            let (requests, receiver) = mpsc::sync_channel::<Transfer>(4);
+            let stopping = Arc::new(AtomicBool::new(false));
+            let generation = Arc::new(AtomicU64::new(0));
+            let stop = Arc::clone(&stopping);
+            let current = Arc::clone(&generation);
+            let thread = std::thread::Builder::new()
+                .name("clipboard-paste".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        match receiver.recv_timeout(POLL_INTERVAL) {
+                            Ok(transfer) => serve(
+                                transfer.fd,
+                                &transfer.text,
+                                &stop,
+                                &current,
+                                transfer.generation,
+                                Instant::now() + TRANSFER_TIMEOUT,
+                            ),
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                })?;
+            Ok(Self {
+                requests,
+                stopping,
+                generation,
+                thread: Some(thread),
+            })
+        }
+
+        fn send(&self, fd: OwnedFd, text: &Arc<str>) {
+            let transfer = Transfer {
+                fd,
+                text: Arc::clone(text),
+                generation: self.generation.load(Ordering::SeqCst),
+            };
+            // Closing an excess request's fd refuses that paste without blocking dispatch.
+            let _ = self.requests.try_send(transfer);
+        }
+
+        fn cancel(&self) {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for TransferWriter {
+        fn drop(&mut self) {
+            self.stopping.store(true, Ordering::SeqCst);
+            self.cancel();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn serve(
+        fd: OwnedFd,
+        text: &str,
+        stopping: &AtomicBool,
+        current: &AtomicU64,
+        generation: u64,
+        deadline: Instant,
+    ) {
+        let flags = rustix::fs::fcntl_getfl(&fd)
+            .and_then(|flags| rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK));
+        if flags.is_err() {
+            return;
+        }
         let mut file = std::fs::File::from(fd);
         let bytes = text.as_bytes();
         let mut offset = 0;
         while offset < bytes.len() {
+            if stopping.load(Ordering::SeqCst)
+                || current.load(Ordering::SeqCst) != generation
+                || Instant::now() >= deadline
+            {
+                return;
+            }
             match file.write(&bytes[offset..]) {
                 Ok(0) => break,
                 Ok(count) => offset += count,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let mut fds = [PollFd::new(&file, PollFlags::OUT)];
+                    match poll(&mut fds, Some(&to_timespec(remaining.min(POLL_INTERVAL)))) {
+                        Ok(_) | Err(Errno::INTR) => {}
+                        Err(_) => return,
+                    }
+                }
                 Err(error) => {
                     tracing::debug!(%error, "the selection transfer was cut short");
                     break;
@@ -851,6 +965,69 @@ mod glue {
     #[cfg(test)]
     mod apply_tests {
         use super::*;
+
+        #[test]
+        fn stalled_paste_does_not_block_dispatch_or_writer_shutdown() {
+            let (read, write) = rustix::pipe::pipe().expect("paste pipe");
+            rustix::pipe::fcntl_setpipe_size(&write, 4096).expect("small pipe");
+            rustix::io::write(&write, &[0u8; 4096]).expect("fill paste pipe");
+            let (dispatch, dispatched) = mpsc::channel();
+            let (shutdown, stopped) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let writer = TransferWriter::new().expect("paste worker");
+                writer.send(write, &Arc::<str>::from("x".repeat(128 * 1024)));
+                dispatch.send(()).unwrap();
+                drop(writer);
+                shutdown.send(()).unwrap();
+            });
+            let responsive = dispatched.recv_timeout(Duration::from_secs(1)).is_ok();
+            let cancelled = responsive && stopped.recv_timeout(Duration::from_secs(1)).is_ok();
+            // Release even the broken synchronous writer before asserting: no hung test thread.
+            drop(read);
+            worker.join().expect("dispatch thread");
+            assert!(
+                responsive,
+                "a stalled paste must not block the next dispatch"
+            );
+            assert!(
+                cancelled,
+                "shutdown must cancel and join the transfer worker"
+            );
+        }
+
+        #[test]
+        fn stalled_paste_has_a_total_deadline() {
+            let (_read, write) = rustix::pipe::pipe().unwrap();
+            rustix::pipe::fcntl_setpipe_size(&write, 4096).unwrap();
+            rustix::io::write(&write, &[0u8; 4096]).unwrap();
+            let started = Instant::now();
+            serve(
+                write,
+                "pending",
+                &AtomicBool::new(false),
+                &AtomicU64::new(0),
+                0,
+                started + Duration::from_millis(30),
+            );
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+
+        #[test]
+        fn cancelled_paste_does_not_block_a_fresh_transfer() {
+            let writer = TransferWriter::new().unwrap();
+            let (_read, write) = rustix::pipe::pipe().unwrap();
+            rustix::pipe::fcntl_setpipe_size(&write, 4096).unwrap();
+            rustix::io::write(&write, &[0u8; 4096]).unwrap();
+            writer.send(write, &Arc::<str>::from("stalled"));
+            writer.cancel();
+            let (read, write) = rustix::pipe::pipe().unwrap();
+            writer.send(write, &Arc::<str>::from("fresh"));
+            let mut fds = [PollFd::new(&read, PollFlags::IN)];
+            assert!(poll(&mut fds, Some(&to_timespec(Duration::from_secs(1)))).unwrap() > 0);
+            let mut bytes = [0u8; 5];
+            assert_eq!(rustix::io::read(&read, &mut bytes).unwrap(), 5);
+            assert_eq!(&bytes, b"fresh");
+        }
 
         fn fake_clipboard() -> (Clipboard, Receiver<Command>) {
             let (commands, receiver) = mpsc::channel();
