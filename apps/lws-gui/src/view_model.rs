@@ -1407,6 +1407,9 @@ impl ViewModel {
                 if paired && !result.peer_name.is_empty() {
                     self.pairing.paired = Some(result.peer_name);
                 }
+                if paired {
+                    self.set_outcome(Outcome::done(self.success_text(Request::PairingAnswer)));
+                }
             }
             Msg::IncomingPairingRequest(prompt) => {
                 self.incoming_pair_request = (prompt.seconds_remaining > 0).then_some(prompt);

@@ -57,6 +57,10 @@ fn audit_only_a_committed_pairing_outcome_shows_success() {
             vm.pairing.paired.as_deref(),
             (outcome == PairingOutcome::Paired).then_some("LAPTOP")
         );
+        assert_eq!(
+            vm.outcome.as_ref().is_some_and(|result| result.ok),
+            outcome == PairingOutcome::Paired
+        );
         assert!(vm.pairing.prompt.is_none());
         assert!(!vm.pairing.dialing);
     }
