@@ -2516,10 +2516,26 @@ mod tests {
                             .is_empty(),
                         "broadcast still waits for receiver intent"
                     );
+                    let (requests, mut request_rx) = mpsc::channel::<QueuedMessage>(4);
+                    let request_reader = tokio::spawn(std::future::pending::<()>());
+                    let request_writer = tokio::spawn(std::future::pending::<()>());
+                    receiver.runtime.inner.lock().await.conns.insert(
+                        origin,
+                        Conn {
+                            generation: 1,
+                            tx: requests,
+                            reader: request_reader.abort_handle(),
+                            writer: request_writer.abort_handle(),
+                            transfers: BTreeMap::new(),
+                        },
+                    );
                     receiver.on_focus().await;
-                    sender
-                        .on_peer_message(peer, ClipboardMessage::Request { offer_id })
-                        .await;
+                    let request = request_rx.recv().await.expect("receiver requests on focus");
+                    assert!(matches!(
+                        request.message,
+                        ClipboardMessage::Request { offer_id: requested } if requested == offer_id
+                    ));
+                    sender.on_peer_message(peer, request.message).await;
                 }
                 loop {
                     let queued = tokio::time::timeout(Duration::from_secs(2), rx.recv())
