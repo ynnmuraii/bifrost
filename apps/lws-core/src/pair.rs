@@ -198,7 +198,14 @@ async fn window_on_running_core(paths: &Paths) -> Result<Option<Result<(), Failu
     let fields = Fields::parse(&prompt);
     println!("SAS: {}", fields.get("sas").unwrap_or("?"));
     println!("peer: {}", fields.get("peer").unwrap_or("?"));
-    println!("compare the six digits with the other machine, then answer y/n");
+    println!(
+        "{}",
+        sas_confirmation_guidance(
+            fields
+                .get("sas_ceremony_version")
+                .and_then(|value| value.parse().ok())
+        )
+    );
     print!("codes match? [y/N] ");
     std::io::stdout().flush().ok();
 
@@ -272,7 +279,10 @@ async fn confirm(
     println!("SAS: {}", driver.sas().text());
     println!("peer: {}", driver.peer_display_name());
     println!("peer fingerprint: {}", driver.peer_fingerprint());
-    println!("compare the six digits with the other machine, then answer y/n");
+    println!(
+        "{}",
+        sas_confirmation_guidance(Some(driver.sas_ceremony_version()))
+    );
     print!("codes match? [y/N] ");
     std::io::stdout().flush().ok();
 
@@ -300,6 +310,15 @@ async fn confirm(
         crate::command::node_id_hex(&node_id)
     );
     Ok(())
+}
+
+/// Old or unspecified ceremonies must not appear to offer v1 SAS protection.
+fn sas_confirmation_guidance(version: Option<u32>) -> &'static str {
+    if version == Some(1) {
+        "compare the six digits with the other machine, then answer y/n"
+    } else {
+        "WARNING: legacy SAS pairing does not protect against active attacks. Upgrade both computers before pairing.\ncompare the six digits with the other machine, then answer y/n"
+    }
 }
 
 /// The address to remember for the peer.
@@ -346,6 +365,19 @@ async fn ask() -> Result<bool, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_and_unknown_sas_versions_warn_before_confirmation() {
+        for version in [None, Some(0), Some(2)] {
+            let guidance = sas_confirmation_guidance(version);
+            assert!(guidance.contains("legacy"));
+            assert!(guidance.contains("does not protect against active attacks"));
+            assert!(guidance.contains("compare the six digits"));
+        }
+        let guidance = sas_confirmation_guidance(Some(1));
+        assert!(!guidance.contains("legacy"));
+        assert!(guidance.contains("compare the six digits"));
+    }
 
     #[test]
     fn running_core_prompt_answers_the_ceremony_not_the_window_attempt() {

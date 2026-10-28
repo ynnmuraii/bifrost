@@ -4802,11 +4802,12 @@ fn prompt_of(prompt: oneshot::Receiver<pairing::Prompt>) -> oneshot::Receiver<ct
 
 fn prompt_response(prompt: &pairing::Prompt) -> ctl::Response {
     ctl::Response::Status(format!(
-        "sas={} peer={} ceremony={} address={}",
+        "sas={} peer={} ceremony={} address={} sas_ceremony_version={}",
         prompt.sas_code,
         prompt.peer_name,
         crate::command::hex16(&prompt.ceremony_id),
-        prompt.address.as_deref().unwrap_or_default()
+        prompt.address.as_deref().unwrap_or_default(),
+        prompt.sas_ceremony_version
     ))
 }
 
