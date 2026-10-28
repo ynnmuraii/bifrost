@@ -236,15 +236,7 @@ impl Injector {
         };
 
         // Do not leave motion tokens behind for events that were never injected.
-        let emitted_motions = plan
-            .records
-            .iter()
-            .take(accepted)
-            .filter(|record| matches!(record, Record::MoveRel { .. } | Record::MoveAbsNorm { .. }))
-            .count();
-        synth::expect_motions(
-            declared_motions - i32::try_from(emitted_motions).unwrap_or(i32::MAX),
-        );
+        synth::expect_motions(motion_budget_adjustment(plan, accepted, declared_motions));
 
         let error = if accepted < total_records {
             // SAFETY: read-only query of the calling thread's last error.
@@ -279,6 +271,16 @@ impl Injector {
             error,
         }
     }
+}
+
+fn motion_budget_adjustment(plan: &Plan, accepted: usize, declared_motions: i32) -> i32 {
+    let emitted_motions = plan
+        .records
+        .iter()
+        .take(accepted)
+        .filter(|record| matches!(record, Record::MoveRel { .. } | Record::MoveAbsNorm { .. }))
+        .count();
+    i32::try_from(emitted_motions).unwrap_or(i32::MAX) - declared_motions
 }
 
 fn classify(raw: WIN32_ERROR) -> InjectError {
@@ -479,8 +481,43 @@ pub fn keyboard_timing() -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, InjectErrorKind};
+    use super::{classify, motion_budget_adjustment, InjectErrorKind, Plan, Record};
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, WIN32_ERROR};
+
+    #[test]
+    fn rejected_motion_budget_is_retracted_for_every_accepted_count() {
+        let plan = Plan {
+            records: vec![
+                Record::Key {
+                    scan: 0x1e,
+                    extended: false,
+                    up: false,
+                },
+                Record::MoveRel { dx: 1, dy: 2 },
+                Record::Wheel {
+                    vertical: true,
+                    delta120: 120,
+                },
+                Record::MoveAbsNorm { x: 123, y: 456 },
+                Record::Button {
+                    button: input_model::MouseButton::Left,
+                    up: false,
+                },
+                Record::MoveRel { dx: -1, dy: -2 },
+            ],
+            ..Plan::default()
+        };
+        let declared = plan.motion_count();
+        let expected_emitted = [0, 0, 1, 1, 2, 2, 3];
+        for (accepted, emitted) in expected_emitted.into_iter().enumerate() {
+            let correction = motion_budget_adjustment(&plan, accepted, declared);
+            assert_eq!(declared + correction, emitted, "accepted {accepted} records");
+            // Capture may have consumed accepted motions before SendInput returns.
+            assert_eq!(declared - emitted + correction, 0);
+        }
+        let empty = Plan::default();
+        assert_eq!(motion_budget_adjustment(&empty, 0, 0), 0);
+    }
 
     #[test]
     fn access_denied_is_classified_and_raw_error_codes_are_preserved() {
