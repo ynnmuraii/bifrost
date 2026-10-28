@@ -62,8 +62,7 @@ pub const TITLE: &str = "Bifrost";
 /// Everything the window needs before its first frame — the directories, the endpoint,
 /// `config.toml`, the client thread — is resolved by [`app::GuiApp::new`].
 pub fn run_gui(mut args: Vec<String>) -> std::process::ExitCode {
-    let updated = args.iter().any(|arg| arg == "--updated");
-    args.retain(|arg| arg != "--updated");
+    let (updated, login) = startup_flags(&mut args);
     // The window's decisions go to a file (`init_logging`): on Windows this role has no
     // console at all, and "why did the window do that?" is a question about its window.
     init_logging(&view_model::CliArgs::parse(args.iter().cloned()));
@@ -114,7 +113,7 @@ pub fn run_gui(mut args: Vec<String>) -> std::process::ExitCode {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint();
             })?;
-            Ok(Box::new(app::GuiApp::new(cc, updated)))
+            Ok(Box::new(app::GuiApp::new(cc, updated, login)))
         }),
     );
     if updater_runtime::RESTART.load(std::sync::atomic::Ordering::Acquire) {
@@ -208,5 +207,27 @@ mod tests {
     #[test]
     fn the_window_title_is_the_product_name() {
         assert_eq!(super::TITLE, "Bifrost");
+    }
+}
+
+fn startup_flags(args: &mut Vec<String>) -> (bool, bool) {
+    let updated = args.iter().any(|arg| arg == "--updated");
+    let login = args.iter().any(|arg| arg == "--login");
+    args.retain(|arg| arg != "--updated" && arg != "--login");
+    (updated, login)
+}
+
+#[cfg(test)]
+mod startup_tests {
+    #[test]
+    fn login_is_explicit_and_not_forwarded_to_restarts() {
+        let mut manual = vec!["--root".into(), "scratch folder".into()];
+        assert_eq!(super::startup_flags(&mut manual), (false, false));
+        let mut login = vec!["--login".into(), "--root".into(), "scratch folder".into()];
+        assert_eq!(super::startup_flags(&mut login), (false, true));
+        assert_eq!(login, manual);
+        login.push("--updated".into());
+        assert_eq!(super::startup_flags(&mut login), (true, false));
+        assert_eq!(login, manual);
     }
 }

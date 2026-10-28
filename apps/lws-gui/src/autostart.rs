@@ -38,7 +38,7 @@ pub fn set_enabled(enable: bool) -> io::Result<()> {
         if enable {
             let exe = std::env::current_exe()?;
             command.args(["add", RUN_KEY, "/v", "Bifrost", "/t", "REG_SZ", "/d"]);
-            command.arg(format!("\"{}\"", exe.display())).arg("/f");
+            command.arg(login_command(&exe)).arg("/f");
         } else {
             command.args(["delete", RUN_KEY, "/v", "Bifrost", "/f"]);
         }
@@ -63,6 +63,24 @@ pub fn set_enabled(enable: bool) -> io::Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn login_command(exe: &std::path::Path) -> String {
+    format!("\"{}\" gui --login", exe.display())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #[test]
+    fn login_command_marks_login_and_quotes_executable() {
+        assert_eq!(
+            super::login_command(std::path::Path::new(
+                r"C:\Program Files\Bifrost\bifrost.exe"
+            )),
+            r#""C:\Program Files\Bifrost\bifrost.exe" gui --login"#
+        );
+    }
+}
+
 #[cfg(not(windows))]
 fn entry() -> io::Result<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -78,7 +96,7 @@ fn entry() -> io::Result<std::path::PathBuf> {
 #[cfg(not(windows))]
 fn desktop_entry(exe: &std::path::Path) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=Bifrost\nExec=\"{}\"\nIcon=bifrost\nTerminal=false\nStartupWMClass=bifrost\n",
+        "[Desktop Entry]\nType=Application\nName=Bifrost\nExec=\"{}\" gui --login\nIcon=bifrost\nTerminal=false\nStartupWMClass=bifrost\n",
         exec_argument(exe)
     )
 }
@@ -134,7 +152,7 @@ mod tests {
     #[test]
     fn login_entry_quotes_the_actual_executable() {
         let text = super::desktop_entry(Path::new("/home/user/My Apps/100%/bifrost"));
-        assert!(text.contains("Exec=\"/home/user/My Apps/100%%/bifrost\"\n"));
+        assert!(text.contains("Exec=\"/home/user/My Apps/100%%/bifrost\" gui --login\n"));
         assert!(text.contains("\nStartupWMClass=bifrost\n"), "{text}");
         assert!(text.ends_with('\n'));
     }
@@ -171,7 +189,10 @@ mod tests {
         ] {
             let entry = desktop_entry(Path::new(path));
             assert!(
-                entry.contains(&format!("Exec=\"{}\"\n", installer_escaped(path))),
+                entry.contains(&format!(
+                    "Exec=\"{}\" gui --login\n",
+                    installer_escaped(path)
+                )),
                 "{path:?} escapes differently from install.sh: {entry}"
             );
             assert_eq!(exec_argument(Path::new(path)), installer_escaped(path));

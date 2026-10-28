@@ -68,7 +68,7 @@ impl GuiApp {
     /// Every failure before the first frame — the directories, the endpoint, a broken
     /// `config.toml` — is carried into the view model and shown in the top bar, because a
     /// window that refuses to open cannot tell its user anything.
-    pub fn new(cc: &eframe::CreationContext<'_>, updated: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, updated: bool, login: bool) -> Self {
         let (mut view, client) = view_model::boot(view_model::cli_args_from_env());
         ui::install_fonts(&cc.egui_ctx);
         // The client thread repaints the window when — and only when — it has something to say.
@@ -84,11 +84,7 @@ impl GuiApp {
         }
         let saved_look = view.look.clone();
         view.settings.autostart = crate::autostart::enabled();
-        let start_core = should_start_core(
-            view.config.config_was_missing,
-            updated,
-            view.settings.autostart,
-        );
+        let start_core = should_start_core(view.config.config_was_missing, updated, login);
         let mut bridge = Bridge::new(view, client);
         if start_core {
             bridge.dispatch(view_model::Action::StartCore, Instant::now());
@@ -218,8 +214,8 @@ pub(crate) fn close_decision(tray_ready: bool) -> Close {
     }
 }
 
-fn should_start_core(config_was_missing: bool, updated: bool, autostart_enabled: bool) -> bool {
-    config_was_missing || updated || autostart_enabled
+fn should_start_core(config_was_missing: bool, updated: bool, login: bool) -> bool {
+    config_was_missing || updated || login
 }
 
 #[cfg(test)]
@@ -233,7 +229,7 @@ mod close_tests {
     }
 
     #[test]
-    fn audit_login_with_existing_config_starts_core() {
+    fn login_starts_core_but_manual_launch_preserves_a_stopped_core() {
         assert!(should_start_core(false, false, true));
         assert!(!should_start_core(false, false, false));
         assert!(should_start_core(true, false, false));
