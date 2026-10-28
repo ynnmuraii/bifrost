@@ -394,6 +394,7 @@ message PairingEnvelope {
     ProtocolError error = 12;
     PairRequest request = 13; // request ALPN only; never grants trust
     PairRequestAck request_ack = 14;
+    PairReveal reveal = 15; // commitment ceremony v1 only, after both Hello commitments
   }
 }
 message PairHello {
@@ -402,6 +403,12 @@ message PairHello {
   reserved 3; reserved "desired_role"; // roles are per-lease in v0.3
   bool supports_sas = 4;       // 6-digit comparison code from TLS exporter
   uint32 listen_port = 5;      // input/control port the sender listens on; 0 = default 47901
+  uint32 sas_ceremony_version = 6; // 0 = legacy exporter SAS; 1 = SHA-256 commitment/reveal
+  bytes sas_commitment = 7;    // exactly 32 for version 1, empty for legacy
+}
+message PairReveal {
+  bytes contribution_id = 1; // fresh random16 per side and TLS connection
+  bytes nonce = 2;           // fresh random32, secret until both commitments are received
 }
 message PairDecision {
   bool approved = 1;           // only after local user decision

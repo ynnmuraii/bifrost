@@ -40,10 +40,10 @@
 //! 2. **A revoked peer cannot establish a runtime session.** [`trust::TrustStore::pinned`]
 //!    excludes revoked records. Transport's separate bounded pending-notice pins permit
 //!    only a capability-checked `Hello`/`Unpaired` exchange, never membership or clipboard.
-//! 3. **The comparison code is a function of the TLS session.** It is derived from the
-//!    RFC 8446 §7.5 exporter with `attempt_id` as the context, so a MITM that terminates
-//!    two sessions cannot make the two codes agree («MITM держит два разных TLS-сеанса,
-//!    поэтому коды не совпадут»).
+//! 3. **Version 1 SAS commits before revealing either fresh contribution.** Both
+//!    certificate identities, roles, attempts and a fixed-context TLS exporter are bound
+//!    by SHA-256. A six-digit match remains a probabilistic out-of-band check, not a
+//!    guarantee. Explicitly legacy peers retain the weaker exporter-only ceremony.
 //! 4. **`PairHello.node_id` must equal the SPKI hash** of the certificate the handshake
 //!    just proved possession of; a mismatch rejects the ceremony (`pairing`).
 //! 5. **A ceremony writes trust only after both sides approved** — the machine emits

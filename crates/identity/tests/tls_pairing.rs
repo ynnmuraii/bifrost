@@ -126,6 +126,8 @@ async fn a_loopback_pairing_commits_on_both_sides_with_one_code() {
 
     // Both sides derive the code from their own exporter, and they must agree.
     assert_eq!(opener.sas(), dialer.sas());
+    assert_eq!(opener.sas_ceremony_version(), identity::sas::COMMITMENT_VERSION);
+    assert_eq!(dialer.sas_ceremony_version(), identity::sas::COMMITMENT_VERSION);
     assert_eq!(opener.peer_node_id(), &b.node_id());
     assert_eq!(dialer.peer_node_id(), &a.node_id());
     // `PairHello.display_name` carries the *configured* name of the sender, which is the only
@@ -163,6 +165,108 @@ async fn a_loopback_pairing_commits_on_both_sides_with_one_code() {
     assert_eq!(trust_a.pinned(), [b.node_id()].into_iter().collect());
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_peers_keep_exporter_sas_and_report_version_zero_in_both_roles() {
+    use protocol::{decode_message, encode_message, Channel};
+    use protocol::wire::{pairing_envelope, PairHello, PairingEnvelope};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    async fn read(stream: &mut (impl AsyncRead + Unpin)) -> PairingEnvelope {
+        let mut prefix = [0; 4];
+        stream.read_exact(&mut prefix).await.expect("frame prefix");
+        let size = u32::from_be_bytes(prefix) as usize;
+        assert!(size <= Channel::Pairing.max_frame_len());
+        let mut frame = vec![0; 4 + size];
+        frame[..4].copy_from_slice(&prefix);
+        stream.read_exact(&mut frame[4..]).await.expect("frame body");
+        decode_message(Channel::Pairing, &frame)
+            .expect("decode")
+            .expect("complete frame")
+    }
+
+    async fn write(
+        stream: &mut (impl AsyncWrite + Unpin),
+        identity: &NodeIdentity,
+        attempt: Vec<u8>,
+    ) {
+        let hello = PairingEnvelope {
+            seq: 1,
+            attempt_id: attempt,
+            major: protocol::limits::PROTOCOL_MAJOR,
+            minor: protocol::limits::PROTOCOL_MINOR,
+            payload: Some(pairing_envelope::Payload::Hello(PairHello {
+                node_id: identity.node_id().as_bytes().to_vec(),
+                display_name: "LAPTOP".into(),
+                supports_sas: true,
+                ..Default::default()
+            })),
+        };
+        stream
+            .write_all(&encode_message(Channel::Pairing, &hello).expect("encode"))
+            .await
+            .expect("legacy Hello");
+    }
+
+    let root = temp_dir("legacy-ceremony");
+    let current = Arc::new(identity_at(&root, "WORKSTATION"));
+    let legacy = Arc::new(identity_at(&root, "LAPTOP"));
+    for legacy_is_opener in [true, false] {
+        let listener = bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_identity = Arc::clone(if legacy_is_opener { &legacy } else { &current });
+        if legacy_is_opener {
+            let server = tokio::spawn(async move {
+                let acceptor = TlsAcceptor::from(Arc::new(
+                    identity::pairing_server_config(&server_identity).expect("legacy server"),
+                ));
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let mut tls = acceptor.accept(tcp).await.expect("TLS");
+                let attempt = vec![42; 16];
+                write(&mut tls, &server_identity, attempt.clone()).await;
+                let response = read(&mut tls).await;
+                let Some(pairing_envelope::Payload::Hello(hello)) = response.payload else {
+                    panic!("expected Hello");
+                };
+                assert_eq!(hello.sas_ceremony_version, 0);
+                assert!(hello.sas_commitment.is_empty());
+                let bytes = tls.get_ref().1.export_keying_material(
+                    [0; 4], identity::sas::EXPORTER_LABEL, Some(&attempt),
+                ).expect("legacy exporter");
+                identity::sas::SasCode::from_exporter_bytes(bytes)
+            });
+            let driver = dial(address, &current, DIAL_TIMEOUT, 47901, "WORKSTATION")
+                .await
+                .expect("legacy opener compatibility");
+            assert_eq!(driver.sas_ceremony_version(), 0);
+            assert_eq!(driver.sas(), server.await.expect("server"));
+        } else {
+            let server = tokio::spawn(async move {
+                let mut window = open_window(0).expect("window");
+                accept_one(&listener, &server_identity, &mut window, 0, 47901, "WORKSTATION")
+                    .await
+                    .expect("current opener")
+            });
+            let connector = TlsConnector::from(Arc::new(
+                pairing_client_config(&legacy).expect("legacy client"),
+            ));
+            let tcp = TcpStream::connect(address).await.expect("connect");
+            let mut tls = connector.connect(identity::server_name(address.ip()), tcp)
+                .await.expect("TLS");
+            let hello = read(&mut tls).await;
+            write(&mut tls, &legacy, hello.attempt_id.clone()).await;
+            let bytes = tls.get_ref().1.export_keying_material(
+                [0; 4], identity::sas::EXPORTER_LABEL, Some(&hello.attempt_id),
+            ).expect("legacy exporter");
+            let driver = server.await.expect("server");
+            assert_eq!(driver.sas_ceremony_version(), 0);
+            assert_eq!(driver.sas(), identity::sas::SasCode::from_exporter_bytes(bytes));
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -363,4 +467,109 @@ fn the_pairing_policy_and_the_pairing_channel_require_each_other() {
     assert!(trusted_server_config(&a, &TrustStore::new()).is_ok());
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+async fn legacy_read(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> protocol::wire::PairingEnvelope {
+    use tokio::io::AsyncReadExt;
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).await.expect("frame prefix");
+    let length = u32::from_be_bytes(prefix) as usize;
+    assert!((1..=protocol::limits::MAX_FRAME_PAIRING).contains(&length));
+    let mut framed = vec![0; 4 + length];
+    framed[..4].copy_from_slice(&prefix);
+    stream.read_exact(&mut framed[4..]).await.expect("frame body");
+    protocol::frame::decode_message(protocol::frame::Channel::Pairing, &framed)
+        .expect("decode").expect("frame")
+}
+
+async fn legacy_write(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    node: NodeId,
+    attempt: Vec<u8>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let hello = protocol::wire::PairingEnvelope {
+        seq: 1,
+        major: protocol::limits::PROTOCOL_MAJOR,
+        minor: protocol::limits::PROTOCOL_MINOR,
+        attempt_id: attempt,
+        payload: Some(protocol::wire::pairing_envelope::Payload::Hello(
+            protocol::wire::PairHello {
+                node_id: node.as_bytes().to_vec(),
+                display_name: "WORKSTATION".into(),
+                supports_sas: true,
+                ..Default::default()
+            },
+        )),
+    };
+    let bytes = protocol::frame::encode_message(protocol::frame::Channel::Pairing, &hello)
+        .expect("encode");
+    stream.write_all(&bytes).await.expect("write");
+}
+
+#[tokio::test]
+async fn new_dialer_explicitly_negotiates_legacy_opener() {
+    let root = temp_dir("legacy-opener");
+    let a = identity_at(&root, "WORKSTATION");
+    let b = identity_at(&root, "LAPTOP");
+    let listener = bind("127.0.0.1:0".parse().expect("address")).await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let opener = tokio::spawn(async move {
+        let acceptor = TlsAcceptor::from(Arc::new(
+            identity::pairing_server_config(&a).expect("config"),
+        ));
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut stream = acceptor.accept(tcp).await.expect("TLS");
+        let attempt = vec![1; 16];
+        legacy_write(&mut stream, a.node_id(), attempt.clone()).await;
+        let reply = legacy_read(&mut stream).await;
+        let Some(protocol::wire::pairing_envelope::Payload::Hello(hello)) = reply.payload else {
+            panic!("legacy Hello reply");
+        };
+        assert_eq!(hello.sas_ceremony_version, 0);
+        assert!(hello.sas_commitment.is_empty());
+        identity::SasCode::from_exporter_bytes(stream.get_ref().1.export_keying_material(
+            [0; 4], identity::EXPORTER_LABEL, Some(&attempt),
+        ).expect("exporter"))
+    });
+    let driver = dial(address, &b, DIAL_TIMEOUT, 47901, "LAPTOP").await.expect("legacy fallback");
+    assert_eq!(driver.sas_ceremony_version(), 0);
+    assert_eq!(driver.sas(), opener.await.expect("opener"));
+    drop(driver);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn new_opener_explicitly_negotiates_legacy_dialer() {
+    let root = temp_dir("legacy-dialer");
+    let a = identity_at(&root, "WORKSTATION");
+    let b = identity_at(&root, "LAPTOP");
+    let listener = bind("127.0.0.1:0".parse().expect("address")).await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let opener = tokio::spawn(async move {
+        let mut window = open_window(0).expect("window");
+        accept_one(&listener, &a, &mut window, 0, 47901, "WORKSTATION").await
+            .expect("legacy fallback")
+    });
+    let connector = TlsConnector::from(Arc::new(pairing_client_config(&b).expect("config")));
+    let tcp = TcpStream::connect(address).await.expect("connect");
+    let mut stream = connector.connect(identity::server_name(address.ip()), tcp).await.expect("TLS");
+    let hello = legacy_read(&mut stream).await;
+    let Some(protocol::wire::pairing_envelope::Payload::Hello(remote)) = &hello.payload else {
+        panic!("new opener Hello");
+    };
+    assert_eq!(remote.sas_ceremony_version, identity::sas::COMMITMENT_VERSION);
+    assert_eq!(remote.sas_commitment.len(), 32);
+    legacy_write(&mut stream, b.node_id(), hello.attempt_id.clone()).await;
+    let expected = identity::SasCode::from_exporter_bytes(stream.get_ref().1.export_keying_material(
+        [0; 4], identity::EXPORTER_LABEL, Some(&hello.attempt_id),
+    ).expect("exporter"));
+    let driver = opener.await.expect("opener");
+    assert_eq!(driver.sas_ceremony_version(), 0);
+    assert_eq!(driver.sas(), expected);
+    drop(driver);
+    drop(stream);
+    let _ = std::fs::remove_dir_all(root);
 }
