@@ -50,6 +50,12 @@ pub const DECODED_FRAME_BYTES: usize = 32 * 1024;
 pub const DEFAULT_RATE_BYTES_PER_S: u64 = 256 * 1024;
 /// `docs/05-protocol.md`: the binding `ttl` of a clipboard channel.
 pub const CHANNEL_TTL_MS: u64 = 60_000;
+/// Maximum simultaneous incoming offers across all authenticated peers, including empty ones.
+pub const MAX_INCOMING_OFFERS: usize = 8;
+/// Shared reservation budget, charged by declared size before allocating an assembler.
+pub const MAX_INCOMING_BYTES: u64 = 4 * MAX_BYTES;
+/// Absolute offer lifetime, including deferred focus and transfer; chunks never renew it.
+pub const INCOMING_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Why a transfer did not happen.
 ///

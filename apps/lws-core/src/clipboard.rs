@@ -266,6 +266,7 @@ struct Incoming {
     offer: cb::Offer,
     secret: bool,
     assembler: cb::Assembler,
+    deadline: Instant,
 }
 
 /// The agent's `ClipboardChanged` chunks, assembled before anything is decided.
@@ -340,7 +341,7 @@ impl Clipboard {
     pub async fn cancel(&self, peer: NodeId, offer_id: [u8; 16], reason: cb::ClipboardError) {
         let _ = self
             .runtime
-            .send(
+            .try_send(
                 peer,
                 ClipboardMessage::Cancel {
                     offer_id,
@@ -909,12 +910,40 @@ impl Clipboard {
         }]
     }
 
+    /// Reclaims expired reservations before returning cancellations to the session.
+    /// Never waits for the runtime queue: a saturated channel cannot prevent reclamation.
+    pub fn expire_incoming(&mut self, now: Instant) -> Vec<Out> {
+        let mut out = Vec::new();
+        self.incoming.retain(|offer_id, incoming| {
+            if now < incoming.deadline {
+                return true;
+            }
+            if self.pending_request == Some((incoming.peer, *offer_id)) {
+                self.pending_request = None;
+            }
+            out.push(Out::Cancel {
+                peer: incoming.peer,
+                offer_id: *offer_id,
+                reason: cb::ClipboardError::Superseded,
+            });
+            false
+        });
+        out
+    }
+
     /// One message from a peer on the clipboard channel.
     pub async fn on_peer_message(&mut self, peer: NodeId, message: ClipboardMessage) -> Vec<Out> {
         if self.down.contains(&peer) {
             // Frames of a connection that is already closed (a revoked peer's last, queued ones).
             return Vec::new();
         }
+        let expired = self.expire_incoming(Instant::now());
+        let mut out = self.on_live_peer_message(peer, message).await;
+        out.extend(expired);
+        out
+    }
+
+    async fn on_live_peer_message(&mut self, peer: NodeId, message: ClipboardMessage) -> Vec<Out> {
         match message {
             offer @ ClipboardMessage::Offer { .. } => self.on_offer(peer, offer).await,
             ClipboardMessage::Request { offer_id } => {
@@ -1107,7 +1136,19 @@ impl Clipboard {
                 }]
             }
         }
-        self.source.accept(&offer);
+        // Charge every declared byte before Assembler::new reserves its payload buffer.
+        // Sum bounded entries rather than maintaining a counter across all cleanup paths.
+        let reserved: u64 = self.incoming.values().map(|incoming| incoming.offer.size).sum();
+        if self.incoming.contains_key(&offer_id)
+            || self.incoming.len() >= cb::MAX_INCOMING_OFFERS
+            || size_bytes > cb::MAX_INCOMING_BYTES.saturating_sub(reserved)
+        {
+            return vec![Out::Cancel {
+                peer,
+                offer_id,
+                reason: cb::ClipboardError::TooLarge,
+            }];
+        }
         let Ok(assembler) = cb::Assembler::new(offer_id, size_bytes) else {
             return vec![Out::Cancel {
                 peer,
@@ -1115,6 +1156,7 @@ impl Clipboard {
                 reason: cb::ClipboardError::TooLarge,
             }];
         };
+        self.source.accept(&offer);
         self.incoming.insert(
             offer_id,
             Incoming {
@@ -1122,13 +1164,18 @@ impl Clipboard {
                 offer,
                 secret,
                 assembler,
+                deadline: Instant::now() + cb::INCOMING_TTL,
             },
         );
         if self.settings.eager {
-            let _ = self
-                .runtime
-                .send(peer, ClipboardMessage::Request { offer_id })
-                .await;
+            if self.runtime.try_send(peer, ClipboardMessage::Request { offer_id }).await.is_err() {
+                self.incoming.remove(&offer_id);
+                return vec![Out::Cancel {
+                    peer,
+                    offer_id,
+                    reason: cb::ClipboardError::Superseded,
+                }];
+            }
         } else {
             // `transfer = "on_focus_enter"`: hold it until this node is the one being typed
             // into, which is what `on_focus` is for.
@@ -1584,6 +1631,13 @@ impl Handle {
         }
     }
 
+    /// Control refusals must not wait behind a paced payload or a stalled socket.
+    async fn try_send(&self, peer: NodeId, message: ClipboardMessage) -> Result<(), ()> {
+        let inner = self.inner.lock().await;
+        let conn = inner.conns.get(&peer).ok_or(())?;
+        conn.tx.try_send(QueuedMessage { message, written: None }).map_err(|_| ())
+    }
+
     /// Paces a payload onto the peer's channel from a task of its own (`KVM-042`).
     async fn send_transfer(
         &self,
@@ -1935,6 +1989,73 @@ async fn write_task(mut writer: ClipboardWriter, mut outbound: mpsc::Receiver<Qu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incoming_reservations_expire_and_terminal_paths_reclaim_them() {
+        let (mut endpoint, root) = started_clipboard("incoming-cleanup").await;
+        let peer: NodeId = [0x21; 32].into();
+        offer_and_data(&mut endpoint, peer, [1; 16], b"text").await;
+        let deadline = endpoint.incoming[&[1; 16]].deadline;
+        assert!(endpoint.expire_incoming(deadline - Duration::from_nanos(1)).is_empty());
+        let expired = endpoint.expire_incoming(deadline);
+        assert!(matches!(expired.as_slice(), [Out::Cancel { offer_id, .. }] if *offer_id == [1; 16]));
+        assert!(endpoint.incoming.is_empty());
+        assert!(endpoint.pending_request.is_none());
+        endpoint.source = cb::Source::new(endpoint.source.origin);
+        offer_and_data(&mut endpoint, peer, [2; 16], b"text").await;
+        endpoint.on_peer_message(peer, ClipboardMessage::Cancel {
+            offer_id: [2; 16],
+            reason: protocol::wire::ErrorCode::ClipboardSuperseded,
+        }).await;
+        assert!(endpoint.incoming.is_empty());
+        endpoint.source = cb::Source::new(endpoint.source.origin);
+        offer_and_data(&mut endpoint, peer, [3; 16], b"text").await;
+        let applied = endpoint.on_peer_message(peer, ClipboardMessage::Complete {
+            offer_id: [3; 16],
+            sha256: cb::sha256(b"text"),
+        }).await;
+        assert!(applied.iter().any(|out| matches!(out, Out::Agent(_))));
+        assert!(endpoint.incoming.is_empty());
+        endpoint.source = cb::Source::new(endpoint.source.origin);
+        offer_and_data(&mut endpoint, peer, [4; 16], b"text").await;
+        endpoint.on_link_down(peer).await;
+        assert!(endpoint.incoming.is_empty());
+        assert!(endpoint.pending_request.is_none());
+        endpoint.runtime.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn incoming_offers_have_count_and_aggregate_reservation_limits() {
+        for size in [0, cb::MAX_BYTES] {
+            let (mut endpoint, root) = started_clipboard("incoming-budget").await;
+            let peer: NodeId = [0x21; 32].into();
+            for version in 1u64..=64 {
+                let mut offer_id = [0; 16];
+                offer_id[..8].copy_from_slice(&version.to_be_bytes());
+                endpoint
+                    .on_peer_message(
+                        peer,
+                        ClipboardMessage::Offer {
+                            offer_id,
+                            origin_node_id: *peer.as_bytes(),
+                            origin_version: version,
+                            mime: cb::MIME.to_owned(),
+                            size_bytes: size,
+                            secret_marked: false,
+                        },
+                    )
+                    .await;
+            }
+            assert!(endpoint.incoming.len() <= 8, "offers must have a count budget");
+            assert!(
+                endpoint.incoming.values().map(|i| i.offer.size).sum::<u64>() <= 4 * cb::MAX_BYTES,
+                "declared payload reservations must have a shared budget"
+            );
+            endpoint.runtime.stop().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
     #[tokio::test]
     async fn cancellation_and_new_local_copy_abort_active_paced_delivery() {
