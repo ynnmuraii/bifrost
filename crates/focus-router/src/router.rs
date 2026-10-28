@@ -485,7 +485,7 @@ impl<I: Identifiers> FocusRouter<I> {
             ),
             LocalInput::Emergency => self.on_emergency(now_ms, out),
             LocalInput::Claim { reason } => self.begin_claim(now_ms, reason, out),
-            LocalInput::Abandon => self.on_abandon(out),
+            LocalInput::Abandon => self.on_abandon(now_ms, out),
             LocalInput::SuspendOrLock => {
                 self.on_session_end(now_ms, LeaveReason::SuspendOrLock, out)
             }
@@ -654,13 +654,14 @@ impl<I: Identifiers> FocusRouter<I> {
         });
     }
 
-    fn on_abandon(&mut self, out: &mut Vec<Output>) {
+    fn on_abandon(&mut self, now_ms: u64, out: &mut Vec<Output>) {
         if !self.ownership.is_owner() {
             return;
         }
         let serial = self.ownership.abandon();
         self.pending_ownership = Some(PendingOwnership::Abandon { serial });
         out.push(Output::CancelTimer(Timer::ClaimGrant));
+        self.release_lease_for_ownership(now_ms, out);
     }
 
     fn on_owner_claim(
@@ -878,9 +879,9 @@ impl<I: Identifiers> FocusRouter<I> {
         // a message forever: the receiver's `LeaveAck`, the agent's `Released` — the
         // guard is the backstop on all of them.
         let bound = now_ms.saturating_add(self.timing.claim_grant_timeout_ms);
-        let depose = matches!(
+        let relinquish = matches!(
             self.pending_ownership,
-            Some(PendingOwnership::Depose { .. })
+            Some(PendingOwnership::Depose { .. } | PendingOwnership::Abandon { .. })
         );
         match &self.lease {
             LeaseSlot::Idle => {}
@@ -896,7 +897,7 @@ impl<I: Identifiers> FocusRouter<I> {
                     timer: Timer::ReleaseGuard,
                     deadline_ms: bound,
                 });
-                if depose {
+                if relinquish {
                     // «разослать `Leave{OWNERSHIP_LOST}` по активным получателям»
                     out.push(Output::Send {
                         peer,
@@ -921,7 +922,7 @@ impl<I: Identifiers> FocusRouter<I> {
                     timer: Timer::ReleaseGuard,
                     deadline_ms: bound,
                 });
-                if depose {
+                if relinquish {
                     out.push(Output::Send {
                         peer,
                         message: Message::Leave {

@@ -4,6 +4,54 @@ use focus_router::*;
 use input_model::{CaptureKind, HidKey};
 
 #[test]
+fn abandon_releases_active_source_and_rejects_later_challenges() {
+    let mut r = remote();
+    let out = r.handle(20, Input::Local(LocalInput::Abandon));
+    assert!(out.contains(&end(id(1), false)));
+    assert!(out.contains(&leave(id(1), LeaveReason::OwnershipLost)));
+    assert_eq!(r.lease().source().unwrap().state, SourceState::Releasing);
+    let late = r.handle(21, net(Message::LeaseChallenge {
+        lease_id: id(1),
+        nonce: [9; 16],
+        ttl_ms: 500,
+    }));
+    assert!(!late.iter().any(|effect| matches!(effect,
+        Output::Send { message: Message::LeaseRenew { .. }, .. }
+    )));
+    let done = r.handle(22, Input::Agent(AgentEvent::Released { lease_id: id(1) }));
+    assert!(done.iter().any(|effect| matches!(effect,
+        Output::Broadcast(Message::OwnerState { owner: None, .. })
+    )));
+    assert!(r.lease().is_idle());
+}
+
+#[test]
+fn abandon_releases_receiver_and_renew_cannot_resurrect_it() {
+    let mut r = active();
+    r.handle(15, claim());
+    r.handle(16, net(Message::OwnerState {
+        serial: 2,
+        owner: Some(LOCAL),
+        granted: true,
+    }));
+    assert!(r.is_owner());
+    let nonce = r.lease().receiver().unwrap().challenges[0].0;
+    let out = r.handle(20, Input::Local(LocalInput::Abandon));
+    assert!(out.contains(&release(L)));
+    assert!(out.contains(&leave(L, LeaveReason::OwnershipLost)));
+    let late = r.handle(21, net(Message::LeaseRenew { lease_id: L, nonce }));
+    assert!(!late.iter().any(|effect| matches!(effect,
+        Output::Send { message: Message::LeaseStatus { accepted: true, .. }, .. }
+    )));
+    assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Releasing);
+    let done = r.handle(22, Input::Agent(AgentEvent::Released { lease_id: L }));
+    assert!(done.iter().any(|effect| matches!(effect,
+        Output::Broadcast(Message::OwnerState { owner: None, .. })
+    )));
+    assert!(r.lease().is_idle());
+}
+
+#[test]
 fn nonce_window_covers_every_legal_ttl_and_both_cadence_endpoints() {
     for ttl_ms in Timing::LEASE_TTL_MIN_MS..=Timing::LEASE_TTL_MAX_MS {
         let timing = Timing {
