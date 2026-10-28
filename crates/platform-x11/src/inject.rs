@@ -154,16 +154,20 @@ impl X11Injector {
     /// XTest extension, since injection is then impossible.
     pub fn new() -> Result<Self, X11Error> {
         let (conn, screen_num) = x11rb::connect(None)?;
-        let (root, root_width, root_height) = {
-            let screen = &conn.setup().roots[screen_num];
-            (screen.root, screen.width_in_pixels, screen.height_in_pixels)
-        };
+        let root = conn.setup().roots[screen_num].root;
+        conn.change_window_attributes(
+            root,
+            &xproto::ChangeWindowAttributesAux::new()
+                .event_mask(xproto::EventMask::STRUCTURE_NOTIFY),
+        )?
+        .check()?;
+        let geometry = conn.get_geometry(root)?.reply()?;
         let version = conn.xtest_get_version(2, 2)?.reply()?;
         Ok(Self {
             conn,
             root,
-            root_width,
-            root_height,
+            root_width: geometry.width,
+            root_height: geometry.height,
             xtest_version: (version.major_version, version.minor_version),
             ledger: PressedLedger::new(),
             scroll_remainder_h: 0,
@@ -226,6 +230,13 @@ impl X11Injector {
     /// Stops at the first event that could not be pushed and reports it; events
     /// before it are already on the wire and are *not* rolled back or replayed.
     pub fn inject(&mut self, events: &[InputEvent]) -> InjectResult {
+        if let Err(error) = self.refresh_geometry() {
+            return InjectResult {
+                applied_count: 0,
+                os_error: Some(error.to_string()),
+                actual: None,
+            };
+        }
         let mut applied_count = 0usize;
         let mut os_error = None;
         let mut moved = false;
@@ -254,6 +265,19 @@ impl X11Injector {
             os_error,
             actual,
         }
+    }
+
+    /// ConfigureNotify keeps the clamp current without a round trip per input batch.
+    fn refresh_geometry(&mut self) -> Result<(), X11Error> {
+        while let Some(event) = self.conn.poll_for_event()? {
+            if let x11rb::protocol::Event::ConfigureNotify(configure) = event {
+                if configure.window == self.root {
+                    self.root_width = configure.width;
+                    self.root_height = configure.height;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Releases every key and button still held down by this injector.
@@ -429,6 +453,77 @@ pub(crate) fn clamp_coordinate(value: f64, extent: u16) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::{clamp_coordinate, take_notches};
+
+    #[test]
+    fn root_resize_updates_the_existing_injectors_clamp_without_input() {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{
+            ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
+            EventMask, WindowClass,
+        };
+        let Ok((conn, screen)) = x11rb::connect(None) else {
+            eprintln!("requires an isolated Xvfb display");
+            return;
+        };
+        let window = conn.generate_id().unwrap();
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            conn.setup().roots[screen].root,
+            0,
+            0,
+            320,
+            200,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        // A private window stands in for root: no desktop resize or synthetic input.
+        conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        let mut injector = super::X11Injector {
+            conn,
+            root: window,
+            root_width: 320,
+            root_height: 200,
+            xtest_version: (2, 2),
+            ledger: super::PressedLedger::new(),
+            scroll_remainder_h: 0,
+            scroll_remainder_v: 0,
+        };
+        for (width, height) in [(800, 600), (240, 160)] {
+            injector
+                .conn
+                .configure_window(
+                    window,
+                    &ConfigureWindowAux::new().width(width).height(height),
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            assert!(injector.inject(&[]).os_error.is_none());
+            assert_eq!(injector.root_size(), (width as u16, height as u16));
+            assert_eq!(
+                clamp_coordinate(799.0, injector.root_size().0),
+                width as i16 - 1
+            );
+        }
+        injector
+            .conn
+            .destroy_window(window)
+            .unwrap()
+            .check()
+            .unwrap();
+    }
 
     #[test]
     fn notches_conserve_units_and_bound_work_even_at_integer_limits() {
