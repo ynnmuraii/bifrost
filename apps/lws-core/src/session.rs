@@ -2973,8 +2973,9 @@ impl Session {
             crate::clipboard::Inbound::Bound { peer, parent, .. }
             | crate::clipboard::Inbound::Message { peer, parent, .. }
             | crate::clipboard::Inbound::Down { peer, parent } => Some((peer, parent)),
-            crate::clipboard::Inbound::Sent { .. }
-            | crate::clipboard::Inbound::Failed { .. } => None,
+            crate::clipboard::Inbound::Sent { .. } | crate::clipboard::Inbound::Failed { .. } => {
+                None
+            }
         };
         if let Some((peer, parent)) = binding {
             if !self
@@ -3031,13 +3032,23 @@ impl Session {
                     secret,
                 }]
             }
-            (Some(clipboard), crate::clipboard::Inbound::Bound { peer, channel_id, .. }) => {
+            (
+                Some(clipboard),
+                crate::clipboard::Inbound::Bound {
+                    peer, channel_id, ..
+                },
+            ) => {
                 tracing::info!(peer = %peer, "clipboard channel bound");
                 clipboard.on_bound(peer, channel_id).await
             }
-            (Some(clipboard), crate::clipboard::Inbound::Message { peer, parent, message }) => {
-                clipboard.on_peer_message_from(peer, parent, message).await
-            }
+            (
+                Some(clipboard),
+                crate::clipboard::Inbound::Message {
+                    peer,
+                    parent,
+                    message,
+                },
+            ) => clipboard.on_peer_message_from(peer, parent, message).await,
             (Some(clipboard), crate::clipboard::Inbound::Down { peer, .. }) => {
                 clipboard.on_channel_down(peer).await;
                 Vec::new()
