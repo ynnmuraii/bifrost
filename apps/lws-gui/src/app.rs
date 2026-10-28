@@ -84,7 +84,11 @@ impl GuiApp {
         }
         let saved_look = view.look.clone();
         view.settings.autostart = crate::autostart::enabled();
-        let start_core = view.config.config_was_missing || updated;
+        let start_core = should_start_core(
+            view.config.config_was_missing,
+            updated,
+            view.settings.autostart,
+        );
         let mut bridge = Bridge::new(view, client);
         if start_core {
             bridge.dispatch(view_model::Action::StartCore, Instant::now());
@@ -214,6 +218,10 @@ pub(crate) fn close_decision(tray_ready: bool) -> Close {
     }
 }
 
+fn should_start_core(config_was_missing: bool, updated: bool, autostart_enabled: bool) -> bool {
+    config_was_missing || updated || autostart_enabled
+}
+
 #[cfg(test)]
 mod close_tests {
     use super::*;
@@ -222,5 +230,13 @@ mod close_tests {
     fn a_window_is_not_closed_into_nothing() {
         assert_eq!(close_decision(true), Close::Quit);
         assert_eq!(close_decision(false), Close::Minimize);
+    }
+
+    #[test]
+    fn audit_login_with_existing_config_starts_core() {
+        assert!(should_start_core(false, false, true));
+        assert!(!should_start_core(false, false, false));
+        assert!(should_start_core(true, false, false));
+        assert!(should_start_core(false, true, false));
     }
 }
