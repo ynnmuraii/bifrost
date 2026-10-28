@@ -4,7 +4,7 @@
 //! focus changes «куда идёт ввод»; a pairing prompt is answered with its own attempt id; a
 //! document older than the one the editor holds does not become the editor's base; a
 //! `LAYOUT_CONFLICT` reloads and retries once; dropped drafts save latest-wins; the document round-trips
-//! through the configuration schema; and a disconnect keeps the last known state visible.
+//! through the configuration schema; and a disconnect retains geometry without a stale target.
 
 mod support;
 
@@ -21,6 +21,25 @@ use support::{
     answer, attempt_id, event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE,
     SELF_NODE,
 };
+
+#[test]
+fn audit_disconnect_forgets_route_but_retains_map_geometry() {
+    let mut vm = view();
+    vm.on_connected("test");
+    vm.apply(event(Msg::TopologyDoc(two_node_doc(1))));
+    vm.apply(event(Msg::Status(status_with("REMOTE"))));
+    assert!(vm.map_model().nodes.iter().any(|node| node.target));
+    let placement = vm.editor.placement.clone();
+    vm.on_disconnected("core stopped".into());
+    let map = vm.map_model();
+    assert_eq!(map.nodes.len(), 2);
+    assert_eq!(vm.editor.placement, placement);
+    assert!(map.nodes.iter().all(|node| !node.target));
+    vm.on_connected("test");
+    assert!(vm.map_model().nodes.iter().all(|node| !node.target));
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    assert!(vm.map_model().nodes.iter().any(|node| node.target));
+}
 
 #[test]
 fn remote_unpair_notice_is_deduplicated_by_monotonic_id_not_name() {
@@ -1023,7 +1042,7 @@ fn the_document_of_the_first_revision_is_still_a_document() {
 }
 
 #[test]
-fn a_disconnect_moves_to_the_disconnected_state_and_keeps_the_last_status() {
+fn a_disconnect_keeps_geometry_but_forgets_the_last_input_target() {
     let mut vm = view();
     vm.apply(event(Msg::Status(status_with("REMOTE"))));
     vm.apply(event(Msg::TopologyDoc(two_node_doc(7))));
@@ -1036,10 +1055,9 @@ fn a_disconnect_moves_to_the_disconnected_state_and_keeps_the_last_status() {
     assert!(vm.disconnected_reason().is_some());
     assert_eq!(
         vm.focus_line(),
-        "Ввод на linux-box",
-        "the last known state stays visible"
+        ui_text::text(vm.look.language, ui_text::Key::NoDataFromTheService)
     );
-    assert_eq!(vm.focus_detail().as_deref(), Some("раскладка ru"));
+    assert!(vm.focus_detail().is_none());
     assert_eq!(
         vm.editor.nodes.len(),
         2,

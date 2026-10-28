@@ -826,9 +826,13 @@ impl ViewModel {
 
     /// The member the input goes to now, as an index: this computer when it is local.
     fn route_target(&self) -> Option<usize> {
+        if !self.connection.is_connected() {
+            return None;
+        }
         let status = self.status.as_ref()?;
         let this = self.self_node().and_then(|id| self.index_of(id));
         match status.focus.as_str() {
+            "" => None,
             "REMOTE" | "PREPARING" if !status.active_peer.is_empty() => self
                 .editor
                 .nodes

@@ -1031,12 +1031,17 @@ impl ViewModel {
         self.config = fresh;
     }
 
-    /// The link is gone; the last `Status` stays on screen.
+    /// The link is gone; retain geometry and settings, but not a claimed input target.
     /// Restart completion depends on process/listener exit, not this event.
     pub fn on_disconnected(&mut self, why: String) {
         let lang = self.look.language;
         self.push_log(format!("Связь со службой потеряна: {}", short_error(&why)));
         self.connection = Connection::Disconnected { why };
+        if let Some(status) = &mut self.status {
+            status.focus.clear();
+            status.active_peer.clear();
+            status.active_layout.clear();
+        }
         self.inflight.clear();
         // History belongs to the lost core session, not to the last known status.
         self.clipboard_history.clear();
@@ -1909,6 +1914,7 @@ impl ViewModel {
             return text(lang, Key::NoDataFromTheService).to_owned();
         };
         match status.focus.as_str() {
+            "" => text(lang, Key::NoDataFromTheService).to_owned(),
             "LOCAL" => text(lang, Key::InputHere).to_owned(),
             "PREPARING" => text(lang, Key::PreparingTheSwitch).to_owned(),
             "REMOTE" => {
