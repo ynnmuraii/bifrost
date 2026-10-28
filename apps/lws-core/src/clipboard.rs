@@ -2293,7 +2293,8 @@ mod tests {
                     )
                     .await;
             }
-            assert!(endpoint.incoming.len() <= 8, "offers must have a count budget");
+            assert_eq!(endpoint.incoming.len(), if size == 0 { 8 } else { 4 },
+                "valid offers fill exactly the count or shared-byte budget");
             assert!(
                 endpoint.incoming.values().map(|i| i.offer.size).sum::<u64>() <= 4 * cb::MAX_BYTES,
                 "declared payload reservations must have a shared budget"
@@ -2301,6 +2302,35 @@ mod tests {
             endpoint.runtime.stop().await;
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[tokio::test]
+    async fn expired_reservations_and_refusals_do_not_wait_on_a_full_outbound_queue() {
+        let (mut endpoint, root) = started_clipboard("expiry-backpressure").await;
+        let peer: NodeId = [0x21; 32].into();
+        offer_and_data(&mut endpoint, peer, [1; 16], b"text").await;
+        let deadline = endpoint.incoming[&[1; 16]].deadline;
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(QueuedMessage {
+            message: ClipboardMessage::Request { offer_id: [9; 16] },
+            written: None,
+        }).unwrap();
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let writer = tokio::spawn(std::future::pending::<()>());
+        endpoint.runtime.inner.lock().await.conns.insert(peer, Conn {
+            generation: 1, tx,
+            reader: reader.abort_handle(), writer: writer.abort_handle(),
+            transfers: BTreeMap::new(),
+        });
+        let expired = endpoint.expire_incoming(deadline);
+        assert!(endpoint.incoming.is_empty());
+        let [Out::Cancel { offer_id, reason, .. }] = expired.as_slice() else {
+            panic!("expiry returns one refusal");
+        };
+        tokio::time::timeout(Duration::from_millis(100), endpoint.cancel(peer, *offer_id, *reason))
+            .await.expect("full channel cannot block expiry refusal");
+        endpoint.runtime.stop().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
