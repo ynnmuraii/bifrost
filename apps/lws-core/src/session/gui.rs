@@ -1301,7 +1301,8 @@ impl Session {
                 clipboard.restore_source(source);
             }
             let mut out = Vec::new();
-            for (&peer, &(connection, supported, address)) in &self.clipboard_links {
+            for (&peer, &(connection, supported, address, epoch)) in &self.clipboard_links {
+                clipboard.set_peer_session(peer, connection, epoch);
                 out.extend(
                     clipboard
                         .on_link_up(peer, connection, supported, address)
