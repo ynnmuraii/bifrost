@@ -81,6 +81,7 @@ enum Capability {
   CAPABILITY_REMOTE_UPDATE = 11;
   CAPABILITY_CLIPBOARD_APPLY_ACK = 12;
   CAPABILITY_UNPAIR_NOTICE = 13;
+  CAPABILITY_CLIPBOARD_SESSION = 14;
 }
 
 enum SessionKind {
@@ -151,6 +152,7 @@ message Hello {
   bytes topology_author = 13;              // author node_id of the applied revision
   string system_name = 14;                 // optional short OS name/version, non-authoritative
   string app_version = 15;                 // optional canonical semver, <= 32 bytes; invalid => unknown
+  bytes clipboard_epoch = 16;              // random16 per process; required with CLIPBOARD_SESSION
 }
 
 // Replaces only the sender's advertised capability set, not its identity or Hello.
@@ -358,6 +360,8 @@ message ClipboardOffer {
   uint64 size_bytes = 5;       // <= 1048576
   reserved 6; reserved "sha256"; // hash moved to ClipboardComplete
   bool secret_marked = 7;     // never retain this transfer in clipboard history
+  bytes sender_epoch = 8;     // authenticated sender's Hello.clipboard_epoch, capability gated
+  bool relayed = 9;           // explicit relay authority; replay namespace remains the TLS sender
 }
 message ClipboardRequest { bytes offer_id = 1; }
 message ClipboardData {

@@ -980,6 +980,8 @@ pub struct PeerInfo {
     pub remote_update: bool,
     /// Whether the peer supports addressed routing and backend clipboard application acks.
     pub clipboard_apply_ack: bool,
+    /// Process epoch authenticated by Hello; absent on legacy peers.
+    pub clipboard_epoch: Option<[u8; 16]>,
     /// `Hello.can_own`.
     pub can_own: bool,
     /// `Hello.owner_serial`.
@@ -1023,6 +1025,13 @@ impl PeerInfo {
             clipboard_apply_ack: hello
                 .capabilities
                 .contains(&(wire::Capability::ClipboardApplyAck as i32)),
+            clipboard_epoch: if hello.capabilities.contains(&(wire::Capability::ClipboardSession as i32)) {
+                Some(hello.clipboard_epoch.as_slice().try_into().map_err(|_| {
+                    ConvertError::Unsupported("clipboard_epoch is not 16 bytes")
+                })?)
+            } else {
+                None
+            },
             can_own: hello.can_own,
             owner_serial: hello.owner_serial,
             owner: if hello.owner_node_id.is_empty() {
@@ -1087,7 +1096,8 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::DisplaysChanged
             | WireCapability::RemoteUpdate
             | WireCapability::ClipboardApplyAck
-            | WireCapability::UnpairNotice => {}
+            | WireCapability::UnpairNotice
+            | WireCapability::ClipboardSession => {}
         }
     }
     out

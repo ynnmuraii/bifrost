@@ -1048,6 +1048,22 @@ fn clipboard_routing_capability_is_optional_in_hello() {
 }
 
 #[test]
+fn clipboard_session_epoch_is_capability_gated_and_exactly_sixteen_bytes() {
+    let mut hello = wire::Hello {
+        node_id: some_owner().as_bytes().to_vec(),
+        clipboard_epoch: vec![7; 16],
+        ..Default::default()
+    };
+    assert_eq!(PeerInfo::from_hello(&hello).unwrap().clipboard_epoch, None);
+    hello.capabilities.push(wire::Capability::ClipboardSession as i32);
+    assert_eq!(PeerInfo::from_hello(&hello).unwrap().clipboard_epoch, Some([7; 16]));
+    for size in [0, 15, 17] {
+        hello.clipboard_epoch = vec![7; size];
+        assert!(PeerInfo::from_hello(&hello).is_err());
+    }
+}
+
+#[test]
 fn clipboard_routing_conversion_validates_metadata_and_lease_scope() {
     use transport::convert::{inbound_from_envelope, Inbound};
     use wire::envelope::Payload;

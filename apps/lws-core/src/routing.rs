@@ -234,6 +234,7 @@ pub fn hello(
         capabilities: {
             let mut bits = capability_bits(capabilities);
             bits.push(wire::Capability::RemoteUpdate as i32);
+            bits.push(wire::Capability::ClipboardSession as i32);
             bits
         },
         displays: Vec::new(),
@@ -249,6 +250,7 @@ pub fn hello(
         topology_revision: gossip.topology_revision,
         topology_author: Vec::new(),
         app_version: protocol::app_version().to_owned(),
+        clipboard_epoch: transport::clipboard::process_epoch().to_vec(),
     }
 }
 

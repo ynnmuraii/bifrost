@@ -39,6 +39,13 @@ use crate::convert::ConvertError;
 use crate::link::Stream;
 use crate::TransportError;
 
+/// One unpredictable epoch per core process, shared by Hello and clipboard offers.
+pub fn process_epoch() -> [u8; 16] {
+    static EPOCH: std::sync::LazyLock<[u8; 16]> =
+        std::sync::LazyLock::new(|| identity::random16().expect("system entropy source"));
+    *EPOCH
+}
+
 /// One message of the clipboard channel (docs/protocol.proto `Clipboard*`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClipboardMessage {
@@ -78,6 +85,10 @@ pub enum ClipboardMessage {
         size_bytes: u64,
         /// Whether platform secret markers were present, independently of transfer policy.
         secret_marked: bool,
+        /// Must match the sender's authenticated Hello epoch; empty for a legacy link.
+        sender_epoch: Vec<u8>,
+        /// Explicitly attributes a carried payload to a different origin.
+        relayed: bool,
     },
     /// `ClipboardRequest`: the sink asking for the payload.
     Request {
@@ -151,6 +162,8 @@ impl ClipboardMessage {
                 mime,
                 size_bytes,
                 secret_marked,
+                sender_epoch,
+                relayed,
             } => Payload::ClipboardOffer(wire::ClipboardOffer {
                 offer_id: offer_id.to_vec(),
                 origin_node_id: origin_node_id.to_vec(),
@@ -158,6 +171,8 @@ impl ClipboardMessage {
                 mime: mime.clone(),
                 size_bytes: *size_bytes,
                 secret_marked: *secret_marked,
+                sender_epoch: sender_epoch.clone(),
+                relayed: *relayed,
             }),
             ClipboardMessage::Request { offer_id } => {
                 Payload::ClipboardRequest(wire::ClipboardRequest {
@@ -366,6 +381,8 @@ fn classify(envelope: &wire::Envelope) -> Result<ClipboardMessage, DecodeError> 
             mime: offer.mime.clone(),
             size_bytes: offer.size_bytes,
             secret_marked: offer.secret_marked,
+            sender_epoch: offer.sender_epoch.clone(),
+            relayed: offer.relayed,
         }),
         Some(Payload::ClipboardRequest(request)) => Ok(ClipboardMessage::Request {
             offer_id: arr16(&request.offer_id).map_err(violation)?,
@@ -501,6 +518,11 @@ pub struct ClipboardConnection {
 }
 
 impl ClipboardConnection {
+    /// Authenticated parent binding established before this connection is served.
+    pub fn parent_connection_id(&self) -> Option<[u8; 16]> {
+        self.connection_id
+    }
+
     /// Sends one message, stamping the envelope `seq` and `connection_id`.
     pub async fn send(&mut self, message: ClipboardMessage) -> Result<(), TransportError> {
         send_message(
