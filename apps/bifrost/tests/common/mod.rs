@@ -306,7 +306,11 @@ impl Node {
         // A plain copy is plain: the markers belong to one copy, so a file left behind by an
         // earlier `copy_to_clipboard_marked` must not leak into this one.
         let _ = std::fs::remove_file(dir.join("in.markers"));
-        std::fs::write(dir.join("in.txt"), text).expect("dry clipboard in.txt");
+        // Publish only after close: a live write can expose both a partial payload and
+        // a second mtime change for the same copy on Windows.
+        let staging = dir.join("in.writing");
+        std::fs::write(&staging, text).expect("stage dry clipboard copy");
+        std::fs::rename(staging, dir.join("in.txt")).expect("publish dry clipboard copy");
     }
 
     /// What the dry clipboard currently holds (`out.txt`), once the agent has written it.
@@ -321,7 +325,9 @@ impl Node {
         std::fs::create_dir_all(&dir).expect("dry clipboard directory");
         // The markers go first: the agent reads the pair when `in.txt` changes.
         std::fs::write(dir.join("in.markers"), markers.join(",")).expect("dry clipboard markers");
-        std::fs::write(dir.join("in.txt"), text).expect("dry clipboard in.txt");
+        let staging = dir.join("in.writing");
+        std::fs::write(&staging, text).expect("stage marked dry clipboard copy");
+        std::fs::rename(staging, dir.join("in.txt")).expect("publish marked dry clipboard copy");
     }
 
     /// Waits until the dry clipboard holds exactly `expected`.
