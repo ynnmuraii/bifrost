@@ -1094,12 +1094,13 @@ impl ViewModel {
         self.inflight.push(Inflight {
             id,
             request,
-            // An addressed send waits for the core's 30-second remote apply verdict.
             deadline: now
-                + if request == Request::SendClipboardHistory {
-                    Duration::from_secs(32)
-                } else {
-                    REQUEST_TIMEOUT
+                + match request {
+                    // Pairing can wait 120 seconds for a human on the other computer.
+                    Request::PairWith | Request::PairingAnswer => Duration::from_secs(122),
+                    // An addressed send waits for the core's 30-second apply verdict.
+                    Request::SendClipboardHistory => Duration::from_secs(32),
+                    _ => REQUEST_TIMEOUT,
                 },
             clipboard_target: None,
         });
