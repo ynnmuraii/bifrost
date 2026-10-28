@@ -762,6 +762,8 @@ pub enum Key {
     TheOtherComputerSPairingWindowShowsTheAddress,
     /// «Код сопряжения»
     PairingCode,
+    /// A legacy or unknown SAS ceremony needs an explicit, non-blocking warning.
+    LegacyPairingWarning,
     /// « подключается — коды совпадают?»
     IsConnectingDoTheCodesMatch,
     /// «Да, совпадают»
@@ -1214,6 +1216,7 @@ const fn ru(key: Key) -> &'static str {
         Key::Connecting2 => "Подключаемся…",
         Key::TheOtherComputerSPairingWindowShowsTheAddress => "Адрес показывает окно сопряжения на другом компьютере",
         Key::PairingCode => "Код сопряжения",
+        Key::LegacyPairingWarning => "LEGACY: слабая защита кода сопряжения. Перед подтверждением проверьте компьютер независимым способом.",
         Key::IsConnectingDoTheCodesMatch => " подключается — коды совпадают?",
         Key::YesTheyMatch => "Да, совпадают",
         Key::No => "Нет",
@@ -1627,6 +1630,7 @@ const fn en(key: Key) -> &'static str {
         Key::Connecting2 => "Connecting…",
         Key::TheOtherComputerSPairingWindowShowsTheAddress => "The other computer's pairing window shows the address",
         Key::PairingCode => "Pairing code",
+        Key::LegacyPairingWarning => "LEGACY: weaker pairing-code protection. Verify the computer independently before confirming.",
         Key::IsConnectingDoTheCodesMatch => " is connecting — do the codes match?",
         Key::YesTheyMatch => "Yes, they match",
         Key::No => "No",
@@ -2212,6 +2216,7 @@ mod tests {
         Key::Connecting2,
         Key::TheOtherComputerSPairingWindowShowsTheAddress,
         Key::PairingCode,
+        Key::LegacyPairingWarning,
         Key::IsConnectingDoTheCodesMatch,
         Key::YesTheyMatch,
         Key::No,

@@ -482,7 +482,7 @@ message SetGameGuard {
   repeated string block_apps = 2;
   repeated string allow_apps = 3;
 }
-message PairingPrompt { bytes attempt_id = 1; string peer_name = 2; string sas_code = 3; string local_fingerprint = 4; string peer_fingerprint = 5; }
+message PairingPrompt { bytes attempt_id = 1; string peer_name = 2; string sas_code = 3; string local_fingerprint = 4; string peer_fingerprint = 5; uint32 sas_ceremony_version = 6; } // 0 legacy, 1 commitment/reveal; unknown versions are not assumed protected
 // Pushed when the pairing window opens or closes, and replayed on GetStatus.
 // The GUI counts down locally from seconds_remaining. The window is served on the node's
 // input/control port by ALPN

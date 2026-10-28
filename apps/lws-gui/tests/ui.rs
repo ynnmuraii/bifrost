@@ -19,6 +19,43 @@ use support::{event, pairing_prompt, status_with, two_node_doc, view, PEER_NODE,
 const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
 
 #[test]
+fn audit_legacy_pairing_shows_a_localized_warning() {
+    for (lang, warning) in [
+        (ui_text::Lang::Ru, "LEGACY: слабая защита кода сопряжения. Перед подтверждением проверьте компьютер независимым способом."),
+        (ui_text::Lang::En, "LEGACY: weaker pairing-code protection. Verify the computer independently before confirming."),
+    ] {
+        for version in [0, 1, 2] {
+            for theme in [Theme::Light, Theme::Dark] {
+                let mut vm = connected();
+                vm.look.language = lang;
+                vm.look.theme = theme;
+                vm.look.dock_open = true;
+                let mut prompt = pairing_prompt();
+                prompt.sas_ceremony_version = version;
+                vm.apply(event(Msg::PairingPrompt(prompt)));
+                let mut harness = Harness::new();
+                let frame = harness.settle(&vm, false);
+                assert_eq!(
+                    frame.texts.iter().any(|(label, _)| label == warning),
+                    version != 1,
+                    "version={version}, language={lang:?}, theme={theme:?}"
+                );
+                let at = text_position(
+                    &mut harness,
+                    &vm,
+                    ui_text::text(lang, ui_text::Key::YesTheyMatch),
+                );
+                let frame = harness.frame(&vm, false, SIZE, click_at(at));
+                assert!(frame.output.actions.iter().any(|action| matches!(
+                    action,
+                    Action::Answer { approve: true, .. }
+                )));
+            }
+        }
+    }
+}
+
+#[test]
 fn pairing_request_prompt_buttons_send_the_selected_certificate_identity() {
     for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
         for (key, accept) in [

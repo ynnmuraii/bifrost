@@ -198,6 +198,7 @@ pub fn pairing_prompt() -> ipc::PairingPrompt {
         sas_code: "482913".to_owned(),
         local_fingerprint: "A1:B2:C3".to_owned(),
         peer_fingerprint: "D4:E5:F6".to_owned(),
+        sas_ceremony_version: 1,
     }
 }
 

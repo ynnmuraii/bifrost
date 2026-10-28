@@ -664,6 +664,7 @@ impl Session {
                             sas_code: prompt.sas_code.clone(),
                             local_fingerprint: prompt.local_fingerprint.clone(),
                             peer_fingerprint: prompt.peer_fingerprint.clone(),
+                            sas_ceremony_version: prompt.sas_ceremony_version,
                         }),
                     )
                     .await;
@@ -995,6 +996,7 @@ impl Session {
                     sas_code: prompt.sas_code,
                     local_fingerprint: prompt.local_fingerprint,
                     peer_fingerprint: prompt.peer_fingerprint,
+                    sas_ceremony_version: prompt.sas_ceremony_version,
                 }));
                 self.publish_gui_state().await;
             }

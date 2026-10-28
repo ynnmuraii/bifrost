@@ -48,8 +48,12 @@ fn request_height(vm: &ViewModel) -> f32 {
 /// The height of the dock for the current state.
 pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     // A prompt names the other computer and wraps in a quarter of the window: it needs room.
-    let prompt = if vm.pairing.prompt.is_some() {
-        40.0
+    let prompt = if let Some(prompt) = &vm.pairing.prompt {
+        40.0 + if prompt.sas_ceremony_version != 1 {
+            80.0
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -725,6 +729,15 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
             false,
             None,
         );
+        if prompt.sas_ceremony_version != 1 {
+            widgets::wrapped(
+                ui,
+                text(lang, Key::LegacyPairingWarning),
+                12.0,
+                fam::sans(),
+                pal.accent_ink,
+            );
+        }
         widgets::duo(ui, |ui| {
             let attempt = vm.pairing.attempt_id();
             let can = attempt.is_some();
@@ -864,7 +877,10 @@ mod tests {
             32.0 + BASE_H,
             "no prompt, nothing to show"
         );
-        vm.pairing.prompt = Some(protocol::ipc::PairingPrompt::default());
+        vm.pairing.prompt = Some(protocol::ipc::PairingPrompt {
+            sas_ceremony_version: 1,
+            ..Default::default()
+        });
         assert_eq!(height(&ctx, &vm, false), 32.0 + BASE_H + 40.0 + DETAILS_H);
     }
 

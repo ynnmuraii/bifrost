@@ -1586,6 +1586,7 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         sas_code: "482913".to_owned(),
         local_fingerprint: "2C19 E07B 5A3F 8D61 …".to_owned(),
         peer_fingerprint: "7F3A 91C2 0B6E D4A8 …".to_owned(),
+        sas_ceremony_version: 1,
     })));
     vm.pairing.details = true;
     if let Some(modal) = modal {

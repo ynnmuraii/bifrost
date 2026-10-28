@@ -57,6 +57,8 @@ pub struct Prompt {
     pub peer_name: String,
     /// The 6 digits both users must see the same.
     pub sas_code: String,
+    /// Negotiated SAS ceremony: 0 legacy, 1 verified commitment/reveal.
+    pub sas_ceremony_version: u32,
     /// This node's own `aa:bb:…` fingerprint.
     pub local_fingerprint: String,
     /// The peer's fingerprint, for the "Подробнее" view (ADR-010).
@@ -508,6 +510,7 @@ pub async fn run(
         ceremony_id,
         peer_name: driver.peer_display_name().to_owned(),
         sas_code: driver.sas().text(),
+        sas_ceremony_version: driver.sas_ceremony_version(),
         local_fingerprint,
         peer_fingerprint: driver.peer_fingerprint(),
         address: peer_address(opener, driver.address(), driver.peer_listen_port()),
@@ -615,6 +618,7 @@ mod expiry_tests {
             ceremony_id,
             peer_name: "dead".to_owned(),
             sas_code: "123456".to_owned(),
+            sas_ceremony_version: 1,
             local_fingerprint: String::new(),
             peer_fingerprint: String::new(),
             address: None,
