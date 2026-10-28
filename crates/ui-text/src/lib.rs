@@ -1876,7 +1876,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 373] = [
+    pub const EVERY: [Key; 374] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
