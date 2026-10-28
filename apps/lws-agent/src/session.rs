@@ -638,7 +638,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                     buttons,
                     scrolls,
                     accepted = injected.applied,
-                    os_error = ?injected.os_error,
+                    os_error = !injected.os_error.is_empty(),
                     actual_position = ?injected.actual,
                     "agent InjectResult"
                 );
@@ -679,9 +679,8 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             // is nothing else that could stop it.
             match repeat.as_mut() {
                 Some(engine) => {
-                    let stopped = engine.stop();
+                    engine.stop();
                     tracing::warn!(
-                        key = ?stopped,
                         repeats = engine.repeats(),
                         "repeat guard: software repeat stopped"
                     );
@@ -2799,9 +2798,39 @@ mod tests {
             "an injected key-down takes the repeat slot"
         );
 
+        #[derive(Clone, Default)]
+        struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = LogBuffer::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        use tracing::instrument::WithSubscriber;
         harness
             .send(Msg::StopRepeat(ipc::StopRepeat { lease_id: lease(9) }))
+            .with_subscriber(subscriber)
             .await;
+        let output = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("repeat guard: software repeat stopped"));
+        assert!(output.contains("repeats=0"));
+        for private in ["key=", "HidKey", "page", "usage", "evdev"] {
+            assert!(!output.contains(private), "private key diagnostic: {private}");
+        }
         let engine = harness.repeat.as_mut().expect("software mode");
         assert_eq!(engine.holding(), None);
         assert_eq!(

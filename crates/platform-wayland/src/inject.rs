@@ -558,19 +558,14 @@ impl WaylandInjector {
                     InputEvent::Scroll { .. } => scrolls += 1,
                 }
             }
-            let first_key_mapping = events.iter().find_map(|event| match event {
-                InputEvent::Key { key, .. } => Some((key.page, key.usage, hid_key_to_evdev(*key))),
-                _ => None,
-            });
             tracing::info!(
                 events = events.len(),
-                first_key_mapping = ?first_key_mapping,
                 keys,
                 pointers,
                 buttons,
                 scrolls,
                 applied = outcome.applied_count,
-                os_error = ?outcome.os_error,
+                os_error = outcome.os_error.is_some(),
                 actual_position = ?outcome.actual,
                 "EIS injection summary"
             );
@@ -1134,6 +1129,39 @@ mod tests {
     use super::{discrete_units, route_event, select_devices, DeviceOffer, DeviceSelection};
     use input_model::{HidKey, InputEvent, KeyState, MouseButton, Position};
 
+    #[derive(Clone, Default)]
+    struct CapturedDiagnostics(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl tracing::field::Visit for CapturedDiagnostics {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            use std::fmt::Write;
+            writeln!(self.0.lock().unwrap(), "{}={value:?}", field.name()).unwrap();
+        }
+    }
+
+    impl tracing::Subscriber for CapturedDiagnostics {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut self.clone());
+        }
+    }
+
     #[tokio::test]
     async fn eis_click_frames_and_lease_end_release_every_held_button() {
         use super::{InjectSource, PortalVersions, UnixStream, WaylandInjector};
@@ -1205,6 +1233,42 @@ mod tests {
         .await
         .expect("bounded handshake")
         .expect("attach test injector");
+        // Exercise both a mapped key and an unmapped usage without a real keyboard.
+        // Neither path emits an EIS frame on this button-only device.
+        let diagnostics = CapturedDiagnostics::default();
+        tracing::subscriber::with_default(diagnostics.clone(), || {
+            for key in [
+                HidKey::keyboard(0x04),
+                HidKey {
+                    page: 0xffed,
+                    usage: 0xabcd,
+                },
+            ] {
+                injector.last_inject_report = None;
+                let outcome = injector.inject(&[InputEvent::Key {
+                    key,
+                    state: KeyState::Down,
+                }]);
+                assert!(outcome.os_error.is_some());
+            }
+        });
+        let output = diagnostics.0.lock().unwrap().clone();
+        assert!(output.contains("EIS injection summary"));
+        assert!(output.contains("events=1"));
+        assert!(output.contains("keys=1"));
+        assert!(output.contains("applied=0"));
+        for private in [
+            "first_key_mapping",
+            "page",
+            "usage",
+            "evdev",
+            "HidKey",
+            "65517",
+            "43981",
+            "Some((7, 4, Some(30)))",
+        ] {
+            assert!(!output.contains(private), "private key diagnostic: {private}");
+        }
         let edge = |button, state| InputEvent::Button { button, state };
         let click = [
             edge(MouseButton::Left, KeyState::Down),
