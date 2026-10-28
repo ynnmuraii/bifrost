@@ -1173,8 +1173,16 @@ mod tests {
             },
         );
         assert_eq!(hello.node_id.len(), 32);
-        assert_eq!(hello.capabilities, vec![12, 13, 1, 2, 3, 10, 11]);
+        assert_eq!(hello.capabilities, vec![12, 13, 1, 2, 3, 10, 11, 14]);
         assert_eq!(hello.app_version, protocol::app_version());
+        let epoch = transport::clipboard::process_epoch();
+        assert_eq!(hello.clipboard_epoch, epoch);
+        assert_eq!(
+            transport::PeerInfo::from_hello(&hello)
+                .expect("advertised Hello negotiates")
+                .clipboard_epoch,
+            Some(epoch)
+        );
         assert!(hello.can_own);
     }
 }
