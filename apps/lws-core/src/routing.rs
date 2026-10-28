@@ -234,7 +234,6 @@ pub fn hello(
         capabilities: {
             let mut bits = capability_bits(capabilities);
             bits.push(wire::Capability::RemoteUpdate as i32);
-            bits.push(wire::Capability::ClipboardSession as i32);
             bits
         },
         displays: Vec::new(),
@@ -289,6 +288,7 @@ pub fn capability_bits(capabilities: Capabilities) -> Vec<i32> {
     let mut bits = vec![
         wire::Capability::ClipboardApplyAck as i32,
         wire::Capability::UnpairNotice as i32,
+        wire::Capability::ClipboardSession as i32,
     ];
     if capabilities.capture {
         bits.push(wire::Capability::Capture as i32);
@@ -1173,7 +1173,7 @@ mod tests {
             },
         );
         assert_eq!(hello.node_id.len(), 32);
-        assert_eq!(hello.capabilities, vec![12, 13, 1, 2, 3, 10, 11, 14]);
+        assert_eq!(hello.capabilities, vec![12, 13, 14, 1, 2, 3, 10, 11]);
         assert_eq!(hello.app_version, protocol::app_version());
         let epoch = transport::clipboard::process_epoch();
         assert_eq!(hello.clipboard_epoch, epoch);
@@ -1184,6 +1184,34 @@ mod tests {
             Some(epoch)
         );
         assert!(hello.can_own);
+    }
+
+    #[test]
+    fn agent_capability_refresh_preserves_authenticated_clipboard_epoch() {
+        let mut capabilities = crate::no_capabilities();
+        let mut hello = hello(
+            NodeId::new([7; 32]),
+            "WORKSTATION",
+            true,
+            capabilities,
+            wire::SessionKind::Windows,
+            Gossip::default(),
+        );
+        let epoch = transport::clipboard::process_epoch();
+        for text_clipboard in [false, true, false] {
+            capabilities.text_clipboard = text_clipboard;
+            hello.capabilities = capability_bits(capabilities);
+            hello
+                .capabilities
+                .push(wire::Capability::RemoteUpdate as i32);
+            let peer = transport::PeerInfo::from_hello(&hello).expect("refreshed Hello");
+            assert_eq!(
+                peer.clipboard_epoch,
+                Some(epoch),
+                "agent readiness must not downgrade the authenticated epoch capability"
+            );
+            assert_eq!(peer.text_clipboard, text_clipboard);
+        }
     }
 }
 
@@ -1548,7 +1576,7 @@ mod contract_tests {
             emergency_hotkey: true,
         };
 
-        let expected: Vec<i32> = vec![12, 13, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let expected: Vec<i32> = vec![12, 13, 14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         assert_eq!(
             capability_bits(capabilities),
             expected,
