@@ -1054,6 +1054,9 @@ impl ViewModel {
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
         self.pairing.prompt = None;
+        self.pairing.window_deadline = None;
+        self.pairing.dialing = false;
+        self.pairing.paired = None;
         self.incoming_pair_request = None;
         self.outgoing_pair_request = None;
         if self.settings.service.stopping.take().is_some() {
@@ -1144,6 +1147,9 @@ impl ViewModel {
         }
         let lang = self.look.language;
         let request = self.take_inflight(id);
+        if matches!(request, Some(Request::PairWith | Request::PairingAnswer)) {
+            self.finish_pairing(false);
+        }
         let name = request.map_or(text(lang, Key::Request), |request| request.label(lang));
         self.push_log(format!("Служба не запущена: {name} не отправлено"));
         if request == Some(Request::Shutdown) {
