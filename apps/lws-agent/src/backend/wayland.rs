@@ -753,16 +753,12 @@ impl Wayland {
             );
             return;
         };
-        let (cursor, reset) = RelativeCursor::enter(bounds);
-        let outcome = self.injector.inject(&[InputEvent::PointerRelative {
-            dx: reset.dx,
-            dy: reset.dy,
-        }]);
-        if let Some(error) = outcome.os_error {
+        if let Err(error) = initialize_relative_cursor(&mut self.relative_cursor, bounds, |event| {
+            self.injector.inject(&[event]).os_error.map_or(Ok(()), Err)
+        }) {
             tracing::warn!(%error, "could not reset relative pointer estimate at entry");
             return;
         }
-        self.relative_cursor = Some(cursor);
         tracing::info!(
             ?bounds,
             "using relative EIS pointer injection; cursor position is an estimate"
@@ -778,6 +774,7 @@ impl Wayland {
         let relative_only =
             select_pointer_mode(self.injector.capabilities()) == PointerMode::Relative;
         if relative_only
+            && self.relative_cursor.is_none()
             && events
                 .iter()
                 .any(|event| matches!(event, InputEvent::PointerAbsolute(_)))
@@ -1278,6 +1275,24 @@ async fn arm_capture(
     Ok(())
 }
 
+/// Resets the relative-only device once per prepared lease, at its first absolute batch.
+fn initialize_relative_cursor<E>(
+    estimate: &mut Option<RelativeCursor>,
+    bounds: RelativeBounds,
+    mut inject: impl FnMut(InputEvent) -> Result<(), E>,
+) -> Result<(), E> {
+    if estimate.is_some() {
+        return Ok(());
+    }
+    let (cursor, reset) = RelativeCursor::enter(bounds);
+    inject(InputEvent::PointerRelative {
+        dx: reset.dx,
+        dy: reset.dy,
+    })?;
+    *estimate = Some(cursor);
+    Ok(())
+}
+
 /// The capability list after the portals have answered.
 ///
 /// The probe can only reason about the session; these rules are the ones the documents
@@ -1403,6 +1418,33 @@ fn fatal(error: &WaylandError) -> Refusal {
 #[cfg(test)]
 mod activation_tests {
     use super::*;
+
+    #[test]
+    fn relative_absolute_batches_reset_once_then_move_by_position_delta() {
+        let bounds = RelativeBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mut cursor = None;
+        let mut sink = Vec::new();
+        for position in [Position::new(100.0, 200.0), Position::new(110.0, 220.0)] {
+            initialize_relative_cursor(&mut cursor, bounds, |event| {
+                sink.push(event);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            let delta = cursor.as_mut().unwrap().move_to(position);
+            sink.push(InputEvent::PointerRelative {
+                dx: delta.dx,
+                dy: delta.dy,
+            });
+        }
+        assert_eq!(sink.len(), 3, "one reset followed by two absolute batches");
+        assert_eq!(sink[1], InputEvent::PointerRelative { dx: 100, dy: 200 });
+        assert_eq!(sink[2], InputEvent::PointerRelative { dx: 10, dy: 20 });
+    }
 
     #[test]
     fn dismissed_and_unbound_shortcuts_are_denied_not_unavailable() {
