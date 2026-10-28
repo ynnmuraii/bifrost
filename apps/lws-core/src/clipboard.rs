@@ -1233,7 +1233,7 @@ impl Clipboard {
         }) {
             return Vec::new();
         }
-        if let Err(error) = offer.is_acceptable().and_then(|()| {
+        if let Err(error) = offer.is_acceptable().and({
             if offer.size > self.settings.policy.max_bytes {
                 Err(cb::ClipboardError::TooLarge)
             } else {
