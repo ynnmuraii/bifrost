@@ -2129,6 +2129,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(receiver_root);
     }
 
+    #[tokio::test]
+    async fn rebinding_listener_preserves_logical_source_carry_and_authenticated_epoch() {
+        let (mut endpoint, root) = started_clipboard("rebind-state").await;
+        endpoint.on_local_copy(b"retained carry".to_vec(), Vec::new()).await;
+        let peer: NodeId = [0x21; 32].into();
+        endpoint.set_peer_session(peer, [1; 16], Some([11; 16]));
+        endpoint.on_peer_message_from(peer, [1; 16], session_offer(peer, [11; 16], 7, 1, false)).await;
+        assert!(complete_empty(&mut endpoint, peer, [1; 16], 1).await.iter().any(|out| matches!(out, Out::Agent(_))));
+        let old_address = endpoint.runtime.listen_address;
+        let version = endpoint.source.version();
+        let carry = endpoint.carried.clone();
+        let payload = endpoint.payload.clone();
+        let _events = endpoint.rebind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let address = endpoint.runtime.listen_address;
+        assert_ne!(address, old_address);
+        assert_eq!(endpoint.source.version(), version);
+        assert_eq!(endpoint.carried, carry);
+        assert_eq!(endpoint.payload, payload);
+        assert_eq!(endpoint.peers[&peer].epoch, Some([11; 16]));
+        assert_eq!(endpoint.received[&peer].echo.highest(peer.as_bytes()), Some(7));
+        let old_listener = tokio::net::TcpListener::bind(old_address).await.expect("old listener was closed");
+        let new_connection = tokio::net::TcpStream::connect(address).await.expect("replacement listener accepts");
+        drop(new_connection);
+        drop(old_listener);
+        endpoint.runtime.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn session_offer(origin: NodeId, epoch: [u8; 16], version: u64, id: u8, relayed: bool) -> ClipboardMessage {
         ClipboardMessage::Offer {
             offer_id: [id; 16],
