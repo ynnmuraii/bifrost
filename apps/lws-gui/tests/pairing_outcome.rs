@@ -22,7 +22,11 @@ fn audit_unstructured_pairing_ack_is_not_trust_confirmation() {
         vm.pairing.paired.is_none(),
         "a processed rejection is not pairing"
     );
-    assert!(vm.outcome.is_none(), "no generic success for pairing answers");
+    assert!(
+        vm.outcome.is_none(),
+        "no generic success for pairing answers"
+    );
+    assert!(!vm.log.iter().any(|line| line.contains("сопряжён")));
 }
 
 #[test]

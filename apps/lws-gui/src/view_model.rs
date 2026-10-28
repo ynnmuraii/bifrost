@@ -1408,7 +1408,13 @@ impl ViewModel {
                     self.pairing.paired = Some(result.peer_name);
                 }
                 if paired {
-                    self.set_outcome(Outcome::done(self.success_text(Request::PairingAnswer)));
+                    let name = self
+                        .pairing
+                        .paired
+                        .as_deref()
+                        .unwrap_or_else(|| text(lang, Key::ComputerTitle));
+                    let line = fill_named(lang, Key::NameIsPaired, &[("name", &name)]);
+                    self.set_outcome(Outcome::done(line));
                 }
             }
             Msg::IncomingPairingRequest(prompt) => {
@@ -1786,7 +1792,7 @@ impl ViewModel {
             return;
         }
         if result.ok {
-            let line = self.success_text(request);
+            let line = success_text(lang, request);
             // A toggle shows its own state; a sentence under it says nothing new.
             if !matches!(
                 request,
@@ -1870,24 +1876,6 @@ impl ViewModel {
     /// Takes the requests the view model made itself, to be sent as they are.
     pub fn take_outgoing(&mut self) -> Vec<(u64, Msg)> {
         std::mem::take(&mut self.outgoing)
-    }
-
-    /// The sentence a successful request is reported with.
-    ///
-    /// The pairing answer names the peer; the live link status arrives separately in `Status`.
-    fn success_text(&self, request: Request) -> String {
-        let lang = self.look.language;
-        if request == Request::PairingAnswer {
-            let name = self
-                .pairing
-                .prompt
-                .as_ref()
-                .map(|prompt| prompt.peer_name.clone())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| text(lang, Key::ComputerTitle).to_owned());
-            return fill_named(lang, Key::NameIsPaired, &[("name", &name)]);
-        }
-        success_text(lang, request)
     }
 
     /// Removes and returns the request `id` names.

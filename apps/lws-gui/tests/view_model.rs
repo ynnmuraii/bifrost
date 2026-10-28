@@ -1273,6 +1273,10 @@ fn a_successful_pairing_promises_what_actually_happens() {
     let mut vm = view();
     vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
     let id = vm.begin_request(Request::PairingAnswer, Instant::now());
+    vm.apply(event(Msg::PairingResult(protocol::ipc::PairingResult {
+        outcome: protocol::ipc::PairingOutcome::Paired as i32,
+        peer_name: pairing_prompt().peer_name,
+    })));
     vm.apply(answer(
         id,
         Msg::OpResult(protocol::ipc::OpResult {
@@ -1763,6 +1767,10 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
     );
     assert_eq!(vm.pairing.paired, None, "dialling is not a completed pair");
     let id = vm.begin_request(Request::PairingAnswer, now);
+    vm.apply(event(Msg::PairingResult(protocol::ipc::PairingResult {
+        outcome: protocol::ipc::PairingOutcome::Paired as i32,
+        peer_name: pairing_prompt().peer_name,
+    })));
     vm.apply(answer(
         id,
         Msg::OpResult(protocol::ipc::OpResult {
