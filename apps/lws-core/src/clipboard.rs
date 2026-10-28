@@ -1372,7 +1372,7 @@ impl Clipboard {
         state.parent = Some(parent);
         state.epoch = epoch;
         let previous = self.received.entry(peer).or_default();
-        if previous.epoch != epoch || epoch.is_none() {
+        if epoch.is_some() && previous.epoch != epoch {
             *previous = ReceivedSession {
                 epoch,
                 echo: cb::Echo::new(),
@@ -1410,8 +1410,8 @@ impl Clipboard {
     /// A member's input link went down: its clipboard channel goes with it.
     pub async fn on_link_down(&mut self, peer: NodeId) {
         self.peers.remove(&peer);
-        // A TCP reconnect is not a process restart: keep committed versions until
-        // authenticated Hello changes the epoch (legacy peers reset at session setup).
+        // A TCP reconnect is not a process restart. Without an authenticated epoch,
+        // legacy peers retain replay protection but cannot signal a counter restart.
         self.waiting.remove(&peer);
         self.offered.remove(&peer);
         self.deliveries.remove(&peer);
@@ -2492,6 +2492,54 @@ mod tests {
             .any(|out| matches!(out, Out::Agent(_))));
         endpoint.runtime.stop().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_reconnect_preserves_committed_clipboard_high_water() {
+        for initial_epoch in [None, Some([11; 16])] {
+            let (mut endpoint, root) = started_clipboard("legacy-reconnect-replay").await;
+            let peer: NodeId = [0x21; 32].into();
+            let offer = |epoch: Option<[u8; 16]>, version, id| {
+                let mut message = session_offer(peer, [0; 16], version, id, false);
+                if let ClipboardMessage::Offer { sender_epoch, .. } = &mut message {
+                    *sender_epoch = epoch.map(|value| value.to_vec()).unwrap_or_default();
+                }
+                message
+            };
+            endpoint.set_peer_session(peer, [1; 16], initial_epoch);
+            endpoint
+                .on_peer_message_from(peer, [1; 16], offer(initial_epoch, 90, 1))
+                .await;
+            assert!(complete_empty(&mut endpoint, peer, [1; 16], 1)
+                .await
+                .iter()
+                .any(|out| matches!(out, Out::Agent(_))));
+
+            endpoint.on_link_down(peer).await;
+            endpoint.set_peer_session(peer, [2; 16], None);
+            endpoint
+                .on_link_up(peer, [2; 16], true, "127.0.0.1".parse().unwrap())
+                .await;
+            endpoint
+                .on_peer_message_from(peer, [2; 16], offer(None, 90, 2))
+                .await;
+            assert!(
+                !endpoint.incoming.contains_key(&[2; 16]),
+                "absence of an authenticated epoch must not reset committed versions"
+            );
+            assert!(complete_empty(&mut endpoint, peer, [2; 16], 2)
+                .await
+                .is_empty());
+            endpoint
+                .on_peer_message_from(peer, [2; 16], offer(None, 91, 3))
+                .await;
+            assert!(complete_empty(&mut endpoint, peer, [2; 16], 3)
+                .await
+                .iter()
+                .any(|out| matches!(out, Out::Agent(_))));
+            endpoint.runtime.stop().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[tokio::test]
