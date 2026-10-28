@@ -86,6 +86,14 @@ pub fn draw(
     let response = ui
         .interact(handle, ui.id().with("dock-toggle"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::CollapsingHeader,
+            ui.is_enabled(),
+            vm.look.dock_open,
+            text(lang, Key::Pairing),
+        )
+    });
     let label = painter.layout_no_wrap(
         text(lang, Key::Pairing).to_owned(),
         font(12.0, fam::sans_medium()),
@@ -672,7 +680,7 @@ fn code_box(ui: &mut egui::Ui, pal: &Palette, glyph: &str, wait: bool, lit: bool
 
 /// Six boxes in two groups of three.
 fn code_row(ui: &mut egui::Ui, pal: &Palette, digits: [&str; 6], wait: bool, lit: Option<usize>) {
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         for (i, glyph) in digits.iter().enumerate() {
             if i == 3 {
@@ -681,6 +689,11 @@ fn code_row(ui: &mut egui::Ui, pal: &Palette, digits: [&str; 6], wait: bool, lit
             code_box(ui, pal, glyph, wait, lit == Some(i));
         }
     });
+    if !wait {
+        row.response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), digits.concat())
+        });
+    }
 }
 
 /// D: the code to compare, the wait for it, or the pair that was made.
@@ -817,6 +830,22 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
 mod tests {
     use super::*;
     use crate::view_model::{CoreEndpoint, LocalConfig};
+
+    #[test]
+    fn audit_sas_has_one_accessible_text_representation() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let pal = Palette::of(crate::gui_settings::Theme::Light);
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            code_row(ui, &pal, ["4", "8", "2", "9", "1", "3"], false, None);
+        });
+        output.textures_delta.clear();
+        let tree = output.platform_output.accesskit_update.unwrap();
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Label && node.value() == Some("482913")
+        }));
+    }
 
     #[test]
     fn the_dock_grows_only_for_the_fingerprints() {

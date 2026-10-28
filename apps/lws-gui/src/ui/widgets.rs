@@ -119,6 +119,9 @@ pub fn centre_galley(painter: &egui::Painter, rect: Rect, galley: Arc<Galley>, c
 /// Paints an already laid-out galley as a widget of its own size.
 pub fn show_galley(ui: &mut Ui, galley: Arc<Galley>) -> Response {
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+    });
     if ui.is_rect_visible(rect) {
         ui.painter().add(egui::epaint::TextShape::new(
             rect.min,
@@ -294,6 +297,9 @@ fn button_sized(
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled && ui.is_enabled(), label)
+    });
     if enabled {
         response.clone().on_hover_cursor(CursorIcon::PointingHand);
     }
@@ -437,6 +443,14 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
         let response = ui
             .interact(cell, ui.id().with(("seg", i, items[i])), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::RadioButton,
+                ui.is_enabled(),
+                i == on,
+                items[i],
+            )
+        });
         if response.clicked() {
             clicked = Some(i);
         }
@@ -487,6 +501,9 @@ pub fn pill(ui: &mut Ui, pal: &Palette, dot: Option<Dot>, runs: &[Run<'_>]) -> R
     let dot_w = if dot.is_some() { 7.0 + 8.0 } else { 0.0 };
     let size = Vec2::new(galley.size().x + dot_w + 24.0, 30.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+    });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect(
@@ -554,6 +571,9 @@ pub fn kbd(ui: &mut Ui, pal: &Palette, label: &str) -> Response {
         .layout_no_wrap(label.to_owned(), font(12.0, fam::mono()), pal.ink);
     let size = Vec2::new(galley.size().x + 18.0, galley.size().y + 12.0 + 2.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label)
+    });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         // `border-bottom-width: 3px`: the cap is a 1 px frame with a thicker bottom edge.
@@ -768,4 +788,29 @@ pub fn select(
             });
     });
     picked
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+
+    #[test]
+    fn audit_custom_controls_expose_accessible_names_and_roles() {
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let pal = Palette::of(crate::gui_settings::Theme::Light);
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            button(ui, &pal, "Connect", Kind::Solid, true);
+            seg(ui, &pal, &["Light", "Dark"], 0);
+        });
+        output.textures_delta.clear();
+        let tree = output.platform_output.accesskit_update.unwrap();
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.label() == Some("Connect")
+        }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::RadioButton && node.label() == Some("Light")
+        }));
+    }
 }
