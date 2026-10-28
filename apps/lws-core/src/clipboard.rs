@@ -1410,7 +1410,8 @@ impl Clipboard {
     /// A member's input link went down: its clipboard channel goes with it.
     pub async fn on_link_down(&mut self, peer: NodeId) {
         self.peers.remove(&peer);
-        self.received.remove(&peer);
+        // A TCP reconnect is not a process restart: keep committed versions until
+        // authenticated Hello changes the epoch (legacy peers reset at session setup).
         self.waiting.remove(&peer);
         self.offered.remove(&peer);
         self.deliveries.remove(&peer);
@@ -2449,6 +2450,46 @@ mod tests {
         assert!(complete_empty(&mut endpoint, a, [2; 16], 8)
             .await
             .is_empty());
+        endpoint.runtime.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconnecting_the_same_process_does_not_replay_committed_clipboard() {
+        let (mut endpoint, root) = started_clipboard("same-epoch-replay").await;
+        let peer: NodeId = [0x21; 32].into();
+        let epoch = [11; 16];
+        endpoint.set_peer_session(peer, [1; 16], Some(epoch));
+        endpoint
+            .on_peer_message_from(peer, [1; 16], session_offer(peer, epoch, 90, 1, false))
+            .await;
+        assert!(complete_empty(&mut endpoint, peer, [1; 16], 1)
+            .await
+            .iter()
+            .any(|out| matches!(out, Out::Agent(_))));
+
+        endpoint.on_link_down(peer).await;
+        endpoint.set_peer_session(peer, [2; 16], Some(epoch));
+        endpoint
+            .on_link_up(peer, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .await;
+        endpoint
+            .on_peer_message_from(peer, [2; 16], session_offer(peer, epoch, 90, 2, false))
+            .await;
+        assert!(
+            !endpoint.incoming.contains_key(&[2; 16]),
+            "a new connection must retain the authenticated process high-water"
+        );
+        assert!(complete_empty(&mut endpoint, peer, [2; 16], 2)
+            .await
+            .is_empty());
+        endpoint
+            .on_peer_message_from(peer, [2; 16], session_offer(peer, epoch, 91, 3, false))
+            .await;
+        assert!(complete_empty(&mut endpoint, peer, [2; 16], 3)
+            .await
+            .iter()
+            .any(|out| matches!(out, Out::Agent(_))));
         endpoint.runtime.stop().await;
         let _ = std::fs::remove_dir_all(root);
     }
