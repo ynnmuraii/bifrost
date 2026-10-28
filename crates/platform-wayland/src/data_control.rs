@@ -450,16 +450,15 @@ mod glue {
                         state.writer.send(fd, text);
                     }
                 }
-                ext_data_control_source_v1::Event::Cancelled => {
+                ext_data_control_source_v1::Event::Cancelled
                     if state
                         .owned
                         .as_ref()
-                        .is_some_and(|owned| owned.id() == source.id())
-                    {
-                        state.writer.cancel();
-                        if let Some(replaced) = state.owned.take() {
-                            replaced.destroy();
-                        }
+                        .is_some_and(|owned| owned.id() == source.id()) =>
+                {
+                    state.writer.cancel();
+                    if let Some(replaced) = state.owned.take() {
+                        replaced.destroy();
                     }
                 }
                 _ => {}
