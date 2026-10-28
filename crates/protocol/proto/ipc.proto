@@ -321,6 +321,7 @@ message GuiFrame {
     IncomingPairingRequest incoming_pairing_request = 56;
     OutgoingPairingRequest outgoing_pairing_request = 57;
     MutePairingRequester mute_pairing_requester = 58;
+    PairingResult pairing_result = 59; // explicit ceremony outcome; OpResult only acknowledges a request
   }
 }
 // Also replays the current open PairingWindow and unanswered PairingPrompt as events
@@ -494,6 +495,13 @@ message PairingWindow {
   bytes attempt_id = 4;         // the id every PairingAnswer of this window names; empty when closed
 }
 message OpResult { bool ok = 1; string error_code = 2; }
+enum PairingOutcome {
+  PAIRING_OUTCOME_UNSPECIFIED = 0;
+  PAIRING_OUTCOME_PAIRED = 1;
+  PAIRING_OUTCOME_REJECTED = 2;
+  PAIRING_OUTCOME_FAILED = 3;
+}
+message PairingResult { PairingOutcome outcome = 1; string peer_name = 2; }
 
 // ---------- layout editor model (gui <-> core) ----------
 // TopologyDoc is the applied layout document plus the display geometry of every

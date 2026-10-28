@@ -1002,6 +1002,13 @@ impl Session {
                 status,
                 reply,
             } => {
+                let (outcome_kind, peer_name) = match &outcome {
+                    pairing::Outcome::Paired(peer) => {
+                        (ipc::PairingOutcome::Paired, peer.display_name.clone())
+                    }
+                    pairing::Outcome::Rejected => (ipc::PairingOutcome::Rejected, String::new()),
+                    pairing::Outcome::Failed(_) => (ipc::PairingOutcome::Failed, String::new()),
+                };
                 if let Some(window) = window_closed {
                     self.publish(Msg::PairingWindow(ipc::PairingWindow {
                         open: false,
@@ -1072,6 +1079,14 @@ impl Session {
                         Err(("PAIRING_FAILED".to_owned(), detail))
                     }
                 };
+                self.publish(Msg::PairingResult(ipc::PairingResult {
+                    outcome: if verdict.is_ok() {
+                        outcome_kind as i32
+                    } else {
+                        ipc::PairingOutcome::Failed as i32
+                    },
+                    peer_name,
+                }));
                 if let Some(reply) = reply {
                     let _ = reply.send(verdict);
                 }

@@ -1400,6 +1400,13 @@ impl ViewModel {
             Msg::Status(status) => self.apply_status(status),
             Msg::TopologyDoc(doc) => self.apply_topology(doc),
             Msg::PairingWindow(window) => self.apply_pairing_window(window),
+            Msg::PairingResult(result) => {
+                let paired = result.outcome == ipc::PairingOutcome::Paired as i32;
+                self.finish_pairing(paired);
+                if paired && !result.peer_name.is_empty() {
+                    self.pairing.paired = Some(result.peer_name);
+                }
+            }
             Msg::IncomingPairingRequest(prompt) => {
                 self.incoming_pair_request = (prompt.seconds_remaining > 0).then_some(prompt);
                 if self.incoming_pair_request.is_some() {
@@ -1712,6 +1719,7 @@ impl ViewModel {
             .map(|prompt| prompt.peer_name)
             .filter(|name| !name.is_empty());
         self.pairing.dialing = false;
+        self.pairing.paired = None;
         if paired {
             self.pairing.paired =
                 Some(name.unwrap_or_else(|| text(lang, Key::ComputerTitle).to_owned()));
@@ -1784,6 +1792,7 @@ impl ViewModel {
                     | Request::SetDiscovery
                     | Request::PairingRequest
                     | Request::SetPairingRequests
+                    | Request::PairingAnswer
             ) {
                 self.set_outcome(Outcome::done(line.clone()));
             }
@@ -1796,7 +1805,10 @@ impl ViewModel {
                     self.settings.export = Some(Outcome::done(line.clone()));
                 }
                 Request::PairWith => self.pairing.dialing = false,
-                Request::PairingAnswer => self.finish_pairing(true),
+                Request::PairingAnswer => {
+                    self.pairing.prompt = None;
+                    self.pairing.dialing = false;
+                }
                 Request::ClearClipboardHistory => {
                     self.clipboard_history.clear();
                     let id = self.begin_request(Request::GetClipboardHistory, Instant::now());
@@ -4002,6 +4014,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::OutgoingPairingRequest(_) => "OutgoingPairingRequest",
         Msg::MutePairingRequester(_) => "MutePairingRequester",
         Msg::PairingAnswer(_) => "PairingAnswer",
+        Msg::PairingResult(_) => "PairingResult",
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
         Msg::SetClipboardPolicy(_) => "SetClipboardPolicy",
