@@ -201,6 +201,56 @@ fn load_reports_missing_files_and_invalid_documents() {
 }
 
 #[test]
+fn load_recovers_valid_backup_without_accepting_invalid_backup() {
+    let root = temp_dir("recovery");
+    let path = root.join("config.toml");
+    let backup = root.join("config.toml.bak");
+    let text = "config_version = 2\n[node]\ndisplay_name = \"WORKSTATION\"\n[network]\nlisten_address = \"192.168.1.10\"\n";
+    std::fs::write(&backup, text).unwrap();
+    for damaged in ["not valid TOML [", "config_version = 2\n"] {
+        std::fs::write(&path, damaged).unwrap();
+        let recovered = Config::load(&path).expect("a valid backup recovers a damaged primary");
+        assert_eq!(recovered.node.display_name, "WORKSTATION");
+        assert_eq!(read(&backup), text, "recovery preserves the backup");
+    }
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        Config::load(&path).unwrap().node.display_name,
+        "WORKSTATION"
+    );
+    std::fs::write(&path, "not valid TOML [").unwrap();
+    std::fs::write(&backup, "config_version = 2\n").unwrap();
+    assert!(matches!(
+        Config::load(&path),
+        Err(ConfigError::Parse { .. })
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn first_run_recovers_missing_primary_before_creating_defaults() {
+    let root = temp_dir("first-run-recovery");
+    let paths = Paths::new(&root, &root, &root, None);
+    let backup = paths.config_backup_file();
+    let text = "config_version = 2\n[node]\ndisplay_name = \"LAPTOP\"\n[network]\nlisten_address = \"192.168.1.20\"\n";
+    std::fs::write(&backup, text).unwrap();
+    assert!(!config::ensure_config(&paths).expect("recovery is not first-run creation"));
+    assert_eq!(
+        Config::load(paths.config_file()).unwrap().node.display_name,
+        "LAPTOP"
+    );
+    assert_eq!(read(&backup), text);
+    std::fs::remove_file(paths.config_file()).unwrap();
+    std::fs::write(&backup, "broken [").unwrap();
+    assert!(
+        config::ensure_config(&paths).is_err(),
+        "do not replace a damaged backup with defaults"
+    );
+    assert!(!paths.config_file().exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn node_id_hex_conversion_round_trips_and_rejects_anything_else() {
     let id = [0xab_u8; 32];
     let reference = peer_reference(&id);

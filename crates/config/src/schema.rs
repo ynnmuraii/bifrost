@@ -328,9 +328,32 @@ impl core::str::FromStr for Config {
 }
 
 impl Config {
-    /// Read and parse `path`, then [`Config::validate`] it.
+    /// Read and validate `path`, falling back to its validated `.bak` with a warning.
+    ///
+    /// Recovery is read-only: loading never overwrites either copy. If neither
+    /// copy is usable, report the primary's error rather than hiding its cause.
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Config, ConfigError> {
         let path = path.as_ref();
+        match Self::load_file(path) {
+            Ok(config) => Ok(config),
+            Err(primary_error) => {
+                let backup = crate::save::suffixed(path, ".bak");
+                match Self::load_file(&backup) {
+                    Ok(config) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            backup = %backup.display(),
+                            "configuration unavailable or invalid; recovered validated backup"
+                        );
+                        Ok(config)
+                    }
+                    Err(_) => Err(primary_error),
+                }
+            }
+        }
+    }
+
+    fn load_file(path: &std::path::Path) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,

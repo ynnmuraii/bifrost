@@ -211,10 +211,11 @@ pub fn choose(candidates: &[Candidate]) -> Option<Ipv4Addr> {
         .map(|candidate| candidate.address)
 }
 
-/// Writes a valid default `config.toml` when there is none.
+/// Restores a missing `config.toml` from its backup, or creates first-run defaults.
 ///
-/// `Ok(true)` means it created one; `Ok(false)` means the file was already there
-/// and was left untouched. The written document passes [`Config::validate`]:
+/// `Ok(true)` means it created defaults; `Ok(false)` means the primary already
+/// existed or a validated backup was restored. An unusable backup is an error.
+/// The written document passes [`Config::validate`]:
 /// `config_version = 2`, a non-empty `display_name`, a non-empty
 /// `listen_address`, `can_own = true`, `claim_on_startup` by host (see the module
 /// docs) and the schema defaults everywhere else.
@@ -241,6 +242,13 @@ pub fn ensure_config(paths: &Paths) -> Result<bool, String> {
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     let _lock = crate::lock::FileLock::acquire(&path).map_err(|error| error.to_string())?;
     if path.exists() {
+        return Ok(false);
+    }
+    // An interrupted older save may have left only the backup. Restore it
+    // before first-run defaults can overwrite the user's configuration.
+    if paths.config_backup_file().exists() {
+        let recovered = Config::load(&path).map_err(|error| error.to_string())?;
+        recovered.save(&path).map_err(|error| error.to_string())?;
         return Ok(false);
     }
     let config = default_config(listen);
