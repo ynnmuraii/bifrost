@@ -358,11 +358,8 @@ mod tests {
     fn selected_dhcp_address_moves_both_listeners_and_preserves_their_ports() {
         let old_input = "192.168.1.5:47901".parse().unwrap();
         let old_clipboard = "192.168.1.5:47902".parse().unwrap();
-        let (input, clipboard) = selected_listener_addresses(
-            "192.168.1.6".parse().unwrap(),
-            old_input,
-            old_clipboard,
-        );
+        let (input, clipboard) =
+            selected_listener_addresses("192.168.1.6".parse().unwrap(), old_input, old_clipboard);
         assert_eq!(input, "192.168.1.6:47901".parse().unwrap());
         assert_eq!(clipboard, "192.168.1.6:47902".parse().unwrap());
     }

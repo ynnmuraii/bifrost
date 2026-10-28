@@ -571,9 +571,8 @@ pub fn kbd(ui: &mut Ui, pal: &Palette, label: &str) -> Response {
         .layout_no_wrap(label.to_owned(), font(12.0, fam::mono()), pal.ink);
     let size = Vec2::new(galley.size().x + 18.0, galley.size().y + 12.0 + 2.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label)
-    });
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         // `border-bottom-width: 3px`: the cap is a 1 px frame with a thicker bottom edge.

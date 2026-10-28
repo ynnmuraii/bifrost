@@ -39,11 +39,8 @@ fn audit_active_peer_node_id_uses_an_appended_status_tag() {
     };
     let bytes = protocol::encode_message(protocol::Channel::Ipc, &status).unwrap();
     assert_eq!(&bytes[4..6], &[0xf2, 0x02]); // field 46, length-delimited
-    let decoded = protocol::decode_message::<protocol::ipc::Status>(
-        protocol::Channel::Ipc,
-        &bytes,
-    )
-    .unwrap()
-    .unwrap();
+    let decoded = protocol::decode_message::<protocol::ipc::Status>(protocol::Channel::Ipc, &bytes)
+        .unwrap()
+        .unwrap();
     assert_eq!(decoded, status);
 }

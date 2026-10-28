@@ -511,7 +511,11 @@ mod tests {
         let expected_emitted = [0, 0, 1, 1, 2, 2, 3];
         for (accepted, emitted) in expected_emitted.into_iter().enumerate() {
             let correction = motion_budget_adjustment(&plan, accepted, declared);
-            assert_eq!(declared + correction, emitted, "accepted {accepted} records");
+            assert_eq!(
+                declared + correction,
+                emitted,
+                "accepted {accepted} records"
+            );
             // Capture may have consumed accepted motions before SendInput returns.
             assert_eq!(declared - emitted + correction, 0);
         }

@@ -18,4 +18,3 @@ fn audit_pairing_wait_does_not_report_transport_silence() {
         assert!(!vm.silent);
     }
 }
-

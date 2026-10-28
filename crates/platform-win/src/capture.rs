@@ -724,7 +724,9 @@ fn push(shared: &Shared, event: InputEvent) {
             shared.dropped.fetch_add(1, Ordering::Relaxed);
             shared.overflowed.store(true, Ordering::Relaxed);
             // Restore local suppression immediately, even if the consumer is stalled.
-            shared.mode.store(CaptureKind::Observe as u8, Ordering::SeqCst);
+            shared
+                .mode
+                .store(CaptureKind::Observe as u8, Ordering::SeqCst);
             shared.hold_valid.store(false, Ordering::SeqCst);
             shared.overflow_pending.store(true, Ordering::SeqCst);
         }
@@ -1170,7 +1172,10 @@ mod tests {
             push(&capture.shared, InputEvent::Scroll { h120: 0, v120: 120 });
         }
         assert_eq!(capture.shared.dropped.load(Ordering::Relaxed), 1);
-        assert!(matches!(capture.try_recv(), Some(CaptureEvent::QueueOverflow)));
+        assert!(matches!(
+            capture.try_recv(),
+            Some(CaptureEvent::QueueOverflow)
+        ));
         assert_eq!(capture.mode(), CaptureKind::Observe);
         assert!(!capture.shared.hold_valid.load(Ordering::SeqCst));
     }

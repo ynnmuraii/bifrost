@@ -20,4 +20,3 @@ fn audit_pairing_disconnect_and_unsent_allow_retry() {
     vm.on_not_sent(id);
     assert!(!vm.pairing.dialing);
 }
-
