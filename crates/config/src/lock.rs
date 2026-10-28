@@ -8,38 +8,32 @@
 //! in-process mutex the core used cannot see another process, so the loser's change vanished
 //! (batch-6 audit, F17).
 //!
-//! The lock is a sibling file created with `create_new`, so the kernel arbitrates the race
-//! instead of the timing. It carries the owner's pid and the time it was taken; a lock older
-//! than [`STALE_AFTER`] is stolen, because a writer that crashed (or was killed) must not
-//! wedge the configuration for ever.
+//! The persistent sibling file is protected by an exclusive OS lock. Its age
+//! never revokes a live writer; closing the handle (including process exit)
+//! releases ownership. Never unlink the file: waiters must lock the same inode,
+//! rather than accidentally acquiring independent locks on replacement files.
 //!
 //! Every writer takes it around its whole read-modify-write: [`update_locked`] is the shape
 //! to use, and it is why the stores no longer write `config.toml` field by field.
 
+use std::fs::TryLockError;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::error::ConfigError;
 
 /// How long `acquire` waits for another writer before giving up.
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A lock file older than this belongs to a writer that died.
-///
-/// Generous on purpose: the critical section is one small file read and one small write, so
-/// anything near this age is a crash, while a live writer that is merely slow (a loaded
-/// machine, a slow disk) still finishes first and removes its own lock.
-pub const STALE_AFTER: Duration = Duration::from_secs(10);
-
 /// How long to sleep between attempts while another writer holds the lock.
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-/// A held lock. Dropping it releases: the file is removed.
+/// A held OS lock. Dropping its file handle releases ownership without unlinking.
 #[derive(Debug)]
 pub struct FileLock {
     path: PathBuf,
+    _file: fs::File,
 }
 
 impl FileLock {
@@ -51,27 +45,27 @@ impl FileLock {
     /// The same, with an explicit wait (tests use a short one).
     pub fn acquire_within(config: &Path, timeout: Duration) -> Result<Self, ConfigError> {
         let path = lock_path(config);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| ConfigError::Io {
+                path: path.clone(),
+                source,
+            })?;
         let deadline = Instant::now() + timeout;
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    // Diagnostic only: a human looking at a stale lock wants to know who.
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if Self::is_stale(&path) {
-                        // No logging dependency in this crate on purpose; the caller logs the
-                        // outcome it cares about (the update it could not make).
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { path, _file: file }),
+                Err(TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
-                        return Err(ConfigError::Locked { path: path.clone() });
+                        return Err(ConfigError::Locked { path });
                     }
                     std::thread::sleep(RETRY_INTERVAL);
                 }
-                Err(source) => return Err(ConfigError::Io { path, source }),
+                Err(TryLockError::Error(source)) => return Err(ConfigError::Io { path, source }),
             }
         }
     }
@@ -80,25 +74,6 @@ impl FileLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Whether the lock file is older than [`STALE_AFTER`].
-    ///
-    /// A file that vanished between the `create_new` failure and this call is *not* stale:
-    /// the next attempt creates it.
-    fn is_stale(path: &Path) -> bool {
-        match fs::metadata(path).and_then(|metadata| metadata.modified()) {
-            Ok(modified) => SystemTime::now()
-                .duration_since(modified)
-                .is_ok_and(|age| age > STALE_AFTER),
-            Err(_) => false,
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -129,6 +104,7 @@ pub fn update_locked<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     use crate::Config;
 
@@ -219,21 +195,19 @@ mod tests {
             200 + ROUNDS - 1,
             "the revision writer's last value survived"
         );
-        assert!(
-            !lock_path(&path).exists(),
-            "the lock is released when the last writer is done"
-        );
+        FileLock::acquire_within(&path, Duration::ZERO)
+            .expect("the OS lock is released when the last writer is done");
     }
 
-    /// A lock file whose writer is gone must not wedge the configuration: it is stolen.
+    /// An abandoned lock file never prevents the kernel from admitting a writer.
     #[test]
-    fn a_stale_lock_is_stolen() {
+    fn an_abandoned_lock_file_is_reused() {
         let dir = temp_dir("stale");
         let path = write_config(&dir);
         let lock = lock_path(&path);
         fs::write(&lock, b"1234\n").expect("a lock file");
-        // Backdate it past the stale threshold, the way a crashed writer leaves it.
-        let old = SystemTime::now() - (STALE_AFTER + Duration::from_secs(60));
+        // Age is irrelevant: even a fresh abandoned file is immediately usable.
+        let old = SystemTime::UNIX_EPOCH;
         fs::File::options()
             .write(true)
             .open(&lock)
@@ -242,7 +216,7 @@ mod tests {
             .expect("backdate the lock file");
 
         let held = FileLock::acquire_within(&path, Duration::from_millis(200))
-            .expect("a stale lock is stolen, not waited out");
+            .expect("an abandoned file is reused, not waited out");
         assert_eq!(held.path(), lock.as_path());
         drop(held);
         // And `update_locked` does not trip over it either.
@@ -258,6 +232,79 @@ mod tests {
                 .revision,
             7
         );
+    }
+
+    #[test]
+    fn backdated_live_owner_cannot_be_displaced() {
+        let dir = temp_dir("backdated-live");
+        let path = write_config(&dir);
+        let owner = FileLock::acquire(&path).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(owner.path())
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert!(
+            matches!(
+                FileLock::acquire_within(&path, Duration::ZERO),
+                Err(ConfigError::Locked { .. })
+            ),
+            "mtime cannot revoke a live owner's exclusive lock"
+        );
+        drop(owner);
+        let successor = FileLock::acquire_within(&path, Duration::ZERO).unwrap();
+        assert!(
+            FileLock::acquire_within(&path, Duration::ZERO).is_err(),
+            "the successor remains the exclusive owner"
+        );
+        drop(successor);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn releasing_lock_preserves_the_shared_lock_file() {
+        let dir = temp_dir("persistent-lock");
+        let path = write_config(&dir);
+        let owner = FileLock::acquire(&path).unwrap();
+        let lock = owner.path().to_owned();
+        drop(owner);
+        assert!(
+            lock.exists(),
+            "unlinking allows writers to lock different files"
+        );
+        let successor = FileLock::acquire_within(&path, Duration::ZERO).unwrap();
+        assert!(FileLock::acquire_within(&path, Duration::ZERO).is_err());
+        drop(successor);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn process_lock_owner_exits_without_drop() {
+        let Some(path) = std::env::var_os("LWS_CONFIG_LOCK_CHILD") else {
+            return;
+        };
+        let owner = FileLock::acquire(Path::new(&path)).unwrap();
+        std::mem::forget(owner);
+    }
+
+    #[test]
+    fn process_exit_releases_lock_without_waiting_for_stale_age() {
+        let dir = temp_dir("process-exit");
+        let path = write_config(&dir);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lock::tests::process_lock_owner_exits_without_drop",
+            ])
+            .env("LWS_CONFIG_LOCK_CHILD", &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let successor = FileLock::acquire_within(&path, Duration::ZERO)
+            .expect("the kernel releases a departed process's lock immediately");
+        drop(successor);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A live lock is respected: a second writer waits, then reports the timeout.
