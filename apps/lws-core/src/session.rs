@@ -370,6 +370,45 @@ fn next_restart_backoff(current: Duration) -> Duration {
 /// do not look hung.
 const LAYOUT_VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Pairing waits for a human; layout verdicts only wait for a network round trip.
+fn deferred_control_timeout(line: &str) -> Duration {
+    if matches!(
+        line.split_whitespace().next(),
+        Some("pair-prompt" | "pair-answer")
+    ) {
+        crate::pair::WINDOW + Duration::from_secs(10)
+    } else if line.trim_start().starts_with("clipboard-send ") {
+        Duration::from_secs(31)
+    } else {
+        LAYOUT_VERDICT_TIMEOUT
+    }
+}
+
+#[cfg(test)]
+mod pairing_control_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn pairing_controls_wait_for_the_human_window_not_a_layout_round_trip() {
+        for line in [
+            "pair-prompt",
+            "  pair-prompt ",
+            "pair-answer 00112233445566778899aabbccddeeff approve",
+        ] {
+            assert!(deferred_control_timeout(line) >= Duration::from_secs(120));
+            assert!(deferred_control_timeout(line) <= Duration::from_secs(130));
+        }
+        assert_eq!(
+            deferred_control_timeout("layout-apply"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            deferred_control_timeout("clipboard-send entry peer"),
+            Duration::from_secs(31)
+        );
+    }
+}
+
 fn accept_agent_ready(
     event: &fr::AgentEvent,
     refusal: &mut Option<String>,
@@ -4073,17 +4112,13 @@ impl Session {
             }
             Handled::Deferred(verdict) => {
                 let clipboard_send = line.trim_start().starts_with("clipboard-send ");
+                let timeout = deferred_control_timeout(&line);
                 // The loop must not block on a peer: the connection is handed to a writer that
                 // waits for the coordinator's verdict and answers either way. A verdict that
                 // never comes is not invented — `PENDING_VERDICT` says so, and the edit stays
                 // pending on this node.
                 tokio::spawn(async move {
                     let mut stream = stream;
-                    let timeout = if clipboard_send {
-                        Duration::from_secs(31)
-                    } else {
-                        LAYOUT_VERDICT_TIMEOUT
-                    };
                     let reply = match tokio::time::timeout(timeout, verdict).await {
                         Ok(Ok(response)) => response.render(),
                         Ok(Err(_)) | Err(_) if clipboard_send => ctl::Response::Error {
@@ -4731,8 +4766,8 @@ enum Step {
 ///
 /// The `pair-*` verbs cannot answer at once — the window is opened here and the peer drives it
 /// from its own node — so the caller is handed a channel and the loop's `Deferred` writer
-/// answers it whenever the ceremony gets there (and gives up on it at
-/// [`LAYOUT_VERDICT_TIMEOUT`], like every other deferred answer).
+/// answers it whenever the ceremony gets there, bounded by the pairing window and
+/// control-channel grace period in [`deferred_control_timeout`].
 fn verdict_of(verdict: oneshot::Receiver<pairing::Verdict>) -> oneshot::Receiver<ctl::Response> {
     let (sender, receiver) = oneshot::channel();
     tokio::spawn(async move {

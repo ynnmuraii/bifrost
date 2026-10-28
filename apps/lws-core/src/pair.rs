@@ -203,13 +203,13 @@ async fn window_on_running_core(paths: &Paths) -> Result<Option<Result<(), Failu
     std::io::stdout().flush().ok();
 
     let approved = ask().await?;
-    let Some(attempt) = fields.get("attempt") else {
+    let Some(ceremony) = fields.get("ceremony") else {
         return Err(Failure::Run(
-            "the core did not name the ceremony's attempt id".to_owned(),
+            "the core did not name the ceremony id".to_owned(),
         ));
     };
     let answer = format!(
-        "pair-answer {attempt} {}",
+        "pair-answer {ceremony} {}",
         if approved { "approve" } else { "reject" }
     );
     let outcome = ask_core(&endpoint, &answer, WINDOW + Duration::from_secs(10))
@@ -346,6 +346,75 @@ async fn ask() -> Result<bool, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_core_prompt_answers_the_ceremony_not_the_window_attempt() {
+        const CHILD: &str = "BIFROST_PAIR_PROMPT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pair::tests::running_core_prompt_answers_the_ceremony_not_the_window_attempt",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = std::env::temp_dir().join(format!(
+                    "lws-pair-prompt-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let paths = Paths::new(&root, &root, &root, Some(root.clone()));
+                let endpoint = crate::ctl::endpoint(crate::private_root(&paths)).unwrap();
+                let mut server = crate::ctl::Server::bind(&endpoint).unwrap();
+                let peer = tokio::spawn(async move {
+                    for (expected, reply) in [
+                        ("ping", "OK pong"),
+                        (
+                            "pair-open 120",
+                            "OK address=127.0.0.1:47901 attempt=11111111111111111111111111111111 seconds=120",
+                        ),
+                        (
+                            "pair-prompt",
+                            "OK sas=123456 peer=LAPTOP ceremony=22222222222222222222222222222222 address=127.0.0.1:47901",
+                        ),
+                        (
+                            "pair-answer 22222222222222222222222222222222 reject",
+                            "OK rejected",
+                        ),
+                    ] {
+                        let mut stream = server.accept().await.unwrap();
+                        let line = crate::ctl::read_line(&mut stream).await.unwrap().unwrap();
+                        assert_eq!(line.trim(), expected);
+                        crate::ctl::write_line(&mut stream, reply).await.unwrap();
+                    }
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    window_on_running_core(&paths),
+                )
+                .await
+                .expect("the local pairing exchange completes");
+                assert!(matches!(result, Ok(Some(Ok(())))));
+                peer.await.unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            });
+    }
 
     #[test]
     fn the_opener_records_the_documented_port_and_the_dialer_keeps_the_typed_one() {
