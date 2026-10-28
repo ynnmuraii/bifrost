@@ -87,7 +87,7 @@ pub fn hex16_decode(text: &str) -> Option<[u8; 16]> {
         return None;
     }
     let mut bytes = [0u8; 16];
-    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
         let nibble = |value| match value {
             b'0'..=b'9' => Some(value - b'0'),
             b'a'..=b'f' => Some(value - b'a' + 10),

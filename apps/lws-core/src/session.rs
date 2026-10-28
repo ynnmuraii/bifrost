@@ -507,6 +507,9 @@ struct CaptureMotionDiagnostics {
     large: bool,
 }
 
+/// Parent input connection, text support, remote address, and authenticated process epoch.
+type ClipboardLink = ([u8; 16], bool, std::net::IpAddr, Option<[u8; 16]>);
+
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
     router: crate::ids::Router,
@@ -663,7 +666,7 @@ pub struct Session {
     /// Preserve per-origin versions and echo history while the network runtime is off.
     clipboard_source: Option<clipboard::Source>,
     /// Live input-link bindings replayed when clipboard sharing is enabled.
-    clipboard_links: BTreeMap<NodeId, ([u8; 16], bool, std::net::IpAddr, Option<[u8; 16]>)>,
+    clipboard_links: BTreeMap<NodeId, ClipboardLink>,
     /// Session-only transferred texts; never persisted with configuration or diagnostics.
     clipboard_history: crate::clipboard_history::History,
     clipboard_follow: clipboard_follow::State,
