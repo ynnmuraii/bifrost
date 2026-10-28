@@ -30,7 +30,7 @@ The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–10
 
 ## Download & install
 
-Get **0.3.1** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
+Get **0.3.2** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
 
 Versions from **0.1.4** can update from **Settings** or the startup update notice. The app checks for newer stable releases shortly after startup; turn this off in **Settings → Check on startup**, or check manually next to the version. Updates keep a binary backup and ask before restarting all roles; your configuration and pairing are preserved. System-wide, non-writable installations must be updated manually.
 
@@ -40,7 +40,7 @@ Versions from **0.1.4** can update from **Settings** or the startup update notic
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.3.1-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.3.2-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902 + UDP 47902 (discovery)** (multicast `239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
@@ -48,10 +48,10 @@ Settings are created automatically in `%APPDATA%\lan-workspace`; logs go to `%LO
 
 ### Linux · x86_64
 
-Download **`bifrost-0.3.1-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.3.2-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.3.1-linux-x86_64.tar.gz
+tar -xzf bifrost-0.3.2-linux-x86_64.tar.gz
 ./install.sh
 ```
 
@@ -70,6 +70,8 @@ Runtime: X11 works too; Wayland needs `xdg-desktop-portal` with RemoteDesktop/In
 4. Arrange the screens on the map and connect their edges. Take control on the computer whose keyboard you want to use, then move across a linked edge. Enable the shared clipboard if you want it, and test your emergency shortcut first.
 
 Pairing requests and synchronized unpairing require **0.3.1 on both computers**. Unpairing removes trust on the other computer immediately if online, or on its next connection within 30 days. Older versions keep manual pairing windows and may show a manual **Remove** suggestion instead of synchronized removal.
+
+New peers use commitment/reveal SAS; a visible GUI/CLI warning identifies the less-protected legacy pairing ceremony. Always compare the codes on both screens. Clipboard restart detection requires capability 14 on both peers; legacy peers retain same-process reconnect replay protection, but cannot detect a peer process restart.
 
 Existing settings and pairing stay in the `lan-workspace` directories when updating. Stop your old Bifrost session before replacing the executable.
 

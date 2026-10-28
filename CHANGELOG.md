@@ -2,6 +2,42 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## 0.3.2 — 2026-10-29
+
+### English
+
+**Security and compatibility**
+
+- Pairing now uses commitment/reveal before comparing the six-digit SAS, preventing either side from choosing its contribution after seeing the other's. GUI and CLI visibly warn when an older peer uses the less-protected legacy ceremony; always compare and confirm the codes on both computers.
+- Clipboard transfers and incoming connection admission now have bounded concurrency, lifetimes and cancellation. Secret-marked text remains refused, and key identities are no longer written to diagnostic logs.
+- Failed trust-store saves are retried so an unpair decision survives a restart. Clipboard offers are bound to the authenticated sender, origin and session epoch, with replay protection retained across reconnects and listener changes.
+- Clipboard process-restart detection requires capability 14 on both peers. Legacy peers still reject replay across reconnects within the same process, but cannot detect a peer process restart. There is no protocol-version bump.
+
+**Reliability and usability**
+
+- Recover valid configuration backups before creating defaults; atomic replacement keeps the previous configuration readable, and process locks cannot be stolen from a live owner.
+- Pairing rejection, success and timeout are reported accurately without premature success or silent expiry. Failed connection attempts recover, CLI pairing has bounded waits, and malformed non-ASCII hexadecimal input is rejected safely.
+- The GUI tracks remote targets by NodeId instead of display name, clears stale targets and improves accessible roles and labels, including SAS controls. Login entries explicitly start the core; opening the window manually does not restart a deliberately stopped core. Re-enable an older login entry once to update it.
+- Input and clipboard listeners recover from DHCP address changes without discarding logical clipboard state. Windows capture overflow and emergency release bypass a full input queue; rejected synthetic motion no longer leaves suppression budget behind.
+- Abandoning an active lease releases control promptly and stale renewals cannot revive it. X11 refreshes pointer bounds after display changes and preserves asynchronous injection errors. X11 and Wayland clipboard reads and stalled transfers can be cancelled without blocking input; Wayland relative cursor initialization no longer repeats or loses its estimate.
+
+### Русский
+
+**Безопасность и совместимость**
+
+- Перед сравнением шестизначного SAS-кода сопряжение теперь использует commitment/reveal: ни одна сторона не может выбрать свой вклад, уже узнав вклад другой. Окно и CLI явно предупреждают о менее защищённой старой процедуре при работе со старым компьютером; всегда сравнивайте и подтверждайте код на обоих экранах.
+- Для передачи буфера обмена и приёма подключений ограничены число одновременных операций, время жизни и ожидание отмены. Секретно помеченный текст по-прежнему отклоняется; идентификаторы клавиш больше не записываются в диагностические журналы.
+- Неудачная запись хранилища доверия повторяется, чтобы удаление сопряжения сохранялось после перезапуска. Предложения буфера привязаны к аутентифицированному отправителю, источнику и эпохе сеанса; защита от повторов сохраняется при переподключении и смене слушателя.
+- Для обнаружения перезапуска процесса при обмене буфером нужна возможность 14 на обоих компьютерах. Старые версии защищены от повторов при переподключении в пределах одного процесса, но не обнаруживают перезапуск процесса соседа. Версия протокола не повышалась.
+
+**Надёжность и удобство**
+
+- Перед созданием настроек по умолчанию восстанавливается корректная резервная копия. Атомарная замена сохраняет доступность предыдущего файла; блокировку нельзя отнять у работающего процесса.
+- Отказ, успех и истечение времени сопряжения отображаются достоверно, без преждевременного успеха и молчаливого завершения. Неудачные подключения восстанавливаются, ожидание CLI-сопряжения ограничено, некорректный шестнадцатеричный ввод с не-ASCII символами отклоняется безопасно.
+- Окно различает удалённые компьютеры по NodeId, а не имени, очищает устаревшие цели и улучшает доступные роли и подписи, включая элементы SAS. Автозапуск явно запускает службу при входе в систему; ручное открытие окна не запускает намеренно остановленную службу. Старую запись автозапуска один раз выключите и включите.
+- Слушатели ввода и буфера восстанавливаются после смены адреса DHCP без потери логического состояния буфера. На Windows переполнение очереди захвата и аварийное освобождение обрабатываются независимо от заполненной очереди; отклонённое синтетическое движение не оставляет лишний бюджет подавления.
+- Отказ от активной аренды быстро возвращает управление, а запоздалые продления не воскрешают её. X11 обновляет границы указателя при изменении экрана и сохраняет асинхронные ошибки инъекции. Чтение буфера X11/Wayland и зависшие передачи отменяются без блокировки ввода; относительный курсор Wayland больше не инициализируется повторно и не теряет оценку положения.
+
 ## 0.3.1 — 2026-10-27
 
 ### English
