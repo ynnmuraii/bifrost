@@ -2172,6 +2172,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_restart_accepts_low_versions_and_rejects_old_sessions_and_completions() {
+        let (mut endpoint, root) = started_clipboard("restart-replay").await;
+        let a: NodeId = [0x21; 32].into();
+        endpoint.set_peer_session(a, [1; 16], Some([11; 16]));
+        endpoint.on_peer_message_from(a, [1; 16], session_offer(a, [11; 16], 90, 1, false)).await;
+        assert!(complete_empty(&mut endpoint, a, [1; 16], 1).await.iter().any(|out| matches!(out, Out::Agent(_))));
+        endpoint.on_peer_message_from(a, [1; 16], session_offer(a, [11; 16], 91, 2, false)).await;
+        endpoint.on_link_down(a).await;
+        endpoint.set_peer_session(a, [2; 16], Some([22; 16]));
+        endpoint.on_link_up(a, [2; 16], true, "127.0.0.1".parse().unwrap()).await;
+        endpoint.on_peer_message_from(a, [2; 16], session_offer(a, [22; 16], 1, 3, false)).await;
+        assert!(complete_empty(&mut endpoint, a, [2; 16], 3).await.iter().any(|out| matches!(out, Out::Agent(_))));
+        assert!(endpoint.on_peer_message_from(a, [1; 16], session_offer(a, [11; 16], 92, 4, false)).await.is_empty());
+        let replay = endpoint.on_peer_message_from(a, [2; 16], session_offer(a, [11; 16], 92, 5, false)).await;
+        assert!(matches!(replay.as_slice(), [Out::Cancel { reason: cb::ClipboardError::Invalid, .. }]));
+        assert!(complete_empty(&mut endpoint, a, [1; 16], 2).await.is_empty());
+        // A reservation alone is not a committed high-water mark.
+        endpoint.on_peer_message_from(a, [2; 16], session_offer(a, [22; 16], u64::MAX, 6, false)).await;
+        endpoint.on_peer_message_from(a, [2; 16], session_offer(a, [22; 16], 2, 7, false)).await;
+        assert!(complete_empty(&mut endpoint, a, [2; 16], 7).await.iter().any(|out| matches!(out, Out::Agent(_))));
+        endpoint.on_peer_message_from(a, [2; 16], session_offer(a, [22; 16], 3, 8, false)).await;
+        endpoint.on_peer_message_from(a, [2; 16], session_offer(a, [22; 16], 4, 9, false)).await;
+        assert!(complete_empty(&mut endpoint, a, [2; 16], 9).await.iter().any(|out| matches!(out, Out::Agent(_))));
+        assert!(complete_empty(&mut endpoint, a, [2; 16], 8).await.is_empty());
+        endpoint.runtime.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn direct_offer_cannot_claim_another_authenticated_origin() {
         let (mut endpoint, root) = started_clipboard("direct-origin").await;
         let peer: NodeId = [0x21; 32].into();
