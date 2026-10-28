@@ -663,7 +663,7 @@ pub struct Session {
     /// Preserve per-origin versions and echo history while the network runtime is off.
     clipboard_source: Option<clipboard::Source>,
     /// Live input-link bindings replayed when clipboard sharing is enabled.
-    clipboard_links: BTreeMap<NodeId, ([u8; 16], bool, std::net::IpAddr)>,
+    clipboard_links: BTreeMap<NodeId, ([u8; 16], bool, std::net::IpAddr, Option<[u8; 16]>)>,
     /// Session-only transferred texts; never persisted with configuration or diagnostics.
     clipboard_history: crate::clipboard_history::History,
     clipboard_follow: clipboard_follow::State,
@@ -1334,6 +1334,12 @@ impl Session {
     async fn service_clock(&mut self) {
         let now = self.now_ms();
         self.service_discovery().await;
+        let expired = self
+            .clipboard
+            .as_mut()
+            .map(|clipboard| clipboard.expire_incoming(Instant::now()))
+            .unwrap_or_default();
+        self.apply_clipboard(expired).await;
 
         // The circuit closes itself so a machine that slept through a bad minute is
         // retried: a breaker only the user can reset leaves the daemon degraded for ever
@@ -2655,8 +2661,14 @@ impl Session {
                 // The clipboard channel of this pair is bound to this connection id as its
                 // parent: the grant carries it, the bind echoes it, and closing the input link
                 // closes the channel (ADR-008, «Clipboard канал»).
-                self.on_clipboard_link_up(peer, connection_id, hello.text_clipboard, remote)
-                    .await;
+                self.on_clipboard_link_up(
+                    peer,
+                    connection_id,
+                    hello.text_clipboard,
+                    remote,
+                    hello.clipboard_epoch,
+                )
+                .await;
                 self.feed(fr::Input::Hello {
                     peer,
                     hello: fr::PeerHello {
@@ -2814,13 +2826,14 @@ impl Session {
                                 .contains(&(protocol::wire::Capability::ClipboardApplyAck as i32)),
                         );
                         tracing::info!(peer = %peer, text_clipboard, "peer capabilities updated");
-                        if let Some((connection_id, previous, remote_ip)) =
+                        if let Some((connection_id, previous, remote_ip, epoch)) =
                             self.clipboard_links.get_mut(&peer)
                         {
                             if *previous != text_clipboard {
                                 *previous = text_clipboard;
                                 let out = match self.clipboard.as_mut() {
                                     Some(clipboard) => {
+                                        clipboard.set_peer_session(peer, *connection_id, *epoch);
                                         clipboard
                                             .on_link_up(
                                                 peer,
@@ -2931,11 +2944,13 @@ impl Session {
         connection_id: [u8; 16],
         text_clipboard: bool,
         remote: std::net::SocketAddr,
+        epoch: Option<[u8; 16]>,
     ) {
         self.clipboard_links
-            .insert(peer, (connection_id, text_clipboard, remote.ip()));
+            .insert(peer, (connection_id, text_clipboard, remote.ip(), epoch));
         let out = match self.clipboard.as_mut() {
             Some(clipboard) => {
+                clipboard.set_peer_session(peer, connection_id, epoch);
                 clipboard
                     .on_link_up(peer, connection_id, text_clipboard, remote.ip())
                     .await
@@ -2954,6 +2969,22 @@ impl Session {
 
     /// One event from the clipboard runtime.
     async fn on_clipboard(&mut self, event: crate::clipboard::Inbound) {
+        let binding = match &event {
+            crate::clipboard::Inbound::Bound { peer, parent, .. }
+            | crate::clipboard::Inbound::Message { peer, parent, .. }
+            | crate::clipboard::Inbound::Down { peer, parent } => Some((peer, parent)),
+            crate::clipboard::Inbound::Sent { .. }
+            | crate::clipboard::Inbound::Failed { .. } => None,
+        };
+        if let Some((peer, parent)) = binding {
+            if !self
+                .clipboard_links
+                .get(peer)
+                .is_some_and(|link| link.0 == *parent)
+            {
+                return;
+            }
+        }
         match &event {
             crate::clipboard::Inbound::Sent {
                 peer,
@@ -2974,12 +3005,13 @@ impl Session {
                 version,
                 sha256,
                 detail,
+                ..
             } => {
                 self.finish_clipboard_send(*peer, *version, *sha256, false, detail.clone());
                 self.clipboard_delivery_failed(*peer, *version, *sha256, detail.clone())
                     .await;
             }
-            crate::clipboard::Inbound::Down { peer } => {
+            crate::clipboard::Inbound::Down { peer, .. } => {
                 self.clipboard_peer_down(*peer, "clipboard channel disconnected")
                     .await
             }
@@ -2999,14 +3031,14 @@ impl Session {
                     secret,
                 }]
             }
-            (Some(clipboard), crate::clipboard::Inbound::Bound { peer, channel_id }) => {
+            (Some(clipboard), crate::clipboard::Inbound::Bound { peer, channel_id, .. }) => {
                 tracing::info!(peer = %peer, "clipboard channel bound");
                 clipboard.on_bound(peer, channel_id).await
             }
-            (Some(clipboard), crate::clipboard::Inbound::Message { peer, message }) => {
-                clipboard.on_peer_message(peer, message).await
+            (Some(clipboard), crate::clipboard::Inbound::Message { peer, parent, message }) => {
+                clipboard.on_peer_message_from(peer, parent, message).await
             }
-            (Some(clipboard), crate::clipboard::Inbound::Down { peer }) => {
+            (Some(clipboard), crate::clipboard::Inbound::Down { peer, .. }) => {
                 clipboard.on_channel_down(peer).await;
                 Vec::new()
             }
