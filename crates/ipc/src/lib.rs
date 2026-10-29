@@ -86,7 +86,7 @@ pub mod watchdog;
 
 pub use error::IpcError;
 pub use framed::Framed;
-pub use link::{AgentLink, GuiLink};
+pub use link::{AgentLink, AgentSender, AgentSplit, GuiLink};
 pub use peer::{CredentialSource, PeerCheck, PeerCredentials, PeerRejected, SameUser};
 pub use watchdog::{Watchdog, DEFAULT_CORE_SILENCE_MS, MAX_CORE_SILENCE_MS, MIN_CORE_SILENCE_MS};
 

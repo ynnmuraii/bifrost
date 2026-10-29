@@ -2,6 +2,28 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## 0.3.3 — 2026-10-30
+
+### English
+
+**New**
+
+- PNG clipboard images have a separate opt-in on both computers, off by default, on Windows, X11 and KDE Wayland (data-control); GNOME Wayland remains unsupported. The default PNG limit is 16 MiB (configurable up to 32 MiB), with a separate default rate limit of 8 MiB/s. Linux passes PNG through unchanged, including large X11 INCR transfers; Windows converts DIB/DIBV5 and eagerly publishes PNG + alpha-preserving DIBV5. Text wins, secret markers are checked before image reads, and images never enter history. Windows decode dimensions and memory are bounded separately.
+
+**Fixes**
+
+- Clipboard assembly requires the exact offered byte count, and agent applies enforce the 1 MiB text cap independently of IPC chunk counts. Clipboard writes, preparation and native apply no longer hold up the input loop; stalled writes close their channel instead of reusing a partially written frame.
+
+### Русский
+
+**Новое**
+
+- PNG-изображения буфера включаются отдельной настройкой на обоих компьютерах, по умолчанию выключенной, на Windows, X11 и KDE Wayland (data-control); GNOME Wayland пока не поддерживается. Лимит PNG по умолчанию — 16 МиБ, настраивается до 32 МиБ; отдельная скорость по умолчанию — 8 МиБ/с. Linux передаёт PNG без преобразований, включая большие передачи X11 INCR; Windows преобразует DIB/DIBV5 и сразу публикует PNG и DIBV5 с альфа-каналом. Текст имеет приоритет, секретные маркеры проверяются до чтения изображения, изображения никогда не попадают в историю. Декодирование на Windows дополнительно ограничено по размерам и памяти.
+
+**Исправления**
+
+- Сборка буфера требует точного заявленного размера, а применение агентом ограничено 1 МиБ независимо от числа IPC-фрагментов. Запись, подготовка и применение буфера больше не задерживают цикл ввода; зависшая запись закрывает свой канал, не продолжая частично записанный кадр.
+
 ## 0.3.2 — 2026-10-29
 
 ### English

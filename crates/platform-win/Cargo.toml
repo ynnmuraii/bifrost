@@ -19,6 +19,7 @@ input-model = { path = "../input-model" }
 # target the crate compiles to the platform-neutral part only (tables, ledger,
 # injection plan) and pulls in no FFI at all.
 [target.'cfg(windows)'.dependencies]
+png = { version = "0.18", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

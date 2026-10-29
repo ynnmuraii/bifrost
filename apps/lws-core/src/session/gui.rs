@@ -38,7 +38,11 @@ const ANSWER_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl Session {
     /// Applies a retained item locally without offering it to another computer.
-    async fn copy_clipboard_history(&mut self, text: &str) -> ipc::OpResult {
+    async fn copy_clipboard_history(
+        &mut self,
+        payload: std::sync::Arc<Vec<u8>>,
+        sha256: [u8; 32],
+    ) -> ipc::OpResult {
         if !self.capabilities.text_clipboard
             || self.agent.state() != crate::command::AgentState::Ready
         {
@@ -48,20 +52,29 @@ impl Session {
             };
         }
         let actions = match self.clipboard.as_mut() {
-            Some(clipboard) => clipboard.history_to_agent(text),
+            Some(clipboard) => clipboard.history_to_agent(payload, sha256),
             None => {
                 let source = self
                     .clipboard_source
                     .get_or_insert_with(|| clipboard::Source::new(*self.node_id.as_bytes()));
-                crate::clipboard::history_to_agent(source, text)
+                crate::clipboard::history_to_agent(source, payload, sha256)
             }
         };
         for action in actions {
             match action {
-                crate::clipboard::Out::Agent(mut frame) => {
-                    self.prepare_clipboard_agent_frame(&mut frame);
-                    if let Err(error) = self.agent.send(frame).await {
-                        tracing::warn!(%error, "cannot apply clipboard history to the agent");
+                crate::clipboard::Out::AgentPayload {
+                    version,
+                    payload,
+                    sha256,
+                    kind,
+                    reservation,
+                } => {
+                    let sequence = self.clipboard_payload_sequence(version);
+                    if let Err(error) =
+                        self.agent
+                            .send_clipboard(sequence, payload, sha256, kind, reservation)
+                    {
+                        tracing::warn!(%error, "cannot queue clipboard history for the agent");
                         self.on_agent_lost().await;
                         return ipc::OpResult {
                             ok: false,
@@ -118,6 +131,40 @@ impl Session {
                 .is_some_and(|item| item.origin == self.node_id)
         {
             self.clipboard_cleared().await;
+        }
+        ok()
+    }
+
+    /// Persists `[clipboard].images` and applies it to the running clipboard runtime.
+    ///
+    /// The flag is policy, not capability: a computer without a PNG backend may keep it on so
+    /// that accepting images becomes possible once support arrives. Live retirement of
+    /// in-flight PNG work belongs to the runtime (`Clipboard::set_images`).
+    async fn set_clipboard_images(&mut self, enabled: bool) -> ipc::OpResult {
+        let path = self.paths.config_file();
+        let saved = tokio::task::spawn_blocking(move || {
+            config::lock::update_locked(&path, |config| config.clipboard.images = enabled)
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            return ipc::OpResult {
+                ok: false,
+                error_code: "CONFIG_SAVE_FAILED".into(),
+            };
+        }
+        self.clipboard_settings.policy.images = enabled;
+        if let Some(endpoint) = self.clipboard.as_mut() {
+            let out = Box::pin(endpoint.set_images(enabled)).await;
+            Box::pin(self.apply_clipboard(out)).await;
+        } else if !enabled {
+            if let Err(error) = self.retire_clipboard_images().await {
+                tracing::warn!(%error, "cannot revoke image clipboard apply");
+                self.on_agent_lost().await;
+                return ipc::OpResult {
+                    ok: false,
+                    error_code: "AGENT_UNAVAILABLE".to_owned(),
+                };
+            }
         }
         ok()
     }
@@ -219,6 +266,8 @@ impl Session {
                 .is_some_and(crate::clipboard::Clipboard::is_enabled),
             clipboard_policy: self.clipboard_settings.routing_policy.as_str().to_owned(),
             clipboard_settle_ms: self.clipboard_settings.settle_ms,
+            clipboard_images: self.clipboard_settings.policy.images,
+            clipboard_images_supported: self.capabilities.image_clipboard,
             emergency_hotkey: self.emergency_hotkey.clone(),
             hotkeys: self.hotkey_status.clone(),
             rtt_p95_us: rtt.p95_us,
@@ -701,7 +750,15 @@ impl Session {
                 self.shutdown_agent().await;
             }
             Msg::SetClipboard(set) => {
-                let result = self.set_clipboard(set.enabled).await;
+                // Boxed for the same reason as the dispatcher itself: starting the runtime and
+                // applying its first actions is the largest future here, and inlining it makes
+                // the core's debug poll frame overflow its main-thread stack.
+                let result = Box::pin(self.set_clipboard(set.enabled)).await;
+                answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::SetClipboardImages(set) => {
+                // Image revocation is deep: keep it behind its own allocation as well.
+                let result = Box::pin(self.set_clipboard_images(set.enabled)).await;
                 answer(&out, request_id, Msg::OpResult(result)).await;
             }
             Msg::SetClipboardPolicy(set) => {
@@ -765,8 +822,11 @@ impl Session {
                     return;
                 };
                 if get.copy_to_local {
-                    let text = text.to_owned();
-                    let result = self.copy_clipboard_history(&text).await;
+                    let (payload, sha256) = self
+                        .clipboard_history
+                        .prepared(get.id)
+                        .expect("the retained history item was checked above");
+                    let result = self.copy_clipboard_history(payload, sha256).await;
                     answer(&out, request_id, Msg::OpResult(result)).await;
                 } else {
                     let text = text.to_owned();
@@ -1320,18 +1380,28 @@ impl Session {
             if let Some(source) = self.clipboard_source.take() {
                 clipboard.restore_source(source);
             }
-            let mut out = Vec::new();
-            for (&peer, &(connection, supported, address, epoch)) in &self.clipboard_links {
+            let mut out = clipboard
+                .set_local_image_support(self.capabilities.image_clipboard)
+                .await;
+            for (&peer, &(connection, supported, image_supported, address, epoch)) in
+                &self.clipboard_links
+            {
                 clipboard.set_peer_session(peer, connection, epoch);
                 out.extend(
                     clipboard
                         .on_link_up(peer, connection, supported, address)
                         .await,
                 );
+                out.extend(
+                    clipboard
+                        .set_peer_image_support(peer, image_supported)
+                        .await,
+                );
             }
             self.clipboard_events = events;
             self.clipboard = Some(clipboard);
-            self.apply_clipboard(out).await;
+            // Do not embed the deep cancellation/agent-loss future in this lifecycle frame.
+            Box::pin(self.apply_clipboard(out)).await;
         } else if !enabled {
             if let Some(clipboard) = self.clipboard.take() {
                 self.clipboard_source = Some(clipboard.stop().await);

@@ -202,6 +202,19 @@ async fn wait_for_event(
 /// 1. A 300 KiB payload round-trips through `Outgoing` and `clipboard::Assembler`, chunked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfer_round_trips_in_chunks() {
+    transfer_round_trip(clipboard::ContentKind::Text, 300 * 1024).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_maximum_png_round_trips_in_2048_chunks() {
+    transfer_round_trip(
+        clipboard::ContentKind::Png,
+        clipboard::MAX_IMAGE_BYTES as usize,
+    )
+    .await;
+}
+
+async fn transfer_round_trip(kind: clipboard::ContentKind, size: usize) {
     let root = temp_root("roundtrip");
     let server = Arc::new(identity_at(&root, "server"));
     let client = identity_at(&root, "client");
@@ -217,7 +230,10 @@ async fn a_transfer_round_trips_in_chunks() {
     let parent = [9u8; 16];
     let channel_id = [4u8; 16];
     let token = [5u8; 32];
-    let payload = payload_of(300 * 1024);
+    let mut payload = payload_of(size);
+    if kind == clipboard::ContentKind::Png {
+        payload[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    }
     let expected_sha = clipboard::sha256(&payload);
     let payload_len = payload.len() as u64;
     let origin = *client.node_id().as_bytes();
@@ -261,7 +277,7 @@ async fn a_transfer_round_trips_in_chunks() {
                 offer_id,
                 origin_node_id: origin,
                 origin_version: 1,
-                mime: clipboard::MIME.to_owned(),
+                mime: kind.mime().to_owned(),
                 size_bytes: payload_len,
                 secret_marked: true,
                 sender_epoch: Vec::new(),
@@ -276,7 +292,7 @@ async fn a_transfer_round_trips_in_chunks() {
             other => panic!("unexpected message before Request: {other:?}"),
         }
         let mut outgoing =
-            Outgoing::new(offer_id, payload, 1 << 40, payload_len, 0).expect("outgoing");
+            Outgoing::new(offer_id, payload, kind, 1 << 40, payload_len, 0).expect("outgoing");
         let mut largest_chunk = 0usize;
         while let Some((message, _delay)) = outgoing.next(0) {
             if let ClipboardMessage::Data { data, .. } = &message {
@@ -289,7 +305,8 @@ async fn a_transfer_round_trips_in_chunks() {
     });
 
     let receiver = tokio::spawn(async move {
-        let mut assembler = clipboard::Assembler::new(offer_id, payload_len).expect("assembler");
+        let mut assembler =
+            clipboard::Assembler::new(offer_id, payload_len, kind).expect("assembler");
         loop {
             match server_conn.recv().await.expect("clipboard recv") {
                 ClipboardMessage::Offer {
@@ -299,7 +316,7 @@ async fn a_transfer_round_trips_in_chunks() {
                     ..
                 } => {
                     assert_eq!(size_bytes, payload_len);
-                    assert_eq!(mime, clipboard::MIME);
+                    assert_eq!(mime, kind.mime());
                     assert!(secret_marked, "secret classification survives the wire");
                     server_conn
                         .send(ClipboardMessage::Request { offer_id })
@@ -312,6 +329,7 @@ async fn a_transfer_round_trips_in_chunks() {
                     chunk_count,
                     data,
                 } => {
+                    assert_eq!(chunk_count as usize, size.div_ceil(clipboard::CHUNK_BYTES));
                     assert_eq!(got, offer_id);
                     assert!(
                         data.len() <= 16384,
@@ -387,7 +405,7 @@ fn every_limit_is_refused() {
     let bad_count = ClipboardMessage::Data {
         offer_id: id,
         chunk_index: 0,
-        chunk_count: 65,
+        chunk_count: 2049,
         data: vec![0u8; 8],
     };
     assert_eq!(bad_count.validate(), Err(ClipboardViolation::BadCount));
@@ -443,11 +461,27 @@ fn every_limit_is_refused() {
 
     // `Outgoing::new` refuses more than the configured `max_bytes`, and more than 1 MiB.
     assert_eq!(
-        Outgoing::new(id, vec![0u8; 100], 1 << 20, 99, 0).err(),
+        Outgoing::new(
+            id,
+            vec![0u8; 100],
+            clipboard::ContentKind::Text,
+            1 << 20,
+            99,
+            0
+        )
+        .err(),
         Some(ClipboardViolation::TooLarge)
     );
     assert_eq!(
-        Outgoing::new(id, vec![0u8; 1024 * 1024 + 1], 1 << 20, u64::MAX, 0).err(),
+        Outgoing::new(
+            id,
+            vec![0u8; 1024 * 1024 + 1],
+            clipboard::ContentKind::Text,
+            1 << 20,
+            u64::MAX,
+            0
+        )
+        .err(),
         Some(ClipboardViolation::TooLarge)
     );
 }
@@ -662,7 +696,9 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
 
     // The receiver: assemble 1 MiB while the sender paces it.
     let receiver = tokio::spawn(async move {
-        let mut assembler = clipboard::Assembler::new(offer_id, payload_len).expect("assembler");
+        let mut assembler =
+            clipboard::Assembler::new(offer_id, payload_len, clipboard::ContentKind::Text)
+                .expect("assembler");
         loop {
             match server_conn.recv().await.expect("clipboard recv") {
                 ClipboardMessage::Data {
@@ -685,8 +721,15 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
 
     // 512 KiB/s: the bucket starts full, so ~1 MiB takes about a second.
     let sender = tokio::spawn(async move {
-        let mut outgoing =
-            Outgoing::new(offer_id, payload, 512 * 1024, u64::MAX, 0).expect("outgoing");
+        let mut outgoing = Outgoing::new(
+            offer_id,
+            payload,
+            clipboard::ContentKind::Text,
+            512 * 1024,
+            u64::MAX,
+            0,
+        )
+        .expect("outgoing");
         let start = Instant::now();
         loop {
             let now_ms = start.elapsed().as_millis() as u64;

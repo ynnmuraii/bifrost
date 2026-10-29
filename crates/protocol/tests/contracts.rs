@@ -603,6 +603,7 @@ fn input_and_clipboard_limits_cover_both_sides_of_each_boundary() {
     for got in [0, 1048576, 1048577] {
         assert_eq!(
             validate::clipboard_offer(&wire::ClipboardOffer {
+                mime: "text/plain;charset=utf-8".into(),
                 size_bytes: got,
                 ..Default::default()
             }),
@@ -613,14 +614,14 @@ fn input_and_clipboard_limits_cover_both_sides_of_each_boundary() {
             }
         );
     }
-    for count in [0, 1, 64, 65] {
+    for count in [0, 1, 64, 65, 2048, 2049] {
         let data = wire::ClipboardData {
             chunk_count: count,
             ..Default::default()
         };
         assert_eq!(
             validate::clipboard_data(&data),
-            if (1..=64).contains(&count) {
+            if (1..=2048).contains(&count) {
                 Ok(())
             } else {
                 Err(Violation::ClipboardChunkCount { got: count })
@@ -943,6 +944,37 @@ fn update_ipc_fields_are_append_only_and_round_trip() {
 }
 
 #[test]
+fn clipboard_images_gui_fields_are_append_only_and_round_trip() {
+    use ipc::gui_frame::Msg;
+    use prost::Message;
+
+    let images = ipc::SetClipboardImages { enabled: true };
+    assert_eq!(images.encode_to_vec(), [8, 1]);
+    let frame = ipc::GuiFrame {
+        seq: 1,
+        msg: Some(Msg::SetClipboardImages(images)),
+        ..Default::default()
+    };
+    let bytes = frame.encode_to_vec();
+    // GuiFrame field 60, containing SetClipboardImages.enabled at field 1.
+    assert_eq!(&bytes[..3], &[0x08, 0x01, 0xe2]);
+    assert_eq!(ipc::GuiFrame::decode(bytes.as_slice()).unwrap(), frame);
+    round_trip(Channel::Ipc, frame);
+
+    let status = ipc::Status {
+        clipboard_images: true,
+        clipboard_images_supported: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        status.encode_to_vec(),
+        [0xf8, 0x02, 1, 0x80, 0x03, 1],
+        "Status.clipboard_images = 47, clipboard_images_supported = 48"
+    );
+    round_trip(Channel::Ipc, status);
+}
+
+#[test]
 fn clipboard_routing_schema_tags_and_roundtrips_are_append_only() {
     use ipc::gui_frame::Msg;
     use prost::Message;
@@ -1044,4 +1076,109 @@ fn locally_copied_history_direction_is_append_only_and_round_trips() {
     };
     assert_eq!(entry.encode_to_vec(), [16, 3]);
     round_trip(Channel::Ipc, entry);
+}
+
+#[test]
+fn image_schema_is_append_only_and_old_ipc_defaults_are_unambiguous() {
+    use prost::Message;
+    assert_eq!(wire::Capability::TextClipboard as i32, 5);
+    assert_eq!(wire::Capability::ClipboardSession as i32, 14);
+    assert_eq!(wire::Capability::ClipboardImage as i32, 15);
+    assert_eq!(protocol::limits::PROTOCOL_MINOR, 3);
+    let old_set = [8, 1, 24, 1, 34, 1, b'x', 42, 1, 7];
+    let set = ipc::SetClipboardText::decode(old_set.as_slice()).expect("old Set");
+    assert!(set.mime.is_empty());
+    assert_eq!(set.size_bytes, None);
+    assert_eq!(set.encode_to_vec(), old_set);
+    let old_changed = [8, 1, 24, 1, 34, 1, b'x', 40, 1, 58, 1, 7];
+    let changed = ipc::ClipboardChanged::decode(old_changed.as_slice()).expect("old Changed");
+    assert!(changed.mime.is_empty());
+    assert_eq!(changed.encode_to_vec(), old_changed);
+    let set = ipc::SetClipboardText {
+        mime: "image/png".into(),
+        size_bytes: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(
+        set.encode_to_vec(),
+        [50, 9, b'i', b'm', b'a', b'g', b'e', b'/', b'p', b'n', b'g', 56, 0]
+    );
+    let changed = ipc::ClipboardChanged {
+        mime: "image/png".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        changed.encode_to_vec(),
+        [66, 9, b'i', b'm', b'a', b'g', b'e', b'/', b'p', b'n', b'g']
+    );
+    for (msg, tag) in [
+        (ipc::agent_frame::Msg::SetClipboardText(set), [0xba, 0x01]),
+        (
+            ipc::agent_frame::Msg::ClipboardChanged(changed),
+            [0xb2, 0x03],
+        ),
+    ] {
+        let frame = ipc::AgentFrame {
+            msg: Some(msg),
+            ..Default::default()
+        };
+        assert_eq!(&frame.encode_to_vec()[..2], &tag);
+        round_trip(Channel::Ipc, frame);
+    }
+    let offer = wire::ClipboardOffer {
+        offer_id: vec![1],
+        origin_node_id: vec![2],
+        origin_version: 3,
+        mime: "image/png".into(),
+        size_bytes: 8,
+        secret_marked: true,
+        sender_epoch: vec![4],
+        relayed: true,
+    };
+    assert_eq!(
+        offer.encode_to_vec(),
+        [
+            10, 1, 1, 18, 1, 2, 24, 3, 34, 9, b'i', b'm', b'a', b'g', b'e', b'/', b'p', b'n', b'g',
+            40, 8, 56, 1, 66, 1, 4, 72, 1,
+        ]
+    );
+}
+
+#[test]
+fn offer_limits_follow_exact_mime_and_not_the_stateless_chunk_ceiling() {
+    for (mime, max) in [
+        ("text/plain;charset=utf-8", 1_048_576),
+        ("image/png", 33_554_432),
+    ] {
+        for size in [0, max, max + 1] {
+            let result = validate::clipboard_offer(&wire::ClipboardOffer {
+                mime: mime.into(),
+                size_bytes: size,
+                ..Default::default()
+            });
+            assert_eq!(
+                result,
+                if size <= max {
+                    Ok(())
+                } else {
+                    Err(Violation::ClipboardPayloadTooLarge { got: size })
+                }
+            );
+        }
+    }
+    for mime in [
+        "",
+        "image/jpeg",
+        "Image/png",
+        "image/png;charset=utf-8",
+        "text/plain",
+    ] {
+        assert_eq!(
+            validate::clipboard_offer(&wire::ClipboardOffer {
+                mime: mime.into(),
+                ..Default::default()
+            }),
+            Err(Violation::ClipboardMime)
+        );
+    }
 }

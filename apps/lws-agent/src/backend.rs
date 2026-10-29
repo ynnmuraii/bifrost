@@ -19,6 +19,7 @@ use clipboard::Marker;
 use input_model::{CaptureKind, HidKey, InputEvent, MouseButton, Position};
 use platform_probe::{BackendOverride, EnvSnapshot, SessionInfo};
 use protocol::ipc;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -77,13 +78,26 @@ pub struct Ready {
     pub backend: ipc::BackendInfo,
 }
 
+/// Text-only adapters reject images rather than reinterpreting their bytes as text.
+fn text_clipboard_content(
+    content: Option<clipboard::ClipboardContent>,
+) -> Result<Option<String>, String> {
+    match content {
+        None => Ok(None),
+        Some(clipboard::ClipboardContent::Text(text)) => Ok(Some(text)),
+        Some(clipboard::ClipboardContent::Image { .. }) => {
+            Err("CLIPBOARD_UNSUPPORTED: this backend does not support PNG".to_owned())
+        }
+    }
+}
+
 /// A local clipboard change the user made (KVM-041/043, ADR-008).
 ///
 /// Nothing here is logged: sizes and marker names only, never the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardChange {
-    /// The text now on the local CLIPBOARD selection.
-    pub text: String,
+    /// The content now on the local CLIPBOARD selection.
+    pub content: clipboard::ClipboardContent,
     /// The secret markers the platform reported for it. The decision whether it may leave
     /// the machine belongs to `clipboard::policy` on core's side of the link; the agent only
     /// reports what it saw.
@@ -340,6 +354,13 @@ impl Ready {
         }
     }
 
+    pub(crate) fn set_image_clipboard(&mut self, available: bool) {
+        self.capabilities.retain(|name| name != "CLIPBOARD_IMAGE");
+        if available {
+            self.capabilities.push("CLIPBOARD_IMAGE".to_owned());
+        }
+    }
+
     /// The same report with no capability claimed, for a session this build cannot
     /// drive.
     fn degraded(reason: &str, platform: &str, session_kind: &str) -> Self {
@@ -493,6 +514,10 @@ pub struct Dry {
     /// The clipboard, when `--dry-clipboard-dir` named one. `None` is a dry agent with no
     /// clipboard at all, which is what it reports.
     clipboard: Option<DryClipboard>,
+    #[cfg(test)]
+    pub(crate) clipboard_apply_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    pub(crate) clipboard_apply_started: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// The `--dry-clipboard-dir` hook: a clipboard made of files.
@@ -663,7 +688,10 @@ impl DryClipboard {
         // markers core already knows).
         let markers = read_markers(&self.markers_path);
         self.write_out();
-        Some(ClipboardChange { text, markers })
+        Some(ClipboardChange {
+            content: clipboard::ClipboardContent::Text(text),
+            markers,
+        })
     }
 }
 
@@ -716,6 +744,7 @@ impl Dry {
         let clipboard = clipboard_dir.map(DryClipboard::new);
         let mut ready = ready;
         ready.set_text_clipboard(clipboard.is_some());
+        ready.set_image_clipboard(false);
         Dry {
             ready,
             scheduled,
@@ -734,6 +763,10 @@ impl Dry {
             hotkey_file: std::env::var_os("LWS_DRY_HOTKEY_FILE").map(PathBuf::from),
             hotkeys: config::HotkeyBindings::default(),
             clipboard,
+            #[cfg(test)]
+            clipboard_apply_gate: None,
+            #[cfg(test)]
+            clipboard_apply_started: None,
             dry_displays,
         }
     }
@@ -861,6 +894,7 @@ impl Dry {
     /// Only `out.txt` is written — `in.txt` (and `in.markers`) belong to the outside world, and
     /// that is exactly what makes "core applied this" and "the user copied this" two different
     /// observations of the same directory.
+    #[cfg(test)]
     fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
         let Some(clipboard) = self.clipboard.as_mut() else {
             return Err("CLIPBOARD_DISABLED: this dry agent has no --dry-clipboard-dir".to_owned());
@@ -886,6 +920,20 @@ impl Dry {
         );
         Ok(())
     }
+}
+
+/// A clipboard-only operation: never borrows the input backend or the IPC link.
+pub type ClipboardApplyJob =
+    std::pin::Pin<Box<dyn Future<Output = Result<ClipboardApplyReceipt, String>> + Send>>;
+
+pub enum ClipboardApplyReceipt {
+    Dry(Option<String>, String),
+    #[cfg(windows)]
+    Win(u32),
+    #[cfg(target_os = "linux")]
+    X11(Option<u64>),
+    #[cfg(target_os = "linux")]
+    Wayland,
 }
 
 impl Backend {
@@ -1062,8 +1110,19 @@ impl Backend {
             Backend::Win(backend) => backend.clipboard_available(),
             #[cfg(target_os = "linux")]
             Backend::X11(backend) => backend.clipboard_available(),
-            // `platform-wayland` answers for itself: the portal clipboard is not implemented
-            // in this build, so a Wayland session reports no clipboard (KVM-041).
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.clipboard_available(),
+        }
+    }
+
+    /// Native adapters carry PNG whenever their clipboard backend is live.
+    pub fn image_clipboard_available(&self) -> bool {
+        match self {
+            #[cfg(windows)]
+            Backend::Win(backend) => backend.clipboard_available(),
+            Backend::Dry(_) => false,
+            #[cfg(target_os = "linux")]
+            Backend::X11(backend) => backend.clipboard_available(),
             #[cfg(target_os = "linux")]
             Backend::Wayland(backend) => backend.clipboard_available(),
         }
@@ -1089,25 +1148,78 @@ impl Backend {
             #[cfg(windows)]
             Backend::Win(backend) => backend.clipboard_change().await,
             #[cfg(target_os = "linux")]
-            Backend::X11(backend) => Ok(backend.clipboard_change().await),
+            Backend::X11(backend) => backend.clipboard_change().await,
             #[cfg(target_os = "linux")]
-            Backend::Wayland(backend) => Ok(backend.clipboard_change().await),
+            Backend::Wayland(backend) => backend.clipboard_change().await,
         }
     }
 
-    /// Owns the local selection and puts `text` on it; `None` releases it and forgets the
-    /// text.
+    /// Owns the local selection and puts verified content on it; `None` releases it.
     ///
     /// The error text is for the `AgentError.detail` of the frame core gets, never a payload.
-    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+    pub fn begin_set_clipboard(
+        &mut self,
+        content: Option<clipboard::ClipboardContent>,
+    ) -> Result<ClipboardApplyJob, String> {
         match self {
-            Backend::Dry(dry) => dry.set_clipboard(text),
+            Backend::Dry(dry) => {
+                let text = text_clipboard_content(content)?;
+                let clipboard = dry.clipboard.as_ref().ok_or_else(|| {
+                    "CLIPBOARD_DISABLED: this dry agent has no --dry-clipboard-dir".to_owned()
+                })?;
+                let path = clipboard.out_path.clone();
+                #[cfg(test)]
+                let gate = dry.clipboard_apply_gate.take();
+                #[cfg(test)]
+                let started = dry.clipboard_apply_started.take();
+                Ok(Box::pin(async move {
+                    #[cfg(test)]
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                    tokio::task::spawn_blocking(move || {
+                        std::fs::write(path, text.as_deref().unwrap_or_default())
+                            .map_err(|error| format!("cannot write dry clipboard: {error}"))?;
+                        let selection = text.as_deref().unwrap_or_default().to_owned();
+                        Ok(ClipboardApplyReceipt::Dry(text, selection))
+                    })
+                    .await
+                    .map_err(|_| "CLIPBOARD_APPLY_FAILED: clipboard worker failed".to_owned())?
+                }))
+            }
             #[cfg(windows)]
-            Backend::Win(backend) => backend.set_clipboard(text).await,
+            Backend::Win(backend) => backend.begin_set_clipboard(content),
             #[cfg(target_os = "linux")]
-            Backend::X11(backend) => backend.set_clipboard(text).await,
+            Backend::X11(backend) => backend.begin_set_clipboard(content),
             #[cfg(target_os = "linux")]
-            Backend::Wayland(backend) => backend.set_clipboard(text).await,
+            Backend::Wayland(backend) => backend.begin_set_clipboard(content),
+        }
+    }
+
+    /// Even stale writes need their echo receipt installed before polling local changes.
+    pub fn complete_clipboard_apply(&mut self, receipt: ClipboardApplyReceipt) {
+        match (self, receipt) {
+            (Backend::Dry(dry), ClipboardApplyReceipt::Dry(text, selection)) => {
+                if let Some(clipboard) = dry.clipboard.as_mut() {
+                    clipboard.text = selection;
+                    clipboard.applied = text;
+                }
+            }
+            #[cfg(windows)]
+            (Backend::Win(backend), ClipboardApplyReceipt::Win(sequence)) => {
+                backend.complete_clipboard_apply(sequence);
+            }
+            #[cfg(target_os = "linux")]
+            (Backend::X11(backend), ClipboardApplyReceipt::X11(hash)) => {
+                backend.complete_clipboard_apply(hash);
+            }
+            #[cfg(target_os = "linux")]
+            (Backend::Wayland(_), ClipboardApplyReceipt::Wayland) => {}
+            _ => unreachable!("clipboard receipt belongs to its originating backend"),
         }
     }
 
@@ -1992,7 +2104,7 @@ mod tests {
         write(&in_path, "copied by the user");
         wait_for_poll();
         let change = dry.clipboard_change().expect("a local copy");
-        assert_eq!(change.text, "copied by the user");
+        assert_eq!(change.content.as_bytes(), b"copied by the user");
         assert!(change.markers.is_empty());
         assert_eq!(read(&out_path), "copied by the user");
 
@@ -2015,8 +2127,9 @@ mod tests {
             clipboard
                 .poll_at(boundary)
                 .expect("copy at interval boundary")
-                .text,
-            "another copy"
+                .content
+                .as_bytes(),
+            b"another copy"
         );
         assert!(clipboard.poll_at(boundary).is_none());
     }
@@ -2034,7 +2147,7 @@ mod tests {
         write(&markers_path, "kde_secret\n");
         wait_for_poll();
         let change = dry.clipboard_change().expect("a marked copy");
-        assert_eq!(change.text, "secret");
+        assert_eq!(change.content.as_bytes(), b"secret");
         assert_eq!(change.markers, vec![Marker::KdeSecret]);
 
         // Separators may be commas, spaces or newlines, an unknown name is ignored, and a
@@ -2125,6 +2238,52 @@ mod tests {
         assert!(
             ready.capabilities.contains(&"CAPTURE".to_owned()),
             "no other capability is touched"
+        );
+    }
+
+    #[test]
+    fn image_capability_tracks_support_and_dry_never_claims_it() {
+        let mut ready = Ready::degraded("test", "platform-test", "windows");
+        ready.capabilities.push("CAPTURE".to_owned());
+        ready.set_image_clipboard(true);
+        ready.set_image_clipboard(true);
+        assert_eq!(
+            ready
+                .capabilities
+                .iter()
+                .filter(|name| *name == "CLIPBOARD_IMAGE")
+                .count(),
+            1
+        );
+        ready.set_image_clipboard(false);
+        assert!(!ready
+            .capabilities
+            .iter()
+            .any(|name| name == "CLIPBOARD_IMAGE"));
+        assert!(ready.capabilities.iter().any(|name| name == "CAPTURE"));
+        ready.set_image_clipboard(true);
+        let dry = Dry::new(ready, 0, false, None, false);
+        assert!(!dry
+            .ready
+            .capabilities
+            .iter()
+            .any(|name| name == "CLIPBOARD_IMAGE"));
+        assert!(!Backend::Dry(Box::new(dry)).image_clipboard_available());
+    }
+
+    #[test]
+    fn text_only_adapter_rejects_images_and_change_debug_is_payload_free() {
+        let content = clipboard::ClipboardContent::Image {
+            png: b"\x89PNG\r\n\x1a\nprivate image".to_vec(),
+        };
+        let change = ClipboardChange {
+            content,
+            markers: Vec::new(),
+        };
+        assert!(!format!("{change:?}").contains("private"));
+        assert_eq!(
+            text_clipboard_content(Some(change.content)).unwrap_err(),
+            "CLIPBOARD_UNSUPPORTED: this backend does not support PNG",
         );
     }
 

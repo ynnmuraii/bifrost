@@ -16,7 +16,7 @@ Bifrost is a software KVM: share one keyboard, mouse and text clipboard across W
 - Live RTT p95 and jitter on the status screen, with latency pills on the monitor map.
 - A freely arranged monitor map, edge links across gaps and an animated ASCII bridge.
 - Edge glow to show where input is going.
-- Shared **text** clipboard with history, follow-cursor/broadcast policies and **Send to…** (opt-in; no files or images).
+- Shared **text** clipboard with history, follow-cursor/broadcast policies and **Send to…**; separately opt-in **PNG images on Windows, X11 and KDE Wayland (data-control)** (images are never kept in history; no files).
 - Game mode guards against accidental edge switches in fullscreen apps; manual mode is available on Wayland.
 - Configurable switching hotkeys and an emergency release shortcut.
 - Russian and English, light and dark themes.
@@ -30,7 +30,7 @@ The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–10
 
 ## Download & install
 
-Get **0.3.2** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
+Get **0.3.3** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
 
 Versions from **0.1.4** can update from **Settings** or the startup update notice. The app checks for newer stable releases shortly after startup; turn this off in **Settings → Check on startup**, or check manually next to the version. Updates keep a binary backup and ask before restarting all roles; your configuration and pairing are preserved. System-wide, non-writable installations must be updated manually.
 
@@ -40,7 +40,7 @@ Versions from **0.1.4** can update from **Settings** or the startup update notic
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.3.2-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.3.3-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902 + UDP 47902 (discovery)** (multicast `239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
@@ -48,10 +48,10 @@ Settings are created automatically in `%APPDATA%\lan-workspace`; logs go to `%LO
 
 ### Linux · x86_64
 
-Download **`bifrost-0.3.2-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.3.3-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.3.2-linux-x86_64.tar.gz
+tar -xzf bifrost-0.3.3-linux-x86_64.tar.gz
 ./install.sh
 ```
 
@@ -79,6 +79,8 @@ Existing settings and pairing stay in the `lan-workspace` directories when updat
 
 For routed input, capable peers acknowledge application before the first press is released (up to 150 ms). Native local input is never held: observed key/button presses or the dwell trigger delivery, and an explicit return to local triggers it immediately. Wayland may not expose local key presses, so an automatic return there uses the dwell. Pasting locally before the transfer completes can still paste the previous clipboard, especially with large text.
 
+**Clipboard images:** supported on Windows, X11 and KDE Wayland with data-control; GNOME Wayland remains unsupported. Enable clipboard sharing and its separate image option on both computers (`clipboard.images`, off by default). Linux passes PNG through unchanged; Windows converts DIB images locally and publishes PNG + DIBV5 on apply. Text wins when an item also contains text, and secret-marked images are refused before image reads. The default PNG limit is 16 MiB (configurable up to 32 MiB), with a separate default rate of 8 MiB/s. Images follow the same destination policy but never enter history. Windows native decode is bounded to 16384 pixels per axis and 128 MiB of RGBA; additional APNG frames are rejected there.
+
 **Discovery and privacy:** discovery and advertising are on by default (`[discovery] enabled = true`, `advertise = true`). Settings lets you turn discovery off; set `advertise = false` in `config.toml` to search without announcing this computer. Names, node IDs, OS metadata, listen ports and pairing availability are visible to other computers on the selected LAN, not encrypted or proof of trust. No secrets, pairing codes, keystrokes or clipboard content are advertised. Pairing still requires matching codes on both computers; changed addresses are used for trusted peers only after pinned mTLS verifies the expected identity, never to replace a live link.
 
 Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited to selected LAN adapters; VPN adapters are used only when explicitly selected. Wi-Fi multicast filtering, guest/client isolation or separate VLANs may hide computers. **Enter the address manually** if the list is empty; TCP connectivity is still required, so manual entry cannot bypass network isolation.
@@ -99,7 +101,7 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 - The Windows executable has no Authenticode signature and may trigger SmartScreen; release checksums have a separate Ed25519 signature. Linux desktops may need explicit portal approval.
 - Wayland shows a desktop-portal permission dialog on first use. Support depends on your compositor and portal backend.
 - The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
-- Clipboard sharing is text-only and is off by default.
+- Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
 
 ## Build from source
 

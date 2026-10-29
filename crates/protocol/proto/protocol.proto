@@ -82,6 +82,7 @@ enum Capability {
   CAPABILITY_CLIPBOARD_APPLY_ACK = 12;
   CAPABILITY_UNPAIR_NOTICE = 13;
   CAPABILITY_CLIPBOARD_SESSION = 14;
+  CAPABILITY_CLIPBOARD_IMAGE = 15;
 }
 
 enum SessionKind {
@@ -356,8 +357,8 @@ message ClipboardOffer {
   bytes offer_id = 1;          // random16
   bytes origin_node_id = 2;    // 32 bytes
   uint64 origin_version = 3;
-  string mime = 4;             // text/plain;charset=utf-8
-  uint64 size_bytes = 5;       // <= 1048576
+  string mime = 4;             // exact text/plain;charset=utf-8 or image/png (capability 15)
+  uint64 size_bytes = 5;       // text <= 1048576; PNG <= 33554432
   reserved 6; reserved "sha256"; // hash moved to ClipboardComplete
   bool secret_marked = 7;     // never retain this transfer in clipboard history
   bytes sender_epoch = 8;     // authenticated sender's Hello.clipboard_epoch, capability gated
@@ -367,7 +368,7 @@ message ClipboardRequest { bytes offer_id = 1; }
 message ClipboardData {
   bytes offer_id = 1;
   uint32 chunk_index = 2;      // zero-based
-  uint32 chunk_count = 3;      // 1..64
+  uint32 chunk_count = 3;      // text 1..64; PNG 1..2048, fixed by accepted offer
   bytes data = 4;              // <= 16384 bytes
 }
 message ClipboardComplete { bytes offer_id = 1; bytes sha256 = 2; }

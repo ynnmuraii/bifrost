@@ -525,3 +525,30 @@ fn clipboard_routing_defaults_clamps_and_roundtrips() {
     }
     assert!(Config::from_str(&format!("{VALID}[clipboard]\npolicy = \"unknown\"\n")).is_err());
 }
+
+#[test]
+fn image_clipboard_config_defaults_roundtrip_and_boundaries() {
+    let old = parse(VALID);
+    assert!(!old.clipboard.images);
+    assert_eq!(old.clipboard.max_image_bytes, 16_777_216);
+    assert_eq!(old.clipboard.image_rate_bytes_per_s, 8_388_608);
+    let saved = toml::to_string(&old).expect("serialize old config");
+    let restored = parse(&saved);
+    assert_eq!(restored.clipboard, old.clipboard);
+    for cap in [0, 16_777_216, 33_554_432] {
+        accept(&format!(
+            "[clipboard]\nimages = true\nmax_image_bytes = {cap}\nimage_rate_bytes_per_s = 1\n"
+        ));
+    }
+    let error = reject("[clipboard]\nmax_image_bytes = 33554433\n");
+    assert_eq!(key_of(&error), "clipboard.max_image_bytes");
+    assert_eq!(code_of(&error), Some(ErrorCode::Clipboard));
+    let error = reject("[clipboard]\nimage_rate_bytes_per_s = 0\n");
+    assert_eq!(key_of(&error), "clipboard.image_rate_bytes_per_s");
+    let configured = parse(&format!("{VALID}[clipboard]\nenabled = false\nimages = true\nmax_image_bytes = 33554432\nimage_rate_bytes_per_s = 1\n"));
+    configured
+        .validate()
+        .expect("image opt-in can be stored while disabled");
+    let saved = toml::to_string(&configured).expect("serialize");
+    assert_eq!(parse(&saved).clipboard, configured.clipboard);
+}

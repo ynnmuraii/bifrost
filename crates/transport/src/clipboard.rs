@@ -261,11 +261,10 @@ impl ClipboardMessage {
             } => {
                 arr16(offer_id)?;
                 arr32(origin_node_id)?;
-                if *size_bytes > limits::MAX_CLIPBOARD_PAYLOAD_BYTES {
+                let kind = clipboard::ContentKind::from_mime(mime)
+                    .map_err(|_| ClipboardViolation::BadMime)?;
+                if *size_bytes > kind.hard_max_bytes() {
                     return Err(ClipboardViolation::TooLarge);
-                }
-                if mime != clipboard::MIME {
-                    return Err(ClipboardViolation::BadMime);
                 }
             }
             ClipboardMessage::Request { offer_id } => {
@@ -307,20 +306,20 @@ impl ClipboardMessage {
 /// Why a decoded clipboard message was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClipboardViolation {
-    /// `ClipboardOffer.size_bytes` exceeds 1 MiB.
-    #[error("clipboard offer exceeds 1 MiB")]
+    /// `ClipboardOffer.size_bytes` exceeds its kind's hard cap.
+    #[error("clipboard offer exceeds its payload limit")]
     TooLarge,
     /// `ClipboardData.data` exceeds 16 KiB.
     #[error("clipboard chunk exceeds 16 KiB")]
     BadChunk,
-    /// `ClipboardData.chunk_count` is outside 1..=64, or `chunk_index >= chunk_count`.
+    /// Stateless count is outside 1..=2048, or `chunk_index >= chunk_count`.
     #[error("clipboard chunk count/index is out of range")]
     BadCount,
     /// A clipboard identifier has the wrong length.
     #[error("a clipboard identifier has the wrong length")]
     BadId,
-    /// `ClipboardOffer.mime` is not `clipboard::MIME`.
-    #[error("clipboard mime is not text/plain;charset=utf-8")]
+    /// `ClipboardOffer.mime` is not an exact supported wire MIME.
+    #[error("clipboard mime is unsupported")]
     BadMime,
     /// `ClipboardComplete.sha256` is not exactly 32 bytes.
     #[error("clipboard sha256 is not 32 bytes")]
@@ -336,11 +335,11 @@ pub enum ClipboardViolation {
 impl From<ClipboardViolation> for ConvertError {
     fn from(violation: ClipboardViolation) -> Self {
         ConvertError::Unsupported(match violation {
-            ClipboardViolation::TooLarge => "clipboard offer exceeds 1 MiB",
+            ClipboardViolation::TooLarge => "clipboard offer exceeds its payload limit",
             ClipboardViolation::BadChunk => "clipboard chunk exceeds 16 KiB",
             ClipboardViolation::BadCount => "clipboard chunk count/index is out of range",
             ClipboardViolation::BadId => "a clipboard identifier has the wrong length",
-            ClipboardViolation::BadMime => "clipboard mime is not text/plain;charset=utf-8",
+            ClipboardViolation::BadMime => "clipboard mime is unsupported",
             ClipboardViolation::BadHash => "clipboard sha256 is not 32 bytes",
             ClipboardViolation::NotClipboard => "the envelope is not a clipboard message",
             ClipboardViolation::Empty => "the envelope has no payload",
@@ -566,6 +565,7 @@ impl ClipboardConnection {
             stream: write,
             connection_id: self.connection_id,
             out_seq: self.out_seq,
+            progress: tokio::sync::watch::channel(tokio::time::Instant::now()).0,
         };
         (reader, writer)
     }
@@ -615,18 +615,64 @@ pub struct ClipboardWriter {
     stream: tokio::io::WriteHalf<Stream>,
     connection_id: Option<[u8; 16]>,
     out_seq: u64,
+    progress: tokio::sync::watch::Sender<tokio::time::Instant>,
 }
 
 impl ClipboardWriter {
+    /// Observes actual write/flush progress for bounded queue and confirmation waits.
+    pub fn subscribe_progress(&self) -> tokio::sync::watch::Receiver<tokio::time::Instant> {
+        self.progress.subscribe()
+    }
+
     /// Sends one message; see [`ClipboardConnection::send`].
     pub async fn send(&mut self, message: ClipboardMessage) -> Result<(), TransportError> {
         send_message(
-            &mut self.stream,
+            &mut ProgressWriter {
+                writer: &mut self.stream,
+                progress: &self.progress,
+            },
             &self.connection_id,
             &mut self.out_seq,
             message,
         )
         .await
+    }
+}
+
+struct ProgressWriter<'a, W> {
+    writer: &'a mut W,
+    progress: &'a tokio::sync::watch::Sender<tokio::time::Instant>,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ProgressWriter<'_, W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::pin::Pin::new(&mut *self.writer).poll_write(cx, bytes);
+        if matches!(result, std::task::Poll::Ready(Ok(size)) if size > 0) {
+            self.progress.send_replace(tokio::time::Instant::now());
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let result = std::pin::Pin::new(&mut *self.writer).poll_flush(cx);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) {
+            self.progress.send_replace(tokio::time::Instant::now());
+        }
+        result
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.writer).poll_shutdown(cx)
     }
 }
 
@@ -650,16 +696,33 @@ async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
         .map_err(|error| TransportError::Protocol(format!("{error}")))?;
     let bytes = encode_message(Channel::Clipboard, &envelope)
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
-    writer.write_all(&bytes).await?;
-    // TLS buffers: `write_all` may consume the whole frame while the records that carry it are
-    // still in the session (`tokio-rustls` returns a short-but-Ready write when the socket
-    // would block). Without this flush the frame can stay there until some *later* write, so a
-    // sender that waits for an answer after sending — `Bind`, `Offer`, `Request`, the last
-    // `Data` — would wait for a peer that never sees it. `link::write_frame` flushes for the
-    // same reason.
-    writer.flush().await?;
+    write_frame_progress(writer, &bytes, CLIPBOARD_WRITE_IDLE_TIMEOUT).await?;
     *out_seq = seq;
     Ok(())
+}
+
+/// Maximum time a clipboard frame may make no socket progress.
+pub const CLIPBOARD_WRITE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn write_frame_progress<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut bytes: &[u8],
+    idle: std::time::Duration,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = tokio::time::timeout(idle, writer.write(bytes))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "clipboard write stalled")
+            })??;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        bytes = &bytes[written..];
+    }
+    tokio::time::timeout(idle, writer.flush())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "clipboard flush stalled"))?
 }
 
 async fn recv_message<R: AsyncRead + Unpin>(
@@ -933,7 +996,7 @@ async fn handshake_clipboard(
 /// chunks and paces them with `clipboard::Rate`.
 pub struct Outgoing {
     offer_id: [u8; 16],
-    payload: Vec<u8>,
+    payload: Arc<Vec<u8>>,
     chunk_count: u32,
     next_index: u32,
     rate: clipboard::Rate,
@@ -945,26 +1008,57 @@ impl Outgoing {
     /// Plans a transfer.
     ///
     /// Fails with [`ClipboardViolation::TooLarge`] when `payload` exceeds `max_bytes` or the
-    /// protocol 1 MiB cap.
+    /// per-kind hard cap.
     pub fn new(
         offer_id: [u8; 16],
         payload: Vec<u8>,
+        kind: clipboard::ContentKind,
+        rate_bytes_per_s: u64,
+        max_bytes: u64,
+        now_ms: u64,
+    ) -> Result<Self, ClipboardViolation> {
+        if payload.len() as u64 > max_bytes || payload.len() as u64 > kind.hard_max_bytes() {
+            return Err(ClipboardViolation::TooLarge);
+        }
+        let digest = clipboard::sha256(&payload)
+            .try_into()
+            .expect("SHA-256 length");
+        Self::prepared(
+            offer_id,
+            payload.into(),
+            digest,
+            kind,
+            rate_bytes_per_s,
+            max_bytes,
+            now_ms,
+        )
+    }
+
+    /// Plans a transfer using an already verified immutable payload and digest.
+    pub fn prepared(
+        offer_id: [u8; 16],
+        payload: Arc<Vec<u8>>,
+        digest: [u8; 32],
+        kind: clipboard::ContentKind,
         rate_bytes_per_s: u64,
         max_bytes: u64,
         now_ms: u64,
     ) -> Result<Self, ClipboardViolation> {
         let size = payload.len() as u64;
-        if size > max_bytes || size > limits::MAX_CLIPBOARD_PAYLOAD_BYTES {
+        if size > max_bytes || size > kind.hard_max_bytes() {
             return Err(ClipboardViolation::TooLarge);
         }
-        // An empty payload is one empty chunk, never zero chunks (`chunk_count` is 1..=64).
+        // Empty text is one empty chunk; zero chunks is never a network transfer.
         let chunk_count = if payload.is_empty() {
             1
         } else {
             payload.len().div_ceil(clipboard::CHUNK_BYTES)
         };
+        if chunk_count > kind.max_network_chunks() {
+            return Err(ClipboardViolation::BadCount);
+        }
         let chunk_count = u32::try_from(chunk_count).map_err(|_| ClipboardViolation::BadCount)?;
-        let sha256 = clipboard::sha256(&payload);
+        let sha256 = digest.to_vec();
         Ok(Outgoing {
             offer_id,
             payload,
@@ -1011,8 +1105,8 @@ impl Outgoing {
         self.payload.len() as u64
     }
 
-    /// Recovers the owned payload after the sender finishes, without copying it.
-    pub fn into_payload(self) -> Vec<u8> {
+    /// Returns the shared payload after the sender finishes.
+    pub fn into_payload(self) -> Arc<Vec<u8>> {
         self.payload
     }
 
@@ -1026,6 +1120,139 @@ impl Outgoing {
 mod tests {
     use super::*;
     use identity::{IdentityPaths, NodeIdentity, TrustStore, TrustedPeer};
+
+    struct StalledWriter {
+        allowance: usize,
+        flush_pending: bool,
+        written: usize,
+    }
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.allowance == 0 {
+                return std::task::Poll::Pending;
+            }
+            let size = self.allowance.min(bytes.len());
+            self.allowance -= size;
+            self.written += size;
+            std::task::Poll::Ready(Ok(size))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.flush_pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn no_progress_bounds_pending_partial_and_flush_writes() {
+        for (allowance, flush_pending, expected) in [(0, false, 0), (1, false, 1), (4, true, 4)] {
+            let mut writer = StalledWriter {
+                allowance,
+                flush_pending,
+                written: 0,
+            };
+            let error =
+                write_frame_progress(&mut writer, b"test", std::time::Duration::from_millis(10))
+                    .await
+                    .expect_err("a stalled frame must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(writer.written, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn positive_progress_resets_idle_deadline() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let reading = tokio::spawn(async move {
+            let mut result = Vec::new();
+            let mut byte = [0];
+            while result.len() < 16 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                reader.read_exact(&mut byte).await.expect("read");
+                result.push(byte[0]);
+            }
+            result
+        });
+        let started = tokio::time::Instant::now();
+        write_frame_progress(&mut writer, &[7; 16], std::time::Duration::from_millis(100))
+            .await
+            .expect("progress must keep the frame alive");
+        assert!(started.elapsed() > std::time::Duration::from_millis(100));
+        assert_eq!(reading.await.expect("reader"), vec![7; 16]);
+    }
+
+    #[test]
+    fn prepared_outgoing_reuses_payload_and_digest() {
+        let payload = Arc::new(b"prepared".to_vec());
+        let digest = [42; 32];
+        let outgoing = Outgoing::prepared(
+            [1; 16],
+            Arc::clone(&payload),
+            digest,
+            clipboard::ContentKind::Text,
+            100,
+            100,
+            0,
+        )
+        .expect("prepared transfer");
+        assert_eq!(outgoing.sha256(), digest);
+        assert!(Arc::ptr_eq(&payload, &outgoing.into_payload()));
+    }
+
+    #[test]
+    fn image_prepared_shares_bytes_and_keeps_digest_without_rehashing() {
+        let payload = Arc::new(b"\x89PNG\r\n\x1a\npayload".to_vec());
+        let digest = [42; 32];
+        let mut outgoing = Outgoing::prepared(
+            [1; 16],
+            Arc::clone(&payload),
+            digest,
+            clipboard::ContentKind::Png,
+            clipboard::DEFAULT_IMAGE_RATE_BYTES_PER_S,
+            clipboard::MAX_IMAGE_BYTES,
+            0,
+        )
+        .expect("prepared PNG");
+        let (chunk, _) = outgoing.next(0).expect("data");
+        match chunk {
+            ClipboardMessage::Data { data, .. } => assert_eq!(data.as_slice(), &*payload),
+            _ => panic!("data must precede complete"),
+        }
+        let (complete, _) = outgoing.next(0).expect("complete");
+        match complete {
+            ClipboardMessage::Complete { sha256, .. } => assert_eq!(sha256, digest),
+            _ => panic!("complete"),
+        }
+        assert!(Arc::ptr_eq(&payload, &outgoing.into_payload()));
+        assert!(Outgoing::prepared(
+            [1; 16],
+            Arc::clone(&payload),
+            digest,
+            clipboard::ContentKind::Png,
+            1,
+            payload.len() as u64 - 1,
+            0,
+        )
+        .is_err());
+    }
 
     struct BufferedWriter {
         pending: Vec<u8>,

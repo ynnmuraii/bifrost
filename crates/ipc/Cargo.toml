@@ -21,7 +21,8 @@ prost = "0.14"
 # feature for them, so it also compiles TCP/UDP. The agent's "no network
 # sockets" invariant is therefore enforced by the CI symbol check described in
 # the crate documentation, not by feature selection.
-tokio = { version = "1", default-features = false, features = ["net", "io-util", "time"] }
+# The production owned writer needs `rt` for spawn, `macros` for select!, and `sync` for queues.
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "rt", "macros", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 # geteuid(3) for the SO_PEERCRED comparison; libc is already in the graph

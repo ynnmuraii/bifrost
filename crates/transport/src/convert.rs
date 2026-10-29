@@ -1004,6 +1004,8 @@ pub struct PeerInfo {
     /// clipboard, but the clipboard channel does — ADR-008 makes it opt-in on both sides, so a
     /// node whose peer did not claim this bit never offers it anything.
     pub text_clipboard: bool,
+    /// Whether the running peer adapter supports PNG clipboard content.
+    pub image_clipboard: bool,
 }
 
 impl PeerInfo {
@@ -1066,6 +1068,9 @@ impl PeerInfo {
             text_clipboard: hello
                 .capabilities
                 .contains(&(wire::Capability::TextClipboard as i32)),
+            image_clipboard: hello
+                .capabilities
+                .contains(&(wire::Capability::ClipboardImage as i32)),
         })
     }
 }
@@ -1095,6 +1100,7 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             WireCapability::Unspecified
             | WireCapability::PhysicalHidKeys
             | WireCapability::TextClipboard
+            | WireCapability::ClipboardImage
             | WireCapability::NativeRepeat
             | WireCapability::SoftwareRepeat
             | WireCapability::ReceiverTakeover

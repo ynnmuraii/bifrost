@@ -30,16 +30,18 @@
 //!
 //! A selection this adapter *sets* comes back to it as a selection event: a data-control
 //! device is told about every selection, its own included. An owner has no sequence number to
-//! compare, so the mechanism is the text itself — the rule
-//! `apps/lws-agent/src/backend/x11.rs` already uses: the payload this adapter last applied is
-//! remembered in `applied`, and one reading that equals it is the echo of our own `set`
-//! rather than a user's copy.
+//! compare, so the mechanism is the content itself: the payload last applied is shared
+//! between the source and `applied`, and one equal reading is swallowed. Comparison runs
+//! on this dedicated adapter thread, never the agent session loop.
 
-use clipboard::Marker;
+use std::sync::Arc;
 
-/// The MIME type every payload uses, so a Wayland offer is asked for exactly the type the
-/// wire carries (`clipboard::MIME`).
+use clipboard::{ClipboardContent, ContentKind, Marker};
+
+/// Preferred text MIME type.
 pub const TEXT_MIME: &str = clipboard::MIME;
+/// Native PNG bytes are carried unchanged.
+pub const IMAGE_MIME: &str = clipboard::IMAGE_MIME;
 
 /// The other text MIME types a selection may offer, in the order they are preferred after
 /// [`TEXT_MIME`].
@@ -54,21 +56,20 @@ pub const KDE_PASSWORD_HINT: &str = "x-kde-passwordManagerHint";
 /// The hint value that means "this is a secret".
 pub const KDE_SECRET: &str = "secret";
 
-/// One text the local selection now holds.
+/// One content item the local selection now holds.
 ///
-/// Nothing here is logged: sizes and marker names only, never the text.
+/// Nothing here is logged: sizes and marker names only, never the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
-    /// The text the selection offered.
-    pub text: String,
+    /// The content the selection offered.
+    pub content: ClipboardContent,
     /// Every secret marker it carried.
     pub markers: Vec<Marker>,
 }
 
 /// The MIME type to ask a selection for: [`TEXT_MIME`], else the best fallback.
 ///
-/// `None`: this selection offers no text at all. An image-only or file-list selection is not
-/// an error, it is simply nothing this adapter can carry.
+/// `None`: this selection offers no supported text MIME; PNG is chosen separately.
 pub fn text_mime_of(mimes: &[String]) -> Option<&str> {
     let exact = |mime: &str| mimes.iter().find(|offered| offered.as_str() == mime);
     let ci = |mime: &str| {
@@ -84,6 +85,18 @@ pub fn text_mime_of(mimes: &[String]) -> Option<&str> {
                 .find_map(|mime| exact(mime).or_else(|| ci(mime)))
         })
         .map(String::as_str)
+}
+
+/// Text wins over PNG; unsupported selections are ignored.
+pub fn content_mime_of(mimes: &[String]) -> Option<(&str, ContentKind)> {
+    text_mime_of(mimes)
+        .map(|mime| (mime, ContentKind::Text))
+        .or_else(|| {
+            mimes
+                .iter()
+                .find(|mime| mime.eq_ignore_ascii_case(IMAGE_MIME))
+                .map(|mime| (mime.as_str(), ContentKind::Png))
+        })
 }
 
 /// Whether a selection offers the KDE secret hint at all.
@@ -127,42 +140,20 @@ pub enum PayloadError {
     TooLarge,
     /// The source did not answer within the transfer budget.
     Timeout,
-    /// The payload arrived but is not UTF-8, so it is not the text MIME the wire carries.
-    NotText,
     /// The pipe could not be read.
     Io,
 }
 
-impl PayloadError {
-    /// The word for logs.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            PayloadError::TooLarge => "too-large",
-            PayloadError::Timeout => "timeout",
-            PayloadError::NotText => "not-utf8",
-            PayloadError::Io => "io",
-        }
-    }
-}
-
-/// Decodes a payload as the text this adapter may carry.
-///
-/// A payload that is not UTF-8 is refused rather than lossily rewritten: half of an image is
-/// not a string, and a monitoring channel must never be handed a plausible-looking mutation
-/// of a secret's bytes.
-pub fn decode_text(bytes: &[u8]) -> Result<String, PayloadError> {
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| PayloadError::NotText)
-}
-
 /// Whether one reading is the echo of `applied`, and whether that echo was the last one.
 ///
-/// Cleared after one sighting, like the X11 adapter: a *later* copy of the same text by the
+/// Cleared after one sighting, like the X11 adapter: a *later* copy of the same content by the
 /// user is then reported, which is the safe direction (a stale echo would instead swallow a
 /// real copy).
-pub fn swallow_echo(applied: &mut Option<String>, text: &str) -> bool {
-    if applied.as_deref() != Some(text) {
+pub fn swallow_echo(
+    applied: &mut Option<Arc<ClipboardContent>>,
+    content: &ClipboardContent,
+) -> bool {
+    if applied.as_deref() != Some(content) {
         return false;
     }
     *applied = None;
@@ -173,6 +164,7 @@ pub fn swallow_echo(applied: &mut Option<String>, text: &str) -> bool {
 mod glue {
     //! The `ext-data-control-v1` client: one thread, one connection, two helper threads.
 
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::os::fd::{AsFd, OwnedFd};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -198,8 +190,8 @@ mod glue {
     };
 
     use super::{
-        decode_text, kde_hint_marker, offers_kde_hint, swallow_echo, text_mime_of, Change,
-        PayloadError, KDE_PASSWORD_HINT, TEXT_MIME,
+        content_mime_of, kde_hint_marker, offers_kde_hint, swallow_echo, Change, ClipboardContent,
+        ContentKind, PayloadError, KDE_PASSWORD_HINT,
     };
 
     /// How long [`Clipboard::connect`] waits for the global to be bound.
@@ -217,20 +209,23 @@ mod glue {
 
     /// One thing the caller asked the thread to do.
     enum Command {
-        /// Own the selection with this text (`None`: give the selection up).
+        /// Own the selection with this content (`None`: give the selection up).
         Set {
-            text: Option<String>,
+            content: Option<ClipboardContent>,
             applied: oneshot::Sender<Result<(), String>>,
         },
         Quit,
     }
+
+    type ServedRead = (u64, Result<Change, clipboard::ClipboardError>);
 
     /// Handle to the clipboard thread.
     ///
     /// Dropping it stops the thread, which also gives the selection back to the compositor.
     pub struct Clipboard {
         commands: Sender<Command>,
-        changes: Receiver<Change>,
+        changes: Receiver<Result<Change, clipboard::ClipboardError>>,
+        disconnected: bool,
     }
 
     impl Clipboard {
@@ -255,6 +250,7 @@ mod glue {
                 Ok(true) => Some(Self {
                     commands: command_tx,
                     changes: change_rx,
+                    disconnected: false,
                 }),
                 Ok(false) => None,
                 Err(_) => {
@@ -270,29 +266,41 @@ mod glue {
         ///
         /// Never blocks and never waits for the platform: the session polls this from its own
         /// tick, and its watchdog and deadline live on that tick too.
-        pub fn poll_change(&mut self) -> Option<Change> {
-            self.changes.try_recv().ok()
+        pub fn poll_change(&mut self) -> Result<Option<Change>, clipboard::ClipboardError> {
+            if self.disconnected {
+                return Ok(None);
+            }
+            match self.changes.try_recv() {
+                Ok(change) => change.map(Some),
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Disconnected) => {
+                    self.disconnected = true;
+                    Err(clipboard::ClipboardError::Invalid)
+                }
+            }
         }
 
-        /// Owns the selection with `text`, or gives it up with `None`.
+        /// Owns the selection, or gives it up with `None`.
         ///
         /// Success requires the compositor's display-sync reply after the selection request,
-        /// not merely enqueueing a command on the worker thread.
-        pub async fn set_text(&self, text: Option<&str>) -> Result<(), String> {
+        /// not merely enqueueing a command on the worker thread. Owned bytes move to that
+        /// thread without copying or comparing large payloads on the session loop.
+        pub fn begin_set_content(
+            &self,
+            content: Option<ClipboardContent>,
+        ) -> impl Future<Output = Result<(), String>> + Send + 'static {
             let (applied, confirmation) = oneshot::channel();
-            self.commands
-                .send(Command::Set {
-                    text: text.map(str::to_owned),
-                    applied,
-                })
-                .map_err(|_| "the data-control clipboard thread is gone".to_owned())?;
-            match tokio::time::timeout(APPLY_TIMEOUT, confirmation).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => {
-                    Err("the data-control clipboard stopped before confirming selection".to_owned())
-                }
-                Err(_) => {
-                    Err("the compositor did not confirm the clipboard selection in time".to_owned())
+            let sent = self.commands.send(Command::Set { content, applied });
+            async move {
+                sent.map_err(|_| "the data-control clipboard thread is gone".to_owned())?;
+                match tokio::time::timeout(APPLY_TIMEOUT, confirmation).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err(
+                        "the data-control clipboard stopped before confirming selection".to_owned(),
+                    ),
+                    Err(_) => Err(
+                        "the compositor did not confirm the clipboard selection in time".to_owned(),
+                    ),
                 }
             }
         }
@@ -305,7 +313,11 @@ mod glue {
     }
 
     /// Thread body: connect, bind, report readiness, then serve until told to quit.
-    fn run(commands: &Receiver<Command>, changes: &Sender<Change>, ready: SyncSender<bool>) {
+    fn run(
+        commands: &Receiver<Command>,
+        changes: &Sender<Result<Change, clipboard::ClipboardError>>,
+        ready: SyncSender<bool>,
+    ) {
         let mut app = match App::connect() {
             Ok(app) => app,
             Err(error) => {
@@ -318,6 +330,7 @@ mod glue {
         drop(ready);
         if let Err(error) = app.serve(commands, changes) {
             tracing::warn!(%error, "the data-control clipboard stopped");
+            let _ = changes.send(Err(clipboard::ClipboardError::Invalid));
         }
     }
 
@@ -342,10 +355,11 @@ mod glue {
         _seat: WlSeat,
         offers: Vec<Offer>,
         selection: Option<ExtDataControlOfferV1>,
+        selection_generation: u64,
         /// The source this adapter owns, so a later `Set` can replace (and destroy) it.
         owned: Option<ExtDataControlSourceV1>,
-        /// The text this adapter itself put on the selection (the echo rule).
-        applied: Option<String>,
+        /// Echo comparison stays on the dedicated adapter thread, never the session loop.
+        applied: Option<Arc<ClipboardContent>>,
         /// The device is gone (`finished`): the adapter stops serving.
         finished: bool,
         /// Replies wait for display-sync callbacks ordered after each selection request.
@@ -431,23 +445,24 @@ mod glue {
         }
     }
 
-    impl Dispatch<ExtDataControlSourceV1, Arc<str>> for State {
+    impl Dispatch<ExtDataControlSourceV1, Arc<ClipboardContent>> for State {
         fn event(
             state: &mut Self,
             source: &ExtDataControlSourceV1,
             event: ext_data_control_source_v1::Event,
-            text: &Arc<str>,
+            content: &Arc<ClipboardContent>,
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
             match event {
-                ext_data_control_source_v1::Event::Send { fd, .. } => {
+                ext_data_control_source_v1::Event::Send { fd, mime_type } => {
                     if state
                         .owned
                         .as_ref()
                         .is_some_and(|owned| owned.id() == source.id())
+                        && mime_type == content.kind().mime()
                     {
-                        state.writer.send(fd, text);
+                        state.writer.send(fd, content);
                     }
                 }
                 ext_data_control_source_v1::Event::Cancelled
@@ -482,6 +497,7 @@ mod glue {
                     requested: false,
                 }),
                 ext_data_control_device_v1::Event::Selection { id } => {
+                    state.selection_generation = state.selection_generation.wrapping_add(1);
                     // The previous selection's offer is dead the moment a new one arrives.
                     if let Some(previous) = state.selection.take() {
                         if let Some(index) = state
@@ -528,8 +544,8 @@ mod glue {
         manager: ExtDataControlManagerV1,
         device: ExtDataControlDeviceV1,
         /// Readings from the helper threads, and the end they are given.
-        served_tx: Sender<Change>,
-        served_rx: Receiver<Change>,
+        served_tx: Sender<ServedRead>,
+        served_rx: Receiver<ServedRead>,
     }
 
     impl App {
@@ -551,6 +567,7 @@ mod glue {
                     _seat: seat,
                     offers: Vec::new(),
                     selection: None,
+                    selection_generation: 0,
                     owned: None,
                     applied: None,
                     finished: false,
@@ -568,7 +585,7 @@ mod glue {
         fn serve(
             &mut self,
             commands: &Receiver<Command>,
-            changes: &Sender<Change>,
+            changes: &Sender<Result<Change, clipboard::ClipboardError>>,
         ) -> Result<(), Box<dyn std::error::Error>> {
             let result = self.serve_loop(commands, changes);
             let detail = match &result {
@@ -584,7 +601,7 @@ mod glue {
         fn serve_loop(
             &mut self,
             commands: &Receiver<Command>,
-            changes: &Sender<Change>,
+            changes: &Sender<Result<Change, clipboard::ClipboardError>>,
         ) -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 self.state
@@ -609,40 +626,32 @@ mod glue {
         }
 
         /// Hands the helper threads' readings to the caller, applying the echo rule.
-        fn forward_served(&mut self, changes: &Sender<Change>) {
-            loop {
-                match self.served_rx.try_recv() {
-                    Ok(change) => {
-                        if swallow_echo(&mut self.state.applied, &change.text) {
-                            tracing::debug!(
-                                bytes = change.text.len(),
-                                "swallowing the selection this node applied"
-                            );
-                            continue;
-                        }
-                        tracing::info!(
-                            bytes = change.text.len(),
-                            markers = change.markers.len(),
-                            "local clipboard change"
-                        );
-                        if changes.send(change).is_err() {
-                            return;
-                        }
-                    }
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return,
-                }
-            }
+        fn forward_served(&mut self, changes: &Sender<Result<Change, clipboard::ClipboardError>>) {
+            forward_served(
+                &self.served_rx,
+                self.state.selection_generation,
+                &mut self.state.applied,
+                changes,
+            );
         }
 
         /// Returns `false` when the thread must stop.
         fn apply_commands(&mut self, commands: &Receiver<Command>) -> bool {
             loop {
                 match commands.try_recv() {
-                    Ok(Command::Set { text, applied }) => {
+                    Ok(Command::Set { content, applied }) => {
                         if applied.is_closed() {
                             continue;
                         }
-                        self.set_selection(text);
+                        if content.as_ref().is_some_and(|content| {
+                            content.len() as u64 > content.kind().hard_max_bytes()
+                                || (content.kind() == ContentKind::Png
+                                    && !content.as_bytes().starts_with(b"\x89PNG\r\n\x1a\n"))
+                        }) {
+                            let _ = applied.send(Err("invalid clipboard payload".to_owned()));
+                            continue;
+                        }
+                        self.set_selection(content);
                         let callback = self.connection.display().sync(&self.qh, ());
                         self.state.pending_applies.push((callback, applied));
                     }
@@ -652,8 +661,8 @@ mod glue {
             }
         }
 
-        /// Takes the selection for `text`, or gives it up.
-        fn set_selection(&mut self, text: Option<String>) {
+        /// Takes the selection for `content`, or gives it up.
+        fn set_selection(&mut self, content: Option<ClipboardContent>) {
             self.state.writer.cancel();
             // A source is single-use: `set_selection` with a source that was already given
             // once is the `used_source` protocol error, so every `Set` creates a new one and
@@ -661,15 +670,16 @@ mod glue {
             if let Some(previous) = self.state.owned.take() {
                 previous.destroy();
             }
-            match text {
-                Some(text) => {
+            match content {
+                Some(content) => {
+                    let content = Arc::new(content);
                     let source = self
                         .manager
-                        .create_data_source(&self.qh, Arc::<str>::from(text.as_str()));
-                    source.offer(TEXT_MIME.to_owned());
+                        .create_data_source(&self.qh, Arc::clone(&content));
+                    source.offer(content.kind().mime().to_owned());
                     self.device.set_selection(Some(&source));
                     self.state.owned = Some(source);
-                    self.state.applied = Some(text);
+                    self.state.applied = Some(content);
                 }
                 None => {
                     self.device.set_selection(None);
@@ -705,29 +715,57 @@ mod glue {
             if offer.requested {
                 return;
             }
-            let Some(mime) = text_mime_of(&offer.mimes).map(str::to_owned) else {
+            let Some((mime, kind)) =
+                content_mime_of(&offer.mimes).map(|(mime, kind)| (mime.to_owned(), kind))
+            else {
                 return;
             };
             let hint = offers_kde_hint(&offer.mimes);
             offer.requested = true;
             let offer = offer.offer.clone();
             let served = self.served_tx.clone();
-            request(&offer, &mime, hint, served);
+            request(
+                &offer,
+                &mime,
+                kind,
+                hint,
+                self.state.selection_generation,
+                served,
+            );
         }
     }
 
-    /// Issues the reads of one selection: the text, and the KDE hint when it is offered.
-    ///
-    /// Both requests are made from the loop's thread (a proxy belongs to its queue) and
-    /// consumed on a helper thread, so a source that never answers cannot stall the loop. The
-    /// hint is only meaningful beside the payload, so one helper reads both and reports once.
-    fn request(offer: &ExtDataControlOfferV1, mime: &str, hint: bool, served: Sender<Change>) {
-        let Ok((text_read, text_write)) = rustix::pipe::pipe() else {
-            tracing::warn!("no clipboard: cannot create a transfer pipe");
-            return;
-        };
-        offer.receive(mime.to_owned(), text_write.as_fd());
-        drop(text_write);
+    fn forward_served(
+        served: &Receiver<ServedRead>,
+        current_generation: u64,
+        applied: &mut Option<Arc<ClipboardContent>>,
+        changes: &Sender<Result<Change, clipboard::ClipboardError>>,
+    ) {
+        while let Ok((generation, result)) = served.try_recv() {
+            if generation != current_generation {
+                continue;
+            }
+            if let Ok(change) = &result {
+                if change.markers.is_empty() && swallow_echo(applied, &change.content) {
+                    continue;
+                }
+            }
+            if changes.send(result).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Issues bounded reads off the event loop. The secret hint is consumed before any
+    /// payload bytes, so secret PNG selections are dropped without reading their image.
+    fn request(
+        offer: &ExtDataControlOfferV1,
+        mime: &str,
+        kind: ContentKind,
+        hint: bool,
+        generation: u64,
+        served: Sender<ServedRead>,
+    ) {
         let hint_read = if hint {
             match rustix::pipe::pipe() {
                 Ok((read, write)) => {
@@ -743,43 +781,62 @@ mod glue {
         } else {
             None
         };
+        let offer = offer.clone();
+        let mime = mime.to_owned();
+        let failed = served.clone();
         let spawned = std::thread::Builder::new()
             .name("clipboard-read".into())
             .spawn(move || {
                 let value = hint_read
                     .as_ref()
                     .and_then(|read| read_bounded(read, HINT_BYTES, HINT_TIMEOUT).ok());
-                let Some(bytes) = read_payload(&text_read) else {
-                    return;
-                };
-                let Ok(text) = decode_text(&bytes) else {
-                    tracing::info!(
-                        code = PayloadError::NotText.as_str(),
-                        "selection payload refused"
-                    );
-                    return;
-                };
-                let change = Change {
-                    text,
-                    markers: kde_hint_marker(hint, value.as_deref())
-                        .into_iter()
-                        .collect(),
-                };
-                let _ = served.send(change);
+                let markers: Vec<_> = kde_hint_marker(hint, value.as_deref())
+                    .into_iter()
+                    .collect();
+                let result = read_content(
+                    || {
+                        let (read, write) = rustix::pipe::pipe().ok()?;
+                        offer.receive(mime, write.as_fd());
+                        drop(write);
+                        Some(read)
+                    },
+                    kind,
+                    &markers,
+                    TRANSFER_TIMEOUT,
+                )
+                .map(|content| Change { content, markers });
+                let _ = served.send((generation, result));
             });
         if let Err(error) = spawned {
             tracing::warn!(%error, "no clipboard: cannot spawn the transfer thread");
+            let _ = failed.send((generation, Err(clipboard::ClipboardError::Invalid)));
         }
     }
 
-    /// Reads one payload, bounded by the protocol's payload limit and by [`TRANSFER_TIMEOUT`].
-    fn read_payload(read: &OwnedFd) -> Option<Vec<u8>> {
-        match read_bounded(read, clipboard::MAX_BYTES, TRANSFER_TIMEOUT) {
-            Ok(bytes) => Some(bytes),
-            Err(error) => {
-                tracing::info!(code = error.as_str(), "selection payload unreadable");
-                None
-            }
+    /// PNG secret checks precede even its receive request; report marker-only invalidation.
+    fn read_content(
+        receive: impl FnOnce() -> Option<OwnedFd>,
+        kind: ContentKind,
+        markers: &[clipboard::Marker],
+        timeout: Duration,
+    ) -> Result<ClipboardContent, clipboard::ClipboardError> {
+        if kind == ContentKind::Png && !markers.is_empty() {
+            return Ok(ClipboardContent::Text(String::new()));
+        }
+        let read = receive().ok_or(clipboard::ClipboardError::Invalid)?;
+        let limit = match kind {
+            ContentKind::Text => 2 * clipboard::MAX_BYTES,
+            ContentKind::Png => clipboard::MAX_IMAGE_BYTES,
+        };
+        let bytes = read_bounded(&read, limit, timeout).map_err(|error| match error {
+            PayloadError::TooLarge => clipboard::ClipboardError::TooLarge,
+            PayloadError::Timeout | PayloadError::Io => clipboard::ClipboardError::Invalid,
+        })?;
+        match kind {
+            ContentKind::Text => String::from_utf8(bytes)
+                .map(ClipboardContent::Text)
+                .map_err(|_| clipboard::ClipboardError::Invalid),
+            ContentKind::Png => ClipboardContent::from_bytes(kind, bytes),
         }
     }
 
@@ -822,7 +879,7 @@ mod glue {
 
     struct Transfer {
         fd: OwnedFd,
-        text: Arc<str>,
+        content: Arc<ClipboardContent>,
         generation: u64,
     }
 
@@ -848,7 +905,7 @@ mod glue {
                         match receiver.recv_timeout(POLL_INTERVAL) {
                             Ok(transfer) => serve(
                                 transfer.fd,
-                                &transfer.text,
+                                transfer.content.as_bytes(),
                                 &stop,
                                 &current,
                                 transfer.generation,
@@ -867,10 +924,10 @@ mod glue {
             })
         }
 
-        fn send(&self, fd: OwnedFd, text: &Arc<str>) {
+        fn send(&self, fd: OwnedFd, content: &Arc<ClipboardContent>) {
             let transfer = Transfer {
                 fd,
-                text: Arc::clone(text),
+                content: Arc::clone(content),
                 generation: self.generation.load(Ordering::SeqCst),
             };
             // Closing an excess request's fd refuses that paste without blocking dispatch.
@@ -894,7 +951,7 @@ mod glue {
 
     fn serve(
         fd: OwnedFd,
-        text: &str,
+        bytes: &[u8],
         stopping: &AtomicBool,
         current: &AtomicU64,
         generation: u64,
@@ -906,7 +963,6 @@ mod glue {
             return;
         }
         let mut file = std::fs::File::from(fd);
-        let bytes = text.as_bytes();
         let mut offset = 0;
         while offset < bytes.len() {
             if stopping.load(Ordering::SeqCst)
@@ -965,6 +1021,131 @@ mod glue {
     mod apply_tests {
         use super::*;
 
+        fn observed_pipe(
+            bytes: Vec<u8>,
+            kind: ContentKind,
+        ) -> Result<ClipboardContent, clipboard::ClipboardError> {
+            let (read, write) = rustix::pipe::pipe().unwrap();
+            let writer = std::thread::spawn(move || {
+                let _ = std::fs::File::from(write).write_all(&bytes);
+            });
+            let result = read_content(|| Some(read), kind, &[], Duration::from_secs(5));
+            writer.join().unwrap();
+            result
+        }
+
+        fn observed_clipboard() -> (Clipboard, Sender<Result<Change, clipboard::ClipboardError>>) {
+            let (commands, _) = mpsc::channel();
+            let (changes, receiver) = mpsc::channel();
+            (
+                Clipboard {
+                    commands,
+                    changes: receiver,
+                    disconnected: false,
+                },
+                changes,
+            )
+        }
+
+        #[test]
+        fn disconnected_actor_reports_one_terminal_invalidation_only() {
+            let (mut clipboard, changes) = observed_clipboard();
+            drop(changes);
+            assert_eq!(
+                clipboard.poll_change(),
+                Err(clipboard::ClipboardError::Invalid)
+            );
+            for _ in 0..100 {
+                assert_eq!(clipboard.poll_change(), Ok(None));
+            }
+        }
+
+        #[test]
+        fn changed_selection_errors_survive_worker_forwarding_and_poll() {
+            let (mut clipboard, changes) = observed_clipboard();
+            let (worker, served) = mpsc::channel();
+            let mut applied = None;
+            let first = Change {
+                content: ClipboardContent::Text("A".into()),
+                markers: vec![],
+            };
+            worker.send((1, Ok(first.clone()))).unwrap();
+            forward_served(&served, 1, &mut applied, &changes);
+            assert_eq!(clipboard.poll_change(), Ok(Some(first)));
+            for (result, error) in [
+                (
+                    observed_pipe(b"invalid PNG".to_vec(), ContentKind::Png),
+                    clipboard::ClipboardError::Invalid,
+                ),
+                (
+                    observed_pipe(vec![0xff], ContentKind::Text),
+                    clipboard::ClipboardError::Invalid,
+                ),
+                (
+                    read_content(|| None, ContentKind::Png, &[], Duration::from_secs(1)),
+                    clipboard::ClipboardError::Invalid,
+                ),
+                (
+                    {
+                        let mut bytes = vec![0; clipboard::MAX_IMAGE_BYTES as usize + 1];
+                        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+                        observed_pipe(bytes, ContentKind::Png)
+                    },
+                    clipboard::ClipboardError::TooLarge,
+                ),
+            ] {
+                assert_eq!(result, Err(error));
+                worker.send((2, Err(error))).unwrap();
+                forward_served(&served, 2, &mut applied, &changes);
+                assert_eq!(clipboard.poll_change(), Err(error));
+                assert_eq!(clipboard.poll_change(), Ok(None));
+            }
+        }
+
+        #[test]
+        fn large_text_copy_is_reported_instead_of_silently_preserving_previous_carry() {
+            let text = vec![b'x'; 1536 * 1024];
+            let content = observed_pipe(text.clone(), ContentKind::Text).unwrap();
+            let (mut clipboard, changes) = observed_clipboard();
+            changes
+                .send(Ok(Change {
+                    content,
+                    markers: vec![],
+                }))
+                .unwrap();
+            assert_eq!(
+                clipboard.poll_change().unwrap().unwrap().content.as_bytes(),
+                text
+            );
+        }
+
+        #[test]
+        fn stale_read_results_cannot_replace_latest_generation_or_drop_current_error() {
+            let (mut clipboard, changes) = observed_clipboard();
+            let (worker, served) = mpsc::channel();
+            worker
+                .send((1, Err(clipboard::ClipboardError::TooLarge)))
+                .unwrap();
+            worker
+                .send((2, Err(clipboard::ClipboardError::Invalid)))
+                .unwrap();
+            worker
+                .send((
+                    1,
+                    Ok(Change {
+                        content: ClipboardContent::Text("stale".into()),
+                        markers: vec![],
+                    }),
+                ))
+                .unwrap();
+            forward_served(&served, 2, &mut None, &changes);
+            assert_eq!(
+                clipboard.poll_change(),
+                Err(clipboard::ClipboardError::Invalid)
+            );
+            assert_eq!(clipboard.poll_change(), Ok(None));
+        }
+
         #[test]
         fn stalled_paste_does_not_block_dispatch_or_writer_shutdown() {
             let (read, write) = rustix::pipe::pipe().expect("paste pipe");
@@ -974,7 +1155,10 @@ mod glue {
             let (shutdown, stopped) = mpsc::channel();
             let worker = std::thread::spawn(move || {
                 let writer = TransferWriter::new().expect("paste worker");
-                writer.send(write, &Arc::<str>::from("x".repeat(128 * 1024)));
+                writer.send(
+                    write,
+                    &Arc::new(ClipboardContent::Text("x".repeat(128 * 1024))),
+                );
                 dispatch.send(()).unwrap();
                 drop(writer);
                 shutdown.send(()).unwrap();
@@ -1002,7 +1186,7 @@ mod glue {
             let started = Instant::now();
             serve(
                 write,
-                "pending",
+                b"pending",
                 &AtomicBool::new(false),
                 &AtomicU64::new(0),
                 0,
@@ -1017,10 +1201,10 @@ mod glue {
             let (_read, write) = rustix::pipe::pipe().unwrap();
             rustix::pipe::fcntl_setpipe_size(&write, 4096).unwrap();
             rustix::io::write(&write, &[0u8; 4096]).unwrap();
-            writer.send(write, &Arc::<str>::from("stalled"));
+            writer.send(write, &Arc::new(ClipboardContent::Text("stalled".into())));
             writer.cancel();
             let (read, write) = rustix::pipe::pipe().unwrap();
-            writer.send(write, &Arc::<str>::from("fresh"));
+            writer.send(write, &Arc::new(ClipboardContent::Text("fresh".into())));
             let mut fds = [PollFd::new(&read, PollFlags::IN)];
             assert!(poll(&mut fds, Some(&to_timespec(Duration::from_secs(1)))).unwrap() > 0);
             let mut bytes = [0u8; 5];
@@ -1028,22 +1212,183 @@ mod glue {
             assert_eq!(&bytes, b"fresh");
         }
 
+        #[test]
+        fn png_source_serves_the_original_bytes() {
+            let png = b"\x89PNG\r\n\x1a\nnative bytes\xff\0".to_vec();
+            let content = Arc::new(ClipboardContent::Image { png: png.clone() });
+            assert_eq!(content.kind().mime(), "image/png");
+            let writer = TransferWriter::new().unwrap();
+            let (read, write) = rustix::pipe::pipe().unwrap();
+            writer.send(write, &content);
+            assert_eq!(
+                read_bounded(&read, clipboard::MAX_IMAGE_BYTES, Duration::from_secs(1)),
+                Ok(png)
+            );
+        }
+
+        #[test]
+        fn secret_png_is_not_requested_and_reports_marker_only_invalidation() {
+            for value in [Some(b"secret".as_slice()), None] {
+                let markers: Vec<_> = kde_hint_marker(true, value).into_iter().collect();
+                let (read, write) = rustix::pipe::pipe().unwrap();
+                let png = b"\x89PNG\r\n\x1a\nsecret";
+                rustix::io::write(&write, png).unwrap();
+                drop(write);
+                let mut requested = false;
+                assert_eq!(
+                    read_content(
+                        || {
+                            requested = true;
+                            None
+                        },
+                        ContentKind::Png,
+                        &markers,
+                        Duration::from_secs(1),
+                    ),
+                    Ok(ClipboardContent::Text(String::new()))
+                );
+                assert!(!requested, "secret PNG receive must not be requested");
+                assert_eq!(
+                    read_bounded(&read, 64, Duration::from_secs(1)),
+                    Ok(png.to_vec()),
+                    "secret check must leave all PNG bytes unread"
+                );
+            }
+        }
+
+        #[test]
+        fn png_pipe_checks_signature_and_preserves_native_bytes() {
+            for bytes in [
+                b"\x89PNG\r\n\x1a\noriginal\xff".as_slice(),
+                b"not a PNG".as_slice(),
+            ] {
+                let (read, write) = rustix::pipe::pipe().unwrap();
+                rustix::io::write(&write, bytes).unwrap();
+                drop(write);
+                let content =
+                    read_content(|| Some(read), ContentKind::Png, &[], Duration::from_secs(1));
+                if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    assert_eq!(content.unwrap().as_bytes(), bytes);
+                } else {
+                    assert_eq!(content, Err(clipboard::ClipboardError::Invalid));
+                }
+            }
+        }
+
+        #[test]
+        fn text_keeps_secret_markers_and_requires_utf8() {
+            for bytes in ["привет".as_bytes(), b"\xff".as_slice(), b"".as_slice()] {
+                let (read, write) = rustix::pipe::pipe().unwrap();
+                rustix::io::write(&write, bytes).unwrap();
+                drop(write);
+                let content = read_content(
+                    || Some(read),
+                    ContentKind::Text,
+                    &[clipboard::Marker::KdeSecret],
+                    Duration::from_secs(1),
+                );
+                assert_eq!(
+                    content,
+                    std::str::from_utf8(bytes)
+                        .map(|text| ClipboardContent::Text(text.to_owned()))
+                        .map_err(|_| clipboard::ClipboardError::Invalid)
+                );
+            }
+        }
+
+        #[test]
+        fn png_pipe_enforces_the_32_mib_cap() {
+            assert_eq!(ContentKind::Png.hard_max_bytes(), 32 * 1024 * 1024);
+            for extra in [0, 1] {
+                let (read, write) = rustix::pipe::pipe().unwrap();
+                let total = clipboard::MAX_IMAGE_BYTES as usize + extra;
+                let source = std::thread::spawn(move || {
+                    let mut file = std::fs::File::from(write);
+                    file.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+                    let chunk = [0u8; 8192];
+                    let mut left = total - 8;
+                    while left > 0 {
+                        let count = left.min(chunk.len());
+                        if file.write_all(&chunk[..count]).is_err() {
+                            break;
+                        }
+                        left -= count;
+                    }
+                });
+                let result = read_bounded(
+                    &read,
+                    ContentKind::Png.hard_max_bytes(),
+                    Duration::from_secs(5),
+                );
+                drop(read);
+                source.join().unwrap();
+                if extra == 0 {
+                    let content = ClipboardContent::from_bytes(ContentKind::Png, result.unwrap())
+                        .expect("PNG at hard cap");
+                    assert_eq!(content.len(), total);
+                } else {
+                    assert_eq!(result, Err(PayloadError::TooLarge));
+                }
+            }
+        }
+
+        #[test]
+        fn stalled_png_pipe_times_out() {
+            let (read, _write) = rustix::pipe::pipe().unwrap();
+            assert_eq!(
+                read_bounded(
+                    &read,
+                    ContentKind::Png.hard_max_bytes(),
+                    Duration::from_millis(10),
+                ),
+                Err(PayloadError::Timeout)
+            );
+        }
+
+        #[tokio::test]
+        async fn png_apply_moves_owned_bytes_and_waits_for_confirmation() {
+            let (clipboard, worker) = fake_clipboard();
+            let png = b"\x89PNG\r\n\x1a\nowned".to_vec();
+            let pointer = png.as_ptr();
+            let apply = clipboard.begin_set_content(Some(ClipboardContent::Image { png }));
+            let Command::Set { content, applied } = worker.try_recv().unwrap() else {
+                panic!("expected selection command");
+            };
+            assert_eq!(content.unwrap().as_bytes().as_ptr(), pointer);
+            tokio::pin!(apply);
+            assert!(futures_util::poll!(&mut apply).is_pending());
+            applied.send(Ok(())).unwrap();
+            assert_eq!(apply.await, Ok(()));
+        }
+
         fn fake_clipboard() -> (Clipboard, Receiver<Command>) {
             let (commands, receiver) = mpsc::channel();
             let (_, changes) = mpsc::channel();
-            (Clipboard { commands, changes }, receiver)
+            (
+                Clipboard {
+                    commands,
+                    changes,
+                    disconnected: false,
+                },
+                receiver,
+            )
         }
 
         #[tokio::test]
         async fn set_waits_for_worker_confirmation_not_command_enqueue() {
             let (clipboard, worker) = fake_clipboard();
-            let apply = clipboard.set_text(Some("clipboard fixture"));
+            let apply = clipboard
+                .begin_set_content(Some(ClipboardContent::Text("clipboard fixture".into())));
             tokio::pin!(apply);
             assert!(futures_util::poll!(&mut apply).is_pending());
-            let Command::Set { text, applied } = worker.try_recv().expect("queued command") else {
+            let Command::Set { content, applied } = worker.try_recv().expect("queued command")
+            else {
                 panic!("expected selection command");
             };
-            assert_eq!(text.as_deref(), Some("clipboard fixture"));
+            assert_eq!(
+                content,
+                Some(ClipboardContent::Text("clipboard fixture".into()))
+            );
             assert!(
                 futures_util::poll!(&mut apply).is_pending(),
                 "dequeue is not compositor confirmation"
@@ -1056,14 +1401,14 @@ mod glue {
         async fn set_propagates_worker_failure_and_disconnection() {
             for explicit_failure in [false, true] {
                 let (clipboard, worker) = fake_clipboard();
-                let apply = clipboard.set_text(None);
+                let apply = clipboard.begin_set_content(None);
                 tokio::pin!(apply);
                 assert!(futures_util::poll!(&mut apply).is_pending());
-                let Command::Set { text, applied } = worker.try_recv().expect("queued command")
+                let Command::Set { content, applied } = worker.try_recv().expect("queued command")
                 else {
                     panic!("expected selection command");
                 };
-                assert!(text.is_none());
+                assert!(content.is_none());
                 if explicit_failure {
                     applied
                         .send(Err("display connection failed".to_owned()))
@@ -1075,13 +1420,17 @@ mod glue {
             }
             let (clipboard, worker) = fake_clipboard();
             drop(worker);
-            assert!(clipboard.set_text(Some("not queued")).await.is_err());
+            assert!(clipboard
+                .begin_set_content(Some(ClipboardContent::Text("not queued".into())))
+                .await
+                .is_err());
         }
 
         #[tokio::test]
         async fn unconfirmed_selection_times_out_and_cannot_acknowledge_success_later() {
             let (clipboard, worker) = fake_clipboard();
-            let apply = clipboard.set_text(Some("clipboard fixture"));
+            let apply = clipboard
+                .begin_set_content(Some(ClipboardContent::Text("clipboard fixture".into())));
             tokio::pin!(apply);
             assert!(futures_util::poll!(&mut apply).is_pending());
             let Command::Set { applied, .. } = worker.try_recv().expect("queued command") else {
@@ -1133,15 +1482,20 @@ mod tests {
     }
 
     #[test]
-    fn only_utf8_payloads_are_text() {
-        assert_eq!(decode_text("привет".as_bytes()), Ok("привет".to_owned()));
-        assert_eq!(decode_text(b""), Ok(String::new()));
-        assert_eq!(decode_text(&[0xff, 0xfe]), Err(PayloadError::NotText));
-        // The codes are the ones the logs carry.
-        assert_eq!(PayloadError::NotText.as_str(), "not-utf8");
-        assert_eq!(PayloadError::TooLarge.as_str(), "too-large");
-        assert_eq!(PayloadError::Timeout.as_str(), "timeout");
-        assert_eq!(PayloadError::Io.as_str(), "io");
+    fn text_wins_then_png_and_other_selections_are_ignored() {
+        assert_eq!(
+            content_mime_of(&mimes(&[IMAGE_MIME, "text/plain"])),
+            Some(("text/plain", ContentKind::Text))
+        );
+        assert_eq!(
+            content_mime_of(&mimes(&["text/html", IMAGE_MIME])),
+            Some((IMAGE_MIME, ContentKind::Png))
+        );
+        assert_eq!(
+            content_mime_of(&mimes(&["image/jpeg", "text/uri-list"])),
+            None
+        );
+        assert_eq!(content_mime_of(&[]), None);
     }
 
     #[test]
@@ -1166,14 +1520,21 @@ mod tests {
 
     #[test]
     fn an_echo_is_swallowed_once_and_a_real_copy_never_is() {
-        let mut applied = Some("copied on this machine".to_owned());
-        assert!(!swallow_echo(&mut applied, "something else"));
-        assert_eq!(applied.as_deref(), Some("copied on this machine"));
-        assert!(swallow_echo(&mut applied, "copied on this machine"));
-        assert_eq!(applied, None);
-        // The same text copied again by the user is reported, not swallowed.
-        assert!(!swallow_echo(&mut applied, "copied on this machine"));
-        let mut nothing = None;
-        assert!(!swallow_echo(&mut nothing, ""));
+        for content in [
+            ClipboardContent::Text("copied on this machine".into()),
+            ClipboardContent::Image {
+                png: b"\x89PNG\r\n\x1a\nunchanged".to_vec(),
+            },
+        ] {
+            let mut applied = Some(Arc::new(content.clone()));
+            assert!(!swallow_echo(
+                &mut applied,
+                &ClipboardContent::Text("other".into())
+            ));
+            assert_eq!(applied.as_deref(), Some(&content));
+            assert!(swallow_echo(&mut applied, &content));
+            assert_eq!(applied, None);
+            assert!(!swallow_echo(&mut applied, &content));
+        }
     }
 }

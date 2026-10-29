@@ -1,6 +1,7 @@
 //! Session-only clipboard history. Full text stays in memory and secret items are never retained.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::ipc;
@@ -11,6 +12,8 @@ const PREVIEW_CHARS: usize = 120;
 struct Item {
     entry: ipc::ClipboardHistoryEntry,
     text: String,
+    payload: Arc<Vec<u8>>,
+    sha256: [u8; 32],
 }
 
 /// The last 30 transferred text items, newest first; owned by the core session.
@@ -23,11 +26,13 @@ pub struct History {
 impl History {
     /// Retains a completed transfer, unless secret-marked or the ID space is exhausted.
     /// Repeated and empty texts are transfers too; each receives its own stable ID.
-    pub fn record(
+    pub fn record_prepared(
         &mut self,
         direction: ipc::ClipboardHistoryDirection,
         peer_name: String,
         text: String,
+        payload: Arc<Vec<u8>>,
+        sha256: [u8; 32],
         secret: bool,
     ) -> Option<u64> {
         if secret {
@@ -51,9 +56,37 @@ impl History {
         if self.items.len() == CAPACITY {
             self.items.pop_back();
         }
-        self.items.push_front(Item { entry, text });
+        self.items.push_front(Item {
+            entry,
+            text,
+            payload,
+            sha256,
+        });
         self.last_id = id;
         Some(id)
+    }
+
+    #[cfg(test)]
+    fn record(
+        &mut self,
+        direction: ipc::ClipboardHistoryDirection,
+        peer_name: String,
+        text: String,
+        secret: bool,
+    ) -> Option<u64> {
+        let payload = Arc::new(text.as_bytes().to_vec());
+        let sha256 = clipboard::sha256(text.as_bytes())
+            .try_into()
+            .expect("SHA-256 length");
+        self.record_prepared(direction, peer_name, text, payload, sha256, secret)
+    }
+
+    /// Reuses worker-prepared bytes and digest without hashing or copying on the session.
+    pub fn prepared(&self, id: u64) -> Option<(Arc<Vec<u8>>, [u8; 32])> {
+        self.items
+            .iter()
+            .find(|item| item.entry.id == id)
+            .map(|item| (Arc::clone(&item.payload), item.sha256))
     }
 
     /// Returns metadata only, newest first; full payloads are fetched separately.
@@ -80,6 +113,28 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_payload_reuses_the_verified_allocation_and_digest() {
+        let mut history = History::default();
+        let payload = Arc::new(b"prepared text".to_vec());
+        let digest = [7; 32];
+        let id = history
+            .record_prepared(
+                ipc::ClipboardHistoryDirection::Copied,
+                "WORKSTATION".to_owned(),
+                "prepared text".to_owned(),
+                Arc::clone(&payload),
+                digest,
+                false,
+            )
+            .expect("retained");
+        let (retained, hash) = history.prepared(id).expect("prepared item");
+        assert!(Arc::ptr_eq(&retained, &payload));
+        assert_eq!(hash, digest);
+        history.clear();
+        assert!(history.prepared(id).is_none());
+    }
 
     #[test]
     fn retains_the_latest_thirty_transfers_newest_first() {

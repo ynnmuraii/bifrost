@@ -279,6 +279,8 @@ pub enum Request {
     RegisterUpdateCoordinator,
     /// `SetClipboard`.
     SetClipboard,
+    /// Persist `[clipboard].images` and apply it live.
+    SetClipboardImages,
     /// Persist LAN discovery through the core.
     SetDiscovery,
     SetGameGuard,
@@ -326,6 +328,7 @@ impl Request {
             Request::SetRemoteUpdate => text(lang, Key::AllowRemoteUpdates),
             Request::RegisterUpdateCoordinator => text(lang, Key::State),
             Request::SetClipboard => text(lang, Key::TheClipboard),
+            Request::SetClipboardImages => text(lang, Key::Images),
             Request::SetDiscovery => text(lang, Key::LanDiscovery),
             Request::SetGameGuard => text(lang, Key::GameMode),
             Request::GetClipboardHistory => text(lang, Key::TheClipboardHistory),
@@ -699,6 +702,8 @@ impl Pairing {
 pub struct Settings {
     /// What a clipboard toggle asked for, until `Status` shows it or the core refuses.
     pub clipboard_pending: Option<bool>,
+    /// What the images toggle asked for, until `Status` shows it or the core refuses.
+    pub clipboard_images_pending: Option<bool>,
     /// Requested discovery state until the core publishes it or refuses.
     pub discovery_pending: Option<bool>,
     pub game_guard_apps_open: bool,
@@ -1054,6 +1059,7 @@ impl ViewModel {
         // The save in flight died with the link, and a draft nobody can send is not kept.
         self.editor.save = Save::default();
         self.settings.clipboard_pending = None;
+        self.settings.clipboard_images_pending = None;
         self.settings.discovery_pending = None;
         self.restore_placement();
         // A pairing window belongs to the connection that opened it; the core closes it on
@@ -1560,6 +1566,17 @@ impl ViewModel {
         {
             self.settings.clipboard_pending = None;
         }
+        // The images switch settles from the same pushed status, independently of the
+        // clipboard one: core answers its own request with the same committed flag.
+        if self.settings.clipboard_images_pending.is_some()
+            && (self.settings.clipboard_images_pending == Some(status.clipboard_images)
+                || !self
+                    .inflight
+                    .iter()
+                    .any(|inflight| inflight.request == Request::SetClipboardImages))
+        {
+            self.settings.clipboard_images_pending = None;
+        }
         self.config.discovery_enabled = status.discovery_enabled;
         self.config.accept_pairing_requests = status.accept_pairing_requests;
         if self.settings.discovery_pending.is_some()
@@ -1797,6 +1814,7 @@ impl ViewModel {
             if !matches!(
                 request,
                 Request::SetClipboard
+                    | Request::SetClipboardImages
                     | Request::SetClipboardPolicy
                     | Request::SetAppearance
                     | Request::SetDiscovery
@@ -1826,6 +1844,7 @@ impl ViewModel {
                         .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
                 }
                 Request::SetClipboardPolicy
+                | Request::SetClipboardImages
                 | Request::SetAppearance
                 | Request::SetDiscovery
                 | Request::SetPairingRequests
@@ -1843,6 +1862,9 @@ impl ViewModel {
         self.push_log(format!("{}: {}", request.label(lang), failure));
         if request == Request::SetClipboard {
             self.settings.clipboard_pending = None;
+        }
+        if request == Request::SetClipboardImages {
+            self.settings.clipboard_images_pending = None;
         }
         if request == Request::SetDiscovery {
             self.settings.discovery_pending = None;
@@ -2072,6 +2094,40 @@ impl ViewModel {
         status.is_owner
             && !status.owner_node_id.is_empty()
             && member.node_id == status.owner_node_id
+    }
+
+    /// The persisted images option in force, including a switch still on the wire.
+    pub fn clipboard_images_enabled(&self) -> bool {
+        self.settings
+            .clipboard_images_pending
+            .unwrap_or_else(|| self.status.as_ref().is_some_and(|s| s.clipboard_images))
+    }
+
+    /// `true` when this computer's backend reported the `CLIPBOARD_IMAGE` capability.
+    pub fn clipboard_images_supported(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| status.clipboard_images_supported)
+    }
+
+    /// Whether the «Изображения» switch can do something: sharing is on, this computer can
+    /// carry PNG, the text backend is not missing, and no clipboard switch is on the wire.
+    pub fn clipboard_images_editable(&self) -> bool {
+        let Some(status) = self.status.as_ref() else {
+            return false;
+        };
+        self.connection.is_connected()
+            && status.clipboard_enabled
+            && !self.capability_missing("TEXT_CLIPBOARD")
+            && self.clipboard_images_supported()
+            && self.settings.clipboard_pending.is_none()
+            && self.settings.clipboard_images_pending.is_none()
+            && !self.inflight.iter().any(|request| {
+                matches!(
+                    request.request,
+                    Request::SetClipboard | Request::SetClipboardImages
+                )
+            })
     }
 
     /// `true` when the core named `code` among the capabilities the active backend cannot
@@ -2420,6 +2476,9 @@ impl ViewModel {
                 self.look.dock_open = true;
             }
             Action::SetClipboard(enabled) => self.settings.clipboard_pending = Some(*enabled),
+            Action::SetClipboardImages(enabled) => {
+                self.settings.clipboard_images_pending = Some(*enabled);
+            }
             Action::SetDiscovery(enabled) => self.settings.discovery_pending = Some(*enabled),
             Action::ToggleGameGuardApps => {
                 self.settings.game_guard_apps_open = !self.settings.game_guard_apps_open
@@ -2627,6 +2686,8 @@ pub enum Action {
     },
     /// Turn the shared clipboard on or off.
     SetClipboard(bool),
+    /// Allow or refuse PNG images through the shared clipboard.
+    SetClipboardImages(bool),
     /// Persist routing mode and the current service-owned settling delay.
     SetClipboardPolicy {
         policy: String,
@@ -2854,6 +2915,10 @@ impl Action {
             Action::SetClipboard(enabled) => (
                 Request::SetClipboard,
                 Msg::SetClipboard(ipc::SetClipboard { enabled: *enabled }),
+            ),
+            Action::SetClipboardImages(enabled) => (
+                Request::SetClipboardImages,
+                Msg::SetClipboardImages(ipc::SetClipboardImages { enabled: *enabled }),
             ),
             Action::SetClipboardPolicy { policy, settle_ms } => (
                 Request::SetClipboardPolicy,
@@ -4009,6 +4074,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::PairingResult(_) => "PairingResult",
         Msg::UpdateTopology(_) => "UpdateTopology",
         Msg::SetClipboard(_) => "SetClipboard",
+        Msg::SetClipboardImages(_) => "SetClipboardImages",
         Msg::SetClipboardPolicy(_) => "SetClipboardPolicy",
         Msg::SendClipboardHistoryItem(_) => "SendClipboardHistoryItem",
         Msg::SetDiscovery(_) => "SetDiscovery",
@@ -4094,6 +4160,7 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::SetRemoteUpdate => text(lang, Key::AllowRemoteUpdates).to_owned(),
         Request::RegisterUpdateCoordinator => text(lang, Key::TheCoreAnswered).to_owned(),
         Request::SetClipboard => text(lang, Key::TheClipboardWasSwitched).to_owned(),
+        Request::SetClipboardImages => text(lang, Key::Images).to_owned(),
         Request::GetClipboardHistory => text(lang, Key::TheClipboardHistoryIsRefreshed).to_owned(),
         Request::CopyClipboardHistory => text(lang, Key::TheTextIsCopied).to_owned(),
         Request::SendClipboardHistory => text(lang, Key::SendClipboardTo).to_owned(),

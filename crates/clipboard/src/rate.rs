@@ -65,6 +65,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_image_and_one_byte_rates_keep_one_bucket_only() {
+        for bytes_per_s in [
+            DEFAULT_RATE_BYTES_PER_S,
+            crate::DEFAULT_IMAGE_RATE_BYTES_PER_S,
+            1,
+        ] {
+            let mut rate = Rate::new(bytes_per_s, 0);
+            assert_eq!(rate.delay_ms(bytes_per_s, 0), 0);
+            assert_eq!(rate.delay_ms(bytes_per_s, 0), 1000);
+            assert_eq!(rate.delay_ms(bytes_per_s, 60_000), 0);
+            assert!(rate.delay_ms(1, 60_000) >= 1);
+        }
+    }
+
+    #[test]
     fn a_full_bucket_sends_at_once_and_an_empty_one_waits() {
         let mut rate = Rate::new(1000, 0);
         // The bucket starts full: one second's worth goes immediately.

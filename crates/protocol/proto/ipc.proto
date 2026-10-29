@@ -247,23 +247,30 @@ message AgentError { string code = 1; string detail = 2; } // never contains key
 message ClipboardChanged {
   uint64 origin_version = 1;   // the agent's monotonic counter of its own clipboard changes
   uint32 chunk_index = 2;      // zero-based
-  uint32 chunk_count = 3;      // 1..=64; a payload that fits one frame has count 1, and 64
-                               // frames of 32 KiB reach 2 MiB — more than the 1 MiB the policy
-                               // refuses, so a copy over the limit is still *reported* and
-                               // refused by core's policy rather than dropped by the agent
-  bytes data = 4;              // UTF-8 text, <= 32768 bytes
+  uint32 chunk_count = 3;      // text 1..64 (reports up to 2 MiB); PNG 1..1024 (32 MiB)
+  bytes data = 4;              // original payload bytes, <= 32768 bytes
   uint64 size_bytes = 5;       // the whole payload's size, repeated on every chunk
   repeated string markers = 6; // secret markers the platform reported: exclude_from_monitor |
                                // no_history | viewer_ignore | kde_secret | portal_secret
   bytes sha256 = 7;            // of the whole payload; present on the last chunk only
+  string mime = 8;             // empty legacy value means text/plain;charset=utf-8
 }
+// A superseded partial IPC apply may fail with an empty hash: core resolves its exact
+// local sequence to the stored digest. Success and network ACKs always use the full hash.
 message ClipboardApplied { uint64 origin_version = 1; bytes sha256 = 2; bool ok = 3; string detail = 4; }
+// chunk_count=0, image/png cancels pre-native PNG work only: never clear the native
+// clipboard or stop an already running write. Preserve all text work and sequences.
+// origin_version targets an apply identity, or 0 for generic pre-native PNG revoke.
+// Canceled applies produce terminal failure ACKs; running writes finish/ACK normally.
+// Empty legacy MIME is the explicit all-content release, not a settings toggle.
 message SetClipboardText {
   uint64 origin_version = 1;   // node-local apply sequence; core maps it back to the peer's wire version
   uint32 chunk_index = 2;      // zero-based
-  uint32 chunk_count = 3;      // 1..=64; 0 releases the selection and forgets the text
-  bytes data = 4;              // UTF-8 text, <= 32768 bytes
+  uint32 chunk_count = 3;      // text 1..64 / <=1 MiB; PNG 1..1024; 0 is the release above
+  bytes data = 4;              // original payload bytes, <= 32768 bytes
   bytes sha256 = 5;            // of the whole payload; present on the last chunk only
+  string mime = 6;             // empty legacy value means text/plain;charset=utf-8
+  optional uint64 size_bytes = 7; // whole payload size on every chunk; required for PNG
 }
 
 // ---------- gui <-> core ----------
@@ -278,6 +285,7 @@ message GuiFrame {
     PairingAnswer pairing_answer = 14;
     UpdateTopology update_topology = 15; // any node; the edit is forwarded to the coordinator
     SetClipboard set_clipboard = 16;
+    SetClipboardImages set_clipboard_images = 60; // persist `[clipboard].images` and apply it live
     SetAppearance set_appearance = 30;
     RevokePeer revoke_peer = 17;
     ExportDiagnostics export_diagnostics = 18;
@@ -353,6 +361,7 @@ message OutgoingPairingRequest {
 }
 message UpdateTopology { bytes layout_toml = 1; uint64 expected_revision = 2; bytes expected_author = 3; } // any node; coordinator applies (CAS)
 message SetClipboard { bool enabled = 1; }
+message SetClipboardImages { bool enabled = 1; }
 message SetClipboardPolicy { string policy = 1; uint32 settle_ms = 2; }
 message SetAppearance { bool edge_effects = 1; bool hide_remote_cursor = 2; } // core saves `[appearance]` under the config lock and pushes SetEffects to the agent at once
 message SetDiscovery { bool enabled = 1; } // core saves under the config lock and updates live discovery
@@ -442,6 +451,8 @@ message Status {
   uint64 unpair_notice_id = 44; // monotonically increasing; 0 means no notice
   bool accept_pairing_requests = 45;
   string active_peer_node_id = 46; // authoritative input target, hex NodeId; empty when local/unknown
+  bool clipboard_images = 47; // persisted `[clipboard].images`, not a GUI-local preference
+  bool clipboard_images_supported = 48; // this computer's backend reported CLIPBOARD_IMAGE
 }
 message PendingUnpairNotice {
   string node_id = 1;

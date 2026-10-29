@@ -929,6 +929,13 @@ pub struct ClipboardConfig {
     /// Per-channel rate limit.
     #[serde(default = "default_clipboard_rate")]
     pub rate_bytes_per_s: u64,
+    /// Image opt-in; backend capability remains independent.
+    #[serde(default)]
+    pub images: bool,
+    #[serde(default = "default_clipboard_max_image_bytes")]
+    pub max_image_bytes: u64,
+    #[serde(default = "default_clipboard_image_rate")]
+    pub image_rate_bytes_per_s: u64,
     /// When an offered payload is requested.
     #[serde(default)]
     pub transfer: ClipboardTransfer,
@@ -950,6 +957,9 @@ impl Default for ClipboardConfig {
             skip_secret_marked: true,
             max_bytes: default_clipboard_max_bytes(),
             rate_bytes_per_s: default_clipboard_rate(),
+            images: false,
+            max_image_bytes: default_clipboard_max_image_bytes(),
+            image_rate_bytes_per_s: default_clipboard_image_rate(),
             transfer: ClipboardTransfer::default(),
             policy: ClipboardRoutingPolicy::default(),
             settle_ms: default_clipboard_settle_ms(),
@@ -963,6 +973,14 @@ fn default_clipboard_max_bytes() -> u64 {
 
 fn default_clipboard_rate() -> u64 {
     262_144
+}
+
+fn default_clipboard_max_image_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_clipboard_image_rate() -> u64 {
+    8 * 1024 * 1024
 }
 
 fn default_clipboard_settle_ms() -> u32 {
@@ -990,6 +1008,21 @@ impl ClipboardConfig {
                 "clipboard.rate_bytes_per_s",
                 self.rate_bytes_per_s,
                 ">= 1 (default 262144, 256 KiB/s per channel)",
+            ));
+        }
+        if self.max_image_bytes > protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD_BYTES {
+            return Err(ConfigError::coded(
+                ErrorCode::Clipboard,
+                "clipboard.max_image_bytes",
+                self.max_image_bytes,
+                "0..=33554432 (32 MiB protocol limit)",
+            ));
+        }
+        if self.image_rate_bytes_per_s == 0 {
+            return Err(ConfigError::invalid(
+                "clipboard.image_rate_bytes_per_s",
+                self.image_rate_bytes_per_s,
+                ">= 1 (default 8388608, 8 MiB/s per channel)",
             ));
         }
         Ok(())

@@ -14,7 +14,7 @@
 
 use crate::echo::{Echo, EchoDecision};
 use crate::policy::{Content, Decision, Marker, Policy};
-use crate::{ClipboardError, MAX_BYTES, MIME};
+use crate::{ClipboardError, ContentKind};
 
 /// One offer as the wire carries it (`ClipboardOffer`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub struct Offer {
     pub origin: [u8; 32],
     /// That node's version counter.
     pub version: u64,
-    /// Always [`MIME`]: ADR-008 allows text only.
+    /// Exact text or PNG wire MIME.
     pub mime: String,
     /// Payload size in bytes.
     pub size: u64,
@@ -37,10 +37,8 @@ impl Offer {
     /// The two refusals are distinct on purpose: `CLIPBOARD_TOO_LARGE` is a size the peer
     /// could shrink, `CLIPBOARD_INVALID` is a payload this node will never accept.
     pub fn is_acceptable(&self) -> Result<(), ClipboardError> {
-        if self.mime != MIME {
-            return Err(ClipboardError::Invalid);
-        }
-        if self.size > MAX_BYTES {
+        let kind = ContentKind::from_mime(&self.mime)?;
+        if self.size > kind.hard_max_bytes() {
             return Err(ClipboardError::TooLarge);
         }
         Ok(())
@@ -121,7 +119,7 @@ impl Source {
             offer_id,
             origin: self.origin,
             version: self.version,
-            mime: MIME.to_owned(),
+            mime: content.kind.mime().to_owned(),
             size: content.bytes,
         })
     }
@@ -141,8 +139,13 @@ impl Source {
             return Err(ClipboardError::Disabled);
         }
         offer.is_acceptable()?;
-        if offer.size > policy.max_bytes {
-            return Err(ClipboardError::TooLarge);
+        let content = Content {
+            kind: ContentKind::from_mime(&offer.mime)?,
+            bytes: offer.size,
+            markers: Vec::new(),
+        };
+        if let Decision::Refuse(reason) = policy.decide(&content) {
+            return Err(reason);
         }
         match self.echo.judge(&offer.origin, offer.version) {
             EchoDecision::Accept => Ok(Incoming::Request),
@@ -165,6 +168,7 @@ impl Source {
 mod tests {
     use super::*;
     use crate::policy::Content;
+    use crate::{MAX_BYTES, MIME};
 
     fn node(byte: u8) -> [u8; 32] {
         [byte; 32]
@@ -179,6 +183,7 @@ mod tests {
             enabled: true,
             skip_secret_marked: true,
             max_bytes: MAX_BYTES,
+            ..Policy::default()
         }
     }
 
@@ -304,7 +309,7 @@ mod tests {
             Err(ClipboardError::TooLarge)
         );
         let wrong_mime = Offer {
-            mime: "image/png".to_owned(),
+            mime: "image/jpeg".to_owned(),
             size: 10,
             ..too_big
         };
@@ -324,5 +329,46 @@ mod tests {
             source.incoming(&fine, &disabled),
             Err(ClipboardError::Disabled)
         );
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn source_preserves_png_mime_and_checks_independent_policy() {
+        let mut source = Source::new([1; 32]);
+        let content = Content {
+            kind: ContentKind::Png,
+            bytes: 8,
+            markers: Vec::new(),
+        };
+        let mut policy = Policy {
+            enabled: true,
+            images: true,
+            ..Policy::default()
+        };
+        let offer = source
+            .local_copy(&content, &[], &policy, [7; 16])
+            .expect("PNG offer");
+        assert_eq!(offer.mime, "image/png");
+        assert_eq!(source.incoming(&offer, &policy), Ok(Incoming::Request));
+        policy.images = false;
+        assert_eq!(
+            source.incoming(&offer, &policy),
+            Err(ClipboardError::Disabled)
+        );
+        policy.images = true;
+        policy.max_image_bytes = 0;
+        assert_eq!(
+            source.incoming(&offer, &policy),
+            Err(ClipboardError::TooLarge)
+        );
+        let oversized = Offer {
+            size: crate::MAX_IMAGE_BYTES + 1,
+            ..offer
+        };
+        assert_eq!(oversized.is_acceptable(), Err(ClipboardError::TooLarge));
     }
 }

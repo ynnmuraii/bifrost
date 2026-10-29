@@ -29,10 +29,11 @@
 //! connection is checked with `SO_PEERCRED`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ::ipc::transport::{self, Endpoint};
-use ::ipc::{AgentLink, IpcError, Watchdog};
+use ::ipc::{AgentLink, AgentSender, AgentSplit, IpcError, Watchdog};
 use protocol::ipc::{self, agent_frame::Msg, AgentMode};
 
 use crate::command::AgentState;
@@ -268,10 +269,105 @@ pub struct Supervisor {
     /// The kill-on-close job the current child lives in (see [`crate::job`]); dropping it
     /// kills the agent, which is what core wants whenever it owns no agent any more.
     job: Option<crate::job::KillOnCoreExit>,
-    link: Option<AgentLink<AgentStream>>,
+    link: Option<AgentSplit<AgentStream>>,
+    clipboard_producer: ClipboardProducer,
     /// Retained after attach until the agent consumes it or this launch is stopped.
     token_file: Option<LaunchTokenFile>,
     state: AgentState,
+}
+
+#[derive(Default)]
+struct ClipboardProducer {
+    task: Option<tokio::task::JoinHandle<()>>,
+    pending: Option<PendingClipboard>,
+}
+
+struct PendingClipboard {
+    /// The session's monotonic local apply generation, never a peer's wire version.
+    version: u64,
+    sha256: [u8; 32],
+    kind: clipboard::ContentKind,
+    _reservation: Option<Arc<crate::clipboard::IncomingReservation>>,
+}
+
+impl ClipboardProducer {
+    fn start(
+        &mut self,
+        sender: AgentSender,
+        version: u64,
+        bytes: Arc<Vec<u8>>,
+        sha256: [u8; 32],
+        kind: clipboard::ContentKind,
+        reservation: Option<Arc<crate::clipboard::IncomingReservation>>,
+    ) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        let generation = sender.replace_bulk();
+        self.pending = Some(PendingClipboard {
+            version,
+            sha256,
+            kind,
+            _reservation: reservation.clone(),
+        });
+        self.task = Some(tokio::spawn(stream_clipboard(
+            sender,
+            generation,
+            version,
+            bytes,
+            sha256,
+            kind,
+            reservation,
+        )));
+    }
+
+    fn cancel(&mut self, sender: Option<&AgentSender>) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(sender) = sender {
+            sender.replace_bulk();
+        }
+        self.pending = None;
+    }
+
+    fn revoke_images(&mut self, sender: Option<&AgentSender>) -> Option<u64> {
+        let version = self
+            .pending
+            .as_ref()
+            .filter(|pending| pending.kind == clipboard::ContentKind::Png)?
+            .version;
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(sender) = sender {
+            sender.replace_bulk();
+        }
+        Some(version)
+    }
+
+    fn pending_hash(&self, version: u64) -> Option<[u8; 32]> {
+        self.pending
+            .as_ref()
+            .filter(|pending| pending.version == version)
+            .map(|pending| pending.sha256)
+    }
+
+    fn applied(&mut self, version: u64, sha256: [u8; 32], ok: bool, sender: Option<&AgentSender>) {
+        if self.pending_hash(version) == Some(sha256) {
+            if !ok {
+                self.cancel(sender);
+            } else {
+                self.pending = None;
+            }
+        }
+    }
+}
+
+impl Drop for ClipboardProducer {
+    fn drop(&mut self) {
+        self.cancel(None);
+    }
 }
 
 impl Supervisor {
@@ -320,6 +416,7 @@ impl Supervisor {
             child: None,
             job: None,
             link: None,
+            clipboard_producer: ClipboardProducer::default(),
             token_file: None,
             state: AgentState::Starting,
         }
@@ -489,7 +586,7 @@ impl Supervisor {
             program = self.program.display().to_string().as_str(),
             "agent started"
         );
-        self.link = Some(link);
+        self.link = Some(link.into_split());
         self.token_file = Some(token_cleanup);
         Ok(())
     }
@@ -501,6 +598,15 @@ impl Supervisor {
 
     /// Sends one frame.
     pub async fn send(&mut self, message: Msg) -> Result<(), String> {
+        if let Msg::SetClipboardText(chunk) = &message {
+            if chunk.chunk_count == 0 {
+                if chunk.mime == clipboard::IMAGE_MIME {
+                    self.revoke_clipboard_images();
+                } else {
+                    self.cancel_clipboard();
+                }
+            }
+        }
         match self.link.as_mut() {
             Some(link) => {
                 let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
@@ -518,6 +624,51 @@ impl Supervisor {
             }
             None => Err("no agent is attached".to_owned()),
         }
+    }
+
+    fn cancel_clipboard(&mut self) {
+        let sender = self.link.as_ref().map(AgentSplit::sender);
+        self.clipboard_producer.cancel(sender.as_ref());
+    }
+
+    /// Stops only PNG production; its reservation waits for a terminal agent ACK.
+    pub fn revoke_clipboard_images(&mut self) -> Option<u64> {
+        let sender = self.link.as_ref().map(AgentSplit::sender);
+        self.clipboard_producer.revoke_images(sender.as_ref())
+    }
+
+    /// Canonical digest for an exact local apply identity, including history applies.
+    pub fn clipboard_pending_hash(&self, version: u64) -> Option<[u8; 32]> {
+        self.clipboard_producer.pending_hash(version)
+    }
+
+    /// A real native completion retires the corresponding reservation, not merely IPC enqueue.
+    pub fn clipboard_applied(&mut self, version: u64, sha256: [u8; 32], ok: bool) {
+        let sender = self.link.as_ref().map(AgentSplit::sender);
+        self.clipboard_producer
+            .applied(version, sha256, ok, sender.as_ref());
+    }
+
+    /// Start a latest-only bounded producer; all whole-payload work is already done.
+    pub fn send_clipboard(
+        &mut self,
+        version: u64,
+        bytes: Arc<Vec<u8>>,
+        sha256: [u8; 32],
+        kind: clipboard::ContentKind,
+        reservation: Option<Arc<crate::clipboard::IncomingReservation>>,
+    ) -> Result<(), String> {
+        if bytes.len() as u64 > kind.hard_max_bytes() {
+            return Err("clipboard payload exceeds its MIME limit".to_owned());
+        }
+        let sender = self
+            .link
+            .as_ref()
+            .ok_or_else(|| "no agent is attached".to_owned())?
+            .sender();
+        self.clipboard_producer
+            .start(sender, version, bytes, sha256, kind, reservation);
+        Ok(())
     }
 
     /// Receives one frame, or reports why the channel ended.
@@ -602,6 +753,7 @@ impl Supervisor {
 
     /// Kills the agent and drops the channel.
     pub async fn stop(&mut self) {
+        self.cancel_clipboard();
         self.link = None;
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
@@ -620,6 +772,7 @@ impl Supervisor {
 
     /// Requests the agent's orderly shutdown so it releases capture before exiting.
     pub async fn shutdown(&mut self) {
+        self.cancel_clipboard();
         let requested = if let Some(link) = self.link.as_mut() {
             link.send(Msg::Shutdown(ipc::AgentShutdown {}))
                 .await
@@ -702,6 +855,431 @@ impl Supervisor {
         // `NORMAL` one rather than trying to promote it.
         self.start(AgentMode::Normal).await?;
         Ok(counts)
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        self.cancel_clipboard();
+    }
+}
+
+/// Allocate only the current 32 KiB frame, with two queued frames at most.
+async fn stream_clipboard(
+    sender: AgentSender,
+    generation: u64,
+    version: u64,
+    bytes: Arc<Vec<u8>>,
+    sha256: [u8; 32],
+    kind: clipboard::ContentKind,
+    reservation: Option<Arc<crate::clipboard::IncomingReservation>>,
+) {
+    let _reservation = reservation;
+    const CHUNK_BYTES: usize = 32 * 1024;
+    let count = bytes.len().div_ceil(CHUNK_BYTES).max(1);
+    for index in 0..count {
+        let start = index * CHUNK_BYTES;
+        let end = (start + CHUNK_BYTES).min(bytes.len());
+        let message = Msg::SetClipboardText(ipc::SetClipboardText {
+            origin_version: version,
+            chunk_index: index as u32,
+            chunk_count: count as u32,
+            data: bytes[start..end].to_vec(),
+            sha256: if index + 1 == count {
+                sha256.to_vec()
+            } else {
+                Vec::new()
+            },
+            mime: kind.mime().to_owned(),
+            size_bytes: Some(bytes.len() as u64),
+        });
+        if sender.send_bulk(generation, message).await.is_err() {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_producer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn producer_chunks_lazily_and_hashes_only_last_frame() {
+        let (core, peer) = tokio::io::duplex(1024);
+        let link = AgentLink::new(core, 0, 3).into_split();
+        let sender = link.sender();
+        let generation = sender.replace_bulk();
+        let bytes: Arc<Vec<u8>> = Arc::from(vec![b'x'; 32769]);
+        let digest = [9; 32];
+        let producer = tokio::spawn(stream_clipboard(
+            sender,
+            generation,
+            17,
+            bytes,
+            digest,
+            clipboard::ContentKind::Text,
+            None,
+        ));
+        let mut peer = AgentLink::new(peer, 0, 3);
+        for index in 0..2 {
+            let frame = peer.recv().await.unwrap();
+            assert_eq!(frame.seq, index + 1);
+            let Some(Msg::SetClipboardText(chunk)) = frame.msg else {
+                panic!("expected clipboard frame");
+            };
+            assert_eq!(chunk.origin_version, 17);
+            assert_eq!(chunk.chunk_index, index as u32);
+            assert_eq!(chunk.chunk_count, 2);
+            assert_eq!(chunk.mime, clipboard::MIME);
+            assert_eq!(chunk.size_bytes, Some(32769));
+            assert_eq!(chunk.data.len(), if index == 0 { 32768 } else { 1 });
+            assert_eq!(
+                chunk.sha256,
+                if index == 0 {
+                    Vec::new()
+                } else {
+                    digest.to_vec()
+                }
+            );
+        }
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_clipboard_is_one_hashed_apply_not_release() {
+        let (core, peer) = tokio::io::duplex(1024);
+        let link = AgentLink::new(core, 0, 3).into_split();
+        let sender = link.sender();
+        let generation = sender.replace_bulk();
+        stream_clipboard(
+            sender,
+            generation,
+            18,
+            Arc::new(Vec::new()),
+            [4; 32],
+            clipboard::ContentKind::Text,
+            None,
+        )
+        .await;
+        let mut peer = AgentLink::new(peer, 0, 3);
+        let Some(Msg::SetClipboardText(chunk)) = peer.recv().await.unwrap().msg else {
+            panic!("expected clipboard frame");
+        };
+        assert_eq!(chunk.chunk_count, 1);
+        assert!(chunk.data.is_empty());
+        assert_eq!(chunk.sha256, [4; 32]);
+    }
+
+    #[tokio::test]
+    async fn a_maximum_png_stream_keeps_ipc_frames_bounded() {
+        let (core, peer) = tokio::io::duplex(65536);
+        let link = AgentLink::new(core, 0, 3).into_split();
+        let sender = link.sender();
+        let generation = sender.replace_bulk();
+        let bytes: Arc<Vec<u8>> = Arc::from(vec![7; 32 * 1024 * 1024]);
+        let producer = tokio::spawn(stream_clipboard(
+            sender,
+            generation,
+            19,
+            bytes,
+            [3; 32],
+            clipboard::ContentKind::Png,
+            None,
+        ));
+        let mut peer = AgentLink::new(peer, 0, 3);
+        for index in 0..1024 {
+            let Some(Msg::SetClipboardText(chunk)) = peer.recv().await.unwrap().msg else {
+                panic!("expected PNG clipboard frame");
+            };
+            assert_eq!(chunk.mime, "image/png");
+            assert_eq!(chunk.size_bytes, Some(33_554_432));
+            assert_eq!(chunk.chunk_count, 1024);
+            assert_eq!(chunk.chunk_index, index);
+            assert_eq!(chunk.data.len(), 32768);
+            assert_eq!(chunk.sha256.len(), if index == 1023 { 32 } else { 0 });
+        }
+        producer.await.unwrap();
+    }
+
+    struct Backpressured {
+        stream: tokio::io::DuplexStream,
+        blocked: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncRead for Backpressured {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Backpressured {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let result = std::pin::Pin::new(&mut this.stream).poll_write(cx, buf);
+            if result.is_pending() {
+                if let Some(blocked) = this.blocked.take() {
+                    let _ = blocked.send(());
+                }
+            }
+            result
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+        }
+    }
+
+    fn image_release(version: u64) -> Msg {
+        Msg::SetClipboardText(ipc::SetClipboardText {
+            origin_version: version,
+            mime: clipboard::IMAGE_MIME.to_owned(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn image_revoke_retains_stalled_producer_reservation_until_terminal_cancel() {
+        let (core, peer) = tokio::io::duplex(1);
+        let (blocked, wait) = tokio::sync::oneshot::channel();
+        let link = AgentLink::new(
+            Backpressured {
+                stream: core,
+                blocked: Some(blocked),
+            },
+            0,
+            3,
+        )
+        .into_split();
+        let sender = link.sender();
+        let mut producer = ClipboardProducer::default();
+        let bytes = Arc::new(vec![0; 4 * 32768]);
+        let reservation = Arc::new(crate::clipboard::IncomingReservation::for_test(
+            clipboard::ContentKind::Png,
+            bytes.len() as u64,
+        ));
+        let weak = Arc::downgrade(&reservation);
+        producer.start(
+            sender.clone(),
+            17,
+            bytes,
+            [7; 32],
+            clipboard::ContentKind::Png,
+            Some(reservation),
+        );
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(producer.revoke_images(Some(&sender)), Some(17));
+        sender.send(image_release(17)).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_some(), "revoke must await terminal ACK");
+        assert_eq!(producer.pending_hash(17), Some([7; 32]));
+        let mut peer = AgentLink::new(peer, 0, 3);
+        let Some(Msg::SetClipboardText(first)) = peer.recv().await.unwrap().msg else {
+            panic!("the already started frame finishes atomically");
+        };
+        assert_eq!(first.origin_version, 17);
+        let Some(Msg::SetClipboardText(release)) = peer.recv().await.unwrap().msg else {
+            panic!("targeted release follows the whole frame");
+        };
+        assert_eq!(release.origin_version, 17);
+        assert_eq!(release.chunk_count, 0);
+        assert_eq!(release.mime, clipboard::IMAGE_MIME);
+        producer.applied(17, [7; 32], false, Some(&sender));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal cancellation must drop the producer guard");
+        assert!(producer.pending.is_none());
+        producer.applied(17, [7; 32], false, Some(&sender));
+        assert!(tokio::time::timeout(Duration::from_millis(20), peer.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn image_revoke_preserves_newer_text_and_its_native_ack_reservation() {
+        let (core, peer) = tokio::io::duplex(1);
+        let (blocked, wait) = tokio::sync::oneshot::channel();
+        let link = AgentLink::new(
+            Backpressured {
+                stream: core,
+                blocked: Some(blocked),
+            },
+            0,
+            3,
+        )
+        .into_split();
+        let sender = link.sender();
+        let mut producer = ClipboardProducer::default();
+        producer.start(
+            sender.clone(),
+            41,
+            Arc::new(vec![0; 4 * 32768]),
+            [1; 32],
+            clipboard::ContentKind::Png,
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let reservation = Arc::new(crate::clipboard::IncomingReservation::for_test(
+            clipboard::ContentKind::Text,
+            70000,
+        ));
+        let weak = Arc::downgrade(&reservation);
+        producer.start(
+            sender.clone(),
+            42,
+            Arc::new(vec![b't'; 70000]),
+            [2; 32],
+            clipboard::ContentKind::Text,
+            Some(reservation),
+        );
+        assert_eq!(producer.revoke_images(Some(&sender)), None);
+        assert_eq!(producer.pending.as_ref().unwrap().version, 42);
+        sender.send(image_release(0)).await.unwrap();
+        let mut peer = AgentLink::new(peer, 0, 3);
+        let Some(Msg::SetClipboardText(first)) = peer.recv().await.unwrap().msg else {
+            panic!("PNG frame");
+        };
+        assert_eq!(first.origin_version, 41);
+        let Some(Msg::SetClipboardText(release)) = peer.recv().await.unwrap().msg else {
+            panic!("release");
+        };
+        assert_eq!(release.origin_version, 0);
+        for index in 0..3 {
+            let Some(Msg::SetClipboardText(text)) = peer.recv().await.unwrap().msg else {
+                panic!("text frame");
+            };
+            assert_eq!(text.origin_version, 42);
+            assert_eq!(text.chunk_index, index);
+            assert_eq!(text.mime, clipboard::MIME);
+        }
+        producer.task.take().unwrap().await.unwrap();
+        assert!(
+            weak.upgrade().is_some(),
+            "finishing IPC enqueue is not native completion"
+        );
+        producer.applied(41, [1; 32], false, Some(&sender));
+        producer.applied(42, [3; 32], false, Some(&sender));
+        assert!(
+            weak.upgrade().is_some(),
+            "stale/foreign ACK cannot retire this generation"
+        );
+        producer.applied(42, [2; 32], true, Some(&sender));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(producer.revoke_images(Some(&sender)), None);
+    }
+
+    #[tokio::test]
+    async fn verified_png_reservation_lives_past_revoke_until_matching_terminal_ack() {
+        for ok in [false, true] {
+            let (core, peer) = tokio::io::duplex(65536);
+            let link = AgentLink::new(core, 0, 3).into_split();
+            let sender = link.sender();
+            let mut producer = ClipboardProducer::default();
+            let reservation = Arc::new(crate::clipboard::IncomingReservation::for_test(
+                clipboard::ContentKind::Png,
+                8,
+            ));
+            let weak = Arc::downgrade(&reservation);
+            producer.start(
+                sender,
+                51,
+                Arc::new(b"\x89PNG\r\n\x1a\n".to_vec()),
+                [5; 32],
+                clipboard::ContentKind::Png,
+                Some(reservation),
+            );
+            let mut peer = AgentLink::new(peer, 0, 3);
+            assert!(matches!(
+                peer.recv().await.unwrap().msg,
+                Some(Msg::SetClipboardText(_))
+            ));
+            producer.task.take().unwrap().await.unwrap();
+            assert_eq!(producer.revoke_images(None), Some(51));
+            assert!(weak.upgrade().is_some());
+            producer.applied(50, [5; 32], ok, None);
+            producer.applied(51, [4; 32], ok, None);
+            assert!(weak.upgrade().is_some());
+            producer.applied(51, [5; 32], ok, None);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_aborts_stalled_producer_and_releases_its_guard() {
+        let (core, peer) = tokio::io::duplex(1);
+        let (blocked, wait) = tokio::sync::oneshot::channel();
+        let link = AgentLink::new(
+            Backpressured {
+                stream: core,
+                blocked: Some(blocked),
+            },
+            0,
+            3,
+        )
+        .into_split();
+        let sender = link.sender();
+        let mut producer = ClipboardProducer::default();
+        let reservation = Arc::new(crate::clipboard::IncomingReservation::for_test(
+            clipboard::ContentKind::Png,
+            4 * 32768,
+        ));
+        let weak = Arc::downgrade(&reservation);
+        producer.start(
+            sender.clone(),
+            71,
+            Arc::new(vec![0; 4 * 32768]),
+            [7; 32],
+            clipboard::ContentKind::Png,
+            Some(reservation),
+        );
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        producer.applied(71, [7; 32], false, Some(&sender));
+        assert!(producer.pending.is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal failure must abort the task's reservation clone");
+        let mut peer = AgentLink::new(peer, 0, 3);
+        let Some(Msg::SetClipboardText(first)) = peer.recv().await.unwrap().msg else {
+            panic!("the already started frame finishes atomically");
+        };
+        assert_eq!(first.origin_version, 71);
+        assert_eq!(first.chunk_index, 0);
+        assert!(tokio::time::timeout(Duration::from_millis(20), peer.recv())
+            .await
+            .is_err());
     }
 }
 

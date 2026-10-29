@@ -8,7 +8,7 @@ pub(super) struct State {
     pub peers: BTreeMap<NodeId, bool>,
     pub routing: Routing,
     pub hold: Option<Hold>,
-    applying: BTreeMap<(u64, [u8; 32]), (NodeId, u64)>,
+    applying: BTreeMap<(u64, [u8; 32]), (NodeId, u64, clipboard::ContentKind)>,
     apply_sequence: u64,
     apply_group: Option<(u64, u64, bool)>,
     forwards: BTreeMap<Key, NodeId>,
@@ -24,11 +24,34 @@ impl State {
             .expect("local clipboard apply sequence exhausted");
         self.apply_sequence
     }
-    fn begin_apply(&mut self, peer: NodeId, wire_version: u64, hash: [u8; 32]) {
+    fn begin_apply(
+        &mut self,
+        peer: NodeId,
+        wire_version: u64,
+        hash: [u8; 32],
+        kind: clipboard::ContentKind,
+    ) {
         let sequence = self.next_apply_sequence();
-        self.applying.retain(|_, (source, _)| *source != peer);
-        self.applying.insert((sequence, hash), (peer, wire_version));
+        self.applying.retain(|_, (source, _, _)| *source != peer);
+        self.applying
+            .insert((sequence, hash), (peer, wire_version, kind));
         self.apply_group = Some((wire_version, sequence, true));
+    }
+    fn applied_hash(
+        &self,
+        ack: &protocol::ipc::ClipboardApplied,
+        pending_hash: Option<[u8; 32]>,
+    ) -> Option<[u8; 32]> {
+        let canonical = pending_hash.or_else(|| {
+            self.applying
+                .keys()
+                .find_map(|(sequence, hash)| (*sequence == ack.origin_version).then_some(*hash))
+        })?;
+        if (!ack.ok && ack.sha256.is_empty()) || ack.sha256.as_slice() == canonical {
+            Some(canonical)
+        } else {
+            None
+        }
     }
     fn rewrite_apply_chunk(&mut self, chunk: &mut protocol::ipc::SetClipboardText) {
         let sequence = match self.apply_group {
@@ -376,10 +399,15 @@ impl Session {
         &mut self,
         ack: &protocol::ipc::ClipboardApplied,
     ) {
-        let Ok(hash) = <[u8; 32]>::try_from(ack.sha256.as_slice()) else {
+        let Some(hash) = self
+            .clipboard_follow
+            .applied_hash(ack, self.agent.clipboard_pending_hash(ack.origin_version))
+        else {
             return;
         };
-        if let Some((peer, wire_version)) = self
+        self.agent
+            .clipboard_applied(ack.origin_version, hash, ack.ok);
+        if let Some((peer, wire_version, _)) = self
             .clipboard_follow
             .applying
             .remove(&(ack.origin_version, hash))
@@ -633,7 +661,7 @@ impl Session {
         self.fail_clipboard_sends(peer, detail);
         self.clipboard_follow
             .applying
-            .retain(|_, (source, _)| *source != peer);
+            .retain(|_, (source, _, _)| *source != peer);
         let requests: Vec<_> = self
             .clipboard_follow
             .requested
@@ -690,11 +718,11 @@ impl Session {
         ) {
             return response("peer is offline or untrusted".into()).into();
         }
-        let Some(text) = self.clipboard_history.text(id) else {
+        let Some((payload, sha256)) = self.clipboard_history.prepared(id) else {
             return response("history item not found".into()).into();
         };
         let out = match self.clipboard.as_mut() {
-            Some(endpoint) => endpoint.send_text_to(peer, text).await,
+            Some(endpoint) => endpoint.send_prepared_to(peer, payload, sha256).await,
             None => Err("clipboard is disabled".into()),
         };
         let out = match out {
@@ -734,13 +762,39 @@ impl Session {
         self.apply_clipboard(out).await;
         Handled::Deferred(rx)
     }
-    pub(super) fn clipboard_apply_pending(&mut self, peer: NodeId, version: u64, hash: [u8; 32]) {
-        self.clipboard_follow.begin_apply(peer, version, hash);
+    pub(super) fn clipboard_apply_pending(
+        &mut self,
+        peer: NodeId,
+        version: u64,
+        hash: [u8; 32],
+        kind: clipboard::ContentKind,
+    ) {
+        self.clipboard_follow.begin_apply(peer, version, hash, kind);
     }
-    pub(super) fn prepare_clipboard_agent_frame(&mut self, frame: &mut Msg) {
-        if let Msg::SetClipboardText(chunk) = frame {
-            self.clipboard_follow.rewrite_apply_chunk(chunk);
-        }
+    pub(super) fn clipboard_payload_sequence(&mut self, version: u64) -> u64 {
+        let mut group = protocol::ipc::SetClipboardText {
+            origin_version: version,
+            chunk_count: 1,
+            ..Default::default()
+        };
+        self.clipboard_follow.rewrite_apply_chunk(&mut group);
+        group.origin_version
+    }
+
+    /// Revoke pre-native PNG work without retiring reservations or touching native ownership.
+    pub(super) async fn retire_clipboard_images(&mut self) -> Result<(), String> {
+        let sequence = self.agent.revoke_clipboard_images().unwrap_or(0);
+        self.agent
+            .send(protocol::ipc::agent_frame::Msg::SetClipboardText(
+                protocol::ipc::SetClipboardText {
+                    origin_version: sequence,
+                    chunk_count: 0,
+                    mime: clipboard::IMAGE_MIME.to_owned(),
+                    ..Default::default()
+                },
+            ))
+            .await?;
+        Ok(())
     }
     pub(super) async fn clipboard_delivery_failed(
         &mut self,
@@ -777,7 +831,7 @@ impl Session {
         self.clipboard_follow.hold = None;
     }
     pub(super) async fn fail_clipboard_applies(&mut self) {
-        for ((_, hash), (peer, version)) in std::mem::take(&mut self.clipboard_follow.applying) {
+        for ((_, hash), (peer, version, _)) in std::mem::take(&mut self.clipboard_follow.applying) {
             self.send_apply_ack(
                 peer,
                 version,
@@ -836,29 +890,126 @@ mod tests {
             } else {
                 Vec::new()
             },
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn image_terminal_cancel_retires_only_exact_mapping_and_preserves_text_group() {
+        let mut state = State::default();
+        state.begin_apply(node(1), 7, [9; 32], clipboard::ContentKind::Png);
+        let mut image = apply_chunk(7, 0, 1);
+        state.rewrite_apply_chunk(&mut image);
+        state.begin_apply(node(2), 7, [9; 32], clipboard::ContentKind::Text);
+        let mut first = apply_chunk(7, 0, 2);
+        state.rewrite_apply_chunk(&mut first);
+        let ack = protocol::ipc::ClipboardApplied {
+            origin_version: image.origin_version,
+            ok: false,
+            ..Default::default()
+        };
+        let hash = state.applied_hash(&ack, None).unwrap();
+        assert_eq!(hash, [9; 32]);
+        assert_eq!(
+            state.applying.remove(&(ack.origin_version, hash)),
+            Some((node(1), 7, clipboard::ContentKind::Png))
+        );
+        assert!(state
+            .applying
+            .contains_key(&(first.origin_version, [9; 32])));
+        assert_eq!(state.applied_hash(&ack, None), None);
+        let mut last = apply_chunk(7, 1, 2);
+        state.rewrite_apply_chunk(&mut last);
+        assert_eq!(last.origin_version, first.origin_version);
+        assert_eq!(state.applying.len(), 1);
+    }
+
+    #[test]
+    fn verified_cancel_and_native_success_resolve_retained_png_mapping() {
+        for ok in [false, true] {
+            let mut state = State::default();
+            state.begin_apply(node(1), 700, [9; 32], clipboard::ContentKind::Png);
+            let sequence = state.apply_sequence;
+            let ack = protocol::ipc::ClipboardApplied {
+                origin_version: sequence,
+                sha256: vec![9; 32],
+                ok,
+                ..Default::default()
+            };
+            let hash = state.applied_hash(&ack, None).unwrap();
+            assert_eq!(
+                state.applying.remove(&(sequence, hash)),
+                Some((node(1), 700, clipboard::ContentKind::Png))
+            );
+            assert_eq!(state.applied_hash(&ack, None), None);
+        }
+    }
+
+    #[test]
+    fn cancellation_hash_requires_exact_local_sequence_and_never_aliases_wire_version() {
+        let mut state = State::default();
+        state.begin_apply(node(1), 700, [9; 32], clipboard::ContentKind::Png);
+        let sequence = state.apply_sequence;
+        let mut ack = protocol::ipc::ClipboardApplied {
+            origin_version: 700,
+            ok: false,
+            ..Default::default()
+        };
+        assert_eq!(state.applied_hash(&ack, None), None);
+        ack.origin_version = sequence;
+        assert_eq!(state.applied_hash(&ack, None), Some([9; 32]));
+        ack.ok = true;
+        assert_eq!(state.applied_hash(&ack, None), None);
+        ack.sha256 = vec![9; 31];
+        assert_eq!(state.applied_hash(&ack, None), None);
+        ack.ok = false;
+        assert_eq!(state.applied_hash(&ack, None), None);
+        ack.sha256 = vec![8; 32];
+        assert_eq!(state.applied_hash(&ack, None), None);
+        ack.sha256 = vec![9; 32];
+        assert_eq!(state.applied_hash(&ack, None), Some([9; 32]));
+        ack.ok = true;
+        assert_eq!(state.applied_hash(&ack, None), Some([9; 32]));
+        ack.origin_version += 1;
+        assert_eq!(state.applied_hash(&ack, None), None);
+    }
+
+    #[test]
+    fn history_cancel_resolves_pending_hash_without_peer_mapping() {
+        let state = State::default();
+        let mut ack = protocol::ipc::ClipboardApplied {
+            origin_version: 3,
+            ok: false,
+            ..Default::default()
+        };
+        assert_eq!(state.applied_hash(&ack, Some([6; 32])), Some([6; 32]));
+        ack.sha256 = vec![6; 32];
+        assert_eq!(state.applied_hash(&ack, Some([6; 32])), Some([6; 32]));
+        ack.sha256.clear();
+        ack.ok = true;
+        assert_eq!(state.applied_hash(&ack, Some([6; 32])), None);
     }
 
     #[test]
     fn same_wire_version_and_hash_from_two_origins_have_distinct_local_ack_keys() {
         let mut state = State::default();
-        state.begin_apply(node(1), 1, [9; 32]);
+        state.begin_apply(node(1), 1, [9; 32], clipboard::ContentKind::Text);
         let mut first = apply_chunk(1, 0, 2);
         let mut last = apply_chunk(1, 1, 2);
         state.rewrite_apply_chunk(&mut first);
         state.rewrite_apply_chunk(&mut last);
         assert_eq!(first.origin_version, last.origin_version);
-        state.begin_apply(node(2), 1, [9; 32]);
+        state.begin_apply(node(2), 1, [9; 32], clipboard::ContentKind::Text);
         let mut other = apply_chunk(1, 0, 1);
         state.rewrite_apply_chunk(&mut other);
         assert_ne!(first.origin_version, other.origin_version);
         assert_eq!(
             state.applying.remove(&(other.origin_version, [9; 32])),
-            Some((node(2), 1))
+            Some((node(2), 1, clipboard::ContentKind::Text))
         );
         assert_eq!(
             state.applying.remove(&(first.origin_version, [9; 32])),
-            Some((node(1), 1))
+            Some((node(1), 1, clipboard::ContentKind::Text))
         );
     }
 
@@ -867,7 +1018,7 @@ mod tests {
         let mut state = State::default();
         let mut previous = None;
         for _ in 0..100 {
-            state.begin_apply(node(1), 1, [9; 32]);
+            state.begin_apply(node(1), 1, [9; 32], clipboard::ContentKind::Text);
             let mut chunk = apply_chunk(1, 0, 1);
             state.rewrite_apply_chunk(&mut chunk);
             if let Some(old) = previous {

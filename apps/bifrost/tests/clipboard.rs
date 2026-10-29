@@ -1042,6 +1042,38 @@ fn gui_clipboard_policy_reports_defaults_and_persists_clamped_settle_values() {
 }
 
 #[test]
+fn gui_clipboard_images_switch_persists_and_reports_capability() {
+    use protocol::ipc::gui_frame::Msg;
+    let _serial = common::serial();
+    let harness = Harness::start(false, false);
+    harness.wait_linked();
+    let status = |node: &common::Node| {
+        let frames = history_exchange(node, Msg::GetStatus(protocol::ipc::GetStatus {}), |frame| {
+            matches!(frame.msg, Some(Msg::Status(_)))
+        });
+        let Some(Msg::Status(status)) = frames.into_iter().last().expect("status reply").msg else {
+            panic!("expected GUI status");
+        };
+        status
+    };
+    let defaults = status(&harness.a);
+    assert!(!defaults.clipboard_images, "images are opt-in per computer");
+    for enabled in [true, false] {
+        history_operation(
+            &harness.a,
+            Msg::SetClipboardImages(protocol::ipc::SetClipboardImages { enabled }),
+        );
+        let current = status(&harness.a);
+        assert_eq!(current.clipboard_images, enabled);
+        // The flag is policy; the capability stays whatever this backend honestly reports.
+        let _supported = current.clipboard_images_supported;
+        let saved = config::Config::load(harness.a.root.join("config/config.toml"))
+            .expect("saved clipboard images option");
+        assert_eq!(saved.clipboard.images, enabled);
+    }
+}
+
+#[test]
 fn follow_first_dry_button_settles_before_the_dwell_deadline() {
     let _serial = common::serial();
     let cluster = follow_cluster("clipboard-follow-button");

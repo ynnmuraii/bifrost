@@ -507,8 +507,8 @@ struct CaptureMotionDiagnostics {
     large: bool,
 }
 
-/// Parent input connection, text support, remote address, and authenticated process epoch.
-type ClipboardLink = ([u8; 16], bool, std::net::IpAddr, Option<[u8; 16]>);
+/// Parent input link, text/image support, remote address, and authenticated process epoch.
+type ClipboardLink = ([u8; 16], bool, bool, std::net::IpAddr, Option<[u8; 16]>);
 
 /// Everything one `lws-core` process owns while it runs.
 pub struct Session {
@@ -2668,6 +2668,7 @@ impl Session {
                     peer,
                     connection_id,
                     hello.text_clipboard,
+                    hello.image_clipboard,
                     remote,
                     hello.clipboard_epoch,
                 )
@@ -2823,28 +2824,56 @@ impl Session {
                         );
                         let text_clipboard = capabilities
                             .contains(&(protocol::wire::Capability::TextClipboard as i32));
+                        let image_clipboard = capabilities
+                            .contains(&(protocol::wire::Capability::ClipboardImage as i32));
                         self.clipboard_follow.peers.insert(
                             peer,
                             capabilities
                                 .contains(&(protocol::wire::Capability::ClipboardApplyAck as i32)),
                         );
-                        tracing::info!(peer = %peer, text_clipboard, "peer capabilities updated");
-                        if let Some((connection_id, previous, remote_ip, epoch)) =
-                            self.clipboard_links.get_mut(&peer)
+                        tracing::info!(peer = %peer, text_clipboard, image_clipboard, "peer capabilities updated");
+                        if let Some(&(
+                            connection_id,
+                            previous_text,
+                            previous_image,
+                            remote_ip,
+                            epoch,
+                        )) = self.clipboard_links.get(&peer)
                         {
-                            if *previous != text_clipboard {
-                                *previous = text_clipboard;
+                            if previous_text != text_clipboard || previous_image != image_clipboard
+                            {
+                                self.clipboard_links.insert(
+                                    peer,
+                                    (
+                                        connection_id,
+                                        text_clipboard,
+                                        image_clipboard,
+                                        remote_ip,
+                                        epoch,
+                                    ),
+                                );
                                 let out = match self.clipboard.as_mut() {
                                     Some(clipboard) => {
-                                        clipboard.set_peer_session(peer, *connection_id, *epoch);
-                                        clipboard
-                                            .on_link_up(
-                                                peer,
-                                                *connection_id,
-                                                text_clipboard,
-                                                *remote_ip,
-                                            )
-                                            .await
+                                        clipboard.set_peer_session(peer, connection_id, epoch);
+                                        let mut out = Vec::new();
+                                        if previous_text != text_clipboard {
+                                            out.extend(
+                                                clipboard
+                                                    .on_link_up(
+                                                        peer,
+                                                        connection_id,
+                                                        text_clipboard,
+                                                        remote_ip,
+                                                    )
+                                                    .await,
+                                            );
+                                        }
+                                        out.extend(
+                                            clipboard
+                                                .set_peer_image_support(peer, image_clipboard)
+                                                .await,
+                                        );
+                                        out
                                     }
                                     None => Vec::new(),
                                 };
@@ -2924,6 +2953,15 @@ impl Session {
     /// handshake before this adapter has finished opening its portal or clipboard.
     async fn adopt_agent_capabilities(&mut self, capabilities: &[String]) {
         routing::adopt_capabilities(&mut self.capabilities, capabilities);
+        let out = match self.clipboard.as_mut() {
+            Some(clipboard) => {
+                clipboard
+                    .set_local_image_support(self.capabilities.image_clipboard)
+                    .await
+            }
+            None => Vec::new(),
+        };
+        self.apply_clipboard(out).await;
         self.router.set_capabilities(fr::Capabilities {
             capture: self.capabilities.capture,
             inject: self.capabilities.inject,
@@ -2946,17 +2984,32 @@ impl Session {
         peer: NodeId,
         connection_id: [u8; 16],
         text_clipboard: bool,
+        image_clipboard: bool,
         remote: std::net::SocketAddr,
         epoch: Option<[u8; 16]>,
     ) {
-        self.clipboard_links
-            .insert(peer, (connection_id, text_clipboard, remote.ip(), epoch));
+        self.clipboard_links.insert(
+            peer,
+            (
+                connection_id,
+                text_clipboard,
+                image_clipboard,
+                remote.ip(),
+                epoch,
+            ),
+        );
         let out = match self.clipboard.as_mut() {
             Some(clipboard) => {
                 clipboard.set_peer_session(peer, connection_id, epoch);
-                clipboard
+                let mut out = clipboard
                     .on_link_up(peer, connection_id, text_clipboard, remote.ip())
-                    .await
+                    .await;
+                out.extend(
+                    clipboard
+                        .set_peer_image_support(peer, image_clipboard)
+                        .await,
+                );
+                out
             }
             None => Vec::new(),
         };
@@ -2975,10 +3028,12 @@ impl Session {
         let binding = match &event {
             crate::clipboard::Inbound::Bound { peer, parent, .. }
             | crate::clipboard::Inbound::Message { peer, parent, .. }
+            | crate::clipboard::Inbound::Offer { peer, parent, .. }
             | crate::clipboard::Inbound::Down { peer, parent } => Some((peer, parent)),
-            crate::clipboard::Inbound::Sent { .. } | crate::clipboard::Inbound::Failed { .. } => {
-                None
-            }
+            crate::clipboard::Inbound::Sent { .. }
+            | crate::clipboard::Inbound::Failed { .. }
+            | crate::clipboard::Inbound::Verified(_)
+            | crate::clipboard::Inbound::LocalPrepared { .. } => None,
         };
         if let Some((peer, parent)) = binding {
             if !self
@@ -3025,16 +3080,23 @@ impl Session {
             (
                 _,
                 crate::clipboard::Inbound::Sent {
-                    peer, text, secret, ..
+                    peer,
+                    history: Some((text, payload)),
+                    sha256,
+                    secret,
+                    ..
                 },
             ) => {
                 vec![crate::clipboard::Out::History {
                     peer,
                     direction: protocol::ipc::ClipboardHistoryDirection::Sent,
                     text,
+                    payload,
+                    sha256,
                     secret,
                 }]
             }
+            (_, crate::clipboard::Inbound::Sent { history: None, .. }) => Vec::new(),
             (
                 Some(clipboard),
                 crate::clipboard::Inbound::Bound {
@@ -3049,9 +3111,38 @@ impl Session {
                 crate::clipboard::Inbound::Message {
                     peer,
                     parent,
+                    generation,
                     message,
                 },
-            ) => clipboard.on_peer_message_from(peer, parent, message).await,
+            ) => {
+                clipboard
+                    .on_network_message(peer, parent, generation, message)
+                    .await
+            }
+            (
+                Some(clipboard),
+                crate::clipboard::Inbound::Offer {
+                    peer,
+                    parent,
+                    generation,
+                    message,
+                    ready,
+                },
+            ) => {
+                clipboard
+                    .on_network_offer(peer, parent, generation, message, ready)
+                    .await
+            }
+            (Some(clipboard), crate::clipboard::Inbound::Verified(verified)) => {
+                clipboard.on_verified(verified)
+            }
+            (
+                Some(clipboard),
+                crate::clipboard::Inbound::LocalPrepared {
+                    generation,
+                    prepared,
+                },
+            ) => clipboard.on_local_prepared(generation, prepared).await,
             (Some(clipboard), crate::clipboard::Inbound::Down { peer, .. }) => {
                 clipboard.on_channel_down(peer).await;
                 Vec::new()
@@ -3079,6 +3170,12 @@ impl Session {
                     .await;
                 }
                 crate::clipboard::Out::CarryCleared => self.clipboard_cleared().await,
+                crate::clipboard::Out::RevokeImages => {
+                    if let Err(error) = self.retire_clipboard_images().await {
+                        tracing::warn!(%error, "cannot revoke image clipboard apply");
+                        self.on_agent_lost().await;
+                    }
+                }
                 crate::clipboard::Out::Delivery {
                     peer,
                     version,
@@ -3093,8 +3190,9 @@ impl Session {
                     peer,
                     version,
                     sha256,
+                    kind,
                 } => {
-                    self.clipboard_apply_pending(peer, version, sha256);
+                    self.clipboard_apply_pending(peer, version, sha256, kind);
                 }
                 crate::clipboard::Out::Grant { peer, message } => {
                     // The grant travels on the input link: the channel it authorises does not
@@ -3122,10 +3220,19 @@ impl Session {
                             .await;
                     }
                 }
-                crate::clipboard::Out::Agent(mut frame) => {
-                    self.prepare_clipboard_agent_frame(&mut frame);
-                    if let Err(error) = self.agent.send(frame).await {
-                        tracing::warn!(%error, "cannot reach the agent");
+                crate::clipboard::Out::AgentPayload {
+                    version,
+                    payload,
+                    sha256,
+                    kind,
+                    reservation,
+                } => {
+                    let sequence = self.clipboard_payload_sequence(version);
+                    if let Err(error) =
+                        self.agent
+                            .send_clipboard(sequence, payload, sha256, kind, reservation)
+                    {
+                        tracing::warn!(%error, "cannot queue clipboard for the agent");
                         self.on_agent_lost().await;
                     }
                 }
@@ -3133,6 +3240,8 @@ impl Session {
                     peer,
                     direction,
                     text,
+                    payload,
+                    sha256,
                     secret,
                 } => {
                     if !secret {
@@ -3144,7 +3253,8 @@ impl Session {
                                 .map(|record| record.display_name.clone())
                                 .unwrap_or_else(|| peer.to_string())
                         };
-                        self.clipboard_history.record(direction, name, text, false);
+                        self.clipboard_history
+                            .record_prepared(direction, name, text, payload, sha256, false);
                         self.publish(protocol::ipc::gui_frame::Msg::ClipboardHistory(
                             self.clipboard_history.entries(),
                         ));
@@ -4038,6 +4148,16 @@ impl Session {
         self.game_guard_logged = false;
         self.fail_clipboard_applies().await;
         self.agent_lost_reported = true;
+        if self.capabilities.image_clipboard {
+            let capabilities: Vec<String> = self
+                .capabilities
+                .advertised()
+                .into_iter()
+                .filter(|name| *name != "CLIPBOARD_IMAGE")
+                .map(str::to_owned)
+                .collect();
+            Box::pin(self.adopt_agent_capabilities(&capabilities)).await;
+        }
         self.agent.stop().await;
         self.feed(fr::Input::Agent(fr::AgentEvent::AgentLost)).await;
         if self.agent_restart_circuit.take_suspend() {

@@ -1,25 +1,48 @@
-//! The Windows clipboard: change notifications, `CF_UNICODETEXT`, and the three documented
-//! secret markers.
+//! Windows clipboard notifications, Unicode text, PNG/DIB images and secret markers.
 //!
-//! ADR-008 allows text only, and `docs/04-decisions.md` names the markers this adapter has
-//! to honour: `ExcludeClipboardContentFromMonitorProcessing` (a password manager telling
-//! every monitor to keep away), `CanIncludeInClipboardHistory = 0` (the Win10/11 clipboard
-//! history opt-out) and `Clipboard Viewer Ignore` (the oldest of the three, what old
-//! password managers still set). All three are *registered* clipboard formats: the format
-//! exists for a while even when the current item does not set it, so presence alone is not
-//! the signal — the value is. This module reads it and reports [`Marker`]s; the decision
-//! belongs to `clipboard::policy`.
+//! Text wins over image representations. Images are read only after secret-marker checks;
+//! native conversion belongs on a blocking worker, never on the hook or session thread.
+//! The listener only queues `WM_CLIPBOARDUPDATE`; sequence numbers suppress applied echoes.
 //!
-//! The listener is the documented one (`AddClipboardFormatListener` on a message-only
-//! window, `WM_CLIPBOARDUPDATE`); [`Clipboard::sequence`] is the cheap second way to notice
-//! a change (`GetClipboardSequenceNumber`), which is what a caller that already runs a timer
-//! can poll instead.
-//!
-//! Reads are bounded by the locked block's `GlobalSize`, including the NUL terminator.
-//! UTF-8 payloads over `clipboard::MAX_BYTES` are refused before text allocation; the
-//! agent reports the existing `CLIPBOARD_TOO_LARGE` error rather than dropping the change.
+//! Reads are bounded by `GlobalSize`. Image byte limits apply to PNG, not the native DIB;
+//! decoded pixel limits live in [`image`].
 
 use clipboard::Marker;
+
+#[cfg(windows)]
+pub mod image;
+
+/// Native representations, in priority order. Text selection is independent of image opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardFormat {
+    Text,
+    Png,
+    DibV5,
+    Dib,
+}
+
+/// Selects metadata only; a secret image must not be read or encoded.
+pub fn choose_format(
+    text: bool,
+    png: bool,
+    dib_v5: bool,
+    dib: bool,
+    secret: bool,
+) -> Option<ClipboardFormat> {
+    if text {
+        Some(ClipboardFormat::Text)
+    } else if secret {
+        None
+    } else if png {
+        Some(ClipboardFormat::Png)
+    } else if dib_v5 {
+        Some(ClipboardFormat::DibV5)
+    } else if dib {
+        Some(ClipboardFormat::Dib)
+    } else {
+        None
+    }
+}
 
 /// `ExcludeClipboardContentFromMonitorProcessing`: presence means "do not monitor".
 pub const EXCLUDE_FROM_MONITOR: &str = "ExcludeClipboardContentFromMonitorProcessing";
@@ -31,25 +54,12 @@ pub const VIEWER_IGNORE: &str = "Clipboard Viewer Ignore";
 /// What one clipboard read found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// `CF_UNICODETEXT`, decoded from UTF-16. Empty when the clipboard carries no text.
-    pub text: String,
-    /// Every secret marker the item carried.
+    /// The selected representation; absent for unsupported or deliberately unread secret images.
+    pub content: Option<clipboard::ClipboardContent>,
+    /// Every secret marker the item carried, including deliberately unread images.
     pub markers: Vec<Marker>,
-    /// Whether `CF_UNICODETEXT` was there at all: an image-only clipboard is not an error,
-    /// it is simply nothing this adapter can offer.
-    pub has_text: bool,
     /// `GetClipboardSequenceNumber` at the moment of the read.
     pub sequence: u32,
-}
-
-impl Snapshot {
-    /// The content description `clipboard::policy` decides on.
-    pub fn content(&self) -> clipboard::Content {
-        clipboard::Content {
-            bytes: self.text.len() as u64,
-            markers: self.markers.clone(),
-        }
-    }
 }
 
 /// `CF_UNICODETEXT` text as the clipboard block wants it: UTF-16 code units, NUL-terminated.
@@ -103,13 +113,16 @@ pub fn classify_names(names: &[&str], history_allowed_zero: bool) -> Vec<Marker>
 }
 
 #[cfg(windows)]
-pub use windows_impl::{read_clipboard, write_clipboard, Change, Clipboard, ClipboardError};
+pub use windows_impl::{
+    read_clipboard, write_clipboard, write_clipboard_sequence, write_content_sequence, Change,
+    Clipboard, ClipboardError,
+};
 
 #[cfg(windows)]
 mod windows_impl {
     use super::{
-        classify_names, decode_text, Snapshot, CAN_INCLUDE_IN_HISTORY, EXCLUDE_FROM_MONITOR,
-        VIEWER_IGNORE,
+        choose_format, classify_names, decode_text, image, ClipboardFormat, Snapshot,
+        CAN_INCLUDE_IN_HISTORY, EXCLUDE_FROM_MONITOR, VIEWER_IGNORE,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -147,7 +160,7 @@ mod windows_impl {
         Formats,
         /// The listener's window class or window could not be created.
         Window,
-        /// The text block is malformed or exceeds the protocol payload limit.
+        /// Malformed content, an image decode limit, or the protocol payload limit.
         Content(clipboard::ClipboardError),
     }
 
@@ -354,34 +367,104 @@ mod windows_impl {
         unsafe { DefWindowProcW(window, message, wparam, lparam) }
     }
 
-    /// Reads the clipboard: text, the registered marker formats, and the sequence number.
+    /// Takes a bounded native snapshot, then converts DIB after releasing the OS clipboard.
     ///
-    /// Blocking by nature — [`open_clipboard`] retries for up to 100 ms while another
-    /// process holds the clipboard — so an async caller runs it on a blocking thread.
+    /// The caller runs this on a blocking worker; neither the notification window nor the
+    /// session loop performs image encoding.
     pub fn read_clipboard() -> Result<Snapshot, ClipboardError> {
-        let sequence = unsafe { GetClipboardSequenceNumber() };
-        open_clipboard()?;
-        let result = read_open_clipboard(sequence);
-        // SAFETY: the clipboard was opened above, on this thread.
-        unsafe {
-            let _ = CloseClipboard();
+        let raw = {
+            let _open = open_clipboard()?;
+            // SAFETY: the clipboard is exclusively open on this thread.
+            let sequence = unsafe { GetClipboardSequenceNumber() };
+            read_open_clipboard(sequence)?
+        };
+        match raw {
+            ReadSnapshot::Ready(snapshot) => Ok(snapshot),
+            ReadSnapshot::Dib {
+                bytes,
+                markers,
+                sequence,
+            } => {
+                let content = image::dib_to_png(&bytes)
+                    .map_err(ClipboardError::Content)?
+                    .map(|png| clipboard::ClipboardContent::Image { png });
+                Ok(Snapshot {
+                    content,
+                    markers,
+                    sequence,
+                })
+            }
         }
-        result
     }
 
     /// Opens the clipboard on this thread, retrying briefly while another process holds it.
     ///
     /// The caller closes it: an open clipboard blocks every other process, so it is never
     /// left open across an operation that can fail.
-    fn open_clipboard() -> Result<(), ClipboardError> {
+    fn open_clipboard() -> Result<OpenClipboardGuard, ClipboardError> {
+        open_clipboard_for(None)
+    }
+
+    fn open_clipboard_for(owner: Option<HWND>) -> Result<OpenClipboardGuard, ClipboardError> {
         for _ in 0..10 {
-            // SAFETY: a null owner means "this thread"; the handle is closed by the caller.
-            if unsafe { OpenClipboard(None) }.is_ok() {
-                return Ok(());
+            // SAFETY: a supplied owner is live on this thread; the caller closes the handle.
+            if unsafe { OpenClipboard(owner) }.is_ok() {
+                return Ok(OpenClipboardGuard);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Err(ClipboardError::Busy)
+    }
+
+    struct OpenClipboardGuard;
+
+    impl Drop for OpenClipboardGuard {
+        fn drop(&mut self) {
+            // SAFETY: this guard exists only after a successful open on the same thread.
+            unsafe {
+                let _ = CloseClipboard();
+            }
+        }
+    }
+
+    /// EmptyClipboard must have a non-null owner or SetClipboardData fails. This
+    /// message-only window lives on the blocking writer thread until the clipboard
+    /// closes. Eager HGLOBAL data remains owned by the system after its destruction.
+    struct WriteOwner(HWND);
+
+    impl WriteOwner {
+        fn new() -> Result<Self, ClipboardError> {
+            // SAFETY: STATIC is a system window class; this hidden window needs no
+            // custom procedure or message pump because no delayed formats are offered.
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("Bifrost clipboard writer"),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|_| ClipboardError::Window)?;
+            Ok(Self(window))
+        }
+    }
+
+    impl Drop for WriteOwner {
+        fn drop(&mut self) {
+            // SAFETY: the window was created and is destroyed on this blocking thread,
+            // after the exclusively open clipboard guard has been dropped.
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
     }
 
     /// Replaces the clipboard contents with `text`, or empties it for `None`.
@@ -391,13 +474,16 @@ mod windows_impl {
     /// sleep must never sit on a runtime thread (the agent's poll tick, its IPC frames
     /// and its watchdog live there).
     pub fn write_clipboard(text: Option<&str>) -> Result<(), ClipboardError> {
-        open_clipboard()?;
-        let result = write_open_clipboard(text);
-        // SAFETY: the clipboard was opened above, on this thread.
-        unsafe {
-            let _ = CloseClipboard();
-        }
-        result
+        write_clipboard_sequence(text).map(|_| ())
+    }
+
+    /// Captures the echo sequence while the clipboard is still exclusively open.
+    pub fn write_clipboard_sequence(text: Option<&str>) -> Result<u32, ClipboardError> {
+        let owner = WriteOwner::new()?;
+        let _open = open_clipboard_for(Some(owner.0))?;
+        write_open_clipboard(text)?;
+        // SAFETY: capture the counter before another owner can replace this selection.
+        Ok(unsafe { GetClipboardSequenceNumber() })
     }
 
     /// The body of [`write_clipboard`], with the clipboard already open.
@@ -409,48 +495,114 @@ mod windows_impl {
         };
 
         let units = super::to_utf16(text);
-        let bytes = std::mem::size_of_val(units.as_slice());
-        // SAFETY: a movable block of `bytes`, uninitialised by contract; it is freed on
-        // every path below unless the clipboard takes ownership of it.
-        let block =
-            unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }.map_err(|_| ClipboardError::Gone)?;
-        // SAFETY: the block was just allocated and is not owned by anyone else.
-        let pointer = unsafe { GlobalLock(block) };
-        if pointer.is_null() {
-            // SAFETY: this thread still owns the block.
-            unsafe {
-                let _ = GlobalFree(Some(block));
+        // SAFETY: UTF-16 units are initialized; their byte view lasts for this call.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                units.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(units.as_slice()),
+            )
+        };
+        GlobalBlock::new(bytes)?.publish(CF_UNICODETEXT)
+    }
+
+    /// Eagerly publishes both PNG and alpha-preserving DIBV5, in one open session.
+    /// Conversion and allocation finish before EmptyClipboard can discard the previous item.
+    pub fn write_content_sequence(
+        content: Option<&clipboard::ClipboardContent>,
+    ) -> Result<u32, ClipboardError> {
+        let png = match content {
+            None => return write_clipboard_sequence(None),
+            Some(clipboard::ClipboardContent::Text(text)) => {
+                return write_clipboard_sequence(Some(text))
             }
-            return Err(ClipboardError::Gone);
+            Some(clipboard::ClipboardContent::Image { png }) => png,
+        };
+        if png.len() as u64 > clipboard::MAX_IMAGE_BYTES {
+            return Err(ClipboardError::Content(clipboard::ClipboardError::TooLarge));
         }
-        // SAFETY: the block is `bytes` long, which is exactly the encoded text, and a
-        // locked block may be written.
-        unsafe {
-            std::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, pointer as *mut u8, bytes);
-            let _ = GlobalUnlock(block);
-        }
-        // SAFETY: the clipboard is open and the block is unlocked; on success the clipboard
-        // owns it and must not be freed here.
-        let taken = unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(block.0))) };
-        if taken.is_err() {
-            // SAFETY: the clipboard refused the block, so this thread still owns it.
+        let dib = image::png_to_dibv5(png).map_err(ClipboardError::Content)?;
+        let png_format = register("PNG")?;
+        let png_block = GlobalBlock::new(png)?;
+        let dib_block = GlobalBlock::new(&dib)?;
+        let owner = WriteOwner::new()?;
+        let _open = open_clipboard_for(Some(owner.0))?;
+        // SAFETY: the selection is exclusively open and both eager representations exist.
+        unsafe { EmptyClipboard() }.map_err(|_| ClipboardError::Gone)?;
+        if let Err(error) = png_block
+            .publish(png_format)
+            .and_then(|()| dib_block.publish(CF_DIBV5))
+        {
+            // Do not leave a partially published item after reporting a failed apply.
             unsafe {
-                let _ = GlobalFree(Some(block));
+                let _ = EmptyClipboard();
             }
-            return Err(ClipboardError::Gone);
+            return Err(error);
         }
-        Ok(())
+        Ok(unsafe { GetClipboardSequenceNumber() })
+    }
+
+    /// A movable global block is ours until SetClipboardData successfully takes ownership.
+    struct GlobalBlock(Option<HGLOBAL>);
+
+    impl GlobalBlock {
+        fn new(bytes: &[u8]) -> Result<Self, ClipboardError> {
+            // SAFETY: the allocation is initialized below before it is published.
+            let block = Self(Some(
+                unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }
+                    .map_err(|_| ClipboardError::Gone)?,
+            ));
+            let handle = block.0.expect("owned global block");
+            let pointer = unsafe { GlobalLock(handle) };
+            if pointer.is_null() {
+                return Err(ClipboardError::Gone);
+            }
+            // SAFETY: the block has exactly this many writable bytes and does not overlap input.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
+                let _ = GlobalUnlock(handle);
+            }
+            Ok(block)
+        }
+
+        fn publish(mut self, format: u32) -> Result<(), ClipboardError> {
+            let handle = self.0.expect("owned global block");
+            // SAFETY: caller opened the clipboard; the initialized block is movable and unlocked.
+            unsafe { SetClipboardData(format, Some(HANDLE(handle.0))) }
+                .map_err(|_| ClipboardError::Gone)?;
+            self.0 = None;
+            Ok(())
+        }
+    }
+
+    impl Drop for GlobalBlock {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                // SAFETY: an unpublished block is still owned by this adapter.
+                unsafe {
+                    let _ = GlobalFree(Some(handle));
+                }
+            }
+        }
     }
 
     /// `CF_UNICODETEXT` is the documented predefined format number 13; the bindings'
     /// constant lives behind a feature this crate does not need for anything else.
     const CF_UNICODETEXT: u32 = 13;
+    const CF_DIB: u32 = 8;
+    const CF_DIBV5: u32 = 17;
 
-    /// The body of [`read_clipboard`], with the clipboard already open.
-    fn read_open_clipboard(sequence: u32) -> Result<Snapshot, ClipboardError> {
-        let text_format = CF_UNICODETEXT;
-        // SAFETY: the clipboard is open on this thread.
-        let has_text = unsafe { IsClipboardFormatAvailable(text_format) }.is_ok();
+    enum ReadSnapshot {
+        Ready(Snapshot),
+        Dib {
+            bytes: Vec<u8>,
+            markers: Vec<clipboard::Marker>,
+            sequence: u32,
+        },
+    }
+
+    /// Reads marker metadata before choosing or copying any image representation.
+    fn read_open_clipboard(sequence: u32) -> Result<ReadSnapshot, ClipboardError> {
+        let has_text = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_ok();
 
         let mut names: Vec<String> = Vec::new();
         let mut history_allowed_zero = false;
@@ -478,18 +630,62 @@ mod windows_impl {
             }
         }
 
-        let text = if has_text {
-            read_text(text_format)?
-        } else {
-            String::new()
-        };
         let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
-        Ok(Snapshot {
-            text,
-            markers: classify_names(&borrowed, history_allowed_zero),
+        let markers = classify_names(&borrowed, history_allowed_zero);
+        let png_format = register("PNG")?;
+        let available = |format| unsafe { IsClipboardFormatAvailable(format) }.is_ok();
+        let selected = choose_format(
             has_text,
+            available(png_format),
+            available(CF_DIBV5),
+            available(CF_DIB),
+            !markers.is_empty(),
+        );
+        let content = match selected {
+            Some(ClipboardFormat::Text) => Some(clipboard::ClipboardContent::Text(read_text(
+                CF_UNICODETEXT,
+            )?)),
+            Some(ClipboardFormat::Png) => Some(clipboard::ClipboardContent::Image {
+                png: with_global_bytes(png_format, |bytes| {
+                    if bytes.len() as u64 > clipboard::MAX_IMAGE_BYTES {
+                        return Err(clipboard::ClipboardError::TooLarge);
+                    }
+                    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                        return Err(clipboard::ClipboardError::Invalid);
+                    }
+                    Ok(bytes.to_vec())
+                })?,
+            }),
+            Some(format @ (ClipboardFormat::DibV5 | ClipboardFormat::Dib)) => {
+                let format = if format == ClipboardFormat::DibV5 {
+                    CF_DIBV5
+                } else {
+                    CF_DIB
+                };
+                let bytes = with_global_bytes(format, |bytes| {
+                    image::dib_storage_bytes(bytes)
+                        .map(|length| length.map(|end| bytes[..end].to_vec()))
+                })?;
+                return Ok(match bytes {
+                    Some(bytes) => ReadSnapshot::Dib {
+                        bytes,
+                        markers,
+                        sequence,
+                    },
+                    None => ReadSnapshot::Ready(Snapshot {
+                        content: None,
+                        markers,
+                        sequence,
+                    }),
+                });
+            }
+            None => None,
+        };
+        Ok(ReadSnapshot::Ready(Snapshot {
+            content,
+            markers,
             sequence,
-        })
+        }))
     }
 
     /// `RegisterClipboardFormatW` for one of the documented names.
@@ -501,6 +697,38 @@ mod windows_impl {
             return Err(ClipboardError::Formats);
         }
         Ok(format)
+    }
+
+    fn with_global_bytes<T>(
+        format: u32,
+        read: impl FnOnce(&[u8]) -> Result<T, clipboard::ClipboardError>,
+    ) -> Result<T, ClipboardError> {
+        let handle = unsafe { GetClipboardData(format) }.map_err(|_| ClipboardError::Gone)?;
+        if handle.is_invalid() {
+            return Err(ClipboardError::Gone);
+        }
+        let handle = HGLOBAL(handle.0);
+        let pointer = unsafe { GlobalLock(handle) };
+        if pointer.is_null() {
+            return Err(ClipboardError::Gone);
+        }
+        struct Locked(HGLOBAL);
+        impl Drop for Locked {
+            fn drop(&mut self) {
+                // SAFETY: the same thread successfully locked this handle.
+                unsafe {
+                    let _ = GlobalUnlock(self.0);
+                }
+            }
+        }
+        let _lock = Locked(handle);
+        let size = unsafe { GlobalSize(handle) };
+        if size > isize::MAX as usize {
+            return Err(ClipboardError::Content(clipboard::ClipboardError::Invalid));
+        }
+        // SAFETY: GlobalSize bounds the successfully locked allocation.
+        let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) };
+        read(bytes).map_err(ClipboardError::Content)
     }
 
     /// The clipboard text as UTF-16, decoded.
@@ -533,23 +761,11 @@ mod windows_impl {
 
     /// Reads a `DWORD` payload, as the history flag format carries.
     fn read_dword(format: u32) -> Result<Option<u32>, ClipboardError> {
-        // SAFETY: the clipboard is open and the format is registered.
-        let handle = unsafe { GetClipboardData(format) }.map_err(|_| ClipboardError::Gone)?;
-        if handle.is_invalid() {
-            return Ok(None);
-        }
-        // SAFETY: the flag format is a `DWORD` block, as the API documents.
-        let pointer = unsafe { GlobalLock(HGLOBAL(handle.0)) };
-        if pointer.is_null() {
-            return Ok(None);
-        }
-        // SAFETY: a `DWORD` is four bytes and the block is at least that large.
-        let value = unsafe {
-            let value = *(pointer as *const u32);
-            let _ = GlobalUnlock(HGLOBAL(handle.0));
-            value
-        };
-        Ok(Some(value))
+        with_global_bytes(format, |bytes| {
+            Ok(bytes
+                .get(..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes"))))
+        })
     }
 }
 
@@ -633,15 +849,28 @@ mod tests {
     }
 
     #[test]
-    fn the_snapshot_describes_itself_as_content() {
-        let snapshot = Snapshot {
-            text: "привет".to_owned(),
-            markers: vec![Marker::ViewerIgnore],
-            has_text: true,
-            sequence: 7,
-        };
-        let content = snapshot.content();
-        assert_eq!(content.bytes, "привет".len() as u64);
-        assert_eq!(content.markers, vec![Marker::ViewerIgnore]);
+    fn format_choice_keeps_text_first_and_never_reads_secret_images() {
+        assert_eq!(
+            choose_format(true, true, true, true, false),
+            Some(ClipboardFormat::Text)
+        );
+        assert_eq!(
+            choose_format(true, true, true, true, true),
+            Some(ClipboardFormat::Text)
+        );
+        assert_eq!(
+            choose_format(false, true, true, true, false),
+            Some(ClipboardFormat::Png)
+        );
+        assert_eq!(
+            choose_format(false, false, true, true, false),
+            Some(ClipboardFormat::DibV5)
+        );
+        assert_eq!(
+            choose_format(false, false, false, true, false),
+            Some(ClipboardFormat::Dib)
+        );
+        assert_eq!(choose_format(false, false, false, false, false), None);
+        assert_eq!(choose_format(false, true, true, true, true), None);
     }
 }

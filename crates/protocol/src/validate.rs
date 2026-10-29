@@ -12,8 +12,9 @@
 
 use crate::limits::{
     CONNECTION_ID_LEN, LEASE_ID_LEN, MAX_CLIPBOARD_CHUNK_BYTES, MAX_CLIPBOARD_CHUNK_COUNT,
-    MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_HELLO_DISPLAYS,
-    MAX_INPUT_BATCH_EVENTS, MIN_CLIPBOARD_CHUNK_COUNT, MIN_INPUT_BATCH_EVENTS, NODE_ID_LEN,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD_BYTES, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_DISPLAY_NAME_BYTES,
+    MAX_HELLO_DISPLAYS, MAX_INPUT_BATCH_EVENTS, MIN_CLIPBOARD_CHUNK_COUNT, MIN_INPUT_BATCH_EVENTS,
+    NODE_ID_LEN,
 };
 use crate::wire;
 
@@ -34,11 +35,13 @@ pub enum Violation {
     TooManyDisplays { got: usize },
     /// `InputBatch.events` is outside 1..=128.
     InputBatchSize { got: usize },
-    /// `ClipboardOffer.size_bytes` exceeds 1 MiB.
+    /// `ClipboardOffer.size_bytes` exceeds its MIME's hard cap.
     ClipboardPayloadTooLarge { got: u64 },
+    /// Only the two exact, supported MIME strings are valid.
+    ClipboardMime,
     /// `ClipboardData.data` exceeds 16 KiB.
     ClipboardChunkTooLarge { got: usize },
-    /// `ClipboardData.chunk_count` is outside 1..=64.
+    /// `ClipboardData.chunk_count` is outside 1..=2048 (stateless ceiling).
     ClipboardChunkCount { got: u32 },
     /// `ClipboardData.chunk_index` is not below `chunk_count`.
     ClipboardChunkIndex { index: u32, count: u32 },
@@ -57,6 +60,7 @@ impl Violation {
             | Violation::DisplayNameTooLong { .. }
             | Violation::TooManyDisplays { .. }
             | Violation::InputBatchSize { .. }
+            | Violation::ClipboardMime
             | Violation::ClipboardChunkCount { .. }
             | Violation::ClipboardChunkIndex { .. } => wire::ErrorCode::InvalidFrame,
         }
@@ -112,9 +116,14 @@ pub fn input_batch(batch: &wire::InputBatch) -> Result<(), Violation> {
     Ok(())
 }
 
-/// Check `ClipboardOffer.size_bytes` (≤ 1 MiB).
+/// Check exact MIME and its hard payload cap before allocating.
 pub fn clipboard_offer(offer: &wire::ClipboardOffer) -> Result<(), Violation> {
-    if offer.size_bytes > MAX_CLIPBOARD_PAYLOAD_BYTES {
+    let max = match offer.mime.as_str() {
+        "text/plain;charset=utf-8" => MAX_CLIPBOARD_PAYLOAD_BYTES,
+        "image/png" => MAX_CLIPBOARD_IMAGE_PAYLOAD_BYTES,
+        _ => return Err(Violation::ClipboardMime),
+    };
+    if offer.size_bytes > max {
         return Err(Violation::ClipboardPayloadTooLarge {
             got: offer.size_bytes,
         });
@@ -122,7 +131,7 @@ pub fn clipboard_offer(offer: &wire::ClipboardOffer) -> Result<(), Violation> {
     Ok(())
 }
 
-/// Check `ClipboardData` chunk count (1..=64), chunk index and chunk size
+/// Check stateless `ClipboardData` count (1..=2048), index and chunk size.
 /// (≤ 16 KiB).
 pub fn clipboard_data(data: &wire::ClipboardData) -> Result<(), Violation> {
     if !(MIN_CLIPBOARD_CHUNK_COUNT..=MAX_CLIPBOARD_CHUNK_COUNT).contains(&data.chunk_count) {

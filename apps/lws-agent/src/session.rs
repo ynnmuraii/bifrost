@@ -20,9 +20,10 @@
 //! | — | `CapturedBatch`, `EmergencyFired`, `LocalInputDetected`, `SessionEvent` | rules 2, 3, 9 |
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ::ipc::{AgentLink, Watchdog};
+use ::ipc::{AgentLink, AgentSender, AgentSplit, Watchdog};
 use protocol::ipc::agent_frame::Msg;
 use protocol::ipc::{
     self, AgentError, AgentFrame, AgentMode, CaptureReady, CapturedBatch, DeadlineExpired,
@@ -108,9 +109,10 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         selected
     };
     let selected = complete_backend_startup(&mut link, &mut progress_rx, backend_selection).await?;
-    let Some((mut backend, ready, refusals)) = selected else {
+    let Some((mut backend, mut ready, refusals)) = selected else {
         return Ok(());
     };
+    ready.set_image_clipboard(backend.image_clipboard_available());
     backend.set_effects(attach.edge_effects, attach.hide_cursor);
     if args.dry_inject {
         tracing::warn!("dry mode: no capture hooks, no injection; Inject is only logged");
@@ -136,7 +138,11 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
             detail = refusal.detail.as_str(),
             "backend degraded"
         );
-        send_error(&mut link, refusal.code, &refusal.detail).await?;
+        link.send(Msg::Error(AgentError {
+            code: refusal.code.to_owned(),
+            detail: refusal.detail.clone(),
+        }))
+        .await?;
     }
 
     // Rule 6's clock starts when the agent is ready. Before `AgentReady` the agent has
@@ -144,6 +150,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
     // answer core heartbeats while the user responds to portal prompts.
     let mut watchdog = watchdog_at_ready(attach.core_silence_ms, now_ms(started));
 
+    let mut link = link.into_split();
     let stop = loop_forever(
         &mut link,
         &mut backend,
@@ -153,6 +160,7 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
         &mut watchdog,
         started,
         args.dev_capture_injected,
+        ClipboardState::new(),
     )
     .await?;
 
@@ -202,7 +210,11 @@ where
                 ..
             })) => return Ok(None),
             Startup::Frame(Ok(_)) => {
-                send_error(link, "STARTUP_ONLY", "agent is initializing its backend").await?;
+                link.send(Msg::Error(AgentError {
+                    code: "STARTUP_ONLY".to_owned(),
+                    detail: "agent is initializing its backend".to_owned(),
+                }))
+                .await?;
             }
             Startup::Frame(Err(error)) => {
                 tracing::warn!(%error, "core IPC ended during backend initialization");
@@ -215,7 +227,7 @@ where
 /// The loop in one place so every exit path releases through the same code.
 #[allow(clippy::too_many_arguments)]
 async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     backend: &mut Backend,
     ready: &backend::Ready,
     mode: i32,
@@ -223,6 +235,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     watchdog: &mut Watchdog,
     started: Instant,
     dev_capture_injected: bool,
+    mut clipboard: ClipboardState,
 ) -> anyhow::Result<Stop> {
     // `ArmDeadline` arms this; rule 4 fixes the bound at 1000 ms.
     let mut deadline: Option<(Instant, Vec<u8>)> = None;
@@ -261,8 +274,6 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     let mut released_after_silence = false;
     // The node's own display set and its revision (`Hello.displays_revision`).
     let mut displays = crate::displays::DisplaysState::default();
-    // The clipboard: the versions this node speaks, and the transfer it is assembling.
-    let mut clipboard = ClipboardState::new();
     let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
     // A slow tick must not queue up: the clipboard is polled, not scheduled.
     clipboard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -319,6 +330,9 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                     return Ok(stop);
                 }
             }
+            finished = clipboard.finished(), if clipboard.active.is_some() => {
+                complete_clipboard_work(link, backend, &mut clipboard, finished).await?;
+            }
             _ = guard_tick.tick() => {
                 let signals = guard_detector.observe();
                 if last_guard.as_ref() != Some(&signals) {
@@ -330,7 +344,9 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
             // deadline and the core-silence watchdog keep running on their own tick
             // while this branch asks the platform whether the user copied something.
             _ = clipboard_tick.tick() => {
-                report_clipboard_change(link, &mut clipboard, backend.clipboard_change().await).await?;
+                if !clipboard.native_active {
+                    report_clipboard_change(link, &mut clipboard, backend.clipboard_change().await).await?;
+                }
             }
             event = backend.next_event() => {
                 let now = now_ms(started);
@@ -423,7 +439,7 @@ fn rearm_after_loop_stall(watchdog: &mut Watchdog, planned_ms: u64, now: u64) {
 /// and rule 6 must only judge a clock its own turn just reset.
 #[allow(clippy::too_many_arguments)]
 async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     backend: &mut Backend,
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     deadline: &mut Option<(Instant, Vec<u8>)>,
@@ -497,7 +513,7 @@ async fn install_hotkeys(
 /// Handles one core → agent frame. `Some(stop)` ends the loop.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     backend: &mut Backend,
     ready: &backend::Ready,
     message: &Msg,
@@ -757,7 +773,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         }
         // ADR-008: the local selection is this agent's to own, and core hands over a payload
         // a peer sent (or the release of one). It is applied only once every chunk arrived and
-        // the whole payload passed its sha256 and the UTF-8 check.
+        // the whole payload passed its sha256 and content-kind validation.
         Msg::SetClipboardText(set) => {
             handle_set_clipboard(link, backend, clipboard, set).await?;
         }
@@ -770,6 +786,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Msg::Shutdown(_) => {
+            retire_local_copy(link, clipboard);
             tracing::info!("shutdown requested by core");
             release_everything(backend, repeat, deadline, self_timeout, held_lease).await;
             return Ok(Some(Stop::Shutdown));
@@ -847,6 +864,13 @@ struct ClipboardState {
     applied_version: u64,
     /// The inbound transfer being assembled, if any. Only one at a time, per channel.
     inbound: Option<clipboard_wire::Inbound>,
+    generation: u64,
+    active: Option<ClipboardTask>,
+    native_active: bool,
+    pending: Option<ClipboardWork>,
+    outbound: Option<LocalCopyProducer>,
+    retired_through: Option<u64>,
+    png_retired_through: Option<u64>,
 }
 
 impl ClipboardState {
@@ -855,7 +879,35 @@ impl ClipboardState {
             own_version: 0,
             applied_version: 0,
             inbound: None,
+            generation: 0,
+            active: None,
+            native_active: false,
+            pending: None,
+            outbound: None,
+            retired_through: None,
+            png_retired_through: None,
         }
+    }
+
+    async fn finished(&mut self) -> ClipboardFinished {
+        let task = self.active.as_mut().expect("guarded active work");
+        match (&mut task.handle).await {
+            Ok(finished) => finished,
+            Err(_) => ClipboardFinished::Applied {
+                generation: task.generation,
+                version: task.version,
+                digest: task.digest.clone(),
+                release: task.release,
+                result: Err("CLIPBOARD_APPLY_FAILED: clipboard worker failed".to_owned()),
+            },
+        }
+    }
+
+    fn supersede(&mut self, version: u64) {
+        self.generation = self.generation.wrapping_add(1);
+        self.own_version = self.own_version.max(version);
+        self.pending = None;
+        self.inbound = None;
     }
 
     /// Records a version this node applied, so a later local change is numbered above it.
@@ -872,107 +924,499 @@ impl ClipboardState {
     }
 }
 
+/// One blocking preparation and one latest-value mailbox, never a task per copy.
+struct LocalCopyProducer {
+    latest: tokio::sync::watch::Sender<Option<Arc<LocalCopy>>>,
+    task: tokio::task::JoinHandle<()>,
+    kind: Option<clipboard::ContentKind>,
+}
+
+struct LocalCopy {
+    generation: u64,
+    version: u64,
+    content: Arc<clipboard::ClipboardContent>,
+    markers: Vec<clipboard::Marker>,
+}
+
+impl LocalCopyProducer {
+    fn new(sender: AgentSender) -> Self {
+        let (latest, mut changes) = tokio::sync::watch::channel::<Option<Arc<LocalCopy>>>(None);
+        let completed = latest.clone();
+        let task = tokio::spawn(async move {
+            'latest: loop {
+                let copy = changes.borrow_and_update().clone();
+                if let Some(copy) = copy {
+                    let preparing = Arc::clone(&copy);
+                    // The owned snapshot is immutable; hashing never runs on the input loop.
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        clipboard_wire::frames(
+                            Arc::clone(&preparing.content),
+                            preparing.version,
+                            &preparing.markers,
+                        )
+                    })
+                    .await;
+                    if changes.has_changed().unwrap_or(true) {
+                        continue;
+                    }
+                    match prepared {
+                        Ok(frames) => {
+                            for frame in frames {
+                                tokio::select! {
+                                    biased;
+                                    changed = changes.changed() => {
+                                        if changed.is_err() {
+                                            return;
+                                        }
+                                        continue 'latest;
+                                    }
+                                    sent = sender.send_bulk(copy.generation, Msg::ClipboardChanged(frame)) => {
+                                        if sent.is_err() {
+                                            // The generation changes just before its mailbox;
+                                            // wait for that update rather than losing the worker.
+                                            if changes.changed().await.is_err() {
+                                                return;
+                                            }
+                                            continue 'latest;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let _ = sender
+                                .send(Msg::Error(AgentError {
+                                    code: "CLIPBOARD_INVALID".to_owned(),
+                                    detail: "local clipboard preparation failed".to_owned(),
+                                }))
+                                .await;
+                        }
+                    }
+                    // Retain only kind metadata after queueing the last bounded chunk.
+                    completed.send_if_modified(|latest| {
+                        if latest
+                            .as_ref()
+                            .is_some_and(|latest| latest.generation == copy.generation)
+                        {
+                            *latest = None;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            latest,
+            task,
+            kind: None,
+        }
+    }
+}
+
+impl Drop for LocalCopyProducer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn retire_local_copy<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &AgentSplit<S>,
+    state: &mut ClipboardState,
+) -> u64 {
+    let generation = link.sender().replace_bulk();
+    if let Some(producer) = &mut state.outbound {
+        producer.latest.send_replace(None);
+        producer.kind = None;
+    }
+    generation
+}
+
+// Keep failure identity outside the worker: a panic cannot return its own metadata.
+struct ClipboardTask {
+    handle: tokio::task::JoinHandle<ClipboardFinished>,
+    generation: u64,
+    version: u64,
+    digest: Vec<u8>,
+    release: bool,
+    kind: Option<clipboard::ContentKind>,
+    retired: bool,
+}
+
+enum ClipboardWork {
+    Verify {
+        generation: u64,
+        inbound: clipboard_wire::Inbound,
+        last: ipc::SetClipboardText,
+    },
+    Release {
+        generation: u64,
+        version: u64,
+    },
+}
+
+enum ClipboardFinished {
+    Verified {
+        generation: u64,
+        version: u64,
+        digest: Vec<u8>,
+        result: Result<clipboard::ClipboardContent, clipboard_wire::InboundError>,
+    },
+    Applied {
+        generation: u64,
+        version: u64,
+        digest: Vec<u8>,
+        release: bool,
+        result: Result<backend::ClipboardApplyReceipt, String>,
+    },
+}
+
+fn begin_native_clipboard(
+    backend: &mut Backend,
+    state: &mut ClipboardState,
+    generation: u64,
+    version: u64,
+    digest: Vec<u8>,
+    content: Option<clipboard::ClipboardContent>,
+) {
+    let kind = content.as_ref().map(clipboard::ClipboardContent::kind);
+    let operation = backend.begin_set_clipboard(content);
+    begin_native_clipboard_job(state, generation, version, digest, kind, operation);
+}
+
+fn begin_native_clipboard_job(
+    state: &mut ClipboardState,
+    generation: u64,
+    version: u64,
+    digest: Vec<u8>,
+    kind: Option<clipboard::ContentKind>,
+    operation: Result<backend::ClipboardApplyJob, String>,
+) {
+    let release = kind.is_none();
+    state.native_active = true;
+    state.active = Some(ClipboardTask {
+        generation,
+        version,
+        digest: digest.clone(),
+        release,
+        kind,
+        retired: false,
+        handle: tokio::spawn(async move {
+            let result = match operation {
+                Ok(operation) => operation.await,
+                Err(error) => Err(error),
+            };
+            ClipboardFinished::Applied {
+                generation,
+                version,
+                digest,
+                release,
+                result,
+            }
+        }),
+    });
+}
+
+fn start_clipboard_work(backend: &mut Backend, state: &mut ClipboardState) {
+    if state.active.is_some() {
+        return;
+    }
+    match state.pending.take() {
+        Some(ClipboardWork::Verify {
+            generation,
+            inbound,
+            last,
+        }) => {
+            state.active = Some(ClipboardTask {
+                generation,
+                version: last.origin_version,
+                digest: last.sha256.clone(),
+                release: false,
+                kind: Some(inbound.kind()),
+                retired: false,
+                handle: tokio::task::spawn_blocking(move || {
+                    let result = inbound.finish(&last);
+                    ClipboardFinished::Verified {
+                        generation,
+                        version: last.origin_version,
+                        digest: last.sha256,
+                        result,
+                    }
+                }),
+            });
+        }
+        Some(ClipboardWork::Release {
+            generation,
+            version,
+        }) => {
+            begin_native_clipboard(backend, state, generation, version, Vec::new(), None);
+        }
+        None => {}
+    }
+}
+
+async fn complete_clipboard_work<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    backend: &mut Backend,
+    state: &mut ClipboardState,
+    finished: ClipboardFinished,
+) -> anyhow::Result<()> {
+    let retired = state.active.take().is_some_and(|task| task.retired);
+    let current_generation = state.generation;
+    let is_current = |generation| generation == current_generation && !retired;
+    state.native_active = false;
+    match finished {
+        ClipboardFinished::Verified {
+            generation,
+            version,
+            digest,
+            result,
+        } if is_current(generation) => match result {
+            Ok(content) => {
+                begin_native_clipboard(backend, state, generation, version, digest, Some(content))
+            }
+            Err(error) => send_error(link, error.code(), error.detail()).await?,
+        },
+        ClipboardFinished::Applied {
+            generation,
+            version,
+            digest,
+            release,
+            result,
+        } => {
+            let (ok, detail) = match result {
+                Ok(receipt) => {
+                    backend.complete_clipboard_apply(receipt);
+                    (true, String::new())
+                }
+                Err(detail) => (false, detail),
+            };
+            if is_current(generation) {
+                if ok {
+                    state.applied(version);
+                }
+                if release {
+                    if !ok {
+                        send_error(link, "CLIPBOARD_APPLY_FAILED", "clipboard release failed")
+                            .await?;
+                    }
+                } else {
+                    state.retired_through = Some(state.retired_through.unwrap_or(0).max(version));
+                    link.send(Msg::ClipboardApplied(ipc::ClipboardApplied {
+                        origin_version: version,
+                        sha256: digest,
+                        ok,
+                        detail,
+                    }))
+                    .await?;
+                }
+            }
+        }
+        ClipboardFinished::Verified { .. } => {}
+    }
+    start_clipboard_work(backend, state);
+    Ok(())
+}
+
+async fn cancel_clipboard_identity<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    version: u64,
+    digest: Vec<u8>,
+) -> anyhow::Result<()> {
+    link.send(Msg::ClipboardApplied(ipc::ClipboardApplied {
+        origin_version: version,
+        sha256: digest,
+        ok: false,
+        detail: "CLIPBOARD_SUPERSEDED".to_owned(),
+    }))
+    .await?;
+    Ok(())
+}
+
+/// Retire before dropping payloads; the two monotonic floors bound discarded IPC tails.
+async fn cancel_clipboard_work<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    state: &mut ClipboardState,
+    png_only: bool,
+) -> anyhow::Result<()> {
+    let matches_kind = |kind| !png_only || kind == Some(clipboard::ContentKind::Png);
+    let mut identities = [None, None, None];
+    if state
+        .inbound
+        .as_ref()
+        .is_some_and(|inbound| matches_kind(Some(inbound.kind())))
+    {
+        let inbound = state.inbound.take().expect("matched inbound");
+        identities[0] = Some((inbound.origin_version(), Vec::new()));
+    }
+    if matches!(&state.pending, Some(ClipboardWork::Verify { inbound, .. }) if matches_kind(Some(inbound.kind())))
+    {
+        if let Some(ClipboardWork::Verify { last, .. }) = state.pending.take() {
+            identities[1] = Some((last.origin_version, last.sha256));
+        }
+    }
+    if let Some(task) = &mut state.active {
+        if !task.release
+            && !task.retired
+            && matches_kind(task.kind)
+            && !(png_only && state.native_active)
+        {
+            task.retired = true;
+            identities[2] = Some((task.version, task.digest.clone()));
+        }
+    }
+    for (version, digest) in identities.into_iter().flatten() {
+        let floor = if png_only {
+            &mut state.png_retired_through
+        } else {
+            &mut state.retired_through
+        };
+        *floor = Some(floor.unwrap_or(0).max(version));
+        cancel_clipboard_identity(link, version, digest).await?;
+    }
+    Ok(())
+}
+
+async fn supersede_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    state: &mut ClipboardState,
+    version: u64,
+) -> anyhow::Result<()> {
+    cancel_clipboard_work(link, state, false).await?;
+    state.supersede(version);
+    Ok(())
+}
+
+async fn revoke_png<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    state: &mut ClipboardState,
+    version: u64,
+) -> anyhow::Result<()> {
+    let local_png = state
+        .outbound
+        .as_ref()
+        .is_some_and(|producer| producer.kind == Some(clipboard::ContentKind::Png));
+    if local_png {
+        retire_local_copy(link, state);
+    }
+    let known = state
+        .inbound
+        .as_ref()
+        .is_some_and(|inbound| inbound.origin_version() == version)
+        || matches!(&state.pending, Some(ClipboardWork::Verify { last, .. }) if last.origin_version == version)
+        || state
+            .active
+            .as_ref()
+            .is_some_and(|task| task.version == version)
+        || state.retired_through.is_some_and(|floor| version <= floor)
+        || state
+            .png_retired_through
+            .is_some_and(|floor| version <= floor);
+    cancel_clipboard_work(link, state, true).await?;
+    if version > 0 && !known {
+        state.png_retired_through = Some(state.png_retired_through.unwrap_or(0).max(version));
+        cancel_clipboard_identity(link, version, Vec::new()).await?;
+    }
+    Ok(())
+}
+
 /// Applies one `SetClipboardText` frame from core.
 ///
-/// The chunks are assembled by `origin_version`, and the selection is set only after the last
-/// chunk's `sha256` covers the whole payload *and* the bytes are valid UTF-8
-/// (`docs/05-protocol.md`: «проверка sha256 и UTF-8 до установки selection»). Invalid input
-/// returns `AgentError` without touching the selection. Once validated text reaches the
-/// backend, `ClipboardApplied` reports its result with the same version and hash.
-/// `chunk_count == 0` releases the selection and forgets the text, without an apply ack.
+/// Chunks fix version, MIME and size; completion verifies size, digest and content bytes.
+/// Invalid input returns `AgentError` without touching the selection. The backend then
+/// reports native success or failure through `ClipboardApplied` with the same version/hash.
+/// `chunk_count == 0` releases the selection, without an apply ACK, except `image/png`:
+/// that command cancels only pre-native PNG work and never changes the native selection.
 async fn handle_set_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     backend: &mut Backend,
     state: &mut ClipboardState,
     set: &ipc::SetClipboardText,
 ) -> anyhow::Result<()> {
-    if set.chunk_count == 0 && !backend.clipboard_available() {
-        // ADR-008: the clipboard is opt-in on both sides and separate from the KVM, so a node
-        // that cannot own a selection says so instead of dropping the frame silently.
-        state.inbound = None;
-        send_error(
-            link,
-            "CLIPBOARD_DISABLED",
-            "this session has no local clipboard (the clipboard is a separate, opt-in feature)",
-        )
-        .await?;
+    let png_only_release = set.chunk_count == 0 && set.mime == clipboard::IMAGE_MIME;
+    if set.chunk_count > 0
+        && (state
+            .retired_through
+            .is_some_and(|floor| set.origin_version <= floor)
+            || (set.mime == clipboard::IMAGE_MIME
+                && state
+                    .png_retired_through
+                    .is_some_and(|floor| set.origin_version <= floor)))
+    {
         return Ok(());
+    }
+    if !png_only_release && (set.chunk_count == 0 || set.chunk_index == 0) {
+        retire_local_copy(link, state);
     }
     if set.chunk_count == 0 {
-        state.inbound = None;
-        match backend.set_clipboard(None).await {
-            Ok(()) => {
-                state.applied(set.origin_version);
-                tracing::info!(version = set.origin_version, "clipboard released by core");
-            }
-            Err(detail) => send_error(link, "CLIPBOARD_APPLY_FAILED", &detail).await?,
+        if !png_only_release {
+            supersede_clipboard(link, state, set.origin_version).await?;
         }
+        if !set.data.is_empty() || !set.sha256.is_empty() {
+            send_error(
+                link,
+                "CLIPBOARD_INVALID",
+                "clipboard release must not carry a payload",
+            )
+            .await?;
+            return Ok(());
+        }
+        if !backend.clipboard_available() {
+            send_error(
+                link,
+                "CLIPBOARD_DISABLED",
+                "this session has no local clipboard",
+            )
+            .await?;
+            return Ok(());
+        }
+        if png_only_release {
+            revoke_png(link, state, set.origin_version).await?;
+            return Ok(());
+        }
+        state.pending = Some(ClipboardWork::Release {
+            generation: state.generation,
+            version: set.origin_version,
+        });
+        start_clipboard_work(backend, state);
         return Ok(());
     }
-
-    // "Keyed by origin_version": a frame for another version opens a new transfer and drops
-    // whatever was half-assembled for the old one. A frame for the *same* version that
-    // disagrees about anything else is the protocol error `push` reports.
-    let opens = state
-        .inbound
-        .as_ref()
-        .map(clipboard_wire::Inbound::origin_version)
-        != Some(set.origin_version);
-    if opens {
+    if set.chunk_index == 0 {
+        supersede_clipboard(link, state, set.origin_version).await?;
+    }
+    if state.inbound.is_none() {
         match clipboard_wire::Inbound::start(set) {
             Ok(inbound) => state.inbound = Some(inbound),
             Err(error) => {
-                state.inbound = None;
                 send_error(link, error.code(), error.detail()).await?;
                 return Ok(());
             }
         }
     }
-    let inbound = state.inbound.as_mut().expect("opened or kept above");
-    match inbound.push(set) {
+    match state.inbound.as_mut().expect("opened above").push(set) {
         Err(error) => {
             state.inbound = None;
             send_error(link, error.code(), error.detail()).await?;
         }
         Ok(clipboard_wire::Progress::NeedMore) => {}
         Ok(clipboard_wire::Progress::Ready) => {
-            let inbound = state.inbound.take().expect("checked above");
-            match inbound.finish(set) {
-                Err(error) => send_error(link, error.code(), error.detail()).await?,
-                Ok(text) => match backend.set_clipboard(Some(&text)).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            version = set.origin_version,
-                            bytes = text.len(),
-                            "clipboard applied from core"
-                        );
-                        state.applied(set.origin_version);
-                        link.send(Msg::ClipboardApplied(ipc::ClipboardApplied {
-                            origin_version: set.origin_version,
-                            sha256: set.sha256.clone(),
-                            ok: true,
-                            detail: String::new(),
-                        }))
-                        .await?;
-                    }
-                    Err(detail) => {
-                        link.send(Msg::ClipboardApplied(ipc::ClipboardApplied {
-                            origin_version: set.origin_version,
-                            sha256: set.sha256.clone(),
-                            ok: false,
-                            detail,
-                        }))
-                        .await?;
-                    }
-                },
-            }
+            state.pending = Some(ClipboardWork::Verify {
+                generation: state.generation,
+                inbound: state.inbound.take().expect("checked above"),
+                last: set.clone(),
+            });
+            start_clipboard_work(backend, state);
         }
     }
     Ok(())
 }
 
 async fn report_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     state: &mut ClipboardState,
     change: Result<Option<ClipboardChange>, clipboard::ClipboardError>,
 ) -> anyhow::Result<()> {
@@ -988,9 +1432,11 @@ async fn report_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// A refused local copy still supersedes the old carry, without disclosing its payload.
 async fn invalidate_clipboard_carry<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     state: &mut ClipboardState,
 ) -> anyhow::Result<()> {
+    retire_local_copy(link, state);
+    supersede_clipboard(link, state, 0).await?;
     link.send(Msg::ClipboardChanged(ipc::ClipboardChanged {
         origin_version: state.next_version(),
         // Core rejects this non-payload frame and clears the previous carry.
@@ -1007,16 +1453,17 @@ async fn invalidate_clipboard_carry<S: AsyncRead + AsyncWrite + Unpin>(
 /// is what core's assembly verifies before it offers anything to a peer. The text is never
 /// logged — only its size, the chunk count and how many markers came with it.
 async fn send_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     state: &mut ClipboardState,
     change: ClipboardChange,
 ) -> anyhow::Result<()> {
-    let bytes = change.text.len();
+    let bytes = change.content.len();
     // The 1 MiB limit is *core's* policy — it is the side that can answer `CLIPBOARD_TOO_LARGE`
     // and that knows `[clipboard].max_bytes` — so a copy over it is still reported. What the
     // agent owns is the framing: beyond `MAX_CHUNKS` frames of `CHUNK_BYTES` each,
     // only a payload-free invalidation reaches core.
-    let ceiling = clipboard_wire::MAX_CHUNKS as usize * clipboard_wire::CHUNK_BYTES;
+    let ceiling =
+        clipboard_wire::max_chunks(change.content.kind()) as usize * clipboard_wire::CHUNK_BYTES;
     if bytes > ceiling {
         tracing::warn!(
             bytes,
@@ -1025,23 +1472,31 @@ async fn send_clipboard_change<S: AsyncRead + AsyncWrite + Unpin>(
         );
         return invalidate_clipboard_carry(link, state).await;
     }
+    supersede_clipboard(link, state, 0).await?;
     let version = state.next_version();
-    let frames = clipboard_wire::frames(&change.text, version, &change.markers);
+    let generation = retire_local_copy(link, state);
     tracing::info!(
         version,
         bytes,
-        chunks = frames.len(),
+        chunks = clipboard_wire::chunk_count(bytes),
         markers = change.markers.len(),
         "offering a local clipboard change"
     );
-    for frame in frames {
-        link.send(Msg::ClipboardChanged(frame)).await?;
-    }
+    let producer = state
+        .outbound
+        .get_or_insert_with(|| LocalCopyProducer::new(link.sender()));
+    producer.kind = Some(change.content.kind());
+    producer.latest.send_replace(Some(Arc::new(LocalCopy {
+        generation,
+        version,
+        content: Arc::new(change.content),
+        markers: change.markers,
+    })));
     Ok(())
 }
 
 async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     batch: &mut Vec<LocalEvent>,
     at_edge: &mut bool,
     activation: &mut Option<ipc::PortalActivation>,
@@ -1095,7 +1550,7 @@ async fn flush_captured<S: AsyncRead + AsyncWrite + Unpin>(
 /// Handles one backend event.
 #[allow(clippy::too_many_arguments)]
 async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     backend: &mut Backend,
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     deadline: &mut Option<(Instant, Vec<u8>)>,
@@ -1269,7 +1724,7 @@ async fn release_everything(
 }
 
 async fn send_error<S: AsyncRead + AsyncWrite + Unpin>(
-    link: &mut AgentLink<S>,
+    link: &mut AgentSplit<S>,
     code: &str,
     detail: &str,
 ) -> anyhow::Result<()> {
@@ -1417,27 +1872,43 @@ mod tests {
     const HOTKEY: &str = "Ctrl+Alt+Shift+F12";
 
     #[tokio::test]
-    async fn oversized_local_clipboard_reports_existing_refusal() {
-        let mut harness = Harness::new().await;
-        report_clipboard_change(
-            &mut harness.agent,
-            &mut harness.clipboard,
-            Err(clipboard::ClipboardError::TooLarge),
-        )
-        .await
-        .expect("refusal is reported");
-        match harness.recv().await {
-            Msg::ClipboardChanged(changed) => {
-                assert_eq!(changed.origin_version, 1);
-                assert_eq!(changed.chunk_count, 0);
-                assert!(changed.data.is_empty());
-                assert!(changed.sha256.is_empty());
+    async fn failed_changed_selection_invalidates_reported_a_for_size_and_read_errors() {
+        for error in [
+            clipboard::ClipboardError::TooLarge,
+            clipboard::ClipboardError::Invalid,
+        ] {
+            let mut harness = Harness::new().await;
+            report_clipboard_change(
+                &mut harness.agent,
+                &mut harness.clipboard,
+                Ok(Some(ClipboardChange {
+                    content: clipboard::ClipboardContent::Text("A".to_owned()),
+                    markers: Vec::new(),
+                })),
+            )
+            .await
+            .expect("A is reported");
+            let Msg::ClipboardChanged(first) = harness.recv().await else {
+                panic!("expected A");
+            };
+            assert_eq!(first.origin_version, 1);
+            assert_eq!(first.data, b"A");
+            report_clipboard_change(&mut harness.agent, &mut harness.clipboard, Err(error))
+                .await
+                .expect("B refusal is reported");
+            match harness.recv().await {
+                Msg::ClipboardChanged(changed) => {
+                    assert_eq!(changed.origin_version, 2);
+                    assert_eq!(changed.chunk_count, 0);
+                    assert!(changed.data.is_empty());
+                    assert!(changed.sha256.is_empty());
+                }
+                other => panic!("expected carry invalidation, got {other:?}"),
             }
-            other => panic!("expected carry invalidation, got {other:?}"),
-        }
-        match harness.recv().await {
-            Msg::Error(error) => assert_eq!(error.code, "CLIPBOARD_TOO_LARGE"),
-            other => panic!("expected clipboard refusal, got {other:?}"),
+            match harness.recv().await {
+                Msg::Error(refusal) => assert_eq!(refusal.code, error.code()),
+                other => panic!("expected clipboard refusal, got {other:?}"),
+            }
         }
     }
 
@@ -1536,7 +2007,7 @@ mod tests {
 
     /// One agent session over an in-memory link and the dry backend.
     struct Harness {
-        agent: AgentLink<tokio::io::DuplexStream>,
+        agent: AgentSplit<tokio::io::DuplexStream>,
         core: AgentLink<tokio::io::DuplexStream>,
         backend: Backend,
         ready: backend::Ready,
@@ -1584,7 +2055,7 @@ mod tests {
             )
             .await;
             Self {
-                agent: AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR),
+                agent: AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR).into_split(),
                 core: AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR),
                 backend,
                 ready,
@@ -1628,12 +2099,18 @@ mod tests {
         }
 
         async fn recv(&mut self) -> Msg {
-            self.core
-                .recv()
-                .await
-                .expect("the agent must answer")
-                .msg
-                .expect("an answered frame carries a payload")
+            loop {
+                tokio::select! {
+                    frame = self.core.recv() => {
+                        return frame.expect("the agent must answer").msg.expect("payload");
+                    }
+                    finished = self.clipboard.finished(), if self.clipboard.active.is_some() => {
+                        complete_clipboard_work(
+                            &mut self.agent, &mut self.backend, &mut self.clipboard, finished,
+                        ).await.expect("clipboard completion");
+                    }
+                }
+            }
         }
 
         async fn event(&mut self, event: Event) {
@@ -1655,12 +2132,716 @@ mod tests {
 
         /// Asserts that the handler answered nothing at all.
         async fn quiet(&mut self) {
+            while self.clipboard.active.is_some() {
+                let finished = self.clipboard.finished().await;
+                complete_clipboard_work(
+                    &mut self.agent,
+                    &mut self.backend,
+                    &mut self.clipboard,
+                    finished,
+                )
+                .await
+                .expect("clipboard completion");
+            }
             match tokio::time::timeout(Duration::from_millis(50), self.core.recv()).await {
                 Err(_) => {}
                 Ok(Ok(frame)) => panic!("expected no frame, got {:?}", frame.msg),
                 Ok(Err(error)) => panic!("the link ended instead of staying quiet: {error}"),
             }
         }
+    }
+
+    async fn finish_one(harness: &mut Harness) {
+        let finished = harness.clipboard.finished().await;
+        complete_clipboard_work(
+            &mut harness.agent,
+            &mut harness.backend,
+            &mut harness.clipboard,
+            finished,
+        )
+        .await
+        .unwrap();
+    }
+    async fn assert_cancelled(harness: &mut Harness, version: u64, digest: Vec<u8>) {
+        match harness.core.recv().await.unwrap().msg.unwrap() {
+            Msg::ClipboardApplied(applied) => {
+                assert_eq!(applied.origin_version, version);
+                assert_eq!(applied.sha256, digest);
+                assert!(!applied.ok);
+                assert_eq!(applied.detail, "CLIPBOARD_SUPERSEDED");
+            }
+            other => panic!("expected terminal cancellation ACK, got {other:?}"),
+        }
+    }
+
+    fn panicking_clipboard_task(state: &mut ClipboardState, version: u64) {
+        state.supersede(version);
+        state.active = Some(ClipboardTask {
+            generation: state.generation,
+            version,
+            digest: clipboard::sha256(b"worker payload"),
+            release: false,
+            kind: Some(clipboard::ContentKind::Text),
+            retired: false,
+            handle: tokio::spawn(async { panic!("fake clipboard worker panicked") }),
+        });
+    }
+
+    #[tokio::test]
+    async fn a_panicking_worker_fails_current_apply_without_ending_the_session() {
+        let mut harness = Harness::new().await;
+        panicking_clipboard_task(&mut harness.clipboard, 51);
+        finish_one(&mut harness).await;
+        match harness.recv().await {
+            Msg::ClipboardApplied(applied) => {
+                assert_eq!(applied.origin_version, 51);
+                assert_eq!(applied.sha256, clipboard::sha256(b"worker payload"));
+                assert!(!applied.ok);
+                assert_eq!(
+                    applied.detail,
+                    "CLIPBOARD_APPLY_FAILED: clipboard worker failed"
+                );
+            }
+            other => panic!("expected failure ACK, got {other:?}"),
+        }
+        assert_eq!(harness.clipboard.applied_version, 0);
+        harness.send(Msg::Ping(ipc::Ping { nonce: 52 })).await;
+        assert!(matches!(
+            harness.recv().await,
+            Msg::Pong(ipc::Pong { nonce: 52 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stale_panicking_worker_is_ignored_and_latest_apply_still_runs() {
+        let dir = temp_dir("panic-stale");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        panicking_clipboard_task(&mut harness.clipboard, 53);
+        harness.send(set_text(54, "latest")).await;
+        assert_cancelled(&mut harness, 53, clipboard::sha256(b"worker payload")).await;
+        finish_one(&mut harness).await;
+        assert_eq!(harness.clipboard.applied_version, 0);
+        assert_applied(&mut harness, 54, b"latest").await;
+        assert_eq!(read(&dir.join("out.txt")), "latest");
+    }
+
+    #[tokio::test]
+    async fn png_apply_is_verified_but_honestly_refused_by_the_dry_backend() {
+        let dir = temp_dir("unsupported-png");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        assert!(!harness.backend.image_clipboard_available());
+        assert!(!harness
+            .ready
+            .capabilities
+            .iter()
+            .any(|name| name == "CLIPBOARD_IMAGE"));
+        let png = b"\x89PNG\r\n\x1a\n\xff\0binary".to_vec();
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 55,
+                chunk_index: 0,
+                chunk_count: 1,
+                sha256: clipboard::sha256(&png),
+                size_bytes: Some(png.len() as u64),
+                mime: "image/png".to_owned(),
+                data: png.clone(),
+            }))
+            .await;
+        match harness.recv().await {
+            Msg::ClipboardApplied(applied) => {
+                assert_eq!(applied.origin_version, 55);
+                assert_eq!(applied.sha256, clipboard::sha256(&png));
+                assert!(!applied.ok);
+                assert!(applied.detail.contains("CLIPBOARD_UNSUPPORTED"));
+            }
+            other => panic!("expected failure ACK, got {other:?}"),
+        }
+        assert_eq!(read(&dir.join("out.txt")), "");
+        assert_eq!(harness.clipboard.applied_version, 0);
+        harness.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn synthetic_local_png_reports_exact_binary_bytes_mime_size_and_hash() {
+        let mut harness = Harness::new().await;
+        let png = b"\x89PNG\r\n\x1a\n\xff\0binary".to_vec();
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                content: clipboard::ClipboardContent::Image { png: png.clone() },
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        match harness.recv().await {
+            Msg::ClipboardChanged(changed) => {
+                assert_eq!(changed.mime, "image/png");
+                assert_eq!(changed.size_bytes, png.len() as u64);
+                assert_eq!(changed.sha256, clipboard::sha256(&png));
+                assert_eq!(changed.data, png);
+            }
+            other => panic!("expected PNG change, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_writes_are_serialized_and_superseded_applies_get_terminal_failure_acks() {
+        let dir = temp_dir("apply-order");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let Backend::Dry(dry) = &mut harness.backend else {
+            panic!("dry backend")
+        };
+        dry.clipboard_apply_gate = Some(gate_rx);
+        harness.send(set_text(10, "A")).await;
+        finish_one(&mut harness).await;
+        assert!(harness.clipboard.native_active);
+        harness.send(set_text(11, "B")).await;
+        harness.send(set_text(12, "C")).await;
+        assert_cancelled(&mut harness, 10, clipboard::sha256(b"A")).await;
+        assert_cancelled(&mut harness, 11, clipboard::sha256(b"B")).await;
+        assert_eq!(harness.clipboard.applied_version, 0);
+        harness.send(Msg::Ping(ipc::Ping { nonce: 21 })).await;
+        assert!(matches!(
+            harness.recv().await,
+            Msg::Pong(Pong { nonce: 21 })
+        ));
+        gate_tx.send(()).unwrap();
+        finish_one(&mut harness).await;
+        assert_eq!(read(&dir.join("out.txt")), "A");
+        assert_eq!(
+            harness.clipboard.applied_version, 0,
+            "stale success is not applied"
+        );
+        std::fs::write(dir.join("in.txt"), "A").unwrap();
+        assert!(
+            harness.backend.clipboard_change().await.unwrap().is_none(),
+            "a stale native write still installs its echo receipt"
+        );
+        assert_applied(&mut harness, 12, b"C").await;
+        assert_eq!(read(&dir.join("out.txt")), "C", "B never writes over C");
+        assert_eq!(harness.clipboard.next_version(), 13);
+    }
+
+    #[tokio::test]
+    async fn release_cancels_pending_identity_and_stale_native_success_has_no_second_ack() {
+        let dir = temp_dir("apply-release");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let Backend::Dry(dry) = &mut harness.backend else {
+            panic!("dry backend")
+        };
+        dry.clipboard_apply_gate = Some(gate_rx);
+        harness.send(set_text(20, "A")).await;
+        finish_one(&mut harness).await;
+        harness.send(set_text(21, "B")).await;
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 22,
+                chunk_count: 0,
+                ..Default::default()
+            }))
+            .await;
+        gate_tx.send(()).unwrap();
+        assert_cancelled(&mut harness, 20, clipboard::sha256(b"A")).await;
+        assert_cancelled(&mut harness, 21, clipboard::sha256(b"B")).await;
+        finish_one(&mut harness).await;
+        assert_eq!(harness.clipboard.applied_version, 0);
+        harness.quiet().await;
+        assert_eq!(read(&dir.join("out.txt")), "");
+        assert_eq!(harness.clipboard.applied_version, 22);
+    }
+
+    #[tokio::test]
+    async fn image_revoke_preserves_an_outbound_local_text_producer() {
+        let dir = temp_dir("revoke-text-producer");
+        let mut harness = Harness::dry(Some(dir)).await;
+        let text = "t".repeat(3 * clipboard_wire::CHUNK_BYTES);
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                content: clipboard::ClipboardContent::Text(text.clone()),
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        harness.send(revoke_images(0)).await;
+        let mut payload = Vec::new();
+        for index in 0..3 {
+            let Msg::ClipboardChanged(frame) = harness.recv().await else {
+                panic!("text producer must survive image-only release")
+            };
+            assert_eq!(frame.origin_version, 1);
+            assert_eq!(frame.chunk_index, index);
+            assert_eq!(frame.chunk_count, 3);
+            if index == 2 {
+                assert_eq!(frame.sha256, clipboard::sha256(text.as_bytes()));
+            }
+            payload.extend_from_slice(&frame.data);
+        }
+        assert_eq!(payload, text.as_bytes());
+        harness.quiet().await;
+        assert_eq!(harness.clipboard.next_version(), 2);
+    }
+
+    fn revoke_images(version: u64) -> Msg {
+        Msg::SetClipboardText(ipc::SetClipboardText {
+            origin_version: version,
+            chunk_count: 0,
+            mime: clipboard::IMAGE_MIME.to_owned(),
+            ..Default::default()
+        })
+    }
+
+    fn delayed_native_png(
+        harness: &mut Harness,
+        path: PathBuf,
+        version: u64,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let (gate, wait) = tokio::sync::oneshot::channel();
+        let png = b"\x89PNG\r\n\x1a\ndelayed native PNG";
+        harness.clipboard.supersede(version);
+        let generation = harness.clipboard.generation;
+        // Fake only the native job: the real task, generation, completion, and release
+        // scheduling stay in use. Production Dry still refuses PNG.
+        let job: backend::ClipboardApplyJob = Box::pin(async move {
+            wait.await.map_err(|_| "test gate closed".to_owned())?;
+            std::fs::write(path, png).map_err(|error| error.to_string())?;
+            Ok(backend::ClipboardApplyReceipt::Dry(None, String::new()))
+        });
+        begin_native_clipboard_job(
+            &mut harness.clipboard,
+            generation,
+            version,
+            clipboard::sha256(png),
+            Some(clipboard::ContentKind::Png),
+            Ok(job),
+        );
+        gate
+    }
+
+    #[tokio::test]
+    async fn image_revoke_preserves_running_native_png_and_its_normal_ack() {
+        let dir = temp_dir("png-native-revoke");
+        let out = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        let gate = delayed_native_png(&mut harness, out.clone(), 60);
+        harness.send(revoke_images(60)).await;
+        harness.send(Msg::Ping(ipc::Ping { nonce: 60 })).await;
+        assert!(matches!(
+            harness.recv().await,
+            Msg::Pong(Pong { nonce: 60 })
+        ));
+        assert_eq!(std::fs::read(&out).unwrap(), b"");
+        gate.send(()).unwrap();
+        finish_one(&mut harness).await;
+        assert!(std::fs::read(&out).unwrap().starts_with(b"\x89PNG"));
+        assert_eq!(harness.clipboard.applied_version, 60);
+        assert_applied(&mut harness, 60, b"\x89PNG\r\n\x1a\ndelayed native PNG").await;
+        harness.quiet().await;
+        assert_eq!(
+            std::fs::read(out).unwrap(),
+            b"\x89PNG\r\n\x1a\ndelayed native PNG"
+        );
+        assert_eq!(harness.clipboard.applied_version, 60);
+    }
+
+    #[tokio::test]
+    async fn image_revoke_preserves_newer_pending_text_and_text_assembly() {
+        for complete_text in [false, true] {
+            let dir = temp_dir(if complete_text {
+                "png-pending-text"
+            } else {
+                "png-text-assembly"
+            });
+            let out = dir.join("out.txt");
+            let mut harness = Harness::dry(Some(dir)).await;
+            let gate = delayed_native_png(&mut harness, out.clone(), 70);
+            if complete_text {
+                harness.send(set_text(71, "newer text")).await;
+            } else {
+                harness
+                    .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                        origin_version: 71,
+                        chunk_index: 0,
+                        chunk_count: 2,
+                        data: b"newer ".to_vec(),
+                        sha256: Vec::new(),
+                        mime: clipboard::MIME.to_owned(),
+                        size_bytes: Some(10),
+                    }))
+                    .await;
+            }
+            assert_cancelled(
+                &mut harness,
+                70,
+                clipboard::sha256(b"\x89PNG\r\n\x1a\ndelayed native PNG"),
+            )
+            .await;
+            harness.send(revoke_images(71)).await;
+            gate.send(()).unwrap();
+            finish_one(&mut harness).await;
+            if !complete_text {
+                assert!(harness.clipboard.inbound.is_some());
+                assert_eq!(
+                    std::fs::read(&out).unwrap(),
+                    b"\x89PNG\r\n\x1a\ndelayed native PNG"
+                );
+                harness
+                    .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                        origin_version: 71,
+                        chunk_index: 1,
+                        chunk_count: 2,
+                        data: b"text".to_vec(),
+                        sha256: clipboard::sha256(b"newer text"),
+                        mime: clipboard::MIME.to_owned(),
+                        size_bytes: Some(10),
+                    }))
+                    .await;
+            }
+            assert_applied(&mut harness, 71, b"newer text").await;
+            harness.quiet().await;
+            assert_eq!(
+                read(&out),
+                "newer text",
+                "image revoke must not clear newer text"
+            );
+            assert_eq!(harness.clipboard.next_version(), 72);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_revoke_does_not_cancel_an_inflight_native_text_job() {
+        let dir = temp_dir("revoke-native-text");
+        let out = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        let (gate, wait) = tokio::sync::oneshot::channel();
+        let Backend::Dry(dry) = &mut harness.backend else {
+            panic!("dry backend")
+        };
+        dry.clipboard_apply_gate = Some(wait);
+        harness.send(set_text(80, "text remains")).await;
+        finish_one(&mut harness).await;
+        harness.send(revoke_images(80)).await;
+        gate.send(()).unwrap();
+        assert_applied(&mut harness, 80, b"text remains").await;
+        harness.quiet().await;
+        assert_eq!(read(&out), "text remains");
+    }
+
+    #[tokio::test]
+    async fn release_terminal_cancels_verified_png_before_native_apply() {
+        let dir = temp_dir("png-release");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        let png = b"\x89PNG\r\n\x1a\nsuperseded PNG";
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 40,
+                chunk_index: 0,
+                chunk_count: 1,
+                data: png.to_vec(),
+                sha256: clipboard::sha256(png),
+                mime: clipboard::IMAGE_MIME.to_owned(),
+                size_bytes: Some(png.len() as u64),
+            }))
+            .await;
+        let verified = harness.clipboard.finished().await;
+        assert!(matches!(
+            &verified,
+            ClipboardFinished::Verified { result: Ok(_), .. }
+        ));
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 41,
+                chunk_count: 0,
+                ..Default::default()
+            }))
+            .await;
+        assert_cancelled(&mut harness, 40, clipboard::sha256(png)).await;
+        complete_clipboard_work(
+            &mut harness.agent,
+            &mut harness.backend,
+            &mut harness.clipboard,
+            verified,
+        )
+        .await
+        .unwrap();
+        harness.quiet().await;
+        assert_eq!(harness.clipboard.applied_version, 41);
+        assert_eq!(read(&dir.join("out.txt")), "");
+    }
+
+    #[tokio::test]
+    async fn stale_verified_result_never_starts_native_apply() {
+        let dir = temp_dir("verify-stale");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        harness.send(set_text(30, "old")).await;
+        harness.send(set_text(31, "new")).await;
+        assert_cancelled(&mut harness, 30, clipboard::sha256(b"old")).await;
+        finish_one(&mut harness).await;
+        assert_eq!(read(&dir.join("out.txt")), "");
+        assert!(!harness.clipboard.native_active);
+        assert_applied(&mut harness, 31, b"new").await;
+    }
+
+    fn blocked_verify(
+        state: &mut ClipboardState,
+        version: u64,
+        content: clipboard::ClipboardContent,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        state.supersede(version);
+        let generation = state.generation;
+        let digest = clipboard::sha256(content.as_bytes());
+        let (gate, wait) = tokio::sync::oneshot::channel();
+        state.active = Some(ClipboardTask {
+            generation,
+            version,
+            digest: digest.clone(),
+            release: false,
+            kind: Some(content.kind()),
+            retired: false,
+            handle: tokio::spawn(async move {
+                wait.await.unwrap();
+                ClipboardFinished::Verified {
+                    generation,
+                    version,
+                    digest,
+                    result: Ok(content),
+                }
+            }),
+        });
+        gate
+    }
+
+    #[tokio::test]
+    async fn local_copy_or_invalid_read_retires_partial_assembly_and_silences_all_tail() {
+        for invalid in [false, true] {
+            let dir = temp_dir("local-partial-retire");
+            let mut harness = Harness::dry(Some(dir)).await;
+            let first = ipc::SetClipboardText {
+                origin_version: 100,
+                chunk_count: 3,
+                data: b"a".to_vec(),
+                mime: clipboard::MIME.to_owned(),
+                size_bytes: Some(3),
+                ..Default::default()
+            };
+            harness.send(Msg::SetClipboardText(first.clone())).await;
+            if invalid {
+                invalidate_clipboard_carry(&mut harness.agent, &mut harness.clipboard)
+                    .await
+                    .unwrap();
+            } else {
+                send_clipboard_change(
+                    &mut harness.agent,
+                    &mut harness.clipboard,
+                    ClipboardChange {
+                        content: clipboard::ClipboardContent::Text("local".to_owned()),
+                        markers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert_cancelled(&mut harness, 100, Vec::new()).await;
+            assert!(matches!(harness.recv().await, Msg::ClipboardChanged(_)));
+            // Opening replays and the final digest must not restart retired assembly.
+            for index in 0..3 {
+                let mut tail = first.clone();
+                tail.chunk_index = index;
+                if index == 2 {
+                    tail.sha256 = clipboard::sha256(b"aaa");
+                }
+                harness.send(Msg::SetClipboardText(tail)).await;
+            }
+            assert!(harness.clipboard.inbound.is_none());
+            harness.quiet().await;
+            harness.send(set_text(101, "newer")).await;
+            assert_applied(&mut harness, 101, b"newer").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_remote_verify_then_local_png_and_revoke_never_clears_local_png() {
+        let dir = temp_dir("verify-local-png");
+        let out = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        let remote = b"\x89PNG\r\n\x1a\nremote";
+        let local = b"\x89PNG\r\n\x1a\nlocal";
+        let gate = blocked_verify(
+            &mut harness.clipboard,
+            110,
+            clipboard::ClipboardContent::Image {
+                png: remote.to_vec(),
+            },
+        );
+        std::fs::write(&out, local).unwrap();
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                content: clipboard::ClipboardContent::Image {
+                    png: local.to_vec(),
+                },
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_cancelled(&mut harness, 110, clipboard::sha256(remote)).await;
+        assert!(matches!(harness.recv().await, Msg::ClipboardChanged(_)));
+        harness.send(revoke_images(110)).await;
+        gate.send(()).unwrap();
+        finish_one(&mut harness).await;
+        harness.quiet().await;
+        assert_eq!(std::fs::read(out).unwrap(), local);
+        assert_eq!(harness.clipboard.applied_version, 0);
+    }
+
+    #[tokio::test]
+    async fn png_revoke_cancels_blocked_verify_once_and_drops_tail_before_start() {
+        let dir = temp_dir("verify-revoke");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        let png = b"\x89PNG\r\n\x1a\nremote";
+        let gate = blocked_verify(
+            &mut harness.clipboard,
+            120,
+            clipboard::ClipboardContent::Image { png: png.to_vec() },
+        );
+        harness.send(revoke_images(120)).await;
+        assert_cancelled(&mut harness, 120, clipboard::sha256(png)).await;
+        harness.send(revoke_images(120)).await;
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 120,
+                chunk_count: 1,
+                mime: clipboard::IMAGE_MIME.to_owned(),
+                size_bytes: Some(png.len() as u64),
+                data: png.to_vec(),
+                sha256: clipboard::sha256(png),
+                ..Default::default()
+            }))
+            .await;
+        gate.send(()).unwrap();
+        finish_one(&mut harness).await;
+        harness.quiet().await;
+        assert_eq!(read(&dir.join("out.txt")), "");
+        assert_eq!(harness.clipboard.applied_version, 0);
+    }
+
+    #[tokio::test]
+    async fn png_revoke_before_first_chunk_sends_one_hashless_failure_without_touching_text() {
+        let dir = temp_dir("revoke-before-start");
+        let mut harness = Harness::dry(Some(dir)).await;
+        harness.send(set_text(130, "text")).await;
+        harness.send(revoke_images(131)).await;
+        assert_cancelled(&mut harness, 131, Vec::new()).await;
+        harness.send(revoke_images(131)).await;
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                origin_version: 131,
+                chunk_count: 1,
+                mime: clipboard::IMAGE_MIME.to_owned(),
+                size_bytes: Some(8),
+                data: b"\x89PNG\r\n\x1a\n".to_vec(),
+                sha256: clipboard::sha256(b"\x89PNG\r\n\x1a\n"),
+                ..Default::default()
+            }))
+            .await;
+        assert_applied(&mut harness, 130, b"text").await;
+        harness.quiet().await;
+        assert_eq!(harness.clipboard.next_version(), 131);
+    }
+
+    #[tokio::test]
+    async fn generic_png_revoke_retires_partial_png_without_a_synthetic_zero_ack() {
+        let dir = temp_dir("png-partial-revoke");
+        let out = dir.join("out.txt");
+        let mut harness = Harness::dry(Some(dir)).await;
+        std::fs::write(&out, b"local selection").unwrap();
+        let first = ipc::SetClipboardText {
+            origin_version: 135,
+            chunk_count: 2,
+            mime: clipboard::IMAGE_MIME.to_owned(),
+            size_bytes: Some(9),
+            data: b"\x89PNG\r\n\x1a\n".to_vec(),
+            ..Default::default()
+        };
+        harness.send(Msg::SetClipboardText(first.clone())).await;
+        harness.send(revoke_images(0)).await;
+        assert_cancelled(&mut harness, 135, Vec::new()).await;
+        harness.send(Msg::SetClipboardText(first.clone())).await;
+        harness
+            .send(Msg::SetClipboardText(ipc::SetClipboardText {
+                chunk_index: 1,
+                data: b"x".to_vec(),
+                sha256: clipboard::sha256(b"\x89PNG\r\n\x1a\nx"),
+                ..first
+            }))
+            .await;
+        harness.send(revoke_images(0)).await;
+        harness.quiet().await;
+        assert_eq!(std::fs::read(out).unwrap(), b"local selection");
+        assert_eq!(harness.clipboard.applied_version, 0);
+    }
+
+    #[tokio::test]
+    async fn local_invalid_read_cancels_blocked_verify_once_without_applying_its_result() {
+        let dir = temp_dir("invalid-verify");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        let gate = blocked_verify(
+            &mut harness.clipboard,
+            140,
+            clipboard::ClipboardContent::Text("remote".to_owned()),
+        );
+        invalidate_clipboard_carry(&mut harness.agent, &mut harness.clipboard)
+            .await
+            .unwrap();
+        assert_cancelled(&mut harness, 140, clipboard::sha256(b"remote")).await;
+        assert!(matches!(harness.recv().await, Msg::ClipboardChanged(_)));
+        harness.send(set_text(140, "remote")).await;
+        gate.send(()).unwrap();
+        finish_one(&mut harness).await;
+        harness.quiet().await;
+        assert_eq!(read(&dir.join("out.txt")), "");
+        assert_eq!(harness.clipboard.applied_version, 0);
+    }
+
+    #[tokio::test]
+    async fn local_copy_terminal_cancels_running_native_once_but_keeps_its_echo_receipt() {
+        let dir = temp_dir("local-native-retire");
+        let mut harness = Harness::dry(Some(dir.clone())).await;
+        let (gate, wait) = tokio::sync::oneshot::channel();
+        let Backend::Dry(dry) = &mut harness.backend else {
+            panic!("dry backend")
+        };
+        dry.clipboard_apply_gate = Some(wait);
+        harness.send(set_text(150, "remote")).await;
+        finish_one(&mut harness).await;
+        send_clipboard_change(
+            &mut harness.agent,
+            &mut harness.clipboard,
+            ClipboardChange {
+                content: clipboard::ClipboardContent::Text("local".to_owned()),
+                markers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_cancelled(&mut harness, 150, clipboard::sha256(b"remote")).await;
+        assert!(matches!(harness.recv().await, Msg::ClipboardChanged(_)));
+        harness.send(set_text(150, "remote")).await;
+        gate.send(()).unwrap();
+        finish_one(&mut harness).await;
+        harness.quiet().await;
+        assert_eq!(read(&dir.join("out.txt")), "remote");
+        assert_eq!(harness.clipboard.applied_version, 0);
+        std::fs::write(dir.join("in.txt"), "remote").unwrap();
+        assert!(harness.backend.clipboard_change().await.unwrap().is_none());
     }
 
     #[cfg(target_os = "windows")]
@@ -1779,6 +2960,7 @@ mod tests {
             chunk_count: 1,
             data: text.as_bytes().to_vec(),
             sha256: clipboard::sha256(text.as_bytes()),
+            ..Default::default()
         })
     }
 
@@ -1817,6 +2999,7 @@ mod tests {
                 chunk_count: 1,
                 sha256: clipboard::sha256(&data),
                 data,
+                ..Default::default()
             }))
             .await;
         match harness.recv().await {
@@ -1900,7 +3083,7 @@ mod tests {
             .await
             .expect("clipboard read")
             .expect("a local copy surfaces");
-        assert_eq!(change.text, "copied by the user");
+        assert_eq!(change.content.as_bytes(), b"copied by the user");
         assert!(change.markers.is_empty(), "dry mode reports no marker");
         assert_eq!(read(&out_path), "copied by the user");
 
@@ -1942,6 +3125,7 @@ mod tests {
                 chunk_count: 0,
                 data: Vec::new(),
                 sha256: Vec::new(),
+                ..Default::default()
             }))
             .await;
         harness.quiet().await;
@@ -1952,7 +3136,7 @@ mod tests {
             &mut harness.agent,
             &mut harness.clipboard,
             ClipboardChange {
-                text: "local".to_owned(),
+                content: clipboard::ClipboardContent::Text("local".to_owned()),
                 markers: Vec::new(),
             },
         )
@@ -1980,6 +3164,7 @@ mod tests {
                 chunk_count: 2,
                 data: b"def".to_vec(),
                 sha256: clipboard::sha256(b"abcdef"),
+                ..Default::default()
             }))
             .await;
         match harness.recv().await {
@@ -1997,6 +3182,7 @@ mod tests {
                 chunk_count: 1,
                 data: "секрет".as_bytes().to_vec(),
                 sha256: clipboard::sha256(b"another payload"),
+                ..Default::default()
             }))
             .await;
         match harness.recv().await {
@@ -2018,6 +3204,7 @@ mod tests {
                 chunk_count: crate::clipboard_wire::MAX_CHUNKS + 1,
                 data: b"x".to_vec(),
                 sha256: Vec::new(),
+                ..Default::default()
             }))
             .await;
         match harness.recv().await {
@@ -2035,6 +3222,7 @@ mod tests {
                 chunk_count: 2,
                 data: b"abc".to_vec(),
                 sha256: Vec::new(),
+                ..Default::default()
             }))
             .await;
         harness.quiet().await;
@@ -2045,6 +3233,7 @@ mod tests {
                 chunk_count: 2,
                 data: b"def".to_vec(),
                 sha256: hash,
+                ..Default::default()
             }))
             .await;
         assert_applied(&mut harness, 10, b"abcdef").await;
@@ -2073,7 +3262,10 @@ mod tests {
             .await
             .expect("clipboard read")
             .is_none());
-        assert!(harness.backend.set_clipboard(Some("x")).await.is_err());
+        assert!(harness
+            .backend
+            .begin_set_clipboard(Some(clipboard::ClipboardContent::Text("x".to_owned())))
+            .is_err());
 
         harness.send(set_text(1, "x")).await;
         match harness.recv().await {
@@ -2099,7 +3291,7 @@ mod tests {
             &mut harness.agent,
             &mut harness.clipboard,
             ClipboardChange {
-                text: text.clone(),
+                content: clipboard::ClipboardContent::Text(text.clone()),
                 markers: vec![Marker::KdeSecret, Marker::ExcludeFromMonitor],
             },
         )
@@ -2133,7 +3325,7 @@ mod tests {
             &mut harness.agent,
             &mut harness.clipboard,
             ClipboardChange {
-                text: "second".to_owned(),
+                content: clipboard::ClipboardContent::Text("second".to_owned()),
                 markers: Vec::new(),
             },
         )
@@ -2159,7 +3351,9 @@ mod tests {
             &mut harness.agent,
             &mut harness.clipboard,
             ClipboardChange {
-                text: "x".repeat(clipboard::MAX_BYTES as usize + 1),
+                content: clipboard::ClipboardContent::Text(
+                    "x".repeat(clipboard::MAX_BYTES as usize + 1),
+                ),
                 markers: Vec::new(),
             },
         )
@@ -2196,7 +3390,7 @@ mod tests {
             &mut harness.agent,
             &mut harness.clipboard,
             ClipboardChange {
-                text: "x".repeat(ceiling + 1),
+                content: clipboard::ClipboardContent::Text("x".repeat(ceiling + 1)),
                 markers: Vec::new(),
             },
         )
@@ -2216,7 +3410,7 @@ mod tests {
             &mut harness.agent,
             &mut harness.clipboard,
             ClipboardChange {
-                text: "small".to_owned(),
+                content: clipboard::ClipboardContent::Text("small".to_owned()),
                 markers: Vec::new(),
             },
         )
@@ -2228,10 +3422,194 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn running_loop_interleaves_control_with_backpressured_png_and_replaces_its_tail() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let dir = temp_dir("local-bulk");
+                    let (mut backend, ready, _) = Backend::select(
+                        BackendKindArg(ipc::BackendKind::Auto as i32),
+                        true,
+                        2,
+                        false,
+                        false,
+                        Some(dir.clone()),
+                        HOTKEY,
+                        &[],
+                        false,
+                        tokio::sync::mpsc::unbounded_channel().0,
+                        ipc::TakeoverDetection::Auto,
+                        12,
+                    )
+                    .await;
+                    let mut clipboard = ClipboardState::new();
+                    // Less than one chunk: the writer must stop inside each whole frame.
+                    let (agent_io, core_io) = duplex(1024);
+                    let mut agent = AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR).into_split();
+                    let mut core = AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR);
+                    let running = tokio::task::spawn_local(async move {
+                        let mut png = vec![0xa5; clipboard::MAX_IMAGE_BYTES as usize];
+                        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+                        send_clipboard_change(
+                            &mut agent,
+                            &mut clipboard,
+                            ClipboardChange {
+                                content: clipboard::ClipboardContent::Image { png },
+                                markers: Vec::new(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let mut watchdog = watchdog_at_ready(500, 0);
+                        loop_forever(
+                            &mut agent,
+                            &mut backend,
+                            &ready,
+                            AgentMode::Normal as i32,
+                            ipc::RepeatMode::ReceiverSoftware as i32,
+                            &mut watchdog,
+                            Instant::now(),
+                            false,
+                            clipboard,
+                        )
+                        .await
+                    });
+
+                    let first = loop {
+                        match core.recv().await.unwrap().msg.unwrap() {
+                            Msg::ClipboardChanged(changed) => break changed,
+                            Msg::GameGuardSignals(_) => {}
+                            other => panic!("expected local PNG, got {other:?}"),
+                        }
+                    };
+                    assert_eq!(first.chunk_count, clipboard_wire::MAX_IMAGE_CHUNKS);
+                    assert_eq!(first.chunk_index, 0);
+                    assert_eq!(first.mime, clipboard::IMAGE_MIME);
+                    assert!(first.sha256.is_empty());
+                    let old_version = first.origin_version;
+                    let mut old_chunks = 1;
+
+                    core.send(Msg::Ping(ipc::Ping { nonce: 101 }))
+                        .await
+                        .unwrap();
+                    core.send(Msg::ReleaseSession(ipc::ReleaseSession {
+                        lease_id: lease(3),
+                    }))
+                    .await
+                    .unwrap();
+                    core.send(Msg::Inject(ipc::Inject {
+                        lease_id: lease(4),
+                        input_batch_seq: 17,
+                        events: vec![ipc::LocalEvent {
+                            monotonic_us: 0,
+                            ev: Some(ipc::local_event::Ev::Key(ipc::HidKey {
+                                usage_page: 7,
+                                usage: 0x04,
+                                down: false,
+                            })),
+                        }],
+                    }))
+                    .await
+                    .unwrap();
+                    core.send(Msg::BeginCapture(ipc::BeginCapture {
+                        kind: ipc::CaptureKind::Remote as i32,
+                        lease_id: lease(5),
+                        self_timeout_ms: 0,
+                        dev_capture_injected: false,
+                    }))
+                    .await
+                    .unwrap();
+                    // Do not drain bulk while the session receives and dispatches commands.
+                    tokio::time::sleep(CLIPBOARD_POLL).await;
+                    let (mut pong, mut released, mut injected, mut captured) =
+                        (false, false, false, false);
+                    while !pong || !released || !injected || !captured {
+                        match core.recv().await.unwrap().msg.unwrap() {
+                            Msg::ClipboardChanged(changed) => {
+                                assert_eq!(changed.origin_version, old_version);
+                                assert_eq!(changed.chunk_index, old_chunks);
+                                old_chunks += 1;
+                            }
+                            Msg::Pong(answer) => {
+                                assert_eq!(answer.nonce, 101);
+                                pong = true;
+                            }
+                            Msg::Released(answer) => {
+                                assert_eq!(answer.lease_id, lease(3));
+                                released = true;
+                            }
+                            Msg::InjectResult(answer) => {
+                                assert_eq!(answer.input_batch_seq, 17);
+                                assert_eq!(answer.applied_count, 1);
+                                injected = true;
+                            }
+                            Msg::CaptureReady(answer) => assert_eq!(answer.lease_id, lease(5)),
+                            Msg::Captured(batch) => {
+                                assert!(!batch.events.is_empty());
+                                captured = true;
+                            }
+                            Msg::GameGuardSignals(_) => {}
+                            other => panic!("unexpected control response: {other:?}"),
+                        }
+                        assert!(
+                            old_chunks < first.chunk_count,
+                            "control waited for all PNG chunks"
+                        );
+                    }
+
+                    // A real dry-backend copy goes through the running poll arm, not a
+                    // direct producer call. Keep the pipe full until that poll can run.
+                    std::fs::write(dir.join("in.txt"), "newest local copy").unwrap();
+                    tokio::time::sleep(backend::DRY_CLIPBOARD_POLL + 2 * CLIPBOARD_POLL).await;
+                    let replacement = loop {
+                        match core.recv().await.unwrap().msg.unwrap() {
+                            Msg::ClipboardChanged(changed)
+                                if changed.origin_version == old_version =>
+                            {
+                                assert_eq!(changed.chunk_index, old_chunks);
+                                old_chunks += 1;
+                                assert!(changed.sha256.is_empty(), "stale PNG completed");
+                            }
+                            Msg::ClipboardChanged(changed) => break changed,
+                            Msg::Captured(batch) => assert!(!batch.events.is_empty()),
+                            Msg::GameGuardSignals(_) => {}
+                            other => panic!("expected replacement copy: {other:?}"),
+                        }
+                    };
+                    assert_eq!(replacement.origin_version, old_version + 1);
+                    assert_eq!(replacement.data, b"newest local copy");
+                    assert_eq!(replacement.chunk_count, 1);
+                    assert_eq!(replacement.sha256, clipboard::sha256(b"newest local copy"));
+                    assert!(old_chunks < first.chunk_count, "stale tail was not retired");
+                    core.send(Msg::Ping(ipc::Ping { nonce: 102 }))
+                        .await
+                        .unwrap();
+                    loop {
+                        match core.recv().await.unwrap().msg.unwrap() {
+                            Msg::Pong(answer) => {
+                                assert_eq!(answer.nonce, 102);
+                                break;
+                            }
+                            Msg::Captured(batch) => assert!(!batch.events.is_empty()),
+                            Msg::GameGuardSignals(_) => {}
+                            other => panic!("stale payload after replacement: {other:?}"),
+                        }
+                    }
+                    core.send(Msg::Shutdown(ipc::AgentShutdown {}))
+                        .await
+                        .unwrap();
+                    assert!(matches!(running.await.unwrap(), Ok(Stop::Shutdown)));
+                })
+                .await;
+        })
+        .await
+        .expect("backpressure must not prevent session control or replacement");
+    }
+
     /// The whole loop, on a real link: a copy the user makes reaches core without anyone
-    /// asking, and a payload core sends lands on the selection. This is the only test that
-    /// covers the `select!` wiring itself — the clipboard branch, its own pacing, and the
-    /// `SetClipboardText` arm behind the same loop that services the deadline and the watchdog.
+    /// asking, and a payload core sends lands on the selection. This covers the poll and
+    /// `SetClipboardText` arms behind the same loop that services deadlines and the watchdog.
     #[tokio::test]
     async fn the_running_loop_reports_a_local_copy_and_applies_what_core_sends() {
         // `Backend` holds the portal streams on Linux, which are not `Send`, so the loop is
@@ -2260,7 +3638,14 @@ mod tests {
                     12,
                 )
                 .await;
-                let mut agent = AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR);
+                let (apply_tx, apply_rx) = tokio::sync::oneshot::channel();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let Backend::Dry(dry) = &mut backend else {
+                    panic!("dry backend")
+                };
+                dry.clipboard_apply_gate = Some(apply_rx);
+                dry.clipboard_apply_started = Some(started_tx);
+                let mut agent = AgentLink::new(agent_io, FRAME_MAJOR, FRAME_MINOR).into_split();
                 let mut core = AgentLink::new(core_io, FRAME_MAJOR, FRAME_MINOR);
                 // 500 ms is the widest the watchdog accepts; the test stays well inside it.
                 let mut watchdog =
@@ -2276,6 +3661,7 @@ mod tests {
                         &mut watchdog,
                         started,
                         false,
+                        ClipboardState::new(),
                     )
                     .await
                 });
@@ -2306,6 +3692,39 @@ mod tests {
                 core.send(set_text(9, "from core"))
                     .await
                     .expect("the frame goes out");
+                tokio::time::timeout(Duration::from_secs(2), started_rx)
+                    .await
+                    .expect("native operation starts")
+                    .unwrap();
+                core.send(Msg::Ping(ipc::Ping { nonce: 73 })).await.unwrap();
+                core.send(Msg::ArmDeadline(ipc::ArmDeadline {
+                    lease_id: lease(7),
+                    remaining_ms: 30,
+                }))
+                .await
+                .unwrap();
+                let mut pong = false;
+                let mut expired = false;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !pong || !expired {
+                        match core.recv().await.unwrap().msg.unwrap() {
+                            Msg::Pong(answer) => {
+                                assert_eq!(answer.nonce, 73);
+                                pong = true;
+                            }
+                            Msg::DeadlineExpired(deadline) => {
+                                assert_eq!(deadline.lease_id, lease(7));
+                                expired = true;
+                            }
+                            Msg::GameGuardSignals(_) => {}
+                            other => panic!("clipboard must remain pending: {other:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("Ping and deadline serviced during delayed native apply");
+                assert_ne!(read(&out_path), "from core");
+                apply_tx.send(()).unwrap();
                 match tokio::time::timeout(Duration::from_secs(2), core.recv()).await {
                     Ok(Ok(frame)) => match frame.msg.expect("a payload") {
                         Msg::ClipboardApplied(applied) => {

@@ -71,11 +71,28 @@ impl<S> Framed<S> {
     pub fn into_inner(self) -> S {
         self.io
     }
+
+    /// Split ownership without discarding already buffered incoming bytes.
+    pub fn into_split(self) -> (Framed<tokio::io::ReadHalf<S>>, tokio::io::WriteHalf<S>)
+    where
+        S: AsyncRead + AsyncWrite,
+    {
+        let (reader, writer) = tokio::io::split(self.io);
+        (
+            Framed {
+                io: reader,
+                channel: self.channel,
+                decoder: self.decoder,
+                buffer: self.buffer,
+            },
+            writer,
+        )
+    }
 }
 
 impl<S> Framed<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
 {
     /// Encode and write one message.
     ///
@@ -92,6 +109,19 @@ where
         self.write_all(&bytes).await
     }
 
+    async fn write_all(&mut self, bytes: &[u8]) -> Result<(), IpcError> {
+        self.io
+            .write_all(bytes)
+            .await
+            .map_err(|source| IpcError::io("writing an IPC frame", source))?;
+        self.io
+            .flush()
+            .await
+            .map_err(|source| IpcError::io("flushing an IPC frame", source))
+    }
+}
+
+impl<S: AsyncRead + Unpin> Framed<S> {
     /// Read one message.
     pub async fn recv<M>(&mut self) -> Result<M, IpcError>
     where
@@ -116,17 +146,6 @@ where
             self.buffer.drain(..consumed);
             return Ok(body);
         }
-    }
-
-    async fn write_all(&mut self, bytes: &[u8]) -> Result<(), IpcError> {
-        self.io
-            .write_all(bytes)
-            .await
-            .map_err(|source| IpcError::io("writing an IPC frame", source))?;
-        self.io
-            .flush()
-            .await
-            .map_err(|source| IpcError::io("flushing an IPC frame", source))
     }
 
     async fn fill(&mut self) -> Result<(), IpcError> {

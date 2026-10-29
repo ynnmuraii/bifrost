@@ -281,6 +281,7 @@ pub fn adopt_capabilities(current: &mut Capabilities, names: &[String]) {
     current.absolute_pointer = has("ABSOLUTE_POINTER");
     current.emergency_hotkey = has("EMERGENCY_HOTKEY");
     current.text_clipboard = has("TEXT_CLIPBOARD");
+    current.image_clipboard = has("CLIPBOARD_IMAGE");
 }
 
 /// The `Hello.capabilities` numbers for the bits the FSM and the product use.
@@ -304,6 +305,9 @@ pub fn capability_bits(capabilities: Capabilities) -> Vec<i32> {
     }
     if capabilities.text_clipboard {
         bits.push(wire::Capability::TextClipboard as i32);
+    }
+    if capabilities.image_clipboard {
+        bits.push(wire::Capability::ClipboardImage as i32);
     }
     if capabilities.native_repeat {
         bits.push(wire::Capability::NativeRepeat as i32);
@@ -1200,6 +1204,7 @@ mod tests {
         let epoch = transport::clipboard::process_epoch();
         for text_clipboard in [false, true, false] {
             capabilities.text_clipboard = text_clipboard;
+            capabilities.image_clipboard = text_clipboard;
             hello.capabilities = capability_bits(capabilities);
             hello
                 .capabilities
@@ -1211,6 +1216,7 @@ mod tests {
                 "agent readiness must not downgrade the authenticated epoch capability"
             );
             assert_eq!(peer.text_clipboard, text_clipboard);
+            assert_eq!(peer.image_clipboard, text_clipboard);
         }
     }
 }
@@ -1569,6 +1575,7 @@ mod contract_tests {
             absolute_pointer: true,
             physical_hid_keys: true,
             text_clipboard: true,
+            image_clipboard: true,
             native_repeat: true,
             software_repeat: true,
             receiver_takeover: true,
@@ -1576,7 +1583,7 @@ mod contract_tests {
             emergency_hotkey: true,
         };
 
-        let expected: Vec<i32> = vec![12, 13, 14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let expected: Vec<i32> = vec![12, 13, 14, 1, 2, 3, 4, 5, 15, 6, 7, 8, 9, 10];
         assert_eq!(
             capability_bits(capabilities),
             expected,
@@ -1599,8 +1606,13 @@ mod contract_tests {
         assert!(capabilities.absolute_pointer);
         adopt_capabilities(&mut capabilities, &["TEXT_CLIPBOARD".into()]);
         assert!(capabilities.text_clipboard);
+        assert!(!capabilities.image_clipboard);
+        adopt_capabilities(&mut capabilities, &["CLIPBOARD_IMAGE".into()]);
+        assert!(capabilities.image_clipboard);
+        assert!(!capabilities.text_clipboard);
         adopt_capabilities(&mut capabilities, &[]);
         assert!(!capabilities.text_clipboard);
+        assert!(!capabilities.image_clipboard);
     }
 
     #[test]

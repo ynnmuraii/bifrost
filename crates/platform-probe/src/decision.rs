@@ -155,6 +155,8 @@ pub struct Capabilities {
     /// `CAPABILITY_TEXT_CLIPBOARD` — declared only after the clipboard portal says
     /// `clipboard_enabled`, so it is `false` at probe time (ADR-008).
     pub text_clipboard: bool,
+    /// `CAPABILITY_CLIPBOARD_IMAGE`; only a running adapter can report PNG support.
+    pub image_clipboard: bool,
     /// `CAPABILITY_NATIVE_REPEAT`.
     pub native_repeat: bool,
     /// `CAPABILITY_SOFTWARE_REPEAT`.
@@ -181,6 +183,7 @@ impl Capabilities {
         push(self.absolute_pointer, "ABSOLUTE_POINTER");
         push(self.physical_hid_keys, "PHYSICAL_HID_KEYS");
         push(self.text_clipboard, "TEXT_CLIPBOARD");
+        push(self.image_clipboard, "CLIPBOARD_IMAGE");
         push(self.native_repeat, "NATIVE_REPEAT");
         push(self.software_repeat, "SOFTWARE_REPEAT");
         push(self.receiver_takeover, "RECEIVER_TAKEOVER");
@@ -298,6 +301,7 @@ impl SessionInfo {
                 absolute_pointer: true,
                 physical_hid_keys: true,
                 text_clipboard: false,
+                image_clipboard: false,
                 // Measured: a key injected with `SendInput` and held without an up produces
                 // no further down of its own (lws-agent `repeat` module, KVM-036), so a
                 // Windows receiver must repeat it in software.
@@ -324,6 +328,7 @@ impl SessionInfo {
                 absolute_pointer: true,
                 physical_hid_keys: true,
                 text_clipboard: false,
+                image_clipboard: false,
                 // Measured: a key injected with `SendInput` and held without an up produces
                 // no further down of its own (lws-agent `repeat` module, KVM-036), so a
                 // Windows receiver must repeat it in software.
@@ -357,6 +362,7 @@ impl SessionInfo {
                 absolute_pointer: remote_desktop_v2,
                 physical_hid_keys: true,
                 text_clipboard: false,
+                image_clipboard: false,
                 // Whether the compositor repeats EIS-emulated keys is a KVM-016
                 // question; neither repeat capability is claimed until it is answered.
                 native_repeat: false,

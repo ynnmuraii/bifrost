@@ -907,6 +907,7 @@ fn decide_session(config: &config::Config) -> LocalSession {
                 // Start conservatively on every platform; AgentReady publishes the real
                 // capability to already-connected peers as well as future handshakes.
                 text_clipboard: false,
+                image_clipboard: false,
                 ..session.capabilities
             },
             fsm: focus_router::Capabilities {
@@ -958,6 +959,7 @@ fn no_capabilities() -> platform_probe::Capabilities {
         absolute_pointer: false,
         physical_hid_keys: false,
         text_clipboard: false,
+        image_clipboard: false,
         native_repeat: false,
         software_repeat: false,
         receiver_takeover: false,

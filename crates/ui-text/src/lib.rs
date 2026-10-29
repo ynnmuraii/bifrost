@@ -543,6 +543,14 @@ pub enum Key {
     WhatIsCarried,
     /// «Только текст. Файлы и изображения — нет.»
     TextOnlyNoFilesNoImages,
+    /// «Текст и изображения. Файлы — нет.»
+    TextAndImagesNoFiles,
+    /// «Изображения»
+    Images,
+    /// «Эта система не может передавать изображения»
+    ThisSystemCannotSendImages,
+    /// «Изображения передаются как PNG в пределах заданного размера и не сохраняются в истории»
+    ImagesAreSentAsPngUpToTheConfiguredSizeAndAreNotKeptInHistory,
     /// «Содержимое буфера не попадает в отчёты диагностики»
     TheClipboardNeverReachesTheDiagnosticsReports,
     /// «Отчёт»
@@ -1089,6 +1097,10 @@ const fn ru(key: Key) -> &'static str {
         Key::TheServiceReportedThatTheSharedClipboardIsUnavailable => "Служба сообщила: общий буфер обмена недоступен",
         Key::WhatIsCarried => "Что передаётся",
         Key::TextOnlyNoFilesNoImages => "Только текст. Файлы и изображения — нет.",
+        Key::TextAndImagesNoFiles => "Текст и изображения. Файлы — нет.",
+        Key::Images => "Изображения",
+        Key::ThisSystemCannotSendImages => "Эта система не может передавать изображения",
+        Key::ImagesAreSentAsPngUpToTheConfiguredSizeAndAreNotKeptInHistory => "Изображения передаются как PNG в пределах заданного размера и не сохраняются в истории",
         Key::TheClipboardNeverReachesTheDiagnosticsReports => "Содержимое буфера не попадает в отчёты диагностики",
         Key::Report => "Отчёт",
         Key::SaveTheDiagnostics2 => "Сохранить диагностику",
@@ -1501,6 +1513,10 @@ const fn en(key: Key) -> &'static str {
         Key::TheServiceReportedThatTheSharedClipboardIsUnavailable => "The service reported that the shared clipboard is unavailable",
         Key::WhatIsCarried => "What is carried",
         Key::TextOnlyNoFilesNoImages => "Text only. No files, no images.",
+        Key::TextAndImagesNoFiles => "Text and images. No files.",
+        Key::Images => "Images",
+        Key::ThisSystemCannotSendImages => "This system cannot send images",
+        Key::ImagesAreSentAsPngUpToTheConfiguredSizeAndAreNotKeptInHistory => "Images are sent as PNG up to the configured size and are not kept in history",
         Key::TheClipboardNeverReachesTheDiagnosticsReports => "The clipboard never reaches the diagnostics reports",
         Key::Report => "Report",
         Key::SaveTheDiagnostics2 => "Save the diagnostics",
@@ -1876,7 +1892,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 374] = [
+    pub const EVERY: [Key; 378] = [
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,
@@ -2089,6 +2105,10 @@ mod tests {
         Key::TheServiceReportedThatTheSharedClipboardIsUnavailable,
         Key::WhatIsCarried,
         Key::TextOnlyNoFilesNoImages,
+        Key::TextAndImagesNoFiles,
+        Key::Images,
+        Key::ThisSystemCannotSendImages,
+        Key::ImagesAreSentAsPngUpToTheConfiguredSizeAndAreNotKeptInHistory,
         Key::TheClipboardNeverReachesTheDiagnosticsReports,
         Key::Report,
         Key::SaveTheDiagnostics2,

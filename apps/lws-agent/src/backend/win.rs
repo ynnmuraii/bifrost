@@ -100,13 +100,16 @@ pub struct Win {
     /// A set of the clipboard moves `GetClipboardSequenceNumber`, and the notification the
     /// OS delivers for that set is indistinguishable from a user's copy *except* by the
     /// counter. So the value right after this backend's own `SetClipboardData` is remembered
-    /// in `last_clipboard_sequence`, and every read that carries it is swallowed: exactly
+    /// in `last_clipboard_write_sequence`, and every read that carries it is swallowed: exactly
     /// this node's write or an already observed notification, never someone else's new copy.
     /// Core separately tracks `(origin_node_id, origin_version)`; this is the same echo
     /// rule at the OS edge, where only the platform's signal exists.
     clipboard: Option<platform_win::clipboard::Clipboard>,
     /// `GetClipboardSequenceNumber` of the last observed item or our own write.
     last_clipboard_sequence: Option<u32>,
+    /// Kept separately: an older in-flight read must not erase our write's echo receipt.
+    last_clipboard_write_sequence: Option<u32>,
+    clipboard_read: ClipboardRead,
     last_capture_report: Option<Instant>,
     last_capture_stats: CaptureStats,
     remote_hook_baseline: input_model::EdgeCounters,
@@ -149,6 +152,7 @@ impl Win {
         };
         let mut ready = ready.clone();
         ready.set_text_clipboard(clipboard.is_some());
+        ready.set_image_clipboard(clipboard.is_some());
         Ok(Win {
             ready,
             capture: Some(
@@ -171,6 +175,8 @@ impl Win {
             repeats: RepeatFilter::new(),
             clipboard,
             last_clipboard_sequence: None,
+            last_clipboard_write_sequence: None,
+            clipboard_read: ClipboardRead::default(),
             last_capture_report: None,
             last_capture_stats: CaptureStats::default(),
             remote_hook_baseline: input_model::EdgeCounters::default(),
@@ -276,88 +282,90 @@ impl Win {
 
     /// The next clipboard change the *user* made, if the listener queued one.
     ///
-    /// Non-blocking on purpose: the session polls this from its own tick, and its watchdog and
-    /// deadline live on that tick too. The *notification* never blocks; the read itself is
-    /// Win32 work with a retry loop (`OpenClipboard` refuses while another process holds the
-    /// clipboard), so it runs on a blocking thread. That keeps the runtime thread — the one
-    /// the 5 ms poll tick, the IPC frames and the core-silence watchdog share — free: a busy
-    /// loop must not be able to delay the `Pong`.
+    /// Both the Win32 retry loop and image conversion run on a blocking worker. Only a
+    /// finished worker is awaited here: even a busy clipboard cannot hold the session tick.
+    /// Notifications during a read coalesce into one more read of the latest selection.
     pub async fn clipboard_change(
         &mut self,
     ) -> Result<Option<ClipboardChange>, clipboard::ClipboardError> {
         let Some(clipboard) = self.clipboard.as_ref() else {
             return Ok(None);
         };
-        if clipboard.wait(Duration::ZERO).is_none() {
-            return Ok(None);
-        }
-        let snapshot =
-            match tokio::task::spawn_blocking(platform_win::clipboard::read_clipboard).await {
-                Ok(Ok(snapshot)) => snapshot,
-                Ok(Err(platform_win::clipboard::ClipboardError::Content(error))) => {
-                    return Err(error);
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "the clipboard could not be read; ignoring the change");
-                    return Ok(None);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "the clipboard read task failed; ignoring the change");
-                    return Ok(None);
-                }
-            };
-        if !new_clipboard_sequence(&mut self.last_clipboard_sequence, snapshot.sequence) {
-            tracing::debug!(
-                sequence = snapshot.sequence,
-                bytes = snapshot.text.len(),
-                "swallowing an already observed clipboard sequence"
+        let current_sequence = clipboard.sequence();
+        let notified = clipboard.wait(Duration::ZERO).is_some()
+            && needs_clipboard_read(
+                current_sequence,
+                self.last_clipboard_sequence,
+                self.last_clipboard_write_sequence,
             );
+        let Some((started_sequence, task)) = self.clipboard_read.poll(
+            notified,
+            current_sequence,
+            platform_win::clipboard::read_clipboard,
+        ) else {
+            return Ok(None);
+        };
+        let result = task.await;
+        if matches!(&result, Err(_) | Ok(Err(_)))
+            && !self
+                .clipboard_read
+                .accept_sequence(started_sequence, clipboard.sequence())
+        {
             return Ok(None);
         }
-        if !snapshot.has_text {
-            // An image-only or empty item: nothing this agent can offer.
-            tracing::debug!(sequence = snapshot.sequence, "the clipboard holds no text");
+        let snapshot = match result {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(platform_win::clipboard::ClipboardError::Content(error))) => {
+                return Err(error);
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "the clipboard could not be read; ignoring the change");
+                return Ok(None);
+            }
+            Err(_) => {
+                tracing::warn!("the clipboard read task failed; ignoring the change");
+                return Ok(None);
+            }
+        };
+        if !self
+            .clipboard_read
+            .accept_sequence(snapshot.sequence, clipboard.sequence())
+        {
             return Ok(None);
         }
-        tracing::info!(
-            sequence = snapshot.sequence,
-            bytes = snapshot.text.len(),
-            markers = snapshot.markers.len(),
-            "local clipboard change"
-        );
-        Ok(Some(ClipboardChange {
-            text: snapshot.text,
-            markers: snapshot.markers,
-        }))
+        Ok(clipboard_snapshot_change(
+            &mut self.last_clipboard_sequence,
+            self.last_clipboard_write_sequence,
+            snapshot,
+        ))
     }
 
-    /// Owns the local selection: `Some` puts `text` on it, `None` empties it.
+    /// Owns the local selection: `Some` puts text or an image on it, `None` empties it.
     ///
     /// The write is Win32 work with the same `OpenClipboard` retry loop as the read, so it
     /// runs on a blocking thread: the session's poll tick and its watchdog must not wait
     /// for another process's clipboard.
-    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
-        let Some(clipboard) = self.clipboard.as_ref() else {
+    pub fn begin_set_clipboard(
+        &mut self,
+        content: Option<clipboard::ClipboardContent>,
+    ) -> Result<super::ClipboardApplyJob, String> {
+        if self.clipboard.is_none() {
             return Err("CLIPBOARD_DISABLED: this session has no clipboard listener".to_owned());
-        };
-        let write = text.map(str::to_owned);
-        tokio::task::spawn_blocking(move || {
-            platform_win::clipboard::write_clipboard(write.as_deref())
-        })
-        .await
-        .map_err(|error| {
-            format!("CLIPBOARD_APPLY_FAILED: the clipboard write task failed: {error}")
-        })?
-        .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: the clipboard was not taken: {error}"))?;
-        // The counter after our own write is what the notification will carry.
-        self.last_clipboard_sequence = Some(clipboard.sequence());
-        tracing::info!(
-            bytes = text.map(str::len).unwrap_or(0),
-            released = text.is_none(),
-            sequence = self.last_clipboard_sequence,
-            "clipboard set"
-        );
-        Ok(())
+        }
+        Ok(Box::pin(async move {
+            let sequence = tokio::task::spawn_blocking(move || {
+                platform_win::clipboard::write_content_sequence(content.as_ref())
+            })
+            .await
+            .map_err(|_| "CLIPBOARD_APPLY_FAILED: clipboard worker failed".to_owned())?
+            .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: clipboard was not taken: {error}"))?;
+            Ok(super::ClipboardApplyReceipt::Win(sequence))
+        }))
+    }
+
+    pub fn complete_clipboard_apply(&mut self, sequence: u32) {
+        self.last_clipboard_sequence = Some(sequence);
+        self.last_clipboard_write_sequence = Some(sequence);
     }
 
     pub fn begin_capture(
@@ -955,9 +963,297 @@ fn new_clipboard_sequence(last: &mut Option<u32>, sequence: u32) -> bool {
     last.replace(sequence) != Some(sequence)
 }
 
+fn needs_clipboard_read(sequence: u32, observed: Option<u32>, written: Option<u32>) -> bool {
+    observed != Some(sequence) && written != Some(sequence)
+}
+
+type ClipboardReadResult =
+    Result<platform_win::clipboard::Snapshot, platform_win::clipboard::ClipboardError>;
+type ClipboardReadTask = tokio::task::JoinHandle<ClipboardReadResult>;
+
+#[derive(Default)]
+struct ClipboardRead {
+    task: Option<(u32, ClipboardReadTask)>,
+    dirty: bool,
+}
+
+impl ClipboardRead {
+    /// Takes only finished work; the worker owns no backend or session state.
+    fn poll(
+        &mut self,
+        notified: bool,
+        sequence: u32,
+        read: impl FnOnce() -> ClipboardReadResult + Send + 'static,
+    ) -> Option<(u32, ClipboardReadTask)> {
+        self.dirty |= notified;
+        let finished = if self
+            .task
+            .as_ref()
+            .is_some_and(|(_, task)| task.is_finished())
+        {
+            self.task.take()
+        } else {
+            None
+        };
+        if self.task.is_none() && self.dirty {
+            self.dirty = false;
+            self.task = Some((sequence, tokio::task::spawn_blocking(read)));
+        }
+        finished
+    }
+
+    fn accept_sequence(&mut self, completed: u32, current: u32) -> bool {
+        if completed != current {
+            // Image conversion may outlive another local copy or our own apply.
+            self.dirty = true;
+            return false;
+        }
+        true
+    }
+}
+
+impl Drop for ClipboardRead {
+    fn drop(&mut self) {
+        if let Some((_, task)) = &self.task {
+            // Running blocking work finishes independently; queued work can be cancelled.
+            task.abort();
+        }
+    }
+}
+
+fn clipboard_snapshot_change(
+    last: &mut Option<u32>,
+    written: Option<u32>,
+    snapshot: platform_win::clipboard::Snapshot,
+) -> Option<ClipboardChange> {
+    if !new_clipboard_sequence(last, snapshot.sequence) || written == Some(snapshot.sequence) {
+        tracing::debug!(
+            sequence = snapshot.sequence,
+            "swallowing an already observed clipboard sequence"
+        );
+        return None;
+    }
+    let content = match snapshot.content {
+        Some(content) => content,
+        // A secret image was deliberately not read. Report only its markers so core
+        // rejects the change and clears carry rather than retaining the previous copy.
+        None if !snapshot.markers.is_empty() => clipboard::ClipboardContent::Text(String::new()),
+        None => return None,
+    };
+    tracing::info!(
+        sequence = snapshot.sequence,
+        bytes = content.as_bytes().len(),
+        markers = snapshot.markers.len(),
+        "local clipboard change"
+    );
+    Some(ClipboardChange {
+        content,
+        markers: snapshot.markers,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(
+        sequence: u32,
+        content: Option<clipboard::ClipboardContent>,
+        markers: Vec<clipboard::Marker>,
+    ) -> platform_win::clipboard::Snapshot {
+        platform_win::clipboard::Snapshot {
+            content,
+            markers,
+            sequence,
+        }
+    }
+
+    #[test]
+    fn clipboard_snapshots_preserve_neutral_content_and_secret_markers() {
+        let mut last = None;
+        for content in [
+            clipboard::ClipboardContent::Text("local text".to_owned()),
+            clipboard::ClipboardContent::Image {
+                png: b"\x89PNG\r\n\x1a\nlocal image".to_vec(),
+            },
+        ] {
+            let sequence = last.unwrap_or(0) + 1;
+            let markers = vec![clipboard::Marker::KdeSecret];
+            let change = clipboard_snapshot_change(
+                &mut last,
+                None,
+                snapshot(sequence, Some(content.clone()), markers.clone()),
+            )
+            .expect("supported content");
+            assert_eq!(change.content, content);
+            assert_eq!(change.markers, markers);
+        }
+        let change = clipboard_snapshot_change(
+            &mut last,
+            None,
+            snapshot(3, None, vec![clipboard::Marker::KdeSecret]),
+        )
+        .expect("a secret image must invalidate the previous carry");
+        assert_eq!(
+            change.content,
+            clipboard::ClipboardContent::Text(String::new())
+        );
+        assert_eq!(change.markers, vec![clipboard::Marker::KdeSecret]);
+        assert!(
+            clipboard_snapshot_change(&mut last, None, snapshot(4, None, Vec::new())).is_none()
+        );
+    }
+
+    #[test]
+    fn completed_read_uses_the_latest_apply_receipt_for_echo_suppression() {
+        let applied = clipboard::ClipboardContent::Image {
+            png: b"\x89PNG\r\n\x1a\napplied image".to_vec(),
+        };
+        // The apply receipt may arrive while this read is still on its worker.
+        let mut last = Some(3551);
+        let written = Some(3551);
+        assert!(clipboard_snapshot_change(
+            &mut last,
+            written,
+            snapshot(3551, Some(applied.clone()), Vec::new()),
+        )
+        .is_none());
+        // An older in-flight read is discarded before it can report stale content.
+        let mut read = ClipboardRead::default();
+        assert!(!read.accept_sequence(3550, 3551));
+        assert!(
+            read.dirty,
+            "the latest clipboard sequence needs another read"
+        );
+        assert_eq!(last, Some(3551));
+        assert!(clipboard_snapshot_change(
+            &mut last,
+            written,
+            snapshot(3551, Some(applied), Vec::new()),
+        )
+        .is_none());
+        assert!(clipboard_snapshot_change(
+            &mut last,
+            written,
+            snapshot(
+                3552,
+                Some(clipboard::ClipboardContent::Text("new copy".to_owned())),
+                Vec::new(),
+            ),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn own_and_duplicate_notifications_do_not_copy_image_payloads() {
+        assert!(!needs_clipboard_read(7, Some(7), None));
+        assert!(!needs_clipboard_read(8, Some(7), Some(8)));
+        assert!(needs_clipboard_read(9, Some(7), Some(8)));
+        assert!(needs_clipboard_read(0, Some(u32::MAX), Some(u32::MAX)));
+    }
+
+    #[test]
+    fn stale_clipboard_read_queues_latest_without_sequence_order_assumptions() {
+        let mut read = ClipboardRead::default();
+        assert!(!read.accept_sequence(u32::MAX, 0));
+        assert!(read.dirty);
+        // Accepting a current result must not clear a coalesced reread.
+        assert!(read.accept_sequence(0, 0));
+        assert!(read.dirty);
+        let mut idle = ClipboardRead::default();
+        assert!(idle.accept_sequence(42, 42));
+        assert!(!idle.dirty);
+    }
+
+    async fn wait_for_read(read: &ClipboardRead) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !read.task.as_ref().expect("pending worker").1.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake clipboard worker finishes");
+    }
+
+    #[tokio::test]
+    async fn clipboard_read_never_waits_and_coalesces_changes_during_work() {
+        let mut read = ClipboardRead::default();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(read
+            .poll(true, 1, move || {
+                started_tx.send(()).expect("test observes start");
+                release_rx.recv().expect("test releases worker");
+                Ok(snapshot(1, None, Vec::new()))
+            })
+            .is_none());
+        started_rx.await.expect("worker started off the session");
+        for _ in 0..3 {
+            assert!(read
+                .poll(true, 2, || panic!("a read is already active"))
+                .is_none());
+        }
+        release_tx.send(()).expect("release fake read");
+        wait_for_read(&read).await;
+        let first = read
+            .poll(false, 2, || Ok(snapshot(2, None, Vec::new())))
+            .expect("finished first worker");
+        assert_eq!(first.1.await.unwrap().unwrap().sequence, 1);
+        assert!(!read.dirty, "notifications coalesce into one more read");
+        wait_for_read(&read).await;
+        let second = read
+            .poll(false, 2, || panic!("no notification requires another read"))
+            .expect("latest selection is read even without another notification");
+        assert_eq!(second.1.await.unwrap().unwrap().sequence, 2);
+        assert!(read.task.is_none());
+        assert!(read
+            .poll(false, 2, || panic!("idle polling must not read"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_clipboard_read_keeps_notifications_for_the_latest_item() {
+        let mut read = ClipboardRead::default();
+        assert!(read
+            .poll(true, 1, || {
+                Err(platform_win::clipboard::ClipboardError::Content(
+                    clipboard::ClipboardError::Invalid,
+                ))
+            })
+            .is_none());
+        wait_for_read(&read).await;
+        let failed = read
+            .poll(true, 2, || Ok(snapshot(2, None, Vec::new())))
+            .expect("finished failed worker");
+        assert!(matches!(
+            failed.1.await.unwrap(),
+            Err(platform_win::clipboard::ClipboardError::Content(
+                clipboard::ClipboardError::Invalid
+            ))
+        ));
+        wait_for_read(&read).await;
+        let latest = read
+            .poll(false, 2, || panic!("the follow-up read already ran"))
+            .expect("follow-up worker");
+        assert_eq!(latest.1.await.unwrap().unwrap().sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn obsolete_read_errors_cannot_invalidate_a_newer_selection() {
+        let mut read = ClipboardRead::default();
+        read.poll(true, 1, || {
+            Err(platform_win::clipboard::ClipboardError::Content(
+                clipboard::ClipboardError::TooLarge,
+            ))
+        });
+        wait_for_read(&read).await;
+        let (started, task) = read
+            .poll(false, 2, || panic!("no newer request yet"))
+            .expect("old error completed");
+        assert!(task.await.unwrap().is_err());
+        assert!(!read.accept_sequence(started, 2));
+        assert!(read.dirty, "the current selection still needs reading");
+    }
 
     #[test]
     fn armed_observe_keeps_pointer_motion_across_every_drain() {

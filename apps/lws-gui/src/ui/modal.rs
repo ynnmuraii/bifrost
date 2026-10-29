@@ -794,10 +794,64 @@ fn clip_body(
             );
         }
     });
+    row(ui, pal, text(lang, Key::Images), false, |ui| {
+        let images_pending = vm.settings.clipboard_images_pending;
+        let images_on = vm.clipboard_images_enabled();
+        // Policy (the file's `images`) is separate from capability: a computer whose backend
+        // cannot read or own PNG is told so and cannot switch the option on.
+        let supported = vm.clipboard_images_supported();
+        ui.add_enabled_ui(vm.clipboard_images_editable(), |ui| {
+            // Two on/off segments in one panel would share `seg`'s id; the images switch
+            // gets a scope of its own so its pill animates independently.
+            ui.push_id("clipboard-images", |ui| {
+                if let Some(i) = widgets::seg(
+                    ui,
+                    pal,
+                    &[text(lang, Key::On), text(lang, Key::Off)],
+                    usize::from(!images_on),
+                ) {
+                    actions.push(Action::SetClipboardImages(i == 0));
+                }
+            });
+        });
+        let blocking = if images_pending.is_some() {
+            Some(text(lang, Key::Applying))
+        } else if !on {
+            Some(text(lang, Key::TheSharedClipboardIsOff))
+        } else if missing {
+            Some(text(lang, Key::ThisSystemCannotCarryTheClipboard))
+        } else if !supported {
+            Some(text(lang, Key::ThisSystemCannotSendImages))
+        } else {
+            None
+        };
+        if let Some(line) = blocking {
+            widgets::wrapped(ui, line, 13.0, fam::sans(), pal.ink);
+        }
+        if on && !missing && supported && images_pending.is_none() {
+            widgets::hint(
+                ui,
+                pal,
+                text(
+                    lang,
+                    Key::ImagesAreSentAsPngUpToTheConfiguredSizeAndAreNotKeptInHistory,
+                ),
+            );
+        }
+    });
     row(ui, pal, text(lang, Key::WhatIsCarried), false, |ui| {
+        // The sentence follows the option that is actually in force and supported here.
+        let images_carried = vm.clipboard_images_enabled() && vm.clipboard_images_supported();
         widgets::wrapped(
             ui,
-            text(lang, Key::TextOnlyNoFilesNoImages),
+            text(
+                lang,
+                if images_carried {
+                    Key::TextAndImagesNoFiles
+                } else {
+                    Key::TextOnlyNoFilesNoImages
+                },
+            ),
             14.0,
             fam::sans(),
             pal.ink,

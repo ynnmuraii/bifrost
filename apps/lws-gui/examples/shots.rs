@@ -401,6 +401,7 @@ fn clipboard_routing_shots(dir: &Path) -> std::process::ExitCode {
                 "failed",
                 "policy-follow",
                 "policy-broadcast",
+                "images-on",
             ] {
                 let settings = scene.starts_with("policy-");
                 let mut vm = mockup(
@@ -422,6 +423,8 @@ fn clipboard_routing_shots(dir: &Path) -> std::process::ExitCode {
                     }
                     .to_owned();
                     status.clipboard_settle_ms = 700;
+                    status.clipboard_images = scene == "images-on";
+                    status.clipboard_images_supported = true;
                 }
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1464,6 +1467,8 @@ fn mockup(theme: Theme, modal: Option<Modal>, lang: ui_text::Lang) -> ViewModel 
         clipboard_enabled: true,
         clipboard_policy: "follow".to_owned(),
         clipboard_settle_ms: 700,
+        clipboard_images: false,
+        clipboard_images_supported: true,
         local_node_id: WORKSTATION.to_owned(),
         discovery_enabled: true,
         emergency_hotkey: "Ctrl+Alt+Shift+F12".to_owned(),

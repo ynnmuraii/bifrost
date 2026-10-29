@@ -329,6 +329,100 @@ fn clipboard_addressed_send_and_policy_requests_preserve_wire_values() {
 }
 
 #[test]
+fn clipboard_images_toggle_carries_the_wire_value_and_settles_from_status() {
+    for enabled in [true, false] {
+        let Some((request, Msg::SetClipboardImages(value))) =
+            (Action::SetClipboardImages(enabled)).wire()
+        else {
+            panic!("images request");
+        };
+        assert_eq!(request, Request::SetClipboardImages);
+        assert_eq!(value.enabled, enabled);
+    }
+    let mut vm = view();
+    vm.on_connected("test");
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.local(&Action::SetClipboardImages(true));
+    let id = vm.begin_request(Request::SetClipboardImages, Instant::now());
+    let mut status = status_with("LOCAL");
+    status.clipboard_images = true;
+    status.clipboard_images_supported = true;
+    vm.apply(event(Msg::Status(status)));
+    assert!(
+        vm.settings.clipboard_images_pending.is_none(),
+        "the pushed status settles the switch on its own"
+    );
+    assert!(vm.clipboard_images_enabled());
+    assert!(vm.clipboard_images_supported());
+    vm.apply(answer(
+        id,
+        Msg::OpResult(protocol::ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+    assert!(
+        vm.take_outgoing()
+            .iter()
+            .any(|(_, msg)| matches!(msg, Msg::GetStatus(_))),
+        "success re-reads the flag the file now holds"
+    );
+}
+
+#[test]
+fn clipboard_images_toggle_is_refused_without_the_local_capability_or_sharing() {
+    let mut vm = view();
+    vm.on_connected("test");
+    let mut unsupported = status_with("LOCAL");
+    unsupported.clipboard_images_supported = false;
+    vm.apply(event(Msg::Status(unsupported)));
+    assert!(
+        !vm.clipboard_images_editable(),
+        "no backend support means no switch to flip"
+    );
+
+    let mut supported = status_with("LOCAL");
+    supported.clipboard_images_supported = true;
+    vm.apply(event(Msg::Status(supported.clone())));
+    assert!(vm.clipboard_images_editable());
+
+    let mut off = supported.clone();
+    off.clipboard_enabled = false;
+    vm.apply(event(Msg::Status(off)));
+    assert!(
+        !vm.clipboard_images_editable(),
+        "images hang off the shared clipboard"
+    );
+
+    let mut no_text = supported;
+    no_text.capabilities_unavailable = vec!["TEXT_CLIPBOARD".to_owned()];
+    vm.apply(event(Msg::Status(no_text)));
+    assert!(!vm.clipboard_images_editable());
+
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        assert!(!ui_text::text(lang, ui_text::Key::ThisSystemCannotSendImages).is_empty());
+        assert!(!ui_text::text(
+            lang,
+            ui_text::Key::ImagesAreSentAsPngUpToTheConfiguredSizeAndAreNotKeptInHistory
+        )
+        .is_empty());
+    }
+}
+
+#[test]
+fn clipboard_images_refusal_clears_the_pending_switch() {
+    let mut vm = view();
+    vm.on_connected("test");
+    vm.apply(event(Msg::Status(status_with("LOCAL"))));
+    vm.local(&Action::SetClipboardImages(true));
+    let id = vm.begin_request(Request::SetClipboardImages, Instant::now());
+    assert_eq!(vm.settings.clipboard_images_pending, Some(true));
+    verdict(&mut vm, id, Some("CONFIG_SAVE_FAILED"));
+    assert_eq!(vm.settings.clipboard_images_pending, None);
+    assert!(vm.outcome.as_ref().is_some_and(|outcome| !outcome.ok));
+}
+
+#[test]
 fn clipboard_send_results_keep_destination_name_and_localize_success_and_failure() {
     for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
         for ok in [true, false] {

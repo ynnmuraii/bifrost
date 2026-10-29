@@ -53,14 +53,16 @@ pub const MAX_FRAME_PAIRING: usize = 8_192;
 /// `AgentFrame`/`GuiFrame` body limit on local IPC: 65536 bytes.
 pub const MAX_FRAME_IPC: usize = 65_536;
 
-/// Clipboard transfer size cap: `ClipboardOffer.size_bytes` ≤ 1 MiB.
+/// Text payload hard cap, never widened by image support.
 pub const MAX_CLIPBOARD_PAYLOAD_BYTES: u64 = 1_048_576;
+pub const MAX_CLIPBOARD_IMAGE_PAYLOAD_BYTES: u64 = 33_554_432;
 /// Clipboard transfer chunk cap: `ClipboardData.data` ≤ 16 KiB.
 pub const MAX_CLIPBOARD_CHUNK_BYTES: usize = 16_384;
-/// `ClipboardData.chunk_count` lower bound (`1..64`).
 pub const MIN_CLIPBOARD_CHUNK_COUNT: u32 = 1;
-/// `ClipboardData.chunk_count` upper bound (`1..64`).
-pub const MAX_CLIPBOARD_CHUNK_COUNT: u32 = 64;
+pub const MAX_CLIPBOARD_TEXT_CHUNK_COUNT: u32 = 64;
+pub const MAX_CLIPBOARD_IMAGE_CHUNK_COUNT: u32 = 2048;
+/// Stateless ceiling; accepted offers enforce the smaller per-kind count.
+pub const MAX_CLIPBOARD_CHUNK_COUNT: u32 = MAX_CLIPBOARD_IMAGE_CHUNK_COUNT;
 
 /// `InputBatch.events` lower bound (`1..128`).
 pub const MIN_INPUT_BATCH_EVENTS: usize = 1;

@@ -552,33 +552,36 @@ impl Wayland {
     /// lives too. The echo rule (a payload this node applied must not be reported back as the
     /// user's copy) is the adapter's own, because a data-control device is told about every
     /// selection including the one this node set; see `platform_wayland::data_control`.
-    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
-        let change = self.clipboard.as_mut()?.poll_change()?;
-        Some(ClipboardChange {
-            text: change.text,
+    pub async fn clipboard_change(
+        &mut self,
+    ) -> Result<Option<ClipboardChange>, clipboard::ClipboardError> {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return Ok(None);
+        };
+        Ok(clipboard.poll_change()?.map(|change| ClipboardChange {
+            content: change.content,
             markers: change.markers,
-        })
+        }))
     }
 
-    /// Owns the local selection with `text`; `None` gives it up.
+    /// Owns the local selection with `content`; `None` gives it up.
     ///
     /// Refused with `CLIPBOARD_DISABLED` when there is no data-control connection: core is
     /// entitled to an answer rather than silence.
-    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
-        let Some(clipboard) = self.clipboard.as_ref() else {
-            return Err(
-                "CLIPBOARD_DISABLED: this compositor has no ext_data_control_manager_v1".to_owned(),
-            );
-        };
-        clipboard.set_text(text).await.map_err(|error| {
-            format!("CLIPBOARD_APPLY_FAILED: selection was not confirmed: {error}")
+    pub fn begin_set_clipboard(
+        &mut self,
+        content: Option<clipboard::ClipboardContent>,
+    ) -> Result<super::ClipboardApplyJob, String> {
+        let clipboard = self.clipboard.as_ref().ok_or_else(|| {
+            "CLIPBOARD_DISABLED: this compositor has no ext_data_control_manager_v1".to_owned()
         })?;
-        tracing::info!(
-            bytes = text.map_or(0, str::len),
-            released = text.is_none(),
-            "CLIPBOARD selection set"
-        );
-        Ok(())
+        let operation = clipboard.begin_set_content(content);
+        Ok(Box::pin(async move {
+            operation.await.map_err(|error| {
+                format!("CLIPBOARD_APPLY_FAILED: selection was not confirmed: {error}")
+            })?;
+            Ok(super::ClipboardApplyReceipt::Wayland)
+        }))
     }
 
     /// Starts (or re-arms) capture for the requested kind.
@@ -1332,6 +1335,7 @@ fn refine_ready(
     // the clipboard: it says `false` at probe time because only the adapter knows. So the
     // capability is also *added* here, not merely kept.
     ready.set_text_clipboard(has_clipboard);
+    ready.set_image_clipboard(has_clipboard);
 
     ready.backend.has_absolute_injection = absolute;
     ready.backend.has_emergency_hotkey = has_hotkey;
@@ -1365,11 +1369,14 @@ fn refine_capabilities(
         "ABSOLUTE_POINTER" => absolute,
         "EMERGENCY_HOTKEY" => has_hotkey,
         "RECEIVER_TAKEOVER" => false,
-        "TEXT_CLIPBOARD" => has_clipboard,
+        "TEXT_CLIPBOARD" | "CLIPBOARD_IMAGE" => has_clipboard,
         _ => true,
     });
     if has_clipboard && !capabilities.iter().any(|name| name == "TEXT_CLIPBOARD") {
         capabilities.push("TEXT_CLIPBOARD".to_owned());
+    }
+    if has_clipboard && !capabilities.iter().any(|name| name == "CLIPBOARD_IMAGE") {
+        capabilities.push("CLIPBOARD_IMAGE".to_owned());
     }
     capabilities
 }
@@ -1548,16 +1555,18 @@ mod capability_tests {
             true,
         );
         assert!(live.iter().any(|name| name == "TEXT_CLIPBOARD"));
+        assert!(live.iter().any(|name| name == "CLIPBOARD_IMAGE"));
 
         // No data-control (GNOME): no clipboard, whichever way the probe answered.
         let absent = refine_capabilities(
-            names(&["CAPTURE", "TEXT_CLIPBOARD"]),
+            names(&["CAPTURE", "TEXT_CLIPBOARD", "CLIPBOARD_IMAGE"]),
             true,
             true,
             true,
             false,
         );
         assert!(!absent.iter().any(|name| name == "TEXT_CLIPBOARD"));
+        assert!(!absent.iter().any(|name| name == "CLIPBOARD_IMAGE"));
         assert!(absent.iter().any(|name| name == "CAPTURE"));
     }
 
@@ -1596,11 +1605,24 @@ mod capability_tests {
             );
         }
         // A clipboard that is live is never listed twice.
-        let doubled = refine_capabilities(names(&["TEXT_CLIPBOARD"]), true, true, true, true);
+        let doubled = refine_capabilities(
+            names(&["TEXT_CLIPBOARD", "CLIPBOARD_IMAGE"]),
+            true,
+            true,
+            true,
+            true,
+        );
         assert_eq!(
             doubled
                 .iter()
                 .filter(|name| *name == "TEXT_CLIPBOARD")
+                .count(),
+            1
+        );
+        assert_eq!(
+            doubled
+                .iter()
+                .filter(|name| *name == "CLIPBOARD_IMAGE")
                 .count(),
             1
         );

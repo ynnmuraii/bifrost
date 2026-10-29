@@ -22,6 +22,15 @@ use crate::backend::{ClipboardChange, Event, Injected, Ready, Released, Takeover
 use crate::takeover::Detector;
 use input_model::RepeatFilter;
 
+fn clipboard_read_error(
+    error: platform_x11::clipboard::ClipboardError,
+) -> clipboard::ClipboardError {
+    match error {
+        platform_x11::clipboard::ClipboardError::Content(error) => error,
+        _ => clipboard::ClipboardError::Invalid,
+    }
+}
+
 /// The X11 input path.
 pub struct X11 {
     ready: Ready,
@@ -46,7 +55,7 @@ pub struct X11 {
     ///
     /// # Echo suppression (KVM-041)
     ///
-    /// A selection owner has no sequence number to compare, so the mechanism is the text
+    /// A selection owner has no sequence number to compare, so the mechanism is the content
     /// itself: the payload this backend last put on CLIPBOARD is remembered in `echo`, and an
     /// observed value equal to it is the echo of our own `set` rather than a user's copy.
     /// (X11 could do better by owning a second selection and watching its timestamp; the
@@ -71,10 +80,10 @@ const ECHO_WINDOW: Duration = Duration::from_millis(400);
 /// Remembers the payload this node put on CLIPBOARD so its own notifications are swallowed.
 ///
 /// The old rule cleared the memory after the first sighting: a second notification with the
-/// same text (Klipper re-reading the selection) then looked like a fresh local copy and was
+/// same content (Klipper re-reading the selection) then looked like a fresh local copy and was
 /// sent back to the peer. The hash now stays for [`ECHO_WINDOW`]: repeats inside the window
-/// are echoes, a different text clears the memory, and the same text after the window is a
-/// real re-copy by the user and passes.
+/// are echoes, different content clears the memory, and the same content after the window
+/// is a real re-copy by the user and passes.
 #[derive(Debug, Default)]
 struct EchoSuppressor {
     applied: Option<(u64, std::time::Instant)>,
@@ -82,20 +91,26 @@ struct EchoSuppressor {
 
 impl EchoSuppressor {
     /// Remembers `text` — the payload just put on the selection — at `now`.
+    #[cfg(test)]
     fn note(&mut self, text: &str, now: std::time::Instant) {
         self.applied = if text.is_empty() {
             None
         } else {
-            Some((content_hash(text), now))
+            Some((
+                platform_x11::clipboard::content_hash(&clipboard::ClipboardContent::Text(
+                    text.to_owned(),
+                )),
+                now,
+            ))
         };
     }
 
-    /// Whether `text`, seen at `now`, is the payload this node applied moments ago.
-    fn is_echo(&mut self, text: &str, now: std::time::Instant) -> bool {
+    /// Whether the actor-computed fingerprint matches a recently applied payload.
+    fn is_echo(&mut self, hash: u64, now: std::time::Instant) -> bool {
         let Some((applied, at)) = self.applied else {
             return false;
         };
-        if applied != content_hash(text) {
+        if applied != hash {
             // Something else is on the selection now: our payload is gone for good.
             self.applied = None;
             return false;
@@ -108,15 +123,6 @@ impl EchoSuppressor {
             false
         }
     }
-}
-
-/// A stable hash of the clipboard text: the suppressor remembers the content without
-/// holding a copy of it.
-fn content_hash(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
 }
 
 impl X11 {
@@ -142,6 +148,7 @@ impl X11 {
         };
         let mut ready = ready.clone();
         ready.set_text_clipboard(clipboard.is_some());
+        ready.set_image_clipboard(clipboard.is_some());
         let mut backend = X11 {
             ready,
             source_kind: None,
@@ -220,51 +227,54 @@ impl X11 {
     ///
     /// Non-blocking: selection reads stay on the existing clipboard actor and are polled
     /// across ticks, so a stalled owner cannot hold up input or the heartbeat.
-    pub async fn clipboard_change(&mut self) -> Option<ClipboardChange> {
-        let clipboard = self.clipboard.as_ref()?;
-        if self.pending_clipboard_read.is_none() {
-            clipboard.wait(Duration::ZERO)?;
-            match clipboard.start_read() {
-                Ok(pending) => self.pending_clipboard_read = Some(pending),
-                Err(error) => {
-                    tracing::warn!(%error, "the CLIPBOARD selection read could not start");
-                    return None;
-                }
-            }
-        }
-        let snapshot = match self.pending_clipboard_read.as_ref()?.poll() {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return None,
-            Err(error) => {
-                self.pending_clipboard_read = None;
-                tracing::warn!(%error, "the CLIPBOARD selection could not be read");
-                return None;
-            }
+    pub async fn clipboard_change(
+        &mut self,
+    ) -> Result<Option<ClipboardChange>, clipboard::ClipboardError> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Ok(None);
         };
-        self.pending_clipboard_read = None;
-        if !snapshot.has_text {
-            tracing::debug!("the CLIPBOARD selection holds no text");
-            return None;
+        if self.pending_clipboard_read.is_none() {
+            if clipboard.wait(Duration::ZERO).is_none() {
+                return Ok(None);
+            }
+            self.pending_clipboard_read =
+                Some(clipboard.start_read().map_err(clipboard_read_error)?);
         }
-        if self.echo.is_echo(&snapshot.text, std::time::Instant::now()) {
+        let pending = self.pending_clipboard_read.as_ref().expect("read started");
+        let result = pending.poll();
+        if matches!(result, Ok(None)) {
+            return Ok(None);
+        }
+        self.pending_clipboard_read = None;
+        let snapshot = result
+            .map_err(clipboard_read_error)?
+            .expect("read completed");
+        let Some(content) = snapshot.content else {
+            return Ok(None);
+        };
+        if snapshot.markers.is_empty()
+            && snapshot
+                .hash
+                .is_some_and(|hash| self.echo.is_echo(hash, std::time::Instant::now()))
+        {
             tracing::debug!(
-                bytes = snapshot.text.len(),
+                bytes = content.len(),
                 "swallowing the CLIPBOARD selection this node applied"
             );
-            return None;
+            return Ok(None);
         }
         tracing::info!(
-            bytes = snapshot.text.len(),
+            bytes = content.len(),
             markers = snapshot.markers.len(),
             "local clipboard change"
         );
-        Some(ClipboardChange {
-            text: snapshot.text,
+        Ok(Some(ClipboardChange {
+            content,
             markers: snapshot.markers,
-        })
+        }))
     }
 
-    /// Owns the CLIPBOARD selection: `Some` puts `text` on it, `None` gives up the payload.
+    /// Owns the CLIPBOARD selection; `None` clears the payload with empty text.
     ///
     /// The adapter has no "release the selection" call in this build (ICCCM release and
     /// `SelectionClear` handling are not wired), so a release puts the empty string on the
@@ -272,22 +282,31 @@ impl X11 {
     ///
     /// Async for the session's sake: the X round-trips ride the selection's own thread, and
     /// the runtime thread must stay free for the poll tick and the heartbeat.
-    pub async fn set_clipboard(&mut self, text: Option<&str>) -> Result<(), String> {
+    pub fn begin_set_clipboard(
+        &mut self,
+        content: Option<clipboard::ClipboardContent>,
+    ) -> Result<super::ClipboardApplyJob, String> {
         self.pending_clipboard_read = None;
-        let Some(clipboard) = self.clipboard.as_ref() else {
-            return Err("CLIPBOARD_DISABLED: this session has no CLIPBOARD selection".to_owned());
-        };
-        let text = text.unwrap_or("");
-        clipboard
-            .set(text)
-            .map_err(|error| format!("CLIPBOARD_APPLY_FAILED: CLIPBOARD was not taken: {error}"))?;
-        self.echo.note(text, std::time::Instant::now());
-        tracing::info!(
-            bytes = text.len(),
-            released = text.is_empty(),
-            "CLIPBOARD selection set"
-        );
-        Ok(())
+        let clipboard = self.clipboard.as_ref().ok_or_else(|| {
+            "CLIPBOARD_DISABLED: this session has no CLIPBOARD selection".to_owned()
+        })?;
+        let setter = clipboard.owned_setter();
+        Ok(Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let content =
+                    content.unwrap_or_else(|| clipboard::ClipboardContent::Text(String::new()));
+                let hash =
+                    (!content.is_empty()).then(|| platform_x11::clipboard::content_hash(&content));
+                setter(content).map_err(|error| format!("CLIPBOARD_APPLY_FAILED: {error}"))?;
+                Ok(super::ClipboardApplyReceipt::X11(hash))
+            })
+            .await
+            .map_err(|_| "CLIPBOARD_APPLY_FAILED: clipboard worker failed".to_owned())?
+        }))
+    }
+
+    pub fn complete_clipboard_apply(&mut self, hash: Option<u64>) {
+        self.echo.applied = hash.map(|hash| (hash, std::time::Instant::now()));
     }
 
     pub fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
@@ -611,6 +630,42 @@ fn release_counts(injector: &mut X11Injector) -> Released {
 mod tests {
     use super::*;
 
+    #[test]
+    fn clipboard_read_failures_reach_the_shared_error_boundary() {
+        use platform_x11::clipboard::ClipboardError as Native;
+        for error in [
+            clipboard::ClipboardError::TooLarge,
+            clipboard::ClipboardError::Invalid,
+        ] {
+            assert_eq!(clipboard_read_error(Native::Content(error)), error);
+        }
+        for error in [Native::Timeout, Native::Internal("unreadable".into())] {
+            assert_eq!(
+                clipboard_read_error(error),
+                clipboard::ClipboardError::Invalid
+            );
+        }
+    }
+
+    fn text_hash(text: &str) -> u64 {
+        platform_x11::clipboard::content_hash(&clipboard::ClipboardContent::Text(text.to_owned()))
+    }
+
+    #[test]
+    fn image_echo_uses_the_worker_fingerprint_without_reading_payload_in_the_loop() {
+        let content = clipboard::ClipboardContent::Image {
+            png: b"\x89PNG\r\n\x1a\nraw".to_vec(),
+        };
+        let hash = platform_x11::clipboard::content_hash(&content);
+        let now = std::time::Instant::now();
+        let mut echo = EchoSuppressor {
+            applied: Some((hash, now)),
+        };
+        assert!(echo.is_echo(hash, now));
+        assert!(!echo.is_echo(hash, now + ECHO_WINDOW + Duration::from_nanos(1)));
+        assert_ne!(hash, text_hash("raw"));
+    }
+
     #[tokio::test]
     async fn stalled_clipboard_owner_does_not_block_backend_poll_or_later_apply() {
         if std::env::var_os("LWS_X11_TEST_ISOLATED").is_none() {
@@ -674,7 +729,7 @@ mod tests {
         let mut elapsed = Duration::ZERO;
         loop {
             let started = std::time::Instant::now();
-            assert!(backend.clipboard_change().await.is_none());
+            assert!(backend.clipboard_change().await.unwrap().is_none());
             elapsed = elapsed.max(started.elapsed());
             if matches!(
                 owner.poll_for_event().unwrap(),
@@ -690,17 +745,26 @@ mod tests {
         }
         // The owner has received the request and deliberately never answers it.
         let started = std::time::Instant::now();
-        assert!(backend.clipboard_change().await.is_none());
+        assert!(backend.clipboard_change().await.unwrap().is_none());
         let second_elapsed = started.elapsed();
         let apply_started = std::time::Instant::now();
-        backend
-            .set_clipboard(Some("worker remains usable"))
+        let receipt = backend
+            .begin_set_clipboard(Some(clipboard::ClipboardContent::Text(
+                "worker remains usable".to_owned(),
+            )))
+            .unwrap()
             .await
             .unwrap();
+        let super::super::ClipboardApplyReceipt::X11(hash) = receipt else {
+            panic!("X11 receipt expected");
+        };
+        backend.complete_clipboard_apply(hash);
         let apply_elapsed = apply_started.elapsed();
         assert_eq!(
-            backend.clipboard.as_ref().unwrap().read().unwrap().text,
-            "worker remains usable"
+            backend.clipboard.as_ref().unwrap().read().unwrap().content,
+            Some(clipboard::ClipboardContent::Text(
+                "worker remains usable".to_owned()
+            ))
         );
         assert!(
             elapsed < Duration::from_millis(50),
@@ -796,12 +860,15 @@ mod tests {
         // Klipper/CopyQ re-reads and re-owns the selection: three notifications, same text.
         for offset_ms in [0, 5, 120, 399] {
             assert!(
-                echo.is_echo("remote payload", t0 + Duration::from_millis(offset_ms)),
+                echo.is_echo(
+                    text_hash("remote payload"),
+                    t0 + Duration::from_millis(offset_ms)
+                ),
                 "a re-own at {offset_ms} ms is our own payload"
             );
         }
         // Still the same payload: the memory is not cleared by the repeats.
-        assert!(echo.is_echo("remote payload", t0 + Duration::from_millis(400)));
+        assert!(echo.is_echo(text_hash("remote payload"), t0 + Duration::from_millis(400)));
     }
 
     #[test]
@@ -810,9 +877,9 @@ mod tests {
         let t0 = std::time::Instant::now();
         echo.note("remote payload", t0);
 
-        assert!(!echo.is_echo("something the user copied", t0));
+        assert!(!echo.is_echo(text_hash("something the user copied"), t0));
         // Our payload can no longer be on the selection, so an old repeat is a user's copy.
-        assert!(!echo.is_echo("remote payload", t0 + Duration::from_millis(10)));
+        assert!(!echo.is_echo(text_hash("remote payload"), t0 + Duration::from_millis(10)));
     }
 
     #[test]
@@ -821,7 +888,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         echo.note("remote payload", t0);
         assert!(!echo.is_echo(
-            "remote payload",
+            text_hash("remote payload"),
             t0 + ECHO_WINDOW + Duration::from_millis(1)
         ));
     }
@@ -830,11 +897,11 @@ mod tests {
     fn nothing_is_an_echo_before_anything_was_applied_and_empty_text_clears() {
         let mut echo = EchoSuppressor::default();
         let t0 = std::time::Instant::now();
-        assert!(!echo.is_echo("anything", t0));
+        assert!(!echo.is_echo(text_hash("anything"), t0));
 
         echo.note("remote payload", t0);
         echo.note("", t0);
-        assert!(!echo.is_echo("remote payload", t0));
+        assert!(!echo.is_echo(text_hash("remote payload"), t0));
     }
 
     /// Batch-3 audit (F13): a queued run of X-server autorepeats must not end the drain.

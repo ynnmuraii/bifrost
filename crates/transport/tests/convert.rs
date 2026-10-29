@@ -1048,6 +1048,27 @@ fn clipboard_routing_capability_is_optional_in_hello() {
 }
 
 #[test]
+fn image_clipboard_capability_is_independent_and_unknown_bits_are_ignored() {
+    let mut hello = wire::Hello {
+        node_id: some_owner().as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let legacy = PeerInfo::from_hello(&hello).unwrap();
+    assert!(!legacy.image_clipboard);
+    hello.capabilities = vec![15, 999_999];
+    let image_only = PeerInfo::from_hello(&hello).unwrap();
+    assert!(image_only.image_clipboard);
+    assert!(!image_only.text_clipboard);
+    assert_eq!(
+        transport::convert::capabilities_from_wire(&hello.capabilities),
+        focus_router::Capabilities::default(),
+        "image support and unknown values cannot alter input routing"
+    );
+    hello.capabilities.clear();
+    assert!(!PeerInfo::from_hello(&hello).unwrap().image_clipboard);
+}
+
+#[test]
 fn clipboard_session_epoch_is_capability_gated_and_exactly_sixteen_bytes() {
     let mut hello = wire::Hello {
         node_id: some_owner().as_bytes().to_vec(),
