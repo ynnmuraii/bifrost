@@ -4,3 +4,4 @@ node_modules/
 docs/
 .agents/
 skills-lock.json
+.omp/
