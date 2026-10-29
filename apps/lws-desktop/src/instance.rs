@@ -324,7 +324,7 @@ mod platform {
         }
     }
     pub struct Guard {
-        _lock: File,
+        lock: File,
         socket: Option<(UnixListener, PathBuf)>,
         ready: Option<Arc<Ready>>,
     }
@@ -367,7 +367,7 @@ mod platform {
             None
         };
         Ok(Some(Guard {
-            _lock: lock,
+            lock,
             socket,
             ready,
         }))
@@ -425,8 +425,18 @@ mod platform {
             if let Some(ready) = &self.ready {
                 ready.set(false);
             }
-            if let Some((_, path)) = &self.socket {
+            if let Some((listener, path)) = self.socket.take() {
+                drop(listener);
+                // Unlink while still holding the lock: a replacement must not
+                // publish its socket before this guard removes the old one.
                 let _ = fs::remove_file(path);
+            }
+            // A concurrent fork can retain this open file description until
+            // exec despite O_CLOEXEC. Closing our fd alone would leave its
+            // flock held by that child, so release the lock explicitly.
+            // SAFETY: the guard owns this live fd and its exclusive flock.
+            unsafe {
+                libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN);
             }
         }
     }
@@ -678,6 +688,48 @@ mod unix_tests {
             .create(&path)
             .unwrap();
         path
+    }
+
+    #[test]
+    fn dropping_a_guard_releases_the_lock_before_a_forked_child_execs() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let namespace = format!("lws-fork-release-test-{}", std::process::id());
+        let InstanceOutcome::Started(gui) = acquire_named(Role::Gui, &namespace, false).unwrap()
+        else {
+            panic!("first GUI must start");
+        };
+        gui.set_show_handler(|| {}).unwrap();
+        let (parent, child) = UnixStream::pair().unwrap();
+        // SAFETY: the child only calls async-signal-safe read and _exit before
+        // exiting. Keep its inherited descriptors live until the parent probes.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let mut byte = 0u8;
+            unsafe {
+                libc::read(child.as_raw_fd(), (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        drop(gui);
+        let socket_removed = !platform::directory(&namespace)
+            .unwrap()
+            .join("gui.sock")
+            .exists();
+        let replacement = acquire_named(Role::Gui, &namespace, false);
+        // Always release and reap the child, including when the assertion fails.
+        use std::io::Write;
+        (&parent).write_all(&[1]).unwrap();
+        let mut status = 0;
+        // SAFETY: pid is our live child and status is valid output storage.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            socket_removed,
+            "the old socket must be removed before return"
+        );
+        assert!(matches!(replacement.unwrap(), InstanceOutcome::Started(_)));
     }
 
     #[test]

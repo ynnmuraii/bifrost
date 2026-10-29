@@ -20,6 +20,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - The GUI tracks remote targets by NodeId instead of display name, clears stale targets and improves accessible roles and labels, including SAS controls. Login entries explicitly start the core; opening the window manually does not restart a deliberately stopped core. Re-enable an older login entry once to update it.
 - Input and clipboard listeners recover from DHCP address changes without discarding logical clipboard state. Windows capture overflow and emergency release bypass a full input queue; rejected synthetic motion no longer leaves suppression budget behind.
 - Abandoning an active lease releases control promptly and stale renewals cannot revive it. X11 refreshes pointer bounds after display changes and preserves asynchronous injection errors. X11 and Wayland clipboard reads and stalled transfers can be cancelled without blocking input; Wayland relative cursor initialization no longer repeats or loses its estimate.
+- On Linux, closing a window releases its instance lock immediately even when a concurrently launched child process has not yet executed, allowing a quick relaunch.
 
 ### Русский
 
@@ -37,6 +38,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Окно различает удалённые компьютеры по NodeId, а не имени, очищает устаревшие цели и улучшает доступные роли и подписи, включая элементы SAS. Автозапуск явно запускает службу при входе в систему; ручное открытие окна не запускает намеренно остановленную службу. Старую запись автозапуска один раз выключите и включите.
 - Слушатели ввода и буфера восстанавливаются после смены адреса DHCP без потери логического состояния буфера. На Windows переполнение очереди захвата и аварийное освобождение обрабатываются независимо от заполненной очереди; отклонённое синтетическое движение не оставляет лишний бюджет подавления.
 - Отказ от активной аренды быстро возвращает управление, а запоздалые продления не воскрешают её. X11 обновляет границы указателя при изменении экрана и сохраняет асинхронные ошибки инъекции. Чтение буфера X11/Wayland и зависшие передачи отменяются без блокировки ввода; относительный курсор Wayland больше не инициализируется повторно и не теряет оценку положения.
+- На Linux закрытие окна сразу освобождает блокировку экземпляра, даже если параллельно запущенный дочерний процесс ещё не выполнил exec, позволяя быстро открыть окно заново.
 
 ## 0.3.1 — 2026-10-27
 
