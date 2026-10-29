@@ -24,7 +24,8 @@
 //! It repeats the **single most recent held key** — the key whose down arrived last and has
 //! not been released. That is what the OS does (one repeat slot, whichever key was pressed
 //! last), and it keeps the injected stream small: one repeat per interval, not one per held
-//! key.
+//! key. Releasing that key ends the repeat; an earlier key that is still held does not take
+//! the slot back (measured on Windows, see `a_modifier_press_and_release_cancels_the_repeat`).
 //!
 //! The clock is a parameter, never `Instant::now()`, so the schedule is testable and the
 //! session's monotonic `now_ms` (the same clock the watchdog uses) drives it in production.
@@ -262,6 +263,42 @@ mod tests {
         engine.applied(&[up(0x05)], 20);
         assert_eq!(engine.holding(), None);
         assert_eq!(engine.due(10_000), None);
+    }
+
+    /// Pins the typematic behaviour observed on Windows: the last pressed key owns the
+    /// repeat, releasing it ends the repeat, and an earlier held key does not resume. So
+    /// Right, then Shift, then releasing Shift leaves nothing repeating — even though Right
+    /// is still down; Shift first, then Right, repeats the selection. Do not "fix" this into
+    /// a key stack: the OS does not behave that way.
+    #[test]
+    fn a_modifier_press_and_release_cancels_the_repeat() {
+        const RIGHT: u16 = 0x4F;
+        const LEFT_SHIFT: u16 = 0xE1;
+
+        // Right held and repeating.
+        let mut typed = engine();
+        typed.applied(&[down(RIGHT)], 0);
+        assert_eq!(typed.due(500), Some(HidKey::keyboard(RIGHT)));
+        assert_eq!(typed.due(530), Some(HidKey::keyboard(RIGHT)));
+
+        // Shift takes the single slot; the guard does not stop, so it repeats Shift.
+        typed.applied(&[down(LEFT_SHIFT)], 600);
+        assert_eq!(typed.holding(), Some(HidKey::keyboard(LEFT_SHIFT)));
+        assert_eq!(typed.due(1100), Some(HidKey::keyboard(LEFT_SHIFT)));
+
+        // Letting Shift up empties the slot: Right is still held but does not resume.
+        typed.applied(&[up(LEFT_SHIFT)], 1200);
+        assert_eq!(typed.holding(), None);
+        assert_eq!(typed.due(10_000), None, "Right does not take the slot back");
+
+        // The control: Shift down, then Right down — Right repeats and extends the selection.
+        let mut control = engine();
+        control.applied(&[down(LEFT_SHIFT)], 0);
+        control.applied(&[down(RIGHT)], 100);
+        assert_eq!(control.holding(), Some(HidKey::keyboard(RIGHT)));
+        assert_eq!(control.due(599), None);
+        assert_eq!(control.due(600), Some(HidKey::keyboard(RIGHT)));
+        assert_eq!(control.due(630), Some(HidKey::keyboard(RIGHT)));
     }
 
     /// A button or a pointer event in the same batch does not disturb the slot.
