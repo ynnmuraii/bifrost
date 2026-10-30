@@ -15,6 +15,9 @@
 //! `cargo build`. TLS 1.3 only, because `docs/05-protocol.md` specifies TLS 1.3 and
 //! there is no reason to keep the older version reachable.
 //!
+//! Session resumption is disabled on every channel so each connection reruns the
+//! certificate and possession checks, including when callers reuse configurations.
+//!
 //! # The policy/ALPN invariant
 //!
 //! [`TrustPolicy::Pairing`] accepts unknown peers, so it may only ever be used on the
@@ -59,6 +62,7 @@ pub fn client_config(
         .with_client_auth_cert(vec![identity.certificate()], identity.private_key())
         .map_err(|error| IdentityError::Tls(error.to_string()))?;
     let mut config = config;
+    config.resumption = rustls::client::Resumption::disabled();
     config.alpn_protocols = alpn.iter().map(|name| name.as_bytes().to_vec()).collect();
     Ok(config)
 }
@@ -78,6 +82,8 @@ pub fn server_config(
         .with_single_cert(vec![identity.certificate()], identity.private_key())
         .map_err(|error| IdentityError::Tls(error.to_string()))?;
     let mut config = config;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     config.alpn_protocols = alpn.iter().map(|name| name.as_bytes().to_vec()).collect();
     Ok(config)
 }
@@ -245,6 +251,115 @@ mod tests {
         let mut b_trust = TrustStore::new();
         b_trust.trust(TrustedPeer::paired(a.node_id(), "peer", None, 0));
         (a_trust, b_trust)
+    }
+
+    async fn assert_reused_configs_require_full_handshakes(
+        client: ClientConfig,
+        server: ServerConfig,
+        alpn: &str,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        assert!(!server.session_storage.can_cache());
+        assert_eq!(server.send_tls13_tickets, 0);
+        let connector = TlsConnector::from(Arc::new(client));
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+
+        // Keep the same Arc-backed configs and address for both connections, and
+        // process post-handshake records before reconnecting so tickets cannot hide.
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let accept = async {
+                    let (tcp, _) = listener.accept().await.expect("accept");
+                    let mut stream = acceptor.accept(tcp).await.expect("server handshake");
+                    assert_eq!(
+                        stream.get_ref().1.handshake_kind(),
+                        Some(rustls::HandshakeKind::Full)
+                    );
+                    assert_eq!(
+                        stream.get_ref().1.protocol_version(),
+                        Some(rustls::ProtocolVersion::TLSv1_3)
+                    );
+                    assert_eq!(stream.get_ref().1.alpn_protocol(), Some(alpn.as_bytes()));
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.expect("read request");
+                    assert_eq!(byte, [1]);
+                    stream.write_all(&[2]).await.expect("write response");
+                    stream.shutdown().await.expect("server shutdown");
+                };
+                let dial = async {
+                    let tcp = TcpStream::connect(address).await.expect("connect");
+                    let mut stream = connector
+                        .connect(server_name(address.ip()), tcp)
+                        .await
+                        .expect("client handshake");
+                    assert_eq!(
+                        stream.get_ref().1.handshake_kind(),
+                        Some(rustls::HandshakeKind::Full)
+                    );
+                    assert_eq!(
+                        stream.get_ref().1.protocol_version(),
+                        Some(rustls::ProtocolVersion::TLSv1_3)
+                    );
+                    assert_eq!(stream.get_ref().1.alpn_protocol(), Some(alpn.as_bytes()));
+                    stream.write_all(&[1]).await.expect("write request");
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.expect("read response");
+                    assert_eq!(byte, [2]);
+                    assert_eq!(stream.read(&mut byte).await.expect("close notify"), 0);
+                    assert_eq!(stream.get_ref().1.tls13_tickets_received(), 0);
+                };
+                tokio::join!(accept, dial);
+            })
+            .await
+            .expect("connections must finish without hanging");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reused_input_configs_always_perform_full_handshakes_without_tickets() {
+        let root = temp_dir("input-full-handshakes");
+        let server = identity_at(&root, "server");
+        let client = identity_at(&root, "client");
+        let (server_trust, client_trust) = paired(&server, &client);
+        assert_reused_configs_require_full_handshakes(
+            trusted_client_config(&client, &client_trust).expect("client config"),
+            trusted_server_config(&server, &server_trust).expect("server config"),
+            protocol::limits::ALPN_INPUT,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reused_clipboard_configs_always_perform_full_handshakes_without_tickets() {
+        let root = temp_dir("clipboard-full-handshakes");
+        let server = identity_at(&root, "server");
+        let client = identity_at(&root, "client");
+        let (server_trust, client_trust) = paired(&server, &client);
+        assert_reused_configs_require_full_handshakes(
+            clipboard_client_config(&client, &client_trust).expect("client config"),
+            clipboard_server_config(&server, &server_trust).expect("server config"),
+            protocol::limits::ALPN_CLIPBOARD,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reused_pairing_configs_always_perform_full_handshakes_without_tickets() {
+        let root = temp_dir("pairing-full-handshakes");
+        let server = identity_at(&root, "server");
+        let client = identity_at(&root, "client");
+        assert_reused_configs_require_full_handshakes(
+            pairing_client_config(&client).expect("client config"),
+            pairing_server_config(&server).expect("server config"),
+            protocol::limits::ALPN_PAIR,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The clipboard channel's handshake negotiates `bifrost/clipboard/1` on both
