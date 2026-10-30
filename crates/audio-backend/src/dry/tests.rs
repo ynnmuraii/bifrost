@@ -682,10 +682,16 @@ fn ptt_observes_release_unregisters_and_lock_session_timeout_fail_closed() {
         PttCancellation::SessionLost,
         PttCancellation::WorkerTimeout,
     ] {
-        backend.configure_ptt(Some(hotkey())).unwrap();
+        backend.configure_ptt(Some(hotkey()), &[]).unwrap();
         backend.apply(ScriptEvent::PttPress).unwrap();
         backend.apply(ScriptEvent::PttPress).unwrap();
-        assert_eq!(backend.poll_event(), Some(Event::PttPressed));
+        assert_eq!(
+            backend.poll_event(),
+            Some(Event::PttPressed {
+                observed_at_ns: 0,
+                expires_at_ns: PTT_LEASE_NS
+            })
+        );
         assert_eq!(backend.poll_event(), None);
         backend.apply(ScriptEvent::CancelPtt(reason)).unwrap();
         assert_eq!(backend.poll_event(), Some(Event::PttReleased));
@@ -694,21 +700,33 @@ fn ptt_observes_release_unregisters_and_lock_session_timeout_fail_closed() {
             Err(BackendError::Unsupported)
         );
     }
-    backend.configure_ptt(Some(hotkey())).unwrap();
+    backend.configure_ptt(Some(hotkey()), &[]).unwrap();
     backend.apply(ScriptEvent::PttPress).unwrap();
     backend.apply(ScriptEvent::PttRelease).unwrap();
-    assert_eq!(backend.poll_event(), Some(Event::PttPressed));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttPressed {
+            observed_at_ns: 0,
+            expires_at_ns: PTT_LEASE_NS
+        })
+    );
     assert_eq!(backend.poll_event(), Some(Event::PttReleased));
     backend.apply(ScriptEvent::PttPress).unwrap();
-    backend.configure_ptt(None).unwrap();
-    assert_eq!(backend.poll_event(), Some(Event::PttPressed));
+    backend.configure_ptt(None, &[]).unwrap();
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttPressed {
+            observed_at_ns: 0,
+            expires_at_ns: PTT_LEASE_NS
+        })
+    );
     assert_eq!(backend.poll_event(), Some(Event::PttReleased));
 }
 
 #[test]
 fn bounded_poll_overflow_revokes_held_press_and_discards_stale_edges() {
     let mut backend = backend();
-    backend.configure_ptt(Some(hotkey())).unwrap();
+    backend.configure_ptt(Some(hotkey()), &[]).unwrap();
     backend.apply(ScriptEvent::PttPress).unwrap();
     for _ in 0..EVENT_CAPACITY + 10 {
         backend
@@ -721,12 +739,21 @@ fn bounded_poll_overflow_revokes_held_press_and_discards_stale_edges() {
     assert_eq!(backend.poll_event(), Some(Event::ResyncRequired));
     let mut count = 0;
     while let Some(event) = backend.poll_event() {
-        assert!(!matches!(event, Event::PttPressed | Event::PttReleased));
+        assert!(!matches!(
+            event,
+            Event::PttPressed { .. } | Event::PttRenewed { .. } | Event::PttReleased
+        ));
         count += 1;
     }
     assert!(count <= EVENT_CAPACITY);
     backend.apply(ScriptEvent::PttPress).unwrap();
-    assert_eq!(backend.poll_event(), Some(Event::PttPressed));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttPressed {
+            observed_at_ns: 0,
+            expires_at_ns: PTT_LEASE_NS
+        })
+    );
 }
 
 #[test]
@@ -734,7 +761,7 @@ fn unsupported_and_server_permission_failures_have_structured_explicit_probe_res
     let mut unsupported = DryBackend::new(Capabilities::default());
     assert_eq!(unsupported.media_sessions(), Err(BackendError::Unsupported));
     assert_eq!(
-        unsupported.configure_ptt(Some(hotkey())),
+        unsupported.configure_ptt(Some(hotkey()), &[]),
         Err(BackendError::Unsupported)
     );
     assert!(matches!(
@@ -863,19 +890,25 @@ fn ptt_binding_accepts_only_documented_non_modifier_hid_usage_ids() {
     let mut backend = backend();
     for key_code in [0, 3, 0x74, 0xe0, u32::MAX] {
         assert_eq!(
-            backend.configure_ptt(Some(PttHotkey {
-                key_code,
-                ..hotkey()
-            })),
+            backend.configure_ptt(
+                Some(PttHotkey {
+                    key_code,
+                    ..hotkey()
+                }),
+                &[]
+            ),
             Err(BackendError::InvalidArgument)
         );
     }
     for key_code in [0x04, 0x73] {
         backend
-            .configure_ptt(Some(PttHotkey {
-                key_code,
-                ..hotkey()
-            }))
+            .configure_ptt(
+                Some(PttHotkey {
+                    key_code,
+                    ..hotkey()
+                }),
+                &[],
+            )
             .unwrap();
     }
 }
@@ -929,4 +962,145 @@ fn format_bounds_are_checked_before_stream_scratch_allocation() {
             Err(BackendError::InvalidArgument)
         ));
     }
+}
+
+#[test]
+fn stream_snapshots_report_native_clock_and_invalidation_without_pumping() {
+    let mut backend = backend();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let output = captured.clone();
+    let mut stream = backend
+        .start_capture(
+            capture_request(),
+            Box::new(move |block| {
+                output.lock().unwrap().push((
+                    block.timestamp_valid,
+                    block.device_position,
+                    block.timestamp_ns,
+                ));
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        stream.snapshot(),
+        StreamSnapshot {
+            status: StreamStatus::Running,
+            device_position: Some(0),
+            clock_frequency: Some(44_100),
+            host_time_100ns: Some(0),
+            underrun_frames: 0,
+            dropped_capture_frames: 0,
+        }
+    );
+    stream.pump(441).unwrap();
+    stream.pump(441).unwrap();
+    assert_eq!(
+        *captured.lock().unwrap(),
+        [(true, Some(0), 0), (true, Some(441), 10_000_000)]
+    );
+    assert_eq!(stream.snapshot().device_position, Some(882));
+    assert_eq!(stream.snapshot().host_time_100ns, Some(200_000));
+    backend
+        .apply(ScriptEvent::InvalidateDevice(id("mic")))
+        .unwrap();
+    assert_eq!(stream.snapshot().status, StreamStatus::DeviceInvalidated);
+    assert_eq!(stream.pump(1), Err(BackendError::DeviceGone));
+    assert_eq!(stream.snapshot().status, StreamStatus::DeviceInvalidated);
+    let mut render = backend
+        .start_render(render_request(), Box::new(|_| {}))
+        .unwrap();
+    render.stop().unwrap();
+    assert_eq!(render.snapshot().status, StreamStatus::Stopped);
+    let mut render = backend
+        .start_render(render_request(), Box::new(|_| {}))
+        .unwrap();
+    backend
+        .apply(ScriptEvent::Availability(Some(
+            BackendError::ServerUnavailable,
+        )))
+        .unwrap();
+    assert_eq!(
+        render.snapshot().status,
+        StreamStatus::Failed(BackendError::ServerUnavailable)
+    );
+    assert_eq!(render.pump(1), Err(BackendError::ServerUnavailable));
+    assert_eq!(
+        render.snapshot().status,
+        StreamStatus::Failed(BackendError::ServerUnavailable)
+    );
+}
+
+#[test]
+fn ptt_collisions_preserve_the_existing_binding_and_press() {
+    let mut backend = backend();
+    let chord = hotkey();
+    backend.configure_ptt(Some(chord), &[]).unwrap();
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    drain(&mut backend);
+    assert_eq!(
+        backend.configure_ptt(Some(chord), &[chord]),
+        Err(BackendError::Conflict)
+    );
+    assert_eq!(backend.poll_event(), None);
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    let different = PttHotkey {
+        alt: !chord.alt,
+        ..chord
+    };
+    backend.configure_ptt(Some(different), &[chord]).unwrap();
+    backend.configure_ptt(None, &[different]).unwrap();
+}
+
+#[test]
+fn ptt_lease_renewal_expiry_and_stalled_consumer_fail_closed() {
+    let mut backend = backend();
+    backend.configure_ptt(Some(hotkey()), &[]).unwrap();
+    backend
+        .apply(ScriptEvent::AdvanceTime { now_ns: 10 })
+        .unwrap();
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttPressed {
+            observed_at_ns: 10,
+            expires_at_ns: 10 + PTT_LEASE_NS
+        })
+    );
+    let renewed_at = 10 + PTT_LEASE_NS / 2;
+    backend
+        .apply(ScriptEvent::AdvanceTime { now_ns: renewed_at })
+        .unwrap();
+    backend.apply(ScriptEvent::PttRenew).unwrap();
+    let expiry = renewed_at + PTT_LEASE_NS;
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttRenewed {
+            expires_at_ns: expiry
+        })
+    );
+    backend
+        .apply(ScriptEvent::AdvanceTime { now_ns: expiry })
+        .unwrap();
+    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    assert_eq!(
+        backend.apply(ScriptEvent::PttRenew),
+        Err(BackendError::Stopped)
+    );
+    // Even if Press was queued while the consumer stalled, its absolute expiry
+    // prevents reopening when it is eventually consumed.
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    let now = expiry + PTT_LEASE_NS;
+    backend
+        .apply(ScriptEvent::AdvanceTime { now_ns: now })
+        .unwrap();
+    let Some(Event::PttPressed { expires_at_ns, .. }) = backend.poll_event() else {
+        panic!("queued press")
+    };
+    assert!(now >= expires_at_ns);
+    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    assert_eq!(
+        backend.apply(ScriptEvent::AdvanceTime { now_ns: now - 1 }),
+        Err(BackendError::InvalidArgument)
+    );
 }
