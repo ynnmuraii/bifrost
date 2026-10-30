@@ -37,6 +37,7 @@ pub enum BackendError {
     Stopped,
     Timeout,
     Cancelled,
+    Conflict,
 }
 
 impl fmt::Display for BackendError {
@@ -152,6 +153,8 @@ pub enum FeedbackGuarantee {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CaptureSpec {
     /// Not endpoint-filtered. Native adapters target the current audio role and descendants.
+    /// The excluded root is deliberately std::process::id() of the calling audio role,
+    /// which owns every Bifrost render stream. No caller-selected PID is accepted.
     /// Caller must supply f32 stereo 48 kHz; activation failure is fatal, with no fallback.
     SystemExcludingOwnProcessTree { format: AudioFormat },
     EndpointLoopback {
@@ -177,6 +180,10 @@ pub struct CaptureBlock<'a> {
     pub frames: usize,
     pub format: AudioFormat,
     pub timestamp_ns: u64,
+    /// False means timestamp_ns is not usable; never infer validity from a zero value.
+    pub timestamp_valid: bool,
+    /// First sample's position in native frames, when the capture API supplies it.
+    pub device_position: Option<u64>,
     pub discontinuity: bool,
 }
 
@@ -186,6 +193,8 @@ impl fmt::Debug for CaptureBlock<'_> {
             .field("frames", &self.frames)
             .field("format", &self.format)
             .field("timestamp_ns", &self.timestamp_ns)
+            .field("timestamp_valid", &self.timestamp_valid)
+            .field("device_position", &self.device_position)
             .field("discontinuity", &self.discontinuity)
             .finish_non_exhaustive()
     }
@@ -202,6 +211,33 @@ pub struct RenderRequest {
 pub type CaptureCallback = Box<dyn for<'a> FnMut(CaptureBlock<'a>) + Send + 'static>;
 pub type RenderCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamStatus {
+    Running,
+    Stopped,
+    DeviceInvalidated,
+    Failed(BackendError),
+}
+
+/// A control-plane snapshot of the native worker, not a request to query from RT code.
+///
+/// Position is in device-clock ticks and frequency is ticks/second. Native WASAPI
+/// adapters retain IAudioClock units and its correlated QPC time; Linux adapters
+/// convert Pulse timing_info indices to native frames and report sample_rate as
+/// frequency. Host time is a correlated local monotonic clock in 100ns units.
+/// None means unavailable/invalid; Some(0) is a valid starting position/time.
+/// Dry reports deterministic frame position/sample_rate/time, with zero hardware
+/// xrun counters because explicit pumping never loses a callback to scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamSnapshot {
+    pub status: StreamStatus,
+    pub device_position: Option<u64>,
+    pub clock_frequency: Option<u64>,
+    pub host_time_100ns: Option<u64>,
+    pub underrun_frames: u64,
+    pub dropped_capture_frames: u64,
+}
+
 /// Owned stream. Implementations also stop on Drop. After stop returns (including an error),
 /// no callback may be running or called again, and callback captures must have been released.
 /// Stop is idempotent; it cancels native work and joins workers on this control thread.
@@ -210,6 +246,7 @@ pub trait Stream: Send {
     /// None for process-tree capture, which is not tied to an endpoint.
     fn device(&self) -> Option<&DeviceId>;
     fn feedback_guarantee(&self) -> FeedbackGuarantee;
+    fn snapshot(&self) -> StreamSnapshot;
     fn stop(&mut self) -> Result<(), BackendError>;
 }
 
@@ -410,6 +447,9 @@ impl PttHotkey {
 
 pub const MEDIA_COMMAND_TIMEOUT_MS: u32 = 1000;
 
+/// Native PTT leases expire after 250ms; renew at intervals no greater than half.
+pub const PTT_LEASE_NS: u64 = 250_000_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceEvent {
     Added(DeviceId),
@@ -435,7 +475,18 @@ pub enum Event {
         request_id: u64,
         result: Result<(), BackendError>,
     },
-    PttPressed,
+    /// Absolute host-monotonic times in nanoseconds (QPC-derived on Windows,
+    /// CLOCK_MONOTONIC on Linux; Dry uses explicitly advanced logical time).
+    /// Consumers MUST check expiry at use time, including after queue/control stalls.
+    PttPressed {
+        observed_at_ns: u64,
+        expires_at_ns: u64,
+    },
+    /// Renew only an already-held, unexpired press; this event can never reopen
+    /// a released/expired gate. Native-release backends must renew too, at <=lease/2.
+    PttRenewed {
+        expires_at_ns: u64,
+    },
     PttReleased,
     /// Queue overflow: refresh device/default/mute/media snapshots and revoke all PTT grants.
     ResyncRequired,
@@ -482,6 +533,12 @@ pub trait Backend {
     fn cancel_media_commands(&mut self);
     /// None unregisters and revokes a held press. Unsupported global release semantics must
     /// return Unsupported, not emulate release with a toggle or timer.
-    fn configure_ptt(&mut self, hotkey: Option<PttHotkey>) -> Result<(), BackendError>;
+    /// Reject a chord matching reserved switch/emergency/game-guard hotkeys with
+    /// Conflict, without changing an existing binding or held-press state.
+    fn configure_ptt(
+        &mut self,
+        hotkey: Option<PttHotkey>,
+        reserved: &[PttHotkey],
+    ) -> Result<(), BackendError>;
     fn poll_event(&mut self) -> Option<Event>;
 }

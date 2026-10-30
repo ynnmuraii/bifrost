@@ -18,6 +18,7 @@
 //! service says something, and never otherwise.
 
 mod appearance;
+pub mod audio_player;
 mod bridge;
 mod dock;
 mod field;
@@ -450,6 +451,19 @@ fn rail_draw(
         text(lang, Key::Appearance),
     ) {
         actions.push(Action::ToggleAppearance);
+    }
+    let audio = rail_slot(rect, Modal::ALL.len() + 1);
+    if rail_button(
+        ui,
+        pal,
+        audio,
+        Icon::Audio,
+        "07",
+        vm.audio_player.open,
+        &mut tip,
+        text(lang, Key::AudioPlayer),
+    ) {
+        actions.push(Action::OpenAudioPlayer);
     }
     if let Some((btn, title)) = tip {
         let layer = ui.ctx().layer_painter(egui::LayerId::new(
