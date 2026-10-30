@@ -152,11 +152,14 @@ pub fn validate_datagram(datagram: &[u8]) -> Result<Header, PacketError> {
     if datagram.len() < HEADER_LEN + TAG_LEN {
         return Err(PacketError::InvalidDatagramLength);
     }
-    let header = Header::decode(&datagram[..HEADER_LEN])?;
-    if datagram.len() != HEADER_LEN + usize::from(header.payload_len) + TAG_LEN {
+    let payload_len = usize::from(u16::from_be_bytes(field(datagram, 42)));
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(PacketError::PayloadTooLarge);
+    }
+    if datagram.len() != HEADER_LEN + payload_len + TAG_LEN {
         return Err(PacketError::InvalidDatagramLength);
     }
-    Ok(header)
+    Header::decode(&datagram[..HEADER_LEN])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
