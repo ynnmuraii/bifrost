@@ -1,0 +1,19 @@
+[package]
+name = "audio-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Bifrost: bounded encrypted audio codec and playout workers"
+
+[lints]
+workspace = true
+
+[dependencies]
+audio-model = { path = "../audio-model" }
+ring = "0.17"
+zeroize = "1"
+opus = "0.4"
+rubato = { version = "5", default-features = false }
+audioadapter-buffers = "5"

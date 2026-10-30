@@ -21,6 +21,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
+- Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling. Deterministic impairment tests use in-memory PCM only; sockets/devices remain outside this implementation.
 
 ### Русский
 
@@ -39,6 +40,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования. Аудиоустройства и сетевые сеансы не активируются.
 - Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
+- Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле. Детерминированные тесты используют только PCM в памяти; сокеты и устройства пока не включаются.
 
 ## 0.4.0 — 2026-10-30
 
