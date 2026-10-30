@@ -86,7 +86,10 @@ pub const LEASE_ID_LEN: usize = 16;
 pub const MAX_DISPLAY_NAME_BYTES: usize = 128;
 /// `Hello.displays` maximum length.
 pub const MAX_HELLO_DISPLAYS: usize = 16;
-/// Maximum advertised Hello capabilities, including unknown optional values.
+/// Maximum advertised capability wire entries, counting unknown values and duplicates.
+///
+/// The <=22 assigned/planned capabilities leave headroom within this 64-entry bound.
+/// Growing the bound requires a major/minor-gated wire contract change.
 pub const MAX_HELLO_CAPABILITIES: usize = 64;
 /// Maximum Hello requirements; bounds duplicate and offer membership scans.
 pub const MAX_REQUIRED_CAPABILITIES: usize = 32;

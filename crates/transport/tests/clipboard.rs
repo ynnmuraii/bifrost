@@ -228,9 +228,12 @@ async fn clipboard_inherits_the_lower_negotiated_parent_minor() {
             ..Default::default()
         })
         .unwrap();
-    let negotiated = acceptor.on_remote_hello(&request, &[]).unwrap();
+    let negotiated = acceptor.on_remote_hello(&request, &[], &[]).unwrap();
     let reply = acceptor.local_hello(Default::default()).unwrap();
-    assert_eq!(dialer.on_remote_hello(&reply, &[]).unwrap(), negotiated);
+    assert_eq!(
+        dialer.on_remote_hello(&reply, &[], &[]).unwrap(),
+        negotiated
+    );
     assert_eq!((negotiated.major, negotiated.minor), (1, 1));
     transfer_round_trip(
         clipboard::ContentKind::Text,
@@ -525,15 +528,17 @@ fn every_limit_is_refused() {
     );
 }
 
-/// 3. `Grants` accepts a bind once, expires, checks parent and token, and drops its grants
-///    when the parent link closes.
+/// 3. `Grants` accepts a bind once, expires, checks peer, parent and token, and drops its
+///    grants when the parent link closes.
 #[test]
 fn grants_are_one_use_expiring_and_parent_scoped() {
+    let peer = [0x21; 32].into();
     let parent = [7u8; 16];
     let other_parent = [8u8; 16];
     let mut grants = Grants::default();
 
     let (channel_id, token) = grants.issue(
+        peer,
         parent,
         (
             protocol::limits::PROTOCOL_MAJOR,
@@ -542,16 +547,20 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
         0,
     );
     assert_eq!(grants.open(), 1);
-    assert_eq!(grants.accept(&parent, &channel_id, &token, 0), Ok((1, 0)));
+    assert_eq!(
+        grants.accept(peer, &parent, &channel_id, &token, 0),
+        Ok((1, 0))
+    );
     assert_eq!(grants.open(), 0, "a bound grant is no longer open");
     assert_eq!(
-        grants.accept(&parent, &channel_id, &token, 0),
+        grants.accept(peer, &parent, &channel_id, &token, 0),
         Err(ClipboardViolation::BadId),
         "the same token cannot bind twice"
     );
 
     // Expiry: `clipboard::CHANNEL_TTL_MS` after issue.
     let (channel_id, token) = grants.issue(
+        peer,
         parent,
         (
             protocol::limits::PROTOCOL_MAJOR,
@@ -560,7 +569,13 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
         0,
     );
     assert_eq!(
-        grants.accept(&parent, &channel_id, &token, clipboard::CHANNEL_TTL_MS + 1),
+        grants.accept(
+            peer,
+            &parent,
+            &channel_id,
+            &token,
+            clipboard::CHANNEL_TTL_MS + 1,
+        ),
         Err(ClipboardViolation::BadId),
         "an expired grant is refused"
     );
@@ -570,6 +585,7 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
 
     // A wrong parent or token is refused and the grant stays open until its parent closes.
     let (channel_id, token) = grants.issue(
+        peer,
         parent,
         (
             protocol::limits::PROTOCOL_MAJOR,
@@ -578,17 +594,48 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
         0,
     );
     assert_eq!(
-        grants.accept(&other_parent, &channel_id, &token, 0),
+        grants.accept(peer, &other_parent, &channel_id, &token, 0),
         Err(ClipboardViolation::BadId)
     );
     assert_eq!(
-        grants.accept(&parent, &channel_id, &[0u8; 32], 0),
+        grants.accept(peer, &parent, &channel_id, &[0u8; 32], 0),
         Err(ClipboardViolation::BadId)
     );
     grants.close_parent(&other_parent);
     assert_eq!(grants.open(), 1, "closing another parent keeps this grant");
     grants.close_parent(&parent);
     assert_eq!(grants.open(), 0, "closing the parent drops its grants");
+}
+
+#[test]
+fn a_leaked_grant_cannot_bind_another_peer_or_consume_the_rightful_peers_grant() {
+    let peer = [0x21; 32].into();
+    let other_peer = [0x22; 32].into();
+    let parent = [7; 16];
+    let version = (1, 3);
+    let mut grants = Grants::default();
+    let (channel, token) = grants.issue(peer, parent, version, 0);
+
+    assert_eq!(
+        grants.accept(other_peer, &parent, &channel, &token, 0),
+        Err(ClipboardViolation::BadId)
+    );
+    assert_eq!(
+        grants.open(),
+        1,
+        "the wrong peer must not consume the grant"
+    );
+    assert_eq!(
+        grants.accept(peer, &parent, &channel, &token, 0),
+        Ok(version),
+        "the rightful peer inherits the negotiated parent version"
+    );
+    assert_eq!(grants.open(), 0);
+    assert_eq!(
+        grants.accept(peer, &parent, &channel, &token, 0),
+        Err(ClipboardViolation::BadId),
+        "the rightful peer still gets only one bind"
+    );
 }
 
 /// 4. A connection whose first frame is not a `Bind` is dropped; `accept()` keeps waiting.

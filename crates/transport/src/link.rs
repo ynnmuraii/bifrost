@@ -43,10 +43,23 @@ pub enum LinkDownReason {
     Timeout,
     /// A framing, sequence or conversion violation; the link is closed.
     Protocol(String),
+    /// The peer's implementation cannot satisfy the Hello contract.
+    Incompatible,
+    /// A fatal wire refusal requested a bounded graceful close.
+    ProtocolRefused(wire::ErrorCode),
     /// Socket error.
     Io(String),
     /// Refused: the workspace is already at `max_members`.
     MembershipFull,
+}
+
+impl LinkDownReason {
+    fn permits_graceful_close(&self) -> bool {
+        matches!(
+            self,
+            Self::LocalClosed | Self::Incompatible | Self::ProtocolRefused(_)
+        )
+    }
 }
 
 /// What the application sees from a link.
@@ -69,6 +82,8 @@ pub enum LinkEvent {
     Up {
         /// The peer.
         peer: NodeId,
+        /// This local link incarnation; consumers must ignore stale replacement events.
+        generation: [u8; 16],
         /// Its `Hello` gossip.
         hello: PeerInfo,
         /// The negotiated `connection_id`: the dialer's random 16 bytes, which the acceptor
@@ -93,6 +108,8 @@ pub enum LinkEvent {
     Down {
         /// The peer.
         peer: NodeId,
+        /// The local link incarnation that ended.
+        generation: [u8; 16],
         /// Why.
         reason: LinkDownReason,
     },
@@ -639,6 +656,10 @@ impl LinkHandle {
         self.auxiliary.handle()
     }
 
+    pub(crate) fn invalidate_auxiliary(&self) {
+        self.auxiliary.invalidate();
+    }
+
     /// Published aggregate diagnostics contain durations and counters only.
     pub fn input_metrics(&self) -> crate::input_metrics::InputMetricsSnapshot {
         self.metrics
@@ -1111,10 +1132,11 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
     let remote = stream.peer_addr().ok();
     // Export once from the authenticated runtime input TLS connection, before split.
     let pending_auxiliary = match crate::auxiliary::export(&stream) {
-        Ok(root) => root,
-        Err(error) => {
-            report_down(&reports, key, peer, reason_from(error)).await;
-            return;
+        Ok(root) => Some(root),
+        Err(_) => {
+            auxiliary.invalidate();
+            tracing::warn!(peer = ?peer, "optional auxiliary key binding unavailable");
+            None
         }
     };
     let (reader, writer) = tokio::io::split(stream);
@@ -1152,7 +1174,7 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
         Arc::clone(&metrics),
         Arc::clone(&tracker),
     );
-    state.auxiliary = Some((auxiliary, pending_auxiliary));
+    state.auxiliary = pending_auxiliary.map(|root| (auxiliary, root));
     state.remote = remote;
     let mut failure = terminal.subscribe();
     let initial = if direction.is_outgoing() {
@@ -1238,11 +1260,11 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
         .borrow()
         .clone()
         .expect("terminal reason was just set");
-    if reason != LinkDownReason::LocalClosed {
+    if !reason.permits_graceful_close() {
         queue.abort();
     }
     let cleanup = async {
-        if reason == LinkDownReason::LocalClosed {
+        if reason.permits_graceful_close() {
             if tokio::time::timeout_at(deadline, &mut writer_task)
                 .await
                 .is_err()
@@ -1306,6 +1328,7 @@ struct LinkState {
     connection_id: [u8; 16],
     announced: bool,
     unpair_notice: bool,
+    remote_requirements: Vec<i32>,
     started: tokio::time::Instant,
     last_pong_ms: u64,
     last_ping_ms: Option<u64>,
@@ -1325,7 +1348,7 @@ struct LinkState {
     ack_tracker: Arc<Mutex<AckTracker>>,
     auxiliary: Option<(
         Arc<crate::auxiliary::AuxiliaryState>,
-        zeroize::Zeroizing<[u8; 32]>,
+        crate::auxiliary::ExporterRoot,
     )>,
 }
 
@@ -1345,6 +1368,7 @@ impl LinkState {
             connection_id,
             announced: false,
             unpair_notice: false,
+            remote_requirements: Vec::new(),
             started: lease_diagnostics.trace.started,
             last_pong_ms: 0,
             last_ping_ms: None,
@@ -1436,6 +1460,29 @@ impl LinkState {
         Ok(())
     }
 
+    async fn refuse(
+        &self,
+        queue: &InputQueue,
+        envelope: &wire::Envelope,
+        code: wire::ErrorCode,
+    ) -> LinkDownReason {
+        let Ok(connection_id) = envelope.connection_id.as_slice().try_into() else {
+            return LinkDownReason::Protocol("invalid refusal connection".into());
+        };
+        let (reply, flushed) = tokio::sync::oneshot::channel();
+        if let Err(error) = queue.refuse(connection_id, code, envelope.seq, reply) {
+            return reason_from(error);
+        }
+        // The dedicated slot bypasses only the Hello barrier, never releases queued input.
+        let deadline = queue.begin_close();
+        let _ = tokio::time::timeout_at(deadline, flushed).await;
+        if code == wire::ErrorCode::UnsupportedVersion {
+            LinkDownReason::Incompatible
+        } else {
+            LinkDownReason::ProtocolRefused(code)
+        }
+    }
+
     async fn on_frame(
         &mut self,
         queue: &InputQueue,
@@ -1457,6 +1504,30 @@ impl LinkState {
                 .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
         }
 
+        // A dialer may be refused instead of receiving an answering Hello.
+        if let (false, Some(wire::envelope::Payload::Error(error))) =
+            (self.announced, &envelope.payload)
+        {
+            validate::envelope(envelope)
+                .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
+            if envelope.seq == 1
+                && envelope.major == limits::PROTOCOL_MAJOR
+                && envelope.connection_id.as_slice() == self.connection_id
+                && envelope.lease_id.is_empty()
+            {
+                match wire::ErrorCode::try_from(error.code) {
+                    Ok(wire::ErrorCode::UnsupportedVersion) => {
+                        return Err(LinkDownReason::Incompatible);
+                    }
+                    Ok(
+                        code @ (wire::ErrorCode::InvalidFrame | wire::ErrorCode::InvalidSequence),
+                    ) => {
+                        return Err(LinkDownReason::ProtocolRefused(code));
+                    }
+                    _ => {}
+                }
+            }
+        }
         // The Hello barrier applies to liveness frames as well.
         if !self.announced && !matches!(envelope.payload, Some(wire::envelope::Payload::Hello(_))) {
             return Err(LinkDownReason::Protocol(
@@ -1501,8 +1572,9 @@ impl LinkState {
                     "a frame arrived before Hello".into(),
                 ));
             };
-            validate::hello(hello)
-                .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
+            if let Err(violation) = validate::hello(hello) {
+                return Err(self.refuse(queue, envelope, violation.error_code()).await);
+            }
             let info = PeerInfo::from_hello(hello)
                 .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
             if info.node_id != self.peer {
@@ -1511,11 +1583,23 @@ impl LinkState {
                     "Hello.node_id does not match the certificate SPKI hash".into(),
                 ));
             }
-            let negotiated = handshake
-                .on_remote_hello(envelope, &local_hello.capabilities)
-                .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
+            let negotiated = match handshake.on_remote_hello(
+                envelope,
+                convert::IMPLEMENTED_CAPABILITIES,
+                &local_hello.required_capabilities,
+            ) {
+                Ok(negotiated) => negotiated,
+                Err(error) => {
+                    if let Some(code) = error.peer_error_code() {
+                        return Err(self.refuse(queue, envelope, code).await);
+                    }
+                    return Err(LinkDownReason::Protocol(format!("{error:?}")));
+                }
+            };
             self.connection_id = negotiated.connection_id;
             self.announced = true;
+            self.remote_requirements
+                .clone_from(&hello.required_capabilities);
             self.unpair_notice = hello
                 .capabilities
                 .contains(&(wire::Capability::UnpairNotice as i32))
@@ -1594,10 +1678,13 @@ impl LinkState {
             Some(wire::envelope::Payload::Hello(_)) => {
                 return Err(LinkDownReason::Protocol("a second Hello".into()));
             }
-            // «пятый член получает `MEMBERSHIP_FULL`»: the refusal is the reason this link
-            // ends, so the refused side reports it as such instead of a bare `Shutdown`
-            // (or a protocol failure). Every other `ProtocolError` code stays an ordinary
-            // message: only the membership refusal terminates the link.
+            // Fatal compatibility refusals select slow reconnects, not ordinary input errors.
+            Some(wire::envelope::Payload::Error(error))
+                if error.code == wire::ErrorCode::UnsupportedVersion as i32 =>
+            {
+                return Err(LinkDownReason::Incompatible);
+            }
+            // Membership refusal is likewise terminal, not an input message.
             Some(wire::envelope::Payload::Error(error))
                 if matches!(
                     convert::error_code_from_i32(error.code),
@@ -1605,6 +1692,21 @@ impl LinkState {
                 ) =>
             {
                 return Err(LinkDownReason::MembershipFull);
+            }
+            Some(wire::envelope::Payload::CapabilitiesChanged(changed)) => {
+                if let Err(violation) = validate::capabilities(&changed.capabilities) {
+                    return Err(self.refuse(queue, envelope, violation.error_code()).await);
+                }
+                if local_hello
+                    .required_capabilities
+                    .iter()
+                    .chain(&self.remote_requirements)
+                    .any(|required| !changed.capabilities.contains(required))
+                {
+                    return Err(self
+                        .refuse(queue, envelope, wire::ErrorCode::InvalidFrame)
+                        .await);
+                }
             }
             _ => {}
         }
@@ -1614,6 +1716,9 @@ impl LinkState {
             .record(envelope.payload.as_ref(), false);
         let message = match convert::inbound_from_envelope(envelope) {
             Ok(message) => message,
+            Err(convert::ConvertError::Violation(violation)) => {
+                return Err(self.refuse(queue, envelope, violation.error_code()).await);
+            }
             Err(error) => {
                 // A payload this node cannot read — an event with no wire form, an absolute
                 // position without a display id, a vocabulary member from another build — is
@@ -1767,12 +1872,31 @@ async fn writer_loop<W: AsyncWrite + Unpin>(
             notified.as_mut().enable();
             let reason = closing.borrow().clone();
             if let Some(reason) = reason {
-                if reason != LinkDownReason::LocalClosed {
+                if !reason.permits_graceful_close() {
                     return Err(TransportError::LinkClosed);
                 }
                 local_close = true;
             }
             if let Some(intent) = queue.pop() {
+                if let Intent::Refuse {
+                    connection_id,
+                    code,
+                    related_seq,
+                    reply,
+                } = intent
+                {
+                    state.connection_id = connection_id;
+                    let envelope =
+                        state.envelope(wire::envelope::Payload::Error(wire::ProtocolError {
+                            code: code as i32,
+                            related_seq,
+                            ..Default::default()
+                        }));
+                    let sent = write_measured(&mut writer, &envelope, &metrics).await;
+                    let _ = reply.send(sent.is_ok());
+                    sent?;
+                    continue;
+                }
                 if let Intent::Unpair(notice, reply) = intent {
                     if !local_hello
                         .capabilities
@@ -1934,7 +2058,9 @@ async fn write_intent<W: AsyncWrite + Unpin>(
             }
             Outbound::Motion { .. } => unreachable!("motion is admitted through the latest slot"),
         },
-        Intent::Unpair(..) => unreachable!("unpair completion belongs to writer loop"),
+        Intent::Unpair(..) | Intent::Refuse { .. } => {
+            unreachable!("terminal completion belongs to writer loop")
+        }
     };
     let started = tokio::time::Instant::now();
     if let Some(wire::envelope::Payload::Ping(ping)) = &envelope.payload {

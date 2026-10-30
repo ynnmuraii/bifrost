@@ -407,13 +407,13 @@ fn dialer_first_hello_negotiates_only_after_both_directions() {
         let request = dialer.local_hello(Default::default()).unwrap();
         assert_eq!(request.seq, 1);
         assert!(!dialer.is_established());
-        acceptor.on_remote_hello(&request, &[]).unwrap();
+        acceptor.on_remote_hello(&request, &[], &[]).unwrap();
         assert!(!acceptor.is_established());
         let reply = acceptor.local_hello(Default::default()).unwrap();
         assert_eq!(reply.seq, 1);
         assert_eq!(reply.connection_id, request.connection_id);
         assert!(acceptor.is_established());
-        dialer.on_remote_hello(&reply, &[]).unwrap();
+        dialer.on_remote_hello(&reply, &[], &[]).unwrap();
         assert_eq!(
             dialer.negotiated(),
             Some(Negotiated {
@@ -428,7 +428,7 @@ fn dialer_first_hello_negotiates_only_after_both_directions() {
             Err(HandshakeError::AlreadySent)
         );
         assert_eq!(
-            acceptor.on_remote_hello(&request, &[]),
+            acceptor.on_remote_hello(&request, &[], &[]),
             Err(HandshakeError::NotHello)
         );
     }
@@ -482,11 +482,11 @@ fn hello_rejects_wrong_sequence_ids_version_and_payload() {
     ));
     for (message, expected) in cases {
         let mut acceptor = HelloHandshake::acceptor(0, 3);
-        assert_eq!(acceptor.on_remote_hello(&message, &[]), Err(expected));
+        assert_eq!(acceptor.on_remote_hello(&message, &[], &[]), Err(expected));
         assert!(!acceptor.is_established());
     }
     assert_eq!(
-        HelloHandshake::dialer(0, 3, [8; 16]).on_remote_hello(&base, &[]),
+        HelloHandshake::dialer(0, 3, [8; 16]).on_remote_hello(&base, &[], &[]),
         Err(HandshakeError::ConnectionIdMismatch)
     );
 }
@@ -504,7 +504,7 @@ fn rejected_remote_hello_does_not_unlock_acceptor_send() {
         },
     ] {
         let mut acceptor = HelloHandshake::acceptor(0, 3);
-        assert!(acceptor.on_remote_hello(&message, &[]).is_err());
+        assert!(acceptor.on_remote_hello(&message, &[], &[]).is_err());
         assert_eq!(
             acceptor.local_hello(Default::default()),
             Err(HandshakeError::NotYourTurn)
@@ -560,6 +560,7 @@ fn hello_capability_lists_are_bounded_before_membership_scans() {
         ..Default::default()
     };
     assert_eq!(validate::hello(&hello), Ok(()));
+    assert_eq!(validate::capabilities(&hello.capabilities), Ok(()));
     hello.capabilities.push(999);
     assert_eq!(
         validate::hello(&hello),
@@ -567,6 +568,14 @@ fn hello_capability_lists_are_bounded_before_membership_scans() {
             got: MAX_HELLO_CAPABILITIES + 1
         })
     );
+    let violation = validate::capabilities(&hello.capabilities).unwrap_err();
+    assert_eq!(
+        violation,
+        Violation::TooManyCapabilities {
+            got: MAX_HELLO_CAPABILITIES + 1
+        }
+    );
+    assert_eq!(violation.error_code(), wire::ErrorCode::InvalidFrame);
     hello.capabilities.clear();
     hello.required_capabilities = vec![999; MAX_REQUIRED_CAPABILITIES];
     assert_eq!(
@@ -650,7 +659,7 @@ fn hello_requirements_are_enforced_on_both_handshake_sides() {
             HelloHandshake::acceptor(1, 0),
             HelloHandshake::dialer(1, 0, [2; 16]),
         ] {
-            let result = handshake.on_remote_hello(&envelope, &[supported]);
+            let result = handshake.on_remote_hello(&envelope, &[supported], &[]);
             if let Some(violation) = expected {
                 let error = HandshakeError::RequiredCapability(violation);
                 assert_eq!(result, Err(error));
@@ -673,6 +682,66 @@ fn hello_requirements_are_enforced_on_both_handshake_sides() {
         Violation::InvalidRequiredCapability { capability: 0 }.error_code(),
         wire::ErrorCode::InvalidFrame
     );
+}
+
+#[test]
+fn local_requirements_are_enforced_against_old_shaped_hello_on_both_sides() {
+    let required = wire::Capability::ClipboardSession as i32;
+    for offered in [
+        vec![],
+        vec![wire::Capability::TextClipboard as i32],
+        vec![required],
+    ] {
+        let remote = wire::Hello {
+            node_id: vec![1; 32],
+            capabilities: offered.clone(),
+            // 0.4.0 peers do not send required_capabilities.
+            ..Default::default()
+        };
+        let envelope = wire::Envelope {
+            major: 0,
+            minor: 4,
+            connection_id: vec![2; 16],
+            seq: 1,
+            payload: Some(wire::envelope::Payload::Hello(remote)),
+            ..Default::default()
+        };
+        for mut handshake in [
+            HelloHandshake::acceptor(0, 4),
+            HelloHandshake::dialer(0, 4, [2; 16]),
+        ] {
+            let result = handshake.on_remote_hello(&envelope, &[required], &[required]);
+            if offered.contains(&required) {
+                assert!(result.is_ok());
+                handshake
+                    .local_hello(wire::Hello {
+                        capabilities: vec![required],
+                        required_capabilities: vec![required],
+                        ..Default::default()
+                    })
+                    .unwrap();
+                assert!(handshake.is_established());
+            } else {
+                let error =
+                    HandshakeError::RequiredCapability(Violation::UnsupportedRequiredCapability {
+                        capability: required,
+                    });
+                assert_eq!(result, Err(error));
+                assert_eq!(
+                    error.peer_error_code(),
+                    Some(wire::ErrorCode::UnsupportedVersion)
+                );
+                assert!(!handshake.is_established());
+                if handshake.side() == protocol::hello::HandshakeSide::Acceptor {
+                    assert_eq!(handshake.connection_id(), None);
+                    assert_eq!(
+                        handshake.local_hello(Default::default()),
+                        Err(HandshakeError::NotYourTurn)
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

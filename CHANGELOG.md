@@ -8,27 +8,35 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Fixes**
 
-- Reject input-link Hello requirements that are unknown or not locally advertised, and malformed requirement lists; optional unknown capabilities remain compatible.
+- Enforce both peers' Hello requirements against stable implementation support and advertised offers, independent of transient agent readiness. Deliver compatibility refusals before graceful closure, select slow reconnects, and forbid bounded capability changes from withdrawing handshake requirements.
 - Bound Hello advertised capability lists to 64 entries and required capability lists to 32 before membership or duplicate scans.
 - Clipboard channels inherit their parent input link's negotiated protocol version for both outgoing frames and incoming validation, preserving clipboard compatibility across future mixed-minor peers.
+- Keep input links usable when optional auxiliary export is unavailable; bind revocable key access to the current manager generation, erase roots on membership refusal, and return zeroizing keys through a closed purpose registry with bounded contexts.
+- Disable TLS session resumption so every runtime and pairing connection re-runs certificate pin verification.
+- Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
 
 **New**
 
 - Optional features can derive per-input-link keys without a new wire capability. The TLS exporter root stays inside transport, is erased on parent closure/replacement, and is accessible only through a redacted, revocable derivation view after validated Hello; consumers gate on their own feature capabilities.
 - Add internal audio backend/Dry and pure packet/replay/status contracts, with dependency-direction checks; no audio devices, network sessions or user-visible audio behavior are enabled by this change.
+- Extend the internal audio backend contract with native clock/status snapshots, valid capture timestamps, reserved-hotkey collision checks and expiring, renewable PTT press leases; no native audio or hotkeys are activated.
 
 ### Русский
 
 **Исправления**
 
-- Требования Hello входного соединения отклоняются, если возможность неизвестна, не заявлена локально или список требований некорректен; неизвестные необязательные возможности не мешают соединению.
+- Требования Hello обеих сторон проверяются по реализованным возможностям и объявленным предложениям независимо от готовности агента. Отказ совместимости доставляется перед плавным закрытием, повторное подключение откладывается, а ограниченные обновления возможностей не могут отзывать обязательные возможности Hello.
 - Списки возможностей Hello ограничены 64 объявленными и 32 обязательными элементами до проверки включения и повторов.
 - Каналы буфера обмена используют согласованную версию родительского входного соединения при отправке и проверке кадров, сохраняя совместимость при будущих различиях младшей версии протокола.
+- Недоступность необязательного экспорта ключей не прерывает входное соединение; доступ к ключам привязан к текущему поколению менеджера, корни стираются при отказе членства, а вывод возвращает стираемые ключи через закрытый реестр назначений с ограниченным контекстом.
+- Возобновление TLS отключено: каждое рабочее и сопрягающее соединение заново проверяет закреплённый сертификат.
+- Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
 
 **Новое**
 
 - Необязательные функции могут выводить ключи входного соединения без новой сетевой возможности. Корневой секрет TLS остаётся внутри транспорта, стирается при закрытии или замене родителя и после проверки Hello доступен только через скрывающий секрет, отзываемый интерфейс вывода ключей; потребители проверяют возможности своих функций.
 - Добавлены внутренние контракты аудиобэкенда/Dry, чистых пакетов, защиты от повторов и статуса с проверкой направлений зависимостей; изменение не включает аудиоустройства, сетевые аудиосеансы или пользовательские функции звука.
+- Внутренний контракт аудиобэкенда дополнен снимками часов и состояния потока, достоверностью временных меток, проверкой конфликтов горячих клавиш и возобновляемыми ограниченными по времени нажатиями PTT; нативный звук и горячие клавиши не включаются.
 
 ## 0.4.0 — 2026-10-30
 

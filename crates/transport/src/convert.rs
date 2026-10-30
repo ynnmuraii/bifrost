@@ -28,12 +28,35 @@ use geometry::{NodeId, Position};
 use input_model::{HidKey, InputEvent, KeyState, MouseButton};
 use protocol::{limits, wire};
 
+/// Implementation support, independent of agent readiness or user preferences.
+/// Runtime offers may change, but never change whether a wire requirement is understood.
+pub(crate) const IMPLEMENTED_CAPABILITIES: &[i32] = &[
+    wire::Capability::Capture as i32,
+    wire::Capability::Inject as i32,
+    wire::Capability::AbsolutePointer as i32,
+    wire::Capability::PhysicalHidKeys as i32,
+    wire::Capability::TextClipboard as i32,
+    wire::Capability::NativeRepeat as i32,
+    wire::Capability::SoftwareRepeat as i32,
+    wire::Capability::ReceiverTakeover as i32,
+    wire::Capability::DisplaysChanged as i32,
+    wire::Capability::EmergencyHotkey as i32,
+    wire::Capability::RemoteUpdate as i32,
+    wire::Capability::ClipboardApplyAck as i32,
+    wire::Capability::UnpairNotice as i32,
+    wire::Capability::ClipboardSession as i32,
+    wire::Capability::ClipboardImage as i32,
+];
+
 /// A message that cannot be expressed on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConvertError {
     /// A relative pointer event has no wire representation.
     #[error("relative pointer events are not part of the wire contract (integrate them into an absolute position)")]
     RelativePointerNotOnWire,
+    /// A decoded value violates a bounded wire contract.
+    #[error("wire contract violation: {0:?}")]
+    Violation(protocol::validate::Violation),
     /// A `oneof` arm or enum value the contract does not define.
     #[error("unsupported wire value: {0}")]
     Unsupported(&'static str),
@@ -485,6 +508,8 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
             Ok(Inbound::UpdateResult(result.clone()))
         }
         Some(Payload::CapabilitiesChanged(changed)) => {
+            protocol::validate::capabilities(&changed.capabilities)
+                .map_err(ConvertError::Violation)?;
             Ok(Inbound::CapabilitiesChanged(changed.capabilities.clone()))
         }
         Some(Payload::Topology(topology)) => {

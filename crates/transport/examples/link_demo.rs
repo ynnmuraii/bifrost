@@ -101,6 +101,7 @@ async fn spawn_node(
                     connection_id: _,
                     remote: _,
                     version: _,
+                    ..
                 } => {
                     println!(
                         "  [{label}] link up with {peer} (peer hello: {})",
@@ -110,7 +111,7 @@ async fn spawn_node(
                 LinkEvent::Message { peer, message } => {
                     println!("  [{label}] <- {peer}: {message:?}")
                 }
-                LinkEvent::Down { peer, reason } => {
+                LinkEvent::Down { peer, reason, .. } => {
                     println!("  [{label}] link down with {peer}: {reason:?}")
                 }
                 LinkEvent::PeerRejected { peer } => {

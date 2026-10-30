@@ -421,6 +421,7 @@ fn arr32(bytes: &[u8]) -> Result<[u8; 32], ClipboardViolation> {
 /// One issued grant, waiting for its `ClipboardBind`.
 #[derive(Debug)]
 struct Grant {
+    peer: NodeId,
     parent: [u8; 16],
     version: (u32, u32),
     token: [u8; 32],
@@ -435,12 +436,13 @@ pub struct Grants {
 }
 
 impl Grants {
-    /// Mints a fresh `(channel_id, binding_token)` bound to the parent id and negotiated version.
+    /// Mints a fresh `(channel_id, binding_token)` bound to the peer, parent and negotiated version.
     ///
     /// The identifiers come from the OS entropy source; the API is infallible, so a failed
     /// entropy source is unrecoverable here and panics rather than issuing a guessable token.
     pub fn issue(
         &mut self,
+        peer: NodeId,
         parent_connection_id: [u8; 16],
         version: (u32, u32),
         now_ms: u64,
@@ -452,6 +454,7 @@ impl Grants {
         self.open.insert(
             channel_id,
             Grant {
+                peer,
                 parent: parent_connection_id,
                 version,
                 token: binding_token,
@@ -462,10 +465,11 @@ impl Grants {
     }
 
     /// Accepts a bind exactly once and returns its parent's negotiated version: the channel
-    /// must be known and unexpired, and the parent and token must match. A second bind with
-    /// the same token fails with [`ClipboardViolation::BadId`].
+    /// must be known and unexpired, and the authenticated peer, parent and token must match.
+    /// A second bind with the same token fails with [`ClipboardViolation::BadId`].
     pub fn accept(
         &mut self,
+        peer: NodeId,
         parent: &[u8; 16],
         channel_id: &[u8; 16],
         token: &[u8; 32],
@@ -477,7 +481,7 @@ impl Grants {
         if now_ms > grant.expires_ms {
             return Err(ClipboardViolation::BadId);
         }
-        if grant.parent != *parent || grant.token != *token {
+        if grant.peer != peer || grant.parent != *parent || grant.token != *token {
             return Err(ClipboardViolation::BadId);
         }
         let version = grant.version;

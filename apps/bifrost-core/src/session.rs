@@ -601,6 +601,8 @@ pub struct Session {
     next_layout_nonce: u64,
     /// Negotiated identities of currently established peer connections.
     layout_connections: HashMap<NodeId, [u8; 16]>,
+    /// Manager-local generations guarding link-loss cleanup against stale reports.
+    link_generations: HashMap<NodeId, [u8; 16]>,
     /// Set by `quit` on the control channel.
     stopping: bool,
     /// The agent reported `AgentLost` for the current crash and is being restarted.
@@ -828,6 +830,7 @@ impl Session {
             layout_requests: HashMap::new(),
             next_layout_nonce: 0,
             layout_connections: HashMap::new(),
+            link_generations: HashMap::new(),
             stopping: false,
             updates: update::Updates::default(),
             agent_restart_due: None,
@@ -2705,6 +2708,7 @@ impl Session {
             }
             LinkEvent::Up {
                 peer,
+                generation,
                 hello,
                 connection_id,
                 version,
@@ -2713,6 +2717,7 @@ impl Session {
                 if !self.trust.is_trusted(&peer) {
                     return;
                 }
+                self.link_generations.insert(peer, generation);
                 self.peer_rejected_since.remove(&peer);
                 self.updates
                     .peers
@@ -2996,7 +3001,19 @@ impl Session {
                         .or_insert_with(Instant::now);
                 }
             }
-            LinkEvent::Down { peer, reason } => {
+            LinkEvent::Down {
+                peer,
+                generation,
+                reason,
+            } => {
+                if self
+                    .link_generations
+                    .get(&peer)
+                    .is_some_and(|active| *active != generation)
+                {
+                    return;
+                }
+                self.link_generations.remove(&peer);
                 self.layout_connections.remove(&peer);
                 self.clipboard_links.remove(&peer);
                 self.clipboard_follow.peers.remove(&peer);
@@ -5813,6 +5830,180 @@ mod game_guard_tests {
         router.handle(2, fr::Input::Local(fr::LocalInput::Emergency));
         assert_eq!(router.focus(), fr::FocusState::Local);
         assert!(matches!(router.lease(), fr::LeaseSlot::Idle));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod link_generation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replaced_links_stale_down_preserves_clipboard_and_input() {
+        let root = std::env::temp_dir().join(format!(
+            "bifrost-session-generation-{}-{}",
+            std::process::id(),
+            lease_hex(&identity::random16().expect("test directory id"))
+        ));
+        let paths = config::Paths::new(&root, &root, &root, Some(root.clone()));
+        let identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(&root))
+                .expect("identity")
+                .0,
+        );
+        let local = identity.node_id();
+        let peer = NodeId::new([9; 32]);
+        let mut trust = identity::TrustStore::new();
+        trust.trust(identity::TrustedPeer::paired(peer, "peer", None, 0));
+        let config = config::Config::default();
+        let address = "127.0.0.1:0".parse().unwrap();
+        let local_hello = protocol::wire::Hello::default();
+        let pairing_gate = transport::PairingGate::closed();
+        let (manager, events) = LinkManager::new(transport::ManagerConfig {
+            identity: Arc::clone(&identity),
+            trust: trust.clone(),
+            local_hello: local_hello.clone(),
+            listen: address,
+            peers: Vec::new(),
+            max_members: 8,
+            queue_capacity: 64,
+            liveness: Default::default(),
+            backoff: Default::default(),
+            pairing: pairing_gate.clone(),
+        })
+        .expect("manager");
+        let router = fr::FocusRouter::new(
+            local,
+            fr::Timing::default(),
+            crate::ids::RandomIds::new().expect("entropy"),
+            fr::Capabilities {
+                capture: true,
+                ..Default::default()
+            },
+        )
+        .with_require_emergency_hotkey(false)
+        .with_persisted_ownership(1, Some((1, local)));
+        let agent = Supervisor::new(
+            root.join("unused-agent"),
+            root.clone(),
+            root.clone(),
+            root.clone(),
+            true,
+            0,
+            false,
+            false,
+            false,
+            String::new(),
+            crate::backend_kind(&config),
+            false,
+            config.timing.agent_core_silence_ms,
+            crate::portal::PortalGrants::load(paths.portal_restore_file()),
+            crate::agent::TakeoverSettings {
+                detection: crate::takeover_detection(&config),
+                threshold_px: config.input.takeover_threshold_px,
+            },
+            crate::repeat_mode(&config),
+        );
+        let ctl = ctl::Server::bind(&ctl::endpoint(&root).unwrap()).expect("control socket");
+        let gui = crate::gui::Server::bind(&ipc::transport::gui_endpoint(&paths).unwrap())
+            .expect("GUI socket");
+        let (_, clipboard_events) = mpsc::channel(1);
+        let mut session = Session::new(
+            router,
+            Arc::new(manager),
+            events,
+            agent,
+            ctl,
+            local,
+            local_hello,
+            false,
+            "test".into(),
+            trust,
+            config.topology.clone(),
+            1.0,
+            0.0,
+            OwnershipStore::new(paths.config_file(), &config),
+            crate::layout_store::LayoutStore::new(paths.config_file(), &config, local),
+            None,
+            clipboard_events,
+            crate::clipboard::Settings::from_config(&config.clipboard),
+            address,
+            gui,
+            identity,
+            paths,
+            address,
+            "test".into(),
+            String::new(),
+            crate::no_capabilities(),
+            false,
+            pairing_gate,
+        );
+        let hello = transport::PeerInfo::from_hello(&protocol::wire::Hello {
+            node_id: peer.as_bytes().to_vec(),
+            capabilities: vec![
+                protocol::wire::Capability::Inject as i32,
+                protocol::wire::Capability::AbsolutePointer as i32,
+            ],
+            ..Default::default()
+        })
+        .expect("peer hello");
+        let generation_a = [1; 16];
+        let generation_b = [2; 16];
+        let connection_a = [3; 16];
+        let connection_b = [4; 16];
+        for (generation, connection_id) in
+            [(generation_a, connection_a), (generation_b, connection_b)]
+        {
+            session
+                .on_link_event(LinkEvent::Up {
+                    peer,
+                    generation,
+                    hello: hello.clone(),
+                    connection_id,
+                    version: (1, 0),
+                    remote: address,
+                })
+                .await;
+        }
+        session.router.handle(
+            0,
+            fr::Input::Local(fr::LocalInput::SwitchRequest {
+                trigger: fr::SwitchTrigger::Hotkey,
+                target: peer,
+                entry_position: geometry::Position::new("target", 0.0, 0.0),
+                topology_revision: 0,
+            }),
+        );
+        assert_eq!(session.router.focus(), fr::FocusState::Preparing);
+        session
+            .on_link_event(LinkEvent::Down {
+                peer,
+                generation: generation_a,
+                reason: transport::LinkDownReason::LocalClosed,
+            })
+            .await;
+        assert_eq!(session.link_generations.get(&peer), Some(&generation_b));
+        assert_eq!(session.layout_connections.get(&peer), Some(&connection_b));
+        assert_eq!(session.clipboard_links.get(&peer).unwrap().0, connection_b);
+        assert!(session.clipboard_follow.peers.contains_key(&peer));
+        assert_eq!(session.router.focus(), fr::FocusState::Preparing);
+        session
+            .on_link_event(LinkEvent::Down {
+                peer,
+                generation: generation_b,
+                reason: transport::LinkDownReason::LocalClosed,
+            })
+            .await;
+        assert!(!session.link_generations.contains_key(&peer));
+        assert!(!session.layout_connections.contains_key(&peer));
+        assert!(!session.clipboard_links.contains_key(&peer));
+        assert!(!session.clipboard_follow.peers.contains_key(&peer));
+        assert!(matches!(
+            session.router.lease(),
+            fr::LeaseSlot::Source(lease)
+                if lease.state == fr::SourceState::Releasing && lease.channel_gone
+        ));
+        drop(session);
+        std::fs::remove_dir_all(root).expect("remove test state");
     }
 }
 

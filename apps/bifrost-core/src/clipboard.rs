@@ -1291,20 +1291,21 @@ impl Clipboard {
         Ok(offer)
     }
 
-    fn require_peer(&self, peer: NodeId, kind: cb::ContentKind) -> Result<(), String> {
+    fn require_peer(&self, peer: NodeId, kind: cb::ContentKind) -> Result<(u32, u32), String> {
         if !self.settings.enabled {
             return Err("clipboard is disabled".to_owned());
         }
-        if self.peers.get(&peer).is_none_or(|state| {
-            state.parent.is_none()
-                || match kind {
-                    cb::ContentKind::Text => !state.text_clipboard,
-                    cb::ContentKind::Png => !state.image_clipboard,
-                }
-        }) {
-            return Err("peer has no live clipboard link for this content kind".to_owned());
-        }
-        Ok(())
+        self.peers
+            .get(&peer)
+            .filter(|state| {
+                state.parent.is_some()
+                    && match kind {
+                        cb::ContentKind::Text => state.text_clipboard,
+                        cb::ContentKind::Png => state.image_clipboard,
+                    }
+            })
+            .and_then(|state| state.version)
+            .ok_or_else(|| "peer has no live clipboard link for this content kind".to_owned())
     }
 
     async fn offer_to(
@@ -1316,7 +1317,7 @@ impl Clipboard {
         immediate: bool,
     ) -> Result<Vec<Out>, String> {
         let kind = cb::ContentKind::from_mime(&offer.mime).map_err(|e| e.code().to_owned())?;
-        self.require_peer(peer, kind)?;
+        let version = self.require_peer(peer, kind)?;
         if kind == cb::ContentKind::Png
             && (!self.peers[&peer].image_clipboard
                 || !self.local_image_support
@@ -1374,10 +1375,7 @@ impl Clipboard {
             }
         } else {
             let parent = state.parent.expect("live peer checked above");
-            let (channel_id, token) = self
-                .runtime
-                .issue(parent, state.version.expect("live parent version"))
-                .await;
+            let (channel_id, token) = self.runtime.issue(peer, parent, version).await;
             tracing::info!(peer = %peer, "clipboard grant");
             out.push(Out::Grant {
                 peer,
@@ -2555,19 +2553,24 @@ impl Handle {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// Mints a channel id and a one-use token for `parent`.
+    /// Mints a channel id and a one-use token bound to `peer` and `parent`.
     ///
     /// The expiry is stamped from **this** clock, the one [`Grants::accept`] checks the bind
     /// against (audit F5): the endpoint's clock used to be passed in, and its `Instant` origin
     /// is a different one, so the 60 s window was really `60 s - <startup delta>` and the two
     /// numbers were not comparable at all.
-    async fn issue(&self, parent: [u8; 16], version: (u32, u32)) -> ([u8; 16], [u8; 32]) {
+    async fn issue(
+        &self,
+        peer: NodeId,
+        parent: [u8; 16],
+        version: (u32, u32),
+    ) -> ([u8; 16], [u8; 32]) {
         let now_ms = self.now_ms();
         self.inner
             .lock()
             .await
             .grants
-            .issue(parent, version, now_ms)
+            .issue(peer, parent, version, now_ms)
     }
 
     /// The expiry the store holds for `channel_id`, for the one-clock test (audit F5).
@@ -2580,6 +2583,7 @@ impl Handle {
     #[cfg(test)]
     async fn accepts(
         &self,
+        peer: NodeId,
         parent: &[u8; 16],
         channel: &[u8; 16],
         token: &[u8; 32],
@@ -2589,7 +2593,7 @@ impl Handle {
             .lock()
             .await
             .grants
-            .accept(parent, channel, token, now_ms)
+            .accept(peer, parent, channel, token, now_ms)
             .is_ok()
     }
 
@@ -2850,7 +2854,7 @@ impl Handle {
                 .lock()
                 .await
                 .grants
-                .accept(&parent, &channel, &token, self.now_ms())
+                .accept(peer, &parent, &channel, &token, self.now_ms())
                 .ok();
             let accepted =
                 version.is_some_and(|version| connection.validate_parent_version(version).is_ok());
@@ -4717,6 +4721,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_without_a_negotiated_version_cannot_start_a_delivery_or_grant() {
+        let (mut endpoint, root) = started_clipboard("missing-parent-version").await;
+        let peer: NodeId = [0x21; 32].into();
+        endpoint
+            .on_local_copy(b"current".to_vec(), Vec::new())
+            .await;
+        let (offer, hash) = endpoint.carried.clone().expect("local carry");
+        endpoint.set_peer_session(peer, [1; 16], None);
+        endpoint.peers.get_mut(&peer).unwrap().text_clipboard = true;
+        let source_version = endpoint.source.version();
+
+        for channel in [None, Some([2; 16])] {
+            endpoint.peers.get_mut(&peer).unwrap().channel = channel;
+            assert_eq!(
+                endpoint.require_peer(peer, cb::ContentKind::Text),
+                Err("peer has no live clipboard link for this content kind".to_owned())
+            );
+            assert!(endpoint.deliver_carried(peer, hash).await.is_err());
+            assert!(endpoint.send_text_to(peer, "history").await.is_err());
+            assert!(endpoint
+                .offer_to(peer, offer.clone(), endpoint.payload.clone(), hash, true)
+                .await
+                .is_err());
+            assert!(endpoint.deliveries.is_empty(), "no delivery may be emitted");
+            assert!(endpoint.waiting.is_empty());
+            assert!(endpoint.offered.is_empty());
+            assert_eq!(endpoint.runtime.inner.lock().await.grants.open(), 0);
+            assert_eq!(endpoint.source.version(), source_version);
+        }
+
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn secret_and_invalid_copies_clear_carry_and_queued_payloads() {
         let (mut endpoint, root) = started_clipboard("secret-carry").await;
         endpoint.settings.policy.skip_secret_marked = false;
@@ -5441,9 +5480,10 @@ mod tests {
     #[tokio::test]
     async fn a_grant_expires_on_the_clock_that_accepts_it() {
         let handle = test_handle().await;
+        let peer = [0x21; 32].into();
         let parent = [0x11u8; 16];
         let before = handle.now_ms();
-        let (channel, token) = handle.issue(parent, (1, 0)).await;
+        let (channel, token) = handle.issue(peer, parent, (1, 0)).await;
         let after = handle.now_ms();
         let expires = handle
             .grant_expiry_ms(&channel)
@@ -5456,13 +5496,104 @@ mod tests {
              got {expires}"
         );
         assert!(
-            handle.accepts(&parent, &channel, &token, expires - 1).await,
+            handle
+                .accepts(peer, &parent, &channel, &token, expires - 1)
+                .await,
             "one millisecond before the ttl the bind is accepted"
         );
         assert!(
-            !handle.accepts(&parent, &channel, &token, expires + 1).await,
+            !handle
+                .accepts(peer, &parent, &channel, &token, expires + 1)
+                .await,
             "one millisecond after it is refused"
         );
+    }
+
+    #[tokio::test]
+    async fn a_colluding_trusted_peer_cannot_use_or_consume_another_peers_grant() {
+        let (mut endpoint, root) = started_clipboard("peer-bound-grant").await;
+        let load = |name: &str| {
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(
+                root.join(name),
+            ))
+            .expect("identity")
+            .0
+        };
+        let rightful = load("rightful");
+        let colluding = load("colluding");
+        let server = endpoint.runtime.identity.node_id();
+        endpoint
+            .runtime
+            .trusted_peers
+            .write()
+            .unwrap()
+            .extend([rightful.node_id(), colluding.node_id()]);
+        let pins = Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::from([
+            server,
+        ])));
+        let parent = protocol::hello::Negotiated {
+            connection_id: [7; 16],
+            major: 1,
+            minor: 3,
+        };
+        let (channel, token) = endpoint
+            .runtime
+            .issue(rightful.node_id(), parent.connection_id, (1, 3))
+            .await;
+        let address = endpoint.runtime.listen_address;
+        let wrong = tokio::time::timeout(
+            Duration::from_secs(5),
+            dial_clipboard(
+                &colluding,
+                Arc::clone(&pins),
+                server,
+                address,
+                parent,
+                channel,
+                token,
+            ),
+        )
+        .await
+        .expect("colluding peer dial completes")
+        .expect("both peers are trusted");
+        let (mut reader, _writer) = wrong.into_split();
+        let refused = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await;
+        assert!(
+            matches!(refused, Ok(Err(_))),
+            "the colluding peer's bind must be refused"
+        );
+        {
+            let inner = endpoint.runtime.inner.lock().await;
+            assert_eq!(inner.grants.open(), 1, "the rightful grant remains usable");
+            assert!(
+                inner.conns.is_empty(),
+                "the wrong peer must not be registered"
+            );
+        }
+        let connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            dial_clipboard(&rightful, pins, server, address, parent, channel, token),
+        )
+        .await
+        .expect("rightful peer dial completes")
+        .expect("rightful peer reuses the unconsumed grant");
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            endpoint.test_events.as_mut().unwrap().recv(),
+        )
+        .await
+        .expect("rightful peer binds")
+        .expect("runtime stays live");
+        assert!(matches!(
+            event,
+            Inbound::Bound { peer, channel_id, .. }
+                if peer == rightful.node_id() && channel_id == channel
+        ));
+        assert_eq!(endpoint.runtime.inner.lock().await.grants.open(), 0);
+
+        connection.close().await;
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// R2: revocation must close the clipboard connection the peer already holds.
@@ -5517,7 +5648,7 @@ mod tests {
         .expect("the clipboard runtime starts");
 
         let parent = [7u8; 16];
-        let (channel, token) = handle.issue(parent, (1, 0)).await;
+        let (channel, token) = handle.issue(id_b, parent, (1, 0)).await;
         let address = handle.listen_address;
         let b_pins = Arc::new(RwLock::new(BTreeSet::from([id_a])));
         let dialer = tokio::spawn(async move {
@@ -5880,7 +6011,7 @@ mod tests {
 
         let mut dialers = Vec::new();
         for parent in [[7u8; 16], [8u8; 16]] {
-            let (channel, token) = handle.issue(parent, (1, 0)).await;
+            let (channel, token) = handle.issue(id_b, parent, (1, 0)).await;
             let identity_b = Arc::clone(&identity_b);
             let b_pins = Arc::clone(&b_pins);
             dialers.push(tokio::spawn(async move {

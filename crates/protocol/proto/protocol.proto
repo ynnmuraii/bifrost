@@ -141,12 +141,18 @@ message Hello {
   bytes node_id = 1;                       // exactly 32: SHA256(SPKI DER)
   string display_name = 2;                 // UTF-8 <= 128 bytes, non-authoritative
   reserved 3; reserved "role";             // role is per-lease in v0.3
-  repeated Capability capabilities = 4;    // max 64, including unknown optional values
+  // Max 64 wire entries, counting unknown values and duplicates. The <=22
+  // assigned/planned capabilities leave headroom; growing this bound requires
+  // a major/minor-gated wire contract change.
+  repeated Capability capabilities = 4;
   repeated Display displays = 5;           // max 16
   // Requirements must be distinct, non-UNSPECIFIED, and a subset of capabilities;
   // violations => ERROR_CODE_INVALID_FRAME. Unknown requirements or requirements
   // absent from the receiver's advertised implementation => ERROR_CODE_UNSUPPORTED_VERSION.
   // Unknown optional capabilities remain ignorable; runtime opt-in is independent.
+  // Each receiver also requires its own requirements to appear in the peer's offer,
+  // even if the peer sends no requirements (including the 0.4.0 Hello shape).
+  // Missing peer support => ERROR_CODE_UNSUPPORTED_VERSION.
   repeated Capability required_capabilities = 6; // max 32, checked before membership scans
   SessionKind session_kind = 7;
   uint64 displays_revision = 8;            // local counter of own display set
@@ -161,6 +167,7 @@ message Hello {
 }
 
 // Replaces only the sender's advertised capability set, not its identity or Hello.
+// The same 64-entry wire bound applies, counting unknown values and duplicates.
 message CapabilitiesChanged { repeated Capability capabilities = 1; }
 
 // Only a version is supplied: releases are resolved from the receiver's trusted source.
