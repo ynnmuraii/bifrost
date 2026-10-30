@@ -77,6 +77,24 @@ impl Sender {
             datagram,
         )?)
     }
+    pub(crate) fn skip_frame(&mut self) {
+        self.skip_frames(1);
+    }
+    pub(crate) fn skip_frames(&mut self, count: u64) {
+        self.timestamp = self
+            .timestamp
+            .wrapping_add(count.wrapping_mul(u64::from(self.profile.frame_samples())) as u32);
+    }
+    /// Control/probes share the same owned nonce counter as media packets.
+    pub(crate) fn control(
+        &mut self,
+        now_ms: u64,
+        kind: PacketKind,
+        payload: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        self.sealer.seal(now_ms, kind, 0, 0, payload, output)
+    }
 }
 
 /// At most one 20 ms input frame; septic interpolation adds only a few samples of delay.
@@ -188,6 +206,9 @@ impl Receiver {
     }
     pub fn target_delay_samples(&self) -> u32 {
         self.jitter.target_samples()
+    }
+    pub fn arrival_variation_samples(&self) -> f64 {
+        self.jitter.arrival_variation_samples()
     }
     /// Authenticates all packet kinds; only Opus affects media health/jitter state.
     /// Returns authenticated nonmedia headers for a caller's bounded path-validation worker.

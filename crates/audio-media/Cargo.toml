@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 audio-model = { path = "../audio-model" }
+audio-backend = { path = "../audio-backend" }
+rtrb = "0.3"
 ring = "0.17"
 zeroize = "1"
 opus = "0.4"

@@ -494,10 +494,12 @@ checksum = "1254ebf6529f3763c491acfb5ab6e960809e3c75a38584cc664f8c5667fb7107"
 name = "audio-media"
 version = "0.4.0"
 dependencies = [
+ "audio-backend",
  "audio-model",
  "audioadapter-buffers",
  "opus",
  "ring",
+ "rtrb",
  "rubato",
  "zeroize",
 ]
@@ -3700,6 +3702,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342e1478a6e1c839e7405033eabfdc954d4d5dabd39f34e83420a43a95acfb04"
 
 [[package]]
 name = "rubato"

@@ -21,7 +21,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
-- Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling. Deterministic impairment tests use in-memory PCM only; sockets/devices remain outside this implementation.
+- Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling.
+- Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback-only tests cover loss/reorder/injection and device invalidation; core/IPC integration remains disabled.
 
 ### Русский
 
@@ -40,7 +41,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования. Аудиоустройства и сетевые сеансы не активируются.
 - Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
-- Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле. Детерминированные тесты используют только PCM в памяти; сокеты и устройства пока не включаются.
+- Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле.
+- Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства; интеграция core/IPC пока не включена.
 
 ## 0.4.0 — 2026-10-30
 

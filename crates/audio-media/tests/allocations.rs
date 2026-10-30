@@ -72,3 +72,85 @@ fn prepared_packet_and_playout_paths_do_not_allocate() {
         assert_eq!(ALLOCATIONS.with(Cell::get), 0);
     }
 }
+
+#[test]
+fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow() {
+    use audio_backend::{
+        dry::{DryBackend, ScriptEvent},
+        AudioFormat, Capabilities, CaptureSpec, Device, DeviceId, DeviceSelection, Direction,
+        RenderRequest,
+    };
+    use audio_media::runtime::{start_listener, start_source, SessionConfig, SessionMaterial};
+    use std::net::UdpSocket;
+    let mut backend = DryBackend::new(Capabilities {
+        system_capture: true,
+        exclude_own_process_tree: true,
+        ..Capabilities::default()
+    });
+    let id = DeviceId::new("DRY_RENDER").unwrap();
+    backend
+        .apply(ScriptEvent::UpsertDevice(Device {
+            id: id.clone(),
+            label: "Dry render".into(),
+            direction: Direction::Render,
+            format: AudioFormat {
+                sample_rate: 44_100,
+                channels: 2,
+            },
+        }))
+        .unwrap();
+    let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let aa = a.local_addr().unwrap();
+    let ba = b.local_addr().unwrap();
+    let keys = || SessionMaterial {
+        forward: material(),
+        reverse: DirectionMaterial::new(Zeroizing::new([4; 32]), Zeroizing::new([5; 4])),
+    };
+    let mut source = start_source(
+        &mut backend,
+        CaptureSpec::SystemExcludingOwnProcessTree {
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        },
+        SessionConfig {
+            socket: a,
+            peer: ba,
+            session_id: [3; 16],
+            profile: Profile::Ethernet,
+        },
+        keys(),
+    )
+    .unwrap();
+    let mut listener = start_listener(
+        &mut backend,
+        RenderRequest {
+            device: DeviceSelection::Explicit(id),
+            requested: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        },
+        SessionConfig {
+            socket: b,
+            peer: aa,
+            session_id: [3; 16],
+            profile: Profile::Ethernet,
+        },
+        keys(),
+    )
+    .unwrap();
+    // Setup/worker allocations occur outside this thread's counted interval.
+    ALLOCATIONS.with(|n| n.set(0));
+    ENABLED.with(|flag| flag.set(true));
+    for _ in 0..100 {
+        source.stream_mut().unwrap().pump(480).unwrap();
+        listener.stream_mut().unwrap().pump(441).unwrap();
+    }
+    ENABLED.with(|flag| flag.set(false));
+    assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+    source.stop().unwrap();
+    listener.stop().unwrap();
+}
