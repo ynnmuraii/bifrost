@@ -15,6 +15,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **New**
 
 - Optional features can derive per-input-link keys without a new wire capability. The TLS exporter root stays inside transport, is erased on parent closure/replacement, and is accessible only through a redacted, revocable derivation view after validated Hello; consumers gate on their own feature capabilities.
+- Add internal audio backend/Dry and pure packet/replay/status contracts, with dependency-direction checks; no audio devices, network sessions or user-visible audio behavior are enabled by this change.
 
 ### Русский
 
@@ -27,6 +28,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Новое**
 
 - Необязательные функции могут выводить ключи входного соединения без новой сетевой возможности. Корневой секрет TLS остаётся внутри транспорта, стирается при закрытии или замене родителя и после проверки Hello доступен только через скрывающий секрет, отзываемый интерфейс вывода ключей; потребители проверяют возможности своих функций.
+- Добавлены внутренние контракты аудиобэкенда/Dry, чистых пакетов, защиты от повторов и статуса с проверкой направлений зависимостей; изменение не включает аудиоустройства, сетевые аудиосеансы или пользовательские функции звука.
 
 ## 0.4.0 — 2026-10-30
 
