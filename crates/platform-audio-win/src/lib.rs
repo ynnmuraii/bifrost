@@ -1,6 +1,34 @@
-//! Optional Windows audio adapter. Merely linking this crate opens no devices.
-//! Native handles stay on their owning threads; PCM crosses preallocated SPSC rings.
-//! Linux intentionally builds an empty library. See each module for lifecycle contracts.
+//! Optional Windows adapter implementing [`audio_backend::Backend`].
+//! Construction/linking opens no devices, sessions or hotkeys; Linux builds an empty library.
+//!
+//! # Developer contract
+//!
+//! Capture/render callbacks execute on owning MTA workers with best-effort MMCSS "Pro Audio".
+//! They must not allocate, block, lock, log or initialize lazy resources. Hand PCM off through
+//! caller-preallocated SPSC rings. Stream snapshots preserve clock validity and device
+//! invalidation; rebuild explicitly without replacing a selected endpoint. Debounce device
+//! notifications for 100 ms before re-enumeration.
+//!
+//! The shared [`audio_backend::MuteGuard`] restores only owned changes and fails closed on
+//! external changes or lost notifications. Callers using lower-level endpoint mute controls
+//! must implement that ownership policy themselves; never clear a pre-existing mute.
+//!
+//! Media commands are bounded/asynchronous and checked against session token/revision.
+//! Timeout or cancellation does not prove an already-dispatched OS command had no effect;
+//! never retry automatically. Metadata is UTF-8 bounded and Debug-redacted; never log it.
+//! Native session methods retain current-session identity and exact playback status; the
+//! shared playback vocabulary maps unknown native states conservatively to Stopped.
+//!
+//! Supply all reserved KVM chords when configuring PTT. Consumers must check the absolute
+//! 250 ms press lease on every use; renewal events cannot reopen an expired gate.
+//!
+//! # Hardware diagnostic
+//!
+//! Tests only read native devices/media sessions. The separate command
+//! `cargo run -p platform-audio-win --example hw_probe` **plays an audible three-second
+//! 1 kHz tone** and checks EXCLUDE capture against a positive INCLUDE control. Run only
+//! with permission on the target desktop; it does not change endpoint selection, volume
+//! or mute, and does not persist PCM.
 #![cfg(windows)]
 
 mod backend;

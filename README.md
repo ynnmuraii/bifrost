@@ -40,39 +40,6 @@ Input still shares one reliable TLS/TCP stream: packet loss can cause retransmis
 
 **Game mode** (Settings) blocks only edge switching: `auto` detects fullscreen apps on Windows/X11 and cursor confinement on Windows; `always` requires an explicit switch, and `off` disables the guard. Per-app allow/block lists match executable basenames or X11 WM_CLASS, case-insensitively; allow takes precedence in auto. **Ctrl+Alt+Shift+G** toggles auto/always (configurable under hotkeys), and the tray offers the same toggle. Explicit switches and emergency release always work, including while input is already remote. Wayland cannot expose foreground apps: use manual mode there. `[game_guard]` defaults to `mode = "auto"`, `block_apps = []`, `allow_apps = []`.
 
-### Optional Windows audio adapter (developer interface)
-
-`platform-audio-win` provides native device discovery/notifications, process-tree-excluding
-48 kHz float stereo capture, shared event-driven render, capture-endpoint mute observation,
-SMTC session controls, and leased push-to-talk hotkeys. It is not connected to the shipped
-KVM roles or enabled implicitly; linking the crate does not open devices. On non-Windows
-targets it is an empty library. The workspace wildcard already includes the adapter.
-
-`WindowsBackend::new()` implements the shared `audio-backend::Backend` interface without
-opening devices, media sessions or hotkeys. Capture/render callbacks run on their owning
-MTA workers with best-effort MMCSS "Pro Audio"; callers must obey the callback's no-allocation,
-no-lock, no-log contract and can hand off PCM through preallocated `rtrb` rings. Native
-ring helpers are also available for hardware diagnostics. Stream snapshots preserve clock
-frequency, correlated QPC time/validity, device invalidation and xrun counters. Invalidation
-requires an explicit rebuild and never replaces an explicitly selected endpoint.
-
-Debounce device changes for 100 ms, then re-enumerate off the audio thread. The shared
-`MuteGuard` restores only owned changes and fails closed on external changes or lost
-notifications; users of the lower-level endpoint mute interface must implement that ownership
-policy themselves. Enumeration reads engine-format properties without activating capture.
-Media commands are bounded, asynchronous and checked against session token/revision;
-timeout or cancellation does not prove that an already-dispatched OS command had no effect.
-The shared playback vocabulary maps unknown native states conservatively to Stopped;
-the native session interface retains the exact status and current-session identity.
-Metadata is UTF-8 bounded, Debug-redacted and never logged. PTT registration receives all
-reserved KVM chords, and consumers must enforce absolute 250 ms press leases on every use;
-renewal events cannot reopen an expired gate.
-
-`cargo test -p platform-audio-win` only reads native devices/media sessions. The separate
-`cargo run -p platform-audio-win --example hw_probe` diagnostic **plays a three-second
-1 kHz tone** and checks EXCLUDE capture against a positive INCLUDE control; run it only
-with permission on the target desktop. It never changes device selection, volume or mute.
-
 ## Download & install
 
 Get **0.4.0** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
