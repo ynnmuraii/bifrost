@@ -41,6 +41,11 @@ pub enum ScriptEvent {
     },
     PttPress,
     PttRelease,
+    PttRenew,
+    /// Absolute logical monotonic time; also expires held PTT without hidden wall clocks.
+    AdvanceTime {
+        now_ns: u64,
+    },
     CancelPtt(PttCancellation),
     /// None recovers availability. Only ServerUnavailable and PermissionDenied are accepted.
     Availability(Option<BackendError>),
@@ -67,6 +72,8 @@ struct State {
     last_media_command: Option<MediaCommandRequest>,
     hotkey: Option<PttHotkey>,
     pressed: bool,
+    now_ns: u64,
+    ptt_expires_at_ns: Option<u64>,
     unavailable: Option<BackendError>,
 }
 
@@ -80,11 +87,13 @@ impl State {
             self.events.pop_front();
             self.overflowed = true;
             self.pressed = false;
+            self.ptt_expires_at_ns = None;
         }
         self.events.push_back(event);
     }
 
     fn release_ptt(&mut self) {
+        self.ptt_expires_at_ns = None;
         if self.pressed {
             self.pressed = false;
             self.emit(Event::PttReleased);
@@ -190,6 +199,8 @@ impl DryBackend {
                 last_media_command: None,
                 hotkey: None,
                 pressed: false,
+                now_ns: 0,
+                ptt_expires_at_ns: None,
                 unavailable: None,
             })),
             capabilities,
@@ -342,8 +353,41 @@ impl DryBackend {
                 }
                 state.available()?;
                 if !state.pressed {
+                    let expires_at_ns = state
+                        .now_ns
+                        .checked_add(PTT_LEASE_NS)
+                        .ok_or(BackendError::InvalidArgument)?;
+                    let observed_at_ns = state.now_ns;
                     state.pressed = true;
-                    state.emit(Event::PttPressed);
+                    state.ptt_expires_at_ns = Some(expires_at_ns);
+                    state.emit(Event::PttPressed {
+                        observed_at_ns,
+                        expires_at_ns,
+                    });
+                }
+            }
+            ScriptEvent::PttRenew => {
+                state.available()?;
+                if !state.pressed {
+                    return Err(BackendError::Stopped);
+                }
+                let expires_at_ns = state
+                    .now_ns
+                    .checked_add(PTT_LEASE_NS)
+                    .ok_or(BackendError::InvalidArgument)?;
+                state.ptt_expires_at_ns = Some(expires_at_ns);
+                state.emit(Event::PttRenewed { expires_at_ns });
+            }
+            ScriptEvent::AdvanceTime { now_ns } => {
+                if now_ns < state.now_ns {
+                    return Err(BackendError::InvalidArgument);
+                }
+                state.now_ns = now_ns;
+                if state
+                    .ptt_expires_at_ns
+                    .is_some_and(|expires| expires <= now_ns)
+                {
+                    state.release_ptt();
                 }
             }
             ScriptEvent::PttRelease => {
@@ -638,12 +682,19 @@ impl Backend for DryBackend {
         cancel_requests(&mut state, None, BackendError::Cancelled);
     }
 
-    fn configure_ptt(&mut self, hotkey: Option<PttHotkey>) -> Result<(), BackendError> {
+    fn configure_ptt(
+        &mut self,
+        hotkey: Option<PttHotkey>,
+        reserved: &[PttHotkey],
+    ) -> Result<(), BackendError> {
         if !self.capabilities.global_ptt {
             return Err(BackendError::Unsupported);
         }
         if let Some(key) = hotkey {
             key.validate()?;
+            if reserved.contains(&key) {
+                return Err(BackendError::Conflict);
+            }
         }
         let mut state = lock(&self.state);
         state.available()?;
@@ -656,9 +707,12 @@ impl Backend for DryBackend {
         let mut state = lock(&self.state);
         if state.overflowed {
             state.overflowed = false;
-            state
-                .events
-                .retain(|event| !matches!(event, Event::PttPressed | Event::PttReleased));
+            state.events.retain(|event| {
+                !matches!(
+                    event,
+                    Event::PttPressed { .. } | Event::PttRenewed { .. } | Event::PttReleased
+                )
+            });
             return Some(Event::ResyncRequired);
         }
         state
@@ -682,6 +736,7 @@ pub struct DryStream {
     callback: Option<Callback>,
     buffer: Vec<f32>,
     frames: u64,
+    status: StreamStatus,
     rendered: VecDeque<f32>,
 }
 
@@ -704,6 +759,7 @@ impl DryStream {
             callback: Some(callback),
             buffer: vec![0.0; samples],
             frames: 0,
+            status: StreamStatus::Running,
             rendered: VecDeque::with_capacity(RENDER_SAMPLE_CAPACITY),
         }
     }
@@ -732,6 +788,7 @@ impl DryStream {
         let muted = match status {
             Ok(muted) => muted,
             Err(error) => {
+                self.status = stream_status(error);
                 self.stop()?;
                 return Err(error);
             }
@@ -755,6 +812,8 @@ impl DryStream {
                     frames,
                     format: self.format,
                     timestamp_ns: timestamp.min(u128::from(u64::MAX)) as u64,
+                    timestamp_valid: true,
+                    device_position: Some(self.frames),
                     discontinuity: false,
                 });
             }
@@ -796,8 +855,35 @@ impl Stream for DryStream {
         self.feedback
     }
 
+    fn snapshot(&self) -> StreamSnapshot {
+        let status = if self.status == StreamStatus::Running {
+            let state = lock(&self.state);
+            match &self.endpoint {
+                Some((id, generation)) => state.endpoint(id, *generation).map(|_| ()),
+                None => state.available(),
+            }
+            .map_or_else(stream_status, |()| StreamStatus::Running)
+        } else {
+            self.status
+        };
+        StreamSnapshot {
+            status,
+            device_position: Some(self.frames),
+            clock_frequency: Some(u64::from(self.format.sample_rate)),
+            host_time_100ns: u64::try_from(
+                u128::from(self.frames) * 10_000_000 / u128::from(self.format.sample_rate),
+            )
+            .ok(),
+            underrun_frames: 0,
+            dropped_capture_frames: 0,
+        }
+    }
+
     fn stop(&mut self) -> Result<(), BackendError> {
         self.callback = None;
+        if self.status == StreamStatus::Running {
+            self.status = StreamStatus::Stopped;
+        }
         Ok(())
     }
 }
@@ -805,6 +891,14 @@ impl Stream for DryStream {
 impl Drop for DryStream {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+fn stream_status(error: BackendError) -> StreamStatus {
+    if error == BackendError::DeviceGone {
+        StreamStatus::DeviceInvalidated
+    } else {
+        StreamStatus::Failed(error)
     }
 }
 
