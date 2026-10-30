@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod jitter;
 pub mod packet;
 pub mod replay;
 pub mod status;

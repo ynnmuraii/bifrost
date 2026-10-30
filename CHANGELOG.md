@@ -17,6 +17,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Optional features can derive per-input-link keys without a new wire capability. The TLS exporter root stays inside transport, is erased on parent closure/replacement, and is accessible only through a redacted, revocable derivation view after validated Hello; consumers gate on their own feature capabilities.
 - Add internal audio backend/Dry and pure packet/replay/status contracts, with dependency-direction checks; no audio devices, network sessions or user-visible audio behavior are enabled by this change.
 
+**Audio media internals**
+
+- Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
+
 ### Русский
 
 **Исправления**
@@ -29,6 +33,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Необязательные функции могут выводить ключи входного соединения без новой сетевой возможности. Корневой секрет TLS остаётся внутри транспорта, стирается при закрытии или замене родителя и после проверки Hello доступен только через скрывающий секрет, отзываемый интерфейс вывода ключей; потребители проверяют возможности своих функций.
 - Добавлены внутренние контракты аудиобэкенда/Dry, чистых пакетов, защиты от повторов и статуса с проверкой направлений зависимостей; изменение не включает аудиоустройства, сетевые аудиосеансы или пользовательские функции звука.
+
+**Внутренний аудиотракт**
+
+- Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования. Аудиоустройства и сетевые сеансы не активируются.
 
 ## 0.4.0 — 2026-10-30
 
