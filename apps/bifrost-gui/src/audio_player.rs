@@ -27,6 +27,8 @@ pub struct AudioPlayerCard {
     pub source_name: String,
     pub title: Option<String>,
     pub subtitle: Option<String>,
+    /// A media session can exist even when the application supplies no title.
+    pub has_media_session: bool,
     pub app: AppKind,
     pub position_ms: Option<u64>,
     pub duration_ms: Option<u64>,

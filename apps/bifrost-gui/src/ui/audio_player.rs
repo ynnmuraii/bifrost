@@ -14,7 +14,8 @@ use crate::gui_settings::Theme;
 pub const WIDTH: f32 = 240.0;
 
 fn has_progress(card: &AudioPlayerCard) -> bool {
-    card.title.as_ref().is_some_and(|s| !s.trim().is_empty())
+    card.has_media_session
+        && card.title.as_ref().is_some_and(|s| !s.trim().is_empty())
         && card.position_ms.is_some()
         && card.duration_ms.is_some_and(|ms| ms > 0)
 }
@@ -23,11 +24,15 @@ pub fn height(cards: &[AudioPlayerCard]) -> f32 {
     if cards.is_empty() {
         return 92.0;
     }
-    16.0 + cards
-        .iter()
-        .map(|c| if has_progress(c) { 150.0 } else { 126.0 })
-        .sum::<f32>()
-        + 8.0 * cards.len().saturating_sub(1) as f32
+    16.0 + cards.iter().map(card_height).sum::<f32>() + 8.0 * cards.len().saturating_sub(1) as f32
+}
+
+fn card_height(card: &AudioPlayerCard) -> f32 {
+    if has_progress(card) {
+        128.0
+    } else {
+        104.0
+    }
 }
 
 /// Draw at any width >= 225 logical pixels; the wide single-card reference uses the same layout.
@@ -59,10 +64,7 @@ pub fn draw(ui: &mut egui::Ui, cards: &[AudioPlayerCard], theme: Theme, lang: La
     }
     for card in cards {
         ui.push_id(&card.stream_id, |ui| {
-            let size = Vec2::new(
-                ui.available_width(),
-                if has_progress(card) { 150.0 } else { 126.0 },
-            );
+            let size = Vec2::new(ui.available_width(), card_height(card));
             let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 let mut card_palette = pal;
@@ -70,7 +72,7 @@ pub fn draw(ui: &mut egui::Ui, cards: &[AudioPlayerCard], theme: Theme, lang: La
                     // Dim emphasis, not the surface: transparent white becomes grey over a dark desktop.
                     card_palette.ink = pal.ink2;
                     card_palette.accent_ink = pal.ink2;
-                    card_palette.accent = pal.ink2;
+                    card_palette.card = pal.bg;
                 }
                 draw_card(ui, rect, card, &card_palette, lang, &mut actions);
             });
@@ -217,10 +219,12 @@ fn draw_card(
         let end = Pos2::new(right - 43.0, y);
         ui.painter()
             .line_segment([start, end], Stroke::new(2.0, pal.line));
-        ui.painter().line_segment(
-            [start, start.lerp(end, elapsed as f32 / duration as f32)],
-            Stroke::new(2.0, pal.accent),
-        );
+        let played_end = start.lerp(end, elapsed as f32 / duration as f32);
+        ui.painter()
+            .line_segment([start, played_end], Stroke::new(2.0, pal.accent));
+        if elapsed > 0 {
+            ui.painter().circle_filled(played_end, 1.5, pal.accent);
+        }
     }
     let y = rect.bottom() - 41.0;
     let step = (right - left - 28.0) / 4.0;
@@ -259,14 +263,29 @@ fn draw_card(
             Action::Next as fn(String) -> Action,
         ),
     ];
-    for (i, (icon, key, enabled, action)) in controls.into_iter().enumerate() {
-        let r = Rect::from_min_size(
-            Pos2::new(left + step * (i + 1) as f32, y),
-            Vec2::splat(28.0),
-        );
-        if button(ui, r, icon, text(lang, key), enabled, pal).clicked() {
-            out.push(action(c.stream_id.clone()));
+    if c.has_media_session {
+        for (i, (icon, key, enabled, action)) in controls.into_iter().enumerate() {
+            let r = Rect::from_min_size(
+                Pos2::new(left + step * (i + 1) as f32, y),
+                Vec2::splat(28.0),
+            );
+            if button(ui, r, icon, text(lang, key), enabled, pal).clicked() {
+                out.push(action(c.stream_id.clone()));
+            }
         }
+    } else {
+        // No transport controls or vacant transport slots for a system-only stream.
+        let level = format!("{}%", c.gain_percent.min(100));
+        label(
+            ui,
+            Rect::from_min_size(
+                Pos2::new(rect.center().x - 16.0, y + 6.0),
+                Vec2::new(40.0, 18.0),
+            ),
+            &level,
+            11.0,
+            pal.ink2,
+        );
     }
     let r = Rect::from_min_size(Pos2::new(right - 28.0, y), Vec2::splat(28.0));
     let response = button(

@@ -14,6 +14,7 @@ fn card(id: &str) -> AudioPlayerCard {
         source_name: "WORKSTATION".into(),
         title: Some("A quiet evening — live session".into()),
         subtitle: Some("Studio sessions".into()),
+        has_media_session: true,
         app: AppKind::YouTube,
         position_ms: Some(5_000),
         duration_ms: Some(869_000),
@@ -50,6 +51,7 @@ fn fixtures(scene: &str) -> Vec<AudioPlayerCard> {
         "system" => {
             first.title = None;
             first.subtitle = None;
+            first.has_media_session = false;
             first.app = AppKind::System;
             vec![first]
         }
@@ -137,10 +139,14 @@ fn cards_render_in_both_languages_and_themes_without_a_display() {
                     .nodes
                     .iter()
                     .any(|(_, n)| n.label() == Some(text(lang, Key::AudioStop))));
-                assert!(tree
-                    .nodes
-                    .iter()
-                    .any(|(_, n)| n.label() == Some(text(lang, Key::AudioPause))));
+                for key in [Key::AudioPrevious, Key::AudioPause, Key::AudioNext] {
+                    assert_eq!(
+                        tree.nodes
+                            .iter()
+                            .any(|(_, n)| n.label() == Some(text(lang, key))),
+                        scene != "system",
+                    );
+                }
             }
         }
     }
@@ -152,7 +158,7 @@ fn disabled_media_controls_never_emit_commands_but_local_mute_does() {
     ui::install_fonts(&ctx);
     let cards = fixtures("disabled");
     draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
-    // Default run_ui margin = 8; card row is 109 points below the card top.
+    // Default run_ui margin = 8; compact card controls start 87 points below the card top.
     for (x, expected) in [
         (68.5, None),
         (115.0, None),
@@ -165,7 +171,7 @@ fn disabled_media_controls_never_emit_commands_but_local_mute_does() {
             }),
         ),
     ] {
-        let at = egui::pos2(x, 131.0);
+        let at = egui::pos2(x, 109.0);
         let events = vec![
             egui::Event::PointerMoved(at),
             egui::Event::PointerButton {
@@ -198,6 +204,31 @@ fn authoritative_snapshots_open_only_on_first_stream_transition() {
     player.replace_cards(Vec::new());
     player.replace_cards(vec![card("three")]);
     assert!(player.open);
+}
+
+#[test]
+fn zero_or_unknown_duration_hides_progress_without_hiding_session_controls() {
+    for duration in [Some(0), None] {
+        let mut card = card("live");
+        card.duration_ms = duration;
+        let cards = [card];
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+        let (output, _) = draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+        assert!(!texts(&output.shapes)
+            .iter()
+            .any(|value| value == "0:05" || value == "0:00"));
+        assert_eq!(audio_player::height(&cards), 120.0);
+        assert!(output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some(text(Lang::En, Key::AudioPause))));
+    }
 }
 
 #[test]
