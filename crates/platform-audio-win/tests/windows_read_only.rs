@@ -58,3 +58,26 @@ fn smtc_sessions_and_subscriptions_are_read_only() {
     }
     manager.shutdown();
 }
+
+#[test]
+fn shared_backend_reads_devices_defaults_mute_and_media() {
+    use audio_backend::{Backend, DeviceSelection, Direction};
+    let backend = platform_audio_win::WindowsBackend::new().unwrap();
+    let devices = backend.devices().unwrap();
+    let _defaults = backend.defaults().unwrap();
+    if let Some(capture) = devices
+        .iter()
+        .find(|device| device.direction == Direction::Capture)
+    {
+        let selection = DeviceSelection::Explicit(capture.id.clone());
+        let first = backend.capture_mute(&selection).unwrap();
+        let second = backend.capture_mute(&selection).unwrap();
+        assert_eq!(first.endpoint, second.endpoint);
+        assert_eq!(first.generation, second.generation);
+    }
+    for session in backend.media_sessions().unwrap() {
+        assert!(session.title().len() <= 256);
+        assert!(session.subtitle().len() <= 256);
+        assert!(session.app().len() <= 128);
+    }
+}

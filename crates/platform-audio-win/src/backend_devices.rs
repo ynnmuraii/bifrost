@@ -489,13 +489,12 @@ impl MuteGuard for WindowsMuteGuard {
             && mute.external_revision() == self.revision
             && self.revision != u64::MAX;
         self.ownership.active = true;
-        if self.ownership.restoration(intact, current)? {
-            if !mute
+        if self.ownership.restoration(intact, current)?
+            && !mute
                 .set_mute_if_revision(self.ownership.original, self.revision)
                 .map_err(map_error)?
-            {
-                return Err(BackendError::OwnershipLost);
-            }
+        {
+            return Err(BackendError::OwnershipLost);
         }
         Ok(())
     }

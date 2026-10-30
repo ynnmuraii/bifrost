@@ -81,12 +81,13 @@ pub enum HotkeyEvent {
     PressLease {
         observed_at: Instant,
         expires_at: Instant,
+        initial: bool,
     },
     Released,
 }
 impl HotkeyEvent {
     pub fn is_live(self, now: Instant) -> bool {
-        matches!(self, Self::PressLease { observed_at, expires_at }
+        matches!(self, Self::PressLease { observed_at, expires_at, .. }
             if now >= observed_at && now < expires_at && expires_at <= observed_at + PRESS_LEASE)
     }
 }
@@ -223,6 +224,7 @@ struct PressState {
     blocked: bool,
     next_renewal: Option<Instant>,
     last_observation: Option<Instant>,
+    announced: bool,
 }
 impl PressState {
     fn activate(&mut self, now: Instant) {
@@ -258,6 +260,7 @@ impl PressState {
                 .try_send(HotkeyEvent::PressLease {
                     observed_at: now,
                     expires_at: now + PRESS_LEASE,
+                    initial: !self.announced,
                 })
                 .is_err()
             {
@@ -266,6 +269,7 @@ impl PressState {
                 self.blocked = true;
                 let _ = tx.try_send(HotkeyEvent::Released);
             } else {
+                self.announced = true;
                 self.next_renewal = Some(now + RENEW);
             }
         }

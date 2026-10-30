@@ -66,6 +66,7 @@ pub struct StreamSnapshot {
     pub device_position: u64,
     pub clock_frequency: u64,
     pub qpc_100ns: u64,
+    pub clock_valid: bool,
 }
 #[derive(Default)]
 struct State {
@@ -78,6 +79,7 @@ struct State {
     position: AtomicU64,
     frequency: AtomicU64,
     qpc: AtomicU64,
+    clock_valid: AtomicBool,
     sequence: AtomicU64,
 }
 /// Drop/stop joins the native worker; call off latency-sensitive threads.
@@ -87,7 +89,7 @@ pub struct StreamHandle {
 }
 impl StreamHandle {
     pub fn snapshot(&self) -> StreamSnapshot {
-        let (position, qpc, frequency) = loop {
+        let (position, qpc, frequency, clock_valid) = loop {
             let before = self.state.sequence.load(Ordering::SeqCst);
             if before & 1 != 0 {
                 std::hint::spin_loop();
@@ -97,6 +99,7 @@ impl StreamHandle {
                 self.state.position.load(Ordering::SeqCst),
                 self.state.qpc.load(Ordering::SeqCst),
                 self.state.frequency.load(Ordering::SeqCst),
+                self.state.clock_valid.load(Ordering::SeqCst),
             );
             if before == self.state.sequence.load(Ordering::SeqCst) {
                 break values;
@@ -115,6 +118,7 @@ impl StreamHandle {
             device_position: position,
             clock_frequency: frequency,
             qpc_100ns: qpc,
+            clock_valid,
         }
     }
     pub fn stop(&mut self) {
@@ -278,6 +282,9 @@ fn start_process_capture(
                 return;
             }
         };
+        state
+            .frequency
+            .store(u64::from(SAMPLE_RATE), Ordering::SeqCst);
         let _priority = ProAudio::enter();
         if let Err(e) = unsafe { raw.Start() } {
             let _ = ready.send(Err(e.into()));
@@ -410,6 +417,13 @@ fn capture_loop(
                                 timestamp_ns: (qpc
                                     + offset as u64 * 10_000_000 / u64::from(SAMPLE_RATE))
                                 .saturating_mul(100),
+                                timestamp_valid: flags
+                                    & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32
+                                    == 0,
+                                device_position: (flags
+                                    & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32
+                                    == 0)
+                                    .then_some(position + offset as u64),
                                 discontinuity: offset == 0 && discontinuity,
                             });
                             delivered += frames as u64;
@@ -440,6 +454,14 @@ fn capture_loop(
                 }
             }
             packet.release()?;
+            state.sequence.fetch_add(1, Ordering::SeqCst);
+            state.position.store(position, Ordering::SeqCst);
+            state.qpc.store(qpc, Ordering::SeqCst);
+            state.clock_valid.store(
+                flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0,
+                Ordering::SeqCst,
+            );
+            state.sequence.fetch_add(1, Ordering::SeqCst);
             state.frames.fetch_add(delivered, Ordering::Relaxed);
             state.dropped.fetch_add(dropped, Ordering::Relaxed);
             if oversized_packet {
@@ -593,6 +615,7 @@ fn render_loop(
         state.sequence.fetch_add(1, Ordering::SeqCst);
         state.position.store(position, Ordering::SeqCst);
         state.qpc.store(qpc, Ordering::SeqCst);
+        state.clock_valid.store(true, Ordering::SeqCst);
         state.sequence.fetch_add(1, Ordering::SeqCst);
     }
     Ok(())

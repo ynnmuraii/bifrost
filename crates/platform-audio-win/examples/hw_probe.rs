@@ -1,8 +1,39 @@
 //! Explicitly audible diagnostic; never run as part of cargo test.
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use audio_backend::{Backend, Stream};
     use platform_audio_win::stream::*;
     use std::{thread, time::Duration};
+    let mut backend = platform_audio_win::WindowsBackend::new()?;
+    let fixed = audio_backend::AudioFormat {
+        sample_rate: SAMPLE_RATE,
+        channels: 2,
+    };
+    let (mut contract_tx, mut contract_rx) = rtrb::RingBuffer::new(48_000 * 6);
+    let mut contract_capture = backend.start_capture(
+        audio_backend::CaptureSpec::SystemExcludingOwnProcessTree { format: fixed },
+        Box::new(move |block| {
+            for (index, samples) in block.samples.as_chunks::<2>().0.iter().enumerate() {
+                let _ = contract_tx.push(CapturedFrame {
+                    samples: [samples[0], samples[1]],
+                    device_position: block.device_position.unwrap_or(0) + index as u64,
+                    qpc_100ns: block.timestamp_ns / 100
+                        + index as u64 * 10_000_000 / u64::from(SAMPLE_RATE),
+                    timestamp_valid: block.timestamp_valid,
+                    discontinuity: index == 0 && block.discontinuity,
+                });
+            }
+        }),
+    )?;
+    let mut contract_render = backend.start_render(
+        audio_backend::RenderRequest {
+            device: audio_backend::DeviceSelection::FollowDefault(
+                audio_backend::DefaultRole::Multimedia,
+            ),
+            requested: fixed,
+        },
+        Box::new(|samples| samples.fill(0.0)),
+    )?;
     println!("Audible 1 kHz probe: in-memory PCM only; no endpoint settings changed.");
     let (exclude_tx, mut exclude_rx) = rtrb::RingBuffer::new(48_000 * 6);
     let (include_tx, mut include_rx) = rtrb::RingBuffer::new(48_000 * 6);
@@ -21,6 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::sleep(Duration::from_millis(200));
     exclude.stop();
     include.stop();
+    contract_capture.stop()?;
+    contract_render.stop()?;
+    let contract_stats = contract_capture.native_snapshot();
+    let contract_clock = Stream::snapshot(&contract_render);
     fn measure(rx: &mut rtrb::Consumer<CapturedFrame>) -> (usize, f64, f64, usize) {
         let mut samples = Vec::new();
         let mut gaps = 0;
@@ -49,6 +84,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             / (samples.len() as f64).powi(2);
         (total, rms, power, gaps)
     }
+    let contract = measure(&mut contract_rx);
+    println!(
+        "SHARED EXCLUDE frames={} rms={:.9} tone_power={:.9} timestamped_clock={:?}",
+        contract.0, contract.1, contract.2, contract_clock
+    );
     let ex = measure(&mut exclude_rx);
     let inc = measure(&mut include_rx);
     let render_stats = render.snapshot();
@@ -76,6 +116,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && exclude.snapshot().dropped_capture_frames == 0
         && include.snapshot().dropped_capture_frames == 0
         && render_stats.status == StreamStatus::Stopped
+        && contract.0 >= 132_000
+        && contract.2 < 0.000001
+        && contract.0 as u64 == contract_stats.transferred_frames
+        && contract_clock.clock_frequency.is_some()
+        && contract_clock.host_time_100ns.is_some()
     {
         println!("PASS capture-exclude + positive INCLUDE control + event-driven render");
         Ok(())

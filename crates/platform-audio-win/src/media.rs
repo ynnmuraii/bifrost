@@ -195,10 +195,12 @@ impl MediaManager {
         &self,
     ) -> Result<Receiver<Result<MediaSnapshot, Error>>, BackendError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.requests.try_send(Request::Snapshot(tx)).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => BackendError::Busy,
-            mpsc::TrySendError::Disconnected(_) => BackendError::ServerUnavailable,
-        })?;
+        self.requests
+            .try_send(Request::Snapshot(tx))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => BackendError::Busy,
+                mpsc::TrySendError::Disconnected(_) => BackendError::ServerUnavailable,
+            })?;
         Ok(rx)
     }
 

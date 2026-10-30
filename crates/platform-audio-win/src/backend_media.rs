@@ -7,7 +7,10 @@ use audio_backend::{
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
-    sync::{mpsc::{Receiver, TryRecvError}, Arc, Mutex},
+    sync::{
+        mpsc::{Receiver, TryRecvError},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -64,12 +67,18 @@ impl Pending {
     }
 }
 
+struct SnapshotRequest {
+    generation: u64,
+    force: bool,
+    response: Receiver<Result<media::MediaSnapshot, crate::Error>>,
+}
+
 pub(crate) struct BackendMedia {
     manager: media::MediaManager,
     pending: VecDeque<Arc<Pending>>,
     cache: RefCell<Vec<MediaInfo>>,
     cache_generation: Cell<u64>,
-    snapshot: Option<(u64, bool, Receiver<Result<media::MediaSnapshot, crate::Error>>)>,
+    snapshot: Option<SnapshotRequest>,
     events: VecDeque<Event>,
     dirty: bool,
     current_dirty: bool,
@@ -92,10 +101,17 @@ impl BackendMedia {
     }
 
     pub(crate) fn sessions(&self) -> Result<Vec<MediaInfo>, BackendError> {
-        let sessions = self.manager.snapshot().map_err(map_error)?.sessions
-            .into_iter().map(convert).collect::<Result<Vec<_>, _>>()?;
+        let sessions = self
+            .manager
+            .snapshot()
+            .map_err(map_error)?
+            .sessions
+            .into_iter()
+            .map(convert)
+            .collect::<Result<Vec<_>, _>>()?;
         *self.cache.borrow_mut() = sessions.clone();
-        self.cache_generation.set(self.cache_generation.get().wrapping_add(1));
+        self.cache_generation
+            .set(self.cache_generation.get().wrapping_add(1));
         Ok(sessions)
     }
 
@@ -136,21 +152,35 @@ impl BackendMedia {
             self.enqueue(Event::ResyncRequired);
         }
         for _ in 0..EVENT_CAPACITY {
-            let Ok(change) = self.manager.events().try_recv() else { break; };
+            let Ok(change) = self.manager.events().try_recv() else {
+                break;
+            };
             self.dirty = true;
-            if change == media::MediaChange::Current { self.current_dirty = true; }
+            if change == media::MediaChange::Current {
+                self.current_dirty = true;
+            }
         }
-        let response = self.snapshot.as_ref().map(|(_, _, rx)| rx.try_recv());
+        let response = self
+            .snapshot
+            .as_ref()
+            .map(|request| request.response.try_recv());
         match response {
             Some(Ok(result)) => {
-                let (generation, force, _) = self.snapshot.take()?;
+                let SnapshotRequest {
+                    generation, force, ..
+                } = self.snapshot.take()?;
                 if generation != self.cache_generation.get() {
                     // An explicit synchronous read superseded this in-flight snapshot.
                     self.dirty = true;
                     self.current_dirty |= force;
                 } else {
-                    match result.map_err(map_error).and_then(|snapshot| snapshot.sessions
-                        .into_iter().map(convert).collect::<Result<Vec<_>, _>>()) {
+                    match result.map_err(map_error).and_then(|snapshot| {
+                        snapshot
+                            .sessions
+                            .into_iter()
+                            .map(convert)
+                            .collect::<Result<Vec<_>, _>>()
+                    }) {
                         Ok(sessions) => self.apply_snapshot(sessions, force),
                         Err(_) => self.enqueue(Event::ResyncRequired),
                     }
@@ -165,7 +195,11 @@ impl BackendMedia {
         if self.dirty && self.snapshot.is_none() && !self.stopped_reported {
             match self.manager.snapshot_async() {
                 Ok(rx) => {
-                    self.snapshot = Some((self.cache_generation.get(), self.current_dirty, rx));
+                    self.snapshot = Some(SnapshotRequest {
+                        generation: self.cache_generation.get(),
+                        force: self.current_dirty,
+                        response: rx,
+                    });
                     self.dirty = false;
                     self.current_dirty = false;
                 }
@@ -194,12 +228,18 @@ impl BackendMedia {
         // current changes, without inventing a revision or exposing application identity.
         for info in &sessions {
             if force || !old.iter().any(|previous| previous == info) {
-                self.enqueue(Event::MediaChanged { session: info.session, info: Some(info.clone()) });
+                self.enqueue(Event::MediaChanged {
+                    session: info.session,
+                    info: Some(info.clone()),
+                });
             }
         }
         for previous in &old {
             if !sessions.iter().any(|info| info.session == previous.session) {
-                self.enqueue(Event::MediaChanged { session: previous.session, info: None });
+                self.enqueue(Event::MediaChanged {
+                    session: previous.session,
+                    info: None,
+                });
             }
         }
         self.cache.replace(sessions);

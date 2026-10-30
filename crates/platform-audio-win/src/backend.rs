@@ -9,33 +9,31 @@ use audio_backend::*;
 use std::{cell::RefCell, sync::mpsc::TryRecvError, time::Instant};
 
 /// Control-thread adapter. Construction opens no native device, session, or window.
-/// Supply every configured KVM hotkey, including emergency release, for collision checks.
-/// Native diagnostic interfaces additionally expose WASAPI clock/status and PTT lease
-/// detail that the shared M1 Stream/Event vocabulary cannot yet represent.
+/// Supply reserved KVM chords to `configure_ptt`; leases use absolute QPC-derived time.
 pub struct WindowsBackend {
     devices: BackendDevices,
     media: RefCell<Option<BackendMedia>>,
-    kvm: Vec<HotkeyBinding>,
+    qpc_frequency: u64,
     ptt: Option<Hotkey>,
-    ptt_expiry: Option<Instant>,
-    ptt_pressed: bool,
+    ptt_binding: Option<HotkeyBinding>,
     pending_release: bool,
     media_turn: bool,
 }
 impl WindowsBackend {
-    pub fn new(kvm_hotkeys: &[PttHotkey]) -> Result<Self, BackendError> {
-        let kvm = kvm_hotkeys
-            .iter()
-            .copied()
-            .map(binding)
-            .collect::<Result<_, _>>()?;
+    pub fn new() -> Result<Self, BackendError> {
+        let mut frequency = 0;
+        unsafe { windows::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency) }
+            .map_err(|e| map_hresult(e.code().0))?;
+        let qpc_frequency = u64::try_from(frequency)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(BackendError::Unsupported)?;
         Ok(Self {
             devices: BackendDevices::new(),
             media: RefCell::new(None),
-            kvm,
+            qpc_frequency,
             ptt: None,
-            ptt_expiry: None,
-            ptt_pressed: false,
+            ptt_binding: None,
             pending_release: false,
             media_turn: false,
         })
@@ -55,37 +53,63 @@ impl WindowsBackend {
             self.pending_release = false;
             return Some(Event::PttReleased);
         }
-        let now = Instant::now();
-        let mut disconnected = false;
-        if let Some(ptt) = &self.ptt {
-            for _ in 0..16 {
-                match ptt.events().try_recv() {
-                    Ok(event @ HotkeyEvent::PressLease { expires_at, .. }) => {
-                        self.ptt_expiry = event.is_live(now).then_some(expires_at);
+        let result = self.ptt.as_ref()?.events().try_recv();
+        match result {
+            Ok(HotkeyEvent::Released) => Some(Event::PttReleased),
+            Ok(HotkeyEvent::PressLease {
+                observed_at,
+                expires_at,
+                initial,
+            }) => {
+                // Sample QPC before Instant so conversion can only shorten a lease.
+                let qpc = match self.qpc_now_ns() {
+                    Ok(value) => value,
+                    Err(_) => return Some(Event::PttReleased),
+                };
+                let now = Instant::now();
+                let observed_at_ns = qpc.saturating_sub(
+                    now.saturating_duration_since(observed_at)
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64,
+                );
+                let expires_at_ns = if now < expires_at {
+                    qpc.saturating_add(
+                        expires_at
+                            .duration_since(now)
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64,
+                    )
+                } else {
+                    qpc.saturating_sub(
+                        now.duration_since(expires_at)
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64,
+                    )
+                };
+                Some(if initial {
+                    Event::PttPressed {
+                        observed_at_ns,
+                        expires_at_ns,
                     }
-                    Ok(HotkeyEvent::Released) => self.ptt_expiry = None,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        self.ptt_expiry = None;
-                        break;
-                    }
-                }
+                } else {
+                    Event::PttRenewed { expires_at_ns }
+                })
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.ptt.take();
+                self.ptt_binding = None;
+                Some(Event::PttReleased)
             }
         }
-        let live = self.ptt_expiry.is_some_and(|expiry| now < expiry);
-        if disconnected {
-            self.ptt.take();
-        }
-        if live != self.ptt_pressed {
-            self.ptt_pressed = live;
-            return Some(if live {
-                Event::PttPressed
-            } else {
-                Event::PttReleased
-            });
-        }
-        disconnected.then_some(Event::ResyncRequired)
+    }
+    fn qpc_now_ns(&self) -> Result<u64, BackendError> {
+        let mut counter = 0;
+        unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&mut counter) }
+            .map_err(|e| map_hresult(e.code().0))?;
+        let ticks = u64::try_from(counter).map_err(|_| BackendError::Unsupported)?;
+        u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(self.qpc_frequency))
+            .map_err(|_| BackendError::Unsupported)
     }
 }
 
@@ -96,7 +120,7 @@ pub struct WindowsStream {
     feedback: FeedbackGuarantee,
 }
 impl WindowsStream {
-    pub fn snapshot(&self) -> stream::StreamSnapshot {
+    pub fn native_snapshot(&self) -> stream::StreamSnapshot {
         self.native.snapshot()
     }
 }
@@ -109,6 +133,24 @@ impl Stream for WindowsStream {
     }
     fn feedback_guarantee(&self) -> FeedbackGuarantee {
         self.feedback
+    }
+    fn snapshot(&self) -> StreamSnapshot {
+        let native = self.native.snapshot();
+        StreamSnapshot {
+            status: match native.status {
+                StreamStatus::Running => audio_backend::StreamStatus::Running,
+                StreamStatus::Stopped => audio_backend::StreamStatus::Stopped,
+                StreamStatus::DeviceInvalidated => audio_backend::StreamStatus::DeviceInvalidated,
+                StreamStatus::Failed(code) => {
+                    audio_backend::StreamStatus::Failed(map_hresult(code))
+                }
+            },
+            device_position: native.clock_valid.then_some(native.device_position),
+            clock_frequency: (native.clock_frequency != 0).then_some(native.clock_frequency),
+            host_time_100ns: native.clock_valid.then_some(native.qpc_100ns),
+            underrun_frames: native.underrun_frames,
+            dropped_capture_frames: native.dropped_capture_frames,
+        }
     }
     fn stop(&mut self) -> Result<(), BackendError> {
         self.native.stop();
@@ -151,11 +193,7 @@ impl Backend for WindowsBackend {
             virtual_key: 0x87,
             modifiers: 7,
         };
-        let ptt = availability(
-            Hotkey::register(probe, &self.kvm)
-                .map(drop)
-                .map_err(map_error),
-        );
+        let ptt = availability(Hotkey::register(probe, &[]).map(drop).map_err(map_error));
         CapabilityProbe {
             os_build: build,
             process_exclude,
@@ -229,15 +267,29 @@ impl Backend for WindowsBackend {
             media.cancel();
         }
     }
-    fn configure_ptt(&mut self, hotkey: Option<PttHotkey>) -> Result<(), BackendError> {
-        let replacement = match hotkey {
-            Some(hotkey) => Some(Hotkey::register(binding(hotkey)?, &self.kvm).map_err(map_error)?),
-            None => None,
-        };
+    fn configure_ptt(
+        &mut self,
+        hotkey: Option<PttHotkey>,
+        reserved: &[PttHotkey],
+    ) -> Result<(), BackendError> {
+        let requested = hotkey.map(binding).transpose()?;
+        let reserved = reserved
+            .iter()
+            .copied()
+            .map(binding)
+            .collect::<Result<Vec<_>, _>>()?;
+        if requested.is_some_and(|key| key.conflicts(&reserved)) {
+            return Err(BackendError::Conflict);
+        }
+        if requested == self.ptt_binding {
+            return Ok(());
+        }
+        let replacement = requested
+            .map(|key| Hotkey::register(key, &reserved).map_err(map_error))
+            .transpose()?;
+        self.pending_release |= self.ptt.is_some();
         self.ptt = replacement;
-        self.pending_release |= self.ptt_pressed;
-        self.ptt_pressed = false;
-        self.ptt_expiry = None;
+        self.ptt_binding = requested;
         Ok(())
     }
     fn poll_event(&mut self) -> Option<Event> {
@@ -365,7 +417,7 @@ mod tests {
     use super::*;
     #[test]
     fn construction_has_no_native_handles_and_hid_is_not_vk() {
-        let backend = WindowsBackend::new(&[]).unwrap();
+        let mut backend = WindowsBackend::new().unwrap();
         assert!(backend.media.borrow().is_none());
         assert!(backend.ptt.is_none());
         let key = PttHotkey {
@@ -382,6 +434,11 @@ mod tests {
                 modifiers: 2
             }
         );
+        assert_eq!(
+            backend.configure_ptt(Some(key), &[key]),
+            Err(BackendError::Conflict)
+        );
+        assert!(backend.ptt.is_none());
         assert!(require_format(AudioFormat {
             sample_rate: 44_100,
             channels: 2
