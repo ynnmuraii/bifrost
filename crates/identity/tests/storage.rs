@@ -24,7 +24,7 @@ fn key_file_name() -> &'static str {
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lws-identity-storage-{}-{}-{label}",
+        "bifrost-identity-storage-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -60,7 +60,7 @@ fn system_paths_resolve_to_documented_roots_without_creating_anything() {
     // so this stays inert even though it looks at the real profile.
     let paths = IdentityPaths::system().expect("APPDATA/HOME must be resolvable here");
 
-    // Both files live in a directory called `lan-workspace`, and the key sits in the data
+    // Both files live in the application directory, and the key sits in the data
     // directory.
     assert!(paths.data_dir.ends_with(config::paths::APP_DIR));
     assert_eq!(paths.key_file.parent(), Some(paths.data_dir.as_path()));
@@ -76,17 +76,19 @@ fn system_paths_resolve_to_documented_roots_without_creating_anything() {
         .trust_file
         .parent()
         .expect("trust.toml has a parent")
-        .ends_with("lan-workspace"));
+        .ends_with(config::paths::APP_DIR));
 
-    // «Файлы и пути»: «Приватный ключ | … | `$XDG_DATA_HOME/lan-workspace/identity.key`
-    // (0600)» and «Доверенные узлы | `%APPDATA%\lan-workspace\trust.toml` |
-    // `$XDG_CONFIG_HOME/lan-workspace/trust.toml`» — the key follows the data root, the
+    // «Файлы и пути»: «Приватный ключ | … | `$XDG_DATA_HOME/bifrost/identity.key`
+    // (0600)» and «Доверенные узлы | `%APPDATA%\bifrost\trust.toml` |
+    // `$XDG_CONFIG_HOME/bifrost/trust.toml`» — the key follows the data root, the
     // trust store the config root. Only on Windows, where both documented rows name
-    // `%APPDATA%\lan-workspace`, do they share a directory.
+    // `%APPDATA%\bifrost`, do they share a directory.
     #[cfg(unix)]
     {
-        let data_root = documented_root("XDG_DATA_HOME", ".local/share").join("lan-workspace");
-        let config_root = documented_root("XDG_CONFIG_HOME", ".config").join("lan-workspace");
+        let data_root =
+            documented_root("XDG_DATA_HOME", ".local/share").join(config::paths::APP_DIR);
+        let config_root =
+            documented_root("XDG_CONFIG_HOME", ".config").join(config::paths::APP_DIR);
         let existed_before = data_root.exists();
 
         assert_eq!(
@@ -113,7 +115,7 @@ fn system_paths_resolve_to_documented_roots_without_creating_anything() {
     #[cfg(windows)]
     {
         let appdata = PathBuf::from(std::env::var_os("APPDATA").expect("%APPDATA% must be set"));
-        assert_eq!(paths.data_dir, appdata.join("lan-workspace"));
+        assert_eq!(paths.data_dir, appdata.join(config::paths::APP_DIR));
         assert_eq!(paths.trust_file, paths.data_dir.join("trust.toml"));
     }
 }

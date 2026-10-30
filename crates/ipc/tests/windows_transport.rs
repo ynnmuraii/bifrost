@@ -55,7 +55,7 @@ fn the_dacl_grants_full_access_to_the_current_user_sid_only() {
     assert_eq!(transport::gui_sddl(&sid), expected);
     assert_eq!(
         transport::gui_pipe_name(&sid),
-        format!(r"\\.\pipe\lan-workspace-{sid}")
+        format!(r"\\.\pipe\bifrost-{sid}")
     );
 
     // The descriptor the pipe is actually created with is that same DACL, and a

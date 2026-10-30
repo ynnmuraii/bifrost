@@ -48,7 +48,7 @@ async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
 
 fn temp_root(label: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "lws-clipboard-tests-{}-{}-{label}",
+        "bifrost-clipboard-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

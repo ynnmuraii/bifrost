@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install only application files; never change lan-workspace settings or trust.
+# Install only application files; never change Bifrost settings or trust.
 set -eu
 if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
     echo 'Bifrost requires x86_64 Linux.' >&2
@@ -45,7 +45,7 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -f "$icons/index.theme"
     gtk-update-icon-cache -f -t "$icons"
 fi
 if [ "${1-}" = --uninstall ]; then
-    echo 'Bifrost removed; your lan-workspace settings and pairing are unchanged.'
+    echo 'Bifrost removed; your settings and pairing (in ~/.config/bifrost) are unchanged.'
 else
     echo 'Open Bifrost from your applications menu (or ~/.local/bin/bifrost), then pair your computers.'
 fi

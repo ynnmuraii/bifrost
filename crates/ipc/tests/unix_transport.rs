@@ -24,7 +24,7 @@ struct TempSocket {
 impl TempSocket {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "lws-ipc-test-{}-{tag}-{}",
+            "bifrost-ipc-test-{}-{tag}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

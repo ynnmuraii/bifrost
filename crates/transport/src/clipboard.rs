@@ -1,4 +1,4 @@
-//! The clipboard channel: port `47902`, ALPN `lan-workspace/clipboard/1`.
+//! The clipboard channel: port `47902`, ALPN `bifrost/clipboard/1`.
 //!
 //! `docs/05-protocol.md` («Clipboard канал») gives the clipboard its own TLS session,
 //! separate from the input/control link, so a 1 MiB transfer cannot delay a key-up
@@ -816,7 +816,7 @@ pub async fn dial_clipboard(
         .await?;
     if stream.get_ref().1.alpn_protocol() != Some(limits::ALPN_CLIPBOARD.as_bytes()) {
         return Err(TransportError::Protocol(
-            "the peer did not negotiate lan-workspace/clipboard/1".into(),
+            "the peer did not negotiate bifrost/clipboard/1".into(),
         ));
     }
     // The pin already refused anyone else; this makes the expected identity explicit, so a
@@ -1339,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn send_leaves_no_unsent_records_in_the_tls_session() {
         let root = std::env::temp_dir().join(format!(
-            "lws-clipboard-flush-{}-{:x}",
+            "bifrost-clipboard-flush-{}-{:x}",
             std::process::id(),
             u128::from_le_bytes(identity::random16().expect("entropy"))
         ));
@@ -1402,7 +1402,7 @@ mod tests {
     #[tokio::test]
     async fn admission_caps_stalled_handshakes() {
         let root = std::env::temp_dir().join(format!(
-            "lws-clipboard-cap-{:x}",
+            "bifrost-clipboard-cap-{:x}",
             u128::from_le_bytes(identity::random16().expect("entropy"))
         ));
         let identity = Arc::new(
@@ -1437,7 +1437,7 @@ mod tests {
     async fn shutdown_joins_a_silent_handshake_and_releases_the_port() {
         use tokio::io::AsyncReadExt;
         let root = std::env::temp_dir().join(format!(
-            "lws-clipboard-shutdown-{}-{:x}",
+            "bifrost-clipboard-shutdown-{}-{:x}",
             std::process::id(),
             u128::from_le_bytes(identity::random16().expect("entropy"))
         ));
@@ -1502,7 +1502,7 @@ mod tests {
     #[tokio::test]
     async fn established_clipboard_links_disable_nagle_on_both_ends() {
         let root = std::env::temp_dir().join(format!(
-            "lws-nodelay-{}-{:x}",
+            "bifrost-nodelay-{}-{:x}",
             std::process::id(),
             u128::from_le_bytes(identity::random16().expect("entropy"))
         ));

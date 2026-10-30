@@ -5,7 +5,7 @@
 //! | | Windows |
 //! |---|---|
 //! | core ↔ agent | Анонимный pipe-пара, унаследованная при `CreateProcess` (без имени в namespace) |
-//! | gui ↔ core | Named pipe `\\.\pipe\lan-workspace-<SID>`, DACL: только SID текущего пользователя, `PIPE_REJECT_REMOTE_CLIENTS` |
+//! | gui ↔ core | Named pipe `\\.\pipe\bifrost-<SID>`, DACL: только SID текущего пользователя, `PIPE_REJECT_REMOTE_CLIENTS` |
 //!
 //! [`listen`] implements the GUI row exactly: the pipe is created with an
 //! explicit security descriptor converted from the SDDL
@@ -59,7 +59,7 @@ use crate::error::IpcError;
 use crate::peer::{PeerCheck, PeerCredentials};
 
 /// Prefix of every Bifrost pipe name.
-pub const PIPE_NAME_PREFIX: &str = "lan-workspace-";
+pub const PIPE_NAME_PREFIX: &str = "bifrost-";
 /// The `\\.\pipe\` namespace prefix.
 pub const PIPE_PATH_PREFIX: &str = r"\\.\pipe\";
 /// `ERROR_PIPE_BUSY`: every instance is connected, retry shortly.
@@ -80,13 +80,13 @@ const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 /// instance is created before the accepted one leaves [`GuiListener::accept`] — so the window
 /// only has to outlast a busy machine: a core whose loop is descheduled for a moment must not
 /// lose a client that would have been served. Two seconds is the CLI's own patience for a
-/// whole exchange (`apps/lws-core/src/main.rs`), so a client never waits longer than the
+/// whole exchange (`apps/bifrost-core/src/main.rs`), so a client never waits longer than the
 /// caller was prepared to.
 const CONNECT_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 /// Delay between retries of a busy or briefly-absent pipe.
 const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// `\\.\pipe\lan-workspace-<SID>`.
+/// `\\.\pipe\bifrost-<SID>`.
 pub fn gui_pipe_name(sid: &str) -> String {
     format!("{PIPE_PATH_PREFIX}{PIPE_NAME_PREFIX}{sid}")
 }
@@ -325,12 +325,12 @@ impl Endpoint {
         Endpoint { name: name.into() }
     }
 
-    /// `\\.\pipe\lan-workspace-<SID>` for an explicit SID.
+    /// `\\.\pipe\bifrost-<SID>` for an explicit SID.
     pub fn gui_pipe_for_sid(sid: &str) -> Self {
         Endpoint::pipe(gui_pipe_name(sid))
     }
 
-    /// `\\.\pipe\lan-workspace-<SID>` for the current user.
+    /// `\\.\pipe\bifrost-<SID>` for the current user.
     ///
     /// Core should prefer the name built from `config::Paths`, which owns the
     /// per-OS layout; this constructor is for callers without configuration.
@@ -427,7 +427,7 @@ impl GuiListener {
     /// *before* the wait and [`PendingInstance`] puts it back if the wait is cancelled —
     /// without that the instance is dropped with a live client on it, and the client reads a
     /// closed pipe instead of its answer («core closed the control channel without an
-    /// answer» watched as `lws-core status` failing a few times in two hundred).
+    /// answer» watched as `bifrost-core status` failing a few times in two hundred).
     pub async fn accept(&mut self, check: &dyn PeerCheck) -> Result<NamedPipeServer, IpcError> {
         let waiting = self
             .pending
@@ -591,7 +591,7 @@ mod tests {
     /// Core's session loop polls `accept` as one branch of a `select!` beside its ticks and
     /// agent frames, so a client that shows up right then is cancelled on almost every
     /// request. Before [`PendingInstance`] the instance waiting for that client was dropped
-    /// with the connection on it, and `lws-core status` reported «core closed the control
+    /// with the connection on it, and `bifrost-core status` reported «core closed the control
     /// channel without an answer» for a few calls in two hundred — even though core served
     /// every *other* one, which is what made it look like the answer had been lost rather
     /// than the connection.

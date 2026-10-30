@@ -13,12 +13,12 @@
 //!
 //! | Назначение | Windows | Linux |
 //! |---|---|---|
-//! | Настройки | `%APPDATA%\lan-workspace\config.toml` | `$XDG_CONFIG_HOME/lan-workspace/config.toml` |
-//! | Доверенные узлы | `%APPDATA%\lan-workspace\trust.toml` | `$XDG_CONFIG_HOME/lan-workspace/trust.toml` |
-//! | Приватный ключ | `%APPDATA%\lan-workspace\identity.dpapi` | `Secret Service`; иначе `$XDG_DATA_HOME/lan-workspace/identity.key` (0600) |
-//! | Логи | `%LOCALAPPDATA%\lan-workspace\logs\` | `$XDG_STATE_HOME/lan-workspace/logs/` |
-//! | IPC GUI | `\\.\pipe\lan-workspace-<SID>` | `$XDG_RUNTIME_DIR/lan-workspace/gui.sock` |
-//! | Портальные токены | — | `$XDG_STATE_HOME/lan-workspace/portal-restore.toml` (0600, каталог 0700) |
+//! | Настройки | `%APPDATA%\bifrost\config.toml` | `$XDG_CONFIG_HOME/bifrost/config.toml` |
+//! | Доверенные узлы | `%APPDATA%\bifrost\trust.toml` | `$XDG_CONFIG_HOME/bifrost/trust.toml` |
+//! | Приватный ключ | `%APPDATA%\bifrost\identity.dpapi` | `Secret Service`; иначе `$XDG_DATA_HOME/bifrost/identity.key` (0600) |
+//! | Логи | `%LOCALAPPDATA%\bifrost\logs\` | `$XDG_STATE_HOME/bifrost/logs/` |
+//! | IPC GUI | `\\.\pipe\bifrost-<SID>` | `$XDG_RUNTIME_DIR/bifrost/gui.sock` |
+//! | Портальные токены | — | `$XDG_STATE_HOME/bifrost/portal-restore.toml` (0600, каталог 0700) |
 //!
 //! The environment is read directly instead of using the `directories` crate:
 //! the documents name XDG variables and `%APPDATA%` explicitly, `directories`
@@ -36,7 +36,10 @@ use std::path::{Path, PathBuf};
 use crate::error::ConfigError;
 
 /// Application directory name under every root.
-pub const APP_DIR: &str = "lan-workspace";
+///
+/// Renamed from `lan-workspace` in 0.4.0; [`crate::relocate`] moves that
+/// directory next to the new one once, at startup.
+pub const APP_DIR: &str = "bifrost";
 
 /// The file names inside [`Paths`]' directories.
 pub const CONFIG_FILE: &str = "config.toml";
@@ -81,26 +84,26 @@ impl Paths {
         }
     }
 
-    /// `%APPDATA%\lan-workspace` on Windows,
-    /// `$XDG_CONFIG_HOME/lan-workspace` (or `~/.config/lan-workspace`) elsewhere.
+    /// `%APPDATA%\bifrost` on Windows,
+    /// `$XDG_CONFIG_HOME/bifrost` (or `~/.config/bifrost`) elsewhere.
     pub fn config_dir(&self) -> &Path {
         &self.config_dir
     }
 
-    /// Where the identity key lives: `%APPDATA%\lan-workspace` on Windows,
-    /// `$XDG_DATA_HOME/lan-workspace` elsewhere. Private keys themselves belong
+    /// Where the identity key lives: `%APPDATA%\bifrost` on Windows,
+    /// `$XDG_DATA_HOME/bifrost` elsewhere. Private keys themselves belong
     /// to the identity layer, not to this crate.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    /// Logs and portal tokens: `%LOCALAPPDATA%\lan-workspace` on Windows,
-    /// `$XDG_STATE_HOME/lan-workspace` elsewhere.
+    /// Logs and portal tokens: `%LOCALAPPDATA%\bifrost` on Windows,
+    /// `$XDG_STATE_HOME/bifrost` elsewhere.
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
 
-    /// `$XDG_RUNTIME_DIR/lan-workspace`; `None` on Windows, which uses a named
+    /// `$XDG_RUNTIME_DIR/bifrost`; `None` on Windows, which uses a named
     /// pipe instead.
     pub fn runtime_dir(&self) -> Option<&Path> {
         self.runtime_dir.as_deref()
@@ -147,7 +150,7 @@ impl Paths {
     }
 
     /// The GUI IPC endpoint: a `gui.sock` path on Unix, `None` on Windows where
-    /// the endpoint is the named pipe `\\.\pipe\lan-workspace-<SID>`.
+    /// the endpoint is the named pipe `\\.\pipe\bifrost-<SID>`.
     pub fn gui_ipc(&self) -> Option<PathBuf> {
         self.runtime_dir
             .as_ref()
@@ -172,12 +175,20 @@ impl fmt::Display for Paths {
 }
 
 /// Resolve the documented directories for the current user.
+///
+/// A process that ran [`crate::relocate::adopt`] returns the paths that are
+/// effective for this run (the legacy directory when a move had to be
+/// deferred), so every role and every `--config-dir` fallback agrees.
 pub fn default_paths() -> Result<Paths, ConfigError> {
+    if let Some(paths) = crate::relocate::startup_paths() {
+        return Ok(paths.clone());
+    }
     resolve()
 }
 
+/// The raw platform defaults, ignoring any startup relocation.
 #[cfg(windows)]
-fn resolve() -> Result<Paths, ConfigError> {
+pub(crate) fn resolve() -> Result<Paths, ConfigError> {
     let roaming = var("APPDATA", "the roaming application-data directory")?;
     let local = var("LOCALAPPDATA", "the local application-data directory")?;
     let config_dir = PathBuf::from(roaming).join(APP_DIR);
@@ -190,7 +201,7 @@ fn resolve() -> Result<Paths, ConfigError> {
 }
 
 #[cfg(not(windows))]
-fn resolve() -> Result<Paths, ConfigError> {
+pub(crate) fn resolve() -> Result<Paths, ConfigError> {
     let home = var("HOME", "the user home directory")?;
     let home = PathBuf::from(home);
     let config_dir = xdg("XDG_CONFIG_HOME", home.join(".config")).join(APP_DIR);

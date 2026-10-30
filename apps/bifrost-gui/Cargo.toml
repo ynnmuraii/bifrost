@@ -1,0 +1,77 @@
+[package]
+name = "bifrost-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+config = { path = "../../crates/config" }
+bifrost-desktop = { path = "../bifrost-desktop" }
+# `default-features = false` + `glow`: the smallest dependency set that still draws a window.
+# glow (OpenGL) loads its libraries at runtime and needs no -dev packages on Linux, which is
+# what the CI runners provide; wgpu would add a whole shader/backend stack for one status
+# window. The feature list is what makes the one binary run on Windows, X11 and Wayland:
+# `x11`/`wayland` reach winit through egui-winit/glutin, `accesskit` is the screen reader,
+# `links` opens the URLs in the docs. There is no `default_fonts`: the window embeds the six
+# faces of the design (Geist, Geist Mono, Silkscreen; Cyrillic included), and egui's own
+# fallback fonts would only add weight to the binary.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "accesskit",
+    "glow",
+    "links",
+    "wayland",
+    "web_screen_reader",
+    "x11",
+] }
+ipc = { path = "../../crates/ipc" }
+# The window's own log file (`bifrost-gui.log`): see `init_logging` in `lib.rs` for why a window
+# that shows no console still needs one.
+logging = { path = "../../crates/logging" }
+protocol = { path = "../../crates/protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+# Reuse the TLS stack's existing cryptography rather than add a second digest stack.
+ring = { version = "0.17", default-features = false, features = ["alloc"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
+flate2 = "1"
+tar = "0.4"
+ui-text = { path = "../../crates/ui-text" }
+# The async half of the GUI: one connection task on a dedicated thread, fed by a channel.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+# The editor writes its document as TOML in the `[topology]` schema.
+toml = "1"
+# The same logger the daemon and the agent install (`crates/logging`).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `winit/default`, as the build spec asks when eframe's own feature list does not pull it:
+# eframe's `x11`/`wayland` enable winit's `x11` and `wayland` features but not the rest of
+# `default`, and `wayland-dlopen` is the one that matters for the Linux build — without it
+# `wayland-backend` links `libwayland-client` at build time and the CI runner would need
+# `libwayland-dev`, while with it the library is loaded at runtime exactly as x11-dl and
+# glutin are (so `build-essential` stays the only system dependency). winit is never named in
+# this crate's code; the entry exists for its features.
+winit = "0.30.13"
+# `CREATE_NO_WINDOW`, so the service this window starts has no console to flash: the value is
+# the one Windows documents, and taking it from the same crate the core does keeps it that way.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+spki = { version = "0.8", features = ["pem"] }
+# An integration test is a crate of its own: it sees `bifrost-gui` and these, and not the window's
+# own dependencies. The fixtures are `GuiFrame`s, so the tests read `protocol` directly, and
+# the editor's serialiser is checked against the `config` schema it has to satisfy.
+config = { path = "../../crates/config" }
+protocol = { path = "../../crates/protocol" }
+toml = "1"
+# Offscreen rendering for `examples/shots.rs`, the screenshot pipeline of the build spec.
+# It is a dev-dependency, never a plain test: `cargo test -p bifrost-gui` must pass on a host
+# with no display and no GPU, and examples are built but not run by `cargo test`.
+egui_kittest = { version = "0.36.2", features = ["snapshot", "wgpu"] }
+
+[lints]
+workspace = true

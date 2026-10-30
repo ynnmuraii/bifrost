@@ -1,5 +1,5 @@
 syntax = "proto3";
-package lan_workspace.v1;
+package bifrost.v1;
 
 // Design draft v0.3. Limits and semantic validation are in 05-protocol.md.
 // Field numbers are never reused; removed fields are reserved. Enum-value and
@@ -174,6 +174,28 @@ message Unpaired {
 
 message Rect { double x = 1; double y = 2; double width = 3; double height = 4; }
 
+message PhysicalSize { double width_mm = 1; double height_mm = 2; string source = 3; }
+
+enum MapSizeMode { MAP_SIZE_MODE_LEGACY = 0; MAP_SIZE_MODE_AUTO = 1; MAP_SIZE_MODE_MANUAL = 2; }
+enum BridgeDecision { BRIDGE_DECISION_ENABLED = 0; BRIDGE_DECISION_DISABLED = 1; }
+message DisplayMap {
+  string node_id = 1;
+  string display_id = 2;
+  Rect rect = 3;
+  MapSizeMode size_mode = 4;
+  optional double diagonal_inches = 5;
+}
+message BridgeEndpoint { string node_id = 1; string display_id = 2; Edge edge = 3; }
+message BridgeRule { BridgeEndpoint a = 1; BridgeEndpoint b = 2; BridgeDecision decision = 3; }
+message MapDocument { repeated DisplayMap displays = 1; repeated BridgeRule bridges = 2; }
+// Authored links retain ids, direction and offline/disabled endpoints independently of runtime.
+message AuthoredLink {
+  string id = 1;
+  Endpoint from = 2;
+  Endpoint to = 3;
+  bool bidirectional = 4;
+}
+
 message Display {
   string id = 1;                 // stable within node, UTF-8 <= 128 bytes
   Rect logical_bounds = 2;       // node logical space, authoritative for topology
@@ -183,6 +205,7 @@ message Display {
   double scale_y = 6;
   bool primary = 7;              // origin of the node logical space
   bool native_known = 8;         // false when the platform exposes logical bounds only (Wayland portals)
+  PhysicalSize physical_size = 9;
 }
 
 enum Edge { EDGE_UNSPECIFIED = 0; EDGE_LEFT = 1; EDGE_RIGHT = 2; EDGE_TOP = 3; EDGE_BOTTOM = 4; }
@@ -208,6 +231,8 @@ message Topology {
   repeated TransitionLink links = 3;
   bytes author_node_id = 4;           // applied order is (revision, author_node_id)
   repeated bytes forgotten_node_ids = 5; // layout exclusion only; never revokes another member's trust
+  MapDocument map = 6;
+  repeated AuthoredLink authored_links = 7;
 }
 message NodeDisplays { bytes node_id = 1; repeated Display displays = 2; bool online = 3; }
 
@@ -387,7 +412,7 @@ message ClipboardCancel {
   ErrorCode reason = 3;
 }
 
-// ---------- Pairing: ALPN lan-workspace/pair/1, max frame 8192 bytes ----------
+// ---------- Pairing: ALPN bifrost/pair/1, max frame 8192 bytes ----------
 message PairingEnvelope {
   uint64 seq = 1;
   bytes attempt_id = 2;        // random16 from the window opener (TLS server), lifetime 120 s

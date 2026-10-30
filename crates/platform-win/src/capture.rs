@@ -334,7 +334,7 @@ impl Capture {
         let thread_id_out = Arc::clone(&thread_id);
 
         let thread = thread::Builder::new()
-            .name("lws-capture".to_owned())
+            .name("bifrost-capture".to_owned())
             .spawn(move || run(config, thread_shared, ready_tx, thread_id_out))
             .map_err(|_| CaptureError::ThreadSpawn)?;
 
@@ -578,7 +578,7 @@ unsafe fn install(
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
-            w!("lws-capture"),
+            w!("bifrost-capture"),
             WINDOW_STYLE(0),
             0,
             0,

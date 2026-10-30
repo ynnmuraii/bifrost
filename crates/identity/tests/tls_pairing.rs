@@ -25,7 +25,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lws-identity-tls-{}-{}-{label}",
+        "bifrost-identity-tls-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

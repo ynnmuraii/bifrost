@@ -151,27 +151,27 @@ jobs:
       # The Linux runner checks the same file, but its run-time guard asks the
       # host for its own sockets, and this is the shipped platform.
       - name: Agent owns no network sockets
-        run: cargo test --locked -p lws-agent --test no_network
+        run: cargo test --locked -p bifrost-agent --test no_network
 
-      # `LWS_KEEP_ROOTS=1` keeps each harness's root, and a failing night uploads
+      # `BIFROST_KEEP_ROOTS=1` keeps each harness's root, and a failing night uploads
       # them: the same reasoning as ci.yml's Windows steps. The directory is
       # created first because the harnesses call `std::env::temp_dir()`, which
       # resolves through TMP/TEMP.
       - name: Prepare diagnostics root
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\lws-roots" | Out-Null
+        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bifrost-roots" | Out-Null
 
       - name: Test
         env:
-          LWS_KEEP_ROOTS: "1"
-          TMP: ${{ runner.temp }}\lws-roots
-          TEMP: ${{ runner.temp }}\lws-roots
+          BIFROST_KEEP_ROOTS: "1"
+          TMP: ${{ runner.temp }}\bifrost-roots
+          TEMP: ${{ runner.temp }}\bifrost-roots
         run: cargo test --workspace
 
       - name: Upload harness roots
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: lws-roots-windows-nightly
-          path: ${{ format('{0}/lws-roots', runner.temp) }}
+          name: bifrost-roots-windows-nightly
+          path: ${{ format('{0}/bifrost-roots', runner.temp) }}
           if-no-files-found: ignore

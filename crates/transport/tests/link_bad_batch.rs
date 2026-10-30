@@ -25,7 +25,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_root(label: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "lws-link-bad-batch-tests-{}-{}-{label}",
+        "bifrost-link-bad-batch-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -107,6 +107,26 @@ async fn a_batch_with_an_unrepresentable_event_does_not_end_the_link() {
                             return;
                         }
                         Some(protocol::wire::envelope::Payload::Hello(_)) => {
+                            transport::write_frame(
+                                &mut peer,
+                                &protocol::wire::Envelope {
+                                    major: protocol::limits::PROTOCOL_MAJOR,
+                                    minor: protocol::limits::PROTOCOL_MINOR,
+                                    connection_id: envelope.connection_id,
+                                    seq: 1,
+                                    payload: Some(protocol::wire::envelope::Payload::Hello(
+                                        protocol::wire::Hello {
+                                            node_id: server_id.as_bytes().to_vec(),
+                                            display_name: "server".into(),
+                                            can_own: true,
+                                            ..Default::default()
+                                        },
+                                    )),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("peer Hello");
                             seen.lock().expect("lock").push(("hello", 0));
                         }
                         Some(_) => seen.lock().expect("lock").push(("other", 0)),
@@ -118,7 +138,7 @@ async fn a_batch_with_an_unrepresentable_event_does_not_end_the_link() {
         })
     };
 
-    let (reports, _report_rx) = tokio::sync::mpsc::channel::<LinkReport>(8);
+    let (reports, mut report_rx) = tokio::sync::mpsc::channel::<LinkReport>(8);
     let hello = protocol::wire::Hello {
         node_id: client_id.as_bytes().to_vec(),
         display_name: "client".to_owned(),
@@ -137,7 +157,11 @@ async fn a_batch_with_an_unrepresentable_event_does_not_end_the_link() {
         liveness: LinkLiveness::default(),
     })
     .expect("spawn a link");
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(report_rx.recv().await, Some(LinkReport::Up { .. })) {}
+    })
+    .await
+    .expect("the input link is established");
 
     let lease_id = [7u8; 16];
     // The first batch mixes an event with no wire form with a key-up: only the relative

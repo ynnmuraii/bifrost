@@ -28,7 +28,7 @@
 //! | [`pairing::WINDOW_MS`] | `120 s` | «Пользователь открывает окно сопряжения на узле-сервере на 120 s» |
 //! | [`pairing::MAX_PENDING_PEERS`] | `3` | «не более 3 ожидающих peers» |
 //! | [`pairing::MAX_ATTEMPTS`] | `3` | «при лимите 3 попытки на 120 s» |
-//! | [`protocol::limits::ALPN_PAIR`] | `"lan-workspace/pair/1"` | `docs/05-protocol.md`, header |
+//! | [`protocol::limits::ALPN_PAIR`] | `"bifrost/pair/1"` | `docs/05-protocol.md`, header |
 //! | [`protocol::limits::MAX_FRAME_PAIRING`] | `8192` | «для pairing — отдельный `PairingEnvelope` с лимитом 8192 bytes» |
 //!
 //! # Invariants

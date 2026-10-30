@@ -19,13 +19,14 @@
 //!   deltas into an absolute position before sending
 //!   (`docs/03-architecture.md`: relative-only injection «в протоколе нет и не
 //!   добавляется»), so it is a conversion error rather than a silent drop.
-//! * `capture_monotonic_us` is diagnostic and set to 0: the normalized event has no
-//!   timestamp, and nothing may derive timing from it.
+//! * Normalized events have no capture clock: ordinary conversion writes timestamp 0.
+//!   [`timed_input_envelope`] preserves source-host diagnostic timestamps without comparing
+//!   clocks on the receiving host or changing normalized input semantics.
 
 use focus_router as fr;
 use geometry::{NodeId, Position};
 use input_model::{HidKey, InputEvent, KeyState, MouseButton};
-use protocol::wire;
+use protocol::{limits, wire};
 
 /// A message that cannot be expressed on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -187,6 +188,35 @@ pub fn to_envelope(
         }),
     });
     Ok(envelope)
+}
+
+/// Converts timed samples directly, without copying a second normalized event list.
+/// Capture times remain opaque diagnostics to the receiving host.
+pub fn timed_input_envelope<'a>(
+    seq: u64,
+    connection_id: &[u8; 16],
+    lease_id: &[u8; 16],
+    display: &str,
+    samples: impl IntoIterator<Item = (&'a InputEvent, Option<u64>)>,
+) -> Result<wire::Envelope, ConvertError> {
+    let events = samples
+        .into_iter()
+        .map(|(event, capture)| {
+            let mut wire = to_wire_event(event, display)?;
+            wire.capture_monotonic_us = capture.unwrap_or(0);
+            Ok(wire)
+        })
+        .collect::<Result<Vec<_>, ConvertError>>()?;
+    Ok(wire::Envelope {
+        major: limits::PROTOCOL_MAJOR,
+        minor: limits::PROTOCOL_MINOR,
+        connection_id: connection_id.to_vec(),
+        seq,
+        lease_id: lease_id.to_vec(),
+        payload: Some(wire::envelope::Payload::InputBatch(wire::InputBatch {
+            events,
+        })),
+    })
 }
 
 /// Wire envelope -> `focus_router` message.

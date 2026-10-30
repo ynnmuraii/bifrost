@@ -74,7 +74,7 @@
 //! `Ctrl+Alt+Shift+F12` (per `[input].emergency_hotkey`, ≥3 modifiers + key) is
 //! detected *inside* the keyboard hook from virtual-key state that the hook
 //! maintains itself. On detection the shared mode is switched to `Observe`
-//! directly — the flag is a plain atomic in this process, so no `lws-core`, no
+//! directly — the flag is a plain atomic in this process, so no `bifrost-core`, no
 //! IPC and no network is on that path — and a [`capture::CaptureEvent::Emergency`]
 //! is queued for the agent. The triggering key down, repeats, and key up are swallowed,
 //! including across a live binding replacement. AC-03's ≤100 ms budget is met by
@@ -99,7 +99,7 @@
 //! ## DPI awareness
 //!
 //! `build.rs` embeds `dpiAwareness = PerMonitorV2` for MSVC-linked targets, which
-//! is what `lws-agent` and `lws-gui` are. Linkers that cannot take MSVC manifest
+//! is what `bifrost-agent` and `bifrost-gui` are. Linkers that cannot take MSVC manifest
 //! switches (the GNU toolchain this crate was verified with) get the same effect
 //! from [`dpi::ensure_per_monitor_v2`], called by both examples before any
 //! coordinate is read. Measured output on Windows 10.0.26200: a process started

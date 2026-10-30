@@ -440,7 +440,7 @@ pub fn describe_event(event: &InputEvent) -> String {
 /// `(delay_index, speed_index)`: the delay is 0..=3 (250 ms steps) and the speed 0..=31
 /// (2.5..30 repeats per second). The receiver's software repeat engine is the only thing on
 /// Windows that repeats a held injected key at all — a `SendInput` key-down without an up
-/// produces no further down of its own (measured; see `lws-agent`'s `repeat` module) — so the
+/// produces no further down of its own (measured; see `bifrost-agent`'s `repeat` module) — so the
 /// rate has to come from here to look like the keyboard the user configured (KVM-036, AC-14).
 ///
 /// A failure returns the Windows defaults (1, 31): 500 ms and the fastest rate.

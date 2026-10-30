@@ -303,7 +303,7 @@ impl SessionInfo {
                 text_clipboard: false,
                 image_clipboard: false,
                 // Measured: a key injected with `SendInput` and held without an up produces
-                // no further down of its own (lws-agent `repeat` module, KVM-036), so a
+                // no further down of its own (bifrost-agent `repeat` module, KVM-036), so a
                 // Windows receiver must repeat it in software.
                 native_repeat: false,
                 software_repeat: true,
@@ -330,7 +330,7 @@ impl SessionInfo {
                 text_clipboard: false,
                 image_clipboard: false,
                 // Measured: a key injected with `SendInput` and held without an up produces
-                // no further down of its own (lws-agent `repeat` module, KVM-036), so a
+                // no further down of its own (bifrost-agent `repeat` module, KVM-036), so a
                 // Windows receiver must repeat it in software.
                 native_repeat: false,
                 software_repeat: true,

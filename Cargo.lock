@@ -500,21 +500,125 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bifrost"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
+ "bifrost-agent",
+ "bifrost-core",
+ "bifrost-gui",
+ "bifrost-tray",
  "clipboard",
  "config",
  "identity",
  "ipc",
- "lws-agent",
- "lws-core",
- "lws-gui",
- "lws-tray",
  "protocol",
  "socket2",
  "tokio",
  "windows-sys 0.61.2",
  "winres",
+]
+
+[[package]]
+name = "bifrost-agent"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "ashpd",
+ "clipboard",
+ "config",
+ "edgefx",
+ "input-model",
+ "ipc",
+ "logging",
+ "platform-probe",
+ "platform-wayland",
+ "platform-win",
+ "platform-x11",
+ "protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows",
+ "windows-sys 0.61.2",
+ "x11rb 0.14.0",
+]
+
+[[package]]
+name = "bifrost-core"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "bifrost-desktop",
+ "clipboard",
+ "config",
+ "edgefx",
+ "focus-router",
+ "geometry",
+ "identity",
+ "input-model",
+ "ipc",
+ "logging",
+ "platform-probe",
+ "protocol",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "transport",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bifrost-desktop"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bifrost-gui"
+version = "0.4.0"
+dependencies = [
+ "bifrost-desktop",
+ "config",
+ "eframe",
+ "egui_kittest",
+ "flate2",
+ "ipc",
+ "logging",
+ "protocol",
+ "ring",
+ "semver",
+ "serde",
+ "serde_json",
+ "spki",
+ "tar",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "ui-text",
+ "ureq",
+ "url",
+ "windows-sys 0.61.2",
+ "winit",
+]
+
+[[package]]
+name = "bifrost-tray"
+version = "0.4.0"
+dependencies = [
+ "bifrost-desktop",
+ "config",
+ "ipc",
+ "ksni",
+ "protocol",
+ "tokio",
+ "ui-text",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -712,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "clipboard"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "ring",
 ]
@@ -777,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "geometry",
  "libc",
@@ -1027,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "edgefx"
-version = "0.3.3"
+version = "0.4.0"
 
 [[package]]
 name = "eframe"
@@ -1353,7 +1457,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "focus-router"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "geometry",
  "input-model",
@@ -1474,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "geometry"
-version = "0.3.3"
+version = "0.4.0"
 
 [[package]]
 name = "gethostname"
@@ -1830,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "config",
  "geometry",
@@ -1894,11 +1998,11 @@ dependencies = [
 
 [[package]]
 name = "input-model"
-version = "0.3.3"
+version = "0.4.0"
 
 [[package]]
 name = "ipc"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "config",
  "libc",
@@ -2169,7 +2273,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "logging"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -2205,110 +2309,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d3a9855747c17eaf4383823f135220716ab49bea5fbea7dd42cc9a92f8aa31"
 dependencies = [
  "logos-codegen",
-]
-
-[[package]]
-name = "lws-agent"
-version = "0.3.3"
-dependencies = [
- "anyhow",
- "ashpd",
- "clipboard",
- "config",
- "edgefx",
- "input-model",
- "ipc",
- "logging",
- "platform-probe",
- "platform-wayland",
- "platform-win",
- "platform-x11",
- "protocol",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "windows",
- "windows-sys 0.61.2",
- "x11rb 0.14.0",
-]
-
-[[package]]
-name = "lws-core"
-version = "0.3.3"
-dependencies = [
- "anyhow",
- "clipboard",
- "config",
- "edgefx",
- "focus-router",
- "geometry",
- "identity",
- "input-model",
- "ipc",
- "logging",
- "lws-desktop",
- "platform-probe",
- "protocol",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "toml 1.1.8+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "transport",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "lws-desktop"
-version = "0.3.3"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "lws-gui"
-version = "0.3.3"
-dependencies = [
- "config",
- "eframe",
- "egui_kittest",
- "flate2",
- "ipc",
- "logging",
- "lws-desktop",
- "protocol",
- "ring",
- "semver",
- "serde",
- "serde_json",
- "spki",
- "tar",
- "tokio",
- "toml 1.1.8+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "ui-text",
- "ureq",
- "url",
- "windows-sys 0.61.2",
- "winit",
-]
-
-[[package]]
-name = "lws-tray"
-version = "0.3.3"
-dependencies = [
- "config",
- "ipc",
- "ksni",
- "lws-desktop",
- "protocol",
- "tokio",
- "ui-text",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3120,7 +3120,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform-probe"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "x11rb 0.14.0",
  "zbus",
@@ -3128,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "platform-wayland"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "ashpd",
  "clipboard",
@@ -3149,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "platform-win"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "clipboard",
  "edgefx",
@@ -3160,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "platform-x11"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "clipboard",
  "input-model",
@@ -3361,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -4424,7 +4424,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "clipboard",
  "focus-router",
@@ -4472,7 +4472,7 @@ dependencies = [
 
 [[package]]
 name = "ui-text"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "serde",
  "toml 1.1.8+spec-1.1.0",

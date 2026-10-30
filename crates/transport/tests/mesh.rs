@@ -88,7 +88,7 @@ impl Drop for TestNode {
 
 fn temp_root(label: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "lws-transport-tests-{}-{}-{label}",
+        "bifrost-transport-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -1868,3 +1868,6 @@ async fn clipboard_routes_and_apply_acks_cross_the_live_control_link() {
     b.kill().await;
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[path = "input_pipeline/loopback.rs"]
+mod input_pipeline;

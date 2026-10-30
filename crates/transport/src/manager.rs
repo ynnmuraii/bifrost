@@ -128,7 +128,7 @@ pub enum DiscoveryRouteError {
 ///
 /// `crates/transport` has no clock helper, and the pairing window is bounded in milliseconds
 /// (`docs/05-protocol.md`: «окно сопряжения … на 120 s»), so the manager keeps its own
-/// `Instant` origin — the same idiom `apps/lws-core/src/session.rs` uses. A monotonic origin
+/// `Instant` origin — the same idiom `apps/bifrost-core/src/session.rs` uses. A monotonic origin
 /// means the window never jumps with the wall clock.
 #[derive(Debug, Clone, Copy)]
 struct Clock {
@@ -1795,7 +1795,7 @@ mod tests {
     ) {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "lws-discovery-{}-{}-{label}",
+            "bifrost-discovery-{}-{}-{label}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));

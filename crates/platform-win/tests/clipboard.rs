@@ -53,7 +53,7 @@ fn wait_for_change(listener: &Clipboard, previous: u32) -> u32 {
 #[ignore = "overwrites the clipboard of whoever runs it"]
 fn a_plain_change_is_seen_and_a_marked_item_is_a_secret() {
     let listener = Clipboard::listen().expect("the listener window");
-    let marker = format!("lws-clipboard-smoke-{}", std::process::id());
+    let marker = format!("bifrost-clipboard-smoke-{}", std::process::id());
 
     // 1. An external writer changes the clipboard; the adapter must see it and read it.
     let before = listener.sequence();
@@ -112,7 +112,7 @@ try {
     );
 
     // 3. Clean up: leave plain text behind, never the marked item.
-    powershell("Set-Clipboard -Value 'lws-clipboard-smoke done'");
+    powershell("Set-Clipboard -Value 'bifrost-clipboard-smoke done'");
 }
 
 /// The writer half of the adapter: text this process puts on the clipboard is exactly what
@@ -128,7 +128,7 @@ fn a_written_text_round_trips_and_clearing_removes_it() {
     // Non-ASCII and non-BMP, so the UTF-16 encoding is exercised for real (a Cyrillic
     // letter is one code unit, the crab is a surrogate pair).
     let text = format!(
-        "lws-clipboard-write-{}\u{4F60}\u{597D}\u{1F980}",
+        "bifrost-clipboard-write-{}\u{4F60}\u{597D}\u{1F980}",
         std::process::id()
     );
     let before = listener.sequence();

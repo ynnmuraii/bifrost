@@ -19,7 +19,7 @@ not part of a shipped artifact. The same policy is enforced as a gate by
 The GUI disables egui's default fonts and embeds the OFL-licensed families listed below.
 These licence texts must travel with the binary.
 
-The fonts bundled with `lws-gui` (Geist, Geist Mono, Silkscreen; `apps/lws-gui/assets/fonts/`) are
+The fonts bundled with `bifrost-gui` (Geist, Geist Mono, Silkscreen; `apps/bifrost-gui/assets/fonts/`) are
 not crates and are therefore not produced by cargo-about: the last section is static text kept in
 `licenses/notices.hbs`. `cargo deny` / `about.toml` do not see it either — update the section by
 hand whenever a font file is added, replaced or removed.
@@ -48,7 +48,7 @@ Used by:
 
 These three families are not crates, so cargo-about does not see them: this section is static text in
 `licenses/notices.hbs`, copied verbatim into the generated file. The subsetted TrueType files live in
-`apps/lws-gui/assets/fonts/` (provenance and subset command in `README.txt` there, licence texts in
+`apps/bifrost-gui/assets/fonts/` (provenance and subset command in `README.txt` there, licence texts in
 `OFL-*.txt`). The outlines are unmodified upstream data; none of the three declares a Reserved Font Name.
 
 ```text

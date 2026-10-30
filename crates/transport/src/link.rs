@@ -1,14 +1,10 @@
 //! One peer's input/control link: TLS, `Hello`, framed envelopes, liveness.
 //!
-//! A link is a Tokio task plus a cloneable [`LinkHandle`]. The task owns the socket and the
-//! per-direction `seq` counter; the handle owns the bounded outbound queue.
-//!
-//! # Why the reader is its own task, and why the coordinator never writes inside `select!`
-//!
-//! `read_exact` is not cancellation-safe: cancelling it mid-frame consumes bytes and
-//! desynchronises the stream. The link therefore splits the TLS stream (`tokio::io::split`)
-//! into a reader task that only reads whole frames, and a coordinator that picks a step with
-//! `select!` and then performs the write *after* the `select!` returned.
+//! A cloneable handle admits bounded intents without waiting for socket capacity.
+//! Reader, coordinator and writer are independent tasks. The writer exclusively owns the
+//! WriteHalf, outbound sequence and display state; whole frames are never interleaved.
+//! The reader never cancels a partially consumed frame. Terminal timeouts destroy the
+//! stream rather than attempting to resume a partial write.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -30,8 +26,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::convert::{self, PeerInfo};
+use crate::input_metrics::{AckTracker, Counter, InputMetrics, Stage};
 use crate::policy::{self, LivenessAction};
-use crate::queue::{self, Outbound};
+use crate::queue::{InputQueue, InputSample, Intent, Outbound};
 use crate::rtt::{RttMeter, RttSnapshot};
 use crate::TransportError;
 
@@ -199,16 +196,43 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
         .ok_or_else(|| TransportError::Protocol("incomplete frame".into()))
 }
 
-/// Writes one framed `Envelope` and flushes buffered transports such as TLS.
+/// The input stream is terminal after either deadline; partial frames are never resumed.
+pub const INPUT_WRITE_IDLE_TIMEOUT: Duration = Duration::from_millis(600);
+pub const INPUT_FRAME_DEADLINE: Duration = Duration::from_millis(1000);
+pub const GRACEFUL_CLOSE_BUDGET: Duration = Duration::from_millis(100);
+
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     envelope: &wire::Envelope,
 ) -> Result<(), TransportError> {
     let bytes = encode_message(Channel::InputControl, envelope)
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
-    writer.write_all(&bytes).await?;
-    writer.flush().await?;
-    Ok(())
+    let deadline = tokio::time::Instant::now() + INPUT_FRAME_DEADLINE;
+    let mut idle = tokio::time::Instant::now() + INPUT_WRITE_IDLE_TIMEOUT;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let n = tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => return Err(write_timeout("frame deadline")),
+            () = tokio::time::sleep_until(idle) => return Err(write_timeout("idle timeout")),
+            result = writer.write(&bytes[offset..]) => result?,
+        };
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+        }
+        offset += n;
+        idle = tokio::time::Instant::now() + INPUT_WRITE_IDLE_TIMEOUT;
+    }
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => Err(write_timeout("frame deadline")),
+        () = tokio::time::sleep_until(idle) => Err(write_timeout("idle timeout")),
+        result = writer.flush() => result.map_err(Into::into),
+    }
+}
+
+fn write_timeout(reason: &'static str) -> TransportError {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, reason).into()
 }
 
 #[cfg(test)]
@@ -259,7 +283,7 @@ mod tests {
                 ..Default::default()
             };
             write_frame(&mut sender, &envelope).await.unwrap();
-            let decoded = frames_rx.recv().await.unwrap().unwrap();
+            let (decoded, _) = frames_rx.recv().await.unwrap().unwrap();
             let raw = format!("{:?}", counters.lease_challenge_trace([7; 16]));
             let raw_stage = match &decoded.payload {
                 Some(wire::envelope::Payload::LeaseChallenge(_)) => "challenge_raw_decode",
@@ -591,30 +615,68 @@ fn edge_snapshot(counters: &[AtomicU64; 6]) -> input_model::EdgeCounters {
 #[derive(Debug, Clone)]
 pub struct LinkHandle {
     peer: NodeId,
-    tx: mpsc::Sender<Outbound>,
-    unpair_tx: mpsc::Sender<(wire::Unpaired, tokio::sync::oneshot::Sender<bool>)>,
+    local: NodeId,
+    queue: Arc<InputQueue>,
+    terminal: tokio::sync::watch::Sender<Option<LinkDownReason>>,
     dropped_motion: Arc<AtomicU64>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
+    metrics: Arc<Mutex<InputMetrics>>,
+    ack_tracker: Arc<Mutex<AckTracker>>,
     /// This connection's `Ping`/`Pong` measurements; a reconnect starts a new one.
     rtt: Arc<Mutex<RttMeter>>,
     /// Ends the link's task without depending on the queue's capacity.
     ///
-    /// The bounded outbound queue is the normal path (`close` puts a `Shutdown` in it), but a
-    /// saturated queue must not be able to swallow the request: the link would then run on
-    /// with nothing left to close it, and the peer would see the socket go instead of a
-    /// `Shutdown` (audit F3).
+    /// Closing is out-of-band even when all bounded queues are full.
     shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl LinkHandle {
-    /// Completes only after the notice has been flushed, and closes this link gracefully.
+    /// Published aggregate diagnostics contain durations and counters only.
+    pub fn input_metrics(&self) -> crate::input_metrics::InputMetricsSnapshot {
+        self.metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot()
+    }
+
+    /// Immediately invalidates pending input without delaying local release.
+    pub fn abort_input_lease(&self, lease_id: [u8; 16]) {
+        let discarded = self.queue.abort_lease(lease_id);
+        self.metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Counter::MotionDiscardedOnLeaseEnd, discarded);
+        self.ack_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_lease(0, lease_id);
+    }
+    /// Success means the notice was flushed, not merely admitted.
     pub async fn send_unpaired(&self, notice: wire::Unpaired) -> Result<(), TransportError> {
-        let (reply, result) = tokio::sync::oneshot::channel();
-        self.unpair_tx
-            .send((notice, reply))
-            .await
-            .map_err(|_| TransportError::LinkClosed)?;
-        if result.await.unwrap_or(false) {
+        if !self.queue.unpair_allowed()
+            || notice.requester_node_id.as_slice() != self.local.as_bytes()
+        {
+            return Err(TransportError::LinkClosed);
+        }
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        let mut terminal = self.terminal.subscribe();
+        self.admit(self.queue.urgent(Intent::Unpair(notice, reply)))?;
+        let deadline = self.queue.begin_close();
+        self.shutdown.notify_one();
+        let result = tokio::time::timeout_at(deadline, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut result => return result.unwrap_or(false),
+                    _ = terminal.changed() => {
+                        if terminal.borrow().as_ref().is_some_and(|reason| *reason != LinkDownReason::LocalClosed) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }).await.unwrap_or(false);
+        if result {
             Ok(())
         } else {
             Err(TransportError::LinkClosed)
@@ -626,158 +688,191 @@ impl LinkHandle {
         &self.peer
     }
 
-    /// Enqueues a message.
-    ///
-    /// Control messages and any batch containing a key/button/scroll edge wait for space
-    /// (bounded backpressure, never a silent drop). A **motion-only** batch is dropped when
-    /// the queue is saturated, because the next position supersedes it; the drop is counted
-    /// and visible through [`LinkHandle::dropped_motion_batches`].
+    /// Admission never waits for network capacity. Critical overflow fails closed.
     pub async fn send(&self, message: fr::Message) -> Result<(), TransportError> {
-        match queue::outbound_of(message) {
-            Outbound::Motion { lease_id, events } => {
-                self.send_motion(lease_id, events);
-                Ok(())
+        match message {
+            fr::Message::InputBatch {
+                lease_id, events, ..
+            } => {
+                self.send_timed_input(
+                    lease_id,
+                    events.into_iter().map(|e| (e, None)).collect(),
+                    None,
+                )
+                .await
             }
-            Outbound::Guaranteed(message) => {
-                static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
-                let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
-                let result = self.tx.send(Outbound::Guaranteed(message)).await;
-                let elapsed = started.map_or(Duration::ZERO, |start| start.elapsed());
-                if elapsed >= Duration::from_millis(10)
-                    && tracing::enabled!(tracing::Level::DEBUG)
-                    && LOG_RATE.allow()
-                {
-                    tracing::debug!(
-                        peer = ?self.peer,
-                        elapsed_ms = elapsed.as_millis(),
-                        remaining_capacity = self.tx.capacity(),
-                        "outbound queue blocked"
-                    );
+            message => {
+                let closing = matches!(message, fr::Message::Shutdown { .. });
+                let result = self.admit(self.queue.push(Outbound::Guaranteed(message)));
+                if result.is_ok() && closing {
+                    self.close();
                 }
-                result.map_err(|_| TransportError::LinkClosed)
+                result
             }
-            // `outbound_of` never produces this arm; it exists because `Outbound` is shared.
-            Outbound::Layout(message) => self.send_layout(message).await,
-            // The same: a clipboard message is queued through `send_clipboard`, never here.
-            Outbound::Clipboard(message) => self.send_clipboard(message).await,
-            Outbound::CapabilitiesChanged(capabilities) => {
-                self.send_capabilities(capabilities).await
-            }
-            Outbound::UpdateRequest(request) => self.send_update_request(request).await,
-            Outbound::UpdateResult(result) => self.send_update_result(result).await,
-            Outbound::ClipboardApplied(applied) => self.send_clipboard_applied(applied).await,
-            Outbound::ClipboardRoute(route) => self.send_clipboard_route(route).await,
         }
     }
 
-    /// Sends the replacement capability set on the bounded, guaranteed control queue.
-    pub async fn send_capabilities(&self, capabilities: Vec<i32>) -> Result<(), TransportError> {
-        self.tx
-            .send(Outbound::CapabilitiesChanged(capabilities))
-            .await
-            .map_err(|_| TransportError::LinkClosed)
+    fn admit(&self, result: Result<(), TransportError>) -> Result<(), TransportError> {
+        if let Err(TransportError::Protocol(reason)) = &result {
+            self.metrics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .increment(Counter::CriticalOverflow, 1);
+            set_terminal_once(&self.terminal, || LinkDownReason::Protocol(reason.clone()));
+            self.queue.abort();
+        }
+        if result.is_ok() {
+            self.metrics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .increment(Counter::QueueHighWater, self.queue.depth() as u64);
+        }
+        result
     }
 
-    /// Sends an update request on the guaranteed queue; core gates the peer capability.
+    /// Capture metadata is source-host diagnostic time, never receiver-clock time.
+    pub async fn send_timed_input(
+        &self,
+        lease_id: [u8; 16],
+        events: Vec<(InputEvent, Option<u64>)>,
+        enqueue_host_us: Option<u64>,
+    ) -> Result<(), TransportError> {
+        let now = tokio::time::Instant::now();
+        let samples = events
+            .into_iter()
+            .map(|(event, capture)| {
+                let capture = capture.filter(|value| *value != 0);
+                InputSample {
+                    event,
+                    capture_host_us: capture,
+                    capture_to_enqueue_us: enqueue_host_us
+                        .zip(capture)
+                        .and_then(|(now, capture)| now.checked_sub(capture)),
+                    enqueued_at: now,
+                }
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
+            for sample in &samples {
+                if let Some(age) = sample.capture_to_enqueue_us {
+                    metrics.record(Stage::CaptureToEnqueue, age);
+                } else {
+                    metrics.unknown(Stage::CaptureToEnqueue);
+                }
+            }
+        }
+        let result = self.queue.input(lease_id, samples);
+        match result {
+            Ok(overwritten) => {
+                self.dropped_motion
+                    .fetch_add(overwritten, Ordering::Relaxed);
+                self.metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .increment(Counter::MotionOverwritten, overwritten);
+                self.metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .increment(Counter::Coalesced, overwritten);
+                self.metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .increment(Counter::QueueHighWater, self.queue.depth() as u64);
+                Ok(())
+            }
+            Err(error) => self.admit(Err(error)),
+        }
+    }
+
+    pub async fn send_capabilities(&self, capabilities: Vec<i32>) -> Result<(), TransportError> {
+        self.admit(self.queue.push(Outbound::CapabilitiesChanged(capabilities)))
+    }
     pub async fn send_update_request(
         &self,
         request: wire::UpdateRequest,
     ) -> Result<(), TransportError> {
         convert::validate_update_version(&request.target_version)
-            .map_err(|error| TransportError::Protocol(error.to_string()))?;
-        self.tx
-            .send(Outbound::UpdateRequest(request))
-            .await
-            .map_err(|_| TransportError::LinkClosed)
+            .map_err(|e| TransportError::Protocol(e.to_string()))?;
+        self.admit(self.queue.push(Outbound::UpdateRequest(request)))
     }
-
-    /// Sends update progress on the guaranteed queue; core gates the peer capability.
     pub async fn send_update_result(
         &self,
         result: wire::UpdateResult,
     ) -> Result<(), TransportError> {
         convert::validate_update_result(&result)
-            .map_err(|error| TransportError::Protocol(error.to_string()))?;
-        self.tx
-            .send(Outbound::UpdateResult(result))
-            .await
-            .map_err(|_| TransportError::LinkClosed)
+            .map_err(|e| TransportError::Protocol(e.to_string()))?;
+        self.admit(self.queue.push(Outbound::UpdateResult(result)))
     }
-
-    /// Sends a backend application result; core gates the peer's routing capability.
     pub async fn send_clipboard_applied(
         &self,
         applied: wire::ClipboardApplied,
     ) -> Result<(), TransportError> {
         convert::validate_clipboard_applied(&applied)
-            .map_err(|error| TransportError::Protocol(error.to_string()))?;
-        self.tx
-            .send(Outbound::ClipboardApplied(applied))
-            .await
-            .map_err(|_| TransportError::LinkClosed)
+            .map_err(|e| TransportError::Protocol(e.to_string()))?;
+        self.admit(self.queue.push(Outbound::ClipboardApplied(applied)))
     }
-
-    /// Sends metadata-only routing; core gates the peer's routing capability.
     pub async fn send_clipboard_route(
         &self,
         route: wire::ClipboardRoute,
     ) -> Result<(), TransportError> {
         convert::validate_clipboard_route(&route)
-            .map_err(|error| TransportError::Protocol(error.to_string()))?;
-        self.tx
-            .send(Outbound::ClipboardRoute(route))
-            .await
-            .map_err(|_| TransportError::LinkClosed)
+            .map_err(|e| TransportError::Protocol(e.to_string()))?;
+        self.admit(self.queue.push(Outbound::ClipboardRoute(route)))
     }
-
-    /// Sends one layout-document message (KVM-072).
-    ///
-    /// Always guaranteed and never coalesced: a document, its CAS and the confirmations around
-    /// them are control traffic, and a dropped `TopologyApplied` would leave the coordinator
-    /// waiting forever.
     pub async fn send_layout(
         &self,
         message: crate::convert::LayoutMessage,
     ) -> Result<(), TransportError> {
-        self.tx
-            .send(Outbound::Layout(message))
-            .await
-            .map_err(|_| TransportError::LinkClosed)
+        self.admit(self.queue.push(Outbound::Layout(message)))
     }
-
-    /// Sends one clipboard message on this link.
-    ///
-    /// The grant is the only clipboard message the input link carries, and it has to reach the
-    /// peer *before* the channel it authorises exists (`docs/05-protocol.md`, «Clipboard канал»);
-    /// every later clipboard message travels on that channel instead.
     pub async fn send_clipboard(
         &self,
         message: crate::clipboard::ClipboardMessage,
     ) -> Result<(), TransportError> {
-        self.tx
-            .send(Outbound::Clipboard(message))
-            .await
-            .map_err(|_| TransportError::LinkClosed)
+        self.admit(self.queue.push(Outbound::Clipboard(message)))
     }
 
-    /// Enqueues pointer motion without waiting; returns whether it was queued.
-    ///
-    /// `lease_id` is the lease the motion belongs to and rides with it into the queue so the
-    /// written batch keeps it (see [`Outbound::Motion`]).
+    /// Replaces the latest absolute position even while the ordered FIFO is full.
     pub fn send_motion(&self, lease_id: [u8; 16], events: Vec<InputEvent>) -> bool {
-        if events.is_empty() {
-            return true;
+        if events
+            .iter()
+            .any(|event| !matches!(event, InputEvent::PointerAbsolute(_)))
+        {
+            return false;
         }
-        match self.tx.try_send(Outbound::Motion { lease_id, events }) {
-            Ok(()) => true,
-            Err(_) => {
-                self.dropped_motion.fetch_add(1, Ordering::Relaxed);
+        let sample_count = events.len();
+        let now = tokio::time::Instant::now();
+        let samples = events
+            .into_iter()
+            .map(|event| InputSample {
+                event,
+                capture_host_us: None,
+                capture_to_enqueue_us: None,
+                enqueued_at: now,
+            })
+            .collect();
+        match self.queue.input(lease_id, samples) {
+            Ok(overwritten) => {
+                self.dropped_motion
+                    .fetch_add(overwritten, Ordering::Relaxed);
+                let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
+                metrics.increment(Counter::MotionOverwritten, overwritten);
+                metrics.increment(Counter::Coalesced, overwritten);
+                metrics.increment(Counter::QueueHighWater, self.queue.depth() as u64);
+                for _ in 0..sample_count {
+                    metrics.unknown(Stage::CaptureToEnqueue);
+                }
+                true
+            }
+            Err(error) => {
+                let _ = self.admit(Err(error));
                 false
             }
         }
     }
 
-    /// Motion batches dropped because the queue was saturated.
+    /// Superseded motion samples (the latest resting point is retained, not dropped).
     pub fn dropped_motion_batches(&self) -> u64 {
         self.dropped_motion.load(Ordering::Relaxed)
     }
@@ -812,31 +907,25 @@ impl LinkHandle {
 
     #[cfg(test)]
     pub(crate) fn for_counter_test(peer: NodeId) -> Self {
-        let (tx, _rx) = mpsc::channel(1);
-        let (unpair_tx, _unpair_rx) = mpsc::channel(1);
+        let (terminal, _) = tokio::sync::watch::channel(None);
         Self {
             peer,
-            tx,
-            unpair_tx,
+            queue: Arc::new(InputQueue::new(1)),
+            terminal,
+            local: NodeId::new([0; 32]),
             dropped_motion: Arc::new(AtomicU64::new(0)),
             lease_diagnostics: Arc::new(LeaseTransportCounters::default()),
+            metrics: Arc::new(Mutex::new(InputMetrics::default())),
+            ack_tracker: Arc::new(Mutex::new(AckTracker::default())),
             rtt: Arc::new(Mutex::new(RttMeter::default())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Asks the link to close: a `Shutdown` is queued, and the task ends after writing it.
-    ///
-    /// The queued frame is the in-order path (whatever is already queued goes out first). If
-    /// the queue is saturated the request must not be lost: the link's own task is the only
-    /// writer, so it is signalled instead and writes the `Shutdown` itself.
+    /// Requests bounded drain and Shutdown without waiting for queue capacity.
     pub fn close(&self) {
-        let shutdown = Outbound::Guaranteed(fr::Message::Shutdown {
-            reason: fr::LeaveReason::Shutdown,
-        });
-        if self.tx.try_send(shutdown).is_err() {
-            self.shutdown.notify_one();
-        }
+        self.queue.begin_close();
+        self.shutdown.notify_one();
     }
 }
 
@@ -912,35 +1001,61 @@ pub struct LinkConfig {
     pub liveness: policy::LinkLiveness,
 }
 
-/// Spawns a link and returns its handle and task.
+/// Spawns independent reader, coordinator and writer tasks.
 pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
-    let (tx, rx) = mpsc::channel::<Outbound>(config.queue_capacity.max(1));
-    let (unpair_tx, unpair_rx) = mpsc::channel(1);
-    let dropped_motion = Arc::new(AtomicU64::new(0));
-    let lease_diagnostics = Arc::new(LeaseTransportCounters::default());
+    let queue = Arc::new(InputQueue::new(config.queue_capacity));
+    let (terminal, _) = tokio::sync::watch::channel(None);
+    let diagnostics = Arc::new(LeaseTransportCounters::default());
+    let metrics = Arc::new(Mutex::new(InputMetrics::default()));
+    let tracker = Arc::new(Mutex::new(AckTracker::default()));
     let rtt = Arc::new(Mutex::new(RttMeter::default()));
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let handle = LinkHandle {
         peer: config.peer,
-        tx,
-        unpair_tx,
-        dropped_motion,
-        lease_diagnostics: Arc::clone(&lease_diagnostics),
-        rtt: Arc::clone(&rtt),
-        shutdown: Arc::clone(&shutdown),
+        queue,
+        terminal,
+        local: config.local,
+        dropped_motion: Arc::new(AtomicU64::new(0)),
+        lease_diagnostics: diagnostics,
+        metrics,
+        ack_tracker: tracker,
+        rtt,
+        shutdown,
     };
-    let task = tokio::spawn(run(config, rx, lease_diagnostics, rtt, shutdown, unpair_rx));
+    let task = tokio::spawn(run(config, handle.clone()));
     Ok(Link { handle, task })
 }
 
-async fn run(
-    config: LinkConfig,
-    outbound: mpsc::Receiver<Outbound>,
-    lease_diagnostics: Arc<LeaseTransportCounters>,
-    rtt: Arc<Mutex<RttMeter>>,
-    shutdown: Arc<tokio::sync::Notify>,
-    mut unpair_rx: mpsc::Receiver<(wire::Unpaired, tokio::sync::oneshot::Sender<bool>)>,
-) {
+/// Dropping a Tokio JoinHandle detaches it; aborting the coordinator must close both halves.
+struct LinkTaskLifetime {
+    reader: tokio::task::AbortHandle,
+    writer: tokio::task::AbortHandle,
+    queue: Arc<InputQueue>,
+    terminal: tokio::sync::watch::Sender<Option<LinkDownReason>>,
+}
+
+impl Drop for LinkTaskLifetime {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+        self.queue.abort();
+        set_terminal_once(&self.terminal, || {
+            LinkDownReason::Io("coordinator stopped".into())
+        });
+    }
+}
+
+async fn run(config: LinkConfig, handle: LinkHandle) {
+    let LinkHandle {
+        queue,
+        terminal,
+        lease_diagnostics: diagnostics,
+        metrics,
+        ack_tracker: tracker,
+        rtt,
+        shutdown,
+        ..
+    } = handle;
     let LinkConfig {
         key,
         peer,
@@ -951,7 +1066,6 @@ async fn run(
         liveness,
         ..
     } = config;
-
     let connection_id = if direction.is_outgoing() {
         match identity::random16() {
             Ok(id) => id,
@@ -967,9 +1081,7 @@ async fn run(
             }
         }
     } else {
-        // The acceptor adopts the dialer's id during the handshake; until then it writes
-        // nothing, so the placeholder can never reach the wire.
-        [0u8; 16]
+        [0; 16]
     };
     let mut handshake = if direction.is_outgoing() {
         HelloHandshake::dialer(
@@ -980,197 +1092,188 @@ async fn run(
     } else {
         HelloHandshake::acceptor(limits::PROTOCOL_MAJOR, limits::PROTOCOL_MINOR)
     };
-
-    // Read before the split: both halves are needed afterwards, and the address is what a
-    // later clipboard dial is built from.
     let remote = stream.peer_addr().ok();
-    let (reader, mut writer) = tokio::io::split(stream);
-    let (frames_tx, mut frames_rx) = mpsc::channel::<Result<wire::Envelope, TransportError>>(8);
-    let reader_task = tokio::spawn(read_loop(reader, frames_tx, Arc::clone(&lease_diagnostics)));
-
-    let mut state = LinkState::new(peer, connection_id, key, lease_diagnostics, rtt);
+    let (reader, writer) = tokio::io::split(stream);
+    let (frames_tx, mut frames_rx) = mpsc::channel(8);
+    let reader_task = tokio::spawn(read_loop(reader, frames_tx, Arc::clone(&diagnostics)));
+    let writer_state = WriterState {
+        tx_seq: 1,
+        connection_id,
+        batch_display: String::new(),
+        lease_diagnostics: Arc::clone(&diagnostics),
+        rtt: Arc::clone(&rtt),
+    };
+    let mut writer_task = tokio::spawn(writer_loop(
+        writer,
+        Arc::clone(&queue),
+        terminal.clone(),
+        writer_state,
+        Arc::clone(&metrics),
+        Arc::clone(&tracker),
+        local_hello.clone(),
+    ));
+    let _task_lifetime = LinkTaskLifetime {
+        reader: reader_task.abort_handle(),
+        writer: writer_task.abort_handle(),
+        queue: Arc::clone(&queue),
+        terminal: terminal.clone(),
+    };
+    let mut state = LinkState::new(
+        peer,
+        connection_id,
+        key,
+        diagnostics,
+        rtt,
+        Arc::clone(&metrics),
+        Arc::clone(&tracker),
+    );
     state.remote = remote;
-
-    // The dialer speaks first: its `Hello` is the first frame of its direction (`seq = 1`).
-    if direction.is_outgoing() {
-        match state
-            .write_hello(&mut writer, &mut handshake, local_hello.clone())
-            .await
-        {
-            Ok(()) => {}
-            Err(reason) => {
-                reader_task.abort();
-                report_down(&reports, key, peer, reason).await;
-                return;
+    let mut failure = terminal.subscribe();
+    let initial = if direction.is_outgoing() {
+        state
+            .write_hello(&queue, &mut handshake, local_hello.clone())
+            .err()
+    } else {
+        None
+    };
+    let reason = if let Some(reason) = initial {
+        reason
+    } else {
+        loop {
+            if let Some(reason) = failure.borrow().clone() {
+                break reason;
             }
-        }
-    }
-
-    let mut outbound = outbound;
-    let mut unpair_reply = None;
-    let reason = loop {
-        let now_ms = state.started.elapsed().as_millis() as u64;
-        let wake =
-            policy::next_liveness_wakeup(now_ms, state.last_pong_ms, state.last_ping_ms, liveness);
-        let sleep = Duration::from_millis(wake.saturating_sub(now_ms).max(1));
-
-        enum Step {
-            Frame,
-            Outbound(Option<Outbound>),
-            Unpair(wire::Unpaired, tokio::sync::oneshot::Sender<bool>),
-            Tick,
-            /// `close()` could not use the queue (it was full): the request came out of band.
-            Shutdown,
-        }
-
-        // Keep the decoded envelope on the stack without inflating every selected event.
-        let mut incoming = None;
-        let step = tokio::select! {
-            frame = frames_rx.recv() => {
-                incoming = frame;
-                Step::Frame
-            },
-            item = outbound.recv() => Step::Outbound(item),
-            Some((notice, reply)) = unpair_rx.recv() => Step::Unpair(notice, reply),
-            () = tokio::time::sleep(sleep) => Step::Tick,
-            () = shutdown.notified() => Step::Shutdown,
-        };
-
-        match step {
-            Step::Unpair(notice, reply) => {
-                let sent = state.announced
-                    && state.unpair_notice
-                    && notice.requester_node_id == local_hello.node_id;
-                let sent = if sent {
-                    let envelope = state.envelope(wire::envelope::Payload::Unpaired(notice));
-                    write_frame(&mut writer, &envelope).await.is_ok()
-                } else {
-                    false
-                };
-                if sent {
-                    unpair_reply = Some(reply);
-                    break LinkDownReason::LocalClosed;
-                }
-                let _ = reply.send(false);
-            }
-            Step::Frame => match incoming {
-                None => break LinkDownReason::Io("reader stopped".into()),
-                Some(Err(error)) => {
-                    if matches!(&error, TransportError::Io(error) if crate::unpair::unknown_peer_alert(error))
-                    {
-                        let _ = reports.send(LinkReport::PeerRejected { peer }).await;
-                    }
-                    break reason_from(error);
-                }
-                Some(Ok(envelope)) => {
-                    match state
-                        .on_frame(
-                            &mut writer,
-                            &mut handshake,
-                            &envelope,
-                            &local_hello,
-                            &reports,
-                        )
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(reason) => break reason,
-                    }
-                }
-            },
-            Step::Outbound(None) => break LinkDownReason::LocalClosed,
-            Step::Outbound(Some(first)) => {
-                if let Err(reason) =
-                    drain_outbound(&mut writer, &mut outbound, first, &mut state).await
-                {
-                    break reason;
-                }
-            }
-            Step::Shutdown => {
-                // `close()` found the queue full. This task is the link's only writer, so the
-                // frame is written here rather than lost (audit F3); the peer sees a
-                // `Shutdown` instead of a bare socket close. Failing to write it (a dead
-                // socket) still ends the link.
-                //
-                // What the queue already holds goes first: a queued key or button edge must
-                // not be lost to a close, and `select!` would otherwise be free to pick this
-                // branch before `Step::Outbound` and drop it (found by the link_close test
-                // under load: the peer read the `Hello` and the `Shutdown` but not the motion
-                // batch that was waiting between them).
-                if let Ok(first) = outbound.try_recv() {
-                    if let Err(reason) =
-                        drain_outbound(&mut writer, &mut outbound, first, &mut state).await
-                    {
-                        break reason;
-                    }
-                }
-                let _ = write_message(
-                    &mut writer,
-                    &mut state,
-                    fr::Message::Shutdown {
-                        reason: fr::LeaveReason::Shutdown,
-                    },
-                )
-                .await;
-                break LinkDownReason::LocalClosed;
-            }
-            Step::Tick => {
-                let now_ms = state.started.elapsed().as_millis() as u64;
-                match policy::liveness_action(
-                    now_ms,
-                    state.last_pong_ms,
-                    state.last_ping_ms,
-                    liveness,
-                ) {
-                    LivenessAction::Ping => {
-                        if let Err(reason) = state.send_ping(&mut writer).await {
-                            break reason;
+            let now_ms = state.started.elapsed().as_millis() as u64;
+            let wake = policy::next_liveness_wakeup(
+                now_ms,
+                state.last_pong_ms,
+                state.last_ping_ms,
+                liveness,
+            );
+            let sleep = Duration::from_millis(wake.saturating_sub(now_ms).max(1));
+            tokio::select! {
+                biased;
+                _ = failure.changed() => break failure.borrow().clone().unwrap_or(LinkDownReason::LocalClosed),
+                () = shutdown.notified() => break LinkDownReason::LocalClosed,
+                frame = frames_rx.recv() => {
+                    match frame {
+                        None => break LinkDownReason::Io("reader stopped".into()),
+                        Some(Err(error)) => {
+                            if matches!(&error, TransportError::Io(error) if crate::unpair::unknown_peer_alert(error)) {
+                                let _ = reports.try_send(LinkReport::PeerRejected { peer });
+                            }
+                            break reason_from(error);
+                        }
+                        Some(Ok((envelope, decoded_at))) => {
+                            metrics.lock().unwrap_or_else(|e| e.into_inner())
+                                .record(Stage::InboundDispatch, duration_us(tokio::time::Instant::now().duration_since(decoded_at)));
+                            let outcome = tokio::select! {
+                                biased;
+                                _ = failure.changed() => Err(failure.borrow().clone().unwrap_or(LinkDownReason::LocalClosed)),
+                                () = shutdown.notified() => Err(LinkDownReason::LocalClosed),
+                                result = state.on_frame(&queue, &mut handshake, &envelope, &local_hello, &reports) => result,
+                            };
+                            if let Err(reason) = outcome { break reason; }
                         }
                     }
-                    LivenessAction::Offline => break LinkDownReason::Timeout,
-                    LivenessAction::Idle => {}
+                }
+                () = tokio::time::sleep(sleep) => {
+                    let now_ms = state.started.elapsed().as_millis() as u64;
+                    match policy::liveness_action(now_ms, state.last_pong_ms, state.last_ping_ms, liveness) {
+                        LivenessAction::Ping if state.announced => {
+                            state.ping_nonce = state.ping_nonce.wrapping_add(1);
+                            state.last_ping_ms = Some(now_ms);
+                            if let Err(error) = queue.urgent(Intent::Payload(wire::envelope::Payload::Ping(
+                                wire::Ping { nonce: state.ping_nonce },
+                            ))) { break reason_from(error); }
+                        }
+                        LivenessAction::Offline => break LinkDownReason::Timeout,
+                        _ => {}
+                    }
+                    let expired = {
+                        let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+                        let before = tracker.pending_expired;
+                        tracker.expire(tokio::time::Instant::now());
+                        tracker.pending_expired.saturating_sub(before)
+                    };
+                    metrics.lock().unwrap_or_else(|e| e.into_inner())
+                        .increment(Counter::AckPendingExpired, expired);
+                    publish_metrics(&metrics, tokio::time::Instant::now(), false);
                 }
             }
         }
     };
-
-    if reason == LinkDownReason::LocalClosed {
-        // Our own close, so the frames we just wrote are ours to deliver: a `Shutdown`, or the
-        // membership refusal that made the manager close this link. Aborting the reader and
-        // dropping the socket here is not enough — on Windows a close with anything of the
-        // peer's still unread sends a **reset**, and a reset discards the frames the peer has
-        // not read yet. The refused member then reported `Io(... 10054)` instead of
-        // `MEMBERSHIP_FULL` (1 failure in ~100 loaded runs of
-        // `mesh::the_membership_cap_refuses_the_extra_member`; every failure had that shape).
-        //
-        // So: TLS `close_notify` (the peer sees a clean end, not a truncation), then read what
-        // the peer already sent until it ends or the grace runs out, so the receive queue is
-        // empty when the socket goes and the OS has no reason to reset it.
-        let _ = tokio::time::timeout(GRACEFUL_CLOSE_GRACE, writer.shutdown()).await;
-        let _ = tokio::time::timeout(GRACEFUL_CLOSE_GRACE, async {
-            while frames_rx.recv().await.is_some() {}
-        })
-        .await;
+    let deadline = queue.begin_close();
+    set_terminal_once(&terminal, || reason);
+    let reason = terminal
+        .borrow()
+        .clone()
+        .expect("terminal reason was just set");
+    if reason != LinkDownReason::LocalClosed {
+        queue.abort();
     }
-    reader_task.abort();
-    if let Some(reply) = unpair_reply {
-        let _ = reply.send(true);
-    }
-    report_down(&reports, key, peer, reason).await;
+    let cleanup = async {
+        if reason == LinkDownReason::LocalClosed {
+            if tokio::time::timeout_at(deadline, &mut writer_task)
+                .await
+                .is_err()
+            {
+                metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .increment(Counter::Failed, 1);
+                set_terminal_once(&terminal, || {
+                    LinkDownReason::Io("graceful close budget exhausted".into())
+                });
+            }
+            let _ = tokio::time::timeout_at(deadline, async {
+                while frames_rx.recv().await.is_some() {}
+            })
+            .await;
+        }
+        writer_task.abort();
+        reader_task.abort();
+    };
+    tokio::join!(report_down(&reports, key, peer, reason.clone()), cleanup);
+    queue.abort();
+    tracker.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    publish_metrics(&metrics, tokio::time::Instant::now(), true);
 }
 
-/// How long a link we are closing ourselves gives the peer to read its last frames.
-///
-/// Bounded, and short: the peer is either reading or it is gone, and a link that refuses to
-/// end would hold the session's cleanup behind it.
-const GRACEFUL_CLOSE_GRACE: Duration = Duration::from_millis(1_000);
+fn set_terminal_once(
+    terminal: &tokio::sync::watch::Sender<Option<LinkDownReason>>,
+    reason: impl FnOnce() -> LinkDownReason,
+) {
+    terminal.send_if_modified(|current| {
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(reason());
+        true
+    });
+}
+
+fn publish_metrics(metrics: &Mutex<InputMetrics>, now: tokio::time::Instant, final_snapshot: bool) {
+    let snapshot = {
+        metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_publication(now, final_snapshot)
+    };
+    if let Some(snapshot) = snapshot {
+        snapshot.publish(final_snapshot);
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
 
 /// The coordinator's mutable state.
 struct LinkState {
     peer: NodeId,
     /// The key the manager gave this link (see [`LinkConfig::key`]).
     key: [u8; 16],
-    tx_seq: u64,
     connection_id: [u8; 16],
     announced: bool,
     unpair_notice: bool,
@@ -1179,8 +1282,6 @@ struct LinkState {
     last_ping_ms: Option<u64>,
     /// Counter for `Ping` nonces (the wire field is a `uint64`).
     ping_nonce: u64,
-    /// Display stamped on outbound batch positions; empty until the model carries one.
-    batch_display: String,
     /// Per-direction sequence validation: «`rx_seq` строго +1. Нарушение приводит к
     /// закрытию CONNECTION».
     rx_seq: SeqValidator,
@@ -1191,6 +1292,8 @@ struct LinkState {
     lease_diagnostics: Arc<LeaseTransportCounters>,
     /// This connection's `Ping`/`Pong` measurement, shared with the handle.
     rtt: Arc<Mutex<RttMeter>>,
+    metrics: Arc<Mutex<InputMetrics>>,
+    ack_tracker: Arc<Mutex<AckTracker>>,
 }
 
 impl LinkState {
@@ -1200,11 +1303,12 @@ impl LinkState {
         key: [u8; 16],
         lease_diagnostics: Arc<LeaseTransportCounters>,
         rtt: Arc<Mutex<RttMeter>>,
+        metrics: Arc<Mutex<InputMetrics>>,
+        ack_tracker: Arc<Mutex<AckTracker>>,
     ) -> Self {
         Self {
             peer,
             key,
-            tx_seq: 1,
             connection_id,
             announced: false,
             unpair_notice: false,
@@ -1212,13 +1316,14 @@ impl LinkState {
             last_pong_ms: 0,
             last_ping_ms: None,
             ping_nonce: 0,
-            batch_display: String::new(),
             rx_seq: SeqValidator::new(),
             remote: None,
             last_batch_log: None,
             last_ack_log: None,
             lease_diagnostics,
             rtt,
+            metrics,
+            ack_tracker,
         }
     }
     fn report_input_batch(&mut self, direction: &'static str, seq: u64, events: &[InputEvent]) {
@@ -1284,57 +1389,22 @@ impl LinkState {
         );
     }
 
-    async fn write_hello<W: AsyncWrite + Unpin>(
+    fn write_hello(
         &mut self,
-        writer: &mut W,
+        queue: &InputQueue,
         handshake: &mut HelloHandshake,
         hello: wire::Hello,
     ) -> Result<(), LinkDownReason> {
         let envelope = handshake
             .local_hello(hello)
             .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
-        self.tx_seq = 2;
-        write_frame(writer, &envelope).await.map_err(reason_from)
-    }
-
-    async fn send_ping<W: AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-    ) -> Result<(), LinkDownReason> {
-        // `wire::Ping.nonce` is a plain `uint64`; a monotonic counter is enough to match a
-        // `Pong` and it cannot collide within a link's lifetime.
-        self.ping_nonce = self.ping_nonce.wrapping_add(1);
-        let envelope = self.envelope(wire::envelope::Payload::Ping(wire::Ping {
-            nonce: self.ping_nonce,
-        }));
-        // The instant is taken before the frame is written, so the measured round trip is
-        // «written, crossed, answered» rather than «already in the socket buffer».
-        let sent_at = Instant::now();
-        write_frame(writer, &envelope).await.map_err(reason_from)?;
-        self.last_ping_ms = Some(self.started.elapsed().as_millis() as u64);
-        self.rtt
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .sent(self.ping_nonce, sent_at);
+        queue.hello(envelope);
         Ok(())
     }
 
-    fn envelope(&mut self, payload: wire::envelope::Payload) -> wire::Envelope {
-        let seq = self.tx_seq;
-        self.tx_seq += 1;
-        wire::Envelope {
-            major: limits::PROTOCOL_MAJOR,
-            minor: limits::PROTOCOL_MINOR,
-            connection_id: self.connection_id.to_vec(),
-            seq,
-            lease_id: Vec::new(),
-            payload: Some(payload),
-        }
-    }
-
-    async fn on_frame<W: AsyncWrite + Unpin>(
+    async fn on_frame(
         &mut self,
-        writer: &mut W,
+        queue: &InputQueue,
         handshake: &mut HelloHandshake,
         envelope: &wire::Envelope,
         local_hello: &wire::Hello,
@@ -1353,13 +1423,29 @@ impl LinkState {
                 .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
         }
 
-        // Liveness frames belong to the transport and never reach the application.
+        // The Hello barrier applies to liveness frames as well.
+        if !self.announced && !matches!(envelope.payload, Some(wire::envelope::Payload::Hello(_))) {
+            return Err(LinkDownReason::Protocol(
+                "a frame arrived before Hello".into(),
+            ));
+        }
+        if self.announced {
+            validate::envelope(envelope).map_err(|e| LinkDownReason::Protocol(format!("{e:?}")))?;
+            if envelope.connection_id.as_slice() != self.connection_id
+                || envelope.major != limits::PROTOCOL_MAJOR
+            {
+                return Err(LinkDownReason::Protocol(
+                    "frame belongs to another connection".into(),
+                ));
+            }
+        }
         match &envelope.payload {
             Some(wire::envelope::Payload::Ping(ping)) => {
-                let pong = self.envelope(wire::envelope::Payload::Pong(wire::Pong {
-                    nonce: ping.nonce,
-                }));
-                return write_frame(writer, &pong).await.map_err(reason_from);
+                return queue
+                    .urgent(Intent::Payload(wire::envelope::Payload::Pong(wire::Pong {
+                        nonce: ping.nonce,
+                    })))
+                    .map_err(reason_from);
             }
             Some(wire::envelope::Payload::Pong(pong)) => {
                 self.last_pong_ms = self.started.elapsed().as_millis() as u64;
@@ -1414,9 +1500,9 @@ impl LinkState {
             // the link the docs say «Первым отправляет `Hello` TCP-инициатор ... принимающая
             // сторона отвечает своим `Hello` с тем же `connection_id`».
             if !handshake.is_established() {
-                self.write_hello(writer, handshake, local_hello.clone())
-                    .await?;
+                self.write_hello(queue, handshake, local_hello.clone())?;
             }
+            queue.ready(self.unpair_notice);
             return reports
                 .send(LinkReport::Up {
                     key: self.key,
@@ -1506,12 +1592,45 @@ impl LinkState {
                 self.report_input_batch("rx", envelope.seq, events);
             }
             convert::Inbound::Focus(fr::Message::InjectAck {
+                lease_id,
                 input_batch_seq,
                 applied_count,
                 status,
                 ..
             }) => {
-                self.report_inject_ack("rx", envelope.seq, *input_batch_seq, *applied_count, status)
+                let (timing, expired) = {
+                    let mut tracker = self.ack_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                    let before = tracker.pending_expired;
+                    let timing = tracker.acknowledge(
+                        0,
+                        *lease_id,
+                        *input_batch_seq,
+                        tokio::time::Instant::now(),
+                    );
+                    (timing, tracker.pending_expired.saturating_sub(before))
+                };
+                {
+                    let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
+                    metrics.increment(Counter::AckPendingExpired, expired);
+                    if let Some((rtt, capture)) = timing {
+                        metrics.increment(Counter::Acked, 1);
+                        metrics.record(Stage::InjectAckRtt, rtt);
+                        if let Some(age) = capture {
+                            metrics.record(Stage::CaptureToAck, age);
+                        } else {
+                            metrics.unknown(Stage::CaptureToAck);
+                        }
+                    } else {
+                        metrics.increment(Counter::AckUnmatched, 1);
+                    }
+                }
+                self.report_inject_ack(
+                    "rx",
+                    envelope.seq,
+                    *input_batch_seq,
+                    *applied_count,
+                    status,
+                );
             }
             _ => {}
         }
@@ -1540,17 +1659,43 @@ impl LinkState {
     }
 }
 
+/// Only this state, moved into the writer task, can allocate outbound sequence numbers.
+struct WriterState {
+    tx_seq: u64,
+    connection_id: [u8; 16],
+    batch_display: String,
+    lease_diagnostics: Arc<LeaseTransportCounters>,
+    rtt: Arc<Mutex<RttMeter>>,
+}
+
+impl WriterState {
+    fn envelope(&mut self, payload: wire::envelope::Payload) -> wire::Envelope {
+        let seq = self.tx_seq;
+        self.tx_seq += 1;
+        wire::Envelope {
+            major: limits::PROTOCOL_MAJOR,
+            minor: limits::PROTOCOL_MINOR,
+            connection_id: self.connection_id.to_vec(),
+            seq,
+            lease_id: Vec::new(),
+            payload: Some(payload),
+        }
+    }
+}
+
 async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: ReadHalf<R>,
-    frames: mpsc::Sender<Result<wire::Envelope, TransportError>>,
+    frames: mpsc::Sender<Result<(wire::Envelope, tokio::time::Instant), TransportError>>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
 ) {
     loop {
         let frame = read_frame(&mut reader).await;
+        let decoded_at = tokio::time::Instant::now();
         if let Ok(envelope) = &frame {
             lease_diagnostics.record_trace(envelope, true, false);
         }
         let stop = frame.is_err();
+        let frame = frame.map(|envelope| (envelope, decoded_at));
         let queued = frames.send(frame).await;
         if queued.is_err() || stop {
             return;
@@ -1558,215 +1703,272 @@ async fn read_loop<R: AsyncRead + Unpin>(
     }
 }
 
-async fn drain_outbound<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    outbound: &mut mpsc::Receiver<Outbound>,
-    first: Outbound,
-    state: &mut LinkState,
-) -> Result<(), LinkDownReason> {
-    // Collect what is already queued (bounded by the channel capacity) so consecutive motion
-    // runs can be merged while every other item keeps its exact position.
-    let mut queued = vec![first];
-    while let Ok(item) = outbound.try_recv() {
-        queued.push(item);
-    }
-    let mut index = 0;
-    while index < queued.len() {
-        match &queued[index] {
-            Outbound::Guaranteed(_) => {
-                let Outbound::Guaranteed(message) = &queued[index] else {
-                    unreachable!()
-                };
-                if matches!(message, fr::Message::Shutdown { .. }) {
-                    write_message(writer, state, message.clone()).await?;
-                    return Err(LinkDownReason::LocalClosed);
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    queue: Arc<InputQueue>,
+    terminal: tokio::sync::watch::Sender<Option<LinkDownReason>>,
+    mut state: WriterState,
+    metrics: Arc<Mutex<InputMetrics>>,
+    tracker: Arc<Mutex<AckTracker>>,
+    local_hello: wire::Hello,
+) {
+    let mut closing = terminal.subscribe();
+    let mut local_close = false;
+    let result = async {
+        loop {
+            // Register before inspecting state: producers cannot lose the final wakeup.
+            let notified = queue.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let reason = closing.borrow().clone();
+            if let Some(reason) = reason {
+                if reason != LinkDownReason::LocalClosed {
+                    return Err(TransportError::LinkClosed);
                 }
-                write_message(writer, state, message.clone()).await?;
-                index += 1;
+                local_close = true;
             }
-            Outbound::Layout(message) => {
-                write_layout_message(writer, state, message.clone()).await?;
-                index += 1;
-            }
-            Outbound::Clipboard(message) => {
-                write_clipboard_message(writer, state, message.clone()).await?;
-                index += 1;
-            }
-            Outbound::CapabilitiesChanged(capabilities) => {
-                let envelope = state.envelope(wire::envelope::Payload::CapabilitiesChanged(
-                    wire::CapabilitiesChanged {
-                        capabilities: capabilities.clone(),
-                    },
-                ));
-                write_frame(writer, &envelope).await.map_err(reason_from)?;
-                index += 1;
-            }
-            Outbound::UpdateRequest(request) => {
-                let envelope =
-                    state.envelope(wire::envelope::Payload::UpdateRequest(request.clone()));
-                write_frame(writer, &envelope).await.map_err(reason_from)?;
-                index += 1;
-            }
-            Outbound::UpdateResult(result) => {
-                let envelope =
-                    state.envelope(wire::envelope::Payload::UpdateResult(result.clone()));
-                write_frame(writer, &envelope).await.map_err(reason_from)?;
-                index += 1;
-            }
-            Outbound::ClipboardApplied(applied) => {
-                let envelope =
-                    state.envelope(wire::envelope::Payload::ClipboardApplied(applied.clone()));
-                write_frame(writer, &envelope).await.map_err(reason_from)?;
-                index += 1;
-            }
-            Outbound::ClipboardRoute(route) => {
-                let envelope =
-                    state.envelope(wire::envelope::Payload::ClipboardRoute(route.clone()));
-                write_frame(writer, &envelope).await.map_err(reason_from)?;
-                index += 1;
-            }
-            Outbound::Motion { .. } => {
-                // Merge the contiguous motion run that shares this lease. Motion from
-                // different leases is never merged: the receiver checks the lease of every
-                // batch, and a batch that mixed two leases (or lost the lease) would be
-                // refused as a `LeaseMismatch`.
-                let lease_id = match &queued[index] {
-                    Outbound::Motion { lease_id, .. } => *lease_id,
-                    _ => unreachable!(),
-                };
-                let mut events = Vec::new();
-                while let Some(Outbound::Motion {
-                    lease_id: next_lease,
-                    events: next,
-                }) = queued.get(index)
-                {
-                    if *next_lease != lease_id {
-                        break;
+            if let Some(intent) = queue.pop() {
+                if let Intent::Unpair(notice, reply) = intent {
+                    if !local_hello
+                        .capabilities
+                        .contains(&(wire::Capability::UnpairNotice as i32))
+                        || notice.requester_node_id != local_hello.node_id
+                    {
+                        let _ = reply.send(false);
+                        continue;
                     }
-                    events.extend(next.iter().copied());
-                    index += 1;
+                    let envelope = state.envelope(wire::envelope::Payload::Unpaired(notice));
+                    let sent = write_measured(&mut writer, &envelope, &metrics).await;
+                    let _ = reply.send(sent.is_ok());
+                    sent?;
+                    set_terminal_once(&terminal, || LinkDownReason::LocalClosed);
+                    local_close = true;
+                    break;
                 }
-                let batch = queue::motion_batch(lease_id, events);
-                write_message(writer, state, batch).await?;
+                let shutdown = matches!(
+                    &intent,
+                    Intent::Outbound(Outbound::Guaranteed(fr::Message::Shutdown { .. }))
+                );
+                write_intent(&mut writer, intent, &mut state, &queue, &metrics, &tracker).await?;
+                if shutdown {
+                    set_terminal_once(&terminal, || LinkDownReason::LocalClosed);
+                    local_close = true;
+                    break;
+                }
+                continue;
             }
+            if local_close {
+                if state.tx_seq > 1 {
+                    let message = fr::Message::Shutdown {
+                        reason: fr::LeaveReason::Shutdown,
+                    };
+                    let intent = Intent::Outbound(Outbound::Guaranteed(message));
+                    write_intent(&mut writer, intent, &mut state, &queue, &metrics, &tracker)
+                        .await?;
+                }
+                break;
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                _ = closing.changed() => {}
+            }
+        }
+        writer.shutdown().await?;
+        Ok::<(), TransportError>(())
+    }
+    .await;
+    if let Err(error) = result {
+        if !local_close {
+            set_terminal_once(&terminal, || reason_from(error));
         }
     }
-    Ok(())
 }
 
-/// Writes one clipboard message: same framing, no lease (it belongs to the connection).
-async fn write_clipboard_message<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    state: &mut LinkState,
-    message: crate::clipboard::ClipboardMessage,
-) -> Result<(), LinkDownReason> {
-    let envelope = message
-        .to_envelope(state.tx_seq, &state.connection_id)
-        .map_err(|error| LinkDownReason::Protocol(error.to_string()))?;
-    state.tx_seq += 1;
-    write_frame(writer, &envelope).await.map_err(reason_from)
-}
-
-/// Writes one layout message: same framing, no lease and no batch display.
-async fn write_layout_message<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    state: &mut LinkState,
-    message: crate::convert::LayoutMessage,
-) -> Result<(), LinkDownReason> {
-    let envelope = convert::layout_envelope(&message, state.tx_seq, &state.connection_id);
-    state.tx_seq += 1;
-    write_frame(writer, &envelope).await.map_err(reason_from)
-}
-
-async fn write_message<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    state: &mut LinkState,
-    message: fr::Message,
-) -> Result<(), LinkDownReason> {
-    let seq = state.tx_seq;
-    // A batch carrying an event this layer cannot express must not fail — and must not be
-    // able to end the link (audit F4). The events with a wire form still travel, so a key or
-    // button edge in the same batch is not lost; only the unrepresentable ones (a relative
-    // pointer delta) are dropped, and the count is logged rate-limited.
-    let message = match message {
-        fr::Message::InputBatch {
-            lease_id,
-            input_batch_seq,
-            events,
-        } => {
-            let (events, dropped) = convert::split_encodable(&events);
-            if dropped > 0 {
-                static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
-                if LOG_RATE.allow() {
-                    tracing::warn!(
-                        peer = ?state.peer,
-                        dropped,
-                        kept = events.len(),
-                        "input events with no wire form were dropped from the batch"
-                    );
-                }
-            }
-            if events.is_empty() {
-                // Nothing this layer can send: the frame is skipped, the link stays up.
-                return Ok(());
-            }
-            fr::Message::InputBatch {
-                lease_id,
-                input_batch_seq,
-                events,
-            }
-        }
-        other => other,
-    };
-    let lease_id = convert::lease_id_of_message(&message);
-    // A lease is entered on one of the peer's displays, and every absolute position the
-    // source sends afterwards is local to it; `EnterPrepare` is where that display is
-    // known, so it becomes the batch display of this link (see `convert::batch_display_after`).
-    let batch_display = convert::batch_display_after(&message, state.batch_display.as_str());
-    let envelope = match convert::to_envelope(
-        &message,
-        seq,
+fn focus_envelope(
+    message: &fr::Message,
+    state: &mut WriterState,
+) -> Result<wire::Envelope, TransportError> {
+    let lease_id = convert::lease_id_of_message(message);
+    let display = convert::batch_display_after(message, &state.batch_display);
+    let envelope = convert::to_envelope(
+        message,
+        state.tx_seq,
         &state.connection_id,
         lease_id.as_ref(),
-        batch_display.as_str(),
-    ) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            // Unreachable for an `InputBatch` (the events were split above), and no other
-            // message has an unrepresentable field: a conversion refusal is a programming
-            // error, not a peer's, so it must not take the link down (audit F4).
-            static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
-            if LOG_RATE.allow() {
-                tracing::error!(
-                    peer = ?state.peer,
-                    seq,
-                    error = %error,
-                    "a message could not be encoded; the frame was skipped"
-                );
-            }
-            return Ok(());
-        }
-    };
-    match &message {
-        fr::Message::InputBatch { events, .. } => {
-            state.report_input_batch("tx", seq, events);
-        }
-        fr::Message::InjectAck {
-            input_batch_seq,
-            applied_count,
-            status,
-            ..
-        } => state.report_inject_ack("tx", seq, *input_batch_seq, *applied_count, status),
-        _ => {}
-    }
-    state.batch_display = batch_display;
+        &display,
+    )
+    .map_err(|error| TransportError::Protocol(error.to_string()))?;
+    state.batch_display = display;
     state.tx_seq += 1;
-    write_frame(writer, &envelope).await.map_err(reason_from)?;
+    Ok(envelope)
+}
+
+async fn write_intent<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    intent: Intent,
+    state: &mut WriterState,
+    queue: &InputQueue,
+    metrics: &Mutex<InputMetrics>,
+    tracker: &Mutex<AckTracker>,
+) -> Result<(), TransportError> {
+    let mut input = None;
+    let envelope = match intent {
+        Intent::Hello(mut envelope) => {
+            state.connection_id =
+                envelope.connection_id.as_slice().try_into().map_err(|_| {
+                    TransportError::Protocol("invalid local Hello connection".into())
+                })?;
+            envelope.seq = state.tx_seq;
+            state.tx_seq += 1;
+            envelope
+        }
+        Intent::Payload(payload) => state.envelope(payload),
+        Intent::Input {
+            generation,
+            lease_id,
+            samples,
+        } => {
+            if !queue.valid_generation(generation) {
+                return Ok(());
+            }
+            let envelope = convert::timed_input_envelope(
+                state.tx_seq,
+                &state.connection_id,
+                &lease_id,
+                &state.batch_display,
+                samples
+                    .iter()
+                    .map(|sample| (&sample.event, sample.capture_host_us)),
+            )
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+            state.tx_seq += 1;
+            input = Some((generation, lease_id, samples));
+            envelope
+        }
+        Intent::Outbound(item) => match item {
+            Outbound::Guaranteed(message) => {
+                if let fr::Message::Leave { lease_id, .. } | fr::Message::LeaveAck { lease_id } =
+                    &message
+                {
+                    tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear_lease(0, *lease_id);
+                }
+                focus_envelope(&message, state)?
+            }
+            Outbound::Layout(message) => {
+                let envelope =
+                    convert::layout_envelope(&message, state.tx_seq, &state.connection_id);
+                state.tx_seq += 1;
+                envelope
+            }
+            Outbound::Clipboard(message) => {
+                let envelope = message
+                    .to_envelope(state.tx_seq, &state.connection_id)
+                    .map_err(|e| TransportError::Protocol(e.to_string()))?;
+                state.tx_seq += 1;
+                envelope
+            }
+            Outbound::CapabilitiesChanged(capabilities) => {
+                state.envelope(wire::envelope::Payload::CapabilitiesChanged(
+                    wire::CapabilitiesChanged { capabilities },
+                ))
+            }
+            Outbound::UpdateRequest(value) => {
+                state.envelope(wire::envelope::Payload::UpdateRequest(value))
+            }
+            Outbound::UpdateResult(value) => {
+                state.envelope(wire::envelope::Payload::UpdateResult(value))
+            }
+            Outbound::ClipboardApplied(value) => {
+                state.envelope(wire::envelope::Payload::ClipboardApplied(value))
+            }
+            Outbound::ClipboardRoute(value) => {
+                state.envelope(wire::envelope::Payload::ClipboardRoute(value))
+            }
+            Outbound::Motion { .. } => unreachable!("motion is admitted through the latest slot"),
+        },
+        Intent::Unpair(..) => unreachable!("unpair completion belongs to writer loop"),
+    };
+    let started = tokio::time::Instant::now();
+    if let Some(wire::envelope::Payload::Ping(ping)) = &envelope.payload {
+        state
+            .rtt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sent(ping.nonce, Instant::now());
+    }
+    if let Some((_, lease_id, samples)) = &input {
+        let mut oldest = None;
+        {
+            let mut metrics = metrics.lock().unwrap_or_else(|e| e.into_inner());
+            for sample in samples {
+                let elapsed = duration_us(started.duration_since(sample.enqueued_at));
+                metrics.record(Stage::EnqueueToWrite, elapsed);
+                if let Some(age) = sample
+                    .capture_to_enqueue_us
+                    .and_then(|age| age.checked_add(elapsed))
+                {
+                    metrics.record(Stage::CaptureToWrite, age);
+                    oldest = Some(oldest.map_or(age, |previous: u64| previous.max(age)));
+                } else {
+                    metrics.unknown(Stage::CaptureToWrite);
+                }
+            }
+            metrics.increment(Counter::Sent, 1);
+        }
+        let (evicted, expired) = {
+            let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let before = (tracker.evicted, tracker.pending_expired);
+            tracker.insert(0, *lease_id, envelope.seq, started, oldest);
+            (
+                tracker.evicted.saturating_sub(before.0),
+                tracker.pending_expired.saturating_sub(before.1),
+            )
+        };
+        let mut metrics = metrics.lock().unwrap_or_else(|e| e.into_inner());
+        metrics.increment(Counter::AckTrackingEvicted, evicted);
+        metrics.increment(Counter::AckPendingExpired, expired);
+    }
+    write_measured(writer, &envelope, metrics).await?;
     state.lease_diagnostics.record_trace(&envelope, false, true);
     state
         .lease_diagnostics
         .record(envelope.payload.as_ref(), true);
     Ok(())
+}
+
+async fn write_measured<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    envelope: &wire::Envelope,
+    metrics: &Mutex<InputMetrics>,
+) -> Result<(), TransportError> {
+    let started = tokio::time::Instant::now();
+    let result = write_frame(writer, envelope).await;
+    let mut metrics = metrics.lock().unwrap_or_else(|e| e.into_inner());
+    let elapsed = duration_us(started.elapsed());
+    let stage = match &result {
+        Ok(()) => Stage::TlsWrite,
+        Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Stage::TlsWriteTimeout
+        }
+        Err(_) => Stage::TlsWriteFailed,
+    };
+    metrics.record(stage, elapsed);
+    if let Err(error) = &result {
+        metrics.increment(Counter::Failed, 1);
+        if matches!(error, TransportError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
+        {
+            let counter = if error.to_string().contains("frame deadline") {
+                Counter::WriterFrameTimeout
+            } else {
+                Counter::WriterIdleTimeout
+            };
+            metrics.increment(counter, 1);
+        }
+    }
+    result
 }
 
 fn reason_from(error: TransportError) -> LinkDownReason {
@@ -1784,3 +1986,7 @@ async fn report_down(
 ) {
     let _ = reports.send(LinkReport::Down { key, peer, reason }).await;
 }
+
+#[cfg(test)]
+#[path = "link/input_pipeline_tests.rs"]
+mod input_pipeline_tests;

@@ -84,7 +84,7 @@ fn clipboard_round_trips_against_an_external_client() {
     drain(&clipboard);
 
     // 1. Out: we own CLIPBOARD, an external client pastes it.
-    let out = format!("lws-clipboard-smoke-out-{}", std::process::id());
+    let out = format!("bifrost-clipboard-smoke-out-{}", std::process::id());
     clipboard
         .set(ClipboardContent::Text(out.clone()))
         .expect("taking CLIPBOARD");
@@ -98,7 +98,7 @@ fn clipboard_round_trips_against_an_external_client() {
 
     // 2. In: an external client owns CLIPBOARD, we see the change and read it.
     drain(&clipboard);
-    let incoming = format!("lws-clipboard-smoke-in-{}", std::process::id());
+    let incoming = format!("bifrost-clipboard-smoke-in-{}", std::process::id());
     xclip_in(incoming.as_bytes());
     assert!(
         wait_for_change(&clipboard),
@@ -156,7 +156,7 @@ fn clipboard_round_trips_against_an_external_client() {
     );
 
     // 4. KDE's secret hint, and its absence.
-    let secret = "lws-clipboard-kde-secret-item";
+    let secret = "bifrost-clipboard-kde-secret-item";
     let owner = RawOwner::start(Some(secret), None, Some("secret"));
     assert!(
         wait_for_change(&clipboard),
@@ -179,7 +179,7 @@ fn clipboard_round_trips_against_an_external_client() {
     drop(owner);
 
     drain(&clipboard);
-    let plain = "lws-clipboard-plain-item";
+    let plain = "bifrost-clipboard-plain-item";
     xclip_in(plain.as_bytes());
     assert!(wait_for_change(&clipboard), "the plain write was observed");
     let snapshot = clipboard.read().expect("reading the plain selection");

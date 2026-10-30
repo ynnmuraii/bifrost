@@ -3,7 +3,7 @@
 //! `docs/06-development-plan.md` (gate after E2: «стабилен ли FSM — если есть залипания или
 //! дубли, не добавлять функции до исправления») and `docs/07-quality-security.md`
 //! («Fault injection») ask for exactly these runs, and `AC-01`/`AC-02`/`AC-14` are the
-//! criteria they measure. Every scenario drives two real `lws-core` processes on loopback
+//! criteria they measure. Every scenario drives two real `bifrost-core` processes on loopback
 //! through the control channel — the E2 slice as a user runs it, with dry agents standing
 //! in for the OS input.
 //! Dry file controls also cover held-edge refusal storms, emergency cancellation in
@@ -238,7 +238,7 @@ fn a_click_during_a_failed_temporary_capture_reaches_the_local_desktop() {
         .expect("failed Temporary capture must release input");
     assert_eq!(harness.a.dry_local_passthrough() - before, 2);
     harness.a.wait_dry_capture("Observe");
-    let agent_log = std::fs::read_to_string(harness.a.root.join("state/logs/lws-agent.log"))
+    let agent_log = std::fs::read_to_string(harness.a.root.join("state/logs/bifrost-agent.log"))
         .expect("agent capture log");
     let released = agent_log
         .lines()

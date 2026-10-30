@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! cargo run -p platform-wayland --example spike_wl_capture -- \
-//!     [--seconds 20] [--grant-store ~/.local/share/lan-workspace/grants.toml]
+//!     [--seconds 20] [--grant-store ~/.local/share/bifrost/grants.toml]
 //! ```
 //!
 //! Move the pointer to the **top edge** of a monitor: that is where the spike puts its

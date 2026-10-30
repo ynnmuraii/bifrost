@@ -12,7 +12,7 @@
 //! ceremony is how a peer becomes known — and that ceremony authenticates through the SAS
 //! code, not through the pin. `docs/05-protocol.md`: «Пока ключ неизвестен, allowlist
 //! разрешает только `PairHello` и статус», and `docs/05-protocol.md` again: the pairing
-//! channel is `lan-workspace/pair/1` and «Нельзя принимать runtime payload на
+//! channel is `bifrost/pair/1` and «Нельзя принимать runtime payload на
 //! pairing-канале». [`crate::config`] therefore refuses to build a pairing policy for a
 //! non-pairing ALPN list, which is what keeps a Pairing-policy handshake off the input
 //! and clipboard channels.

@@ -12,7 +12,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lws-identity-tests-{}-{}-{label}",
+        "bifrost-identity-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

@@ -14,7 +14,7 @@ on:
     # compile or assert: `cargo build`, `clippy`, `test` and `deny` read no
     # Markdown, no doc tree and no packaging text.
     #
-    # `icon.ico`, `icon-32.rgba` and `apps/lws-gui/assets/fonts/*.ttf` are
+    # `icon.ico`, `icon-32.rgba` and `apps/bifrost-gui/assets/fonts/*.ttf` are
     # deliberately *not* in this list. `apps/bifrost/build.rs` embeds the
     # first into the executable (and declares it `rerun-if-changed`), and the
     # other two are `include_bytes!` inputs, so all three are build inputs like
@@ -173,15 +173,15 @@ jobs:
       # `UnsupportedSession`, so the agent advertises no capabilities and every
       # switch is refused. `xauth` comes with `xvfb-run`.
       #
-      # `apps/lws-gui` adds nothing to this list, and that is why its window is
+      # `apps/bifrost-gui` adds nothing to this list, and that is why its window is
       # eframe/egui on the `glow` renderer: glutin opens GLX/EGL through
       # `libloading`, `x11-dl` opens `libX11` the same way, and `wayland-dlopen`
-      # (pulled by the `winit` entry in `apps/lws-gui/Cargo.toml`) opens
+      # (pulled by the `winit` entry in `apps/bifrost-gui/Cargo.toml`) opens
       # `libwayland-client` — so no X11/Wayland library is a *link-time*
       # dependency and no `-dev` package or GL driver has to exist here. What the
       # workflow builds and runs headlessly is the view model, the screens drawn
       # into an offscreen `egui::Context`, and one test against two real cores;
-      # the offscreen PNGs are an example (`cargo run -p lws-gui --example
+      # the offscreen PNGs are an example (`cargo run -p bifrost-gui --example
       # shots`), which `cargo test` compiles but never runs.
       - name: System dependencies
         if: runner.os == 'Linux'
@@ -223,7 +223,7 @@ jobs:
 
       # `cargo test` builds a package's *test* targets, and the two-core harnesses in
       # `apps/bifrost/tests` get the binary from `CARGO_BIN_EXE_bifrost`. The
-      # window's own two-core test (`apps/lws-gui/tests/cores.rs`) is a test of another package
+      # window's own two-core test (`apps/bifrost-gui/tests/cores.rs`) is a test of another package
       # and looks for `bifrost` in target/debug, as does the core when it spawns its
       # agent (`bifrost agent …` from its own executable). Build the workspace first.
       - name: Build
@@ -237,19 +237,19 @@ jobs:
       # nothing about the agent, so both link-time checks are gone. What replaces them runs
       # on both runners, before `Test` so that a red suite cannot hide it:
       #
-      #  * `cargo tree -p lws-agent -e normal` must not contain the transport/TLS/identity
+      #  * `cargo tree -p bifrost-agent -e normal` must not contain the transport/TLS/identity
       #    crates, the window or the core, nor the usual network clients (a denylist);
-      #  * no source file of `apps/lws-agent` may name a TCP/UDP socket type;
-      #  * the agent's run-time guard (`lws_agent::netguard`, which also runs in every real
+      #  * no source file of `apps/bifrost-agent` may name a TCP/UDP socket type;
+      #  * the agent's run-time guard (`bifrost_agent::netguard`, which also runs in every real
       #    agent process, at start and every two seconds) must report a TCP/UDP socket of
       #    this process when there is one and none when there is not.
       #
-      # All three live in `apps/lws-agent/tests/no_network.rs`.
+      # All three live in `apps/bifrost-agent/tests/no_network.rs`.
       - name: Agent owns no network sockets
-        run: cargo test --locked -p lws-agent --test no_network
+        run: cargo test --locked -p bifrost-agent --test no_network
 
 
-      # `LWS_KEEP_ROOTS=1` stops the harness from deleting its per-test root
+      # `BIFROST_KEEP_ROOTS=1` stops the harness from deleting its per-test root
       # (`unique_dir`), and the roots are then uploaded as an artifact below: a
       # flaky two-core or three-node test is diagnosed from the cores' own logs
       # and configs, not from a rerun. The harness has no base-dir variable of its
@@ -260,22 +260,22 @@ jobs:
       - name: Prepare diagnostics root
         if: runner.os == 'Windows'
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\lws-roots" | Out-Null
+        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bifrost-roots" | Out-Null
 
       - name: Prepare diagnostics root
         if: runner.os == 'Linux'
         # A *short* root, because a socket path cannot be longer than
         # `sockaddr_un.sun_path` (108 bytes) and two harnesses put their whole
-        # temporary tree under it. `apps/lws-core`'s agent launcher builds
-        # `<temp>/lws-core-agent-<pid>-<n>-<label>/lan-workspace/agent-<pid>-<n>.sock`,
+        # temporary tree under it. `apps/bifrost-core`'s agent launcher builds
+        # `<temp>/bifrost-core-agent-<pid>-<n>-<label>/bifrost/agent-<pid>-<n>.sock`,
         # which measures `<len(temp)> + 66 + 2 * <digits of pid>`: with
         # `$RUNNER_TEMP` (33) that fits a four-digit pid (107) and overflows on a
         # five-digit one (109), so run 38624252563 failed
         # `agent::launch_tests::successful_attach_keeps_the_token_until_stop_or_supervisor_drop`
         # with «path must be shorter than SUN_LEN» as soon as the runner's pids
-        # passed 10000. `/tmp/lws-roots` (14) keeps the same path at 90 and
+        # passed 10000. `/tmp/bifrost-roots` (14) keeps the same path at 90 and
         # leaves room up to a seven-digit pid. Windows has no such limit.
-        run: mkdir -p /tmp/lws-roots
+        run: mkdir -p /tmp/bifrost-roots
 
       - name: Linux resources before test linking
         if: runner.os == 'Linux'
@@ -307,43 +307,43 @@ jobs:
       #    `bifrost` are — `--bins` because the app's own units live in
       #    `main.rs`, and a bin-only package has no lib target to select;
       #  * the suites of the crates whose subject is Windows: `platform-win`
-      #    (Win32 capture, injection, clipboard, DPI), `lws-agent` (netguard,
-      #    the launcher and the backend), `lws-tray`, `identity` (the DPAPI
+      #    (Win32 capture, injection, clipboard, DPI), `bifrost-agent` (netguard,
+      #    the launcher and the backend), `bifrost-tray`, `identity` (the DPAPI
       #    keystore), `config` (paths and first run) and `ipc` (the named-pipe
       #    transport, which `tests/windows_transport.rs` exercises).
       #
       # The full `cargo test --workspace` on windows-latest is not dropped: it
       # moves to `nightly.yml`, which runs it (plus the licences check against
       # the Windows graph) once a day when `main` has moved. `cargo test -p
-      # lws-agent` below re-runs the no-network test that the step above already
+      # bifrost-agent` below re-runs the no-network test that the step above already
       # ran alone — 3 seconds, kept so that the suite and the dedicated check
       # cannot drift apart.
       - name: Test (unit tests of every crate)
         if: runner.os == 'Windows'
         env:
-          LWS_KEEP_ROOTS: "1"
-          TMP: ${{ runner.temp }}\lws-roots
-          TEMP: ${{ runner.temp }}\lws-roots
+          BIFROST_KEEP_ROOTS: "1"
+          TMP: ${{ runner.temp }}\bifrost-roots
+          TEMP: ${{ runner.temp }}\bifrost-roots
         run: cargo test --workspace --lib --bins
 
       - name: Test (Windows-specific suites)
         if: runner.os == 'Windows'
         env:
-          LWS_KEEP_ROOTS: "1"
-          TMP: ${{ runner.temp }}\lws-roots
-          TEMP: ${{ runner.temp }}\lws-roots
-        run: cargo test -p platform-win -p lws-agent -p lws-tray -p identity -p config -p ipc
+          BIFROST_KEEP_ROOTS: "1"
+          TMP: ${{ runner.temp }}\bifrost-roots
+          TEMP: ${{ runner.temp }}\bifrost-roots
+        run: cargo test -p platform-win -p bifrost-agent -p bifrost-tray -p identity -p config -p ipc
 
       # Windows runners have a session; Linux ones need Xvfb (above). The fault
-      # suite in `apps/lws-core/tests/fault_injection.rs` is what makes this
+      # suite in `apps/bifrost-core/tests/fault_injection.rs` is what makes this
       # matter: it spawns two cores and waits for real transitions. It is also
       # why the full workspace run is kept on this runner on every push rather
       # than only in the nightly.
       - name: Test
         if: runner.os == 'Linux'
         env:
-          LWS_KEEP_ROOTS: "1"
-          TMPDIR: /tmp/lws-roots
+          BIFROST_KEEP_ROOTS: "1"
+          TMPDIR: /tmp/bifrost-roots
         # Keep the server alive between short-lived probe clients. Xvfb otherwise resets
         # when its last client disconnects, racing the next core's capability probe.
         run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" cargo test --workspace
@@ -356,16 +356,16 @@ jobs:
           du -sh target
 
 
-      # The kept roots are the point of `LWS_KEEP_ROOTS` above: one directory per
-      # harness (`lws-<label>-<pid>-<n>`) with each core's log, config and state.
+      # The kept roots are the point of `BIFROST_KEEP_ROOTS` above: one directory per
+      # harness (`bifrost-<label>-<pid>-<n>`) with each core's log, config and state.
       # Only on failure, so a green run uploads nothing.
       - name: Upload harness roots
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: lws-roots-${{ runner.os }}
+          name: bifrost-roots-${{ runner.os }}
           # Linux keeps its roots in `/tmp` so that socket paths fit (see
           # `Prepare diagnostics root` above); Windows uses the job's temp
           # directory, which has no length limit.
-          path: ${{ runner.os == 'Linux' && '/tmp/lws-roots' || format('{0}/lws-roots', runner.temp) }}
+          path: ${{ runner.os == 'Linux' && '/tmp/bifrost-roots' || format('{0}/bifrost-roots', runner.temp) }}
           if-no-files-found: ignore

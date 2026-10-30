@@ -3,7 +3,13 @@
 //! The legacy exporter-only derivation remains solely for explicitly legacy peers;
 //! it does not provide version 1's resistance to offline context grinding.
 
-/// The exporter label. Quoted from `docs/05-protocol.md`: `"EXPORTER-lan-workspace-pair"`.
+/// The legacy exporter label. Quoted from `docs/05-protocol.md`:
+/// `"EXPORTER-lan-workspace-pair"`.
+///
+/// Deliberately legacy-named after the 0.4.0 rename: it is an input to the six-digit
+/// code two people compare, and the label only reaches peers that use the pre-commitment
+/// ceremony (all 0.4.0 peers speak `COMMITMENT_EXPORTER_LABEL`). Renaming it is a
+/// protocol decision, not a cosmetic one — do not change it without one.
 pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-lan-workspace-pair";
 
 /// How many exporter bytes feed the code: «4 байта».

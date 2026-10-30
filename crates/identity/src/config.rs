@@ -4,9 +4,9 @@
 //! strings and the frame limits in one place, so this crate cannot drift from the wire
 //! contract:
 //!
-//! * `ALPN_INPUT = "lan-workspace/input/1"`
-//! * `ALPN_CLIPBOARD = "lan-workspace/clipboard/1"`
-//! * `ALPN_PAIR = "lan-workspace/pair/1"`
+//! * `ALPN_INPUT = "bifrost/input/1"`
+//! * `ALPN_CLIPBOARD = "bifrost/clipboard/1"`
+//! * `ALPN_PAIR = "bifrost/pair/1"`
 //!
 //! # Why `ring`
 //!
@@ -106,7 +106,7 @@ pub fn trusted_server_config(
 ///
 /// The clipboard channel is its own TLS session on port `47902`
 /// (`docs/05-protocol.md`), so its handshake negotiates only
-/// `lan-workspace/clipboard/1`. A peer with no active trust record is refused during the
+/// `bifrost/clipboard/1`. A peer with no active trust record is refused during the
 /// handshake, before any `ClipboardBind` is read; a peer that answered on another channel
 /// cannot reach this one.
 pub fn clipboard_client_config(
@@ -224,7 +224,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "lws-identity-config-{}-{label}",
+            "bifrost-identity-config-{}-{label}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -247,7 +247,7 @@ mod tests {
         (a_trust, b_trust)
     }
 
-    /// The clipboard channel's handshake negotiates `lan-workspace/clipboard/1` on both
+    /// The clipboard channel's handshake negotiates `bifrost/clipboard/1` on both
     /// sides: the two builders offer that ALPN and nothing else, and rustls selects it.
     #[tokio::test(flavor = "current_thread")]
     async fn a_clipboard_handshake_negotiates_the_clipboard_alpn() {

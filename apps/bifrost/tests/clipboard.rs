@@ -217,7 +217,7 @@ fn toggling_the_sender_preserves_origin_versions_for_a_live_receiver() {
 
 /// Distinct payloads, so a later assertion cannot pass on an earlier copy.
 fn payload(tag: &str, len: usize) -> String {
-    let mut text = format!("lws-{tag}-{}-", std::process::id());
+    let mut text = format!("bifrost-{tag}-{}-", std::process::id());
     while text.len() < len {
         text.push_str(tag);
     }
@@ -262,6 +262,109 @@ fn repeated_copies_reuse_the_channel_in_both_directions() {
                 .unwrap_or_else(|error| panic!("{direction} copy {copy}: {error}"));
         }
     }
+}
+
+/// A real filesystem wait must not stop IPC heartbeats in a dry agent.
+#[cfg(windows)]
+#[test]
+fn a_blocked_dry_clipboard_write_keeps_bidirectional_delivery_alive() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows_sys::Win32::System::IO::{
+        CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED,
+    };
+
+    struct Oplock {
+        file: std::fs::File,
+        overlapped: Box<OVERLAPPED>,
+        event: OwnedHandle,
+    }
+    impl Drop for Oplock {
+        fn drop(&mut self) {
+            let mut transferred = 0;
+            // SAFETY: this guard owns the handle, stable OVERLAPPED allocation and event.
+            // Await cancellation even on assertion unwind before freeing that allocation.
+            unsafe {
+                CancelIoEx(self.file.as_raw_handle(), &*self.overlapped);
+                GetOverlappedResult(
+                    self.file.as_raw_handle(),
+                    &*self.overlapped,
+                    &mut transferred,
+                    1,
+                );
+            }
+        }
+    }
+
+    let _serial = common::serial();
+    let harness = two_nodes_with_clipboard();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(7)
+        .custom_flags(0x40000000) // FILE_FLAG_OVERLAPPED
+        .open(harness.a.root.join("run/clipboard-dry/out.txt"))
+        .expect("dry selection file");
+    // SAFETY: a null security descriptor/name creates an unnamed event; ownership is
+    // transferred once and held until the pending oplock has been closed below.
+    let event = unsafe {
+        let raw = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+        assert!(!raw.is_null(), "{}", std::io::Error::last_os_error());
+        OwnedHandle::from_raw_handle(raw)
+    };
+    // SAFETY: zero initializes all offsets and the internal completion fields.
+    let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+    overlapped.hEvent = event.as_raw_handle();
+    let mut oplock = Oplock {
+        file,
+        overlapped,
+        event,
+    };
+    let mut returned = 0;
+    // SAFETY: the file is open for overlapped IO, the unused buffers are empty, and
+    // both the event and OVERLAPPED remain alive until the file handle is dropped.
+    let requested = unsafe {
+        DeviceIoControl(
+            oplock.file.as_raw_handle(),
+            0x00090000, // FSCTL_REQUEST_OPLOCK_LEVEL_1
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            &mut *oplock.overlapped,
+        )
+    };
+    assert_eq!(requested, 0);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(ERROR_IO_PENDING as i32)
+    );
+    harness.a.copy_to_clipboard("filesystem-blocked-copy");
+    // SAFETY: the event is owned above and remains open throughout this wait.
+    assert_eq!(
+        unsafe { WaitForSingleObject(oplock.event.as_raw_handle(), 3000) },
+        0
+    );
+    // Only this fixture file's conflicting open/write is blocked, not either process.
+    // This exceeds the unchanged 300 ms watchdog deliberately.
+    std::thread::sleep(Duration::from_millis(350));
+    drop(oplock);
+    harness
+        .b
+        .wait_for_clipboard("filesystem-blocked-copy", Duration::from_secs(10))
+        .expect("the delayed local copy reaches B");
+    harness.b.copy_to_clipboard("reply-after-filesystem-wait");
+    harness
+        .a
+        .wait_for_clipboard("reply-after-filesystem-wait", Duration::from_secs(10))
+        .expect("A remains attached and applies B's reply");
+    assert!(
+        !harness.a.log().contains("the agent stopped answering"),
+        "a dry filesystem operation must not starve agent IPC"
+    );
 }
 
 #[test]

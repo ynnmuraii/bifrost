@@ -2,6 +2,68 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## 0.4.0 — 2026-10-30
+
+### English
+
+**New**
+
+- Screen map: right-click a display-edge pair to allow or forbid crossing it. The rule covers every visible fragment of that pair, forbidden edges are drawn dashed and persist in the layout.
+- Automatic short-edge contacts are disabled when the shared span is under the larger of 32 logical pixels and 2% of the full edge at either end after occlusion; such an edge can still be enabled manually.
+- Physical display size is read from EDID on Windows (SetupAPI), X11 and Wayland and used to scale the map. A manual size can be entered as a diagonal of 3–120 inches; **Reset** returns to the automatic size when it is valid and to the legacy size otherwise. Shift+drag moves a single display, a normal drag moves the whole computer. Existing layouts keep the legacy map size until **Reset**.
+- Input diagnostics use a source-host monotonic capture-receipt timestamp and bounded p50/p95/p99 histograms for queue age, TLS writes, inbound dispatch, local injection and send-to-InjectAck round trips. Logs contain durations/counters, not coordinates, keys or content; Ping RTT remains distinct from input latency.
+- The newest absolute motion has a per-lease slot outside the bounded queue. The preceding position is frozen before button/key/wheel events, discrete ordering is retained and lease changes clear pending motion.
+- A dedicated TLS writer keeps slow writes out of the reader/coordinator. Control/lease/Pong priority is bounded at whole-frame boundaries; pending writes close the link after 600 ms without progress or 1000 ms total, with one shared 100 ms graceful-close budget. Idle healthy links are not timed out by the writer.
+
+**Fixes**
+
+- Loss-recovery bursts no longer evict native-offer metadata after 64 outstanding batches and turn a successful completion into false Partial/InjectionFailed. Core→Agent admission is bounded to 64 offered plus 64 pending batches, ordered by exact local lease+sequence completions; control/release bypass pending input, not completion validation. Fresh input does not depend on network InjectAck credits.
+- An admitted topology update cannot be overtaken by a later entry fence, and continuous motion cannot starve auxiliary frames. Metrics snapshots release their shared lock before synchronous logging, empty idle windows are skipped, and link shutdown preserves the first terminal reason.
+- The file-only dry clipboard adapter keeps slow filesystem polling and selection writes off the agent session loop, without changing the 300 ms watchdog or native clipboard adapters.
+
+**Breaking changes**
+
+- 0.4.0 cannot connect, pair or share input/clipboard with any 0.3.x computer: the network protocol major version is 1 and the TLS channel names, the Protobuf packages and the local IPC endpoint names changed. Update every computer. Existing pairing, trusted computers and the private key are kept, so no new pairing is needed. Do not downgrade to 0.3.x.
+- Close Bifrost 0.3.x completely before installing 0.4.0. A running 0.3.x window is not detected as an existing instance, and it can keep the old data directory in use.
+- The application directory is renamed from `lan-workspace` to `bifrost` on Windows (`%APPDATA%`, `%LOCALAPPDATA%`) and Linux (`~/.config`, `~/.local/share`, `~/.local/state`). The first 0.4.0 start moves the existing directory automatically. The move is a rename, never a copy or a merge: if a `bifrost` directory already exists it wins and the old one is left untouched with a warning. If the old directory is still in use, that start keeps using it and the next start retries.
+- The configuration/log environment variables are now `BIFROST_*` (`BIFROST_LOG`, `BIFROST_KEEP_ROOTS`); the old `LWS_*` names are no longer read.
+
+**Notes**
+
+- Log files are now `bifrost-core.log`, `bifrost-agent.log` and `bifrost-gui.log`. The old `lws-*.log` files move with the old directory and are no longer written to.
+- “Update all computers” across this breaking version waits up to about five minutes for the whole batch, because the old version cannot verify the new protocol, and then reports the updated computers as unreachable before the requesting computer updates itself. This is expected; the computers reconnect after the requester restarts into 0.4.0.
+- The input lease/control-return bounds, 150 ms repeat guard and 300 ms agent core-silence watchdog are unchanged. Controlled Docker loss tests show variable TCP retransmission tails, not a guaranteed reduction in Wi-Fi p99; aborted leases are marked separately rather than counted as successful latency samples.
+
+### Русский
+
+**Новое**
+
+- Карта экранов: правый клик по паре краёв дисплеев разрешает или запрещает переход. Правило действует для всех видимых фрагментов этой пары, запрещённые края рисуются пунктиром и сохраняются в раскладке.
+- Автоматические короткие контакты краёв отключаются, если общий участок после перекрытия меньше большего из 32 логических пикселей и 2% полной длины края хотя бы с одной стороны; такой край можно включить вручную.
+- Физический размер дисплея читается из EDID на Windows (SetupAPI), X11 и Wayland и используется для масштаба карты. Размер можно задать вручную по диагонали 3–120 дюймов; **Сброс** возвращает автоматический размер, если он корректен, иначе прежний. Shift+перетаскивание двигает отдельный дисплей, обычное перетаскивание — весь компьютер. Существующие раскладки сохраняют прежний размер карты до **Сброса**.
+- Диагностика ввода использует монотонную метку получения захвата на исходном компьютере и ограниченные гистограммы p50/p95/p99 для возраста очереди, TLS-записи, входящей диспетчеризации, локальной инъекции и времени send→InjectAck. В журналах — длительности/счётчики, не координаты, клавиши или содержимое; Ping RTT не выдаётся за задержку ввода.
+- Новейшая абсолютная позиция хранится в отдельном слоте своей аренды вне ограниченной очереди. Перед кнопкой, клавишей или колесом фиксируется предшествующая позиция; порядок дискретных событий сохраняется, при смене аренды ожидающее движение очищается.
+- Отдельная задача TLS-записи не задерживает чтение и координатор. Управление/аренда/Pong имеют ограниченный приоритет между целыми кадрами; ожидающая запись закрывает соединение после 600 мс без прогресса или 1000 мс суммарно, с общим бюджетом корректного закрытия 100 мс. Исправное соединение без ожидающей записи этот таймаут не закрывает.
+
+**Исправления**
+
+- Пачки после восстановления TCP больше не вытесняют metadata native-offers при 64 незавершённых операциях и не превращают успешное применение в ложный Partial/InjectionFailed. Core→Agent ограничивает число отправленных пачек до 64 и ожидающих до 64, продвигая FIFO по точным локальным завершениям аренда+номер; управление/освобождение обходят ожидающий ввод, но не проверку завершений. Свежий ввод не ждёт сетевых кредитов InjectAck.
+- Принятое обновление топологии нельзя обогнать более поздним входом в аренду, а непрерывное движение не вытесняет вспомогательные кадры навсегда. Снимок метрик освобождает общий mutex до синхронной записи журнала; пустые окна бездействия пропускаются, а закрытие сохраняет первую причину отказа.
+- Файловый dry-адаптер буфера выполняет медленный опрос файловой системы и запись выделения вне цикла агента; watchdog 300 мс и нативные адаптеры буфера не изменены.
+
+**Ломающие изменения**
+
+- 0.4.0 не соединяется, не сопрягается и не передаёт ввод/буфер с компьютерами 0.3.x: мажорная версия сетевого протокола теперь 1, изменились имена TLS-каналов, пакетов Protobuf и локальных IPC-эндпоинтов. Обновите все компьютеры. Сопряжения, доверенные компьютеры и приватный ключ сохраняются, повторное сопряжение не требуется. Не откатывайтесь на 0.3.x.
+- Перед установкой 0.4.0 полностью закройте Bifrost 0.3.x. Запущенное окно 0.3.x не распознаётся как уже работающий экземпляр и может удерживать старый каталог данных.
+- Каталог приложения переименован из `lan-workspace` в `bifrost` (Windows: `%APPDATA%`, `%LOCALAPPDATA%`; Linux: `~/.config`, `~/.local/share`, `~/.local/state`). Первый запуск 0.4.0 переносит существующий каталог автоматически. Это переименование, а не копирование и не объединение: если каталог `bifrost` уже существует, используется он, а старый остаётся нетронутым с предупреждением. Если старый каталог ещё занят, этот запуск продолжает работать с ним, а следующий попробует снова.
+- Переменные окружения настроек и журналов теперь `BIFROST_*` (`BIFROST_LOG`, `BIFROST_KEEP_ROOTS`); старые имена `LWS_*` больше не читаются.
+
+**Примечания**
+
+- Файлы журналов теперь называются `bifrost-core.log`, `bifrost-agent.log` и `bifrost-gui.log`. Старые `lws-*.log` переезжают вместе с прежним каталогом, и запись в них больше не ведётся.
+- «Обновить все компьютеры» при переходе через ломающую версию ждёт до примерно пяти минут на весь пакет, потому что старая версия не может проверить новый протокол, после чего помечает обновлённые компьютеры как недоступные и обновляется компьютер-инициатор. Это ожидаемо; компьютеры соединятся снова после перезапуска инициатора в 0.4.0.
+- Границы аренды/возврата управления, защита повторов 150 мс и watchdog тишины core 300 мс не изменены. Контролируемый Docker-стенд показывает изменчивые хвосты повторных передач TCP, а не гарантированное снижение Wi-Fi p99; прерванные аренды помечаются отдельно, а не учитываются как успешные latency samples.
+
 ## 0.3.3 — 2026-10-30
 
 ### English

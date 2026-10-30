@@ -3,8 +3,8 @@
 //! On a loaded `windows-latest` runner (2 vCPU) the cores repeatedly declared their agent
 //! lost and restarted it in `RECOVERY`, five cycles in a row, leaving the node
 //! `Blocked`/`agent=starting` when the at-rest check of `three_nodes` looked at it. Two
-//! product causes were fixed for this (`apps/lws-core/src/agent.rs`,
-//! `apps/lws-agent/src/session.rs`): the silence clock ran while an agent was still
+//! product causes were fixed for this (`apps/bifrost-core/src/agent.rs`,
+//! `apps/bifrost-agent/src/session.rs`): the silence clock ran while an agent was still
 //! *starting*, and blocking platform work (the clipboard's `OpenClipboard` retry loop,
 //! `EnumDisplayMonitors`) sat on the runtime thread the heartbeat rides.
 //!
@@ -21,10 +21,10 @@
 //!
 //! ```text
 //! # the faithful emulation of the CI runner (2 vCPU, everything on them)
-//! powershell -NoProfile -Command "Start-Process cargo -ArgumentList 'test','-p','lws-core','--test','heartbeat_stress' -PassThru | %%{ $_.ProcessorAffinity = 3; $_.WaitForExit() }"
+//! powershell -NoProfile -Command "Start-Process cargo -ArgumentList 'test','-p','bifrost-core','--test','heartbeat_stress' -PassThru | %%{ $_.ProcessorAffinity = 3; $_.WaitForExit() }"
 //!
 //! # a longer or lighter run
-//! LWS_STRESS_SECONDS=120 LWS_STRESS_BURNERS=1 cargo test -p lws-core --test heartbeat_stress
+//! BIFROST_STRESS_SECONDS=120 BIFROST_STRESS_BURNERS=1 cargo test -p bifrost-core --test heartbeat_stress
 //! ```
 
 mod common;
@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 /// How long the loaded, at-rest cluster must run without a single false agent-lost.
 fn stress_seconds() -> u64 {
-    std::env::var("LWS_STRESS_SECONDS")
+    std::env::var("BIFROST_STRESS_SECONDS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(60)
@@ -45,7 +45,7 @@ fn stress_seconds() -> u64 {
 /// Number of optional pure-spin burners for an explicit starvation probe. The CI default
 /// is zero: these threads fill the available CPUs and do not model ordinary runner load.
 fn burner_count() -> usize {
-    std::env::var("LWS_STRESS_BURNERS")
+    std::env::var("BIFROST_STRESS_BURNERS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0)
@@ -97,7 +97,7 @@ fn loaded_agents_keep_answering_the_heartbeat() {
         let stop = Arc::clone(&stop);
         burners.push(
             std::thread::Builder::new()
-                .name(format!("lws-burner-{index}"))
+                .name(format!("bifrost-burner-{index}"))
                 .spawn(move || {
                     // A pure spin: no I/O, no allocation, just scheduler pressure, which
                     // is what a loaded runner puts on the heartbeat's timer.

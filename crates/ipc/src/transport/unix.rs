@@ -5,7 +5,7 @@
 //! | | Linux |
 //! |---|---|
 //! | core ↔ agent | `socketpair(AF_UNIX)`, унаследованный дескриптор |
-//! | gui ↔ core | UDS `$XDG_RUNTIME_DIR/lan-workspace/gui.sock`, каталог 0700, сокет 0600, проверка `SO_PEERCRED` uid |
+//! | gui ↔ core | UDS `$XDG_RUNTIME_DIR/bifrost/gui.sock`, каталог 0700, сокет 0600, проверка `SO_PEERCRED` uid |
 //!
 //! [`agent_pair`] is the `socketpair` of the first row; the core passes one end
 //! to the agent it spawns, so there is no path to connect to and no window in
@@ -42,7 +42,7 @@ impl Endpoint {
         Endpoint { path: path.into() }
     }
 
-    /// `$XDG_RUNTIME_DIR/lan-workspace/gui.sock`.
+    /// `$XDG_RUNTIME_DIR/bifrost/gui.sock`.
     ///
     /// Core should prefer the value from `config::Paths::gui_ipc()`, which
     /// resolves the same path from the same environment variable; this
@@ -70,7 +70,7 @@ impl Endpoint {
     }
 }
 
-/// `runtime_dir/lan-workspace/gui.sock`.
+/// `runtime_dir/bifrost/gui.sock`.
 ///
 /// The two names come from [`config::paths`], the single source of the documented file
 /// names; this function only adds the `$XDG_RUNTIME_DIR` prefix.

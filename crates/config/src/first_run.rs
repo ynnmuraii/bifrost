@@ -1,10 +1,10 @@
 //! First run: the configuration file exists before anything reads it.
 //!
-//! `lws-core run` used to die on a missing `config.toml`, and the owner of the
+//! `bifrost-core run` used to die on a missing `config.toml`, and the owner of the
 //! machine is not a developer — AC-16 («настройка пары без CLI ≤3 мин») leaves no
 //! room for editing TOML by hand. So the first `run` writes a valid file itself,
 //! from the schema defaults plus what this host can say about its own network,
-//! and `lws-gui` edits one field of it (`set_listen_address`) from its settings
+//! and `bifrost-gui` edits one field of it (`set_listen_address`) from its settings
 //! screen.
 //!
 //! What the first run writes — every value documented in
@@ -32,8 +32,8 @@
 //! must not do.
 //!
 //! The chooser is pure ([`choose`], [`Candidate`]); only the enumeration knows a
-//! platform. `lws-gui` calls [`lan_addresses`] and [`set_listen_address`];
-//! `lws-core` calls [`ensure_config`].
+//! platform. `bifrost-gui` calls [`lan_addresses`] and [`set_listen_address`];
+//! `bifrost-core` calls [`ensure_config`].
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -448,7 +448,7 @@ fn platform_hostname() -> Option<String> {
 /// this crate sets `0700` itself — it owns the documented paths and makes no
 /// platform calls of its own. On Windows the owner-only ACL is `identity`'s
 /// business (`identity::acl`, for keys; `identity::atomic::create_private_dir`,
-/// which `lws-core` runs over these very directories before it reads the
+/// which `bifrost-core` runs over these very directories before it reads the
 /// configuration), so this only creates the directory — the same thing
 /// [`save_atomic`] would do, made explicit so the permission does not depend on
 /// the caller's umask.

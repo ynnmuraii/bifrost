@@ -136,7 +136,7 @@ fn spawn(enabled: bool) -> Option<Worker> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let join = std::thread::Builder::new()
-        .name("lws-cursor-veil".to_owned())
+        .name("bifrost-cursor-veil".to_owned())
         .spawn(move || {
             // A panic here must end only the veil (its window dies with the thread).
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

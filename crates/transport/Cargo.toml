@@ -31,3 +31,6 @@ toml = "1"
 [target.'cfg(windows)'.dependencies]
 # `SO_EXCLUSIVEADDRUSE` is a WinSock constant; transport sets it in `bind_listener`.
 windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

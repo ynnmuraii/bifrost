@@ -544,9 +544,9 @@ mod x11_impl {
                 png: intern(&conn, IMAGE_TARGET_NAMES[2])?,
                 incr: intern(&conn, "INCR")?,
                 kde_hint: intern(&conn, KDE_PASSWORD_HINT)?,
-                read_property: intern(&conn, "LWS_CLIPBOARD_SELECTION")?,
-                hint_property: intern(&conn, "LWS_CLIPBOARD_KDE_HINT")?,
-                time_property: intern(&conn, "LWS_CLIPBOARD_TIME")?,
+                read_property: intern(&conn, "BIFROST_CLIPBOARD_SELECTION")?,
+                hint_property: intern(&conn, "BIFROST_CLIPBOARD_KDE_HINT")?,
+                time_property: intern(&conn, "BIFROST_CLIPBOARD_TIME")?,
             };
 
             conn.xfixes_select_selection_input(
@@ -563,7 +563,7 @@ mod x11_impl {
             let generation = Arc::new(AtomicU64::new(0));
             let worker_generation = Arc::clone(&generation);
             let thread = std::thread::Builder::new()
-                .name("lws-x11-clipboard".to_owned())
+                .name("bifrost-x11-clipboard".to_owned())
                 .spawn(move || {
                     run(
                         conn,

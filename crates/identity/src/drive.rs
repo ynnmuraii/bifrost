@@ -431,7 +431,7 @@ pub async fn accept_one(
 /// Runs the opener's half of the ceremony on an already-handshaked `pair/1` stream.
 ///
 /// This is the acceptor side used when the pairing window is served by the shared link
-/// listener (`crates/transport`, ALPN `lan-workspace/pair/1`): the manager admitted the
+/// listener (`crates/transport`, ALPN `bifrost/pair/1`): the manager admitted the
 /// dialer through its own gate before the handshake, so this function does **not** call
 /// [`PairingWindow::admit`]/[`PairingWindow::finish`] — it only runs the one
 /// [`opener_ceremony`] body on the stream and the window it is handed.

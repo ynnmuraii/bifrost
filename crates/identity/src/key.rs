@@ -4,8 +4,8 @@
 //!
 //! | | path |
 //! |---|---|
-//! | Windows | `%APPDATA%\lan-workspace\identity.dpapi` (DPAPI CurrentUser, owner-only ACL) |
-//! | Linux | Secret Service; otherwise `$XDG_DATA_HOME/lan-workspace/identity.key` (0600) |
+//! | Windows | `%APPDATA%\bifrost\identity.dpapi` (DPAPI CurrentUser, owner-only ACL) |
+//! | Linux | Secret Service; otherwise `$XDG_DATA_HOME/bifrost/identity.key` (0600) |
 //!
 //! «Каталоги создаются с правами только для пользователя: ACL на текущий SID в Windows,
 //! 0700 в Linux. Core отказывается стартовать, если права шире, и выдаёт понятную

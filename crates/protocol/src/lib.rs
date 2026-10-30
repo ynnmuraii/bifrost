@@ -4,9 +4,9 @@
 //!
 //! # What is here
 //!
-//! * [`wire`] — `lan_workspace.v1` messages: `Envelope`, `Hello`, leases,
+//! * [`wire`] — `bifrost.v1` messages: `Envelope`, `Hello`, leases,
 //!   clipboard, `PairingEnvelope`.
-//! * [`ipc`] — `lan_workspace.ipc.v1` messages: `AgentFrame`, `GuiFrame`.
+//! * [`ipc`] — `bifrost.ipc.v1` messages: `AgentFrame`, `GuiFrame`.
 //! * [`frame`] — `4-byte big-endian length || Protobuf body` encode/decode over
 //!   byte buffers. Sans-IO: no `tokio`, no sockets, no allocation while
 //!   decoding; a decode never allocates before the declared length was checked
@@ -43,17 +43,33 @@ pub mod limits;
 pub mod seq;
 pub mod validate;
 
-/// Generated `lan_workspace.v1` messages (`docs/protocol.proto`).
+/// Generated Protobuf modules, laid out as their Protobuf packages.
+///
+/// The nesting is not cosmetic: prost emits cross-package references relative to
+/// the package depth (`bifrost.ipc.v1` names a `bifrost.v1` message as
+/// `super::super::v1::…`), so `proto/ipc.proto` may only import
+/// `proto/protocol.proto` when the generated files keep this shape. The public
+/// paths stay [`wire`] and [`ipc`] (aliases below); nothing outside this module
+/// should name `bifrost::…` directly.
 #[allow(clippy::all)]
-pub mod wire {
-    include!(concat!(env!("OUT_DIR"), "/lan_workspace.v1.rs"));
+pub mod bifrost {
+    /// `bifrost.v1` (`proto/protocol.proto`): the wire contract.
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/bifrost.v1.rs"));
+    }
+    /// `bifrost.ipc.v1` (`proto/ipc.proto`): the local IPC contract.
+    pub mod ipc {
+        #[allow(clippy::all)]
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/bifrost.ipc.v1.rs"));
+        }
+    }
 }
 
-/// Generated `lan_workspace.ipc.v1` messages (`docs/ipc.proto`).
-#[allow(clippy::all)]
-pub mod ipc {
-    include!(concat!(env!("OUT_DIR"), "/lan_workspace.ipc.v1.rs"));
-}
+/// The local IPC messages (`bifrost.ipc.v1`).
+pub use bifrost::ipc::v1 as ipc;
+/// The wire messages (`bifrost.v1`).
+pub use bifrost::v1 as wire;
 
 pub use frame::{
     decode_message, encode, encode_message, encode_to, Channel, DecodeError, Frame, FrameDecoder,

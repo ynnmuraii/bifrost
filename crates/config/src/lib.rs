@@ -18,8 +18,8 @@
 //!   carries its `CONFIG_*` code ([`ErrorCode`]).
 //! * [`save_atomic`] — temp file, `fsync`, rename, `.bak`, as required by
 //!   «Правила записи».
-//! * [`first_run`] — the `config.toml` the first `lws-core run` writes when there
-//!   is none, and the LAN-address chooser `lws-gui` drives from its settings
+//! * [`first_run`] — the `config.toml` the first `bifrost-core run` writes when there
+//!   is none, and the LAN-address chooser `bifrost-gui` drives from its settings
 //!   screen.
 //! * [`paths::Paths`] / [`default_paths`] — the per-OS locations of «Файлы и
 //!   пути».
@@ -66,6 +66,7 @@ mod legacy;
 pub mod lock;
 pub mod migrate;
 pub mod paths;
+pub mod relocate;
 pub mod save;
 pub mod schema;
 pub mod topology;
@@ -82,10 +83,12 @@ pub use migrate::migrate_legacy_hotkeys;
 pub use paths::{default_paths, Paths};
 pub use save::save_atomic;
 pub use schema::{
-    AppearanceConfig, Backend, ClipboardConfig, ClipboardRoutingPolicy, ClipboardTransfer, Config,
-    DiscoveryConfig, DisplayConfig, Edge, EndpointConfig, InputConfig, Language, LinkConfig,
-    LogConfig, LogLevel, NetworkConfig, NodeConfig, PairingConfig, PeerConfig, PlatformConfig,
-    RepeatMode, TakeoverDetection, TimingConfig, TopologyConfig, UiConfig, WorkspaceConfig,
+    AppearanceConfig, Backend, BridgeDecision, BridgeEndpointConfig, BridgeRuleConfig,
+    ClipboardConfig, ClipboardRoutingPolicy, ClipboardTransfer, Config, DiscoveryConfig,
+    DisplayConfig, DisplayMapConfig, Edge, EndpointConfig, InputConfig, Language, LinkConfig,
+    LogConfig, LogLevel, MapConfig, NetworkConfig, NodeConfig, PairingConfig, PeerConfig,
+    PlatformConfig, RepeatMode, SizeMode, TakeoverDetection, TimingConfig, TopologyConfig,
+    UiConfig, WorkspaceConfig,
 };
 pub use topology::{node_id_from_hex, parse_node_ref, peer_reference};
 

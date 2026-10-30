@@ -6,9 +6,9 @@
 //!   pipe pair on Windows, `socketpair(AF_UNIX)` on Linux), so there is nothing
 //!   to connect to; «Унаследованный канал убирает класс атак «подключиться к
 //!   сокету агента раньше core». Token остаётся второй проверкой.»
-//! * gui ↔ core is a **named** endpoint: «Named pipe `\\.\pipe\lan-workspace-<SID>`,
+//! * gui ↔ core is a **named** endpoint: «Named pipe `\\.\pipe\bifrost-<SID>`,
 //!   DACL: только SID текущего пользователя, `PIPE_REJECT_REMOTE_CLIENTS`» on
-//!   Windows and «UDS `$XDG_RUNTIME_DIR/lan-workspace/gui.sock`, каталог 0700,
+//!   Windows and «UDS `$XDG_RUNTIME_DIR/bifrost/gui.sock`, каталог 0700,
 //!   сокет 0600, проверка `SO_PEERCRED` uid» on Linux.
 //!
 //! The two platforms enforce "same user only" at different points, and this

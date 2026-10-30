@@ -6,7 +6,7 @@
 //! `GetCursorPos`/`EnumDisplayMonitors` call, otherwise Windows virtualises the
 //! coordinates at 150/200% scaling and edge transitions (AC-08) cannot work. A
 //! manifest is honoured from process start; an API call in `main` would work for
-//! the examples too, but it is not what the shipped `lws-agent`/`lws-gui` will
+//! the examples too, but it is not what the shipped `bifrost-agent`/`bifrost-gui` will
 //! use, so the spike exercises the same mechanism the product needs. Cargo build
 //! scripts can attach link arguments per target kind, so this works for
 //! `cargo build --examples` without any extra crate.
@@ -39,7 +39,7 @@ fn main() {
     }
 
     // `/MANIFEST:EMBED` and `/MANIFESTINPUT:` are MSVC `link.exe` switches. The
-    // shipped `lws-agent`/`lws-gui` are MSVC builds, which is what KVM-010/KVM-011
+    // shipped `bifrost-agent`/`bifrost-gui` are MSVC builds, which is what KVM-010/KVM-011
     // require; a mingw/gnullvm link cannot take these flags, so there the examples
     // fall back to `dpi::ensure_per_monitor_v2()` at startup instead (see the
     // crate docs and `src/dpi.rs`).
@@ -48,7 +48,7 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let manifest_path = out_dir.join("lws-per-monitor-v2.manifest");
+    let manifest_path = out_dir.join("bifrost-per-monitor-v2.manifest");
     fs::write(&manifest_path, MANIFEST).expect("write manifest");
 
     let manifest_input = format!("/MANIFESTINPUT:{}", manifest_path.display());

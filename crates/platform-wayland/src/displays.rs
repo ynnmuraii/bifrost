@@ -14,6 +14,9 @@ pub struct Display {
     /// Current mode before compositor transform, in pixels.
     pub native: Option<[i32; 2]>,
     pub rotated: bool,
+    /// Panel dimensions before compositor transform.
+    pub physical_size: Option<[f64; 2]>,
+    pub physical_size_source: String,
 }
 
 /// Selects one coordinate source, never combines incompatible snapshots.
@@ -37,12 +40,22 @@ pub fn discover(
 fn merge_mirrors(outputs: Vec<Display>) -> Vec<Display> {
     let mut result: Vec<Display> = Vec::with_capacity(outputs.len());
     for output in outputs {
-        if output.logical[2] > 0
-            && output.logical[3] > 0
-            && !result
-                .iter()
-                .any(|existing| existing.logical == output.logical)
+        if output.logical[2] <= 0 || output.logical[3] <= 0 {
+            continue;
+        }
+        if let Some(existing) = result
+            .iter_mut()
+            .find(|existing| existing.logical == output.logical)
         {
+            // A mirrored logical screen cannot pick one of several different panels.
+            if existing.physical_size() != output.physical_size() {
+                existing.physical_size = None;
+                existing.physical_size_source.clear();
+            }
+            if existing.native_size() != output.native_size() {
+                existing.native = None;
+            }
+        } else {
             result.push(output);
         }
     }
@@ -52,17 +65,50 @@ fn merge_mirrors(outputs: Vec<Display>) -> Vec<Display> {
 /// Adds physical-mode metadata without changing capture-zone ids or logical geometry.
 pub fn enrich(mut zones: Vec<Display>, outputs: &[Display]) -> Vec<Display> {
     for zone in &mut zones {
-        if let Some(output) = outputs.iter().find(|output| output.logical == zone.logical) {
-            zone.native = output.native;
-            zone.rotated = output.rotated;
-            zone.name.clone_from(&output.name);
-            zone.scale = output.scale;
+        let mut matches = outputs
+            .iter()
+            .filter(|output| output.logical == zone.logical);
+        let Some(first) = matches.next() else {
+            continue;
+        };
+        // Only identical metadata on every exact match is unambiguous.
+        let physical = first.physical_size();
+        let native = first.native_size();
+        let mut same_physical = true;
+        let mut same_native = true;
+        for output in matches {
+            same_physical &= output.physical_size() == physical;
+            same_native &= output.native_size() == native;
         }
+        zone.native = if same_native { first.native } else { None };
+        zone.rotated = first.rotated;
+        zone.name.clone_from(&first.name);
+        zone.scale = first.scale;
+        zone.physical_size = if same_physical {
+            first.physical_size
+        } else {
+            None
+        };
+        zone.physical_size_source = if zone.physical_size.is_some() {
+            first.physical_size_source.clone()
+        } else {
+            String::new()
+        };
     }
     zones
 }
 
 impl Display {
+    pub fn physical_size(&self) -> Option<[f64; 2]> {
+        self.physical_size.map(|[width, height]| {
+            if self.rotated {
+                [height, width]
+            } else {
+                [width, height]
+            }
+        })
+    }
+
     pub fn native_size(&self) -> Option<[i32; 2]> {
         self.native.map(|[width, height]| {
             if self.rotated {
@@ -186,6 +232,8 @@ impl Dispatch<wl_output::WlOutput, u32> for Outputs {
             }
             wl_output::Event::Geometry {
                 transform: wayland_client::WEnum::Value(transform),
+                physical_width,
+                physical_height,
                 ..
             } => {
                 output.rotated = matches!(
@@ -195,6 +243,13 @@ impl Dispatch<wl_output::WlOutput, u32> for Outputs {
                         | wl_output::Transform::Flipped90
                         | wl_output::Transform::Flipped270
                 );
+                output.physical_size = (physical_width > 0 && physical_height > 0)
+                    .then_some([f64::from(physical_width), f64::from(physical_height)]);
+                output.physical_size_source = if output.physical_size.is_some() {
+                    "wayland".to_owned()
+                } else {
+                    String::new()
+                };
             }
             _ => {}
         }
@@ -240,6 +295,34 @@ mod tests {
             scale,
             ..Display::default()
         }
+    }
+
+    #[test]
+    fn physical_geometry_rotates_and_ambiguous_mirrors_stay_unknown() {
+        let zone = output("zone", [0, 0, 1080, 1920], 1);
+        let mut panel = output("DP-1", zone.logical, 1);
+        panel.native = Some([1920, 1080]);
+        panel.physical_size = Some([530.0, 300.0]);
+        panel.physical_size_source = "wayland".into();
+        panel.rotated = true;
+        assert_eq!(panel.physical_size(), Some([300.0, 530.0]));
+        let enriched = enrich(vec![zone.clone()], &[panel.clone()]);
+        assert_eq!(enriched[0].physical_size(), Some([300.0, 530.0]));
+        assert_eq!(enriched[0].logical, zone.logical);
+        let mut mirror = panel.clone();
+        mirror.id = "HDMI-1".into();
+        mirror.physical_size = Some([600.0, 340.0]);
+        assert!(
+            enrich(vec![zone.clone()], &[panel.clone(), mirror.clone()])[0]
+                .physical_size
+                .is_none()
+        );
+        let (_, merged) = discover(Vec::new(), || Ok(vec![panel.clone(), mirror])).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].physical_size.is_none());
+        let mut unrelated = panel;
+        unrelated.logical[0] = 1;
+        assert!(enrich(vec![zone], &[unrelated])[0].physical_size.is_none());
     }
 
     #[test]

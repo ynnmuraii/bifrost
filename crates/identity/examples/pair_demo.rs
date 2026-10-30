@@ -14,7 +14,7 @@
 //!
 //! Run with: `cargo run -p identity --example pair_demo`
 //!
-//! The state directory is **stable** (`%TEMP%/lan-workspace-pair-demo`, not per-process), so
+//! The state directory is **stable** (`%TEMP%/bifrost-pair-demo`, not per-process), so
 //! running the demo twice proves the second run *loads* the stored identity: it prints
 //! `Loaded` instead of `Created` and the same `node_id`, and on Windows the key file is
 //! `identity.dpapi` (a DPAPI blob, not a DER sequence — the demo prints its first bytes).
@@ -33,7 +33,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stable on purpose: the second run must find (and load) what the first one stored.
-    let root = std::env::temp_dir().join("lan-workspace-pair-demo");
+    let root = std::env::temp_dir().join("bifrost-pair-demo");
     let dir_a = root.join("node-a");
     let dir_b = root.join("node-b");
     let dir_c = root.join("node-c");
@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- unknown peer on the *input* channel -------------------------------------
-    println!("== unknown peer on the input channel (ALPN lan-workspace/input/1) ==");
+    println!("== unknown peer on the input channel (ALPN bifrost/input/1) ==");
     // C is made to pin A, so only A's own trust store can refuse the handshake.
     let mut trust_c = TrustStore::new();
     trust_c.trust(identity::TrustedPeer::paired(
@@ -225,7 +225,7 @@ async fn secure_listener(
 ) -> Result<(TcpListener, TlsAcceptor), Box<dyn std::error::Error>> {
     // The configuration is built here (and checked below) so the demo also exercises the
     // policy/ALPN invariant: `server_config` refuses a pairing policy on
-    // `lan-workspace/input/1`, which is what keeps unknown peers off the runtime channels.
+    // `bifrost/input/1`, which is what keeps unknown peers off the runtime channels.
     let config = trusted_server_config(identity, trust)?;
     assert_eq!(config.alpn_protocols.len(), identity::LINK_ALPN.len());
     assert!(matches!(

@@ -24,7 +24,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_root(label: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "lws-link-close-tests-{}-{}-{label}",
+        "bifrost-link-close-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -101,6 +101,29 @@ async fn a_saturated_queue_cannot_swallow_the_link_close() {
             loop {
                 match read_frame(&mut peer).await {
                     Ok(envelope) => {
+                        if let Some(protocol::wire::envelope::Payload::Hello(_)) = &envelope.payload
+                        {
+                            transport::write_frame(
+                                &mut peer,
+                                &protocol::wire::Envelope {
+                                    major: protocol::limits::PROTOCOL_MAJOR,
+                                    minor: protocol::limits::PROTOCOL_MINOR,
+                                    connection_id: envelope.connection_id.clone(),
+                                    seq: 1,
+                                    payload: Some(protocol::wire::envelope::Payload::Hello(
+                                        protocol::wire::Hello {
+                                            node_id: server_id.as_bytes().to_vec(),
+                                            display_name: "server".into(),
+                                            can_own: true,
+                                            ..Default::default()
+                                        },
+                                    )),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("peer Hello");
+                        }
                         let name = match envelope.payload {
                             Some(protocol::wire::envelope::Payload::Shutdown(_)) => "shutdown",
                             Some(protocol::wire::envelope::Payload::Hello(_)) => "hello",
@@ -120,7 +143,7 @@ async fn a_saturated_queue_cannot_swallow_the_link_close() {
         })
     };
 
-    let (reports, _report_rx) = tokio::sync::mpsc::channel::<LinkReport>(8);
+    let (reports, mut report_rx) = tokio::sync::mpsc::channel::<LinkReport>(8);
     let hello = protocol::wire::Hello {
         node_id: client_id.as_bytes().to_vec(),
         display_name: "client".to_owned(),
@@ -140,22 +163,54 @@ async fn a_saturated_queue_cannot_swallow_the_link_close() {
     })
     .expect("spawn a link");
 
-    // No settling delay here on purpose: the link has to end *politely* by itself, whether or
-    // not the peer's post-handshake messages are still unread by the time it closes. Closing
-    // with anything unread sends a reset on Windows, and a reset discards the frames the peer
-    // has not read yet — which is the shape of the `mesh::the_membership_cap_refuses_the_extra_member`
-    // flake (1 failure in ~100 loaded runs: `Io(... 10054)` instead of `MEMBERSHIP_FULL`).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(report_rx.recv().await, Some(LinkReport::Up { .. })) {}
+    })
+    .await
+    .expect("link established");
     let lease_id = [7u8; 16];
-    let one = vec![input_model::InputEvent::PointerAbsolute(
-        input_model::Position::new(1.0, 2.0),
-    )];
+    link.handle
+        .send(focus_router::Message::EnterPrepare {
+            lease_id,
+            topology_revision: 1,
+            position: geometry::Position::new("screen", 1.0, 2.0),
+            owner_serial: 1,
+        })
+        .await
+        .expect("prepare");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !seen.lock().expect("lock").contains(&"other") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("prepare delivered");
+    // The ordered FIFO is full while this current-thread task remains unyielded.
+    link.handle
+        .send(focus_router::Message::InputBatch {
+            lease_id,
+            input_batch_seq: 0,
+            events: vec![input_model::InputEvent::Button {
+                button: input_model::MouseButton::Left,
+                state: input_model::KeyState::Up,
+            }],
+        })
+        .await
+        .expect("capacity-1 FIFO accepts the edge");
+    assert!(link.handle.send_motion(
+        lease_id,
+        vec![input_model::InputEvent::PointerAbsolute(
+            input_model::Position::new(1.0, 2.0),
+        )],
+    ));
     assert!(
-        link.handle.send_motion(lease_id, one.clone()),
-        "the capacity-1 queue takes one item"
-    );
-    assert!(
-        !link.handle.send_motion(lease_id, one),
-        "the queue is full now, so the next motion is dropped"
+        link.handle.send_motion(
+            lease_id,
+            vec![input_model::InputEvent::PointerAbsolute(
+                input_model::Position::new(3.0, 4.0),
+            )],
+        ),
+        "the newest motion overwrites the slot even while the FIFO is full"
     );
     link.handle.close();
 

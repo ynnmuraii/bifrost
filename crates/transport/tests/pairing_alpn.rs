@@ -1,6 +1,6 @@
 //! `pair/1` and `input/1` share one listener on `47901`, told apart by ALPN
 //! (`docs/05-protocol.md`, «Сопряжение»: «Сопряжение — отдельный bounded state machine на
-//! ALPN `lan-workspace/pair/1`»).
+//! ALPN `bifrost/pair/1`»).
 //!
 //! The manager peeks the ClientHello with `LazyConfigAcceptor`: a `pair/1` offer while a
 //! [`PairingGate`] window is open is handshaked with the unknown-peer pairing config and
@@ -37,7 +37,7 @@ const LIVENESS: LinkLiveness = LinkLiveness {
 
 fn temp_root(label: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "lws-pairing-alpn-tests-{}-{}-{label}",
+        "bifrost-pairing-alpn-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

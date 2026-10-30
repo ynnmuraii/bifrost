@@ -8,8 +8,7 @@
 //! * `docs/05-protocol.md`:
 //!   * «Все узлы слушают два порта на своём настроенном LAN-интерфейсе — 47901
 //!     input/control и 47902 clipboard».
-//!   * «ALPN: `lan-workspace/input/1`, `lan-workspace/clipboard/1` и
-//!     `lan-workspace/pair/1`.»
+//!   * «ALPN: `bifrost/input/1`, `bifrost/clipboard/1` и `bifrost/pair/1`.»
 //!   * «Каждый фрейм: 4-byte unsigned big-endian длина + serialized `Envelope`
 //!     Protobuf; для pairing — отдельный `PairingEnvelope` с лимитом 8192 bytes.
 //!     Frame length input/control 1..65536 bytes. Не выделять память до проверки
@@ -30,19 +29,27 @@ pub const PORT_INPUT_CONTROL: u16 = 47901;
 pub const PORT_CLIPBOARD: u16 = 47902;
 
 /// ALPN for the input/control link. `05-protocol.md`.
-pub const ALPN_INPUT: &str = "lan-workspace/input/1";
+///
+/// The name changed in 0.4.0 (`lan-workspace/input/1` → `bifrost/input/1`)
+/// together with the major bump, so 0.4.0 and 0.3.x refuse each other at the TLS
+/// handshake — before either side can see the other's `Hello`.
+pub const ALPN_INPUT: &str = "bifrost/input/1";
 /// ALPN for the clipboard link. `05-protocol.md`.
-pub const ALPN_CLIPBOARD: &str = "lan-workspace/clipboard/1";
+pub const ALPN_CLIPBOARD: &str = "bifrost/clipboard/1";
 /// ALPN for the pairing channel; carries no runtime payload. `05-protocol.md`.
-pub const ALPN_PAIR: &str = "lan-workspace/pair/1";
+pub const ALPN_PAIR: &str = "bifrost/pair/1";
 /// Prompt-only pairing requests; never permits runtime traffic or trust changes.
-pub const ALPN_PAIR_REQUEST: &str = "lan-workspace/pair-request/1";
+pub const ALPN_PAIR_REQUEST: &str = "bifrost/pair-request/1";
 
-/// Wire major version ("Сетевой протокол v0.3"). Both Hello versions must be
-/// equal in `major`; the negotiated `minor` is `min` of both sides.
-pub const PROTOCOL_MAJOR: u32 = 0;
+/// Wire major version ("Сетевой протокол v1", 0.4.0). Both Hello versions must
+/// be equal in `major`; the negotiated `minor` is `min` of both sides.
+pub const PROTOCOL_MAJOR: u32 = 1;
 /// Wire minor version.
-pub const PROTOCOL_MINOR: u32 = 3;
+///
+/// Reset to 0 with the 0.4.0 major bump. `crates/transport/src/clipboard.rs`
+/// still requires an exact major **and** minor, so a future minor bump still
+/// breaks the clipboard channel until that check is capability-gated.
+pub const PROTOCOL_MINOR: u32 = 0;
 
 /// `Envelope` frame body limit on the input/control channel: 1..=65536 bytes.
 pub const MAX_FRAME_INPUT_CONTROL: usize = 65_536;

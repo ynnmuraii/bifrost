@@ -125,7 +125,7 @@ fn spawn() -> Option<Worker> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let join = std::thread::Builder::new()
-        .name("lws-edge-strip".to_owned())
+        .name("bifrost-edge-strip".to_owned())
         .spawn(move || {
             // A panic ends only this cosmetic thread.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

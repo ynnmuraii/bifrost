@@ -3,7 +3,7 @@
 //! `docs/06-development-plan.md`: «`Topology{revision, author_node_id}` — единственный
 //! документ, реплика на каждом узле; `LayoutEdit` применяет только координатор (текущий
 //! owner), устаревшая база → `LAYOUT_CONFLICT`; после партиции координатор забирает
-//! победившую ревизию…». Every test here drives the harness in `tests/common` — two `lws-core`
+//! победившую ревизию…». Every test here drives the harness in `tests/common` — two `bifrost-core`
 //! processes on loopback, real control channel, real links — because a document that only
 //! replicates in a unit test has not replicated at all.
 //!

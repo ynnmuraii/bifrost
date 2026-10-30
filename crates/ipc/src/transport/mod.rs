@@ -9,7 +9,7 @@
 //! | [`GuiListener::accept`] | the DACL already ran in the kernel | `SO_PEERCRED` uid check after `accept` |
 //! | [`connect`] | `CreateFile` on the pipe | `connect(2)` on the socket |
 //! | [`agent_pair`] | a private single-instance pipe pair | `socketpair(AF_UNIX)` |
-//! | [`gui_endpoint`] | `\\.\pipe\lan-workspace-<SID>` | `$XDG_RUNTIME_DIR/lan-workspace/gui.sock` |
+//! | [`gui_endpoint`] | `\\.\pipe\bifrost-<SID>` | `$XDG_RUNTIME_DIR/bifrost/gui.sock` |
 //!
 //! See the platform module documentation for the exact security properties and
 //! for the one documented deviation (the agent pair on Windows).
@@ -40,7 +40,7 @@ use crate::IpcError;
 
 /// The stream an accepted local client is served on.
 ///
-/// `lws-core` serves two local channels with it — the CLI's control line and the GUI's
+/// `bifrost-core` serves two local channels with it — the CLI's control line and the GUI's
 /// `GuiFrame` link — and both platforms hand back their own type, so the alias names the
 /// one place that difference lives.
 #[cfg(unix)]
@@ -51,7 +51,7 @@ pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeServer;
 
 /// The stream a local client *connects* with: what [`connect`] hands back.
 ///
-/// One name for the other end of [`ClientStream`], so a client (`lws-core status`, `lws-gui`,
+/// One name for the other end of [`ClientStream`], so a client (`bifrost-core status`, `bifrost-gui`,
 /// a test that drives `GuiFrame`) is written once for both platforms.
 #[cfg(unix)]
 pub type ClientConnection = tokio::net::UnixStream;
@@ -61,8 +61,8 @@ pub type ClientConnection = tokio::net::windows::named_pipe::NamedPipeClient;
 
 /// The directory a per-user endpoint name is derived from.
 ///
-/// Windows has no runtime directory, so `lws-core` falls back to the state directory for
-/// everything it keeps in one (`apps/lws-core/src/main.rs::private_root`); this mirrors
+/// Windows has no runtime directory, so `bifrost-core` falls back to the state directory for
+/// everything it keeps in one (`apps/bifrost-core/src/main.rs::private_root`); this mirrors
 /// that choice so the daemon, the GUI and the CLI agree on one name without a lookup.
 ///
 /// Windows-only: on Unix the two endpoints are paths under the runtime directory, and a
@@ -74,7 +74,7 @@ fn endpoint_root(paths: &config::Paths) -> &std::path::Path {
 
 /// The `--root` tag for a per-user endpoint name, or `None` for the default directories.
 ///
-/// A GUI endpoint is per *user* (`\\.\pipe\lan-workspace-<SID>`, the documented name),
+/// A GUI endpoint is per *user* (`\\.\pipe\bifrost-<SID>`, the documented name),
 /// because a desktop has one GUI, but `--root` promises to put «config/, data/, state/ and
 /// run/ under DIR», and two cores for the same user — the loopback smoke, a test host —
 /// must not fight over one name. The tag is an FNV-1a hash of the canonical runtime
@@ -128,10 +128,10 @@ fn canonical_existing_prefix(path: &std::path::Path) -> std::path::PathBuf {
 
 /// The documented GUI endpoint of a resolved set of paths.
 ///
-/// `docs/03-architecture.md`, «Транспорт и аутентификация»: `\\.\pipe\lan-workspace-<SID>`
+/// `docs/03-architecture.md`, «Транспорт и аутентификация»: `\\.\pipe\bifrost-<SID>`
 /// with the DACL of the current user and `PIPE_REJECT_REMOTE_CLIENTS` on Windows, and
-/// `$XDG_RUNTIME_DIR/lan-workspace/gui.sock` (directory 0700, socket 0600) on Linux. This is
-/// the *only* place that name is built: `lws-core` binds it, `lws-gui` connects to it, and a
+/// `$XDG_RUNTIME_DIR/bifrost/gui.sock` (directory 0700, socket 0600) on Linux. This is
+/// the *only* place that name is built: `bifrost-core` binds it, `bifrost-gui` connects to it, and a
 /// test that starts a core with `--root` asks for the same endpoint the core did.
 ///
 /// # Errors
@@ -163,8 +163,8 @@ pub fn gui_endpoint(paths: &config::Paths) -> Result<Endpoint, IpcError> {
 /// `ctl` name, plus the same `--root` tag.
 ///
 /// The control channel belongs to a core, not to the desktop, so it never shares the GUI
-/// name: `$XDG_RUNTIME_DIR/lan-workspace/ctl.sock` next to `gui.sock` on Linux, and
-/// `\\.\pipe\lan-workspace-ctl-<SID>` next to the GUI pipe on Windows.
+/// name: `$XDG_RUNTIME_DIR/bifrost/ctl.sock` next to `gui.sock` on Linux, and
+/// `\\.\pipe\bifrost-ctl-<SID>` next to the GUI pipe on Windows.
 #[cfg(unix)]
 pub fn ctl_endpoint(paths: &config::Paths) -> Result<Endpoint, IpcError> {
     let runtime = paths.runtime_dir().ok_or_else(|| {
@@ -197,7 +197,8 @@ mod root_tag_tests {
 
     #[test]
     fn endpoint_tag_is_stable_when_the_runtime_directory_is_created() {
-        let root = std::env::temp_dir().join(format!("lws-ipc-root-tag-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("bifrost-ipc-root-tag-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let runtime = root.join("run");
         let before = root_tag(&runtime).expect("a tagged non-default path");

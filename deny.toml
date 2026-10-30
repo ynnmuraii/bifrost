@@ -51,7 +51,7 @@ allow = [
 # `self_cell` (Apache-2.0 OR GPL-2.0-only) or `r-efi` (MIT OR Apache-2.0 OR LGPL-2.1-or-later).
 #
 # MPL-2.0 is the one copyleft licence that exists in *this* tree: `colored 2.2.0` is MPL-2.0, and
-# it is reachable only from dev-dependencies (`lws-gui` → `egui_kittest` → `dify` → `colored`).
+# it is reachable only from dev-dependencies (`bifrost-gui` → `egui_kittest` → `dify` → `colored`).
 # cargo-deny's `include-dev = false` below is exactly the rule "MPL is allowed for
 # dev-dependencies": a dev-dependency is not part of a shipped artifact, so it is not checked —
 # and `cargo tree --workspace -e normal -i colored` prints nothing, which is the same statement

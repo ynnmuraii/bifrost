@@ -1,5 +1,17 @@
 use protocol::{ipc, validate, wire, *};
 
+/// The 0.4.0 identity: one major bump, names under `bifrost/…`. A drift here is a
+/// silent interoperability break, so the literals are asserted, not derived.
+#[test]
+fn protocol_identity_is_bifrost_v1() {
+    assert_eq!(PROTOCOL_MAJOR, 1);
+    assert_eq!(PROTOCOL_MINOR, 0);
+    assert_eq!(ALPN_INPUT, "bifrost/input/1");
+    assert_eq!(ALPN_CLIPBOARD, "bifrost/clipboard/1");
+    assert_eq!(ALPN_PAIR, "bifrost/pair/1");
+    assert_eq!(ALPN_PAIR_REQUEST, "bifrost/pair-request/1");
+}
+
 #[test]
 fn pairing_request_wire_and_ipc_round_trip_append_only_tags() {
     use prost::Message;
@@ -981,7 +993,7 @@ fn clipboard_routing_schema_tags_and_roundtrips_are_append_only() {
     use wire::envelope::Payload;
 
     assert_eq!(wire::Capability::ClipboardApplyAck as i32, 12);
-    assert_eq!(protocol::limits::PROTOCOL_MINOR, 3);
+    assert_eq!(protocol::limits::PROTOCOL_MINOR, 0);
     let ack = ipc::ClipboardApplied {
         origin_version: 7,
         sha256: vec![1],
@@ -1084,7 +1096,7 @@ fn image_schema_is_append_only_and_old_ipc_defaults_are_unambiguous() {
     assert_eq!(wire::Capability::TextClipboard as i32, 5);
     assert_eq!(wire::Capability::ClipboardSession as i32, 14);
     assert_eq!(wire::Capability::ClipboardImage as i32, 15);
-    assert_eq!(protocol::limits::PROTOCOL_MINOR, 3);
+    assert_eq!(protocol::limits::PROTOCOL_MINOR, 0);
     let old_set = [8, 1, 24, 1, 34, 1, b'x', 42, 1, 7];
     let set = ipc::SetClipboardText::decode(old_set.as_slice()).expect("old Set");
     assert!(set.mime.is_empty());

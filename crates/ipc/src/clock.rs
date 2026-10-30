@@ -10,12 +10,69 @@
 //! если ОС monotonic clock не учитывал время сна».
 //!
 //! The [`Watchdog`](crate::watchdog::Watchdog) of this crate stays sans-IO and still takes
-//! `now_ms` from its caller; [`Clock`] is where the callers — `lws-core`'s supervision and
-//! `lws-agent`'s session — get that reading from, together with the wall reading that tells
+//! `now_ms` from its caller; [`Clock`] is where the callers — `bifrost-core`'s supervision and
+//! `bifrost-agent`'s session — get that reading from, together with the wall reading that tells
 //! the two apart. [`ManualClock`] is the other implementation: a test advances it by hand
 //! instead of sleeping.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Shared same-host diagnostic epoch in microseconds, never a lease/watchdog clock.
+///
+/// A missing reading is unknown; callers must not substitute wall time or a
+/// process-local origin. Remote hosts' readings are not comparable.
+pub fn host_monotonic_us() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn QueryPerformanceCounter(value: *mut i64) -> i32;
+            fn QueryPerformanceFrequency(value: *mut i64) -> i32;
+        }
+        static FREQUENCY: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+            let mut frequency = 0i64;
+            // SAFETY: the API writes one i64 to a valid stack address.
+            let ok = unsafe { QueryPerformanceFrequency(&mut frequency) };
+            (ok != 0 && frequency > 0).then_some(frequency as u64)
+        });
+        let frequency = (*FREQUENCY)?;
+        let mut ticks = 0i64;
+        // SAFETY: the API writes one i64 to a valid stack address.
+        if unsafe { QueryPerformanceCounter(&mut ticks) } == 0 || ticks < 0 {
+            return None;
+        }
+        ticks_to_us(ticks as u64, frequency)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: value is writable and CLOCK_MONOTONIC requires no other resources.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+            return None;
+        }
+        let seconds = u64::try_from(value.tv_sec).ok()?;
+        let nanos = u64::try_from(value.tv_nsec).ok()?;
+        if nanos >= 1_000_000_000 {
+            return None;
+        }
+        seconds.checked_mul(1_000_000)?.checked_add(nanos / 1_000)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(any(windows, test))]
+fn ticks_to_us(ticks: u64, frequency: u64) -> Option<u64> {
+    if frequency == 0 {
+        return None;
+    }
+    u64::try_from(u128::from(ticks) * 1_000_000 / u128::from(frequency)).ok()
+}
 
 /// Monotonic and wall-clock milliseconds: the two readings a suspend is visible in.
 ///
@@ -171,6 +228,26 @@ impl SuspendDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_clock_conversion_is_checked_and_not_process_relative() {
+        assert_eq!(ticks_to_us(123_456_789, 10_000_000), Some(12_345_678));
+        assert_eq!(ticks_to_us(1, 0), None);
+        assert_eq!(ticks_to_us(u64::MAX, 1), None);
+        assert_eq!(ticks_to_us(u64::MAX, 1_000_000), Some(u64::MAX));
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))]
+    fn diagnostic_host_clock_is_available_and_monotonic_across_threads() {
+        let before = host_monotonic_us().expect("native monotonic clock");
+        let other = std::thread::spawn(host_monotonic_us)
+            .join()
+            .expect("reader thread")
+            .expect("native monotonic clock");
+        let after = host_monotonic_us().expect("native monotonic clock");
+        assert!(before <= other && other <= after);
+    }
 
     #[test]
     fn ordinary_time_keeps_both_clocks_together() {

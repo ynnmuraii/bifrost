@@ -2,7 +2,7 @@
 //!
 //! `config.toml` has more than one writer: the core persists the ownership pair and the
 //! layout revision (two stores, and the GUI drives both), and a first run writes the whole
-//! document. More than one process can address the same root — a second `lws-core` start, a
+//! document. More than one process can address the same root — a second `bifrost-core` start, a
 //! CLI command while a core runs, a first run racing a core's first persistence — and each
 //! writer reads the file, changes its own fields and writes the **whole** document back. The
 //! in-process mutex the core used cannot see another process, so the loser's change vanished
@@ -110,7 +110,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "lws-config-lock-{}-{}-{label}",
+            "bifrost-config-lock-{}-{}-{label}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn process_lock_owner_exits_without_drop() {
-        let Some(path) = std::env::var_os("LWS_CONFIG_LOCK_CHILD") else {
+        let Some(path) = std::env::var_os("BIFROST_CONFIG_LOCK_CHILD") else {
             return;
         };
         let owner = FileLock::acquire(Path::new(&path)).unwrap();
@@ -297,7 +297,7 @@ mod tests {
                 "--exact",
                 "lock::tests::process_lock_owner_exits_without_drop",
             ])
-            .env("LWS_CONFIG_LOCK_CHILD", &path)
+            .env("BIFROST_CONFIG_LOCK_CHILD", &path)
             .status()
             .unwrap();
         assert!(status.success());

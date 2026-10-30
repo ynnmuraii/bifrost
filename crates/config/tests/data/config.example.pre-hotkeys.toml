@@ -11,7 +11,7 @@ claim_on_startup = true             # при старте заявить вла�
 [platform]
 backend = "auto"                    # "auto" | "x11" | "wayland"; выбранный вручную обязан совпасть с сеансом
 # Wayland: restore token порталов лежит отдельно от этого файла —
-# $XDG_STATE_HOME/lan-workspace/portal-restore.toml (0600, каталог 0700);
+# $XDG_STATE_HOME/bifrost/portal-restore.toml (0600, каталог 0700);
 # в config.toml и в diagnostic export он не попадает.
 
 [network]

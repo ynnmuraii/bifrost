@@ -129,7 +129,7 @@ fn current_user_sid() -> Result<OwnedSid, AclError> {
 
 /// Replaces `path`'s DACL with a protected, owner-only one.
 ///
-/// Applied to both the `lan-workspace` directory (with inheritance flags) and the key file
+/// Applied to both the application directory (with inheritance flags) and the key file
 /// itself, so neither is readable by another account even if the parent directory was
 /// permissive.
 pub fn apply_owner_only(path: &Path) -> Result<(), AclError> {

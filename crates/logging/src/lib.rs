@@ -1,8 +1,8 @@
-//! The rotating log file `lws-core` and `lws-agent` both write.
+//! The rotating log file `bifrost-core` and `bifrost-agent` both write.
 //!
 //! `docs/03-architecture.md`, «Конфигурация, пути и логи» puts the logs in one directory
-//! per user (`%LOCALAPPDATA%\lan-workspace\logs\` on Windows,
-//! `$XDG_STATE_HOME/lan-workspace/logs/` elsewhere) and gives `[log]` a `level`, a
+//! per user (`%LOCALAPPDATA%\bifrost\logs\` on Windows,
+//! `$XDG_STATE_HOME/bifrost/logs/` elsewhere) and gives `[log]` a `level`, a
 //! `max_file_mb` and a `max_files`. A daemon that a human starts once and then closes the
 //! window of writes those files itself, because its stderr may be nowhere: the GUI starts it
 //! with no console at all, and a Windows service-shaped process has no terminal to inherit.
@@ -19,7 +19,7 @@
 //! destination, not of the process: a console on stderr — a *hidden* console is enough —
 //! must not put `ESC[…m` into a file that parsers and grep read, which is what a single
 //! `fmt()` subscriber whose `with_ansi` follows stderr did. stderr stays for a second
-//! reason: `lws-core`'s own integration tests read a core's log from a redirected stderr.
+//! reason: `bifrost-core`'s own integration tests read a core's log from a redirected stderr.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -266,7 +266,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lws-logging-{}-{label}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bifrost-logging-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temporary directory");
         dir
@@ -276,19 +277,19 @@ mod tests {
     fn a_file_rotates_at_its_size_and_keeps_max_files_of_them() {
         let dir = temp_dir("rotate");
         // 1 MiB is the floor, so write just past it: the second write rotates.
-        let mut file = RotatingFile::open(&dir, "lws-core", 0, 3).expect("a log file");
+        let mut file = RotatingFile::open(&dir, "bifrost-core", 0, 3).expect("a log file");
         let line = vec![b'x'; 1024 * 1024];
         file.write_all(&line).expect("the first mebibyte");
         file.write_all(b"second\n").expect("past the size");
         file.flush().expect("flush");
 
-        assert!(dir.join("lws-core.log").is_file(), "the current file");
-        assert!(dir.join("lws-core.1.log").is_file(), "the rotated one");
+        assert!(dir.join("bifrost-core.log").is_file(), "the current file");
+        assert!(dir.join("bifrost-core.1.log").is_file(), "the rotated one");
         assert!(
-            !dir.join("lws-core.2.log").exists(),
+            !dir.join("bifrost-core.2.log").exists(),
             "3 files means .log + .1"
         );
-        let rotated = std::fs::read(dir.join("lws-core.1.log")).expect("the rotated file");
+        let rotated = std::fs::read(dir.join("bifrost-core.1.log")).expect("the rotated file");
         assert_eq!(rotated.len(), 1024 * 1024, "the size the rotation saw");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -296,11 +297,11 @@ mod tests {
     #[test]
     fn the_file_writer_writes_the_file() {
         let dir = temp_dir("file-only");
-        let sink = file_sink(&dir, "lws-agent", 5, 5).expect("a log file");
+        let sink = file_sink(&dir, "bifrost-agent", 5, 5).expect("a log file");
         let mut writer = FileOnly::new(Arc::clone(&sink));
         writer.write_all(b"an event\n").expect("write");
         writer.flush().expect("flush");
-        let text = std::fs::read_to_string(dir.join("lws-agent.log")).expect("the log file");
+        let text = std::fs::read_to_string(dir.join("bifrost-agent.log")).expect("the log file");
         assert_eq!(text, "an event\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -354,7 +355,7 @@ mod tests {
         let dir = temp_dir("unwritable");
         let blocker = dir.join("blocker");
         std::fs::write(&blocker, b"not a directory").expect("the blocker file");
-        assert!(RotatingFile::open(&blocker.join("logs"), "lws-core", 5, 5).is_none());
+        assert!(RotatingFile::open(&blocker.join("logs"), "bifrost-core", 5, 5).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn replacement_failure_preserves_primary_for_concurrent_reader() {
         let directory =
-            std::env::temp_dir().join(format!("lws-config-replacement-{}", std::process::id()));
+            std::env::temp_dir().join(format!("bifrost-config-replacement-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("config.toml");
         fs::write(&path, "previous").unwrap();

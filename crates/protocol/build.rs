@@ -1,4 +1,4 @@
-//! Generates the wire (`lan_workspace.v1`) and IPC (`lan_workspace.ipc.v1`)
+//! Generates the wire (`bifrost.v1`) and IPC (`bifrost.ipc.v1`)
 //! Protobuf modules from `proto/*.proto`.
 //!
 //! `protox` compiles the descriptors in pure Rust, so no `protoc` binary is

@@ -1,0 +1,1019 @@
+//! The monitor map, as pure geometry: placement, snapping and links.
+//!
+//! Nothing here knows `egui` or the wire: the functions take rectangles and answer rectangles,
+//! so `cargo test -p bifrost-gui` checks the whole of «Карта мониторов» — where a computer is
+//! first drawn, where a drag lands, which edges end up linked — without a window.
+//!
+//! # Units
+//!
+//! The map works in *stage units*: the nominal stage is [`STAGE_W`] × [`STAGE_H`] and a
+//! display of `logical_w` units is drawn `logical_w * scale` stage units wide, where `scale`
+//! is [`BASE_SCALE`] shrunk until every computer fits the stage ([`arrange`]).
+//! The UI converts free pointer movement and paddle hit targets between screen and stage units.
+//!
+//! Links join visible, facing display edges across at most [`LINK_MAX_GAP`] stage units.
+//! Each display pair retains its own overlap segment, rather than a desktop bounding box.
+//! Legacy documents still determine their initial placement.
+
+use crate::view_model::Side;
+
+/// Nominal stage width.
+pub const STAGE_W: f64 = 916.0;
+/// Nominal stage height.
+pub const STAGE_H: f64 = 270.0;
+/// Initial spacing for reconstructed links, never a drag snap target.
+pub const GAP: f64 = 72.0;
+/// How near (stage units) an edge has to be before the drag snaps onto it.
+pub const SNAP: f64 = 12.0;
+/// Maximum empty space between facing display edges.
+pub const LINK_MAX_GAP: f64 = 288.0;
+/// Floating-point tolerance for touching edges and positive projection overlap.
+pub const MIN_OVERLAP: f64 = 1e-6;
+/// Stage units per logical unit before shrinking (1920 logical → 144).
+pub const BASE_SCALE: f64 = 0.075;
+/// Canonical map units per physical millimetre; never an OS DPI conversion.
+pub const MM_SCALE: f64 = BASE_SCALE * 96.0 / 25.4;
+
+/// Convert a map interval to distances in one display's logical edge.
+pub fn logical_span(span: (f64, f64), origin: f64, extent: f64, logical: f64) -> (f64, f64) {
+    (
+        ((span.0 - origin) / extent).clamp(0.0, 1.0) * logical,
+        ((span.1 - origin) / extent).clamp(0.0, 1.0) * logical,
+    )
+}
+
+/// Convert display-local logical distances back into canonical map coordinates.
+pub fn layout_span(span: (f64, f64), origin: f64, extent: f64, logical: f64) -> (f64, f64) {
+    (
+        origin + span.0 / logical * extent,
+        origin + span.1 / logical * extent,
+    )
+}
+
+/// A candidate must provide a usable contact on both logical display edges.
+pub fn short_overlap(length: f64, map_edges: [f64; 2], logical_edges: [f64; 2]) -> bool {
+    map_edges
+        .into_iter()
+        .zip(logical_edges)
+        .any(|(map, logical)| length / map * logical + MIN_OVERLAP < 32.0_f64.max(0.02 * logical))
+}
+
+/// Physical map dimensions for an aspect-locked diagonal, in inches.
+pub fn diagonal_size(inches: f64, aspect: f64) -> (f64, f64) {
+    let height = 25.4 * inches / aspect.hypot(1.0) * MM_SCALE;
+    (height * aspect, height)
+}
+/// Computers that are not linked to anyone are parked this far below the rest.
+const PARK_GAP: f64 = 130.0;
+
+/// A point of the stage.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Pt {
+    /// Horizontal.
+    pub x: f64,
+    /// Vertical.
+    pub y: f64,
+}
+
+impl Pt {
+    /// A point.
+    pub const fn new(x: f64, y: f64) -> Self {
+        Pt { x, y }
+    }
+}
+
+/// A rectangle of the stage.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Rect {
+    /// Left.
+    pub x: f64,
+    /// Top.
+    pub y: f64,
+    /// Width.
+    pub w: f64,
+    /// Height.
+    pub h: f64,
+}
+
+impl Rect {
+    /// A rectangle.
+    pub const fn new(x: f64, y: f64, w: f64, h: f64) -> Self {
+        Rect { x, y, w, h }
+    }
+}
+
+/// One computer: its displays relative to its own top-left corner, and the box around them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Shape {
+    /// The displays, relative to the computer's origin.
+    pub mons: Vec<Rect>,
+    /// Width of the box around all displays.
+    pub w: f64,
+    /// Height of the box around all displays.
+    pub h: f64,
+}
+
+impl Shape {
+    /// The shape of `displays` (logical rectangles) drawn at `scale`; the box starts at 0,0.
+    pub fn new(displays: &[Rect], scale: f64) -> Self {
+        let min_x = displays.iter().map(|d| d.x).fold(f64::INFINITY, f64::min);
+        let min_y = displays.iter().map(|d| d.y).fold(f64::INFINITY, f64::min);
+        let mons: Vec<Rect> = displays
+            .iter()
+            .map(|d| {
+                Rect::new(
+                    (d.x - min_x) * scale,
+                    (d.y - min_y) * scale,
+                    d.w * scale,
+                    d.h * scale,
+                )
+            })
+            .collect();
+        let w = mons.iter().map(|m| m.x + m.w).fold(0.0, f64::max);
+        let h = mons.iter().map(|m| m.y + m.h).fold(0.0, f64::max);
+        Shape { mons, w, h }
+    }
+}
+
+/// «Computer `b` is on side `side` of computer `a`» — one link of the applied document.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DocLink {
+    /// The computer the link leaves.
+    pub a: usize,
+    /// Which side of `a` the link is on.
+    pub side: Side,
+    /// The computer it arrives at.
+    pub b: usize,
+    /// Concrete endpoint segment bounds in node-local units at [`BASE_SCALE`].
+    pub contact: Option<(Rect, Rect)>,
+}
+
+/// The direction two linked computers face each other in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    /// Side by side: `a` is left of `b`.
+    Horizontal,
+    /// Stacked: `a` is above `b`.
+    Vertical,
+}
+
+/// Two computers that face each other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeoLink {
+    /// The left (or upper) computer.
+    pub a: usize,
+    /// The right (or lower) computer.
+    pub b: usize,
+    /// Display index on the left/upper computer.
+    pub a_display: usize,
+    /// Display index on the right/lower computer.
+    pub b_display: usize,
+    /// How they face.
+    pub dir: Dir,
+    /// The empty space between the two edges (may be slightly negative).
+    pub gap: f64,
+    /// Where the link leaves `a`'s edge.
+    pub from: Pt,
+    /// Where it arrives at `b`'s edge.
+    pub to: Pt,
+    /// The shared stretch of the two edges, along the edge's own axis.
+    pub span: (f64, f64),
+}
+
+impl GeoLink {
+    /// Which side of `a` computer `b` is on.
+    pub const fn side_of_b(&self) -> Side {
+        match self.dir {
+            Dir::Horizontal => Side::Right,
+            Dir::Vertical => Side::Bottom,
+        }
+    }
+}
+
+/// The computers drawn on the stage: their shapes, positions and the scale they were drawn at.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Arrangement {
+    /// Stage units per logical unit.
+    pub scale: f64,
+    /// One shape per computer.
+    pub shapes: Vec<Shape>,
+    /// One position per computer.
+    pub pos: Vec<Pt>,
+}
+
+fn opposite(side: Side) -> Side {
+    match side {
+        Side::Left => Side::Right,
+        Side::Right => Side::Left,
+        Side::Top => Side::Bottom,
+        Side::Bottom => Side::Top,
+    }
+}
+
+/// Where `other` sits when it is put on `side` of `me`, centred on the shared edge and `GAP`
+/// away from it.
+pub fn adjacent(me: &Shape, me_at: Pt, other: &Shape, side: Side) -> Pt {
+    match side {
+        Side::Right => Pt::new(me_at.x + me.w + GAP, me_at.y + (me.h - other.h) / 2.0),
+        Side::Left => Pt::new(me_at.x - GAP - other.w, me_at.y + (me.h - other.h) / 2.0),
+        Side::Bottom => Pt::new(me_at.x + (me.w - other.w) / 2.0, me_at.y + me.h + GAP),
+        Side::Top => Pt::new(me_at.x + (me.w - other.w) / 2.0, me_at.y - GAP - other.h),
+    }
+}
+
+/// The corners of the box around every computer: `(min_x, min_y, max_x, max_y)`.
+pub fn bounds(shapes: &[Shape], pos: &[Pt]) -> (f64, f64, f64, f64) {
+    let mut b = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (shape, at) in shapes.iter().zip(pos) {
+        b = (
+            b.0.min(at.x),
+            b.1.min(at.y),
+            b.2.max(at.x + shape.w),
+            b.3.max(at.y + shape.h),
+        );
+    }
+    if b.0.is_finite() {
+        b
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    }
+}
+
+/// The first placement: the applied links decide where each computer goes.
+///
+/// `anchor` is the root. Concrete endpoint starts align along the tangent, preserving
+/// display-relative offsets; every reconstructed link leaves an initial [`GAP`].
+/// Disconnected computers are parked below the rest. The result is stage-centred.
+pub fn place(shapes: &[Shape], doc_links: &[DocLink], anchor: usize) -> Vec<Pt> {
+    place_at_scale(shapes, doc_links, anchor, BASE_SCALE)
+}
+
+/// Reconstruct concrete contacts at the scale used by the current shapes.
+pub fn place_at_scale(
+    shapes: &[Shape],
+    doc_links: &[DocLink],
+    anchor: usize,
+    scale: f64,
+) -> Vec<Pt> {
+    let n = shapes.len();
+    let mut pos: Vec<Option<Pt>> = vec![None; n];
+    let mut queue = std::collections::VecDeque::new();
+    let mut seeds = std::iter::once(anchor).chain(0..n).filter(|i| *i < n);
+    let mut park_x: Option<f64> = None;
+    while let Some(seed) = seeds.find(|seed| pos[*seed].is_none()) {
+        let at = if queue.is_empty() && pos.iter().all(Option::is_none) {
+            Pt::new(0.0, 0.0)
+        } else {
+            let placed: Vec<(Shape, Pt)> = pos
+                .iter()
+                .zip(shapes)
+                .filter_map(|(p, s)| p.map(|p| (s.clone(), p)))
+                .collect();
+            let (shapes_p, pos_p): (Vec<Shape>, Vec<Pt>) = placed.into_iter().unzip();
+            let (min_x, _, _, max_y) = bounds(&shapes_p, &pos_p);
+            let x = park_x.unwrap_or(min_x);
+            park_x = Some(x + shapes[seed].w + PARK_GAP);
+            Pt::new(x, max_y + PARK_GAP)
+        };
+        pos[seed] = Some(at);
+        queue.push_back(seed);
+        while let Some(i) = queue.pop_front() {
+            let Some(at_i) = pos[i] else { continue };
+            for link in doc_links {
+                let (j, side) = if link.a == i {
+                    (link.b, link.side)
+                } else if link.b == i {
+                    (link.a, opposite(link.side))
+                } else {
+                    continue;
+                };
+                if j >= n || pos[j].is_some() {
+                    continue;
+                }
+                pos[j] = Some(if let Some((from, to)) = link.contact {
+                    let (from, to) = if link.a == i { (from, to) } else { (to, from) };
+                    let factor = scale / BASE_SCALE;
+                    let offset = match side {
+                        Side::Left => Pt::new(-GAP, 0.0),
+                        Side::Right => Pt::new(GAP, 0.0),
+                        Side::Top => Pt::new(0.0, -GAP),
+                        Side::Bottom => Pt::new(0.0, GAP),
+                    };
+                    Pt::new(
+                        at_i.x + (from.x - to.x) * factor + offset.x,
+                        at_i.y + (from.y - to.y) * factor + offset.y,
+                    )
+                } else {
+                    adjacent(&shapes[i], at_i, &shapes[j], side)
+                });
+                queue.push_back(j);
+            }
+        }
+    }
+    let mut pos: Vec<Pt> = pos.into_iter().map(|p| p.unwrap_or_default()).collect();
+    let (min_x, min_y, max_x, max_y) = bounds(shapes, &pos);
+    let (dx, dy) = (
+        STAGE_W / 2.0 - (min_x + max_x) / 2.0,
+        STAGE_H / 2.0 - (min_y + max_y) / 2.0,
+    );
+    for p in &mut pos {
+        p.x += dx;
+        p.y += dy;
+    }
+    pos
+}
+
+/// Shapes and first placement for `nodes` (each the logical rectangles of one computer),
+/// shrunk until the whole arrangement fits the stage.
+pub fn arrange(nodes: &[Vec<Rect>], doc_links: &[DocLink], anchor: usize) -> Arrangement {
+    let mut scale = BASE_SCALE;
+    let mut result = Arrangement::default();
+    for _ in 0..10 {
+        let shapes: Vec<Shape> = nodes.iter().map(|n| Shape::new(n, scale)).collect();
+        let pos = place_at_scale(&shapes, doc_links, anchor, scale);
+        let (min_x, min_y, max_x, max_y) = bounds(&shapes, &pos);
+        let (w, h) = (max_x - min_x, max_y - min_y);
+        result = Arrangement { scale, shapes, pos };
+        let fit = (STAGE_W * 0.96 / w.max(1.0)).min(STAGE_H * 0.96 / h.max(1.0));
+        if fit >= 1.0 {
+            break;
+        }
+        scale *= fit * 0.97;
+    }
+    result
+}
+
+/// Snap perpendicular to the nearest real display edge, preserving tangent offset.
+pub fn snap(shapes: &[Shape], pos: &[Pt], me: usize, x: f64, y: f64) -> Pt {
+    snap_with_threshold(shapes, pos, me, x, y, SNAP)
+}
+
+/// Screen-aware variant, with the pixel threshold converted to stage units.
+pub fn snap_with_threshold(
+    shapes: &[Shape],
+    pos: &[Pt],
+    me: usize,
+    x: f64,
+    y: f64,
+    threshold: f64,
+) -> Pt {
+    let Some(mine) = shapes.get(me) else {
+        return Pt::new(x, y);
+    };
+    let mut best = threshold;
+    let mut landed = Pt::new(x, y);
+    for (index, (other, at)) in shapes.iter().zip(pos).enumerate() {
+        if index == me {
+            continue;
+        }
+        for m in &mine.mons {
+            for o in &other.mons {
+                let (mx, my) = (x + m.x, y + m.y);
+                let (ox, oy) = (at.x + o.x, at.y + o.y);
+                if (my + m.h).min(oy + o.h) - my.max(oy) > MIN_OVERLAP {
+                    for delta in [ox + o.w - mx, ox - (mx + m.w)] {
+                        if delta.abs() < best {
+                            best = delta.abs();
+                            landed = Pt::new(x + delta, y);
+                        }
+                    }
+                }
+                if (mx + m.w).min(ox + o.w) - mx.max(ox) > MIN_OVERLAP {
+                    for delta in [oy + o.h - my, oy - (my + m.h)] {
+                        if delta.abs() < best {
+                            best = delta.abs();
+                            landed = Pt::new(x, y + delta);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    landed
+}
+
+/// Every visible facing display-edge segment, including touching edges.
+pub fn links(shapes: &[Shape], pos: &[Pt]) -> Vec<GeoLink> {
+    let mut out = Vec::new();
+    for i in 0..shapes.len().min(pos.len()) {
+        for j in i + 1..shapes.len().min(pos.len()) {
+            for (mi, m) in shapes[i].mons.iter().enumerate() {
+                for (mj, n) in shapes[j].mons.iter().enumerate() {
+                    for (a, am, ar, ap, b, bm, br, bp) in [
+                        (i, mi, m, pos[i], j, mj, n, pos[j]),
+                        (j, mj, n, pos[j], i, mi, m, pos[i]),
+                    ] {
+                        let (ax, ay) = (ap.x + ar.x, ap.y + ar.y);
+                        let (bx, by) = (bp.x + br.x, bp.y + br.y);
+                        for (dir, gap, start, end, edge) in [
+                            (
+                                Dir::Horizontal,
+                                bx - (ax + ar.w),
+                                ay.max(by),
+                                (ay + ar.h).min(by + br.h),
+                                ax + ar.w,
+                            ),
+                            (
+                                Dir::Vertical,
+                                by - (ay + ar.h),
+                                ax.max(bx),
+                                (ax + ar.w).min(bx + br.w),
+                                ay + ar.h,
+                            ),
+                        ] {
+                            if gap < -MIN_OVERLAP
+                                || gap > LINK_MAX_GAP + MIN_OVERLAP
+                                || end - start <= MIN_OVERLAP
+                            {
+                                continue;
+                            }
+                            let mut visible = vec![(start, end)];
+                            for (node, (shape, at)) in shapes.iter().zip(pos).enumerate() {
+                                for (display, rect) in shape.mons.iter().enumerate() {
+                                    if (node == a && display == am) || (node == b && display == bm)
+                                    {
+                                        continue;
+                                    }
+                                    let (near, far, lo, hi) = match dir {
+                                        Dir::Horizontal => (
+                                            at.x + rect.x,
+                                            at.x + rect.x + rect.w,
+                                            at.y + rect.y,
+                                            at.y + rect.y + rect.h,
+                                        ),
+                                        Dir::Vertical => (
+                                            at.y + rect.y,
+                                            at.y + rect.y + rect.h,
+                                            at.x + rect.x,
+                                            at.x + rect.x + rect.w,
+                                        ),
+                                    };
+                                    // A node's own siblings hide an edge even beyond the
+                                    // peer: the core rejects links into local monitor holes.
+                                    // Unrelated computers only occlude the bridge corridor.
+                                    let target = edge + gap.max(0.0);
+                                    let obstructs = if node == a {
+                                        far > edge + MIN_OVERLAP
+                                    } else if node == b {
+                                        near < target - MIN_OVERLAP
+                                    } else {
+                                        far > edge + MIN_OVERLAP && near < target - MIN_OVERLAP
+                                    };
+                                    if !obstructs {
+                                        continue;
+                                    }
+                                    let mut segment = 0;
+                                    while segment < visible.len() {
+                                        let (lo_visible, hi_visible) = visible[segment];
+                                        if hi <= lo_visible || lo >= hi_visible {
+                                            segment += 1;
+                                            continue;
+                                        }
+                                        let keep_start = lo - lo_visible > MIN_OVERLAP;
+                                        let keep_end = hi_visible - hi > MIN_OVERLAP;
+                                        match (keep_start, keep_end) {
+                                            (true, true) => {
+                                                visible[segment] = (lo_visible, lo);
+                                                visible.insert(segment + 1, (hi, hi_visible));
+                                                segment += 2;
+                                            }
+                                            (true, false) => {
+                                                visible[segment] = (lo_visible, lo);
+                                                segment += 1;
+                                            }
+                                            (false, true) => {
+                                                visible[segment] = (hi, hi_visible);
+                                                segment += 1;
+                                            }
+                                            (false, false) => {
+                                                visible.remove(segment);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for (start, end) in visible {
+                                let mid = (start + end) / 2.0;
+                                let (from, to) = match dir {
+                                    Dir::Horizontal => (Pt::new(edge, mid), Pt::new(bx, mid)),
+                                    Dir::Vertical => (Pt::new(mid, edge), Pt::new(mid, by)),
+                                };
+                                out.push(GeoLink {
+                                    a,
+                                    b,
+                                    a_display: am,
+                                    b_display: bm,
+                                    dir,
+                                    gap: gap.max(0.0),
+                                    from,
+                                    to,
+                                    span: (start, end),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Clamp an absolute tangent interval to an available edge, with a 12-unit minimum.
+pub fn clamp_paddle(start: f64, end: f64, edge_start: f64, edge_end: f64) -> (f64, f64) {
+    let available = (edge_end - edge_start).max(0.0);
+    let length = (end - start).max(available.min(12.0)).min(available);
+    let start = start.clamp(edge_start, edge_end.max(edge_start) - length);
+    (start, start + length)
+}
+
+/// Translate a paddle without changing its length unless the available edge is shorter.
+pub fn move_paddle(span: (f64, f64), delta: f64, bounds: (f64, f64)) -> (f64, f64) {
+    clamp_paddle(span.0 + delta, span.1 + delta, bounds.0, bounds.1)
+}
+
+/// Resize one endpoint while keeping the opposite endpoint fixed inside the edge.
+pub fn resize_paddle(
+    span: (f64, f64),
+    start_end: bool,
+    value: f64,
+    bounds: (f64, f64),
+) -> (f64, f64) {
+    let span = clamp_paddle(span.0, span.1, bounds.0, bounds.1);
+    let minimum = (bounds.1 - bounds.0).clamp(0.0, 12.0);
+    if start_end {
+        (value.clamp(bounds.0, span.1 - minimum), span.1)
+    } else {
+        (span.0, value.clamp(span.0 + minimum, bounds.1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn representative_03_01_02_layout_has_no_enabled_sliver() {
+        for second in [(1080.0, 1920.0), (1920.0, 1080.0)] {
+            for laptop in [(1745.0, 1091.0), (1920.0 / 1.1, 1200.0 / 1.1)] {
+                let shapes = vec![
+                    Shape::new(
+                        &[
+                            Rect::new(0.0, 420.0, 1920.0, 1080.0),
+                            Rect::new(1920.0, 0.0, second.0, second.1),
+                        ],
+                        BASE_SCALE,
+                    ),
+                    Shape::new(&[Rect::new(0.0, 0.0, laptop.0, laptop.1)], BASE_SCALE),
+                ];
+                let pos = vec![
+                    Pt::new(0.0, 0.0),
+                    Pt::new((-laptop.0 - 96.0) * BASE_SCALE, 400.0 * BASE_SCALE),
+                ];
+                let candidates = links(&shapes, &pos);
+                let sliver = candidates
+                    .iter()
+                    .find(|g| g.a == 1 && g.b == 0 && g.b_display == 1)
+                    .expect("visible 03-to-02 candidate");
+                let len = sliver.span.1 - sliver.span.0;
+                assert!((len / BASE_SCALE - 20.0).abs() < 1e-6);
+                assert!(short_overlap(
+                    len,
+                    [laptop.1 * BASE_SCALE, second.1 * BASE_SCALE],
+                    [laptop.1, second.1]
+                ));
+                let main = candidates
+                    .iter()
+                    .find(|g| g.a == 1 && g.b == 0 && g.b_display == 0)
+                    .expect("03-to-01 main bridge");
+                assert!(!short_overlap(
+                    main.span.1 - main.span.0,
+                    [laptop.1 * BASE_SCALE, 1080.0 * BASE_SCALE],
+                    [laptop.1, 1080.0]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn threshold_uses_both_logical_edges_after_occlusion() {
+        for edge in [1080.0, 1920.0, 2160.0] {
+            let threshold = 32.0_f64.max(edge * 0.02);
+            assert!(short_overlap(threshold - 0.001, [edge, edge], [edge, edge]));
+            assert!(!short_overlap(threshold, [edge, edge], [edge, edge]));
+        }
+        assert!(short_overlap(40.0, [100.0, 200.0], [1080.0, 100.0]));
+        assert!(!short_overlap(40.0, [100.0, 100.0], [1080.0, 1080.0]));
+    }
+
+    #[test]
+    fn layout_logical_intervals_round_trip_without_native_scaling() {
+        for (origin, extent, logical) in [(-19.0, 130.0, 1091.0), (42.0, 250.0, 2160.0)] {
+            let expected = (origin + extent * 0.2, origin + extent * 0.8);
+            let logical_interval = logical_span(expected, origin, extent, logical);
+            let actual = layout_span(logical_interval, origin, extent, logical);
+            assert!((actual.0 - expected.0).abs() < 1e-9);
+            assert!((actual.1 - expected.1).abs() < 1e-9);
+            assert!((logical_interval.0 - logical * 0.2).abs() < 1e-9);
+        }
+        let (w, h) = diagonal_size(24.0, 16.0 / 9.0);
+        assert!((w / h - 16.0 / 9.0).abs() < 1e-9);
+        assert!((w.hypot(h) / MM_SCALE / 25.4 - 24.0).abs() < 1e-9);
+    }
+
+    fn boxed(w: f64, h: f64) -> Shape {
+        Shape {
+            mons: vec![Rect::new(0.0, 0.0, w, h)],
+            w,
+            h,
+        }
+    }
+
+    #[test]
+    fn real_display_coordinates_are_normalized_without_rearranging() {
+        let shape = Shape::new(
+            &[
+                Rect::new(-1920.0, 100.0, 1920.0, 1080.0),
+                Rect::new(0.0, 0.0, 1080.0, 1920.0),
+            ],
+            0.1,
+        );
+        assert_eq!(
+            shape.mons,
+            vec![
+                Rect::new(0.0, 10.0, 192.0, 108.0),
+                Rect::new(192.0, 0.0, 108.0, 192.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn four_sides_snap_flush_and_preserve_the_tangent_offset() {
+        let shapes = [boxed(144.0, 190.0), boxed(100.0, 80.0)];
+        let pos = [Pt::new(300.0, 60.0), Pt::default()];
+        for (drop, expected, dir) in [
+            (
+                Pt::new(450.0, 157.5),
+                Pt::new(444.0, 157.5),
+                Dir::Horizontal,
+            ),
+            (
+                Pt::new(194.0, 157.5),
+                Pt::new(200.0, 157.5),
+                Dir::Horizontal,
+            ),
+            (Pt::new(327.5, 256.0), Pt::new(327.5, 250.0), Dir::Vertical),
+            (Pt::new(327.5, -26.0), Pt::new(327.5, -20.0), Dir::Vertical),
+        ] {
+            let landed = snap(&shapes, &pos, 1, drop.x, drop.y);
+            assert_eq!(landed, expected);
+            let contacts = links(&shapes, &[pos[0], landed]);
+            assert_eq!(contacts.len(), 1);
+            assert_eq!(contacts[0].dir, dir);
+            assert_eq!(contacts[0].gap, 0.0);
+        }
+    }
+
+    #[test]
+    fn free_placement_is_not_clamped_and_gap_links_do_not_snap() {
+        let shapes = [boxed(144.0, 90.0), boxed(100.0, 80.0)];
+        let pos = [Pt::default(), Pt::default()];
+        let landed = snap(&shapes, &pos, 1, -5000.5, 9000.25);
+        assert_eq!(landed, Pt::new(-5000.5, 9000.25));
+        assert!(links(&shapes, &[pos[0], landed]).is_empty());
+        assert_eq!(links(&shapes, &[pos[0], Pt::new(150.0, 0.0)]).len(), 1);
+    }
+
+    #[test]
+    fn lower_half_of_portrait_monitor_is_the_only_contact() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 20.0, 192.0, 108.0),
+                Rect::new(192.0, 0.0, 108.0, 192.0),
+            ],
+            w: 300.0,
+            h: 192.0,
+        };
+        let shapes = [desktop, boxed(174.5, 96.0)];
+        let pos = [Pt::default(), Pt::new(307.0, 96.0)];
+        let laptop = snap(&shapes, &pos, 1, pos[1].x, pos[1].y);
+        assert_eq!(laptop, Pt::new(300.0, 96.0));
+        let contacts = links(&shapes, &[pos[0], laptop]);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!((contacts[0].a_display, contacts[0].b_display), (1, 0));
+        assert_eq!(contacts[0].span, (96.0, 192.0));
+        assert_eq!(contacts[0].from, Pt::new(300.0, 144.0));
+    }
+
+    #[test]
+    fn touching_two_displays_produces_two_exact_segments() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 0.0, 100.0, 80.0),
+                Rect::new(0.0, 80.0, 100.0, 120.0),
+            ],
+            w: 100.0,
+            h: 200.0,
+        };
+        let contacts = links(
+            &[desktop, boxed(100.0, 120.0)],
+            &[Pt::default(), Pt::new(100.0, 40.0)],
+        );
+        assert_eq!(contacts.len(), 2);
+        assert_eq!((contacts[0].a_display, contacts[0].span), (0, (40.0, 80.0)));
+        assert_eq!(
+            (contacts[1].a_display, contacts[1].span),
+            (1, (80.0, 160.0))
+        );
+    }
+
+    #[test]
+    fn horizontal_contacts_use_real_edges_of_unequal_height_displays() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 20.0, 100.0, 80.0),
+                Rect::new(100.0, 0.0, 80.0, 100.0),
+            ],
+            w: 180.0,
+            h: 100.0,
+        };
+        let shapes = [desktop, boxed(120.0, 90.0)];
+        let pos = [Pt::default(), Pt::new(40.25, 106.0)];
+        let landed = snap(&shapes, &pos, 1, pos[1].x, pos[1].y);
+        assert_eq!(landed, Pt::new(40.25, 100.0));
+        let contacts = links(&shapes, &[pos[0], landed]);
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].span, (40.25, 100.0));
+        assert_eq!(contacts[1].span, (100.0, 160.25));
+        assert!(contacts.iter().all(|link| link.dir == Dir::Vertical));
+    }
+
+    #[test]
+    fn screen_threshold_is_not_a_long_distance_magnet() {
+        let shapes = [boxed(100.0, 100.0), boxed(80.0, 80.0)];
+        let pos = [Pt::default(), Pt::default()];
+        assert_eq!(
+            snap_with_threshold(&shapes, &pos, 1, 107.0, 30.25, 6.0),
+            Pt::new(107.0, 30.25)
+        );
+        assert_eq!(
+            snap_with_threshold(&shapes, &pos, 1, 105.0, 30.25, 6.0),
+            Pt::new(100.0, 30.25)
+        );
+    }
+
+    #[test]
+    fn legacy_links_load_and_disconnected_nodes_are_parked() {
+        let nodes = vec![vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)]; 3];
+        let doc = [DocLink {
+            a: 0,
+            b: 1,
+            side: Side::Right,
+            contact: None,
+        }];
+        let arrangement = arrange(&nodes, &doc, 0);
+        assert!(
+            (arrangement.pos[1].x - arrangement.pos[0].x - arrangement.shapes[0].w - GAP).abs()
+                < 1e-6
+        );
+        assert!(arrangement.pos[2].y > arrangement.pos[0].y + arrangement.shapes[0].h);
+    }
+
+    #[test]
+    fn concrete_contacts_reconstruct_at_any_scale_without_rounding() {
+        for scale in [BASE_SCALE, BASE_SCALE / 3.0] {
+            let shapes = vec![Shape::new(&[Rect::new(0.0, 0.0, 1920.0, 1080.0)], scale); 2];
+            let doc = [DocLink {
+                a: 0,
+                b: 1,
+                side: Side::Right,
+                contact: Some((
+                    Rect::new(144.0, 40.125, 0.0, 20.0),
+                    Rect::new(0.0, 0.0, 0.0, 20.0),
+                )),
+            }];
+            let pos = place_at_scale(&shapes, &doc, 0, scale);
+            assert!((pos[1].x - pos[0].x - shapes[0].w - GAP).abs() < 1e-9);
+            assert!((pos[1].y - pos[0].y - 40.125 * scale / BASE_SCALE).abs() < 1e-9);
+            assert_eq!(links(&shapes, &pos).len(), 1);
+        }
+    }
+
+    #[test]
+    fn concrete_paddles_reconstruct_with_bridge_room_on_every_side() {
+        for (side, from, to, delta) in [
+            (
+                Side::Right,
+                Rect::new(100.0, 20.0, 0.0, 30.0),
+                Rect::new(0.0, 10.0, 0.0, 40.0),
+                Pt::new(100.0 + GAP, 10.0),
+            ),
+            (
+                Side::Left,
+                Rect::new(0.0, 20.0, 0.0, 30.0),
+                Rect::new(100.0, 10.0, 0.0, 40.0),
+                Pt::new(-100.0 - GAP, 10.0),
+            ),
+            (
+                Side::Bottom,
+                Rect::new(20.0, 80.0, 30.0, 0.0),
+                Rect::new(10.0, 0.0, 40.0, 0.0),
+                Pt::new(10.0, 80.0 + GAP),
+            ),
+            (
+                Side::Top,
+                Rect::new(20.0, 0.0, 30.0, 0.0),
+                Rect::new(10.0, 80.0, 40.0, 0.0),
+                Pt::new(10.0, -80.0 - GAP),
+            ),
+        ] {
+            let shapes = [boxed(100.0, 80.0), boxed(100.0, 80.0)];
+            let doc = [DocLink {
+                a: 0,
+                b: 1,
+                side,
+                contact: Some((from, to)),
+            }];
+            for anchor in [0, 1] {
+                let pos = place(&shapes, &doc, anchor);
+                assert!((pos[1].x - pos[0].x - delta.x).abs() < 1e-9);
+                assert!((pos[1].y - pos[0].y - delta.y).abs() < 1e-9);
+                let found = links(&shapes, &pos);
+                assert_eq!(found.len(), 1);
+                assert!((found[0].gap - GAP).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn facing_edges_accept_gaps_and_touching_in_both_axes() {
+        let shapes = [boxed(100.0, 80.0), boxed(60.0, 40.0)];
+        for gap in [0.0, 25.0, LINK_MAX_GAP] {
+            for (position, dir, span) in [
+                (Pt::new(100.0 + gap, 20.0), Dir::Horizontal, (20.0, 60.0)),
+                (Pt::new(20.0, 80.0 + gap), Dir::Vertical, (20.0, 80.0)),
+            ] {
+                let found = links(&shapes, &[Pt::default(), position]);
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].dir, dir);
+                assert_eq!(found[0].gap, gap);
+                assert_eq!(found[0].span, span);
+            }
+        }
+        for position in [
+            Pt::new(99.0, 20.0),
+            Pt::new(100.0 + LINK_MAX_GAP + 0.01, 20.0),
+            Pt::new(120.0, 80.0),
+            Pt::new(20.0, 79.0),
+            Pt::new(20.0, 80.0 + LINK_MAX_GAP + 0.01),
+            Pt::new(100.0, 100.0),
+        ] {
+            assert!(links(&shapes, &[Pt::default(), position]).is_empty());
+        }
+    }
+
+    #[test]
+    fn gap_links_keep_each_displays_default_projection_overlap() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 0.0, 100.0, 80.0),
+                Rect::new(0.0, 80.0, 100.0, 120.0),
+            ],
+            w: 100.0,
+            h: 200.0,
+        };
+        let found = links(
+            &[desktop, boxed(100.0, 120.0)],
+            &[Pt::default(), Pt::new(160.0, 40.0)],
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].a_display, found[0].span), (0, (40.0, 80.0)));
+        assert_eq!((found[1].a_display, found[1].span), (1, (80.0, 160.0)));
+    }
+
+    #[test]
+    fn sibling_monitor_holes_are_not_externally_facing_links() {
+        for vertical in [false, true] {
+            let second = if vertical {
+                Rect::new(0.0, 200.0, 100.0, 100.0)
+            } else {
+                Rect::new(200.0, 0.0, 100.0, 100.0)
+            };
+            let desktop = Shape {
+                mons: vec![Rect::new(0.0, 0.0, 100.0, 100.0), second],
+                w: if vertical { 100.0 } else { 300.0 },
+                h: if vertical { 300.0 } else { 100.0 },
+            };
+            let peer = if vertical {
+                boxed(100.0, 20.0)
+            } else {
+                boxed(20.0, 100.0)
+            };
+            let at = if vertical {
+                Pt::new(0.0, 140.0)
+            } else {
+                Pt::new(140.0, 0.0)
+            };
+            assert!(
+                links(&[desktop, peer], &[Pt::default(), at]).is_empty(),
+                "links into a local monitor hole would fail core SegmentInHole validation"
+            );
+        }
+    }
+
+    #[test]
+    fn portrait_occludes_the_landscape_edge_across_a_gap() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 20.0, 192.0, 108.0),
+                Rect::new(192.0, 0.0, 108.0, 192.0),
+            ],
+            w: 300.0,
+            h: 192.0,
+        };
+        let found = links(
+            &[desktop, boxed(120.0, 160.0)],
+            &[Pt::default(), Pt::new(350.0, 10.0)],
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].a_display, 1);
+        assert_eq!(found[0].span, (10.0, 170.0));
+    }
+
+    #[test]
+    fn intervening_computers_clip_occluded_projection() {
+        let shapes = [boxed(100.0, 100.0), boxed(100.0, 100.0), boxed(20.0, 40.0)];
+        let found = links(
+            &shapes,
+            &[Pt::default(), Pt::new(200.0, 0.0), Pt::new(140.0, 30.0)],
+        );
+        let outer: Vec<_> = found
+            .iter()
+            .filter(|link| link.a == 0 && link.b == 1)
+            .collect();
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[0].span, (0.0, 30.0));
+        assert_eq!(outer[1].span, (70.0, 100.0));
+    }
+
+    #[test]
+    fn closer_lower_display_occludes_an_upper_displays_bottom_edge() {
+        let desktop = Shape {
+            mons: vec![
+                Rect::new(0.0, 0.0, 100.0, 80.0),
+                Rect::new(0.0, 80.0, 100.0, 40.0),
+            ],
+            w: 100.0,
+            h: 120.0,
+        };
+        let found = links(
+            &[desktop, boxed(80.0, 50.0)],
+            &[Pt::default(), Pt::new(10.0, 150.0)],
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].dir, Dir::Vertical);
+        assert_eq!(found[0].a_display, 1);
+        assert_eq!(found[0].span, (10.0, 90.0));
+    }
+
+    #[test]
+    fn zero_snap_threshold_preserves_free_node_movement() {
+        let shapes = [boxed(100.0, 80.0), boxed(60.0, 40.0)];
+        assert_eq!(
+            snap_with_threshold(&shapes, &[Pt::default(); 2], 1, 103.0, 21.5, 0.0),
+            Pt::new(103.0, 21.5)
+        );
+    }
+
+    #[test]
+    fn paddles_clamp_translate_and_resize_with_a_short_edge_minimum() {
+        assert_eq!(clamp_paddle(-10.0, 10.0, 0.0, 100.0), (0.0, 20.0));
+        assert_eq!(clamp_paddle(95.0, 99.0, 0.0, 100.0), (88.0, 100.0));
+        assert_eq!(clamp_paddle(3.0, 4.0, 2.0, 9.0), (2.0, 9.0));
+        assert_eq!(
+            move_paddle((20.0, 50.0), 100.0, (0.0, 100.0)),
+            (70.0, 100.0)
+        );
+        assert_eq!(move_paddle((20.0, 50.0), -100.0, (0.0, 100.0)), (0.0, 30.0));
+        assert_eq!(move_paddle((20.0, 50.0), 0.0, (4.0, 10.0)), (4.0, 10.0));
+        assert_eq!(
+            resize_paddle((20.0, 50.0), true, 49.0, (0.0, 100.0)),
+            (38.0, 50.0)
+        );
+        assert_eq!(
+            resize_paddle((20.0, 50.0), false, 21.0, (0.0, 100.0)),
+            (20.0, 32.0)
+        );
+        assert_eq!(
+            resize_paddle((20.0, 50.0), false, 120.0, (0.0, 100.0)),
+            (20.0, 100.0)
+        );
+        assert_eq!(resize_paddle((2.0, 9.0), true, 8.0, (2.0, 9.0)), (2.0, 9.0));
+        assert_eq!(clamp_paddle(2.0, 4.0, 5.0, 5.0), (5.0, 5.0));
+    }
+}

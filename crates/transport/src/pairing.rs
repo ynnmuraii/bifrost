@@ -1,7 +1,7 @@
 //! The pairing window as seen by the link listener: `pair/1` shares `47901`.
 //!
 //! `docs/05-protocol.md`, «Сопряжение»: «Сопряжение — отдельный bounded state machine на
-//! ALPN `lan-workspace/pair/1`; … узел, открывший окно сопряжения, — TLS-сервер и отправляет
+//! ALPN `bifrost/pair/1`; … узел, открывший окно сопряжения, — TLS-сервер и отправляет
 //! `PairHello` первым, второй узел дозванивается и отвечает тем же сообщением». Both nodes
 //! listen on exactly two ports (`docs/05-protocol.md`: «оба узла слушают `47901`/`47902`»),
 //! so the pairing window is *not* a third listener: it is served by the same `47901`

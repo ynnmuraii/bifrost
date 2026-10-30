@@ -9,16 +9,21 @@ publish = false
 # The one executable dispatches over independent role library crates (see
 # `src/main.rs`). Core, agent, GUI and tray retain separate dependency graphs,
 # which is what the agent's no-network check
-# (`apps/lws-agent/tests/no_network.rs`) relies on.
+# (`apps/bifrost-agent/tests/no_network.rs`) relies on.
 [[bin]]
 name = "bifrost"
 path = "src/main.rs"
 
 [dependencies]
-lws-agent = { path = "../lws-agent" }
-lws-core = { path = "../lws-core" }
-lws-gui = { path = "../lws-gui" }
-lws-tray = { path = "../lws-tray" }
+bifrost-agent = { path = "../bifrost-agent" }
+bifrost-core = { path = "../bifrost-core" }
+bifrost-gui = { path = "../bifrost-gui" }
+bifrost-tray = { path = "../bifrost-tray" }
+# The one startup decision that belongs to the binary rather than to a role: the
+# 0.4.0 move of the pre-0.4.0 application directory must happen before the role
+# resolves any path (`src/main.rs::adopt_default_directories`). This is not a new
+# crate in the graph — every role already depends on `config`.
+config = { path = "../../crates/config" }
 
 [target.'cfg(windows)'.dependencies]
 # `AttachConsole` / `SetStdHandle`: the binary is a Windows-subsystem program (no console for
@@ -33,7 +38,6 @@ winres = "0.1"
 # that owns a binary gets `CARGO_BIN_EXE_bifrost` — they drive real `bifrost`
 # processes, and read the cores' answers through the same crates the window uses.
 clipboard = { path = "../../crates/clipboard" }
-config = { path = "../../crates/config" }
 identity = { path = "../../crates/identity" }
 ipc = { path = "../../crates/ipc" }
 protocol = { path = "../../crates/protocol" }
@@ -44,7 +48,7 @@ tokio = { version = "1", features = ["rt", "time"] }
 socket2 = "0.6"
 
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

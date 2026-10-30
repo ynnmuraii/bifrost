@@ -1148,10 +1148,13 @@ pub struct TopologyConfig {
     /// Nodes explicitly removed from the shared map; direct trust remains local.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forgotten_nodes: Vec<String>,
+    /// Authored map placement and persistent pair decisions.
+    #[serde(default)]
+    pub map: MapConfig,
 }
 
 impl TopologyConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.revision > 0 && self.author.is_empty() {
             return Err(ConfigError::coded(
                 ErrorCode::Topology,
@@ -1180,6 +1183,7 @@ impl TopologyConfig {
                 "the author applied together with topology.max_seen_revision",
             ));
         }
+        self.map.validate()?;
 
         let mut seen: Vec<&str> = Vec::with_capacity(self.links.len());
         for link in &self.links {
@@ -1238,6 +1242,123 @@ impl TopologyConfig {
                     "topology.links",
                     &link.id,
                     "a link between two different nodes",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MapConfig {
+    pub displays: Vec<DisplayMapConfig>,
+    pub bridges: Vec<BridgeRuleConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayMapConfig {
+    pub node_id: String,
+    pub display_id: String,
+    pub rect: [f64; 4],
+    #[serde(default)]
+    pub size_mode: SizeMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagonal_inches: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeMode {
+    #[default]
+    Legacy,
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeDecision {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEndpointConfig {
+    pub node_id: String,
+    pub display_id: String,
+    pub edge: Edge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeRuleConfig {
+    pub a: BridgeEndpointConfig,
+    pub b: BridgeEndpointConfig,
+    pub decision: BridgeDecision,
+}
+
+impl BridgeRuleConfig {
+    /// Pair identity is unordered and includes both complete display identities and edges.
+    pub fn matches(&self, a: &BridgeEndpointConfig, b: &BridgeEndpointConfig) -> bool {
+        (&self.a == a && &self.b == b) || (&self.a == b && &self.b == a)
+    }
+}
+
+impl MapConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let valid_node = |node: &str| {
+            node == "self"
+                || crate::node_id_from_hex(node.strip_prefix("peer:").unwrap_or(node)).is_some()
+        };
+        let invalid = |key, value: String, expected| {
+            ConfigError::coded(ErrorCode::Topology, key, value, expected)
+        };
+        for (index, row) in self.displays.iter().enumerate() {
+            if !valid_node(&row.node_id)
+                || row.display_id.is_empty()
+                || row.display_id == crate::AUTO_DISPLAY
+                || row.rect.iter().any(|value| !value.is_finite())
+                || row.rect[2] <= 0.0
+                || row.rect[3] <= 0.0
+                || row
+                    .diagonal_inches
+                    .is_some_and(|value| !value.is_finite() || !(3.0..=120.0).contains(&value))
+            {
+                return Err(invalid(
+                    "topology.map.displays",
+                    format!("{row:?}"),
+                    "a complete display identity, finite positive rectangle and optional diagonal in 3..=120 inches",
+                ));
+            }
+            if self.displays[..index]
+                .iter()
+                .any(|other| other.node_id == row.node_id && other.display_id == row.display_id)
+            {
+                return Err(invalid(
+                    "topology.map.displays",
+                    row.display_id.clone(),
+                    "unique display identities",
+                ));
+            }
+        }
+        for (index, rule) in self.bridges.iter().enumerate() {
+            if [&rule.a, &rule.b].iter().any(|end| {
+                !valid_node(&end.node_id)
+                    || end.display_id.is_empty()
+                    || end.display_id == crate::AUTO_DISPLAY
+            }) || rule.a.node_id == rule.b.node_id
+                || self.bridges[..index]
+                    .iter()
+                    .any(|other| other.matches(&rule.a, &rule.b))
+            {
+                return Err(invalid(
+                    "topology.map.bridges",
+                    format!("{rule:?}"),
+                    "unique unordered edge pairs between complete display identities on different nodes",
                 ));
             }
         }

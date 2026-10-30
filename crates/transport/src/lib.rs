@@ -2,6 +2,7 @@
 
 pub mod clipboard;
 pub mod convert;
+pub mod input_metrics;
 pub mod link;
 pub mod manager;
 pub mod pairing;

@@ -97,6 +97,7 @@ impl TopologyConfig {
         }
         let is_local = |node: &str| {
             parse_node_ref(node, local_node_id).is_ok_and(|id| id.as_bytes() == local_node_id)
+                || node_id_from_hex(node).as_ref() == Some(local_node_id)
         };
 
         let mut changed = false;
@@ -130,6 +131,51 @@ impl TopologyConfig {
                 }
             }
         }
+        for row in &mut self.map.displays {
+            if is_local(&row.node_id) {
+                if let Some(target) = aliases.get(&row.display_id) {
+                    row.display_id = target.clone();
+                    changed = true;
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        self.map.displays.retain(|row| {
+            let key = (row.node_id.clone(), row.display_id.clone());
+            if rows.contains(&key) {
+                changed = true;
+                false
+            } else {
+                rows.push(key);
+                true
+            }
+        });
+        for rule in &mut self.map.bridges {
+            for end in [&mut rule.a, &mut rule.b] {
+                if is_local(&end.node_id) {
+                    if let Some(target) = aliases.get(&end.display_id) {
+                        end.display_id = target.clone();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let mut rules: Vec<crate::BridgeRuleConfig> = Vec::new();
+        for rule in self.map.bridges.drain(..) {
+            if let Some(existing) = rules
+                .iter_mut()
+                .find(|other| other.matches(&rule.a, &rule.b))
+            {
+                // A persistent prohibition wins if old aliases collapse onto the same pair.
+                if rule.decision == crate::BridgeDecision::Disabled {
+                    existing.decision = rule.decision;
+                }
+                changed = true;
+            } else {
+                rules.push(rule);
+            }
+        }
+        self.map.bridges = rules;
         changed
     }
 
@@ -144,46 +190,110 @@ impl TopologyConfig {
         &self,
         local_node_id: &[u8; 32],
     ) -> Result<Vec<geometry::TransitionLink>, ConfigError> {
-        self.links
+        let mut links = Vec::new();
+        for link in &self.links {
+            let source = endpoint_node(&link.from, local_node_id, "topology.links.from")?;
+            let target = endpoint_node(&link.to, local_node_id, "topology.links.to")?;
+            if self.link_disabled(link, local_node_id) {
+                continue;
+            }
+            links.push(geometry::TransitionLink::new(
+                geometry::LinkId::new(link.id.clone()),
+                endpoint(&link.from, source),
+                endpoint(&link.to, target),
+                link.bidirectional,
+            ));
+        }
+        Ok(links)
+    }
+
+    /// Explicit pair rules override the default minimum contact on either concrete endpoint.
+    pub fn link_disabled(&self, link: &crate::LinkConfig, local: &[u8; 32]) -> bool {
+        let same = |a: &crate::BridgeEndpointConfig, b: &EndpointConfig| {
+            let node = if a.node_id == "self" {
+                Some(*local)
+            } else {
+                node_id_from_hex(a.node_id.strip_prefix("peer:").unwrap_or(&a.node_id))
+            };
+            a.display_id == b.display
+                && a.edge == b.edge
+                && node.is_some_and(|node| {
+                    parse_node_ref(&b.node, local).is_ok_and(|id| id.as_bytes() == &node)
+                })
+        };
+        let matching = |rule: &&crate::BridgeRuleConfig| {
+            (same(&rule.a, &link.from) && same(&rule.b, &link.to))
+                || (same(&rule.b, &link.from) && same(&rule.a, &link.to))
+        };
+        if self
+            .map
+            .bridges
             .iter()
-            .map(|link| {
-                let source = endpoint(&link.from, local_node_id, "topology.links.from")?;
-                let target = endpoint(&link.to, local_node_id, "topology.links.to")?;
-                Ok(geometry::TransitionLink::new(
-                    geometry::LinkId::new(link.id.clone()),
-                    source,
-                    target,
-                    link.bidirectional,
-                ))
-            })
-            .collect()
+            .filter(matching)
+            .any(|rule| rule.decision == crate::BridgeDecision::Disabled)
+        {
+            return true;
+        }
+        if self
+            .map
+            .bridges
+            .iter()
+            .filter(matching)
+            .any(|rule| rule.decision == crate::BridgeDecision::Enabled)
+        {
+            return false;
+        }
+        [&link.from, &link.to].into_iter().any(|end| {
+            let span = end.end - end.start;
+            if !span.is_finite() || span <= 0.0 || end.start < 0.0 {
+                return false;
+            }
+            if end.is_auto() {
+                return false;
+            }
+            let Some(display) = self.displays.iter().find(|display| {
+                display.id == end.display
+                    && parse_node_ref(&display.node, local).ok()
+                        == parse_node_ref(&end.node, local).ok()
+            }) else {
+                return false;
+            };
+            let extent = match end.edge {
+                crate::Edge::Left | crate::Edge::Right => display.logical[3],
+                crate::Edge::Top | crate::Edge::Bottom => display.logical[2],
+            };
+            span + 1e-6 < (0.02 * extent).max(32.0)
+        })
     }
 }
 
-fn endpoint(
+fn endpoint_node(
     config: &EndpointConfig,
     local_node_id: &[u8; 32],
     key: &'static str,
-) -> Result<geometry::Endpoint, ConfigError> {
-    let node = parse_node_ref(&config.node, local_node_id).map_err(|_| {
+) -> Result<geometry::NodeId, ConfigError> {
+    parse_node_ref(&config.node, local_node_id).map_err(|_| {
         ConfigError::coded(
             ErrorCode::Topology,
             key,
             format!("node = {:?}", config.node),
             "\"self\" or \"peer:<64 hexadecimal digits>\"",
         )
-    })?;
+    })
+}
+
+fn endpoint(config: &EndpointConfig, node: geometry::NodeId) -> geometry::Endpoint {
     if config.is_auto() {
         // `display = "auto"`: the edge of the whole desktop. The segment is derived from the
         // live manifests by `geometry::resolve_auto_links`, so nothing else is read here.
-        return Ok(geometry::Endpoint::auto(node, config.edge.to_geometry()));
+        return geometry::Endpoint::auto(node, config.edge.to_geometry());
     }
-    Ok(geometry::Endpoint::new(
+    geometry::Endpoint::new(
         node,
         geometry::DisplayId::new(config.display.clone()),
         config.edge.to_geometry(),
         geometry::Segment::new(config.start, config.end),
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -355,5 +465,102 @@ bidirectional = true
             .map(|display| display.id.as_str())
             .collect();
         assert_eq!(self_rows, vec!["display-interface-path"]);
+    }
+
+    #[test]
+    fn map_rules_reverse_filter_and_alias_without_losing_authored_links() {
+        let mut config = document();
+        let end = |end: &EndpointConfig| crate::BridgeEndpointConfig {
+            node_id: end.node.clone(),
+            display_id: end.display.clone(),
+            edge: end.edge,
+        };
+        let a = end(&config.links[0].from);
+        let b = end(&config.links[0].to);
+        config.map.bridges.push(crate::BridgeRuleConfig {
+            a: b.clone(),
+            b: a.clone(),
+            decision: crate::BridgeDecision::Disabled,
+        });
+        assert!(config.map.bridges[0].matches(&a, &b));
+        assert!(config.to_transition_links(&local()).unwrap().is_empty());
+        assert_eq!(config.links.len(), 1);
+        config.map.displays.push(crate::DisplayMapConfig {
+            node_id: "self".into(),
+            display_id: a.display_id.clone(),
+            rect: [-10.0, 20.0, 144.0, 81.0],
+            size_mode: crate::SizeMode::Manual,
+            diagonal_inches: Some(24.0),
+        });
+        let aliases = BTreeMap::from([(a.display_id, "stable-panel".to_owned())]);
+        assert!(config.rewrite_display_ids(&local(), &aliases));
+        assert_eq!(config.map.displays[0].display_id, "stable-panel");
+        assert_eq!(config.map.bridges[0].b.display_id, "stable-panel");
+        assert!(config.to_transition_links(&local()).unwrap().is_empty());
+        let text = toml::to_string(&config).unwrap();
+        let restored: TopologyConfig = toml::from_str(&text).unwrap();
+        assert_eq!(restored, config);
+    }
+
+    #[test]
+    fn old_map_defaults_and_strict_new_rows_validate() {
+        let old: TopologyConfig = toml::from_str("").unwrap();
+        assert_eq!(old.map, crate::MapConfig::default());
+        assert!(toml::from_str::<TopologyConfig>("[map]\nextra = true").is_err());
+        let mut config = crate::Config::default();
+        config.topology.map.displays.push(crate::DisplayMapConfig {
+            node_id: "self".into(),
+            display_id: "panel".into(),
+            rect: [0.0, 0.0, 1.0, 1.0],
+            size_mode: crate::SizeMode::Legacy,
+            diagonal_inches: None,
+        });
+        assert!(config.topology.validate().is_ok());
+        config.topology.map.displays[0].rect[2] = 0.0;
+        assert!(config.topology.validate().is_err());
+    }
+
+    #[test]
+    fn short_default_checks_both_ends_and_explicit_enabled_overrides() {
+        let mut config = document();
+        config.displays[1].logical[3] = 2160.0;
+        config.links[0].from.end = 100.0;
+        config.links[0].to.end = 40.0;
+        assert!(config.link_disabled(&config.links[0], &local()));
+        config.links[0].to.end = 43.2;
+        assert!(!config.link_disabled(&config.links[0], &local()));
+        config.links[0].from.end = 31.999;
+        assert!(config.link_disabled(&config.links[0], &local()));
+        config.links[0].from.end = 32.0;
+        assert!(!config.link_disabled(&config.links[0], &local()));
+        let endpoint = |end: &EndpointConfig| crate::BridgeEndpointConfig {
+            node_id: end.node.clone(),
+            display_id: end.display.clone(),
+            edge: end.edge,
+        };
+        config.map.bridges.push(crate::BridgeRuleConfig {
+            a: endpoint(&config.links[0].to),
+            b: endpoint(&config.links[0].from),
+            decision: crate::BridgeDecision::Enabled,
+        });
+        config.links[0].from.end = 1.0;
+        assert!(!config.link_disabled(&config.links[0], &local()));
+        config.map.bridges[0].decision = crate::BridgeDecision::Disabled;
+        config.links[0].from.end = 100.0;
+        assert!(config.link_disabled(&config.links[0], &local()));
+    }
+
+    #[test]
+    fn missing_short_endpoint_is_not_hidden_before_live_resolution() {
+        let mut config = document();
+        config.displays.clear();
+        config.links[0].from.end = 10.0;
+        config.links[0].to.end = 10.0;
+        assert!(!config.link_disabled(&config.links[0], &local()));
+        assert_eq!(config.to_transition_links(&local()).unwrap().len(), 1);
+        config.links[0].from.node = "bogus".into();
+        let error = config.to_transition_links(&local()).unwrap_err();
+        assert_eq!(error.code(), Some(ErrorCode::Topology));
+        assert!(error.to_string().contains("topology.links.from"));
     }
 }

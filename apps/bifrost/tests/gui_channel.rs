@@ -1,9 +1,9 @@
 //! The GUI's channel, driven over the real endpoint of two real cores.
 //!
-//! `docs/03-architecture.md` («GUI ↔ core») makes `GuiFrame` the contract for `lws-gui`, and
+//! `docs/03-architecture.md` («GUI ↔ core») makes `GuiFrame` the contract for `bifrost-gui`, and
 //! the GUI is not in the hot path: it asks, core decides, and the answers and events travel on
 //! one `seq`-stamped link per window. This suite is the transport-level proof of that contract
-//! — it speaks `GuiFrame` over `\\.\pipe\lan-workspace-<SID>` / `gui.sock` to two `lws-core run`
+//! — it speaks `GuiFrame` over `\\.\pipe\bifrost-<SID>` / `gui.sock` to two `bifrost-core run`
 //! processes, with the dry agent and no OS input, and asserts what the window would see.
 //!
 //! What it covers, in the order the wizard uses them:

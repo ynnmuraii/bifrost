@@ -210,7 +210,7 @@ mod windows_impl {
             let thread_id = Arc::new(AtomicU32::new(0));
             let thread_id_out = Arc::clone(&thread_id);
             let thread = std::thread::Builder::new()
-                .name("lws-clipboard".to_owned())
+                .name("bifrost-clipboard".to_owned())
                 .spawn(move || {
                     run_listener(sender, ready_sender, thread_id_out);
                 })
@@ -288,7 +288,7 @@ mod windows_impl {
         ready: Sender<Result<isize, ClipboardError>>,
         thread_id_out: Arc<AtomicU32>,
     ) {
-        const CLASS: windows::core::PCWSTR = w!("lws-clipboard-listener");
+        const CLASS: windows::core::PCWSTR = w!("bifrost-clipboard-listener");
         let class = WNDCLASSW {
             style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
             lpfnWndProc: Some(window_proc),

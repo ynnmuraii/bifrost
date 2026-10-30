@@ -15,18 +15,23 @@
 //! interface (the call fails, or the output has no monitor attached), the device name is the
 //! id — the pre-existing behaviour.
 //!
-//! Not implemented here: per-display rotation. Windows rotates the *logical* desktop
-//! itself, so the logical bounds are already correct; only the diagnostic `rotation`
-//! field would need `EnumDisplaySettingsW`/`DEVMODEW`, and nothing in `geometry` uses
-//! it.
+//! Current-mode orientation is used only to orient EDID millimeters. Windows already
+//! rotates desktop coordinates; physical metadata never rescales or rotates those.
 #![cfg(windows)]
 
-use windows::core::{BOOL, PCWSTR};
+use windows::core::{w, BOOL, GUID, PCWSTR};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIGCF_PRESENT, DIREG_DEV,
+    SP_DEVINFO_DATA,
+};
 use windows::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC, HMONITOR,
-    MONITORINFOEXW,
+    EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, DEVMODEW,
+    DISPLAY_DEVICEW, DMDO_180, DMDO_270, DMDO_90, DMDO_DEFAULT, DM_DISPLAYORIENTATION,
+    ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFOEXW,
 };
+use windows::Win32::System::Registry::{RegCloseKey, RegQueryValueExW, KEY_READ, REG_BINARY};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY,
@@ -49,6 +54,8 @@ pub struct Monitor {
     pub scale: f64,
     /// Whether this is the primary monitor (the node logical origin).
     pub primary: bool,
+    pub physical_size: Option<[f64; 2]>,
+    pub physical_size_source: String,
 }
 
 /// Monitor enumeration failed before producing anything.
@@ -87,6 +94,8 @@ pub fn enumerate() -> Result<Vec<Monitor>, DisplaysError> {
     if collected.is_empty() {
         return Err(DisplaysError("the desktop reports no monitors".to_owned()));
     }
+    // Registry queries stay outside the GDI enumeration callback.
+    enrich_physical_sizes(&mut collected);
     // Primary first: it hosts the node logical origin, and a stable order keeps the
     // reported set comparable between calls.
     collected.sort_by(|left, right| {
@@ -155,6 +164,8 @@ unsafe extern "system" fn collect_monitor(
         native,
         scale,
         primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+        physical_size: None,
+        physical_size_source: String::new(),
     });
     TRUE
 }
@@ -210,11 +221,232 @@ fn utf16_z(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..end])
 }
 
+/// Device interfaces encode the complete PnP instance, not just the model.
+fn monitor_instance(interface: &str) -> Option<String> {
+    let mut parts = interface.strip_prefix("\\\\?\\")?.split('#');
+    let class = parts.next()?;
+    let model = parts.next()?;
+    let instance = parts.next()?;
+    let guid = parts.next()?;
+    if !class.eq_ignore_ascii_case("DISPLAY")
+        || model.is_empty()
+        || instance.is_empty()
+        || !guid.starts_with('{')
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some(format!("DISPLAY\\{model}\\{instance}"))
+}
+
+fn oriented_size(size: [f64; 2], rotated: bool) -> [f64; 2] {
+    if rotated {
+        [size[1], size[0]]
+    } else {
+        size
+    }
+}
+
+fn monitor_rotated(device: &str) -> Option<bool> {
+    let name: Vec<u16> = device.encode_utf16().chain(Some(0)).collect();
+    let mut mode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: the terminated name and correctly sized output live throughout the call.
+    if !unsafe { EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode) }
+        .as_bool()
+    {
+        return None;
+    }
+    if !mode.dmFields.contains(DM_DISPLAYORIENTATION) {
+        return None;
+    }
+    // SAFETY: EnumDisplaySettingsW fills the display (not printer) union member.
+    let orientation = unsafe { mode.Anonymous1.Anonymous2.dmDisplayOrientation };
+    if orientation == DMDO_90 || orientation == DMDO_270 {
+        Some(true)
+    } else if orientation == DMDO_DEFAULT || orientation == DMDO_180 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn enrich_physical_sizes(monitors: &mut [Monitor]) {
+    let monitor_class = GUID::from_u128(0x4d36e96e_e325_11ce_bfc1_08002be10318);
+    // SAFETY: class GUID is valid; no parent window or enumerator is required.
+    let Ok(devices) = (unsafe {
+        SetupDiGetClassDevsW(Some(&monitor_class), PCWSTR::null(), None, DIGCF_PRESENT)
+    }) else {
+        return;
+    };
+    let mut index = 0;
+    let mut edid = [0u8; 32768];
+    loop {
+        let mut data = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: the device set is live and data has the API-required size.
+        if unsafe { SetupDiEnumDeviceInfo(devices, index, &mut data) }.is_err() {
+            break;
+        }
+        index += 1;
+        let mut instance = [0u16; 512];
+        // SAFETY: writable instance buffer, valid device record from this set.
+        if unsafe { SetupDiGetDeviceInstanceIdW(devices, &data, Some(&mut instance), None) }
+            .is_err()
+        {
+            continue;
+        }
+        let instance = utf16_z(&instance);
+        let Some(monitor) = monitors.iter_mut().find(|monitor| {
+            monitor_instance(&monitor.id).is_some_and(|id| id.eq_ignore_ascii_case(&instance))
+        }) else {
+            continue;
+        };
+        // SAFETY: opens only this exact monitor's device registry key, read-only.
+        let Ok(key) = (unsafe {
+            SetupDiOpenDevRegKey(devices, &data, DICS_FLAG_GLOBAL.0, 0, DIREG_DEV, KEY_READ.0)
+        }) else {
+            continue;
+        };
+        let mut kind = REG_BINARY;
+        let mut len = edid.len() as u32;
+        // SAFETY: the buffer is len bytes and all output pointers remain valid.
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                w!("EDID"),
+                None,
+                Some(&mut kind),
+                Some(edid.as_mut_ptr()),
+                Some(&mut len),
+            )
+        };
+        // SAFETY: key was opened above and is no longer used.
+        let _ = unsafe { RegCloseKey(key) };
+        if status.is_err() || kind != REG_BINARY || len as usize > edid.len() {
+            continue;
+        }
+        if let (Some(size), Some(rotated)) = (
+            parse_edid_size(&edid[..len as usize]),
+            monitor_rotated(&monitor.device_name),
+        ) {
+            monitor.physical_size = Some(oriented_size(size, rotated));
+            monitor.physical_size_source = "edid".to_owned();
+        }
+    }
+    // SAFETY: releases the single device set created by this function.
+    let _ = unsafe { SetupDiDestroyDeviceInfoList(devices) };
+}
+
+/// EDID base block and every advertised extension must be complete and checksummed.
+fn parse_edid_size(edid: &[u8]) -> Option<[f64; 2]> {
+    if edid.len() < 128
+        || edid[..8] != [0, 255, 255, 255, 255, 255, 255, 0]
+        || edid.len() != (usize::from(edid[126]) + 1) * 128
+        || edid
+            .as_chunks::<128>()
+            .0
+            .iter()
+            .any(|block| block.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0)
+    {
+        return None;
+    }
+    for timing in edid[54..126].as_chunks::<18>().0 {
+        if timing[0] == 0 && timing[1] == 0 {
+            continue;
+        }
+        let width = u16::from(timing[12]) | (u16::from(timing[14] & 0xf0) << 4);
+        let height = u16::from(timing[13]) | (u16::from(timing[14] & 0x0f) << 8);
+        if width > 0 && height > 0 {
+            return Some([f64::from(width), f64::from(height)]);
+        }
+    }
+    // EDID 1.4 uses a zero axis for aspect-only encoding, not centimeters.
+    (edid[21] > 0 && edid[22] > 0)
+        .then_some([f64::from(edid[21]) * 10.0, f64::from(edid[22]) * 10.0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     // Only the cross-check test reads the desktop metrics.
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CMONITORS};
+
+    fn checksum(edid: &mut [u8]) {
+        for block in edid.as_chunks_mut::<128>().0 {
+            block[127] = 0;
+            block[127] =
+                0u8.wrapping_sub(block[..127].iter().fold(0u8, |sum, b| sum.wrapping_add(*b)));
+        }
+    }
+
+    fn base_edid() -> [u8; 128] {
+        let mut edid = [0u8; 128];
+        edid[..8].copy_from_slice(&[0, 255, 255, 255, 255, 255, 255, 0]);
+        edid[21] = 53;
+        edid[22] = 30;
+        checksum(&mut edid);
+        edid
+    }
+
+    #[test]
+    fn edid_prefers_detailed_mm_then_base_cm_and_rotates() {
+        let mut edid = base_edid();
+        assert_eq!(parse_edid_size(&edid), Some([530.0, 300.0]));
+        edid[54] = 1;
+        edid[66] = 0x58;
+        edid[67] = 0x54;
+        edid[68] = 0x21;
+        checksum(&mut edid);
+        assert_eq!(parse_edid_size(&edid), Some([600.0, 340.0]));
+        assert_eq!(
+            oriented_size(parse_edid_size(&edid).unwrap(), true),
+            [340.0, 600.0]
+        );
+        edid[54] = 0;
+        checksum(&mut edid);
+        assert_eq!(parse_edid_size(&edid), Some([530.0, 300.0]));
+        edid[21] = 0;
+        checksum(&mut edid);
+        assert_eq!(parse_edid_size(&edid), None);
+    }
+
+    #[test]
+    fn malformed_edid_is_unknown() {
+        let edid = base_edid();
+        assert!(parse_edid_size(&edid[..127]).is_none());
+        let mut bad = edid;
+        bad[0] = 1;
+        checksum(&mut bad);
+        assert!(parse_edid_size(&bad).is_none());
+        bad = edid;
+        bad[20] ^= 1;
+        assert!(parse_edid_size(&bad).is_none());
+        bad = edid;
+        bad[126] = 1;
+        checksum(&mut bad);
+        assert!(parse_edid_size(&bad).is_none());
+        let mut extended = [0u8; 256];
+        extended[..128].copy_from_slice(&bad);
+        checksum(&mut extended);
+        assert_eq!(parse_edid_size(&extended), Some([530.0, 300.0]));
+        extended[130] = 1;
+        assert!(parse_edid_size(&extended).is_none());
+    }
+
+    #[test]
+    fn instance_matching_never_confuses_identical_models() {
+        let first = monitor_instance("\\\\?\\DISPLAY#DEL4098#instance-a#{guid}").unwrap();
+        let second = monitor_instance("\\\\?\\DISPLAY#DEL4098#instance-b#{guid}").unwrap();
+        assert!(first.eq_ignore_ascii_case("display\\del4098\\INSTANCE-A"));
+        assert!(!first.eq_ignore_ascii_case(&second));
+        assert!(monitor_instance("\\\\.\\DISPLAY1").is_none());
+        assert!(monitor_instance("\\\\?\\DISPLAY#DEL4098##{guid}").is_none());
+    }
 
     #[test]
     fn a_device_name_is_read_up_to_its_nul() {

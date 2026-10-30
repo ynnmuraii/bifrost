@@ -34,6 +34,8 @@ pub struct Monitor {
     pub scale: f64,
     /// Whether RandR marks this monitor as primary (the node logical origin).
     pub primary: bool,
+    pub physical_size: Option<[f64; 2]>,
+    pub physical_size_source: String,
 }
 
 /// Monitor enumeration failed.
@@ -94,6 +96,14 @@ fn assemble(named: Vec<(String, MonitorInfo)>) -> Vec<Monitor> {
                 i32::from(monitor.width),
                 i32::from(monitor.height),
             ];
+            // A user-defined monitor spanning outputs is not one physical panel.
+            let physical_size = (monitor.outputs.len() == 1
+                && monitor.width_in_millimeters > 0
+                && monitor.height_in_millimeters > 0)
+                .then_some([
+                    f64::from(monitor.width_in_millimeters),
+                    f64::from(monitor.height_in_millimeters),
+                ]);
             Monitor {
                 id: if name.is_empty() {
                     // RandR allows an unnamed monitor; the geometry needs an id, and
@@ -111,6 +121,12 @@ fn assemble(named: Vec<(String, MonitorInfo)>) -> Vec<Monitor> {
                 native,
                 scale: 1.0,
                 primary: monitor.primary,
+                physical_size,
+                physical_size_source: if physical_size.is_some() {
+                    "randr".to_owned()
+                } else {
+                    String::new()
+                },
             }
         })
         .collect();
@@ -146,6 +162,26 @@ mod tests {
             height_in_millimeters: 0,
             outputs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn randr_physical_size_requires_a_single_panel_and_both_axes() {
+        let mut panel = monitor(1, true, 0, 0, 1080, 1920);
+        panel.outputs = vec![7];
+        panel.width_in_millimeters = 300;
+        panel.height_in_millimeters = 530;
+        let displays = assemble(vec![("DP-1".into(), panel.clone())]);
+        assert_eq!(displays[0].physical_size, Some([300.0, 530.0]));
+        assert_eq!(displays[0].physical_size_source, "randr");
+        panel.outputs.push(8);
+        assert!(assemble(vec![("aggregate".into(), panel.clone())])[0]
+            .physical_size
+            .is_none());
+        panel.outputs = vec![7];
+        panel.width_in_millimeters = 0;
+        assert!(assemble(vec![("unknown".into(), panel)])[0]
+            .physical_size
+            .is_none());
     }
 
     #[test]

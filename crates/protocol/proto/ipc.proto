@@ -1,8 +1,9 @@
 syntax = "proto3";
-package lan_workspace.ipc.v1;
+package bifrost.ipc.v1;
+import "protocol.proto";
 
-// Local IPC of Bifrost: lws-core <-> lws-agent (AgentFrame) and
-// lws-core <-> lws-gui (GuiFrame). See 03-architecture.md, section "Локальный IPC".
+// Local IPC of Bifrost: bifrost-core <-> bifrost-agent (AgentFrame) and
+// bifrost-core <-> bifrost-gui (GuiFrame). See 03-architecture.md, section "Локальный IPC".
 // Framing: 4-byte unsigned big-endian length + serialized AgentFrame / GuiFrame.
 // Max frame: 65536 bytes. Never sent over the network.
 // Backend selection and portal restore tokens travel in AgentAttach; portal
@@ -213,6 +214,7 @@ message DisplayInfo {
   // backend has none. Windows renumbers that name when monitors change, so `id` is the
   // stable device-interface id and this field is the alias core maps an older layout through.
   string name = 13;
+  bifrost.v1.PhysicalSize physical_size = 14;
 }
 message LocalInputDetected { bytes lease_id = 1; }
 
@@ -497,7 +499,7 @@ message PairingPrompt { bytes attempt_id = 1; string peer_name = 2; string sas_c
 // Pushed when the pairing window opens or closes, and replayed on GetStatus.
 // The GUI counts down locally from seconds_remaining. The window is served on the node's
 // input/control port by ALPN
-// `lan-workspace/pair/1` (docs/05-protocol.md, «Сопряжение»), so a `StartPairing`
+// `bifrost/pair/1` (docs/05-protocol.md, «Сопряжение»), so a `StartPairing`
 // answer alone would leave the GUI unable to tell its user what the other computer
 // has to type: `address` is exactly that.
 message PairingWindow {
@@ -527,6 +529,7 @@ message TopologyDoc {
   repeated MemberTopology members = 3;
   repeated LinkView links = 4;
   repeated string forgotten_node_ids = 5; // retain layout exclusions when editing the map
+  bifrost.v1.MapDocument map = 6;
 }
 message MemberTopology {
   string node_id = 1;
@@ -545,6 +548,7 @@ message DisplayView {
   double scale = 9;                  // native/logical when known; GUI only
   uint32 native_width = 10;                // current mode pixels; zero means unknown
   uint32 native_height = 11;
+  bifrost.v1.PhysicalSize physical_size = 12;
 }
 message LinkView {
   string id = 1;
@@ -561,6 +565,8 @@ message LinkView {
   // (авто)») resolves to against the live manifests right now, in document order. Empty for a
   // link that names its displays. GUI text only.
   repeated string auto_displays = 7;
+  bool disabled = 8;
+  bool short_candidate = 9;
 }
 message EndpointView {
   string node_id = 1;

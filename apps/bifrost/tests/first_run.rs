@@ -1,4 +1,4 @@
-//! AC-16: `lws-core run` writes `config.toml` itself when there is none, and still
+//! AC-16: `bifrost-core run` writes `config.toml` itself when there is none, and still
 //! turns its control channel on afterwards.
 //!
 //! The very first start on a fresh `--root` is the scenario: no `config/config.toml`,
@@ -20,7 +20,7 @@ fn core_exe() -> PathBuf {
 fn unique_dir(label: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let dir = std::env::temp_dir().join(format!(
-        "lws-first-run-{}-{}-{label}",
+        "bifrost-first-run-{}-{}-{label}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
@@ -52,7 +52,7 @@ struct Core {
 }
 
 impl Core {
-    /// `lws-core --root <root> run`, dry like every other suite (no OS input on the
+    /// `bifrost-core --root <root> run`, dry like every other suite (no OS input on the
     /// runner) and with the agent next to the core binary.
     fn start(root: &Path) -> Core {
         let log = root.join("core.log");

@@ -1,0 +1,594 @@
+//! The window's own settings: theme, background, map view and dock, in a file of the GUI's own.
+//!
+//! The choice of a theme is a fact about this window and not about the service, so it lives in
+//! `gui.toml` next to `config.toml` and the core never reads it (and `config.toml` is never
+//! written for it). A missing or broken file is the defaults, and a failed write is silent: a
+//! look that cannot be remembered must not become an error dialog.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use ui_text::Lang;
+
+/// The file name inside the configuration directory.
+pub const FILE_NAME: &str = "gui.toml";
+
+/// «Светлая» or «Тёмная»: the same window with different colours, and the same radii. The
+/// stored values stay `light` and `dark`, so a file written before the rename still reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// «Светлая».
+    #[default]
+    Light,
+    /// «Тёмная».
+    Dark,
+}
+
+impl Theme {
+    /// The other one.
+    pub const fn toggled(self) -> Theme {
+        match self {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+}
+
+/// What the particles do near the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldMode {
+    /// «Разлетаются».
+    Repel,
+    /// «Собираются».
+    #[default]
+    Attract,
+    /// «Без движения»: nothing moves, nothing is redrawn on a timer.
+    Off,
+}
+
+/// How the links between computers are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkStyle {
+    /// «ASCII-изолиния»: a chain of glyphs.
+    #[default]
+    Ascii,
+    /// «Линия»: a dashed line.
+    Line,
+}
+
+/// Maximum number of locally hidden LAN identities remembered across restarts.
+pub const HIDDEN_DISCOVERED_LIMIT: usize = 64;
+
+/// Bounded canonical node IDs shared by cheap appearance snapshots.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HiddenDiscovered {
+    ids: Arc<Vec<String>>,
+}
+
+impl HiddenDiscovered {
+    /// The number of hidden identities, including computers no longer announcing.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether no identities are hidden.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Canonical lowercase hexadecimal IDs in insertion order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.ids.iter().map(String::as_str)
+    }
+
+    /// Whether this valid identity is hidden, independent of hexadecimal case.
+    pub fn contains(&self, node_id: &str) -> bool {
+        self.iter().any(|id| id.eq_ignore_ascii_case(node_id))
+    }
+
+    /// Remember a valid identity once; a full list leaves existing choices intact.
+    pub fn insert(&mut self, node_id: &str) -> bool {
+        if config::node_id_from_hex(node_id).is_none()
+            || self.contains(node_id)
+            || self.len() == HIDDEN_DISCOVERED_LIMIT
+        {
+            return false;
+        }
+        Arc::make_mut(&mut self.ids).push(node_id.to_ascii_lowercase());
+        true
+    }
+
+    /// Explicitly hide a valid identity, evicting the oldest choice at capacity.
+    pub fn hide(&mut self, node_id: &str) -> bool {
+        if config::node_id_from_hex(node_id).is_none() || self.contains(node_id) {
+            return false;
+        }
+        let ids = Arc::make_mut(&mut self.ids);
+        if ids.len() == HIDDEN_DISCOVERED_LIMIT {
+            ids.remove(0);
+        }
+        ids.push(node_id.to_ascii_lowercase());
+        true
+    }
+
+    /// Restore an identity, even when its last LAN announcement has expired.
+    pub fn remove(&mut self, node_id: &str) -> bool {
+        let Some(index) = self.iter().position(|id| id.eq_ignore_ascii_case(node_id)) else {
+            return false;
+        };
+        Arc::make_mut(&mut self.ids).remove(index);
+        true
+    }
+}
+
+impl Serialize for HiddenDiscovered {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for HiddenDiscovered {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Ids;
+
+        impl<'de> serde::de::Visitor<'de> for Ids {
+            type Value = HiddenDiscovered;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a list of hidden node IDs")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut ids = HiddenDiscovered::default();
+                while let Some(id) = seq.next_element::<String>()? {
+                    ids.insert(&id);
+                }
+                Ok(ids)
+            }
+        }
+
+        deserializer.deserialize_seq(Ids)
+    }
+}
+
+/// The look of the window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Look {
+    /// The language of the window, and of the tray that reads the same file.
+    pub language: Lang,
+    /// The theme.
+    pub theme: Theme,
+    /// The particle field.
+    pub field: FieldMode,
+    /// The speed of the particles, `SPEED_MIN..=SPEED_MAX`.
+    pub speed: f32,
+    /// «ASCII-облака».
+    pub clouds: bool,
+    /// How links are drawn.
+    pub link_style: LinkStyle,
+    /// Physical map scale relative to its fitted base (70..=300); not the UI percentage.
+    pub zoom_percent: u16,
+    /// How far the map was dragged with the right button, in points (`-PAN_MAX..=PAN_MAX`).
+    pub pan_x: i16,
+    /// The same, vertically.
+    pub pan_y: i16,
+    /// The pairing dock is open (`false`: only its handle shows).
+    pub dock_open: bool,
+    /// Background release checks are opt-out.
+    pub check_updates: bool,
+    /// Stable release deliberately skipped for automatic checks only.
+    pub skipped_update: Option<[u64; 3]>,
+    /// Locally hidden unpaired LAN identities, never written to the core configuration.
+    pub hidden_discovered: HiddenDiscovered,
+}
+
+/// The furthest the map may be panned, in points.
+pub const PAN_MAX: i16 = 2000;
+
+/// Physical map zoom bounds, kept in the original persisted percentage units.
+pub const ZOOM_MIN: u16 = 70;
+/// Physical 3× zoom is displayed as 200%.
+pub const ZOOM_MAX: u16 = 300;
+
+/// Maps physical zoom onto 50–200%, keeping the default 1× view at 100%.
+pub fn zoom_display_percent(physical: u16) -> f32 {
+    let physical = physical.clamp(ZOOM_MIN, ZOOM_MAX);
+    if physical <= 100 {
+        50.0 + f32::from(physical - ZOOM_MIN) * 50.0 / 30.0
+    } else {
+        100.0 + f32::from(physical - 100) / 2.0
+    }
+}
+
+/// Inverts the piecewise UI mapping, rounding and clamping to physical units.
+pub fn zoom_from_display(display: f32) -> u16 {
+    let display = display.clamp(50.0, 200.0);
+    let physical = if display <= 100.0 {
+        f32::from(ZOOM_MIN) + (display - 50.0) * 30.0 / 50.0
+    } else {
+        100.0 + (display - 100.0) * 2.0
+    };
+    physical.round() as u16
+}
+
+/// The slowest the particles may be told to chase.
+pub const SPEED_MIN: f32 = 0.3;
+/// The fastest.
+pub const SPEED_MAX: f32 = 2.0;
+/// The speed the slider starts at: exactly the pace «Спокойно».
+pub const SPEED_DEFAULT: f32 = 1.0;
+/// The speed «Живо» used to be, for a file that still says `pace = "live"`.
+const SPEED_LIVE: f32 = 1.8;
+
+impl Default for Look {
+    fn default() -> Self {
+        Look {
+            language: Lang::default(),
+            theme: Theme::default(),
+            field: FieldMode::default(),
+            speed: SPEED_DEFAULT,
+            clouds: true,
+            link_style: LinkStyle::default(),
+            zoom_percent: 100,
+            pan_x: 0,
+            pan_y: 0,
+            dock_open: true,
+            check_updates: true,
+            skipped_update: None,
+            hidden_discovered: HiddenDiscovered::default(),
+        }
+    }
+}
+
+/// The two-step pace of the window before the slider replaced it; read, never written.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Pace {
+    /// «Спокойно».
+    Calm,
+    /// «Живо».
+    Live,
+}
+
+impl Pace {
+    /// The speed the slider shows for it.
+    const fn speed(self) -> f32 {
+        match self {
+            Pace::Calm => SPEED_DEFAULT,
+            Pace::Live => SPEED_LIVE,
+        }
+    }
+}
+
+/// `gui.toml` as any version of the window may have written it.
+#[derive(Deserialize)]
+#[serde(default)]
+struct Stored {
+    /// `None` in a file of the window before it had a language: the system's own.
+    language: Option<Lang>,
+    theme: Theme,
+    field: FieldMode,
+    clouds: bool,
+    link_style: LinkStyle,
+    zoom_percent: u16,
+    pan_x: i16,
+    pan_y: i16,
+    dock_open: bool,
+    check_updates: bool,
+    skipped_update: Option<[u64; 3]>,
+    hidden_discovered: HiddenDiscovered,
+    /// The slider, since it replaced the pace.
+    speed: Option<f32>,
+    /// The pace, as a file written before the slider still says it.
+    pace: Option<Pace>,
+}
+
+impl Default for Stored {
+    fn default() -> Self {
+        let look = Look::default();
+        Stored {
+            language: None,
+            theme: look.theme,
+            field: look.field,
+            clouds: look.clouds,
+            link_style: look.link_style,
+            zoom_percent: look.zoom_percent,
+            pan_x: look.pan_x,
+            pan_y: look.pan_y,
+            dock_open: look.dock_open,
+            check_updates: true,
+            skipped_update: None,
+            hidden_discovered: HiddenDiscovered::default(),
+            speed: None,
+            pace: None,
+        }
+    }
+}
+
+impl From<Stored> for Look {
+    fn from(stored: Stored) -> Look {
+        Look {
+            language: stored.language.unwrap_or_else(Lang::from_system),
+            theme: stored.theme,
+            field: stored.field,
+            // A file with both says the speed; one with neither is a file of the pace era.
+            speed: stored
+                .speed
+                .or_else(|| stored.pace.map(Pace::speed))
+                .unwrap_or(SPEED_DEFAULT),
+            clouds: stored.clouds,
+            link_style: stored.link_style,
+            zoom_percent: stored.zoom_percent,
+            pan_x: stored.pan_x,
+            pan_y: stored.pan_y,
+            dock_open: stored.dock_open,
+            check_updates: stored.check_updates,
+            skipped_update: stored.skipped_update,
+            hidden_discovered: stored.hidden_discovered,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Look {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Stored::deserialize(deserializer)?.into())
+    }
+}
+
+/// Where the settings of the configuration directory `config_dir` are.
+pub fn path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join(FILE_NAME)
+}
+
+/// Reads the settings; anything that is not a valid file is the defaults, with the language
+/// this system is set to rather than the stored one.
+pub fn load(path: &Path) -> Look {
+    let stored = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<Look>(&text).ok());
+    let mut look = stored.unwrap_or(Look {
+        language: Lang::from_system(),
+        ..Look::default()
+    });
+    look.zoom_percent = look.zoom_percent.clamp(ZOOM_MIN, ZOOM_MAX);
+    look.speed = look.speed.clamp(SPEED_MIN, SPEED_MAX);
+    look.pan_x = look.pan_x.clamp(-PAN_MAX, PAN_MAX);
+    look.pan_y = look.pan_y.clamp(-PAN_MAX, PAN_MAX);
+    look
+}
+
+/// Writes the settings through a temporary file, so a crash never leaves half of one.
+pub fn save(path: &Path, look: &Look) -> std::io::Result<()> {
+    let text = toml::to_string(look).map_err(std::io::Error::other)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bifrost-gui-look-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn the_defaults_are_light_with_the_field_gathering_and_ascii_links() {
+        let look = Look::default();
+        assert_eq!(look.theme, Theme::Light);
+        assert_eq!(look.field, FieldMode::Attract);
+        assert_eq!(look.link_style, LinkStyle::Ascii);
+        assert_eq!(look.speed, SPEED_DEFAULT);
+        assert_eq!(look.speed, 1.0);
+        assert!(look.clouds && look.dock_open);
+        assert!(look.check_updates);
+        assert!(look.skipped_update.is_none());
+        assert_eq!((look.pan_x, look.pan_y), (0, 0));
+    }
+
+    #[test]
+    fn a_choice_survives_a_restart() {
+        let dir = dir("roundtrip");
+        let path = path_in(&dir);
+        let look = Look {
+            language: Lang::Ru,
+            theme: Theme::Dark,
+            field: FieldMode::Repel,
+            speed: 1.4,
+            clouds: false,
+            link_style: LinkStyle::Line,
+            zoom_percent: 125,
+            pan_x: -120,
+            pan_y: 37,
+            dock_open: false,
+            check_updates: false,
+            skipped_update: Some([0, 1, 4]),
+            hidden_discovered: {
+                let mut ids = HiddenDiscovered::default();
+                ids.insert(&"ab".repeat(32));
+                ids
+            },
+        };
+        save(&path, &look).expect("the directory is created");
+        let stored = std::fs::read_to_string(&path).expect("read settings");
+        assert!(stored.contains("hidden_discovered = ["));
+        assert!(stored.contains(&"ab".repeat(32)));
+        assert_eq!(load(&path), look);
+        assert!(!path.with_extension("toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_two_step_pace_reads_as_the_speed_it_meant() {
+        let dir = dir("pace");
+        let path = path_in(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (stored, expected) in [
+            ("pace = \"calm\"", SPEED_DEFAULT),
+            ("pace = \"live\"", SPEED_LIVE),
+            ("pace = \"live\"\nspeed = 0.5", 0.5),
+        ] {
+            std::fs::write(&path, format!("{stored}\n")).expect("write");
+            let look = load(&path);
+            assert_eq!(look.speed, expected, "{stored}");
+            // The written file no longer carries a pace: the slider is the only fact.
+            save(&path, &look).expect("write");
+            let text = std::fs::read_to_string(&path).expect("read");
+            assert!(text.contains("speed = "), "{text}");
+            assert!(!text.contains("pace"), "{text}");
+        }
+        // And the speeds a file may hold are bounded like the slider bounds them.
+        for (stored, expected) in [(0.0, SPEED_MIN), (1.6, 1.6), (9.0, SPEED_MAX)] {
+            std::fs::write(&path, format!("speed = {stored}\n")).expect("write");
+            assert_eq!(load(&path).speed, expected);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a file that says nothing about a field gives: the defaults, with the language of
+    /// the system the window runs on.
+    fn fresh() -> Look {
+        Look {
+            language: Lang::from_system(),
+            ..Look::default()
+        }
+    }
+
+    #[test]
+    fn a_missing_or_broken_file_is_the_defaults_and_a_partial_one_keeps_what_it_says() {
+        let dir = dir("broken");
+        let path = path_in(&dir);
+        assert_eq!(load(&path), fresh());
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&path, "theme = [").expect("write");
+        assert_eq!(load(&path), fresh());
+        std::fs::write(&path, "theme = \"dark\"\n").expect("write");
+        let partial = load(&path);
+        assert_eq!(
+            partial.language,
+            Lang::from_system(),
+            "the system's language"
+        );
+        assert_eq!(partial.theme, Theme::Dark);
+        assert_eq!(partial.field, FieldMode::Attract);
+        assert_eq!(partial.zoom_percent, 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_core_config_is_not_the_place() {
+        assert_eq!(FILE_NAME, "gui.toml");
+        assert_ne!(FILE_NAME, "config.toml");
+    }
+
+    #[test]
+    fn persisted_zoom_and_pan_are_bounded_without_touching_core_config() {
+        let dir = dir("zoom");
+        let path = path_in(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (stored, expected) in [(0, 70), (100, 100), (150, 150), (300, 300), (65535, 300)] {
+            std::fs::write(&path, format!("zoom_percent = {stored}\n")).expect("write");
+            assert_eq!(load(&path).zoom_percent, expected);
+        }
+        std::fs::write(&path, "pan_x = 30000\npan_y = -30000\n").expect("write");
+        let look = load(&path);
+        assert_eq!((look.pan_x, look.pan_y), (PAN_MAX, -PAN_MAX));
+        assert!(!dir.join("config.toml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hidden_id_storage_is_validated_deduplicated_bounded_and_cheap_to_clone() {
+        assert!(std::mem::size_of::<Look>() < 128);
+        let mut ids = HiddenDiscovered::default();
+        assert!(ids.is_empty());
+        for invalid in ["", "nearby-laptop", &"a".repeat(63), &"g".repeat(64)] {
+            assert!(!ids.insert(invalid));
+        }
+        let first = "AB".repeat(32);
+        assert!(ids.insert(&first));
+        assert!(!ids.insert(&first.to_ascii_lowercase()));
+        assert!(ids.contains(&first));
+        assert_eq!(ids.iter().next(), Some("ab".repeat(32).as_str()));
+        for n in 0..HIDDEN_DISCOVERED_LIMIT - 1 {
+            assert!(ids.insert(&format!("{n:064x}")));
+        }
+        assert_eq!(ids.len(), HIDDEN_DISCOVERED_LIMIT);
+        assert!(!ids.insert(&"ff".repeat(32)));
+        let copied = ids.clone();
+        assert!(ids.remove(&first));
+        assert!(!ids.remove(&first));
+        assert_eq!(ids.len(), HIDDEN_DISCOVERED_LIMIT - 1);
+        assert!(copied.contains(&first));
+        assert!(ids.insert(&"ff".repeat(32)));
+        assert_eq!(ids.iter().last(), Some("ff".repeat(32).as_str()));
+    }
+
+    #[test]
+    fn stored_hidden_ids_keep_only_the_first_64_valid_unique_identities() {
+        let dir = dir("hidden-ids");
+        let path = path_in(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut values = vec![
+            "\"invalid\"".to_owned(),
+            format!("\"{}\"", "AB".repeat(32)),
+            format!("\"{}\"", "ab".repeat(32)),
+        ];
+        values.extend((0..70).map(|n| format!("\"{n:064x}\"")));
+        std::fs::write(
+            &path,
+            format!(
+                "theme = \"dark\"\nhidden_discovered = [{}]\n",
+                values.join(",")
+            ),
+        )
+        .expect("write");
+        let mut look = load(&path);
+        assert_eq!(
+            look.theme,
+            Theme::Dark,
+            "invalid IDs do not reset other settings"
+        );
+        assert_eq!(look.hidden_discovered.len(), HIDDEN_DISCOVERED_LIMIT);
+        assert_eq!(
+            look.hidden_discovered.iter().next(),
+            Some("ab".repeat(32).as_str())
+        );
+        assert!(!look.hidden_discovered.contains(&format!("{:064x}", 69)));
+        assert!(look.hidden_discovered.remove(&"AB".repeat(32)));
+        save(&path, &look).expect("save unhide");
+        assert_eq!(load(&path), look);
+        assert!(!dir.join("config.toml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zoom_mapping_preserves_physical_bounds_default_and_clamping() {
+        for (physical, display) in [(70, 50.0), (100, 100.0), (300, 200.0)] {
+            assert!((zoom_display_percent(physical) - display).abs() < 0.001);
+            assert_eq!(zoom_from_display(display), physical);
+        }
+        assert_eq!(zoom_display_percent(0), 50.0);
+        assert_eq!(zoom_display_percent(u16::MAX), 200.0);
+        assert_eq!(zoom_from_display(-100.0), ZOOM_MIN);
+        assert_eq!(zoom_from_display(500.0), ZOOM_MAX);
+        for display in (50..=200).step_by(5) {
+            let display = display as f32;
+            assert!((zoom_display_percent(zoom_from_display(display)) - display).abs() < 0.001);
+        }
+    }
+}

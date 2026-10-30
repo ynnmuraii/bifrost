@@ -4,8 +4,8 @@
 //!
 //! | | path |
 //! |---|---|
-//! | Windows | `%APPDATA%\lan-workspace\identity.dpapi` (DPAPI CurrentUser) |
-//! | Linux | Secret Service; otherwise `$XDG_DATA_HOME/lan-workspace/identity.key` (0600) |
+//! | Windows | `%APPDATA%\bifrost\identity.dpapi` (DPAPI CurrentUser) |
+//! | Linux | Secret Service; otherwise `$XDG_DATA_HOME/bifrost/identity.key` (0600) |
 //!
 //! * **Windows** seals the PKCS#8 key with DPAPI (`CryptProtectData`) under the *current
 //!   user*: the blob can only be unsealed by the same user profile on the same machine
@@ -30,6 +30,10 @@
 
 /// Application-specific DPAPI entropy. **Never change this value**: it is part of the
 /// on-disk format of `identity.dpapi`.
+///
+/// The `lan-workspace` part is deliberately legacy-named after the 0.4.0 rename: the
+/// byte string is mixed into the sealed blob, so renaming it would make every stored
+/// key undecryptable.
 pub const DPAPI_ENTROPY: &[u8] = b"lan-workspace/identity/v1";
 
 /// Why sealing or unsealing failed.

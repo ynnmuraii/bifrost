@@ -1,6 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Local IPC of Bifrost (KVM-023/KVM-024): the transport, the peer checks
-//! and the heartbeat watchdog that keep `lws-core`, `lws-agent` and `lws-gui`
+//! and the heartbeat watchdog that keep `bifrost-core`, `bifrost-agent` and `bifrost-gui`
 //! talking without a network in between.
 //!
 //! # What is here

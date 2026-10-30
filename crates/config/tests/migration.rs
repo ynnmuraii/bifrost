@@ -45,7 +45,7 @@ fn parse(text: &str) -> Config {
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lws-config-migration-{}-{}-{label}",
+        "bifrost-config-migration-{}-{}-{label}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

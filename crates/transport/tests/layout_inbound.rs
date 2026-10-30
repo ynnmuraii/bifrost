@@ -58,6 +58,7 @@ fn document() -> wire::Topology {
                 scale_y: 1.0,
                 primary: true,
                 native_known: false,
+                physical_size: None,
             }],
             online: true,
         }],
@@ -79,6 +80,8 @@ fn document() -> wire::Topology {
         }],
         author_node_id: node(1),
         forgotten_node_ids: Vec::new(),
+        map: None,
+        authored_links: Vec::new(),
     }
 }
 
@@ -105,6 +108,7 @@ fn every_layout_payload_round_trips() {
                 scale_y: 1.0,
                 primary: true,
                 native_known: false,
+                physical_size: None,
             }],
         },
         LayoutMessage::LayoutEdit(wire::LayoutEdit {

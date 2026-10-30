@@ -143,7 +143,7 @@ async fn wait_for_members(node: &Node, wanted: usize, timeout: Duration) -> bool
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::env::temp_dir().join("lan-workspace-link-demo");
+    let root = std::env::temp_dir().join("bifrost-link-demo");
     std::fs::remove_dir_all(&root).ok();
     println!("== identities and managers ==");
 

@@ -8,12 +8,12 @@
 //! `docs/06-development-plan.md` («Рекомендуемая структура repository») puts fault
 //! injection in `tests/fault-injection`; that directory is **not** a workspace member
 //! (`members = ["apps/*", "crates/*"]`, and E0 deliberately never lists members), and
-//! this harness is about `lws-core`'s own binaries, so it lives next to them as an
-//! integration test of the `lws-core` package — the same shape `crates/transport` uses
-//! for its mesh tests. `cargo test --workspace` picks it up; `CARGO_BIN_EXE_lws-core`
+//! this harness is about `bifrost-core`'s own binaries, so it lives next to them as an
+//! integration test of the `bifrost-core` package — the same shape `crates/transport` uses
+//! for its mesh tests. `cargo test --workspace` picks it up; `CARGO_BIN_EXE_bifrost`
 //! hands us the binary under test, and the agent binary sits next to it.
 //!
-//! Two real `lws-core` processes, separate `--root`, dry agents, driven through the
+//! Two real `bifrost-core` processes, separate `--root`, dry agents, driven through the
 //! control channel: that is the E2 slice as a user runs it, minus the OS input. Every
 //! wait is event-driven (`status` polling with generous timeouts) so the harness never
 //! depends on a sleep being long enough; latencies are read back from the cores' own
@@ -47,7 +47,7 @@ fn diagnose(context: &str, nodes: &[&Node]) -> String {
             |status| format!("{status:?}"),
         );
         text.push_str(&format!("\n\n=== {} status: {status}\n", node.id));
-        for path in [&node.log, &node.root.join("state/logs/lws-agent.log")] {
+        for path in [&node.log, &node.root.join("state/logs/bifrost-agent.log")] {
             text.push_str(&format!("=== {} (last {TAIL} lines):\n", path.display()));
             let log = std::fs::read_to_string(path)
                 .unwrap_or_else(|error| format!("<cannot read log: {error}>"));
@@ -419,7 +419,7 @@ impl Node {
 
     /// Fires the emergency combination on this node's dry agent, with no desktop.
     ///
-    /// The dry agent watches the path `LWS_DRY_EMERGENCY_FILE` names and reports
+    /// The dry agent watches the path `BIFROST_DRY_EMERGENCY_FILE` names and reports
     /// `EmergencyFired` once when the marker appears. A real agent gets the emergency from
     /// its capture hook, which a dry session does not have.
     pub fn trigger_emergency(&self) {
@@ -514,7 +514,7 @@ impl Node {
 
     /// Durable capture evidence, scoped to this action rather than an earlier capture.
     pub fn wait_dry_capture_started(&self, expected: &str, since: i64) -> i64 {
-        let path = self.root.join("state/logs/lws-agent.log");
+        let path = self.root.join("state/logs/bifrost-agent.log");
         let deadline = Instant::now() + Duration::from_secs(10);
         let marker = format!("dry mode: capture begins (no OS hooks) kind={expected}");
         loop {
@@ -1142,9 +1142,9 @@ impl Drop for Harness {
         }
         self.a.stop();
         self.b.stop();
-        // `LWS_KEEP_ROOTS=1` leaves the logs behind: a failing fault test is diagnosed
+        // `BIFROST_KEEP_ROOTS=1` leaves the logs behind: a failing fault test is diagnosed
         // from the cores' own lines, not from a rerun.
-        if std::env::var_os("LWS_KEEP_ROOTS").is_none() {
+        if std::env::var_os("BIFROST_KEEP_ROOTS").is_none() {
             let _ = std::fs::remove_dir_all(&self.dir);
         } else {
             println!("roots kept at {}", self.dir.display());
@@ -1175,7 +1175,7 @@ pub fn report_latencies(label: &str, values: &[f64]) {
 pub fn unique_dir(label: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let dir = std::env::temp_dir().join(format!(
-        "lws-{label}-{}-{}",
+        "bifrost-{label}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
@@ -1531,22 +1531,22 @@ fn spawn_node(
     // The dry emergency aid: the agent inherits this path and reports `EmergencyFired`
     // once when the file appears (`Node::trigger_emergency`). Harmless until it does.
     command.env(
-        "LWS_DRY_EMERGENCY_FILE",
+        "BIFROST_DRY_EMERGENCY_FILE",
         root.join("run").join("emergency-dry"),
     );
     if root.join("run/hotkey-enabled-dry").is_file() {
-        command.env("LWS_DRY_HOTKEY_FILE", root.join("run/hotkey-dry"));
+        command.env("BIFROST_DRY_HOTKEY_FILE", root.join("run/hotkey-dry"));
     }
     if dry_control_dir.is_dir() {
-        command.env("LWS_DRY_CONTROL_DIR", dry_control_dir);
-        command.env("LWS_LOG", "debug");
+        command.env("BIFROST_DRY_CONTROL_DIR", dry_control_dir);
+        command.env("BIFROST_LOG", "debug");
     }
     if root.join("run/refuse-prepare-dry").is_file() {
-        command.env("LWS_DRY_REFUSE_PREPARE", "1");
+        command.env("BIFROST_DRY_REFUSE_PREPARE", "1");
     }
     let ready_gate = root.join("run/agent-ready-gate");
     if ready_gate.is_file() {
-        command.env("LWS_DRY_READY_GATE", ready_gate);
+        command.env("BIFROST_DRY_READY_GATE", ready_gate);
     }
     let child = command.spawn().expect("the core starts");
     let pid = child.id();
@@ -1724,7 +1724,7 @@ impl Drop for Cluster {
         for node in &mut self.nodes {
             node.stop();
         }
-        if std::env::var_os("LWS_KEEP_ROOTS").is_none() {
+        if std::env::var_os("BIFROST_KEEP_ROOTS").is_none() {
             let _ = std::fs::remove_dir_all(&self.dir);
         } else {
             println!("cluster roots kept at {}", self.dir.display());
@@ -1734,9 +1734,9 @@ impl Drop for Cluster {
 
 /// The documented path roots of a `--root DIR` core.
 ///
-/// Mirrors `apps/lws-core/src/main.rs::resolve_paths`: `config/`, `data/`, `state/` and
+/// Mirrors `apps/bifrost-core/src/main.rs::resolve_paths`: `config/`, `data/`, `state/` and
 /// `run/` under the root. The GUI's endpoint is derived from these
-/// (`ipc::transport::gui_endpoint`), which is the same call the daemon and `lws-gui` make.
+/// (`ipc::transport::gui_endpoint`), which is the same call the daemon and `bifrost-gui` make.
 pub fn paths_under(root: &Path) -> config::Paths {
     config::Paths::new(
         root.join("config"),

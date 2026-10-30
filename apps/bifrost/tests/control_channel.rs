@@ -1,6 +1,6 @@
 //! The control channel under load: two hundred sequential `status` calls over one core.
 //!
-//! `lws-core status` is the CLI's answer to «what is core doing», and it is one connection:
+//! `bifrost-core status` is the CLI's answer to «what is core doing», and it is one connection:
 //! connect, write one line, read one line. `docs/03-architecture.md` promises the channel is
 //! always there, so no call may come back without an answer — and one did: on Windows core
 //! polls `GuiListener::accept` as a branch of its `select!`, the tick won the race a few times
@@ -76,7 +76,7 @@ primary = true
     config.write_all(text.as_bytes()).expect("the config");
 }
 
-/// Starts `lws-core run` for `root` and waits until it answers `status`.
+/// Starts `bifrost-core run` for `root` and waits until it answers `status`.
 fn start_core(root: &Path) -> Child {
     let mut child = Command::new(core_binary())
         .arg("--root")
@@ -133,7 +133,7 @@ fn status_line(root: &Path) -> Option<String> {
 /// Two hundred calls in a row, each one answered.
 #[test]
 fn two_hundred_sequential_status_calls_are_all_answered() {
-    let root = std::env::temp_dir().join(format!("lws-control-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("bifrost-control-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     write_config(&root, free_port());
 
@@ -181,7 +181,7 @@ const CALLS_PER_CLIENT: u32 = 50;
 /// below are the regression.
 #[test]
 fn eight_concurrent_clients_get_fifty_answers_each() {
-    let root = std::env::temp_dir().join(format!("lws-control-stress-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("bifrost-control-stress-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     write_config(&root, free_port());
 

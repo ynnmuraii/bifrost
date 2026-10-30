@@ -17,7 +17,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// per-user configuration directories.
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lws-first-run-tests-{}-{}-{label}",
+        "bifrost-first-run-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -26,7 +26,7 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// The `Paths` of a fresh `--root` tree, exactly the shape `lws-core` builds.
+/// The `Paths` of a fresh `--root` tree, exactly the shape `bifrost-core` builds.
 fn paths_under(root: &Path) -> Paths {
     Paths::new(
         root.join("config"),

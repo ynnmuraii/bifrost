@@ -15,7 +15,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// per-user configuration directories.
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lws-config-tests-{}-{}-{label}",
+        "bifrost-config-tests-{}-{}-{label}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -31,10 +31,10 @@ fn read(path: &Path) -> String {
 #[test]
 fn explicit_roots_drive_every_derived_path() {
     let root = temp_dir("paths");
-    let config_dir = root.join("roaming").join("lan-workspace");
+    let config_dir = root.join("roaming").join("bifrost");
     let data_dir = config_dir.clone();
-    let state_dir = root.join("local").join("lan-workspace");
-    let runtime_dir = root.join("runtime").join("lan-workspace");
+    let state_dir = root.join("local").join("bifrost");
+    let runtime_dir = root.join("runtime").join("bifrost");
 
     let paths = Paths::new(
         &config_dir,
