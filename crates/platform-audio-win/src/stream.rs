@@ -26,6 +26,15 @@ use windows::{
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub type StereoFrame = [f32; 2];
+
+enum CaptureSink {
+    Ring(Producer<CapturedFrame>),
+    Callback(audio_backend::CaptureCallback),
+}
+enum RenderSource {
+    Ring(Consumer<StereoFrame>),
+    Callback(audio_backend::RenderCallback),
+}
 /// Timestamp is WASAPI QPC time converted to 100 ns units, not raw QPC ticks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CapturedFrame {
@@ -214,7 +223,7 @@ pub fn start_capture_excluding(
             "process loopback requires Windows build 20348",
         ));
     }
-    start_process_capture(pid, false, sink)
+    start_process_capture(pid, false, CaptureSink::Ring(sink))
 }
 /// Diagnostic positive control used by hw_probe; never use this for a Source.
 #[doc(hidden)]
@@ -227,12 +236,23 @@ pub fn start_capture_including_for_probe(
             "process loopback requires Windows build 20348",
         ));
     }
-    start_process_capture(pid, true, sink)
+    start_process_capture(pid, true, CaptureSink::Ring(sink))
 }
+pub(crate) fn start_capture_callback(
+    callback: audio_backend::CaptureCallback,
+) -> Result<StreamHandle, Error> {
+    if os_build()? < 20348 {
+        return Err(Error::Unsupported(
+            "process loopback requires Windows build 20348",
+        ));
+    }
+    start_process_capture(std::process::id(), false, CaptureSink::Callback(callback))
+}
+
 fn start_process_capture(
     pid: u32,
     include: bool,
-    mut sink: Producer<CapturedFrame>,
+    mut sink: CaptureSink,
 ) -> Result<StreamHandle, Error> {
     start_worker(move |state, ready| {
         let setup = || -> Result<_, Error> {
@@ -280,13 +300,55 @@ unsafe fn read_frame(pointer: *const u8, silent: bool, index: usize) -> StereoFr
         }
     }
 }
+struct CapturePacket<'a> {
+    client: &'a IAudioCaptureClient,
+    frames: Option<u32>,
+}
+impl CapturePacket<'_> {
+    fn release(mut self) -> windows::core::Result<()> {
+        unsafe {
+            self.client
+                .ReleaseBuffer(self.frames.take().expect("owned packet"))
+        }
+    }
+}
+impl Drop for CapturePacket<'_> {
+    fn drop(&mut self) {
+        if let Some(frames) = self.frames.take() {
+            let _ = unsafe { self.client.ReleaseBuffer(frames) };
+        }
+    }
+}
+struct RenderPacket<'a> {
+    client: &'a IAudioRenderClient,
+    frames: Option<u32>,
+}
+impl RenderPacket<'_> {
+    fn release(mut self) -> windows::core::Result<()> {
+        unsafe {
+            self.client
+                .ReleaseBuffer(self.frames.take().expect("owned packet"), 0)
+        }
+    }
+}
+impl Drop for RenderPacket<'_> {
+    fn drop(&mut self) {
+        if let Some(frames) = self.frames.take() {
+            let _ = unsafe {
+                self.client
+                    .ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)
+            };
+        }
+    }
+}
 fn capture_loop(
     state: &State,
     capture: &IAudioCaptureClient,
     event: &Event,
-    sink: &mut Producer<CapturedFrame>,
+    sink: &mut CaptureSink,
 ) -> windows::core::Result<()> {
     let mut pending_gap = false;
+    let silence = [0.0_f32; audio_backend::MAX_CAPTURE_BLOCK_FRAMES * 2];
     while !state.stop.load(Ordering::Acquire) {
         let wait = unsafe { WaitForSingleObject(event.0, 100) };
         if wait == WAIT_TIMEOUT {
@@ -309,6 +371,10 @@ fn capture_loop(
                     Some(&mut qpc),
                 )?;
             }
+            let packet = CapturePacket {
+                client: capture,
+                frames: Some(count),
+            };
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             let invalid_pointer = !silent && pointer.is_null() && count != 0;
             let oversized_packet = count > SAMPLE_RATE;
@@ -316,27 +382,64 @@ fn capture_loop(
             // Read only while the WASAPI buffer is held, and never construct a slice for silence.
             if !invalid_pointer && !oversized_packet {
                 let discontinuity = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
-                for index in 0..count {
-                    let samples = unsafe { read_frame(pointer, silent, index as usize) };
-                    let frame = CapturedFrame {
-                        samples,
-                        device_position: position + u64::from(index),
-                        qpc_100ns: qpc + u64::from(index) * 10_000_000 / u64::from(SAMPLE_RATE),
-                        timestamp_valid: flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0,
-                        discontinuity: pending_gap || (index == 0 && discontinuity),
-                    };
-                    if sink.push(frame).is_err() {
-                        pending_gap = true;
-                        dropped += 1;
-                    } else {
-                        pending_gap = false;
-                        delivered += 1;
+                match sink {
+                    CaptureSink::Callback(callback) => {
+                        for offset in
+                            (0..count as usize).step_by(audio_backend::MAX_CAPTURE_BLOCK_FRAMES)
+                        {
+                            let frames = (count as usize - offset)
+                                .min(audio_backend::MAX_CAPTURE_BLOCK_FRAMES);
+                            let samples = if silent {
+                                &silence[..frames * 2]
+                            } else {
+                                // WASAPI f32 buffers are aligned native PCM; null was rejected above.
+                                unsafe {
+                                    std::slice::from_raw_parts(
+                                        pointer.cast::<f32>().add(offset * 2),
+                                        frames * 2,
+                                    )
+                                }
+                            };
+                            callback(audio_backend::CaptureBlock {
+                                samples,
+                                frames,
+                                format: audio_backend::AudioFormat {
+                                    sample_rate: SAMPLE_RATE,
+                                    channels: 2,
+                                },
+                                timestamp_ns: (qpc
+                                    + offset as u64 * 10_000_000 / u64::from(SAMPLE_RATE))
+                                .saturating_mul(100),
+                                discontinuity: offset == 0 && discontinuity,
+                            });
+                            delivered += frames as u64;
+                        }
+                    }
+                    CaptureSink::Ring(sink) => {
+                        for index in 0..count {
+                            let samples = unsafe { read_frame(pointer, silent, index as usize) };
+                            let frame = CapturedFrame {
+                                samples,
+                                device_position: position + u64::from(index),
+                                qpc_100ns: qpc
+                                    + u64::from(index) * 10_000_000 / u64::from(SAMPLE_RATE),
+                                timestamp_valid: flags
+                                    & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32
+                                    == 0,
+                                discontinuity: pending_gap || (index == 0 && discontinuity),
+                            };
+                            if sink.push(frame).is_err() {
+                                pending_gap = true;
+                                dropped += 1;
+                            } else {
+                                pending_gap = false;
+                                delivered += 1;
+                            }
+                        }
                     }
                 }
             }
-            unsafe {
-                capture.ReleaseBuffer(count)?;
-            }
+            packet.release()?;
             state.frames.fetch_add(delivered, Ordering::Relaxed);
             state.dropped.fetch_add(dropped, Ordering::Relaxed);
             if oversized_packet {
@@ -357,7 +460,19 @@ fn capture_loop(
 /// Explicit IDs are never silently replaced. DeviceInvalidated requires a caller-driven rebuild.
 pub fn start_render(
     selection: EndpointSelection,
-    mut source: Consumer<StereoFrame>,
+    source: Consumer<StereoFrame>,
+) -> Result<StreamHandle, Error> {
+    start_render_source(selection, RenderSource::Ring(source))
+}
+pub(crate) fn start_render_callback(
+    selection: EndpointSelection,
+    callback: audio_backend::RenderCallback,
+) -> Result<StreamHandle, Error> {
+    start_render_source(selection, RenderSource::Callback(callback))
+}
+fn start_render_source(
+    selection: EndpointSelection,
+    mut source: RenderSource,
 ) -> Result<StreamHandle, Error> {
     start_worker(move |state, ready| {
         let setup = || -> Result<_, Error> {
@@ -414,7 +529,7 @@ fn render_loop(
     render: &IAudioRenderClient,
     clock: &IAudioClock,
     capacity: u32,
-    source: &mut Consumer<StereoFrame>,
+    source: &mut RenderSource,
 ) -> windows::core::Result<()> {
     while !state.stop.load(Ordering::Acquire) {
         let wait = unsafe { WaitForSingleObject(event.0, 100) };
@@ -435,21 +550,37 @@ fn render_loop(
                     0x80004003u32 as i32,
                 )));
             }
+            let packet = RenderPacket {
+                client: render,
+                frames: Some(available),
+            };
             let mut missing = 0;
-            for index in 0..available {
-                let frame = source.pop().unwrap_or_else(|_| {
-                    missing += 1;
-                    [0.0; 2]
-                });
-                unsafe {
-                    let p = pointer.cast::<f32>().add(index as usize * 2);
-                    p.write_unaligned(frame[0]);
-                    p.add(1).write_unaligned(frame[1]);
+            match source {
+                RenderSource::Callback(callback) => {
+                    let samples = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            pointer.cast::<f32>(),
+                            available as usize * 2,
+                        )
+                    };
+                    samples.fill(0.0);
+                    callback(samples);
+                }
+                RenderSource::Ring(source) => {
+                    for index in 0..available {
+                        let frame = source.pop().unwrap_or_else(|_| {
+                            missing += 1;
+                            [0.0; 2]
+                        });
+                        unsafe {
+                            let p = pointer.cast::<f32>().add(index as usize * 2);
+                            p.write_unaligned(frame[0]);
+                            p.add(1).write_unaligned(frame[1]);
+                        }
+                    }
                 }
             }
-            unsafe {
-                render.ReleaseBuffer(available, 0)?;
-            }
+            packet.release()?;
             state
                 .frames
                 .fetch_add(u64::from(available), Ordering::Relaxed);

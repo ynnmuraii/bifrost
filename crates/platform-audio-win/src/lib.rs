@@ -3,6 +3,10 @@
 //! Linux intentionally builds an empty library. See each module for lifecycle contracts.
 #![cfg(windows)]
 
+mod backend;
+mod backend_devices;
+mod backend_media;
+pub use backend::{WindowsBackend, WindowsStream};
 mod common;
 pub mod devices;
 pub mod hotkey;

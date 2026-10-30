@@ -10,7 +10,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
         Arc,
     },
@@ -29,15 +29,16 @@ use windows::{
                 IAudioEndpointVolume, IAudioEndpointVolumeCallback,
                 IAudioEndpointVolumeCallback_Impl,
             },
-            IAudioClient, IMMDevice, IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient,
-            IMMNotificationClient_Impl, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA,
-            DEVICE_STATE, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+            IMMDevice, IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient,
+            IMMNotificationClient_Impl, MMDeviceEnumerator, PKEY_AudioEngine_DeviceFormat,
+            AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
         },
         System::Com::{
             CoCreateGuid, CoCreateInstance, CoTaskMemFree,
             StructuredStorage::{PropVariantClear, PropVariantToStringAlloc},
             CLSCTX_ALL, STGM_READ,
         },
+        System::Variant::VT_BLOB,
     },
 };
 
@@ -121,33 +122,40 @@ fn friendly_name(device: &IMMDevice) -> Result<String, Error> {
 }
 
 fn mix_format(device: &IMMDevice) -> Result<MixFormat, Error> {
-    let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
-    let allocation = TaskMemory(unsafe { client.GetMixFormat()? });
-    if allocation.0.is_null() {
-        return Err(Error::Unsupported("GetMixFormat returned no format"));
+    // Reading the engine-format property does not activate a capture audio client.
+    let store = unsafe { device.OpenPropertyStore(STGM_READ)? };
+    let mut property = unsafe { store.GetValue(&PKEY_AudioEngine_DeviceFormat)? };
+    let result = (|| {
+        if property.vt() != VT_BLOB {
+            return Err(Error::Unsupported("engine format property is not a blob"));
+        }
+        let blob = unsafe { property.Anonymous.Anonymous.Anonymous.blob };
+        let header = std::mem::size_of::<WAVEFORMATEX>();
+        if blob.pBlobData.is_null() || (blob.cbSize as usize) < header {
+            return Err(Error::Unsupported("engine format header is missing"));
+        }
+        let format = unsafe { blob.pBlobData.cast::<WAVEFORMATEX>().read_unaligned() };
+        if header + usize::from(format.cbSize) > blob.cbSize as usize {
+            return Err(Error::Unsupported("engine format extension is truncated"));
+        }
+        let extension = unsafe {
+            std::slice::from_raw_parts(blob.pBlobData.add(header), usize::from(format.cbSize))
+        }
+        .to_vec();
+        Ok(MixFormat {
+            format_tag: format.wFormatTag,
+            channels: format.nChannels,
+            sample_rate: format.nSamplesPerSec,
+            average_bytes_per_second: format.nAvgBytesPerSec,
+            block_align: format.nBlockAlign,
+            bits_per_sample: format.wBitsPerSample,
+            extension,
+        })
+    })();
+    unsafe {
+        PropVariantClear(&mut property)?;
     }
-    // SAFETY: GetMixFormat owns a WAVEFORMATEX plus cbSize extension until freed.
-    // WAVEFORMATEX is packed; copy it rather than borrow its fields.
-    let format = unsafe { allocation.0.read_unaligned() };
-    let extension = unsafe {
-        std::slice::from_raw_parts(
-            allocation
-                .0
-                .cast::<u8>()
-                .add(std::mem::size_of::<WAVEFORMATEX>()),
-            usize::from(format.cbSize),
-        )
-    }
-    .to_vec();
-    Ok(MixFormat {
-        format_tag: format.wFormatTag,
-        channels: format.nChannels,
-        sample_rate: format.nSamplesPerSec,
-        average_bytes_per_second: format.nAvgBytesPerSec,
-        block_align: format.nBlockAlign,
-        bits_per_sample: format.wBitsPerSample,
-        extension,
-    })
+    result
 }
 
 /// Read-only active render and capture enumeration. An endpoint disappearing
@@ -439,6 +447,7 @@ struct MuteCallback {
     overflowed: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     context: GUID,
+    external_revision: Arc<AtomicU64>,
 }
 #[allow(non_snake_case)]
 impl IAudioEndpointVolumeCallback_Impl for MuteCallback_Impl {
@@ -451,15 +460,26 @@ impl IAudioEndpointVolumeCallback_Impl for MuteCallback_Impl {
             // Never read afChannelVolumes (a variable-length trailing array).
             let context = unsafe { (*notification).guidEventContext };
             let muted = unsafe { (*notification).bMuted }.as_bool();
-            queue_hint(
-                &self.sender,
-                &self.overflowed,
-                MuteChange {
-                    muted,
-                    context: EventContext(context.to_u128()),
-                    local: context == self.context,
-                },
-            );
+            if context != self.context {
+                let _ = self.external_revision.try_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |value| Some(value.saturating_add(1)),
+                );
+            }
+            let event = MuteChange {
+                muted,
+                context: EventContext(context.to_u128()),
+                local: context == self.context,
+            };
+            if self.sender.try_send(event).is_err() {
+                self.overflowed.store(true, Ordering::Release);
+                let _ = self.external_revision.try_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |value| Some(value.saturating_add(1)),
+                );
+            }
         }
         Ok(())
     }
@@ -468,6 +488,7 @@ impl IAudioEndpointVolumeCallback_Impl for MuteCallback_Impl {
 enum MuteCommand {
     Read(SyncSender<Result<bool, Error>>),
     Set(bool, SyncSender<Result<(), Error>>),
+    SetIfRevision(bool, u64, SyncSender<Result<bool, Error>>),
     Stop,
 }
 
@@ -479,6 +500,7 @@ pub struct CaptureMute {
     pub event_context: EventContext,
     pub changes: Receiver<MuteChange>,
     overflowed: Arc<AtomicBool>,
+    external_revision: Arc<AtomicU64>,
     commands: Option<SyncSender<MuteCommand>>,
     worker: Option<JoinHandle<Result<(), Error>>>,
 }
@@ -500,6 +522,8 @@ impl CaptureMute {
         let (ready, started) = mpsc::sync_channel(1);
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflow = Arc::clone(&overflowed);
+        let external_revision = Arc::new(AtomicU64::new(0));
+        let callback_revision = Arc::clone(&external_revision);
         let worker = thread::spawn(move || {
             let setup = (|| {
                 let apartment = Apartment::mta()?;
@@ -519,6 +543,7 @@ impl CaptureMute {
                     overflowed: callback_overflow,
                     active: Arc::clone(&active),
                     context,
+                    external_revision: Arc::clone(&callback_revision),
                 }
                 .into();
                 unsafe { volume.RegisterControlChangeNotify(&callback)? };
@@ -545,6 +570,18 @@ impl CaptureMute {
                                 unsafe { volume.SetMute(muted, &context) }.map_err(Error::from);
                             let _ = reply.try_send(result);
                         }
+                        MuteCommand::SetIfRevision(muted, expected, reply) => {
+                            let result = if expected == u64::MAX
+                                || callback_revision.load(Ordering::Acquire) != expected
+                            {
+                                Ok(false)
+                            } else {
+                                unsafe { volume.SetMute(muted, &context) }
+                                    .map(|_| callback_revision.load(Ordering::Acquire) == expected)
+                                    .map_err(Error::from)
+                            };
+                            let _ = reply.try_send(result);
+                        }
                         MuteCommand::Stop => break,
                     }
                 }
@@ -559,6 +596,7 @@ impl CaptureMute {
                 event_context,
                 changes,
                 overflowed,
+                external_revision,
                 commands: Some(commands),
                 worker: Some(worker),
             }),
@@ -590,6 +628,21 @@ impl CaptureMute {
             .as_ref()
             .ok_or(Error::WorkerStopped)?
             .send(MuteCommand::Set(muted, reply))
+            .map_err(|_| Error::WorkerStopped)?;
+        result.recv().map_err(|_| Error::WorkerStopped)?
+    }
+
+    pub(crate) fn external_revision(&self) -> u64 {
+        self.external_revision.load(Ordering::Acquire)
+    }
+
+    /// Refuse a write if any external notification or queue loss revoked the lease.
+    pub(crate) fn set_mute_if_revision(&self, muted: bool, expected: u64) -> Result<bool, Error> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or(Error::WorkerStopped)?
+            .send(MuteCommand::SetIfRevision(muted, expected, reply))
             .map_err(|_| Error::WorkerStopped)?;
         result.recv().map_err(|_| Error::WorkerStopped)?
     }
@@ -646,11 +699,13 @@ mod tests {
     fn mute_notification_preserves_context_and_ownership() {
         let context = GUID::from_u128(42);
         let (sender, receiver) = mpsc::sync_channel(2);
+        let external_revision = Arc::new(AtomicU64::new(0));
         let callback: IAudioEndpointVolumeCallback = MuteCallback {
             sender,
             overflowed: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
             context,
+            external_revision: Arc::clone(&external_revision),
         }
         .into();
         let mut notification = AUDIO_VOLUME_NOTIFICATION_DATA {
@@ -659,6 +714,7 @@ mod tests {
             ..Default::default()
         };
         unsafe { callback.OnNotify(&mut notification).unwrap() };
+        assert_eq!(external_revision.load(Ordering::Acquire), 0);
         assert_eq!(
             receiver.try_recv().unwrap(),
             MuteChange {
@@ -670,6 +726,7 @@ mod tests {
         notification.guidEventContext = GUID::from_u128(7);
         notification.bMuted = false.into();
         unsafe { callback.OnNotify(&mut notification).unwrap() };
+        assert_eq!(external_revision.load(Ordering::Acquire), 1);
         assert_eq!(
             receiver.try_recv().unwrap(),
             MuteChange {
@@ -678,5 +735,31 @@ mod tests {
                 local: false,
             }
         );
+    }
+
+    #[test]
+    fn same_value_external_notifications_and_overflow_revoke_revision() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let revision = Arc::new(AtomicU64::new(0));
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let callback: IAudioEndpointVolumeCallback = MuteCallback {
+            sender,
+            overflowed: Arc::clone(&overflowed),
+            active: Arc::new(AtomicBool::new(true)),
+            context: GUID::from_u128(42),
+            external_revision: Arc::clone(&revision),
+        }
+        .into();
+        let mut notification = AUDIO_VOLUME_NOTIFICATION_DATA {
+            guidEventContext: GUID::from_u128(7),
+            bMuted: true.into(),
+            ..Default::default()
+        };
+        unsafe { callback.OnNotify(&mut notification).unwrap() };
+        assert_eq!(revision.load(Ordering::Acquire), 1);
+        unsafe { callback.OnNotify(&mut notification).unwrap() };
+        assert!(overflowed.load(Ordering::Acquire));
+        assert_eq!(revision.load(Ordering::Acquire), 3);
+        assert!(receiver.try_recv().unwrap().muted);
     }
 }

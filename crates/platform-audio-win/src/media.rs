@@ -5,11 +5,13 @@
 //! memory and is UTF-8 byte bounded; this module never logs it or injects keys.
 
 use crate::Error;
+use crate::{backend::map_error, backend_media::Pending};
+use audio_backend::BackendError;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
-        Arc,
+        Arc, Mutex, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -76,9 +78,10 @@ pub struct Timeline {
     pub updated_at: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MediaSession {
     pub token: SessionToken,
+    pub revision: u64,
     pub app_id: String,
     pub title: String,
     pub artist: String,
@@ -86,6 +89,14 @@ pub struct MediaSession {
     pub playback_status: i32,
     pub timeline: Timeline,
     pub controls: Controls,
+}
+
+impl std::fmt::Debug for MediaSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaSession")
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +108,7 @@ pub struct MediaSnapshot {
 enum Request {
     Snapshot(SyncSender<Result<MediaSnapshot, Error>>),
     Command(SessionToken, MediaCommand, SyncSender<Result<bool, Error>>),
+    BackendCommand(Arc<Pending>),
 }
 
 /// Dropping or shutting down joins the worker and revokes all subscriptions.
@@ -106,6 +118,7 @@ pub struct MediaManager {
     overflow: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    pending: Arc<Mutex<Vec<Weak<Pending>>>>,
 }
 
 impl MediaManager {
@@ -116,12 +129,14 @@ impl MediaManager {
         let overflow = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let worker_pending = pending.clone();
         let sink = EventSink {
             tx: events_tx,
             overflow: overflow.clone(),
         };
         let worker = thread::spawn(move || {
-            let initialized = State::open(sink);
+            let initialized = State::open(sink, worker_pending);
             match initialized {
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -137,6 +152,10 @@ impl MediaManager {
                             }
                             Ok(Request::Command(token, command, reply)) => {
                                 let _ = reply.send(state.command(token, command));
+                            }
+                            Ok(Request::BackendCommand(pending)) => {
+                                let result = state.backend_command(&pending);
+                                pending.finish(result);
                             }
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -159,6 +178,7 @@ impl MediaManager {
                 overflow,
                 stop,
                 worker: Some(worker),
+                pending,
             }),
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -169,6 +189,17 @@ impl MediaManager {
                 Err(Error::WorkerStopped)
             }
         }
+    }
+
+    pub(crate) fn snapshot_async(
+        &self,
+    ) -> Result<Receiver<Result<MediaSnapshot, Error>>, BackendError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.requests.try_send(Request::Snapshot(tx)).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => BackendError::Busy,
+            mpsc::TrySendError::Disconnected(_) => BackendError::ServerUnavailable,
+        })?;
+        Ok(rx)
     }
 
     pub fn snapshot(&self) -> Result<MediaSnapshot, Error> {
@@ -186,6 +217,25 @@ impl MediaManager {
             .send(Request::Command(token, command, tx))
             .map_err(|_| Error::WorkerStopped)?;
         rx.recv().map_err(|_| Error::WorkerStopped)?
+    }
+
+    pub(crate) fn admit(&self, pending: Arc<Pending>) -> Result<(), BackendError> {
+        let mut registered = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        registered.retain(|job| job.upgrade().is_some_and(|job| job.outcome().is_none()));
+        self.requests
+            .try_send(Request::BackendCommand(pending.clone()))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => BackendError::Busy,
+                mpsc::TrySendError::Disconnected(_) => BackendError::ServerUnavailable,
+            })?;
+        registered.push(Arc::downgrade(&pending));
+        Ok(())
+    }
+
+    pub(crate) fn worker_stopped(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
     }
 
     pub fn events(&self) -> &Receiver<MediaChange> {
@@ -260,6 +310,7 @@ struct Entry {
     identity: IUnknown,
     session: Session,
     token: SessionToken,
+    revision: Arc<AtomicU64>,
     metadata: Option<i64>,
     playback: Option<i64>,
     timeline: Option<i64>,
@@ -286,11 +337,12 @@ struct State {
     current_changed: Option<i64>,
     sink: EventSink,
     dirty: Arc<AtomicBool>,
+    pending: Arc<Mutex<Vec<Weak<Pending>>>>,
     // Last field: all COM objects/subscriptions are released before apartment teardown.
     _apartment: WinRt,
 }
 impl State {
-    fn open(sink: EventSink) -> Result<Self, Error> {
+    fn open(sink: EventSink, pending: Arc<Mutex<Vec<Weak<Pending>>>>) -> Result<Self, Error> {
         let apartment = WinRt::open()?;
         let manager = complete!(Manager::RequestAsync());
         let mut state = Self {
@@ -301,6 +353,7 @@ impl State {
             current_changed: None,
             sink,
             dirty: Arc::new(AtomicBool::new(false)),
+            pending,
             _apartment: apartment,
         };
         let sink = state.sink.clone();
@@ -338,27 +391,34 @@ impl State {
                     identity: identity.clone(),
                     session,
                     token,
+                    revision: Arc::new(AtomicU64::new(1)),
                     metadata: None,
                     playback: None,
                     timeline: None,
                 };
                 let sink = self.sink.clone();
+                let revision = entry.revision.clone();
                 entry.metadata = Some(entry.session.MediaPropertiesChanged(
                     &TypedEventHandler::new(move |_, _| {
+                        advance_revision(&revision);
                         sink.emit(MediaChange::Metadata(token));
                         Ok(())
                     }),
                 )?);
                 let sink = self.sink.clone();
+                let revision = entry.revision.clone();
                 entry.playback = Some(entry.session.PlaybackInfoChanged(
                     &TypedEventHandler::new(move |_, _| {
+                        advance_revision(&revision);
                         sink.emit(MediaChange::Playback(token));
                         Ok(())
                     }),
                 )?);
                 let sink = self.sink.clone();
+                let revision = entry.revision.clone();
                 entry.timeline = Some(entry.session.TimelinePropertiesChanged(
                     &TypedEventHandler::new(move |_, _| {
+                        advance_revision(&revision);
                         sink.emit(MediaChange::Timeline(token));
                         Ok(())
                     }),
@@ -368,6 +428,17 @@ impl State {
             live.push(identity);
         }
         self.entries.retain(|entry| live.contains(&entry.identity));
+        // Invalidate queued jobs as soon as disappearance is observed, not only on dispatch.
+        let registered = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for pending in registered.iter().filter_map(Weak::upgrade) {
+            if !self
+                .entries
+                .iter()
+                .any(|entry| entry.token.0 == pending.request.session.0)
+            {
+                pending.finish(Err(BackendError::DeviceGone));
+            }
+        }
         Ok(())
     }
 
@@ -395,11 +466,14 @@ impl State {
         };
         let mut sessions = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
+            // Capture before reads: a concurrent native change invalidates this snapshot's revision.
+            let revision = entry.revision.load(Ordering::Acquire);
             let metadata = complete!(entry.session.TryGetMediaPropertiesAsync());
             let playback = entry.session.GetPlaybackInfo()?;
             let timeline = entry.session.GetTimelineProperties()?;
             sessions.push(MediaSession {
                 token: entry.token,
+                revision,
                 app_id: bounded_utf8(&entry.session.SourceAppUserModelId()?, 128),
                 title: bounded_utf8(&metadata.Title()?, 256),
                 artist: bounded_utf8(&metadata.Artist()?, 256),
@@ -442,6 +516,87 @@ impl State {
             MediaCommand::Next => complete!(session.TrySkipNextAsync()),
             MediaCommand::Previous => complete!(session.TrySkipPreviousAsync()),
         })
+    }
+
+    fn backend_command(&mut self, pending: &Pending) -> Result<(), BackendError> {
+        if let Some(result) = pending.outcome() {
+            return result;
+        }
+        self.reconcile().map_err(map_error)?;
+        let token = SessionToken(pending.request.session.0);
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.token == token)
+            .ok_or(BackendError::DeviceGone)?;
+        if !revision_matches(&entry.revision, pending.request.expected_revision) {
+            return Err(BackendError::StaleRevision);
+        }
+        let session = entry.session.clone();
+        let revision = entry.revision.clone();
+        let available = controls(&session).map_err(map_error)?;
+        let enabled = match pending.request.command {
+            audio_backend::MediaCommand::Play => available.play,
+            audio_backend::MediaCommand::Pause => available.pause,
+            audio_backend::MediaCommand::Toggle => available.toggle,
+            audio_backend::MediaCommand::Next => available.next,
+            audio_backend::MediaCommand::Previous => available.previous,
+        };
+        if !enabled {
+            return Err(BackendError::Unsupported);
+        }
+        let operation = match pending.start(|| {
+            if !revision_matches(&revision, pending.request.expected_revision) {
+                return Err(BackendError::StaleRevision);
+            }
+            match pending.request.command {
+                audio_backend::MediaCommand::Play => session.TryPlayAsync(),
+                audio_backend::MediaCommand::Pause => session.TryPauseAsync(),
+                audio_backend::MediaCommand::Toggle => session.TryTogglePlayPauseAsync(),
+                audio_backend::MediaCommand::Next => session.TrySkipNextAsync(),
+                audio_backend::MediaCommand::Previous => session.TrySkipPreviousAsync(),
+            }
+            .map_err(|error| map_error(Error::Windows(error)))
+        }) {
+            Some(operation) => operation?,
+            None => {
+                return pending
+                    .outcome()
+                    .unwrap_or(Err(BackendError::ServerUnavailable))
+            }
+        };
+        // Cancellation/timeout cannot prove whether an already dispatched OS command took effect.
+        let result = loop {
+            if let Some(result) = pending.outcome() {
+                break result;
+            }
+            if let Err(error) = self.reconcile() {
+                break Err(map_error(error));
+            }
+            if !self.entries.iter().any(|entry| entry.token == token) {
+                break Err(BackendError::DeviceGone);
+            }
+            match operation.Status() {
+                Ok(status) if status.0 == 0 => thread::sleep(Duration::from_millis(5)),
+                Ok(_) => {
+                    break operation
+                        .GetResults()
+                        .map_err(|error| map_error(Error::Windows(error)))
+                        .and_then(|accepted| {
+                            if accepted {
+                                Ok(())
+                            } else {
+                                Err(BackendError::Unsupported)
+                            }
+                        })
+                }
+                Err(error) => break Err(map_error(Error::Windows(error))),
+            }
+        };
+        if result.is_err() {
+            let _ = operation.Cancel();
+        }
+        result
     }
 }
 impl Drop for State {
@@ -489,9 +644,63 @@ fn bounded_utf8(value: &HSTRING, max: usize) -> String {
     result
 }
 
+fn advance_revision(revision: &AtomicU64) {
+    // Saturation would let a changed session reuse its revision; exhaustion is fail-closed.
+    let _ = revision.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        value.checked_add(1)
+    });
+}
+
+fn revision_matches(revision: &AtomicU64, expected: u64) -> bool {
+    let actual = revision.load(Ordering::Acquire);
+    actual != u64::MAX && actual == expected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn changes_invalidate_revision_and_exhaustion_fails_closed() {
+        let revision = AtomicU64::new(1);
+        assert!(revision_matches(&revision, 1));
+        advance_revision(&revision);
+        assert!(!revision_matches(&revision, 1));
+        assert!(revision_matches(&revision, 2));
+        revision.store(u64::MAX - 1, Ordering::Release);
+        advance_revision(&revision);
+        advance_revision(&revision);
+        assert!(!revision_matches(&revision, u64::MAX));
+    }
+
+    #[test]
+    fn metadata_debug_is_redacted() {
+        let session = MediaSession {
+            token: SessionToken(1),
+            revision: 1,
+            app_id: "private-app".into(),
+            title: "private-title".into(),
+            artist: "private-artist".into(),
+            playback_status: 0,
+            timeline: Timeline {
+                start: 0,
+                end: 0,
+                position: 0,
+                min_seek: 0,
+                max_seek: 0,
+                updated_at: 0,
+            },
+            controls: Controls::default(),
+        };
+        let debug = format!(
+            "{:?}",
+            MediaSnapshot {
+                sessions: vec![session],
+                current: None
+            }
+        );
+        assert!(!debug.contains("private-"));
+    }
+
     #[test]
     fn utf8_bounds_preserve_codepoints() {
         assert_eq!(bounded_utf8(&HSTRING::from("ab🎵é"), 5), "ab");
