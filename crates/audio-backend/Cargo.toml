@@ -1,0 +1,11 @@
+[package]
+name = "audio-backend"
+version.workspace = true
+description = "Platform-neutral audio device contracts and deterministic in-memory adapter"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

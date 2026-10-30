@@ -16,6 +16,8 @@ use std::process::Command;
 /// Crates that must never be reachable from `bifrost-agent`: the link/TLS/identity stack of the
 /// core, the window, and the usual network clients.
 const DENIED_CRATES: &[&str] = &[
+    "audio-model",
+    "audio-backend",
     "transport",
     "identity",
     "focus-router",
