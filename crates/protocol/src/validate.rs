@@ -33,6 +33,10 @@ pub enum Violation {
     DisplayNameTooLong { len: usize },
     /// `Hello.displays` exceeds 16 entries.
     TooManyDisplays { got: usize },
+    /// `Hello.capabilities` exceeds its bounded implementation offer.
+    TooManyCapabilities { got: usize },
+    /// `Hello.required_capabilities` exceeds its bounded requirement list.
+    TooManyRequiredCapabilities { got: usize },
     /// A required capability is unknown or not advertised by the local implementation.
     UnsupportedRequiredCapability { capability: i32 },
     /// A requirement is UNSPECIFIED, repeated, or absent from the sender's offer.
@@ -64,6 +68,8 @@ impl Violation {
             | Violation::NodeIdLen { .. }
             | Violation::DisplayNameTooLong { .. }
             | Violation::TooManyDisplays { .. }
+            | Violation::TooManyCapabilities { .. }
+            | Violation::TooManyRequiredCapabilities { .. }
             | Violation::InvalidRequiredCapability { .. }
             | Violation::InputBatchSize { .. }
             | Violation::ClipboardMime
@@ -121,6 +127,16 @@ pub fn hello_required_capabilities(
     hello: &wire::Hello,
     local_capabilities: &[i32],
 ) -> Result<(), Violation> {
+    if hello.capabilities.len() > crate::limits::MAX_HELLO_CAPABILITIES {
+        return Err(Violation::TooManyCapabilities {
+            got: hello.capabilities.len(),
+        });
+    }
+    if hello.required_capabilities.len() > crate::limits::MAX_REQUIRED_CAPABILITIES {
+        return Err(Violation::TooManyRequiredCapabilities {
+            got: hello.required_capabilities.len(),
+        });
+    }
     for (index, &capability) in hello.required_capabilities.iter().enumerate() {
         if capability == wire::Capability::Unspecified as i32
             || hello.required_capabilities[..index].contains(&capability)

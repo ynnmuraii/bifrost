@@ -550,6 +550,47 @@ fn envelope_checks_payload_and_identifier_lengths_without_lease_policy() {
 }
 
 #[test]
+fn hello_capability_lists_are_bounded_before_membership_scans() {
+    use protocol::limits::{MAX_HELLO_CAPABILITIES, MAX_REQUIRED_CAPABILITIES};
+    use protocol::validate::Violation;
+
+    let mut hello = wire::Hello {
+        node_id: vec![1; 32],
+        capabilities: vec![999; MAX_HELLO_CAPABILITIES],
+        ..Default::default()
+    };
+    assert_eq!(validate::hello(&hello), Ok(()));
+    hello.capabilities.push(999);
+    assert_eq!(
+        validate::hello(&hello),
+        Err(Violation::TooManyCapabilities {
+            got: MAX_HELLO_CAPABILITIES + 1
+        })
+    );
+    hello.capabilities.clear();
+    hello.required_capabilities = vec![999; MAX_REQUIRED_CAPABILITIES];
+    assert_eq!(
+        validate::hello(&hello),
+        Err(Violation::UnsupportedRequiredCapability { capability: 999 })
+    );
+    hello.required_capabilities.push(999);
+    assert_eq!(
+        validate::hello(&hello),
+        Err(Violation::TooManyRequiredCapabilities {
+            got: MAX_REQUIRED_CAPABILITIES + 1
+        })
+    );
+    assert_eq!(
+        Violation::TooManyCapabilities { got: 65 }.error_code(),
+        wire::ErrorCode::InvalidFrame
+    );
+    assert_eq!(
+        Violation::TooManyRequiredCapabilities { got: 33 }.error_code(),
+        wire::ErrorCode::InvalidFrame
+    );
+}
+
+#[test]
 fn hello_requirements_are_enforced_on_both_handshake_sides() {
     use protocol::hello::{HandshakeError, HelloHandshake};
     use protocol::validate::Violation;
