@@ -1,0 +1,493 @@
+//! Event-driven 48 kHz float stereo streams. The caller allocates the rings before start.
+//! No allocation, logging, channel send, or mutex acquisition occurs in either steady-state
+//! loop. Poll `snapshot` off the real-time thread. On invalidation, drop the handle and
+//! explicitly restart with the original selection (or re-resolve FollowDefault).
+use crate::{
+    common::{Apartment, Event, ProAudio},
+    Error,
+};
+use rtrb::{Consumer, Producer};
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering},
+        mpsc, Arc,
+    },
+    thread::{self, JoinHandle},
+};
+use wasapi::{AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Media::Audio::*,
+        System::Threading::{CreateEventW, WaitForSingleObject},
+    },
+};
+
+pub const SAMPLE_RATE: u32 = 48_000;
+pub type StereoFrame = [f32; 2];
+/// Timestamp is WASAPI QPC time converted to 100 ns units, not raw QPC ticks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapturedFrame {
+    pub samples: StereoFrame,
+    pub device_position: u64,
+    pub qpc_100ns: u64,
+    pub timestamp_valid: bool,
+    pub discontinuity: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EndpointSelection {
+    FollowDefaultMultimedia,
+    Id(String),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamStatus {
+    Running,
+    Stopped,
+    DeviceInvalidated,
+    Failed(i32),
+}
+#[derive(Clone, Copy, Debug)]
+pub struct StreamSnapshot {
+    pub status: StreamStatus,
+    pub transferred_frames: u64,
+    pub dropped_capture_frames: u64,
+    pub underrun_frames: u64,
+    /// Render clock units and frequency (not necessarily audio sample frames).
+    pub device_position: u64,
+    pub clock_frequency: u64,
+    pub qpc_100ns: u64,
+}
+#[derive(Default)]
+struct State {
+    stop: AtomicBool,
+    status: AtomicU8,
+    error: AtomicI32,
+    frames: AtomicU64,
+    dropped: AtomicU64,
+    underruns: AtomicU64,
+    position: AtomicU64,
+    frequency: AtomicU64,
+    qpc: AtomicU64,
+    sequence: AtomicU64,
+}
+/// Drop/stop joins the native worker; call off latency-sensitive threads.
+pub struct StreamHandle {
+    state: Arc<State>,
+    worker: Option<JoinHandle<()>>,
+}
+impl StreamHandle {
+    pub fn snapshot(&self) -> StreamSnapshot {
+        let (position, qpc, frequency) = loop {
+            let before = self.state.sequence.load(Ordering::SeqCst);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let values = (
+                self.state.position.load(Ordering::SeqCst),
+                self.state.qpc.load(Ordering::SeqCst),
+                self.state.frequency.load(Ordering::SeqCst),
+            );
+            if before == self.state.sequence.load(Ordering::SeqCst) {
+                break values;
+            }
+        };
+        StreamSnapshot {
+            status: match self.state.status.load(Ordering::Acquire) {
+                0 => StreamStatus::Running,
+                1 => StreamStatus::Stopped,
+                2 => StreamStatus::DeviceInvalidated,
+                _ => StreamStatus::Failed(self.state.error.load(Ordering::Relaxed)),
+            },
+            transferred_frames: self.state.frames.load(Ordering::Relaxed),
+            dropped_capture_frames: self.state.dropped.load(Ordering::Relaxed),
+            underrun_frames: self.state.underruns.load(Ordering::Relaxed),
+            device_position: position,
+            clock_frequency: frequency,
+            qpc_100ns: qpc,
+        }
+    }
+    pub fn stop(&mut self) {
+        self.state.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[repr(C)]
+struct OsVersion {
+    size: u32,
+    major: u32,
+    minor: u32,
+    build: u32,
+    platform: u32,
+    service_pack: [u16; 128],
+}
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlGetVersion(version: *mut OsVersion) -> i32;
+}
+/// Read-only runtime gate. Activation can still fail and never falls back to whole-system capture.
+pub fn os_build() -> Result<u32, Error> {
+    let mut v = OsVersion {
+        size: std::mem::size_of::<OsVersion>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform: 0,
+        service_pack: [0; 128],
+    };
+    if unsafe { RtlGetVersion(&mut v) } < 0 {
+        return Err(Error::Unsupported("OS version unavailable"));
+    }
+    Ok(v.build)
+}
+fn format() -> WaveFormat {
+    WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 2, None)
+}
+fn attach_event(client: &IAudioClient) -> Result<Event, Error> {
+    let event = Event(unsafe { CreateEventW(None, false, false, PCWSTR::null())? });
+    unsafe {
+        client.SetEventHandle(event.0)?;
+    }
+    Ok(event)
+}
+fn start_worker<F>(run: F) -> Result<StreamHandle, Error>
+where
+    F: FnOnce(Arc<State>, mpsc::SyncSender<Result<(), Error>>) + Send + 'static,
+{
+    let state = Arc::new(State::default());
+    let shared = state.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || run(shared, tx));
+    match rx.recv() {
+        Ok(Ok(())) => Ok(StreamHandle {
+            state,
+            worker: Some(worker),
+        }),
+        Ok(Err(error)) => {
+            let _ = worker.join();
+            Err(error)
+        }
+        Err(_) => {
+            let _ = worker.join();
+            Err(Error::WorkerStopped)
+        }
+    }
+}
+fn finish(state: &State, result: windows::core::Result<()>) {
+    match result {
+        Ok(()) => state.status.store(1, Ordering::Release),
+        Err(error) => {
+            state.error.store(error.code().0, Ordering::Relaxed);
+            state.status.store(
+                if error.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+                    2
+                } else {
+                    3
+                },
+                Ordering::Release,
+            );
+        }
+    }
+}
+/// Exclude the supplied audio-role PID and all descendants, across all render endpoints.
+/// `pid` must own every Bifrost render stream. The format is fixed explicitly; process
+/// loopback does not implement GetMixFormat/GetDevicePeriod. Full rings drop frames and
+/// mark the next delivered frame discontinuous. There is no whole-system fallback.
+pub fn start_capture_excluding(
+    pid: u32,
+    sink: Producer<CapturedFrame>,
+) -> Result<StreamHandle, Error> {
+    if pid == 0 {
+        return Err(Error::InvalidArgument("zero process ID"));
+    }
+    if os_build()? < 20348 {
+        return Err(Error::Unsupported(
+            "process loopback requires Windows build 20348",
+        ));
+    }
+    start_process_capture(pid, false, sink)
+}
+/// Diagnostic positive control used by hw_probe; never use this for a Source.
+#[doc(hidden)]
+pub fn start_capture_including_for_probe(
+    pid: u32,
+    sink: Producer<CapturedFrame>,
+) -> Result<StreamHandle, Error> {
+    if os_build()? < 20348 {
+        return Err(Error::Unsupported(
+            "process loopback requires Windows build 20348",
+        ));
+    }
+    start_process_capture(pid, true, sink)
+}
+fn start_process_capture(
+    pid: u32,
+    include: bool,
+    mut sink: Producer<CapturedFrame>,
+) -> Result<StreamHandle, Error> {
+    start_worker(move |state, ready| {
+        let setup = || -> Result<_, Error> {
+            let apartment = Apartment::mta()?;
+            let mut client = AudioClient::new_application_loopback_client(pid, include)?;
+            client.initialize_client(
+                &format(),
+                &Direction::Capture,
+                &StreamMode::EventsShared {
+                    autoconvert: true,
+                    buffer_duration_hns: 0,
+                },
+            )?;
+            let raw = client.as_iaudioclient().clone();
+            let event = attach_event(&raw)?;
+            let capture: IAudioCaptureClient = unsafe { raw.GetService()? };
+            Ok((apartment, client, raw, event, capture))
+        };
+        let (_apartment, _client, raw, event, capture) = match setup() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        let _priority = ProAudio::enter();
+        if let Err(e) = unsafe { raw.Start() } {
+            let _ = ready.send(Err(e.into()));
+            return;
+        }
+        let _ = ready.send(Ok(()));
+        let result = capture_loop(&state, &capture, &event, &mut sink);
+        let _ = unsafe { raw.Stop() };
+        finish(&state, result);
+    })
+}
+// The SILENT contract permits a null data pointer; test this independently of hardware.
+unsafe fn read_frame(pointer: *const u8, silent: bool, index: usize) -> StereoFrame {
+    if silent {
+        [0.0; 2]
+    } else {
+        unsafe {
+            let p = pointer.cast::<f32>().add(index * 2);
+            [p.read_unaligned(), p.add(1).read_unaligned()]
+        }
+    }
+}
+fn capture_loop(
+    state: &State,
+    capture: &IAudioCaptureClient,
+    event: &Event,
+    sink: &mut Producer<CapturedFrame>,
+) -> windows::core::Result<()> {
+    let mut pending_gap = false;
+    while !state.stop.load(Ordering::Acquire) {
+        let wait = unsafe { WaitForSingleObject(event.0, 100) };
+        if wait == WAIT_TIMEOUT {
+            // An unplugged endpoint need not signal another audio event.
+            let _ = unsafe { capture.GetNextPacketSize()? };
+            continue;
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(windows::core::Error::from_thread());
+        }
+        while unsafe { capture.GetNextPacketSize()? } != 0 {
+            let (mut pointer, mut count, mut flags, mut position, mut qpc) =
+                (std::ptr::null_mut(), 0, 0, 0, 0);
+            unsafe {
+                capture.GetBuffer(
+                    &mut pointer,
+                    &mut count,
+                    &mut flags,
+                    Some(&mut position),
+                    Some(&mut qpc),
+                )?;
+            }
+            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+            let invalid_pointer = !silent && pointer.is_null() && count != 0;
+            let oversized_packet = count > SAMPLE_RATE;
+            let (mut delivered, mut dropped) = (0, 0);
+            // Read only while the WASAPI buffer is held, and never construct a slice for silence.
+            if !invalid_pointer && !oversized_packet {
+                let discontinuity = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
+                for index in 0..count {
+                    let samples = unsafe { read_frame(pointer, silent, index as usize) };
+                    let frame = CapturedFrame {
+                        samples,
+                        device_position: position + u64::from(index),
+                        qpc_100ns: qpc + u64::from(index) * 10_000_000 / u64::from(SAMPLE_RATE),
+                        timestamp_valid: flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0,
+                        discontinuity: pending_gap || (index == 0 && discontinuity),
+                    };
+                    if sink.push(frame).is_err() {
+                        pending_gap = true;
+                        dropped += 1;
+                    } else {
+                        pending_gap = false;
+                        delivered += 1;
+                    }
+                }
+            }
+            unsafe {
+                capture.ReleaseBuffer(count)?;
+            }
+            state.frames.fetch_add(delivered, Ordering::Relaxed);
+            state.dropped.fetch_add(dropped, Ordering::Relaxed);
+            if oversized_packet {
+                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x80070057u32 as i32,
+                )));
+            }
+            if invalid_pointer {
+                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x80004003u32 as i32,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+/// Shared-mode engine conversion accepts 48 kHz f32 stereo even on another native mix.
+/// Explicit IDs are never silently replaced. DeviceInvalidated requires a caller-driven rebuild.
+pub fn start_render(
+    selection: EndpointSelection,
+    mut source: Consumer<StereoFrame>,
+) -> Result<StreamHandle, Error> {
+    start_worker(move |state, ready| {
+        let setup = || -> Result<_, Error> {
+            let apartment = Apartment::mta()?;
+            let enumerator = DeviceEnumerator::new()?;
+            let device = match &selection {
+                EndpointSelection::FollowDefaultMultimedia => enumerator
+                    .get_default_device_for_role(&Direction::Render, &wasapi::Role::Multimedia)?,
+                EndpointSelection::Id(id) => enumerator.get_device(id)?,
+            };
+            let mut client = device.get_iaudioclient()?;
+            client.initialize_client(
+                &format(),
+                &Direction::Render,
+                &StreamMode::EventsShared {
+                    autoconvert: true,
+                    buffer_duration_hns: 0,
+                },
+            )?;
+            let raw = client.as_iaudioclient().clone();
+            let event = attach_event(&raw)?;
+            let render: IAudioRenderClient = unsafe { raw.GetService()? };
+            let clock: IAudioClock = unsafe { raw.GetService()? };
+            let capacity = unsafe { raw.GetBufferSize()? };
+            if capacity == 0 || capacity > SAMPLE_RATE {
+                return Err(Error::Unsupported("render buffer outside one-second bound"));
+            }
+            let frequency = unsafe { clock.GetFrequency()? };
+            state.frequency.store(frequency, Ordering::SeqCst);
+            Ok((apartment, client, raw, event, render, clock, capacity))
+        };
+        let (_apartment, _client, raw, event, render, clock, capacity) = match setup() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        let _priority = ProAudio::enter();
+        if let Err(e) = unsafe { raw.Start() } {
+            let _ = ready.send(Err(e.into()));
+            return;
+        }
+        let _ = ready.send(Ok(()));
+        let result = render_loop(&state, &raw, &event, &render, &clock, capacity, &mut source);
+        let _ = unsafe { raw.Stop() };
+        finish(&state, result);
+    })
+}
+fn render_loop(
+    state: &State,
+    raw: &IAudioClient,
+    event: &Event,
+    render: &IAudioRenderClient,
+    clock: &IAudioClock,
+    capacity: u32,
+    source: &mut Consumer<StereoFrame>,
+) -> windows::core::Result<()> {
+    while !state.stop.load(Ordering::Acquire) {
+        let wait = unsafe { WaitForSingleObject(event.0, 100) };
+        if wait == WAIT_TIMEOUT {
+            let _ = unsafe { raw.GetCurrentPadding()? };
+            continue;
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(windows::core::Error::from_thread());
+        }
+        let available = capacity.saturating_sub(unsafe { raw.GetCurrentPadding()? });
+        if available != 0 {
+            let pointer = unsafe { render.GetBuffer(available)? };
+            if pointer.is_null() {
+                let _ =
+                    unsafe { render.ReleaseBuffer(available, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) };
+                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x80004003u32 as i32,
+                )));
+            }
+            let mut missing = 0;
+            for index in 0..available {
+                let frame = source.pop().unwrap_or_else(|_| {
+                    missing += 1;
+                    [0.0; 2]
+                });
+                unsafe {
+                    let p = pointer.cast::<f32>().add(index as usize * 2);
+                    p.write_unaligned(frame[0]);
+                    p.add(1).write_unaligned(frame[1]);
+                }
+            }
+            unsafe {
+                render.ReleaseBuffer(available, 0)?;
+            }
+            state
+                .frames
+                .fetch_add(u64::from(available), Ordering::Relaxed);
+            state.underruns.fetch_add(missing, Ordering::Relaxed);
+        }
+        let (mut position, mut qpc) = (0, 0);
+        unsafe {
+            clock.GetPosition(&mut position, Some(&mut qpc))?;
+        }
+        state.sequence.fetch_add(1, Ordering::SeqCst);
+        state.position.store(position, Ordering::SeqCst);
+        state.qpc.store(qpc, Ordering::SeqCst);
+        state.sequence.fetch_add(1, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_format_and_ring_handoff() {
+        let f = format();
+        assert_eq!(f.get_samplespersec(), SAMPLE_RATE);
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(2);
+        let frame = CapturedFrame {
+            samples: [0.25, -0.25],
+            device_position: 7,
+            ..Default::default()
+        };
+        tx.push(frame).unwrap();
+        assert_eq!(rx.pop().unwrap().samples, frame.samples);
+        assert!(rx.pop().is_err());
+        assert_eq!(unsafe { read_frame(std::ptr::null(), true, 0) }, [0.0; 2]);
+        let samples = [0.25_f32, -0.75];
+        assert_eq!(
+            unsafe { read_frame(samples.as_ptr().cast(), false, 0) },
+            samples
+        );
+    }
+}

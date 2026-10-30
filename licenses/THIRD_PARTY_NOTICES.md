@@ -3405,6 +3405,7 @@ Used by:
 - bitflags 1.3.2 — https://github.com/bitflags/bitflags
 - bitflags 2.13.2 — https://github.com/bitflags/bitflags
 - log 0.4.34 — https://github.com/rust-lang/log
+- num-integer 0.1.47 — https://github.com/rust-num/num-integer
 - num-traits 0.2.19 — https://github.com/rust-num/num-traits
 - regex-automata 0.4.18 — https://github.com/rust-lang/regex
 - regex-syntax 0.8.11 — https://github.com/rust-lang/regex
@@ -5235,6 +5236,34 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
+```
+
+## MIT License
+
+Used by:
+
+- wasapi 0.26.0 — https://github.com/HEnquist/wasapi-rs
+
+```text
+Copyright (c) 2020 Henrik Enquist
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ## MIT License
@@ -7266,6 +7295,7 @@ Used by:
 - protox 0.10.0 — https://github.com/andrewhickman/protox
 - quote 1.0.47 — https://github.com/dtolnay/quote
 - reis 0.7.1 — https://github.com/ids1024/reis
+- rtrb 0.3.6 — https://github.com/mgeier/rtrb
 - rustix 0.38.44 — https://github.com/bytecodealliance/rustix
 - rustix 1.1.5 — https://github.com/bytecodealliance/rustix
 - rustversion 1.0.23 — https://github.com/dtolnay/rustversion

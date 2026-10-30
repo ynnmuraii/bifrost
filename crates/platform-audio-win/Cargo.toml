@@ -1,0 +1,16 @@
+[package]
+name = "platform-audio-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+rtrb = "0.3"
+wasapi = "=0.26.0"
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = ["Foundation", "Foundation_Collections", "Media_Control", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_WinRT", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Devices_FunctionDiscovery", "Win32_UI_Shell_PropertiesSystem"] }
