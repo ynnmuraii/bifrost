@@ -4433,6 +4433,7 @@ dependencies = [
  "input-model",
  "logging",
  "protocol",
+ "ring",
  "rustls",
  "serde",
  "socket2",
@@ -4442,6 +4443,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

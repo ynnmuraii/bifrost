@@ -194,6 +194,7 @@ async fn seeded_impairment_profiles_preserve_final_point_edges_and_bounded_stora
                     queue: Arc::clone(&queue),
                     terminal: terminal.clone(),
                     local: NodeId::new([1; 32]),
+                    auxiliary: Arc::new(crate::auxiliary::AuxiliaryState::new()),
                     dropped_motion: Arc::new(AtomicU64::new(0)),
                     lease_diagnostics: Arc::new(LeaseTransportCounters::default()),
                     metrics: Arc::clone(&metrics),

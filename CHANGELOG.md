@@ -12,6 +12,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Bound Hello advertised capability lists to 64 entries and required capability lists to 32 before membership or duplicate scans.
 - Clipboard channels inherit their parent input link's negotiated protocol version for both outgoing frames and incoming validation, preserving clipboard compatibility across future mixed-minor peers.
 
+**New**
+
+- Optional features can derive per-input-link keys without a new wire capability. The TLS exporter root stays inside transport, is erased on parent closure/replacement, and is accessible only through a redacted, revocable derivation view after validated Hello; consumers gate on their own feature capabilities.
+
 ### Русский
 
 **Исправления**
@@ -19,6 +23,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Требования Hello входного соединения отклоняются, если возможность неизвестна, не заявлена локально или список требований некорректен; неизвестные необязательные возможности не мешают соединению.
 - Списки возможностей Hello ограничены 64 объявленными и 32 обязательными элементами до проверки включения и повторов.
 - Каналы буфера обмена используют согласованную версию родительского входного соединения при отправке и проверке кадров, сохраняя совместимость при будущих различиях младшей версии протокола.
+
+**Новое**
+
+- Необязательные функции могут выводить ключи входного соединения без новой сетевой возможности. Корневой секрет TLS остаётся внутри транспорта, стирается при закрытии или замене родителя и после проверки Hello доступен только через скрывающий секрет, отзываемый интерфейс вывода ключей; потребители проверяют возможности своих функций.
 
 ## 0.4.0 — 2026-10-30
 

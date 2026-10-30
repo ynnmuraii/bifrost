@@ -618,6 +618,7 @@ fn edge_snapshot(counters: &[AtomicU64; 6]) -> input_model::EdgeCounters {
 pub struct LinkHandle {
     peer: NodeId,
     local: NodeId,
+    auxiliary: Arc<crate::auxiliary::AuxiliaryState>,
     queue: Arc<InputQueue>,
     terminal: tokio::sync::watch::Sender<Option<LinkDownReason>>,
     dropped_motion: Arc<AtomicU64>,
@@ -633,6 +634,11 @@ pub struct LinkHandle {
 }
 
 impl LinkHandle {
+    /// A revocable key-derivation view, available only after validated runtime Hello.
+    pub fn auxiliary_secret(&self) -> Option<crate::AuxiliarySecret> {
+        self.auxiliary.handle()
+    }
+
     /// Published aggregate diagnostics contain durations and counters only.
     pub fn input_metrics(&self) -> crate::input_metrics::InputMetricsSnapshot {
         self.metrics
@@ -916,6 +922,7 @@ impl LinkHandle {
             terminal,
             local: NodeId::new([0; 32]),
             dropped_motion: Arc::new(AtomicU64::new(0)),
+            auxiliary: Arc::new(crate::auxiliary::AuxiliaryState::new()),
             lease_diagnostics: Arc::new(LeaseTransportCounters::default()),
             metrics: Arc::new(Mutex::new(InputMetrics::default())),
             ack_tracker: Arc::new(Mutex::new(AckTracker::default())),
@@ -927,6 +934,7 @@ impl LinkHandle {
     /// Requests bounded drain and Shutdown without waiting for queue capacity.
     pub fn close(&self) {
         self.queue.begin_close();
+        self.auxiliary.invalidate();
         self.shutdown.notify_one();
     }
 }
@@ -1016,6 +1024,7 @@ pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let handle = LinkHandle {
         peer: config.peer,
+        auxiliary: Arc::new(crate::auxiliary::AuxiliaryState::new()),
         queue,
         terminal,
         local: config.local,
@@ -1036,10 +1045,12 @@ struct LinkTaskLifetime {
     writer: tokio::task::AbortHandle,
     queue: Arc<InputQueue>,
     terminal: tokio::sync::watch::Sender<Option<LinkDownReason>>,
+    auxiliary: Arc<crate::auxiliary::AuxiliaryState>,
 }
 
 impl Drop for LinkTaskLifetime {
     fn drop(&mut self) {
+        self.auxiliary.invalidate();
         self.reader.abort();
         self.writer.abort();
         self.queue.abort();
@@ -1053,6 +1064,7 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
     let LinkHandle {
         queue,
         terminal,
+        auxiliary,
         lease_diagnostics: diagnostics,
         metrics,
         ack_tracker: tracker,
@@ -1097,6 +1109,14 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
         HelloHandshake::acceptor(limits::PROTOCOL_MAJOR, limits::PROTOCOL_MINOR)
     };
     let remote = stream.peer_addr().ok();
+    // Export once from the authenticated runtime input TLS connection, before split.
+    let pending_auxiliary = match crate::auxiliary::export(&stream) {
+        Ok(root) => root,
+        Err(error) => {
+            report_down(&reports, key, peer, reason_from(error)).await;
+            return;
+        }
+    };
     let (reader, writer) = tokio::io::split(stream);
     let (frames_tx, mut frames_rx) = mpsc::channel(8);
     let reader_task = tokio::spawn(read_loop(reader, frames_tx, Arc::clone(&diagnostics)));
@@ -1121,6 +1141,7 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
         writer: writer_task.abort_handle(),
         queue: Arc::clone(&queue),
         terminal: terminal.clone(),
+        auxiliary: auxiliary.clone(),
     };
     let mut state = LinkState::new(
         peer,
@@ -1131,6 +1152,7 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
         Arc::clone(&metrics),
         Arc::clone(&tracker),
     );
+    state.auxiliary = Some((auxiliary, pending_auxiliary));
     state.remote = remote;
     let mut failure = terminal.subscribe();
     let initial = if direction.is_outgoing() {
@@ -1207,6 +1229,9 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
             }
         }
     };
+    // Rejected Hello must erase its still-unpublished exporter before reporting Down.
+    drop(state.auxiliary.take());
+    _task_lifetime.auxiliary.invalidate();
     let deadline = queue.begin_close();
     set_terminal_once(&terminal, || reason);
     let reason = terminal
@@ -1298,6 +1323,10 @@ struct LinkState {
     rtt: Arc<Mutex<RttMeter>>,
     metrics: Arc<Mutex<InputMetrics>>,
     ack_tracker: Arc<Mutex<AckTracker>>,
+    auxiliary: Option<(
+        Arc<crate::auxiliary::AuxiliaryState>,
+        zeroize::Zeroizing<[u8; 32]>,
+    )>,
 }
 
 impl LinkState {
@@ -1328,6 +1357,7 @@ impl LinkState {
             rtt,
             metrics,
             ack_tracker,
+            auxiliary: None,
         }
     }
     fn report_input_batch(&mut self, direction: &'static str, seq: u64, events: &[InputEvent]) {
@@ -1505,6 +1535,16 @@ impl LinkState {
             // сторона отвечает своим `Hello` с тем же `connection_id`».
             if !handshake.is_established() {
                 self.write_hello(queue, handshake, local_hello.clone())?;
+            }
+            if let Some((auxiliary, root)) = self.auxiliary.take() {
+                auxiliary.establish(
+                    root,
+                    crate::AuxiliaryBinding {
+                        peer: self.peer,
+                        connection_id: self.connection_id,
+                        generation: self.key,
+                    },
+                );
             }
             queue.ready(self.unpair_notice);
             return reports
