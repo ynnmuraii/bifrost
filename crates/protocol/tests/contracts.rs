@@ -407,13 +407,13 @@ fn dialer_first_hello_negotiates_only_after_both_directions() {
         let request = dialer.local_hello(Default::default()).unwrap();
         assert_eq!(request.seq, 1);
         assert!(!dialer.is_established());
-        acceptor.on_remote_hello(&request).unwrap();
+        acceptor.on_remote_hello(&request, &[]).unwrap();
         assert!(!acceptor.is_established());
         let reply = acceptor.local_hello(Default::default()).unwrap();
         assert_eq!(reply.seq, 1);
         assert_eq!(reply.connection_id, request.connection_id);
         assert!(acceptor.is_established());
-        dialer.on_remote_hello(&reply).unwrap();
+        dialer.on_remote_hello(&reply, &[]).unwrap();
         assert_eq!(
             dialer.negotiated(),
             Some(Negotiated {
@@ -428,7 +428,7 @@ fn dialer_first_hello_negotiates_only_after_both_directions() {
             Err(HandshakeError::AlreadySent)
         );
         assert_eq!(
-            acceptor.on_remote_hello(&request),
+            acceptor.on_remote_hello(&request, &[]),
             Err(HandshakeError::NotHello)
         );
     }
@@ -482,11 +482,11 @@ fn hello_rejects_wrong_sequence_ids_version_and_payload() {
     ));
     for (message, expected) in cases {
         let mut acceptor = HelloHandshake::acceptor(0, 3);
-        assert_eq!(acceptor.on_remote_hello(&message), Err(expected));
+        assert_eq!(acceptor.on_remote_hello(&message, &[]), Err(expected));
         assert!(!acceptor.is_established());
     }
     assert_eq!(
-        HelloHandshake::dialer(0, 3, [8; 16]).on_remote_hello(&base),
+        HelloHandshake::dialer(0, 3, [8; 16]).on_remote_hello(&base, &[]),
         Err(HandshakeError::ConnectionIdMismatch)
     );
 }
@@ -504,7 +504,7 @@ fn rejected_remote_hello_does_not_unlock_acceptor_send() {
         },
     ] {
         let mut acceptor = HelloHandshake::acceptor(0, 3);
-        assert!(acceptor.on_remote_hello(&message).is_err());
+        assert!(acceptor.on_remote_hello(&message, &[]).is_err());
         assert_eq!(
             acceptor.local_hello(Default::default()),
             Err(HandshakeError::NotYourTurn)
@@ -547,6 +547,91 @@ fn envelope_checks_payload_and_identifier_lengths_without_lease_policy() {
             }
         );
     }
+}
+
+#[test]
+fn hello_requirements_are_enforced_on_both_handshake_sides() {
+    use protocol::hello::{HandshakeError, HelloHandshake};
+    use protocol::validate::Violation;
+
+    let supported = wire::Capability::TextClipboard as i32;
+    let unsupported = wire::Capability::Capture as i32;
+    for (offered, required, expected) in [
+        (vec![999], vec![], None),
+        (vec![supported], vec![supported], None),
+        (
+            vec![999],
+            vec![999],
+            Some(Violation::UnsupportedRequiredCapability { capability: 999 }),
+        ),
+        (
+            vec![unsupported],
+            vec![unsupported],
+            Some(Violation::UnsupportedRequiredCapability {
+                capability: unsupported,
+            }),
+        ),
+        (
+            vec![],
+            vec![supported],
+            Some(Violation::InvalidRequiredCapability {
+                capability: supported,
+            }),
+        ),
+        (
+            vec![0],
+            vec![0],
+            Some(Violation::InvalidRequiredCapability { capability: 0 }),
+        ),
+        (
+            vec![supported],
+            vec![supported, supported],
+            Some(Violation::InvalidRequiredCapability {
+                capability: supported,
+            }),
+        ),
+    ] {
+        let hello = wire::Hello {
+            node_id: vec![1; 32],
+            capabilities: offered,
+            required_capabilities: required,
+            ..Default::default()
+        };
+        let envelope = wire::Envelope {
+            major: 1,
+            minor: 0,
+            connection_id: vec![2; 16],
+            seq: 1,
+            payload: Some(wire::envelope::Payload::Hello(hello.clone())),
+            ..Default::default()
+        };
+        for mut handshake in [
+            HelloHandshake::acceptor(1, 0),
+            HelloHandshake::dialer(1, 0, [2; 16]),
+        ] {
+            let result = handshake.on_remote_hello(&envelope, &[supported]);
+            if let Some(violation) = expected {
+                let error = HandshakeError::RequiredCapability(violation);
+                assert_eq!(result, Err(error));
+                assert_eq!(error.peer_error_code(), Some(violation.error_code()));
+                assert!(!handshake.is_established());
+                if handshake.side() == protocol::hello::HandshakeSide::Acceptor {
+                    assert_eq!(handshake.connection_id(), None);
+                }
+            } else {
+                assert!(result.is_ok());
+                assert!(validate::hello(&hello).is_ok());
+            }
+        }
+    }
+    assert_eq!(
+        Violation::UnsupportedRequiredCapability { capability: 999 }.error_code(),
+        wire::ErrorCode::UnsupportedVersion
+    );
+    assert_eq!(
+        Violation::InvalidRequiredCapability { capability: 0 }.error_code(),
+        wire::ErrorCode::InvalidFrame
+    );
 }
 
 #[test]

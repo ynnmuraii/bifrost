@@ -33,6 +33,10 @@ pub enum Violation {
     DisplayNameTooLong { len: usize },
     /// `Hello.displays` exceeds 16 entries.
     TooManyDisplays { got: usize },
+    /// A required capability is unknown or not advertised by the local implementation.
+    UnsupportedRequiredCapability { capability: i32 },
+    /// A requirement is UNSPECIFIED, repeated, or absent from the sender's offer.
+    InvalidRequiredCapability { capability: i32 },
     /// `InputBatch.events` is outside 1..=128.
     InputBatchSize { got: usize },
     /// `ClipboardOffer.size_bytes` exceeds its MIME's hard cap.
@@ -51,6 +55,7 @@ impl Violation {
     /// The wire [`wire::ErrorCode`] the receiver answers with.
     pub const fn error_code(self) -> wire::ErrorCode {
         match self {
+            Violation::UnsupportedRequiredCapability { .. } => wire::ErrorCode::UnsupportedVersion,
             Violation::ClipboardPayloadTooLarge { .. }
             | Violation::ClipboardChunkTooLarge { .. } => wire::ErrorCode::ClipboardTooLarge,
             Violation::EmptyPayload
@@ -59,6 +64,7 @@ impl Violation {
             | Violation::NodeIdLen { .. }
             | Violation::DisplayNameTooLong { .. }
             | Violation::TooManyDisplays { .. }
+            | Violation::InvalidRequiredCapability { .. }
             | Violation::InputBatchSize { .. }
             | Violation::ClipboardMime
             | Violation::ClipboardChunkCount { .. }
@@ -103,6 +109,33 @@ pub fn hello(hello: &wire::Hello) -> Result<(), Violation> {
         return Err(Violation::TooManyDisplays {
             got: hello.displays.len(),
         });
+    }
+    hello_required_capabilities(hello, &hello.capabilities)
+}
+
+/// Validate requirements against implementation capabilities, not runtime preferences.
+///
+/// Unknown optional capabilities are deliberately ignored. Diagnostics retain only one
+/// numeric capability, never the peer's unbounded capability lists.
+pub fn hello_required_capabilities(
+    hello: &wire::Hello,
+    local_capabilities: &[i32],
+) -> Result<(), Violation> {
+    for (index, &capability) in hello.required_capabilities.iter().enumerate() {
+        if capability == wire::Capability::Unspecified as i32
+            || hello.required_capabilities[..index].contains(&capability)
+        {
+            return Err(Violation::InvalidRequiredCapability { capability });
+        }
+        if wire::Capability::try_from(capability).is_err() {
+            return Err(Violation::UnsupportedRequiredCapability { capability });
+        }
+        if !hello.capabilities.contains(&capability) {
+            return Err(Violation::InvalidRequiredCapability { capability });
+        }
+        if !local_capabilities.contains(&capability) {
+            return Err(Violation::UnsupportedRequiredCapability { capability });
+        }
     }
     Ok(())
 }

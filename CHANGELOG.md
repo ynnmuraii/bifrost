@@ -2,6 +2,20 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## Unreleased
+
+### English
+
+**Fixes**
+
+- Reject input-link Hello requirements that are unknown or not locally advertised, and malformed requirement lists; optional unknown capabilities remain compatible.
+
+### Русский
+
+**Исправления**
+
+- Требования Hello входного соединения отклоняются, если возможность неизвестна, не заявлена локально или список требований некорректен; неизвестные необязательные возможности не мешают соединению.
+
 ## 0.4.0 — 2026-10-30
 
 ### English

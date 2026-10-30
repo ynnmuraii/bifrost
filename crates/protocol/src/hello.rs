@@ -8,9 +8,9 @@
 //! принимающая сторона отвечает своим `Hello` с тем же `connection_id`. Version
 //! `major` должен совпасть; negotiated `minor = min` обеих сторон.»
 //!
-//! [`HelloHandshake`] encodes exactly those rules and nothing else: it produces
-//! and checks the two first `Envelope`s of a link. Payload validation after that
-//! belongs to the lease FSM.
+//! [`HelloHandshake`] checks those first-envelope rules and the peer's capability
+//! requirements against the local implementation's advertised capabilities.
+//! Payload validation after Hello belongs to the lease FSM.
 
 use crate::limits::CONNECTION_ID_LEN;
 use crate::wire;
@@ -52,6 +52,8 @@ pub enum HandshakeError {
     NotHello,
     /// No common major version.
     MajorMismatch { local: u32, remote: u32 },
+    /// The peer's capability requirements cannot be satisfied or are malformed.
+    RequiredCapability(crate::validate::Violation),
 }
 
 impl HandshakeError {
@@ -62,6 +64,7 @@ impl HandshakeError {
     pub const fn peer_error_code(self) -> Option<wire::ErrorCode> {
         match self {
             HandshakeError::MajorMismatch { .. } => Some(wire::ErrorCode::UnsupportedVersion),
+            HandshakeError::RequiredCapability(violation) => Some(violation.error_code()),
             HandshakeError::BadSeq { .. } => Some(wire::ErrorCode::InvalidSequence),
             HandshakeError::BadConnectionId
             | HandshakeError::ConnectionIdMismatch
@@ -175,11 +178,14 @@ impl HelloHandshake {
     ///
     /// Rejects a second `Hello`, a non-`Hello` payload, `seq != 1`, a
     /// `connection_id` that is not 16 bytes or that differs from the dialer's,
-    /// and a `major` mismatch. The link is only fully established once both
-    /// sides have sent; check [`HelloHandshake::is_established`] for that.
+    /// a `major` mismatch, and malformed or unsupported capability requirements.
+    /// `local_capabilities` is the local Hello's implementation offer, not enabled
+    /// preferences. The link is only fully established once both sides have sent;
+    /// check [`HelloHandshake::is_established`] for that.
     pub fn on_remote_hello(
         &mut self,
         envelope: &wire::Envelope,
+        local_capabilities: &[i32],
     ) -> Result<Negotiated, HandshakeError> {
         if self.remote_received {
             return Err(HandshakeError::NotHello);
@@ -202,15 +208,17 @@ impl HelloHandshake {
                 return Err(HandshakeError::ConnectionIdMismatch);
             }
         }
-        if !matches!(envelope.payload, Some(wire::envelope::Payload::Hello(_))) {
+        let Some(wire::envelope::Payload::Hello(hello)) = &envelope.payload else {
             return Err(HandshakeError::NotHello);
-        }
+        };
         if envelope.major != self.local_major {
             return Err(HandshakeError::MajorMismatch {
                 local: self.local_major,
                 remote: envelope.major,
             });
         }
+        crate::validate::hello_required_capabilities(hello, local_capabilities)
+            .map_err(HandshakeError::RequiredCapability)?;
         // Accepted: an acceptor adopts the dialer's id here.
         if self.connection_id.is_none() {
             self.connection_id = Some(connection_id);

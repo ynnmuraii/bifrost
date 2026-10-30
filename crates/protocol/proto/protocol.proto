@@ -143,7 +143,11 @@ message Hello {
   reserved 3; reserved "role";             // role is per-lease in v0.3
   repeated Capability capabilities = 4;
   repeated Display displays = 5;           // max 16
-  repeated Capability required_capabilities = 6; // unknown => ERROR_CODE_UNSUPPORTED_VERSION
+  // Requirements must be distinct, non-UNSPECIFIED, and a subset of capabilities;
+  // violations => ERROR_CODE_INVALID_FRAME. Unknown requirements or requirements
+  // absent from the receiver's advertised implementation => ERROR_CODE_UNSUPPORTED_VERSION.
+  // Unknown optional capabilities remain ignorable; runtime opt-in is independent.
+  repeated Capability required_capabilities = 6;
   SessionKind session_kind = 7;
   uint64 displays_revision = 8;            // local counter of own display set
   uint64 owner_serial = 9;                 // last known owner claim serial (0 = none)

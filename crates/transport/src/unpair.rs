@@ -211,7 +211,7 @@ pub(crate) async fn notify_only<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| TransportError::Protocol("invalid local Hello identity".into()))?;
     let mut handshake = HelloHandshake::acceptor(limits::PROTOCOL_MAJOR, limits::PROTOCOL_MINOR);
     let negotiated = handshake
-        .on_remote_hello(&remote)
+        .on_remote_hello(&remote, &local_hello.capabilities)
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
     let hello = handshake
         .local_hello(local_hello)
@@ -331,7 +331,9 @@ mod tests {
         }
         client.shutdown().await.unwrap();
         let remote_hello = read_frame(&mut client).await.unwrap();
-        handshake.on_remote_hello(&remote_hello).unwrap();
+        handshake
+            .on_remote_hello(&remote_hello, &[wire::Capability::UnpairNotice as i32])
+            .unwrap();
         let envelope = read_frame(&mut client).await.unwrap();
         let Some(wire::envelope::Payload::Unpaired(notice)) = &envelope.payload else {
             panic!("expected only an unpair notice");

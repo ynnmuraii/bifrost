@@ -1478,7 +1478,7 @@ impl LinkState {
                 ));
             }
             let negotiated = handshake
-                .on_remote_hello(envelope)
+                .on_remote_hello(envelope, &local_hello.capabilities)
                 .map_err(|error| LinkDownReason::Protocol(format!("{error:?}")))?;
             self.connection_id = negotiated.connection_id;
             self.announced = true;
