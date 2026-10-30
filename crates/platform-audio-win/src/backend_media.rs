@@ -115,6 +115,13 @@ impl BackendMedia {
         Ok(sessions)
     }
 
+    pub(crate) fn current_session(&self) -> Result<Option<MediaSessionToken>, BackendError> {
+        self.manager
+            .snapshot()
+            .map(|snapshot| snapshot.current.map(|token| MediaSessionToken(token.0)))
+            .map_err(map_error)
+    }
+
     pub(crate) fn admit(&mut self, request: MediaCommandRequest) -> Result<(), BackendError> {
         if self.pending.len() == CAPACITY {
             return Err(BackendError::Busy);
@@ -262,9 +269,9 @@ fn convert(session: media::MediaSession) -> Result<MediaInfo, BackendError> {
         match session.playback_status {
             4 => PlaybackState::Playing,
             5 => PlaybackState::Paused,
-            // The shared contract has no Unknown: Closed, Opened, Changing and future values
-            // cannot safely imply active playback.
-            _ => PlaybackState::Stopped,
+            3 => PlaybackState::Stopped,
+            // Closed, opened, changing and unknown values do not assert stopped playback.
+            _ => PlaybackState::Unknown,
         },
         MediaCommands {
             play: session.controls.play,
@@ -328,5 +335,37 @@ mod tests {
         pending.finish(Ok(()));
         pending.finish(Err(BackendError::Cancelled));
         assert_eq!(pending.outcome(), Some(Ok(())));
+    }
+
+    #[test]
+    fn playback_conversion_does_not_invent_a_stopped_state() {
+        for (native, expected) in [
+            (0, PlaybackState::Unknown),
+            (1, PlaybackState::Unknown),
+            (2, PlaybackState::Unknown),
+            (3, PlaybackState::Stopped),
+            (4, PlaybackState::Playing),
+            (5, PlaybackState::Paused),
+            (i32::MAX, PlaybackState::Unknown),
+        ] {
+            let session = media::MediaSession {
+                token: media::SessionToken(1),
+                revision: 1,
+                app_id: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                playback_status: native,
+                controls: media::Controls::default(),
+                timeline: media::Timeline {
+                    start: 0,
+                    end: 0,
+                    position: 0,
+                    min_seek: 0,
+                    max_seek: 0,
+                    updated_at: 0,
+                },
+            };
+            assert_eq!(convert(session).unwrap().state, expected);
+        }
     }
 }

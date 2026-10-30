@@ -259,6 +259,9 @@ impl Backend for WindowsBackend {
     fn media_sessions(&self) -> Result<Vec<MediaInfo>, BackendError> {
         self.with_media(|media| media.sessions())
     }
+    fn current_media_session(&self) -> Result<Option<MediaSessionToken>, BackendError> {
+        self.with_media(|media| media.current_session())
+    }
     fn media_command(&mut self, request: MediaCommandRequest) -> Result<(), BackendError> {
         self.with_media(|media| media.admit(request))
     }

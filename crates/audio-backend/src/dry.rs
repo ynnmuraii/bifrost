@@ -35,6 +35,10 @@ pub enum ScriptEvent {
         session: MediaSessionToken,
         info: Option<MediaInfo>,
     },
+    /// Explicit OS current-session selection; never inferred from ordering or app id.
+    SetCurrentMediaSession {
+        session: Option<MediaSessionToken>,
+    },
     /// Deterministically expires an admitted request without a wall clock or native side effect.
     TimeoutMediaRequest {
         request_id: u64,
@@ -66,6 +70,7 @@ struct State {
     overflowed: bool,
     generation: u64,
     media: BTreeMap<MediaSessionToken, MediaInfo>,
+    current_media: Option<MediaSessionToken>,
     max_session_token: Option<u64>,
     requests: VecDeque<MediaCommandRequest>,
     completions: VecDeque<Event>,
@@ -193,6 +198,7 @@ impl DryBackend {
                 overflowed: false,
                 generation: 0,
                 media: BTreeMap::new(),
+                current_media: None,
                 max_session_token: None,
                 requests: VecDeque::with_capacity(MEDIA_REQUEST_CAPACITY),
                 completions: VecDeque::with_capacity(MEDIA_REQUEST_CAPACITY),
@@ -329,8 +335,30 @@ impl DryBackend {
                         .remove(&session)
                         .ok_or(BackendError::DeviceGone)?;
                     cancel_requests(&mut state, Some(session), BackendError::DeviceGone);
+                    if state.current_media == Some(session) {
+                        state.current_media = None;
+                    }
                 }
                 state.emit(Event::MediaChanged { session, info });
+            }
+            ScriptEvent::SetCurrentMediaSession { session } => {
+                if !self.capabilities.media {
+                    return Err(BackendError::Unsupported);
+                }
+                if session.is_some_and(|token| !state.media.contains_key(&token)) {
+                    return Err(BackendError::DeviceGone);
+                }
+                if state.current_media != session {
+                    let changed = session.or(state.current_media);
+                    state.current_media = session;
+                    if let Some(changed) = changed {
+                        let info = state.media.get(&changed).cloned();
+                        state.emit(Event::MediaChanged {
+                            session: changed,
+                            info,
+                        });
+                    }
+                }
             }
             ScriptEvent::TimeoutMediaRequest { request_id } => {
                 let position = state
@@ -659,6 +687,15 @@ impl Backend for DryBackend {
         let state = lock(&self.state);
         state.available()?;
         Ok(state.media.values().cloned().collect())
+    }
+
+    fn current_media_session(&self) -> Result<Option<MediaSessionToken>, BackendError> {
+        if !self.capabilities.media {
+            return Err(BackendError::Unsupported);
+        }
+        let state = lock(&self.state);
+        state.available()?;
+        Ok(state.current_media)
     }
 
     fn media_command(&mut self, request: MediaCommandRequest) -> Result<(), BackendError> {

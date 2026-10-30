@@ -20,6 +20,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Optional features can derive per-input-link keys without a new wire capability. The TLS exporter root stays inside transport, is erased on parent closure/replacement, and is accessible only through a redacted, revocable derivation view after validated Hello; consumers gate on their own feature capabilities.
 - Add internal audio backend/Dry and pure packet/replay/status contracts, with dependency-direction checks; no audio devices, network sessions or user-visible audio behavior are enabled by this change.
 - Extend the internal audio backend contract with native clock/status snapshots, valid capture timestamps, reserved-hotkey collision checks and expiring, renewable PTT press leases; no native audio or hotkeys are activated.
+- Preserve unknown native playback states and expose the OS-selected current media-session token in the shared backend contract and Windows adapter.
 
 ### Русский
 
@@ -37,6 +38,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Необязательные функции могут выводить ключи входного соединения без новой сетевой возможности. Корневой секрет TLS остаётся внутри транспорта, стирается при закрытии или замене родителя и после проверки Hello доступен только через скрывающий секрет, отзываемый интерфейс вывода ключей; потребители проверяют возможности своих функций.
 - Добавлены внутренние контракты аудиобэкенда/Dry, чистых пакетов, защиты от повторов и статуса с проверкой направлений зависимостей; изменение не включает аудиоустройства, сетевые аудиосеансы или пользовательские функции звука.
 - Внутренний контракт аудиобэкенда дополнен снимками часов и состояния потока, достоверностью временных меток, проверкой конфликтов горячих клавиш и возобновляемыми ограниченными по времени нажатиями PTT; нативный звук и горячие клавиши не включаются.
+- Общий контракт бэкенда и адаптер Windows сохраняют неизвестные состояния воспроизведения и предоставляют выбранный ОС текущий медиасеанс.
 
 ## 0.4.0 — 2026-10-30
 

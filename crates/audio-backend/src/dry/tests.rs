@@ -1104,3 +1104,90 @@ fn ptt_lease_renewal_expiry_and_stalled_consumer_fail_closed() {
         Err(BackendError::InvalidArgument)
     );
 }
+
+#[test]
+fn current_media_session_is_explicit_and_cleared_when_removed() {
+    let mut backend = backend();
+    assert_eq!(backend.current_media_session(), Ok(None));
+    set_media(&mut backend, 1, 1);
+    set_media(&mut backend, 2, 1);
+    assert_eq!(backend.current_media_session(), Ok(None));
+    while backend.poll_event().is_some() {}
+    assert_eq!(
+        backend.apply(ScriptEvent::SetCurrentMediaSession {
+            session: Some(MediaSessionToken(99)),
+        }),
+        Err(BackendError::DeviceGone)
+    );
+    assert_eq!(backend.current_media_session(), Ok(None));
+    backend
+        .apply(ScriptEvent::SetCurrentMediaSession {
+            session: Some(MediaSessionToken(2)),
+        })
+        .unwrap();
+    assert_eq!(
+        backend.current_media_session(),
+        Ok(Some(MediaSessionToken(2)))
+    );
+    assert!(matches!(
+        backend.poll_event(),
+        Some(Event::MediaChanged {
+            session: MediaSessionToken(2),
+            info: Some(_)
+        })
+    ));
+    backend
+        .apply(ScriptEvent::SetCurrentMediaSession { session: None })
+        .unwrap();
+    assert_eq!(backend.current_media_session(), Ok(None));
+    assert_eq!(backend.media_sessions().unwrap().len(), 2);
+    backend
+        .apply(ScriptEvent::SetCurrentMediaSession {
+            session: Some(MediaSessionToken(1)),
+        })
+        .unwrap();
+    backend
+        .apply(ScriptEvent::SetMedia {
+            session: MediaSessionToken(1),
+            info: None,
+        })
+        .unwrap();
+    assert_eq!(backend.current_media_session(), Ok(None));
+    assert_eq!(backend.media_sessions().unwrap().len(), 1);
+}
+
+#[test]
+fn unknown_playback_is_preserved_and_current_queries_report_availability() {
+    let mut backend = backend();
+    let mut media = info(1, 1);
+    media.state = PlaybackState::Unknown;
+    backend
+        .apply(ScriptEvent::SetMedia {
+            session: MediaSessionToken(1),
+            info: Some(media),
+        })
+        .unwrap();
+    assert_eq!(
+        backend.media_sessions().unwrap()[0].state,
+        PlaybackState::Unknown
+    );
+    backend
+        .apply(ScriptEvent::Availability(Some(
+            BackendError::ServerUnavailable,
+        )))
+        .unwrap();
+    assert_eq!(
+        backend.current_media_session(),
+        Err(BackendError::ServerUnavailable)
+    );
+    backend.apply(ScriptEvent::Availability(None)).unwrap();
+    backend.capabilities.media = false;
+    assert_eq!(
+        backend.current_media_session(),
+        Err(BackendError::Unsupported)
+    );
+    assert_eq!(
+        backend.apply(ScriptEvent::SetCurrentMediaSession { session: None }),
+        Err(BackendError::Unsupported)
+    );
+}
