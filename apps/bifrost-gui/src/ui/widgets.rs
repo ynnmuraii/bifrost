@@ -631,6 +631,8 @@ pub fn duo(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 /// The icons of the rail and the top bar, in the 22-unit box of the mockup's SVGs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
+    /// Remote system audio.
+    Audio,
     /// «Пары».
     Pairs,
     /// «Клавиши».
@@ -657,6 +659,18 @@ enum Prim {
 fn prims(icon: Icon) -> &'static [Prim] {
     use Prim::{Line, Rect as R};
     match icon {
+        Icon::Audio => &[
+            Line(&[
+                (3.0, 9.0),
+                (7.0, 9.0),
+                (12.0, 5.0),
+                (12.0, 17.0),
+                (7.0, 13.0),
+                (3.0, 13.0),
+                (3.0, 9.0),
+            ]),
+            Line(&[(16.0, 7.0), (19.0, 11.0), (16.0, 15.0)]),
+        ],
         Icon::Pairs => &[
             R(2.75, 7.75, 7.5, 6.5, 1.5),
             R(11.75, 7.75, 7.5, 6.5, 1.5),

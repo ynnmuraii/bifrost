@@ -114,6 +114,11 @@ impl GuiApp {
 }
 
 impl eframe::App for GuiApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Root UI paints an opaque background; transparent popup corners must stay clear.
+        [0.0; 4]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Instant::now();
         let arrived = self.bridge.pump();
@@ -166,6 +171,48 @@ impl eframe::App for GuiApp {
             // Animate only when the viewport positively reports focus and is not minimized.
             animate: !minimized && focused == Some(true),
         };
+        let look = &self.bridge.view().look;
+        let (theme, lang) = (look.theme, look.language);
+        let audio_actions = ui::audio_player::viewport(
+            ui.ctx(),
+            &mut self.bridge.view_mut().audio_player,
+            theme,
+            lang,
+        );
+        for action in audio_actions {
+            match action {
+                crate::audio_player::AudioPlayerAction::HidePlayer => {
+                    self.bridge.view_mut().audio_player.open = false;
+                }
+                crate::audio_player::AudioPlayerAction::OpenSettings => {
+                    self.bridge.view_mut().audio_player.settings_open = true;
+                    ui.ctx().send_viewport_cmd_to(
+                        egui::ViewportId::ROOT,
+                        egui::ViewportCommand::Minimized(false),
+                    );
+                    ui.ctx()
+                        .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                }
+                // Do not optimistically mutate a stream or pretend the missing audio IPC sent it.
+                _ => {
+                    self.bridge.view_mut().outcome = Some(view_model::Outcome::failed(
+                        ui_text::text(lang, ui_text::Key::AudioUnavailable),
+                    ));
+                }
+            }
+        }
+        let player = &mut self.bridge.view_mut().audio_player;
+        egui::Window::new(ui_text::text(lang, ui_text::Key::AudioSettings))
+            .open(&mut player.settings_open)
+            .show(ui.ctx(), |ui| {
+                ui.label(ui_text::text(lang, ui_text::Key::AudioUnavailable));
+                if ui
+                    .button(ui_text::text(lang, ui_text::Key::AudioPlayer))
+                    .clicked()
+                {
+                    player.open = true;
+                }
+            });
         let output = ui::draw(ui, self.bridge.view(), &mut self.ui, env);
 
         let acted = !output.actions.is_empty();

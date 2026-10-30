@@ -35,6 +35,7 @@ pub use protocol::app_version;
 pub use ui_text;
 
 pub mod app;
+pub mod audio_player;
 pub mod autostart;
 mod core_exit;
 pub mod gui_settings;
