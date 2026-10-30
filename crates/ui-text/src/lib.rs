@@ -90,6 +90,24 @@ fn system_language() -> Option<String> {
 /// One string of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
+    AudioPlayer,
+    AudioHide,
+    AudioSettings,
+    AudioSystem,
+    AudioEmpty,
+    AudioUnavailable,
+    AudioPrevious,
+    AudioPlay,
+    AudioPause,
+    AudioNext,
+    AudioMute,
+    AudioUnmute,
+    AudioGain,
+    AudioStop,
+    AudioBuffering,
+    AudioDegraded,
+    AudioBackground,
+    AudioPrimary,
     /// «Пары»
     Pairs,
     /// «Клавиши»
@@ -873,6 +891,24 @@ pub const fn text(lang: Lang, key: Key) -> &'static str {
 /// The Russian strings, as the mockup writes them.
 const fn ru(key: Key) -> &'static str {
     match key {
+        Key::AudioPlayer => "Аудиоплеер",
+        Key::AudioHide => "Скрыть плеер",
+        Key::AudioSettings => "Настройки аудио",
+        Key::AudioSystem => "Системный звук",
+        Key::AudioEmpty => "Нет активных аудиопотоков",
+        Key::AudioUnavailable => "Управление аудио недоступно: служба ещё не предоставляет аудио IPC.",
+        Key::AudioPrevious => "Предыдущий трек",
+        Key::AudioPlay => "Воспроизвести",
+        Key::AudioPause => "Приостановить",
+        Key::AudioNext => "Следующий трек",
+        Key::AudioMute => "Выключить звук этого компьютера",
+        Key::AudioUnmute => "Включить звук этого компьютера",
+        Key::AudioGain => "Громкость на этом компьютере",
+        Key::AudioStop => "Остановить аудиопоток",
+        Key::AudioBuffering => "Буферизация",
+        Key::AudioDegraded => "Нестабильный звук",
+        Key::AudioBackground => "Фоновый поток",
+        Key::AudioPrimary => "Основной поток",
         Key::Pairs => "Пары",
         Key::Keys => "Клавиши",
         Key::Clipboard => "Буфер обмена",
@@ -1309,6 +1345,24 @@ const fn ru(key: Key) -> &'static str {
 /// The English strings.
 const fn en(key: Key) -> &'static str {
     match key {
+        Key::AudioPlayer => "Audio player",
+        Key::AudioHide => "Hide player",
+        Key::AudioSettings => "Audio settings",
+        Key::AudioSystem => "System audio",
+        Key::AudioEmpty => "No active audio streams",
+        Key::AudioUnavailable => "Audio control is unavailable: the service does not yet provide audio IPC.",
+        Key::AudioPrevious => "Previous track",
+        Key::AudioPlay => "Play",
+        Key::AudioPause => "Pause",
+        Key::AudioNext => "Next track",
+        Key::AudioMute => "Mute this source locally",
+        Key::AudioUnmute => "Unmute this source locally",
+        Key::AudioGain => "Volume on this computer",
+        Key::AudioStop => "Stop audio stream",
+        Key::AudioBuffering => "Buffering",
+        Key::AudioDegraded => "Degraded audio",
+        Key::AudioBackground => "Background stream",
+        Key::AudioPrimary => "Primary stream",
         Key::Pairs => "Pairs",
         Key::Keys => "Keys",
         Key::Clipboard => "Clipboard",
@@ -1952,7 +2006,25 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 378] = [
+    pub const EVERY: [Key; 396] = [
+        Key::AudioHide,
+        Key::AudioPlayer,
+        Key::AudioSettings,
+        Key::AudioSystem,
+        Key::AudioEmpty,
+        Key::AudioUnavailable,
+        Key::AudioPrevious,
+        Key::AudioPlay,
+        Key::AudioPause,
+        Key::AudioNext,
+        Key::AudioMute,
+        Key::AudioUnmute,
+        Key::AudioGain,
+        Key::AudioStop,
+        Key::AudioBuffering,
+        Key::AudioDegraded,
+        Key::AudioBackground,
+        Key::AudioPrimary,
         Key::Pairs,
         Key::Keys,
         Key::Clipboard,

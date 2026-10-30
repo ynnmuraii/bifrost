@@ -889,6 +889,8 @@ impl ServiceStart {
 /// Everything the screens draw, and every decision behind it.
 #[derive(Debug, Clone)]
 pub struct ViewModel {
+    /// Provisional audio presentation state; populated by the audio IPC adapter when available.
+    pub audio_player: crate::audio_player::AudioPlayer,
     /// The endpoint the core serves, or the reason there is none.
     pub endpoint: CoreEndpoint,
     /// The state of the local channel.
@@ -989,6 +991,7 @@ impl ViewModel {
     pub fn new(endpoint: CoreEndpoint, config: LocalConfig) -> Self {
         let lang = Lang::from_system();
         let mut view = ViewModel {
+            audio_player: crate::audio_player::AudioPlayer::default(),
             endpoint,
             connection: Connection::Disconnected {
                 why: text(lang, Key::TheServiceHasNotAnsweredYet).to_owned(),
@@ -2478,6 +2481,7 @@ impl ViewModel {
     /// typing, where they dragged a rectangle.
     pub fn local(&mut self, action: &Action) {
         match action {
+            Action::OpenAudioPlayer => self.audio_player.open = true,
             Action::ToggleModal(Modal::Appearance) => self.local(&Action::ToggleAppearance),
             Action::ToggleModal(modal) => {
                 self.modal = if self.modal == Some(*modal) {
@@ -2702,6 +2706,8 @@ impl ViewModel {
 /// is applied to the view model by the app. [`Action::wire`] is the boundary between them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    /// Open the Listener mini-player without changing a remote stream.
+    OpenAudioPlayer,
     /// A GUI-only updater operation; intercepted by the app, never sent to the agent.
     Update(crate::updater::Action),
     /// Core orchestrates all peers before replacing this computer.
