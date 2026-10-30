@@ -9,12 +9,14 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Fixes**
 
 - Reject input-link Hello requirements that are unknown or not locally advertised, and malformed requirement lists; optional unknown capabilities remain compatible.
+- Clipboard channels inherit their parent input link's negotiated protocol version for both outgoing frames and incoming validation, preserving clipboard compatibility across future mixed-minor peers.
 
 ### Русский
 
 **Исправления**
 
 - Требования Hello входного соединения отклоняются, если возможность неизвестна, не заявлена локально или список требований некорректен; неизвестные необязательные возможности не мешают соединению.
+- Каналы буфера обмена используют согласованную версию родительского входного соединения при отправке и проверке кадров, сохраняя совместимость при будущих различиях младшей версии протокола.
 
 ## 0.4.0 — 2026-10-30
 

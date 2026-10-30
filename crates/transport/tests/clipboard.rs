@@ -202,7 +202,7 @@ async fn wait_for_event(
 /// 1. A 300 KiB payload round-trips through `Outgoing` and `clipboard::Assembler`, chunked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfer_round_trips_in_chunks() {
-    transfer_round_trip(clipboard::ContentKind::Text, 300 * 1024).await;
+    transfer_round_trip(clipboard::ContentKind::Text, 300 * 1024, (1, 0)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -210,11 +210,37 @@ async fn a_maximum_png_round_trips_in_2048_chunks() {
     transfer_round_trip(
         clipboard::ContentKind::Png,
         clipboard::MAX_IMAGE_BYTES as usize,
+        (1, 0),
     )
     .await;
 }
 
-async fn transfer_round_trip(kind: clipboard::ContentKind, size: usize) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clipboard_inherits_the_lower_negotiated_parent_minor() {
+    use protocol::hello::HelloHandshake;
+
+    // Simulate a future mixed-minor pair without changing this build's 1/0 constants.
+    let mut dialer = HelloHandshake::dialer(1, 3, [9; 16]);
+    let mut acceptor = HelloHandshake::acceptor(1, 1);
+    let request = dialer
+        .local_hello(protocol::wire::Hello {
+            capabilities: vec![999], // Unknown optional features do not prevent a baseline link.
+            ..Default::default()
+        })
+        .unwrap();
+    let negotiated = acceptor.on_remote_hello(&request, &[]).unwrap();
+    let reply = acceptor.local_hello(Default::default()).unwrap();
+    assert_eq!(dialer.on_remote_hello(&reply, &[]).unwrap(), negotiated);
+    assert_eq!((negotiated.major, negotiated.minor), (1, 1));
+    transfer_round_trip(
+        clipboard::ContentKind::Text,
+        300 * 1024,
+        (negotiated.major, negotiated.minor),
+    )
+    .await;
+}
+
+async fn transfer_round_trip(kind: clipboard::ContentKind, size: usize, version: (u32, u32)) {
     let root = temp_root("roundtrip");
     let server = Arc::new(identity_at(&root, "server"));
     let client = identity_at(&root, "client");
@@ -248,7 +274,11 @@ async fn transfer_round_trip(kind: clipboard::ContentKind, size: usize) {
                 &client_trust,
                 server.node_id(),
                 address,
-                parent,
+                protocol::hello::Negotiated {
+                    connection_id: parent,
+                    major: version.0,
+                    minor: version.1,
+                },
                 channel_id,
                 token,
             )
@@ -257,6 +287,15 @@ async fn transfer_round_trip(kind: clipboard::ContentKind, size: usize) {
     .await;
     let (mut server_conn, bind) = accept_result.expect("accept");
     let mut client_conn = dial_result.expect("dial");
+    server_conn
+        .validate_parent_version(version)
+        .expect("parent version");
+    assert!(server_conn
+        .validate_parent_version((version.0 + 1, version.1))
+        .is_err());
+    assert!(server_conn
+        .validate_parent_version((version.0, version.1 + 1))
+        .is_err());
 
     assert_eq!(
         bind,
@@ -494,9 +533,16 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
     let other_parent = [8u8; 16];
     let mut grants = Grants::default();
 
-    let (channel_id, token) = grants.issue(parent, 0);
+    let (channel_id, token) = grants.issue(
+        parent,
+        (
+            protocol::limits::PROTOCOL_MAJOR,
+            protocol::limits::PROTOCOL_MINOR,
+        ),
+        0,
+    );
     assert_eq!(grants.open(), 1);
-    assert_eq!(grants.accept(&parent, &channel_id, &token, 0), Ok(()));
+    assert_eq!(grants.accept(&parent, &channel_id, &token, 0), Ok((1, 0)));
     assert_eq!(grants.open(), 0, "a bound grant is no longer open");
     assert_eq!(
         grants.accept(&parent, &channel_id, &token, 0),
@@ -505,7 +551,14 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
     );
 
     // Expiry: `clipboard::CHANNEL_TTL_MS` after issue.
-    let (channel_id, token) = grants.issue(parent, 0);
+    let (channel_id, token) = grants.issue(
+        parent,
+        (
+            protocol::limits::PROTOCOL_MAJOR,
+            protocol::limits::PROTOCOL_MINOR,
+        ),
+        0,
+    );
     assert_eq!(
         grants.accept(&parent, &channel_id, &token, clipboard::CHANNEL_TTL_MS + 1),
         Err(ClipboardViolation::BadId),
@@ -516,7 +569,14 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
     assert_eq!(grants.open(), 0);
 
     // A wrong parent or token is refused and the grant stays open until its parent closes.
-    let (channel_id, token) = grants.issue(parent, 0);
+    let (channel_id, token) = grants.issue(
+        parent,
+        (
+            protocol::limits::PROTOCOL_MAJOR,
+            protocol::limits::PROTOCOL_MINOR,
+        ),
+        0,
+    );
     assert_eq!(
         grants.accept(&other_parent, &channel_id, &token, 0),
         Err(ClipboardViolation::BadId)
@@ -592,7 +652,11 @@ async fn the_first_frame_must_be_a_bind() {
             &client_trust,
             server_id,
             address,
-            parent,
+            protocol::hello::Negotiated {
+                connection_id: parent,
+                major: protocol::limits::PROTOCOL_MAJOR,
+                minor: protocol::limits::PROTOCOL_MINOR,
+            },
             channel_id,
             token,
         )
@@ -684,7 +748,11 @@ async fn a_mebibyte_transfer_does_not_block_key_up() {
                 &trust_b,
                 id_a,
                 clipboard_address,
-                parent,
+                protocol::hello::Negotiated {
+                    connection_id: parent,
+                    major: 1,
+                    minor: 0,
+                },
                 channel_id,
                 token,
             )
@@ -866,7 +934,11 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
             Arc::clone(&b_pins),
             id_a,
             address_a,
-            [1; 16],
+            protocol::hello::Negotiated {
+                connection_id: [1; 16],
+                major: protocol::limits::PROTOCOL_MAJOR,
+                minor: protocol::limits::PROTOCOL_MINOR,
+            },
             [2; 16],
             [3; 32],
         ),
@@ -888,7 +960,11 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
             Arc::clone(&b_pins),
             id_a,
             address_a,
-            [1; 16],
+            protocol::hello::Negotiated {
+                connection_id: [1; 16],
+                major: protocol::limits::PROTOCOL_MAJOR,
+                minor: protocol::limits::PROTOCOL_MINOR,
+            },
             [2; 16],
             [3; 32],
         ),
@@ -913,7 +989,11 @@ async fn runtime_paired_peer_clipboard_works_and_revocation_refuses_handshake() 
             Arc::new(std::sync::RwLock::new([id_a].into_iter().collect())),
             id_a,
             address_a,
-            [4; 16],
+            protocol::hello::Negotiated {
+                connection_id: [4; 16],
+                major: protocol::limits::PROTOCOL_MAJOR,
+                minor: protocol::limits::PROTOCOL_MINOR,
+            },
             [5; 16],
             [6; 32],
         ),
@@ -963,7 +1043,11 @@ async fn a_silent_connection_does_not_block_a_valid_one() {
             b_pins,
             id_a,
             address,
-            [1; 16],
+            protocol::hello::Negotiated {
+                connection_id: [1; 16],
+                major: protocol::limits::PROTOCOL_MAJOR,
+                minor: protocol::limits::PROTOCOL_MINOR,
+            },
             [2; 16],
             [3; 32],
         )

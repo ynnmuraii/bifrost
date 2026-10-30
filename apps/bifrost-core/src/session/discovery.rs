@@ -175,11 +175,15 @@ impl Session {
                     let mut out = clipboard
                         .set_local_image_support(self.capabilities.image_clipboard)
                         .await;
-                    for (&peer, &(parent, supported, image_supported, remote, epoch)) in
+                    for (&peer, &(parent, version, supported, image_supported, remote, epoch)) in
                         &self.clipboard_links
                     {
                         clipboard.set_peer_session(peer, parent, epoch);
-                        out.extend(clipboard.on_link_up(peer, parent, supported, remote).await);
+                        out.extend(
+                            clipboard
+                                .on_link_up(peer, parent, version, supported, remote)
+                                .await,
+                        );
                         out.extend(
                             clipboard
                                 .set_peer_image_support(peer, image_supported)

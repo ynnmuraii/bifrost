@@ -1411,13 +1411,13 @@ impl Session {
             let mut out = clipboard
                 .set_local_image_support(self.capabilities.image_clipboard)
                 .await;
-            for (&peer, &(connection, supported, image_supported, address, epoch)) in
+            for (&peer, &(connection, version, supported, image_supported, address, epoch)) in
                 &self.clipboard_links
             {
                 clipboard.set_peer_session(peer, connection, epoch);
                 out.extend(
                     clipboard
-                        .on_link_up(peer, connection, supported, address)
+                        .on_link_up(peer, connection, version, supported, address)
                         .await,
                 );
                 out.extend(

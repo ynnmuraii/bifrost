@@ -422,6 +422,7 @@ fn arr32(bytes: &[u8]) -> Result<[u8; 32], ClipboardViolation> {
 #[derive(Debug)]
 struct Grant {
     parent: [u8; 16],
+    version: (u32, u32),
     token: [u8; 32],
     expires_ms: u64,
 }
@@ -434,11 +435,16 @@ pub struct Grants {
 }
 
 impl Grants {
-    /// Mints a fresh `(channel_id, binding_token)` bound to `parent_connection_id`.
+    /// Mints a fresh `(channel_id, binding_token)` bound to the parent id and negotiated version.
     ///
     /// The identifiers come from the OS entropy source; the API is infallible, so a failed
     /// entropy source is unrecoverable here and panics rather than issuing a guessable token.
-    pub fn issue(&mut self, parent_connection_id: [u8; 16], now_ms: u64) -> ([u8; 16], [u8; 32]) {
+    pub fn issue(
+        &mut self,
+        parent_connection_id: [u8; 16],
+        version: (u32, u32),
+        now_ms: u64,
+    ) -> ([u8; 16], [u8; 32]) {
         let channel_id = identity::random16().expect("system entropy source");
         let mut binding_token = [0u8; 32];
         binding_token[..16].copy_from_slice(&identity::random16().expect("system entropy source"));
@@ -447,6 +453,7 @@ impl Grants {
             channel_id,
             Grant {
                 parent: parent_connection_id,
+                version,
                 token: binding_token,
                 expires_ms: now_ms.saturating_add(clipboard::CHANNEL_TTL_MS),
             },
@@ -454,16 +461,16 @@ impl Grants {
         (channel_id, binding_token)
     }
 
-    /// Accepts a bind exactly once: the channel must be known and unexpired, and the parent
-    /// and token must match. A second bind with the same token fails with
-    /// [`ClipboardViolation::BadId`].
+    /// Accepts a bind exactly once and returns its parent's negotiated version: the channel
+    /// must be known and unexpired, and the parent and token must match. A second bind with
+    /// the same token fails with [`ClipboardViolation::BadId`].
     pub fn accept(
         &mut self,
         parent: &[u8; 16],
         channel_id: &[u8; 16],
         token: &[u8; 32],
         now_ms: u64,
-    ) -> Result<(), ClipboardViolation> {
+    ) -> Result<(u32, u32), ClipboardViolation> {
         let Some(grant) = self.open.get(channel_id) else {
             return Err(ClipboardViolation::BadId);
         };
@@ -473,8 +480,9 @@ impl Grants {
         if grant.parent != *parent || grant.token != *token {
             return Err(ClipboardViolation::BadId);
         }
+        let version = grant.version;
         self.open.remove(channel_id);
-        Ok(())
+        Ok(version)
     }
 
     /// Drops every grant of a parent link: closing the input link closes its clipboard
@@ -509,6 +517,7 @@ pub struct ClipboardConnection {
     stream: Stream,
     /// The parent input connection's id, learned from the first frame.
     connection_id: Option<[u8; 16]>,
+    version: Option<(u32, u32)>,
     /// The last outbound `seq`; the dialer's `Bind` is `1`.
     out_seq: u64,
     /// The last accepted inbound `seq`.
@@ -522,11 +531,22 @@ impl ClipboardConnection {
         self.connection_id
     }
 
+    /// Checks the first Bind's claimed version against its authenticated parent grant.
+    pub fn validate_parent_version(&self, version: (u32, u32)) -> Result<(), TransportError> {
+        if self.version != Some(version) {
+            return Err(TransportError::Protocol(
+                "clipboard version does not match its parent input connection".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Sends one message, stamping the envelope `seq` and `connection_id`.
     pub async fn send(&mut self, message: ClipboardMessage) -> Result<(), TransportError> {
         send_message(
             &mut self.stream,
             &self.connection_id,
+            self.version,
             &mut self.out_seq,
             message,
         )
@@ -539,6 +559,7 @@ impl ClipboardConnection {
         recv_message(
             &mut self.stream,
             &mut self.connection_id,
+            &mut self.version,
             &mut self.in_seq,
             &mut self.inbound,
         )
@@ -556,6 +577,7 @@ impl ClipboardConnection {
             channel_id: self.channel_id,
             stream: read,
             connection_id: self.connection_id,
+            version: self.version,
             in_seq: self.in_seq,
             inbound: self.inbound,
         };
@@ -564,6 +586,7 @@ impl ClipboardConnection {
             channel_id: self.channel_id,
             stream: write,
             connection_id: self.connection_id,
+            version: self.version,
             out_seq: self.out_seq,
             progress: tokio::sync::watch::channel(tokio::time::Instant::now()).0,
         };
@@ -589,6 +612,7 @@ pub struct ClipboardReader {
     pub channel_id: [u8; 16],
     stream: tokio::io::ReadHalf<Stream>,
     connection_id: Option<[u8; 16]>,
+    version: Option<(u32, u32)>,
     in_seq: u64,
     inbound: SeqValidator,
 }
@@ -599,6 +623,7 @@ impl ClipboardReader {
         recv_message(
             &mut self.stream,
             &mut self.connection_id,
+            &mut self.version,
             &mut self.in_seq,
             &mut self.inbound,
         )
@@ -614,6 +639,7 @@ pub struct ClipboardWriter {
     pub channel_id: [u8; 16],
     stream: tokio::io::WriteHalf<Stream>,
     connection_id: Option<[u8; 16]>,
+    version: Option<(u32, u32)>,
     out_seq: u64,
     progress: tokio::sync::watch::Sender<tokio::time::Instant>,
 }
@@ -632,6 +658,7 @@ impl ClipboardWriter {
                 progress: &self.progress,
             },
             &self.connection_id,
+            self.version,
             &mut self.out_seq,
             message,
         )
@@ -679,6 +706,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ProgressWriter<
 async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     connection_id: &Option<[u8; 16]>,
+    version: Option<(u32, u32)>,
     out_seq: &mut u64,
     message: ClipboardMessage,
 ) -> Result<(), TransportError> {
@@ -690,10 +718,17 @@ async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
             "the clipboard connection_id is not established yet".into(),
         ));
     };
+    let Some((major, minor)) = version else {
+        return Err(TransportError::Protocol(
+            "clipboard parent version is not established yet".into(),
+        ));
+    };
     let seq = *out_seq + 1;
-    let envelope = message
+    let mut envelope = message
         .to_envelope(seq, connection_id)
         .map_err(|error| TransportError::Protocol(format!("{error}")))?;
+    envelope.major = major;
+    envelope.minor = minor;
     let bytes = encode_message(Channel::Clipboard, &envelope)
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
     write_frame_progress(writer, &bytes, CLIPBOARD_WRITE_IDLE_TIMEOUT).await?;
@@ -728,18 +763,21 @@ async fn write_frame_progress<W: tokio::io::AsyncWrite + Unpin>(
 async fn recv_message<R: AsyncRead + Unpin>(
     reader: &mut R,
     connection_id: &mut Option<[u8; 16]>,
+    version: &mut Option<(u32, u32)>,
     in_seq: &mut u64,
     inbound: &mut SeqValidator,
 ) -> Result<ClipboardMessage, TransportError> {
     let envelope = read_frame(reader).await?;
-    if envelope.major != limits::PROTOCOL_MAJOR || envelope.minor != limits::PROTOCOL_MINOR {
-        return Err(TransportError::Protocol(format!(
-            "clipboard envelope version {}.{} is not {}.{}",
-            envelope.major,
-            envelope.minor,
-            limits::PROTOCOL_MAJOR,
-            limits::PROTOCOL_MINOR
-        )));
+    match *version {
+        Some((major, minor)) if (envelope.major, envelope.minor) != (major, minor) => {
+            return Err(TransportError::Protocol(format!(
+                "clipboard envelope version {}.{} is not {major}.{minor}",
+                envelope.major, envelope.minor
+            )));
+        }
+        // Provisional until core checks the authenticated parent grant, before serving.
+        None => *version = Some((envelope.major, envelope.minor)),
+        Some(_) => {}
     }
     let seen = arr16(&envelope.connection_id)
         .map_err(|violation| TransportError::Protocol(format!("{violation}")))?;
@@ -803,10 +841,12 @@ pub async fn dial_clipboard(
     trust: impl Into<identity::TrustPolicy>,
     peer: NodeId,
     address: SocketAddr,
-    parent_connection_id: [u8; 16],
+    parent: protocol::hello::Negotiated,
     channel_id: [u8; 16],
     binding_token: [u8; 32],
 ) -> Result<ClipboardConnection, TransportError> {
+    let parent_connection_id = parent.connection_id;
+    let version = (parent.major, parent.minor);
     let config = identity::clipboard_client_config(identity, trust)?;
     let connector = TlsConnector::from(Arc::new(config));
     let tcp = TcpStream::connect(address).await?;
@@ -842,6 +882,7 @@ pub async fn dial_clipboard(
         channel_id,
         stream: Stream::Client(Box::new(stream)),
         connection_id: Some(parent_connection_id),
+        version: Some(version),
         out_seq: 0,
         in_seq: 0,
         inbound: SeqValidator::new(),
@@ -978,6 +1019,7 @@ async fn handshake_clipboard(
         channel_id: [0u8; 16],
         stream: Stream::Server(Box::new(stream)),
         connection_id: None,
+        version: None,
         out_seq: 0,
         in_seq: 0,
         inbound: SeqValidator::new(),
@@ -1286,6 +1328,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn clipboard_frames_require_the_parent_version() {
+        let parent = [1; 16];
+        let message = ClipboardMessage::Request { offer_id: [2; 16] };
+        for version in [(1, 1), (1, 2), (2, 1)] {
+            let mut bytes = Vec::new();
+            send_message(
+                &mut bytes,
+                &Some(parent),
+                Some(version),
+                &mut 0,
+                message.clone(),
+            )
+            .await
+            .expect("frame");
+            let mut reader = bytes.as_slice();
+            let result = recv_message(
+                &mut reader,
+                &mut Some(parent),
+                &mut Some((1, 1)),
+                &mut 0,
+                &mut SeqValidator::new(),
+            )
+            .await;
+            if version == (1, 1) {
+                assert_eq!(result.unwrap(), message);
+            } else {
+                assert!(matches!(result, Err(TransportError::Protocol(_))));
+            }
+        }
+    }
+
     /// A frame must be on the wire when `send` returns, not left in the transport's buffer.
     ///
     /// `tokio-rustls` reports a short-but-ready write when the socket would block, and it leaves
@@ -1311,7 +1385,7 @@ mod tests {
         )
         .expect("frame");
 
-        send_message(&mut writer, &Some(parent), &mut 0, message)
+        send_message(&mut writer, &Some(parent), Some((1, 0)), &mut 0, message)
             .await
             .expect("send");
 
@@ -1371,7 +1445,11 @@ mod tests {
                     &client_trust,
                     server.node_id(),
                     address,
-                    [1; 16],
+                    protocol::hello::Negotiated {
+                        connection_id: [1; 16],
+                        major: 1,
+                        minor: 0
+                    },
                     [2; 16],
                     [3; 32],
                 )
@@ -1534,7 +1612,11 @@ mod tests {
                     &client_trust,
                     server.node_id(),
                     address,
-                    [1; 16],
+                    protocol::hello::Negotiated {
+                        connection_id: [1; 16],
+                        major: 1,
+                        minor: 0
+                    },
                     [2; 16],
                     [3; 32],
                 )

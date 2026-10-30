@@ -75,6 +75,8 @@ pub enum LinkEvent {
         /// adopts. Every `Envelope` of this link carries it, and a clipboard channel is bound
         /// to it as its parent (`docs/05-protocol.md`, «Clipboard канал»).
         connection_id: [u8; 16],
+        /// Exact major and negotiated minor inherited by parent-bound channels.
+        version: (u32, u32),
         /// The peer's address on this connection. A listener the peer owns — the clipboard
         /// one — is reached at *this* address's IP with the port the peer advertises, not at
         /// the address a trust record remembers (`docs/05-protocol.md`, «Clipboard канал»).
@@ -952,6 +954,8 @@ pub enum LinkReport {
         hello: PeerInfo,
         /// The negotiated `connection_id` (see [`LinkEvent::Up`]).
         connection_id: [u8; 16],
+        /// Exact major and negotiated minor.
+        version: (u32, u32),
         /// The peer's address on this connection (see [`LinkEvent::Up`]).
         remote: SocketAddr,
     },
@@ -1509,6 +1513,7 @@ impl LinkState {
                     peer: self.peer,
                     hello: info,
                     connection_id: self.connection_id,
+                    version: (negotiated.major, negotiated.minor),
                     remote: self.remote.expect("a connected socket has a peer address"),
                 })
                 .await

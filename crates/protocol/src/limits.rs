@@ -46,9 +46,9 @@ pub const ALPN_PAIR_REQUEST: &str = "bifrost/pair-request/1";
 pub const PROTOCOL_MAJOR: u32 = 1;
 /// Wire minor version.
 ///
-/// Reset to 0 with the 0.4.0 major bump. `crates/transport/src/clipboard.rs`
-/// still requires an exact major **and** minor, so a future minor bump still
-/// breaks the clipboard channel until that check is capability-gated.
+/// Reset to 0 with the 0.4.0 major bump. Parent-bound clipboard channels stamp
+/// and validate the input link's exact major and negotiated minor; optional
+/// additions remain capability-gated rather than requiring a minor bump.
 pub const PROTOCOL_MINOR: u32 = 0;
 
 /// `Envelope` frame body limit on the input/control channel: 1..=65536 bytes.

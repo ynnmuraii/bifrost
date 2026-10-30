@@ -526,8 +526,15 @@ fn freeze_capture_run(
 #[path = "session/input_pipeline_tests.rs"]
 mod input_pipeline_tests;
 
-/// Parent input link, text/image support, remote address, and authenticated process epoch.
-type ClipboardLink = ([u8; 16], bool, bool, std::net::IpAddr, Option<[u8; 16]>);
+/// Parent input link/version, text/image support, remote address, and process epoch.
+type ClipboardLink = (
+    [u8; 16],
+    (u32, u32),
+    bool,
+    bool,
+    std::net::IpAddr,
+    Option<[u8; 16]>,
+);
 
 /// Everything one `bifrost-core` process owns while it runs.
 pub struct Session {
@@ -2700,6 +2707,7 @@ impl Session {
                 peer,
                 hello,
                 connection_id,
+                version,
                 remote,
             } => {
                 if !self.trust.is_trusted(&peer) {
@@ -2738,7 +2746,11 @@ impl Session {
                 // closes the channel (ADR-008, «Clipboard канал»).
                 self.on_clipboard_link_up(
                     peer,
-                    connection_id,
+                    protocol::hello::Negotiated {
+                        connection_id,
+                        major: version.0,
+                        minor: version.1,
+                    },
                     hello.text_clipboard,
                     hello.image_clipboard,
                     remote,
@@ -2906,6 +2918,7 @@ impl Session {
                         tracing::info!(peer = %peer, text_clipboard, image_clipboard, "peer capabilities updated");
                         if let Some(&(
                             connection_id,
+                            version,
                             previous_text,
                             previous_image,
                             remote_ip,
@@ -2918,6 +2931,7 @@ impl Session {
                                     peer,
                                     (
                                         connection_id,
+                                        version,
                                         text_clipboard,
                                         image_clipboard,
                                         remote_ip,
@@ -2934,6 +2948,7 @@ impl Session {
                                                     .on_link_up(
                                                         peer,
                                                         connection_id,
+                                                        version,
                                                         text_clipboard,
                                                         remote_ip,
                                                     )
@@ -3054,16 +3069,19 @@ impl Session {
     async fn on_clipboard_link_up(
         &mut self,
         peer: NodeId,
-        connection_id: [u8; 16],
+        parent: protocol::hello::Negotiated,
         text_clipboard: bool,
         image_clipboard: bool,
         remote: std::net::SocketAddr,
         epoch: Option<[u8; 16]>,
     ) {
+        let connection_id = parent.connection_id;
+        let version = (parent.major, parent.minor);
         self.clipboard_links.insert(
             peer,
             (
                 connection_id,
+                version,
                 text_clipboard,
                 image_clipboard,
                 remote.ip(),
@@ -3074,7 +3092,7 @@ impl Session {
             Some(clipboard) => {
                 clipboard.set_peer_session(peer, connection_id, epoch);
                 let mut out = clipboard
-                    .on_link_up(peer, connection_id, text_clipboard, remote.ip())
+                    .on_link_up(peer, connection_id, version, text_clipboard, remote.ip())
                     .await;
                 out.extend(
                     clipboard

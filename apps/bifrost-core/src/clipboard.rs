@@ -419,6 +419,8 @@ pub struct Clipboard {
 struct Peer {
     /// The parent input link's connection id.
     parent: Option<[u8; 16]>,
+    /// The parent link's exact major and negotiated minor.
+    version: Option<(u32, u32)>,
     /// The channel this peer bound.
     channel: Option<[u8; 16]>,
     /// Whether the peer claimed `CAPABILITY_TEXT_CLIPBOARD` in its `Hello`.
@@ -654,11 +656,18 @@ impl Clipboard {
         channel_id: [u8; 16],
         token: [u8; 32],
     ) {
+        let Some(version) = self.peers.get(&peer).and_then(|state| state.version) else {
+            return;
+        };
         self.runtime
             .dial(
                 peer,
                 address,
-                parent,
+                protocol::hello::Negotiated {
+                    connection_id: parent,
+                    major: version.0,
+                    minor: version.1,
+                },
                 channel_id,
                 token,
                 self.queue_capacity,
@@ -1365,7 +1374,10 @@ impl Clipboard {
             }
         } else {
             let parent = state.parent.expect("live peer checked above");
-            let (channel_id, token) = self.runtime.issue(parent).await;
+            let (channel_id, token) = self
+                .runtime
+                .issue(parent, state.version.expect("live parent version"))
+                .await;
             tracing::info!(peer = %peer, "clipboard grant");
             out.push(Out::Grant {
                 peer,
@@ -2197,6 +2209,7 @@ impl Clipboard {
         &mut self,
         peer: NodeId,
         connection_id: [u8; 16],
+        version: (u32, u32),
         text_clipboard: bool,
         remote_ip: std::net::IpAddr,
     ) -> Vec<Out> {
@@ -2206,6 +2219,7 @@ impl Clipboard {
             state.image_clipboard = false;
         }
         state.parent = Some(connection_id);
+        state.version = Some(version);
         state.text_clipboard = text_clipboard;
         state.remote_ip = Some(remote_ip);
         if !matches!(
@@ -2547,9 +2561,13 @@ impl Handle {
     /// against (audit F5): the endpoint's clock used to be passed in, and its `Instant` origin
     /// is a different one, so the 60 s window was really `60 s - <startup delta>` and the two
     /// numbers were not comparable at all.
-    async fn issue(&self, parent: [u8; 16]) -> ([u8; 16], [u8; 32]) {
+    async fn issue(&self, parent: [u8; 16], version: (u32, u32)) -> ([u8; 16], [u8; 32]) {
         let now_ms = self.now_ms();
-        self.inner.lock().await.grants.issue(parent, now_ms)
+        self.inner
+            .lock()
+            .await
+            .grants
+            .issue(parent, version, now_ms)
     }
 
     /// The expiry the store holds for `channel_id`, for the one-clock test (audit F5).
@@ -2827,13 +2845,15 @@ impl Handle {
                 continue;
             };
             let peer = connection.peer;
-            let accepted = self
+            let version = self
                 .inner
                 .lock()
                 .await
                 .grants
                 .accept(&parent, &channel, &token, self.now_ms())
-                .is_ok();
+                .ok();
+            let accepted =
+                version.is_some_and(|version| connection.validate_parent_version(version).is_ok());
             if !accepted {
                 // One-use tokens and the 60 s ttl are what refuse a replay.
                 tracing::warn!(peer = %peer, "clipboard bind refused");
@@ -3018,7 +3038,7 @@ impl Handle {
         &self,
         peer: NodeId,
         address: SocketAddr,
-        parent: [u8; 16],
+        parent: protocol::hello::Negotiated,
         channel_id: [u8; 16],
         token: [u8; 32],
         queue_capacity: usize,
@@ -3646,7 +3666,16 @@ mod tests {
             Some(transport::clipboard::process_epoch()),
         );
         sender
-            .on_link_up(receiver_id, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                receiver_id,
+                [1; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         let message = sender
             .waiting
@@ -3869,7 +3898,16 @@ mod tests {
         endpoint.on_link_down(a).await;
         endpoint.set_peer_session(a, [2; 16], Some([22; 16]));
         endpoint
-            .on_link_up(a, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                a,
+                [2; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         endpoint
             .on_peer_message_from(a, [2; 16], session_offer(a, [22; 16], 1, 3, false))
@@ -3941,7 +3979,16 @@ mod tests {
         endpoint.on_link_down(peer).await;
         endpoint.set_peer_session(peer, [2; 16], Some(epoch));
         endpoint
-            .on_link_up(peer, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                peer,
+                [2; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         endpoint
             .on_peer_message_from(peer, [2; 16], session_offer(peer, epoch, 90, 2, false))
@@ -3989,7 +4036,16 @@ mod tests {
             endpoint.on_link_down(peer).await;
             endpoint.set_peer_session(peer, [2; 16], None);
             endpoint
-                .on_link_up(peer, [2; 16], true, "127.0.0.1".parse().unwrap())
+                .on_link_up(
+                    peer,
+                    [2; 16],
+                    (
+                        protocol::limits::PROTOCOL_MAJOR,
+                        protocol::limits::PROTOCOL_MINOR,
+                    ),
+                    true,
+                    "127.0.0.1".parse().unwrap(),
+                )
                 .await;
             endpoint
                 .on_peer_message_from(peer, [2; 16], offer(None, 90, 2))
@@ -4254,7 +4310,16 @@ mod tests {
         let (mut endpoint, root) = started_clipboard("cancel-delivery").await;
         let peer: NodeId = [0x21; 32].into();
         endpoint
-            .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                peer,
+                [1; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         endpoint
             .on_local_copy(b"current".to_vec(), Vec::new())
@@ -4306,7 +4371,16 @@ mod tests {
                 let peer: NodeId = [0x21; 32].into();
                 receiver.source = cb::Source::new(*peer.as_bytes());
                 sender
-                    .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
+                    .on_link_up(
+                        peer,
+                        [1; 16],
+                        (
+                            protocol::limits::PROTOCOL_MAJOR,
+                            protocol::limits::PROTOCOL_MINOR,
+                        ),
+                        true,
+                        "127.0.0.1".parse().unwrap(),
+                    )
                     .await;
                 if bound {
                     sender.peers.get_mut(&peer).unwrap().channel = Some([3; 16]);
@@ -4360,7 +4434,16 @@ mod tests {
                 let origin: NodeId = (*origin_node_id).into();
                 let offer_id = *offer_id;
                 receiver
-                    .on_link_up(origin, [1; 16], true, "127.0.0.1".parse().unwrap())
+                    .on_link_up(
+                        origin,
+                        [1; 16],
+                        (
+                            protocol::limits::PROTOCOL_MAJOR,
+                            protocol::limits::PROTOCOL_MINOR,
+                        ),
+                        true,
+                        "127.0.0.1".parse().unwrap(),
+                    )
                     .await;
                 receiver.on_peer_message(origin, offer.message).await;
                 assert_eq!(receiver.pending_request, Some((origin, offer_id)));
@@ -4442,7 +4525,16 @@ mod tests {
         let first: NodeId = [0x21; 32].into();
         let late: NodeId = [0x22; 32].into();
         endpoint
-            .on_link_up(first, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                first,
+                [1; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         let out = endpoint.on_local_copy(b"carry".to_vec(), Vec::new()).await;
         let (offer, hash) = endpoint.carried.clone().expect("carry");
@@ -4460,7 +4552,7 @@ mod tests {
         assert!(endpoint.waiting.is_empty());
         assert!(endpoint.offered.is_empty());
         assert!(endpoint
-            .on_link_up(late, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(late, [2; 16], (1, 0), true, "127.0.0.1".parse().unwrap())
             .await
             .is_empty());
         assert_eq!(endpoint.source.version(), offer.version);
@@ -4475,7 +4567,16 @@ mod tests {
         let first: NodeId = [0x21; 32].into();
         let late: NodeId = [0x22; 32].into();
         endpoint
-            .on_link_up(first, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                first,
+                [1; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         let out = endpoint
             .on_local_copy(b"broadcast".to_vec(), Vec::new())
@@ -4492,7 +4593,16 @@ mod tests {
         assert!(endpoint.waiting.contains_key(&first));
         let version = endpoint.source.version();
         let out = endpoint
-            .on_link_up(late, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                late,
+                [2; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         assert!(out
             .iter()
@@ -4518,6 +4628,10 @@ mod tests {
             .on_link_up(
                 [0x21; 32].into(),
                 [1; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
                 true,
                 "127.0.0.1".parse().unwrap(),
             )
@@ -4536,7 +4650,16 @@ mod tests {
         let incapable: NodeId = [0x23; 32].into();
         for (peer, capable) in [(target, true), (other, true), (incapable, false)] {
             endpoint
-                .on_link_up(peer, [1; 16], capable, "127.0.0.1".parse().unwrap())
+                .on_link_up(
+                    peer,
+                    [1; 16],
+                    (
+                        protocol::limits::PROTOCOL_MAJOR,
+                        protocol::limits::PROTOCOL_MINOR,
+                    ),
+                    capable,
+                    "127.0.0.1".parse().unwrap(),
+                )
                 .await;
         }
         endpoint
@@ -4599,7 +4722,16 @@ mod tests {
         endpoint.settings.policy.skip_secret_marked = false;
         let peer: NodeId = [0x21; 32].into();
         endpoint
-            .on_link_up(peer, [1; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                peer,
+                [1; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         for secret in [true, false] {
             endpoint.on_local_copy(b"safe".to_vec(), Vec::new()).await;
@@ -5233,7 +5365,18 @@ mod tests {
         let address = silent.local_addr().expect("address");
         let worker = endpoint.runtime.clone();
         worker
-            .dial([0x21; 32].into(), address, [1; 16], [2; 16], [3; 32], 4)
+            .dial(
+                [0x21; 32].into(),
+                address,
+                protocol::hello::Negotiated {
+                    connection_id: [1; 16],
+                    major: 1,
+                    minor: 0,
+                },
+                [2; 16],
+                [3; 32],
+                4,
+            )
             .await;
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), silent.accept())
             .await
@@ -5300,7 +5443,7 @@ mod tests {
         let handle = test_handle().await;
         let parent = [0x11u8; 16];
         let before = handle.now_ms();
-        let (channel, token) = handle.issue(parent).await;
+        let (channel, token) = handle.issue(parent, (1, 0)).await;
         let after = handle.now_ms();
         let expires = handle
             .grant_expiry_ms(&channel)
@@ -5374,11 +5517,24 @@ mod tests {
         .expect("the clipboard runtime starts");
 
         let parent = [7u8; 16];
-        let (channel, token) = handle.issue(parent).await;
+        let (channel, token) = handle.issue(parent, (1, 0)).await;
         let address = handle.listen_address;
         let b_pins = Arc::new(RwLock::new(BTreeSet::from([id_a])));
         let dialer = tokio::spawn(async move {
-            dial_clipboard(&identity_b, b_pins, id_a, address, parent, channel, token).await
+            dial_clipboard(
+                &identity_b,
+                b_pins,
+                id_a,
+                address,
+                protocol::hello::Negotiated {
+                    connection_id: parent,
+                    major: protocol::limits::PROTOCOL_MAJOR,
+                    minor: protocol::limits::PROTOCOL_MINOR,
+                },
+                channel,
+                token,
+            )
+            .await
         });
 
         // The runtime binds the channel before the test revokes it.
@@ -5724,11 +5880,24 @@ mod tests {
 
         let mut dialers = Vec::new();
         for parent in [[7u8; 16], [8u8; 16]] {
-            let (channel, token) = handle.issue(parent).await;
+            let (channel, token) = handle.issue(parent, (1, 0)).await;
             let identity_b = Arc::clone(&identity_b);
             let b_pins = Arc::clone(&b_pins);
             dialers.push(tokio::spawn(async move {
-                dial_clipboard(&identity_b, b_pins, id_a, address, parent, channel, token).await
+                dial_clipboard(
+                    &identity_b,
+                    b_pins,
+                    id_a,
+                    address,
+                    protocol::hello::Negotiated {
+                        connection_id: parent,
+                        major: protocol::limits::PROTOCOL_MAJOR,
+                        minor: protocol::limits::PROTOCOL_MINOR,
+                    },
+                    channel,
+                    token,
+                )
+                .await
             }));
         }
         let mut bound = 0;
@@ -5780,7 +5949,11 @@ mod tests {
             handle.dial(
                 [0x55u8; 32].into(),
                 address,
-                [1u8; 16],
+                protocol::hello::Negotiated {
+                    connection_id: [1; 16],
+                    major: 1,
+                    minor: 0,
+                },
                 [2u8; 16],
                 [3u8; 32],
                 4,
@@ -5856,7 +6029,16 @@ mod tests {
         endpoint.settings.policy.max_image_bytes = cb::MAX_IMAGE_BYTES;
         endpoint.set_local_image_support(true).await;
         endpoint
-            .on_link_up(peer, [1; 16], false, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                peer,
+                [1; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                false,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         endpoint.set_peer_image_support(peer, true).await;
         (endpoint, root)
@@ -6131,7 +6313,16 @@ mod tests {
         let old_peer = [0x22; 32].into();
         let (mut endpoint, root) = image_endpoint("image-carry", peer).await;
         endpoint
-            .on_link_up(old_peer, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                old_peer,
+                [2; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         let prepared = prepare_copy(
             vec![b"\x89PNG\r\n\x1a\n".to_vec()],
@@ -6177,7 +6368,16 @@ mod tests {
         let text_peer = [0x22; 32].into();
         let (mut endpoint, root) = image_endpoint("image-consent", peer).await;
         endpoint
-            .on_link_up(text_peer, [2; 16], true, "127.0.0.1".parse().unwrap())
+            .on_link_up(
+                text_peer,
+                [2; 16],
+                (
+                    protocol::limits::PROTOCOL_MAJOR,
+                    protocol::limits::PROTOCOL_MINOR,
+                ),
+                true,
+                "127.0.0.1".parse().unwrap(),
+            )
             .await;
         let prepared = prepare_copy(
             vec![b"\x89PNG\r\n\x1a\n".to_vec()],

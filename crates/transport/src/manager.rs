@@ -989,8 +989,12 @@ impl LinkManager {
                     peer,
                     hello,
                     connection_id,
+                    version,
                     remote,
-                } => self.on_up(key, peer, hello, connection_id, remote).await,
+                } => {
+                    self.on_up(key, peer, hello, connection_id, version, remote)
+                        .await
+                }
                 LinkReport::Message { peer, message } => {
                     let send_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
                     static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
@@ -1045,6 +1049,7 @@ impl LinkManager {
         peer: NodeId,
         hello: PeerInfo,
         connection_id: [u8; 16],
+        version: (u32, u32),
         remote: std::net::SocketAddr,
     ) {
         let incoming = self.inner.lock().await.pending.remove(&key);
@@ -1192,6 +1197,7 @@ impl LinkManager {
                 peer,
                 hello,
                 connection_id,
+                version,
                 remote,
             })
             .await;
