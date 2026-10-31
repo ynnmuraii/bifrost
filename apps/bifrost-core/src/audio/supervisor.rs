@@ -41,6 +41,7 @@ pub enum AudioPrivacyOperation {
     DisableMediaWatch,
     MuteMicrophone,
     RevokePtt,
+    ReleaseAllPtt,
     ReleaseMicMute,
     StopSession,
 }
@@ -50,6 +51,7 @@ impl AudioPrivacyOperation {
             Self::DisableMediaWatch => "disable_media_watch",
             Self::MuteMicrophone => "mute_microphone",
             Self::RevokePtt => "revoke_ptt",
+            Self::ReleaseAllPtt => "release_all_ptt",
             Self::ReleaseMicMute => "release_mic_mute",
             Self::StopSession => "stop_session",
         }
@@ -62,6 +64,7 @@ impl AudioPrivacyOperation {
             }
             Msg::SetMicMute(w::SetMicMute { muted: true, .. }) => Some(Self::MuteMicrophone),
             Msg::PttRevoke(_) => Some(Self::RevokePtt),
+            Msg::PttReleaseAll(_) => Some(Self::ReleaseAllPtt),
             Msg::ReleaseMicMute(_) => Some(Self::ReleaseMicMute),
             Msg::StopSession(_) => Some(Self::StopSession),
             _ => None,
@@ -185,7 +188,10 @@ pub enum AudioSupervisorEvent {
 #[derive(Clone)]
 pub struct AudioHandle {
     commands: mpsc::Sender<Command>,
+    priority: mpsc::Sender<Command>,
+    talk_epoch: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
+    bound_generation: Option<u64>,
     shutdown: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
 }
@@ -197,6 +203,7 @@ enum Reply {
 }
 struct Command {
     generation: u64,
+    talk_epoch: u64,
     message: Msg,
     admitted_at: Instant,
     reply: oneshot::Sender<Result<Reply>>,
@@ -219,10 +226,19 @@ struct PendingPrivacy {
 }
 
 impl AudioHandle {
+    /// Pins a private safety view to one child incarnation. A bound clone cannot
+    /// be rebound, and never retags stale privacy work onto a replacement child.
+    pub(crate) fn for_generation(&self, expected: u64) -> Self {
+        let mut handle = self.clone();
+        handle.bound_generation = Some(self.bound_generation.unwrap_or(expected));
+        handle
+    }
+
     async fn command(&self, message: Msg) -> Result<Reply> {
         let admitted_at = Instant::now();
-        let generation = self.generation.load(Ordering::Acquire);
-        if generation == 0 {
+        let current = self.generation.load(Ordering::Acquire);
+        let generation = self.bound_generation.unwrap_or(current);
+        if generation == 0 || generation != current {
             return Err(AudioSupervisorError::Unavailable);
         }
         let mut frame = w::AudioFrame {
@@ -237,13 +253,14 @@ impl AudioHandle {
         let message = frame.msg.take().ok_or(AudioSupervisorError::InvalidFrame)?;
         let privacy = AudioPrivacyOperation::of(&message);
         let (reply, rx) = oneshot::channel();
-        self.commands
-            .try_send(Command {
-                generation,
-                message,
-                admitted_at,
-                reply,
-            })
+        let priority = is_talk_fence(&message);
+        let queue = if priority {
+            &self.priority
+        } else {
+            &self.commands
+        };
+        let permit = queue
+            .try_reserve()
             .map_err(|error| match (error, privacy) {
                 (mpsc::error::TrySendError::Full(_), Some(operation)) => {
                     tracing::info!(
@@ -257,6 +274,21 @@ impl AudioHandle {
                 (mpsc::error::TrySendError::Full(_), None) => AudioSupervisorError::QueueFull,
                 (mpsc::error::TrySendError::Closed(_), _) => AudioSupervisorError::Unavailable,
             })?;
+        // Reserving first keeps a rejected safety command from fencing live grants.
+        let talk_epoch = if priority {
+            self.talk_epoch
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1)
+        } else {
+            self.talk_epoch.load(Ordering::Acquire)
+        };
+        permit.send(Command {
+            generation,
+            talk_epoch,
+            message,
+            admitted_at,
+            reply,
+        });
         timeout(COMMAND_TIMEOUT, rx)
             .await
             .map_err(|_| AudioSupervisorError::Timeout)?
@@ -348,6 +380,12 @@ impl AudioHandle {
         self.written(Msg::PttRevoke(w::PttRevoke { grant_id }))
             .await
     }
+    /// Clears all transient native and remote talk, preserving persistent unmute.
+    pub async fn ptt_release_all(&self) -> Result<u64> {
+        self.for_generation(self.generation.load(Ordering::Acquire))
+            .written(Msg::PttReleaseAll(w::PttReleaseAll {}))
+            .await
+    }
     pub async fn set_media_watch(&self, enabled: bool) -> Result<u64> {
         self.written(Msg::SetMediaWatch(w::SetMediaWatch { enabled }))
             .await
@@ -366,6 +404,11 @@ impl AudioHandle {
         .await
     }
     pub async fn shutdown(&self) -> Result<()> {
+        // Generation-pinned safety views must never control the supervisor's
+        // generation-independent shutdown channel.
+        if self.bound_generation.is_some() {
+            return Err(AudioSupervisorError::Unavailable);
+        }
         // Reserved stop admission: disabling audio also interrupts backoff/launch
         // and cannot be blocked by the ordinary command queue or generation zero.
         self.shutdown.send_replace(true);
@@ -395,14 +438,26 @@ impl AudioSupervisor {
             return Err(AudioSupervisorError::InvalidFrame);
         }
         let (commands, rx) = mpsc::channel(QUEUE);
+        let (priority, priority_rx) = mpsc::channel(QUEUE);
+        let talk_epoch = Arc::new(AtomicU64::new(0));
         let (events, event_rx) = mpsc::channel(QUEUE);
         let generation = Arc::new(AtomicU64::new(0));
         let (started, ready) = oneshot::channel();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (stopped_tx, stopped) = watch::channel(false);
         let actor_generation = generation.clone();
+        let actor_talk_epoch = talk_epoch.clone();
         tokio::spawn(async move {
-            run(config, rx, events, actor_generation, started, shutdown_rx).await;
+            run(
+                config,
+                rx,
+                (priority_rx, actor_talk_epoch),
+                events,
+                actor_generation,
+                started,
+                shutdown_rx,
+            )
+            .await;
             stopped_tx.send_replace(true);
         });
         // Dropping this receiver on timeout also makes the actor reap a late child.
@@ -413,7 +468,10 @@ impl AudioSupervisor {
         Ok((
             AudioHandle {
                 commands,
+                priority,
+                talk_epoch,
                 generation,
+                bound_generation: None,
                 shutdown,
                 stopped,
             },
@@ -653,15 +711,39 @@ async fn send(child: &mut Child, id: u64, message: Msg) -> Result<()> {
         .map_err(|_| AudioSupervisorError::Timeout)?
         .map_err(|_| AudioSupervisorError::InvalidFrame)
 }
+fn is_talk_fence(message: &Msg) -> bool {
+    matches!(
+        message,
+        Msg::PttReleaseAll(_) | Msg::SetMicMute(w::SetMicMute { muted: true, .. })
+    )
+}
+
+fn stale_talk(command: &Command, talk_epoch: &AtomicU64) -> bool {
+    matches!(command.message, Msg::PttGrant(_))
+        && command.talk_epoch != talk_epoch.load(Ordering::Acquire)
+}
+
+async fn next_command(
+    priority: &mut mpsc::Receiver<Command>,
+    commands: &mut mpsc::Receiver<Command>,
+) -> Option<Command> {
+    tokio::select! {
+        biased;
+        command = priority.recv() => command,
+        command = commands.recv() => command,
+    }
+}
 
 async fn serve(
     child: &mut Child,
     generation: u64,
     commands: &mut mpsc::Receiver<Command>,
+    safety: (&mut mpsc::Receiver<Command>, &AtomicU64),
     events: &mpsc::Sender<AudioSupervisorEvent>,
     available: &AtomicU64,
     sessions: &mut BTreeSet<[u8; 16]>,
 ) -> Result<()> {
+    let (priority, talk_epoch) = safety;
     let mut pending = BTreeMap::<u64, Pending>::new();
     let mut pending_starts = BTreeMap::<u64, [u8; 16]>::new();
     let mut pending_controls = BTreeMap::<u64, PendingControl>::new();
@@ -762,16 +844,20 @@ async fn serve(
                         _ => return Err(AudioSupervisorError::InvalidFrame),
                     }
                 }
-                command = commands.recv() => {
+                command = next_command(priority, commands) => {
                     let Some(command) = command else { return Ok(()); };
-                    if command.reply.is_closed() { continue; }
+                    if command.reply.is_closed() && !is_talk_fence(&command.message) { continue; }
                     if command.generation != generation {
+                        let _ = command.reply.send(Err(AudioSupervisorError::Unavailable)); continue;
+                    }
+                    if stale_talk(&command, talk_epoch) {
                         let _ = command.reply.send(Err(AudioSupervisorError::Unavailable)); continue;
                     }
                     // The child holds one paged inventory snapshot at a time.
                     let privacy = AudioPrivacyOperation::of(&command.message);
                     let no_reply_privacy = pending_privacy.values().filter(|pending| pending.after_ping.is_some()).count();
-                    if pending.len() + pending_controls.len() + no_reply_privacy >= QUEUE || (matches!(&command.message, Msg::ListDevices(_)) && pending.values().any(|response| response.inventory.is_some())) {
+                    let limit = if is_talk_fence(&command.message) { QUEUE * 2 } else { QUEUE };
+                    if pending.len() + pending_controls.len() + no_reply_privacy >= limit || (matches!(&command.message, Msg::ListDevices(_)) && pending.values().any(|response| response.inventory.is_some())) {
                         if let Some(operation) = privacy {
                             let _ = command.reply.send(Err(AudioSupervisorError::PrivacyControlRejected));
                             worker_rejection(events, generation, 0, Some(operation), false, w::Error {code: 3, session_id: Vec::new()})?;
@@ -791,7 +877,7 @@ async fn serve(
                     let response = matches!(message, Msg::ProbeBackend(_) | Msg::ListDevices(_));
                     let control = match &message {
                         Msg::AcquireMicMute(_) | Msg::SetMicMute(_) | Msg::ReleaseMicMute(_) => Some(ControlReply::Mute),
-                        Msg::ConfigurePtt(_) | Msg::PttGrant(_) | Msg::PttRevoke(_) => Some(ControlReply::Ptt),
+                        Msg::ConfigurePtt(_) | Msg::PttGrant(_) | Msg::PttRevoke(_) | Msg::PttReleaseAll(_) => Some(ControlReply::Ptt),
                         Msg::MediaCommand(_) => Some(ControlReply::Media),
                         _ => None,
                     };
@@ -887,11 +973,13 @@ fn bound_grant_queue(message: &mut Msg, admitted_at: Instant, now: Instant) -> R
 async fn run(
     config: AudioSupervisorConfig,
     mut commands: mpsc::Receiver<Command>,
+    safety: (mpsc::Receiver<Command>, Arc<AtomicU64>),
     events: mpsc::Sender<AudioSupervisorEvent>,
     available: Arc<AtomicU64>,
     started: oneshot::Sender<Result<()>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let (mut priority, talk_epoch) = safety;
     let mut first = Some(started);
     let mut generation = 1u64;
     let mut restarts = VecDeque::<Instant>::new();
@@ -962,7 +1050,15 @@ async fn run(
                     return;
                 };
                 generation = next_generation;
-                if !backoff(&mut commands, &events, restarts.len(), &mut shutdown).await {
+                if !backoff(
+                    &mut commands,
+                    &mut priority,
+                    &events,
+                    restarts.len(),
+                    &mut shutdown,
+                )
+                .await
+                {
                     return;
                 }
                 continue;
@@ -1003,7 +1099,7 @@ async fn run(
         let outcome = tokio::select! {
             biased;
             _ = shutdown_requested(&mut shutdown) => Ok(()),
-            outcome = serve(&mut child, generation, &mut commands, &events, &available, &mut sessions) => outcome,
+            outcome = serve(&mut child, generation, &mut commands, (&mut priority, &talk_epoch), &events, &available, &mut sessions) => outcome,
         };
         available.store(0, Ordering::Release);
         if outcome.is_ok() {
@@ -1016,6 +1112,9 @@ async fn run(
         }
         child.reap().await;
         while let Ok(command) = commands.try_recv() {
+            let _ = command.reply.send(Err(AudioSupervisorError::Unavailable));
+        }
+        while let Ok(command) = priority.try_recv() {
             let _ = command.reply.send(Err(AudioSupervisorError::Unavailable));
         }
         let Err(reason) = outcome else {
@@ -1078,7 +1177,15 @@ async fn run(
             return;
         };
         generation = next_generation;
-        if !backoff(&mut commands, &events, restarts.len(), &mut shutdown).await {
+        if !backoff(
+            &mut commands,
+            &mut priority,
+            &events,
+            restarts.len(),
+            &mut shutdown,
+        )
+        .await
+        {
             return;
         }
     }
@@ -1096,6 +1203,7 @@ async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
 
 async fn backoff(
     commands: &mut mpsc::Receiver<Command>,
+    priority: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<AudioSupervisorEvent>,
     attempt: usize,
     shutdown: &mut watch::Receiver<bool>,
@@ -1108,7 +1216,7 @@ async fn backoff(
             _ = shutdown_requested(shutdown) => return false,
             _ = &mut delay => return true,
             _ = events.closed() => return false,
-            command = commands.recv() => match command {
+            command = next_command(priority, commands) => match command {
                 Some(command) => { let _ = command.reply.send(Err(AudioSupervisorError::Unavailable)); }
                 None => return false,
             }
@@ -1268,11 +1376,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_bound_safety_view_never_retags_or_rebinds_after_restart() {
+        let (commands, mut ordinary) = mpsc::channel(2);
+        let (priority, mut safety) = mpsc::channel(2);
+        let (shutdown, requested) = watch::channel(false);
+        let handle = AudioHandle {
+            commands,
+            priority,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
+            shutdown,
+            stopped: watch::channel(true).1,
+        };
+        let bound = handle.for_generation(7);
+        let (result, ()) = tokio::join!(bound.ptt_release_all(), async {
+            let command = safety.recv().await.unwrap();
+            assert_eq!(command.generation, 7);
+            // A restart racing admission leaves the queued command tagged OLD;
+            // the actor's existing generation check rejects it, never replays it.
+            handle.generation.store(8, Ordering::Release);
+            assert_eq!(command.generation, 7);
+            let _ = command.reply.send(Err(AudioSupervisorError::ChildLost));
+        });
+        assert_eq!(result, Err(AudioSupervisorError::ChildLost));
+        let epoch = handle.talk_epoch.load(Ordering::Acquire);
+        for stale in [
+            bound.clone(),
+            bound.for_generation(8),
+            handle.for_generation(0),
+        ] {
+            assert_eq!(
+                stale.ptt_release_all().await,
+                Err(AudioSupervisorError::Unavailable)
+            );
+            assert_eq!(
+                stale.set_mic_mute(99, true).await,
+                Err(AudioSupervisorError::Unavailable)
+            );
+            assert_eq!(
+                stale.shutdown().await,
+                Err(AudioSupervisorError::Unavailable)
+            );
+        }
+        assert_eq!(handle.talk_epoch.load(Ordering::Acquire), epoch);
+        assert!(!*requested.borrow());
+        assert!(safety.try_recv().is_err());
+        assert!(ordinary.try_recv().is_err());
+        let fresh = handle.for_generation(8);
+        let (result, ()) = tokio::join!(fresh.set_mic_mute(99, true), async {
+            let command = safety.recv().await.unwrap();
+            assert_eq!(command.generation, 8);
+            let _ = command.reply.send(Ok(Reply::Written(42)));
+        });
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
     async fn invalid_commands_never_enter_secret_queue() {
         let (commands, mut rx) = mpsc::channel(1);
         let handle = AudioHandle {
             commands,
+            priority: mpsc::channel(1).0,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(1)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
@@ -1322,7 +1490,10 @@ mod tests {
         let (commands, mut rx) = mpsc::channel(1);
         let handle = AudioHandle {
             commands,
+            priority: mpsc::channel(1).0,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
@@ -1343,16 +1514,22 @@ mod tests {
     #[tokio::test]
     async fn native_controls_are_correlated_generation_fenced_write_requests() {
         let (commands, mut rx) = mpsc::channel(1);
+        let (priority, mut priority_rx) = mpsc::channel(1);
         let handle = AudioHandle {
             commands,
+            priority,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
         macro_rules! written {
             ($call:expr, $pattern:pat) => {{
                 let (result, ()) = tokio::join!($call, async {
-                    let command = rx.recv().await.expect("explicit native control");
+                    let command = next_command(&mut priority_rx, &mut rx)
+                        .await
+                        .expect("explicit native control");
                     assert_eq!(command.generation, 7);
                     assert!(matches!(command.message, $pattern));
                     assert!(command.reply.send(Ok(Reply::Written(42))).is_ok());
@@ -1371,6 +1548,8 @@ mod tests {
         written!(handle.configure_ptt(None, Vec::new()), Msg::ConfigurePtt(_));
         written!(handle.ptt_grant(7, 250), Msg::PttGrant(_));
         written!(handle.ptt_revoke(7), Msg::PttRevoke(_));
+        written!(handle.ptt_release_all(), Msg::PttReleaseAll(_));
+        written!(handle.set_mic_mute(1, true), Msg::SetMicMute(_));
         written!(handle.set_media_watch(false), Msg::SetMediaWatch(_));
         written!(
             handle.media_command(7, 1, w::MediaCommandKind::Play),
@@ -1382,6 +1561,7 @@ mod tests {
     #[tokio::test]
     async fn backoff_rejects_queued_previous_generation() {
         let (tx, mut rx) = mpsc::channel(1);
+        let (priority, mut priority_rx) = mpsc::channel(1);
         let (events, _events_rx) = mpsc::channel(1);
         let (_shutdown, mut shutdown) = watch::channel(false);
         for message in [
@@ -1394,18 +1574,34 @@ mod tests {
             let (reply, response) = oneshot::channel();
             tx.send(Command {
                 generation: 1,
+                talk_epoch: 0,
                 message,
                 admitted_at: Instant::now(),
                 reply,
             })
             .await
             .unwrap_or_else(|_| panic!("command queue"));
-            assert!(backoff(&mut rx, &events, 1, &mut shutdown).await);
+            let (reply, safety_response) = oneshot::channel();
+            priority
+                .try_send(Command {
+                    generation: 1,
+                    talk_epoch: 1,
+                    message: Msg::PttReleaseAll(w::PttReleaseAll {}),
+                    admitted_at: Instant::now(),
+                    reply,
+                })
+                .unwrap_or_else(|_| panic!("priority queue"));
+            assert!(backoff(&mut rx, &mut priority_rx, &events, 1, &mut shutdown).await);
             assert!(matches!(
                 response.await.unwrap(),
                 Err(AudioSupervisorError::Unavailable)
             ));
             assert!(rx.try_recv().is_err());
+            assert!(matches!(
+                safety_response.await.unwrap(),
+                Err(AudioSupervisorError::Unavailable)
+            ));
+            assert!(priority_rx.try_recv().is_err());
         }
     }
 
@@ -1717,6 +1913,7 @@ mod tests {
         commands
             .try_send(Command {
                 generation: 1,
+                talk_epoch: 0,
                 message: Msg::ProbeBackend(w::ProbeBackend {}),
                 admitted_at: Instant::now(),
                 reply,
@@ -1726,7 +1923,10 @@ mod tests {
         let (finished, stopped) = watch::channel(false);
         let handle = AudioHandle {
             commands,
+            priority: mpsc::channel(1).0,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
+            bound_generation: None,
             shutdown,
             stopped,
         };
@@ -1936,6 +2136,10 @@ mod tests {
                 AudioPrivacyOperation::RevokePtt,
             ),
             (
+                Msg::PttReleaseAll(w::PttReleaseAll {}),
+                AudioPrivacyOperation::ReleaseAllPtt,
+            ),
+            (
                 Msg::ReleaseMicMute(w::ReleaseMicMute {}),
                 AudioPrivacyOperation::ReleaseMicMute,
             ),
@@ -2029,10 +2233,12 @@ mod tests {
     #[tokio::test]
     async fn full_supervisor_admission_distinguishes_privacy_reductions() {
         let (commands, mut queue) = mpsc::channel(1);
+        let (priority, mut priority_rx) = mpsc::channel(1);
         let (reply, _receive) = oneshot::channel();
         commands
             .try_send(Command {
                 generation: 7,
+                talk_epoch: 0,
                 message: Msg::ProbeBackend(w::ProbeBackend {}),
                 admitted_at: Instant::now(),
                 reply,
@@ -2040,7 +2246,10 @@ mod tests {
             .unwrap_or_else(|_| panic!("fill admission"));
         let handle = AudioHandle {
             commands,
+            priority,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
@@ -2048,10 +2257,20 @@ mod tests {
             handle.set_media_watch(false).await,
             Err(AudioSupervisorError::PrivacyControlRejected)
         );
-        assert_eq!(
-            handle.set_mic_mute(1, true).await,
-            Err(AudioSupervisorError::PrivacyControlRejected)
-        );
+        for message in [
+            Msg::SetMicMute(w::SetMicMute {
+                expected_generation: 1,
+                muted: true,
+            }),
+            Msg::PttReleaseAll(w::PttReleaseAll {}),
+        ] {
+            let (result, ()) = tokio::join!(handle.written(message), async {
+                let command = priority_rx.recv().await.unwrap();
+                assert_eq!(queue.len(), 1);
+                assert!(command.reply.send(Ok(Reply::Written(42))).is_ok());
+            });
+            assert_eq!(result, Ok(42));
+        }
         assert_eq!(
             handle.ptt_revoke(1).await,
             Err(AudioSupervisorError::PrivacyControlRejected)
@@ -2074,6 +2293,182 @@ mod tests {
         );
         assert!(queue.try_recv().is_ok());
         assert!(queue.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn talk_fences_bypass_full_queue_and_only_invalidate_transient_grants() {
+        let (commands, mut queued) = mpsc::channel(2);
+        let (priority, mut safety) = mpsc::channel(1);
+        let handle = AudioHandle {
+            commands,
+            priority,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
+            shutdown: watch::channel(false).0,
+            stopped: watch::channel(true).1,
+        };
+        for message in [
+            Msg::PttGrant(w::PttGrant {
+                grant_id: 7,
+                ttl_ms: 250,
+            }),
+            Msg::SetMicMute(w::SetMicMute {
+                expected_generation: 1,
+                muted: false,
+            }),
+        ] {
+            let (reply, _response) = oneshot::channel();
+            handle
+                .commands
+                .try_send(Command {
+                    generation: 7,
+                    talk_epoch: 0,
+                    message,
+                    admitted_at: Instant::now(),
+                    reply,
+                })
+                .unwrap_or_else(|_| panic!("fill normal queue"));
+        }
+        for message in [
+            Msg::PttReleaseAll(w::PttReleaseAll {}),
+            Msg::SetMicMute(w::SetMicMute {
+                expected_generation: 1,
+                muted: true,
+            }),
+        ] {
+            let previous = handle.talk_epoch.load(Ordering::Acquire);
+            let (result, ()) = tokio::join!(handle.written(message), async {
+                let command = safety.recv().await.unwrap();
+                assert_eq!(queued.len(), 2);
+                assert_eq!(handle.talk_epoch.load(Ordering::Acquire), previous + 1);
+                assert!(command.reply.send(Ok(Reply::Written(42))).is_ok());
+            });
+            assert_eq!(result, Ok(42));
+        }
+        let grant = queued.recv().await.unwrap();
+        assert!(stale_talk(&grant, &handle.talk_epoch));
+        let persistent = queued.recv().await.unwrap();
+        assert!(!stale_talk(&persistent, &handle.talk_epoch));
+        assert!(matches!(
+            persistent.message,
+            Msg::SetMicMute(w::SetMicMute { muted: false, .. })
+        ));
+        let (reply, _response) = oneshot::channel();
+        handle
+            .priority
+            .try_send(Command {
+                generation: 7,
+                talk_epoch: 2,
+                message: Msg::PttReleaseAll(w::PttReleaseAll {}),
+                admitted_at: Instant::now(),
+                reply,
+            })
+            .unwrap_or_else(|_| panic!("fill priority queue"));
+        for message in [
+            Msg::PttReleaseAll(w::PttReleaseAll {}),
+            Msg::SetMicMute(w::SetMicMute {
+                expected_generation: 1,
+                muted: true,
+            }),
+        ] {
+            assert!(matches!(
+                handle.written(message).await,
+                Err(AudioSupervisorError::PrivacyControlRejected)
+            ));
+            assert_eq!(handle.talk_epoch.load(Ordering::Acquire), 2);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_child_release_all_acknowledges_owned_dry_talk_without_physical_edge() {
+        let root = Root::new();
+        let (handle, mut events) = AudioSupervisor::start(root.config("release-all"))
+            .await
+            .unwrap();
+        let (generation, _) = ready(&mut events).await;
+        handle.probe().await.unwrap();
+        let acquire = handle
+            .acquire_mic_mute(w::DeviceSelection {
+                selector: Some(w::device_selection::Selector::FollowDefault(2)),
+            })
+            .await
+            .unwrap();
+        let endpoint_generation = loop {
+            match next(&mut events).await {
+                AudioSupervisorEvent::MuteSnapshot {
+                    request_id,
+                    snapshot,
+                    ..
+                } if request_id == acquire => {
+                    assert!(snapshot.guard_active);
+                    break snapshot.generation;
+                }
+                AudioSupervisorEvent::CommandRejected { error, .. } => {
+                    panic!("acquire rejected: {error:?}")
+                }
+                _ => {}
+            }
+        };
+        let muted = handle
+            .set_mic_mute(endpoint_generation, true)
+            .await
+            .unwrap();
+        loop {
+            if let AudioSupervisorEvent::MuteSnapshot {
+                request_id,
+                snapshot,
+                ..
+            } = next(&mut events).await
+            {
+                if request_id == muted {
+                    assert!(snapshot.muted);
+                    break;
+                }
+            }
+        }
+        let grant = handle.ptt_grant(73, 250).await.unwrap();
+        loop {
+            if let AudioSupervisorEvent::PttEvent {
+                request_id, event, ..
+            } = next(&mut events).await
+            {
+                if request_id == grant {
+                    assert_eq!(event.kind, w::PttEventKind::Pressed as i32);
+                    break;
+                }
+            }
+        }
+        let release = handle.ptt_release_all().await.unwrap();
+        let (mut acknowledged, mut remuted) = (false, false);
+        while !acknowledged || !remuted {
+            match next(&mut events).await {
+                AudioSupervisorEvent::PttEvent {
+                    generation: observed,
+                    request_id,
+                    event,
+                } if request_id == release => {
+                    assert_eq!(observed, generation);
+                    assert_eq!(event.kind, w::PttEventKind::Released as i32);
+                    assert_eq!(event.reason, w::PttReleaseReason::Revoked as i32);
+                    assert_eq!(
+                        (event.grant_id, event.observed_at_ns, event.expires_at_ns),
+                        (0, 0, 0)
+                    );
+                    acknowledged = true;
+                }
+                AudioSupervisorEvent::MuteSnapshot { snapshot, .. } if snapshot.muted => {
+                    assert!(snapshot.guard_active);
+                    remuted = true;
+                }
+                AudioSupervisorEvent::CommandRejected { error, .. } => {
+                    panic!("release rejected: {error:?}")
+                }
+                AudioSupervisorEvent::Failed { reason, .. } => panic!("release failed: {reason}"),
+                _ => {}
+            }
+        }
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

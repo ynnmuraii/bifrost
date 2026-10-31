@@ -13,6 +13,10 @@
 //! Privacy reductions bypass the generic native-control queue. Watch withdrawal blanks
 //! metadata at IPC admission; mute/revoke/release wake the independent guard timer.
 //! Admission fences prevent older queued openings from reviving withdrawn authority.
+//! Release-all cancels talk authority, not an independently explicit persistent unmute.
+//! Its epoch fences old grants and native observations even with a full control queue.
+//! A held native key stays fenced across expiry/reset/reconfiguration until a backend
+//! proves physical key-up; only a subsequent fresh press may request talk again.
 #![forbid(unsafe_code)]
 mod clock;
 mod lifecycle;
@@ -449,6 +453,14 @@ where
                     },
                     message=>{
                         if let Some(result)=shared.privacy.admit(request_id,&message) {
+                            if matches!(&message,Msg::PttReleaseAll(_) | Msg::SetMicMute(w::SetMicMute {muted:true,..})) {
+                                ptt_forwarder.fence(
+                                    shared.privacy.native_fence_ns.load(Ordering::Acquire),
+                                    shared.privacy.revoked_through.load(Ordering::Acquire),
+                                );
+                            }
+                            if matches!(result,Ok(false))
+                                && send(&mut link,request_id,Msg::PttEvent(w::PttEvent {grant_id:0,kind:3,reason:2,observed_at_ns:0,expires_at_ns:0})).await.is_err(){break;}
                             if let Err(code)=result {
                                 let response=if code==6 {match &message {
                                     Msg::PttRevoke(revoke)=>Msg::PttEvent(w::PttEvent {grant_id:revoke.grant_id,kind:5,reason:2,observed_at_ns:0,expires_at_ns:0}),

@@ -272,6 +272,7 @@ fn is_core(message: &w::audio_frame::Msg) -> bool {
             | w::audio_frame::Msg::ConfigurePtt(_)
             | w::audio_frame::Msg::PttGrant(_)
             | w::audio_frame::Msg::PttRevoke(_)
+            | w::audio_frame::Msg::PttReleaseAll(_)
             | w::audio_frame::Msg::SetMediaWatch(_)
             | w::audio_frame::Msg::MediaCommand(_)
     )
@@ -312,6 +313,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 | Msg::ConfigurePtt(_)
                 | Msg::PttGrant(_)
                 | Msg::PttRevoke(_)
+                | Msg::PttReleaseAll(_)
                 | Msg::SetMediaWatch(_)
                 | Msg::MediaCommand(_)
                 | Msg::MediaCommandResult(_)
@@ -593,12 +595,22 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 _ => false,
             };
             let scope_valid = if event.grant_id == 0 {
-                event.reason == 0 && matches!(event.kind, 1..=3)
+                match event.kind {
+                    1 | 2 => event.reason == 0,
+                    3 => {
+                        if frame.request_id == 0 {
+                            matches!(event.reason, 1..=4 | 6..=8)
+                        } else {
+                            event.reason == w::PttReleaseReason::Revoked as i32
+                        }
+                    }
+                    _ => false,
+                }
             } else {
                 match event.kind {
                     1 | 2 => event.reason == 0,
                     3 => matches!(event.reason, 1..=4 | 6),
-                    4 => matches!(event.reason, 5 | 7),
+                    4 => matches!(event.reason, 2 | 5 | 7),
                     5 => matches!(event.reason, 2 | 6),
                     _ => false,
                 }
@@ -649,7 +661,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 return Err(invalid());
             }
         }
-        Msg::ReleaseMicMute(_) | Msg::SetMediaWatch(_) => {}
+        Msg::ReleaseMicMute(_) | Msg::PttReleaseAll(_) | Msg::SetMediaWatch(_) => {}
         Msg::Shutdown(_) | Msg::ProbeBackend(_) => {}
     }
     if frame.encoded_len() > protocol::Channel::Ipc.max_frame_len() {

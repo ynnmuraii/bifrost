@@ -60,6 +60,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                 let mut active: Option<(u64, Instant)> = None;
                 let mut persistent = false;
                 let mut saturated = false;
+                let mut release_seen = 0;
                 loop {
                     if reductions(
                         &mut guard,
@@ -68,6 +69,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                         &mut active,
                         &mut persistent,
                         &mut saturated,
+                        &mut release_seen,
                     ) {
                         return guard;
                     }
@@ -104,7 +106,6 @@ impl<M: MuteGuard + 'static> Guard<M> {
                         Command::Set(generation, muted, fence, reply) => {
                             let stale = || {
                                 fence.0 != timer_privacy.epoch.load(Ordering::Acquire)
-                                    || fence.1 != timer_privacy.talk_epoch.load(Ordering::Acquire)
                                     || timer_privacy.failed.load(Ordering::Acquire)
                             };
                             if !muted && stale() {
@@ -131,8 +132,16 @@ impl<M: MuteGuard + 'static> Guard<M> {
                             let _ = reply.send(result);
                         }
                         Command::Grant(id, ttl_ms, deadline, fence, reply) => {
-                            let mut result = if fence.0
-                                != timer_privacy.epoch.load(Ordering::Acquire)
+                            if fence.1 != timer_privacy.talk_epoch.load(Ordering::Acquire) {
+                                timer_privacy
+                                    .revoked_through
+                                    .fetch_max(id, Ordering::AcqRel);
+                            }
+                            let mut result = if id > 0
+                                && id <= timer_privacy.revoked_through.load(Ordering::Acquire)
+                            {
+                                event(id, 4, 2)
+                            } else if fence.0 != timer_privacy.epoch.load(Ordering::Acquire)
                                 || fence.1 != timer_privacy.talk_epoch.load(Ordering::Acquire)
                                 || timer_privacy.failed.load(Ordering::Acquire)
                                 || id == 0
@@ -196,6 +205,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                                 &mut active,
                                 &mut persistent,
                                 &mut saturated,
+                                &mut release_seen,
                             ) {
                                 let _ = reply.send(event(id, 3, 2));
                                 return guard;
@@ -288,6 +298,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
         admitted_at: Instant,
         fence: (u64, u64),
     ) -> w::PttEvent {
+        self.privacy.grant_highwater.fetch_max(id, Ordering::AcqRel);
         let Some(deadline) = admitted_at.checked_add(Duration::from_millis(u64::from(ttl_ms)))
         else {
             return event(id, 3, 1);
@@ -344,7 +355,21 @@ fn reductions(
     active: &mut Option<(u64, Instant)>,
     persistent: &mut bool,
     saturated: &mut bool,
+    release_seen: &mut u64,
 ) -> bool {
+    // This latch is independent of queue capacity; even a saturated priority mailbox
+    // cannot keep an old grant alive or replace an explicit persistent-unmute baseline.
+    let epoch = privacy.release_epoch.load(Ordering::Acquire);
+    if epoch != *release_seen {
+        *release_seen = epoch;
+        if !*persistent {
+            remute(guard, sink);
+        }
+        if let Some((id, _)) = active.take() {
+            sink(0, Msg::PttEvent(event(id, 3, 2)));
+        }
+        publish(guard, sink);
+    }
     if privacy.failed.load(Ordering::Acquire) && !*saturated {
         *saturated = true;
         *persistent = false;
@@ -356,7 +381,17 @@ fn reductions(
     }
     while let Some(reduction) = privacy.next() {
         match reduction {
+            crate::privacy::Reduction::ReleaseAll(request) => {
+                publish(guard, sink);
+                sink(request, Msg::PttEvent(event(0, 3, 2)));
+            }
             crate::privacy::Reduction::Mute(request, generation) => {
+                if let Some((id, _)) = active.take() {
+                    if !*persistent {
+                        remute(guard, sink);
+                    }
+                    sink(0, Msg::PttEvent(event(id, 3, 4)));
+                }
                 match guard.set_capture_mute(generation, true) {
                     Ok(()) => {
                         *persistent = false;
@@ -512,7 +547,7 @@ mod correlation_tests {
                 privacy.active.store(true, Ordering::Release);
                 assert_eq!(
                     privacy.admit(42, &Msg::ReleaseMicMute(w::ReleaseMicMute {})),
-                    Some(Ok(()))
+                    Some(Ok(true))
                 );
                 let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
                 let observed = messages.clone();
@@ -526,7 +561,7 @@ mod correlation_tests {
                     muted: true,
                 };
                 assert!(reductions(
-                    &mut guard, &sink, &privacy, &mut None, &mut false, &mut false
+                    &mut guard, &sink, &privacy, &mut None, &mut false, &mut false, &mut 0
                 ));
                 let messages = crate::lock(&messages);
                 let correlated: Vec<_> = messages.iter().filter(|(id, _)| *id == 42).collect();
@@ -563,7 +598,7 @@ mod correlation_tests {
             muted: false,
         };
         assert!(!reductions(
-            &mut guard, &sink, &privacy, &mut None, &mut true, &mut false
+            &mut guard, &sink, &privacy, &mut None, &mut true, &mut false, &mut 0
         ));
         assert!(crate::lock(&messages).iter().any(|(id, message)| {
             *id == 0
@@ -576,5 +611,53 @@ mod correlation_tests {
                     })
                 )
         }));
+    }
+
+    #[test]
+    fn release_all_latch_survives_a_full_privacy_mailbox_without_overwriting_baseline() {
+        for persistent in [false, true] {
+            let privacy = crate::privacy::Privacy::new();
+            privacy.active.store(true, Ordering::Release);
+            privacy.admit(
+                1,
+                &Msg::PttGrant(w::PttGrant {
+                    grant_id: 7,
+                    ttl_ms: 250,
+                }),
+            );
+            for id in 0..16 {
+                assert_eq!(
+                    privacy.admit(id + 10, &Msg::PttRevoke(w::PttRevoke { grant_id: 99 })),
+                    Some(Ok(true))
+                );
+            }
+            assert_eq!(
+                privacy.admit(90, &Msg::PttReleaseAll(w::PttReleaseAll {})),
+                Some(Err(3))
+            );
+            assert!(!privacy.failed.load(Ordering::Acquire));
+            let sink: EventSink = Arc::new(|_, _| {});
+            let mut guard = ReleaseGuard {
+                restored: false,
+                restore_error: false,
+                snapshot_unavailable_after_restore: false,
+                muted: false,
+            };
+            let mut active = (!persistent).then_some((7, Instant::now() + Duration::from_secs(1)));
+            let mut baseline = persistent;
+            assert!(!reductions(
+                &mut guard,
+                &sink,
+                &privacy,
+                &mut active,
+                &mut baseline,
+                &mut false,
+                &mut 0
+            ));
+            assert!(active.is_none());
+            assert_eq!(guard.muted, !persistent);
+            assert_eq!(baseline, persistent);
+            assert_eq!(privacy.revoked_through.load(Ordering::Acquire), 7);
+        }
     }
 }

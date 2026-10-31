@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, GlobalShortcuts, NewShortcut};
 use ashpd::desktop::CreateSessionOptions;
-use audio_backend::{BackendError, Event, PttHotkey, PTT_LEASE_NS};
+use audio_backend::{BackendError, Event, PttHotkey, PttReleaseReason, PTT_LEASE_NS};
 use futures::channel::mpsc;
 use futures::{select_biased, FutureExt, StreamExt};
 
@@ -33,12 +33,12 @@ struct State {
 }
 
 impl State {
-    fn release(&mut self) {
+    fn release(&mut self, reason: PttReleaseReason) {
         self.held_until = None;
         self.events
             .retain(|event| !matches!(event, Event::PttPressed { .. } | Event::PttRenewed { .. }));
-        if !matches!(self.events.back(), Some(Event::PttReleased)) {
-            self.push(Event::PttReleased);
+        if self.events.back() != Some(&Event::PttReleased { reason }) {
+            self.push(Event::PttReleased { reason });
         }
     }
 
@@ -50,7 +50,9 @@ impl State {
         if self.events.len() >= QUEUE_CAPACITY {
             self.held_until = None;
             self.events.clear();
-            self.events.push_back(Event::PttReleased);
+            self.events.push_back(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            });
             self.events.push_back(Event::ResyncRequired);
             return;
         }
@@ -75,7 +77,11 @@ impl State {
             return;
         };
         if now == 0 || now >= expiry {
-            self.release();
+            self.release(if now == 0 {
+                PttReleaseReason::UnavailableOrReset
+            } else {
+                PttReleaseReason::LeaseExpired
+            });
         } else if now.saturating_sub(self.renewed_at) >= RENEW_NS {
             let expires_at_ns = now.saturating_add(PTT_LEASE_NS);
             self.held_until = Some(expires_at_ns);
@@ -112,7 +118,10 @@ impl PortalPtt {
             {
                 runtime.block_on(worker(receiver, &worker_state));
             }
-            worker_state.lock().unwrap().release();
+            worker_state
+                .lock()
+                .unwrap()
+                .release(PttReleaseReason::UnavailableOrReset);
             let _ = done_tx.send(());
         });
         Self {
@@ -181,7 +190,7 @@ impl PortalPtt {
             .ok_or(BackendError::Stopped)?;
         // Invalidate first, including when a busy/disconnected command queue refuses admission.
         state.generation = generation;
-        state.release();
+        state.release(PttReleaseReason::UnavailableOrReset);
         self.commands
             .as_mut()
             .ok_or(BackendError::Stopped)?
@@ -196,13 +205,16 @@ impl PortalPtt {
             .held_until
             .is_some_and(|expiry| monotonic_ns() >= expiry)
         {
-            state.release();
+            state.release(PttReleaseReason::LeaseExpired);
         }
         state.events.pop_front()
     }
 
     pub(crate) fn shutdown(&mut self) {
-        self.state.lock().unwrap().release();
+        self.state
+            .lock()
+            .unwrap()
+            .release(PttReleaseReason::UnavailableOrReset);
         self.commands.take();
         if self.done.recv_timeout(Duration::from_millis(500)).is_ok() {
             if let Some(thread) = self.thread.take() {
@@ -243,7 +255,7 @@ async fn worker(mut commands: mpsc::Receiver<Configuration>, state: &Arc<Mutex<S
             {
                 let mut current = state.lock().unwrap();
                 if current.generation == configuration.generation {
-                    current.release();
+                    current.release(PttReleaseReason::UnavailableOrReset);
                     current.push(Event::ResyncRequired);
                 }
             }
@@ -358,7 +370,7 @@ async fn run_configuration(
             }
             match edge {
                 Edge::Press => current.press(monotonic_ns()),
-                Edge::Release => current.release(),
+                Edge::Release => current.release(PttReleaseReason::PhysicalKeyUp),
                 Edge::Tick => current.tick(monotonic_ns()),
             }
         }
@@ -377,7 +389,7 @@ async fn run_configuration(
     {
         let mut current = state.lock().unwrap();
         if current.generation == generation {
-            current.release();
+            current.release(PttReleaseReason::UnavailableOrReset);
         }
     }
     // Session.Close aborts related interactions too, including a pending BindShortcuts dialog.
@@ -506,7 +518,12 @@ mod tests {
             Some(Event::PttRenewed { .. })
         ));
         state.tick(1 + RENEW_NS + PTT_LEASE_NS);
-        assert_eq!(state.events.pop_front(), Some(Event::PttReleased));
+        assert_eq!(
+            state.events.pop_front(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::LeaseExpired,
+            })
+        );
         state.tick(1_000_000_000);
         assert!(state.held_until.is_none());
         assert!(state.events.is_empty());
@@ -516,16 +533,23 @@ mod tests {
     fn release_cancellation_and_overflow_fail_closed() {
         let mut state = State::default();
         state.press(1);
-        state.release();
-        assert_eq!(state.events.pop_front(), Some(Event::PttReleased));
+        state.release(PttReleaseReason::PhysicalKeyUp);
+        assert_eq!(
+            state.events.pop_front(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            })
+        );
         state.press(2);
         for _ in 0..QUEUE_CAPACITY {
             state.push(Event::ResyncRequired);
         }
         assert!(state.held_until.is_none());
-        assert!(state.events.contains(&Event::PttReleased));
+        assert!(state.events.contains(&Event::PttReleased {
+            reason: PttReleaseReason::UnavailableOrReset,
+        }));
         assert!(state.events.len() <= QUEUE_CAPACITY);
-        state.release();
+        state.release(PttReleaseReason::UnavailableOrReset);
         state.tick(100_000_002);
         assert!(!state
             .events
@@ -542,10 +566,97 @@ mod tests {
         assert_eq!(state.events.len(), 2);
         assert!(matches!(state.events[0], Event::PttPressed { .. }));
         assert!(matches!(state.events[1], Event::PttRenewed { .. }));
-        state.release();
+        state.release(PttReleaseReason::UnavailableOrReset);
         state.press(RENEW_NS * 2 + 2);
-        assert!(matches!(state.events[0], Event::PttReleased));
+        assert_eq!(
+            state.events[0],
+            Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            }
+        );
         assert!(matches!(state.events[1], Event::PttPressed { .. }));
+    }
+
+    #[test]
+    fn physical_release_is_not_coalesced_with_synthetic_closure() {
+        for reason in [
+            PttReleaseReason::LeaseExpired,
+            PttReleaseReason::UnavailableOrReset,
+        ] {
+            let mut state = State::default();
+            state.press(1);
+            state.release(reason);
+            state.release(PttReleaseReason::PhysicalKeyUp);
+            assert_eq!(
+                state.events.pop_front(),
+                Some(Event::PttReleased { reason })
+            );
+            assert_eq!(
+                state.events.pop_front(),
+                Some(Event::PttReleased {
+                    reason: PttReleaseReason::PhysicalKeyUp,
+                })
+            );
+            assert!(state.events.is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_clock_closes_without_claiming_physical_release() {
+        let mut state = State::default();
+        state.press(1);
+        state.tick(0);
+        assert_eq!(
+            state.events.pop_front(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
+        assert!(state.held_until.is_none());
+        assert!(state.events.is_empty());
+    }
+
+    #[test]
+    fn reconfiguration_and_shutdown_never_claim_physical_release() {
+        let (commands, receiver) = mpsc::channel(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        drop(done_tx);
+        let state = Arc::new(Mutex::new(State::default()));
+        let mut ptt = PortalPtt {
+            commands: Some(commands),
+            state: state.clone(),
+            thread: None,
+            done,
+        };
+        state.lock().unwrap().press(1);
+        ptt.configure(None, &[]).unwrap();
+        assert_eq!(
+            state.lock().unwrap().events.pop_front(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
+        drop(receiver);
+        state.lock().unwrap().press(2);
+        assert_eq!(
+            ptt.configure(None, &[]),
+            Err(BackendError::ServerUnavailable)
+        );
+        assert_eq!(
+            state.lock().unwrap().events.pop_front(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
+        state.lock().unwrap().press(3);
+        ptt.shutdown();
+        assert_eq!(
+            state.lock().unwrap().events.pop_front(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
+        assert!(state.lock().unwrap().held_until.is_none());
     }
 
     #[test]

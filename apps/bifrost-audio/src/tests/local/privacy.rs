@@ -33,13 +33,13 @@ fn list() -> Msg {
 // The backend handshake, not a sleep, proves generic control cannot drain the queue.
 #[tokio::test]
 async fn privacy_reductions_bypass_a_full_blocked_audio_link_queue() {
-    for mode in 0..3 {
+    for mode in 0..4 {
         let (mut fixture, script) = scripted::child(2).await;
         fixture.core.send(2, acquire()).await.unwrap();
         let Msg::MuteSnapshot(owned) = correlated(&mut fixture, 2).await else {
             panic!("acquisition missing")
         };
-        if mode == 1 {
+        if mode == 1 || mode == 3 {
             fixture
                 .core
                 .send(
@@ -128,7 +128,8 @@ async fn privacy_reductions_bypass_a_full_blocked_audio_link_queue() {
                 muted: true,
             }),
             1 => Msg::PttRevoke(w::PttRevoke { grant_id: 77 }),
-            _ => Msg::ReleaseMicMute(w::ReleaseMicMute {}),
+            2 => Msg::ReleaseMicMute(w::ReleaseMicMute {}),
+            _ => Msg::PttReleaseAll(w::PttReleaseAll {}),
         };
         fixture.core.send(91, reduction).await.unwrap();
         let response = correlated(&mut fixture, 91).await;
@@ -150,11 +151,20 @@ async fn privacy_reductions_bypass_a_full_blocked_audio_link_queue() {
                     ..
                 })
             )),
-            _ => assert!(matches!(
+            2 => assert!(matches!(
                 response,
                 Msg::MuteSnapshot(w::MuteSnapshot {
                     muted: false,
                     guard_active: false,
+                    ..
+                })
+            )),
+            _ => assert!(matches!(
+                response,
+                Msg::PttEvent(w::PttEvent {
+                    grant_id: 0,
+                    kind: 3,
+                    reason: 2,
                     ..
                 })
             )),
@@ -173,10 +183,20 @@ async fn privacy_reductions_bypass_a_full_blocked_audio_link_queue() {
                 let received = fixture.core.recv().await.unwrap();
                 let id = received.frame.request_id;
                 if (10..=12).contains(&id) {
-                    assert!(matches!(
-                        received.frame.msg,
-                        Some(Msg::Error(_)) | Some(Msg::PttEvent(w::PttEvent { kind: 3..=5, .. }))
-                    ));
+                    if id == 10 && matches!(mode, 1 | 3) {
+                        // Talk cancellation must not overwrite an independently explicit
+                        // persistent-unmute command already admitted to the generic queue.
+                        assert!(matches!(
+                            received.frame.msg,
+                            Some(Msg::MuteSnapshot(w::MuteSnapshot { muted: false, .. }))
+                        ));
+                    } else {
+                        assert!(matches!(
+                            received.frame.msg,
+                            Some(Msg::Error(_))
+                                | Some(Msg::PttEvent(w::PttEvent { kind: 3..=5, .. }))
+                        ));
+                    }
                     rejected[(id - 10) as usize] = true;
                 }
             }

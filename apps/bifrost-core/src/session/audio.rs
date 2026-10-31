@@ -1774,6 +1774,7 @@ impl Actor {
                         }
                         crate::audio::AudioPrivacyOperation::MuteMicrophone => "mute_microphone",
                         crate::audio::AudioPrivacyOperation::RevokePtt => "revoke_ptt",
+                        crate::audio::AudioPrivacyOperation::ReleaseAllPtt => "release_all_ptt",
                         crate::audio::AudioPrivacyOperation::ReleaseMicMute => "release_mic_mute",
                         crate::audio::AudioPrivacyOperation::StopSession => "stop_session",
                     };

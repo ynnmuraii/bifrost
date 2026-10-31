@@ -194,6 +194,10 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
         .await
         .unwrap();
     ptt(&mut fixture, 30, 3).await;
+    // Earlier explicit mute fenced native holds. Reconfiguration is not proof of
+    // key-up: the scripted backend must report an actual physical release first.
+    script.send(Script::Event(ScriptEvent::PttRelease)).unwrap();
+    assert_eq!(ptt(&mut fixture, 0, 3).await.reason, 8);
 
     let observed = advance(&script);
     script.send(Script::Event(ScriptEvent::PttPress)).unwrap();
@@ -217,8 +221,24 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
         renewed.expires_at_ns,
         renewed_at + audio_backend::PTT_LEASE_NS
     );
+    fixture
+        .core
+        .send(31, Msg::PttReleaseAll(w::PttReleaseAll {}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response(&mut fixture, 31).await,
+        Msg::PttEvent(w::PttEvent {
+            grant_id: 0,
+            kind: 3,
+            reason: 2,
+            ..
+        })
+    ));
+    // The native key is still held. A queued renewal cannot resurrect its lease.
+    script.send(Script::Event(ScriptEvent::PttRenew)).unwrap();
     script.send(Script::Event(ScriptEvent::PttRelease)).unwrap();
-    ptt(&mut fixture, 0, 3).await;
+    assert_eq!(ptt(&mut fixture, 0, 3).await.reason, 8);
 
     let observed = advance(&script);
     script.send(Script::Event(ScriptEvent::PttPress)).unwrap();

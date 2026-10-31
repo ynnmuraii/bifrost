@@ -133,12 +133,22 @@ fn shared_backend_ptt_registration_collision_and_cleanup_without_input() {
     );
     assert!(contender.configure_ptt(Some(key), &[]).is_err());
     owner.configure_ptt(None, &[]).unwrap();
-    assert!(matches!(owner.poll_event(), Some(Event::PttReleased)));
+    assert!(matches!(
+        owner.poll_event(),
+        Some(Event::PttReleased {
+            reason: audio_backend::PttReleaseReason::UnavailableOrReset,
+        })
+    ));
     contender
         .configure_ptt(Some(key), &[])
         .expect("explicit unregister must free the chord");
     contender.configure_ptt(None, &[]).unwrap();
-    assert!(matches!(contender.poll_event(), Some(Event::PttReleased)));
+    assert!(matches!(
+        contender.poll_event(),
+        Some(Event::PttReleased {
+            reason: audio_backend::PttReleaseReason::UnavailableOrReset,
+        })
+    ));
     assert!(!matches!(
         owner.poll_event(),
         Some(Event::PttPressed { .. } | Event::PttRenewed { .. })

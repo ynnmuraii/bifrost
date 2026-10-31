@@ -464,6 +464,17 @@ pub enum DeviceEvent {
     Invalidated(DeviceId),
 }
 
+/// Provenance of a closed PTT gate; only a native key-up observation ends a physical hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PttReleaseReason {
+    /// A backend observed the physical release edge, independently of lease state.
+    PhysicalKeyUp,
+    /// The held press exceeded its absolute observation deadline.
+    LeaseExpired,
+    /// Observation was lost or invalidated; the physical key may still be held.
+    UnavailableOrReset,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Device(DeviceEvent),
@@ -491,7 +502,9 @@ pub enum Event {
     PttRenewed {
         expires_at_ns: u64,
     },
-    PttReleased,
+    PttReleased {
+        reason: PttReleaseReason,
+    },
     /// Queue overflow: refresh device/default/mute/media snapshots and revoke all PTT grants.
     ResyncRequired,
 }
