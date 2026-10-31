@@ -30,7 +30,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Recover Listener health when valid decoded PCM resumes after Wi-Fi loss instead of retaining a permanent degraded label; distinguish jitter rebuffer episodes from native zero-fill callbacks, keep peer receiver quality separate from local Source state, and fall back safely when a native render position stops advancing.
 - Document Listener-first authenticated UDP hole punching and one-second idle traffic as runtime invariants; report bounded path-probe/authentication observations on health and terminal timeouts without guessing which firewall blocked traffic.
 - Keep audio-child lifecycle and path-failure diagnostics in a separate bounded rotating log while retaining null stdio; log only allowlisted scalar fields and prevent dependency traces from exposing session keys, now-playing metadata or PCM, including at DEBUG level.
-- Release-all talk cancellation bypasses full control queues, fences stale grants and held native keys, and preserves explicitly persistent unmute; only a proven physical key-up can rearm native push-to-talk after a safety fence.
+- Release-all talk cancellation bypasses full control queues, fences stale grants and held native keys, and preserves explicitly persistent unmute. Newer explicit mute invalidates older queued unmute; targeted revoke cannot cancel a newer grant, and old release-all never replays into new mic ownership.
+- Report native PTT registration and arming separately; rearming needs configured-key release or a distinct trusted portal logical release in the current safety epoch. Saturated supervisor safety admission reaps the child; genuine releases survive bounded Dry/Linux queue overflow.
+- Fail closed on unverifiable portal clocks, including current KDE zero timestamps and mapped events older than 250 ms; delayed first events may also disable native PTT. GUI hold-to-talk remains available independently.
 
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
@@ -132,7 +134,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Внутренний аудиотракт**
 
-- Общий отзыв разрешений говорить обходит заполненные очереди, блокирует старые продления и удерживаемые нативные клавиши, сохраняя явное постоянное включение микрофона; после защитного отзыва нативный PTT возобновляется только при подтверждённом физическом отпускании и новом нажатии.
+- Общий отзыв разрешений говорить обходит заполненные очереди и сохраняет явное постоянное включение микрофона. Новое mute отменяет старое отложенное unmute; адресный отзыв не отменяет новое разрешение, а старый общий отзыв не применяется к новому владению микрофоном.
+- Регистрация нативной PTT отделена от готовности: нужны отпускание настроенной клавиши либо отдельное доверенное логическое отпускание портала в текущей эпохе защиты. Переполнение защитной очереди супервизора завершает дочерний процесс; реальные отпускания сохраняются при переполнении Dry/Linux.
+- Непроверяемые часы портала, включая нулевые метки текущего KDE и события старше 250 мс, закрывают нативную PTT; задержка первого события тоже может сделать её недоступной. Кнопка «удерживать для разговора» в интерфейсе остаётся независимой.
 
 - Состояние Listener восстанавливается после возобновления декодированного PCM при потерях Wi-Fi, а не остаётся навсегда ухудшенным; эпизоды повторного буферизования отделены от нативных callback с заполнением тишиной, отчёты удалённого приёмника — от локального состояния Source, а остановившаяся нативная позиция безопасно переключается на резервные часы.
 - Закреплены инварианты исходящего аутентифицированного UDP-запроса Listener до ожидания Source и секундного служебного трафика; Health и завершение по тайм-ауту передают ограниченные наблюдения проверки пути и аутентификации без догадок о виновном брандмауэре.

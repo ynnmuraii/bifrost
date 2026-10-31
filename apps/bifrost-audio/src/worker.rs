@@ -332,6 +332,7 @@ where
                     self.response(
                         id,
                         Msg::PttEvent(w::PttEvent {
+                            safety_epoch: 0,
                             kind: 3,
                             observed_at_ns: 0,
                             expires_at_ns: 0,
@@ -652,9 +653,11 @@ where
         if let (Some(pump), Some(backend)) = (self.control_pump, self.backend.as_mut()) {
             pump(backend);
         }
+        self.mic_controls.begin_native_events();
         for _ in 0..8 {
             let event = self.backend.as_mut().and_then(Backend::poll_event);
             let Some(event) = event else {
+                self.mic_controls.native_queue_drained();
                 break;
             };
             for session in &mut self.sessions {

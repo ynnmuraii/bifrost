@@ -43,8 +43,9 @@ pub enum ScriptEvent {
     TimeoutMediaRequest {
         request_id: u64,
     },
+    /// Physical down edge; repeats cannot reopen a cancelled lease before physical up.
     PttPress,
-    /// Proven physical key-up, including after a lease expired or its queue overflowed.
+    /// Physical up edge; emits proof only if a scripted physical key was actually down.
     PttRelease,
     PttRenew,
     /// Absolute logical monotonic time; also expires held PTT without hidden wall clocks.
@@ -77,7 +78,9 @@ struct State {
     completions: VecDeque<Event>,
     last_media_command: Option<MediaCommandRequest>,
     hotkey: Option<PttHotkey>,
-    pressed: bool,
+    physical_down: bool,
+    // One positive edge survives queue overflow; synthetic closures cannot replace it.
+    pending_physical_up: bool,
     now_ns: u64,
     ptt_expires_at_ns: Option<u64>,
     unavailable: Option<BackendError>,
@@ -90,18 +93,35 @@ impl State {
 
     fn emit(&mut self, event: Event) {
         if self.events.len() == EVENT_CAPACITY {
-            self.events.pop_front();
+            if self.events.pop_front()
+                == Some(Event::PttReleased {
+                    reason: PttReleaseReason::PhysicalKeyUp,
+                })
+            {
+                self.pending_physical_up = true;
+            }
             self.overflowed = true;
-            self.pressed = false;
             self.ptt_expires_at_ns = None;
         }
-        self.events.push_back(event);
+        if self.overflowed
+            && event
+                == (Event::PttReleased {
+                    reason: PttReleaseReason::PhysicalKeyUp,
+                })
+        {
+            self.pending_physical_up = true;
+        } else {
+            self.events.push_back(event);
+        }
     }
 
     fn release_ptt(&mut self, reason: PttReleaseReason) {
-        self.ptt_expires_at_ns = None;
-        if self.pressed || reason == PttReleaseReason::PhysicalKeyUp {
-            self.pressed = false;
+        let leased = self.ptt_expires_at_ns.take().is_some();
+        let physical_up = reason == PttReleaseReason::PhysicalKeyUp && self.physical_down;
+        if physical_up {
+            self.physical_down = false;
+        }
+        if physical_up || (leased && reason != PttReleaseReason::PhysicalKeyUp) {
             self.emit(Event::PttReleased { reason });
         }
     }
@@ -205,7 +225,8 @@ impl DryBackend {
                 completions: VecDeque::with_capacity(MEDIA_REQUEST_CAPACITY),
                 last_media_command: None,
                 hotkey: None,
-                pressed: false,
+                physical_down: false,
+                pending_physical_up: false,
                 now_ns: 0,
                 ptt_expires_at_ns: None,
                 unavailable: None,
@@ -381,13 +402,17 @@ impl DryBackend {
                     return Err(BackendError::Unsupported);
                 }
                 state.available()?;
-                if !state.pressed {
+                if !state.physical_down {
+                    state.physical_down = true;
+                    if state.overflowed || state.pending_physical_up {
+                        return Ok(());
+                    }
                     let expires_at_ns = state
                         .now_ns
                         .checked_add(PTT_LEASE_NS)
                         .ok_or(BackendError::InvalidArgument)?;
                     let observed_at_ns = state.now_ns;
-                    state.pressed = true;
+                    // Lease state is independent of the physical hold.
                     state.ptt_expires_at_ns = Some(expires_at_ns);
                     state.emit(Event::PttPressed {
                         observed_at_ns,
@@ -397,7 +422,7 @@ impl DryBackend {
             }
             ScriptEvent::PttRenew => {
                 state.available()?;
-                if !state.pressed {
+                if state.ptt_expires_at_ns.is_none() {
                     return Err(BackendError::Stopped);
                 }
                 let expires_at_ns = state
@@ -420,7 +445,7 @@ impl DryBackend {
                 }
             }
             ScriptEvent::PttRelease => {
-                if !self.capabilities.global_ptt || state.hotkey.is_none() {
+                if !self.capabilities.global_ptt {
                     return Err(BackendError::Unsupported);
                 }
                 state.release_ptt(PttReleaseReason::PhysicalKeyUp);
@@ -745,6 +770,14 @@ impl Backend for DryBackend {
         let mut state = lock(&self.state);
         if state.overflowed {
             state.overflowed = false;
+            if state.events.iter().any(|event| {
+                *event
+                    == (Event::PttReleased {
+                        reason: PttReleaseReason::PhysicalKeyUp,
+                    })
+            }) {
+                state.pending_physical_up = true;
+            }
             state.events.retain(|event| {
                 !matches!(
                     event,
@@ -752,6 +785,12 @@ impl Backend for DryBackend {
                 )
             });
             return Some(Event::ResyncRequired);
+        }
+        if state.pending_physical_up {
+            state.pending_physical_up = false;
+            return Some(Event::PttReleased {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            });
         }
         state
             .completions

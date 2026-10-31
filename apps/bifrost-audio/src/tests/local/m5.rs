@@ -17,6 +17,7 @@ async fn response(fixture: &mut Fixture, request_id: u64) -> Msg {
                     | Msg::MuteSnapshot(_)
                     | Msg::SessionEvent(_)
                     | Msg::PttEvent(_)
+                    | Msg::PttStatus(_)
             ));
         }
     })
@@ -47,7 +48,11 @@ async fn ptt(fixture: &mut Fixture, request_id: u64, kind: i32) -> w::PttEvent {
                     }
                     return event;
                 }
-                Msg::Pong(_) | Msg::Health(_) | Msg::MuteSnapshot(_) | Msg::SessionEvent(_) => {
+                Msg::Pong(_)
+                | Msg::Health(_)
+                | Msg::MuteSnapshot(_)
+                | Msg::SessionEvent(_)
+                | Msg::PttStatus(_) => {
                     assert_eq!(received.frame.request_id, 0);
                 }
                 other => panic!("unexpected PTT response: {other:?}"),
@@ -196,6 +201,21 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
     ptt(&mut fixture, 30, 3).await;
     // Earlier explicit mute fenced native holds. Reconfiguration is not proof of
     // key-up: the scripted backend must report an actual physical release first.
+    // Confirm a worker/backend quiescence boundary before the actual arming cycle.
+    fixture
+        .core
+        .send(301, Msg::ProbeBackend(w::ProbeBackend {}))
+        .await
+        .unwrap();
+    response(&mut fixture, 301).await;
+    fixture
+        .core
+        .send(302, Msg::ProbeBackend(w::ProbeBackend {}))
+        .await
+        .unwrap();
+    response(&mut fixture, 302).await;
+    advance(&script);
+    script.send(Script::Event(ScriptEvent::PttPress)).unwrap();
     script.send(Script::Event(ScriptEvent::PttRelease)).unwrap();
     assert_eq!(ptt(&mut fixture, 0, 3).await.reason, 8);
 
@@ -236,6 +256,18 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
         })
     ));
     // The native key is still held. A queued renewal cannot resurrect its lease.
+    fixture
+        .core
+        .send(303, Msg::ProbeBackend(w::ProbeBackend {}))
+        .await
+        .unwrap();
+    response(&mut fixture, 303).await;
+    fixture
+        .core
+        .send(304, Msg::ProbeBackend(w::ProbeBackend {}))
+        .await
+        .unwrap();
+    response(&mut fixture, 304).await;
     script.send(Script::Event(ScriptEvent::PttRenew)).unwrap();
     script.send(Script::Event(ScriptEvent::PttRelease)).unwrap();
     assert_eq!(ptt(&mut fixture, 0, 3).await.reason, 8);
@@ -282,7 +314,7 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
                             assert_eq!(event.expires_at_ns, 0);
                             break;
                         }
-                        Msg::Health(_) | Msg::MuteSnapshot(_) => {}
+                        Msg::Health(_) | Msg::MuteSnapshot(_) | Msg::PttStatus(_) => {}
                         other => panic!("unexpected blocked-worker response: {other:?}"),
                     }
                 }
@@ -316,7 +348,7 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
                         assert_eq!(event.observed_at_ns, 0);
                         assert_eq!(event.expires_at_ns, 0);
                     }
-                    Msg::Pong(_) | Msg::Health(_) | Msg::MuteSnapshot(_) => {}
+                    Msg::Pong(_) | Msg::Health(_) | Msg::MuteSnapshot(_) | Msg::PttStatus(_) => {}
                     other => panic!("unexpected stale-event response: {other:?}"),
                 }
             }
@@ -596,6 +628,7 @@ async fn native_windows_child_registers_and_releases_ptt_without_input() {
                         pongs += 1;
                     }
                     Msg::Health(_) => {}
+                    Msg::PttStatus(status) => assert_ne!(status.state,1,"registration alone cannot arm native PTT"),
                     other => panic!("registration without input invented an event: {other:?}"),
                 }
             }

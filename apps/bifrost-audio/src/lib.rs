@@ -428,8 +428,12 @@ where
             _=check.tick()=>{
                 if shared.stopping.load(Ordering::Acquire){break;}
                 let now=Instant::now();
-                if let Some(event)=ptt_forwarder.expire(now) {
+                if let Some(mut event)=ptt_forwarder.expire(now) {
+                    shared.privacy.fence_native(clock::now_ns());
+                    event.safety_epoch=shared.privacy.native_epoch.load(Ordering::Acquire);
+                    ptt_forwarder.fence(shared.privacy.native_fence_ns.load(Ordering::Acquire),shared.privacy.revoked_through.load(Ordering::Acquire));
                     if send(&mut link,0,Msg::PttEvent(event)).await.is_err(){break;}
+                    if send(&mut link,0,Msg::PttStatus(shared.privacy.fenced_status(clock::now_ns()))).await.is_err(){break;}
                 }
                 if !shared.has_source(now) {shared.media_enabled.store(false,Ordering::Release);}
                 if media_present && !shared.media_enabled.load(Ordering::Acquire) {
@@ -458,12 +462,13 @@ where
                                     shared.privacy.native_fence_ns.load(Ordering::Acquire),
                                     shared.privacy.revoked_through.load(Ordering::Acquire),
                                 );
+                                if send(&mut link,0,Msg::PttStatus(shared.privacy.fenced_status(clock::now_ns()))).await.is_err(){break;}
                             }
                             if matches!(result,Ok(false))
-                                && send(&mut link,request_id,Msg::PttEvent(w::PttEvent {grant_id:0,kind:3,reason:2,observed_at_ns:0,expires_at_ns:0})).await.is_err(){break;}
+                                && send(&mut link,request_id,Msg::PttEvent(w::PttEvent {grant_id:0,kind:3,reason:2,observed_at_ns:0,expires_at_ns:0,safety_epoch:shared.privacy.native_epoch.load(Ordering::Acquire)})).await.is_err(){break;}
                             if let Err(code)=result {
                                 let response=if code==6 {match &message {
-                                    Msg::PttRevoke(revoke)=>Msg::PttEvent(w::PttEvent {grant_id:revoke.grant_id,kind:5,reason:2,observed_at_ns:0,expires_at_ns:0}),
+                                    Msg::PttRevoke(revoke)=>Msg::PttEvent(w::PttEvent {grant_id:revoke.grant_id,kind:5,reason:2,observed_at_ns:0,expires_at_ns:0,safety_epoch:0}),
                                     _=>Msg::Error(w::Error {code,session_id:Vec::new()}),
                                 }} else {Msg::Error(w::Error {code,session_id:Vec::new()})};
                                 if send(&mut link,request_id,response).await.is_err(){break;}
@@ -499,8 +504,13 @@ where
                 Some(response)=>{
                     let message=match response.message {
                         Msg::PttEvent(event)=>{
+                            if response.request_id==0 && event.grant_id==0 && event.safety_epoch!=shared.privacy.native_epoch.load(Ordering::Acquire){continue;}
                             let Some(event)=ptt_forwarder.accept(event,clock::now_ns(),Instant::now()) else{continue;};
                             Msg::PttEvent(event)
+                        },
+                        Msg::PttStatus(status)=>{
+                            if status.safety_epoch!=shared.privacy.native_epoch.load(Ordering::Acquire){continue;}
+                            Msg::PttStatus(status)
                         },
                         Msg::MediaSessions(mut snapshot)=>{
                             if !shared.media_enabled.load(Ordering::Acquire) || !shared.has_source(Instant::now()) {
