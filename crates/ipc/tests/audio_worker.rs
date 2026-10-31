@@ -497,6 +497,7 @@ fn m5_m6_requests() -> Vec<Msg> {
             binding: Some(hotkey(0x04)),
             reserved: vec![hotkey(0x05)],
         }),
+        Msg::PttReleaseAll(w::PttReleaseAll {}),
         Msg::SetMediaWatch(w::SetMediaWatch { enabled: true }),
         Msg::MediaCommand(w::MediaCommand {
             token: 1,
@@ -518,6 +519,7 @@ fn m5_m6_responses() -> Vec<Msg> {
             kind: 3,
             observed_at_ns: 0,
             expires_at_ns: 0,
+            reason: w::PttReleaseReason::Revoked as i32,
             ..Default::default()
         }),
         Msg::MediaSessions(media_snapshot()),
@@ -528,7 +530,7 @@ fn m5_m6_responses() -> Vec<Msg> {
 #[test]
 fn m5_m6_exact_tags_and_outer_request_correlations() {
     let messages = m5_m6_requests().into_iter().chain(m5_m6_responses());
-    for (message, tag) in messages.zip([18u32, 19, 20, 21, 30, 31, 47, 48, 60, 61]) {
+    for (message, tag) in messages.zip([18u32, 19, 20, 21, 71, 30, 31, 47, 48, 60, 61]) {
         // A minimal envelope contains only the oneof field and its length-delimited body.
         let encoded = w::AudioFrame {
             msg: Some(message.clone()),
@@ -676,6 +678,11 @@ fn ptt_event_timestamps_do_not_wrap_or_extend_press_grants() {
                     kind,
                     observed_at_ns,
                     expires_at_ns,
+                    reason: if kind == 3 {
+                        w::PttReleaseReason::Revoked as i32
+                    } else {
+                        0
+                    },
                     ..Default::default()
                 })))
                 .is_ok(),
@@ -703,11 +710,15 @@ fn remote_talk_grants_are_bounded_and_distinct_from_physical_observations() {
     }
     for (kind, reason, valid) in [
         (3, 1, true),
+        (4, 2, true),
         (4, 5, true),
         (5, 6, true),
         (3, 0, false),
         (4, 6, false),
         (5, 5, false),
+        (3, 8, false),
+        (3, 9, false),
+        (3, i32::MAX, false),
     ] {
         assert_eq!(
             contract::validate_frame(&frame(Msg::PttEvent(w::PttEvent {
@@ -719,6 +730,27 @@ fn remote_talk_grants_are_bounded_and_distinct_from_physical_observations() {
             .is_ok(),
             valid
         );
+    }
+}
+
+#[test]
+fn release_all_and_physical_release_have_distinct_provenance() {
+    for request_id in [0, 1] {
+        let mut request = frame(Msg::PttReleaseAll(w::PttReleaseAll {}));
+        request.request_id = request_id;
+        assert_eq!(contract::validate_frame(&request).is_ok(), request_id != 0);
+        for reason in [-1, 0, 2, 7, 8, 9, i32::MAX] {
+            let mut event = frame(Msg::PttEvent(w::PttEvent {
+                kind: 3,
+                reason,
+                ..Default::default()
+            }));
+            event.request_id = request_id;
+            assert_eq!(
+                contract::validate_frame(&event).is_ok(),
+                reason == 2 || matches!(reason, 7 | 8) && request_id == 0,
+            );
+        }
     }
 }
 

@@ -44,6 +44,7 @@ pub enum ScriptEvent {
         request_id: u64,
     },
     PttPress,
+    /// Proven physical key-up, including after a lease expired or its queue overflowed.
     PttRelease,
     PttRenew,
     /// Absolute logical monotonic time; also expires held PTT without hidden wall clocks.
@@ -97,11 +98,11 @@ impl State {
         self.events.push_back(event);
     }
 
-    fn release_ptt(&mut self) {
+    fn release_ptt(&mut self, reason: PttReleaseReason) {
         self.ptt_expires_at_ns = None;
-        if self.pressed {
+        if self.pressed || reason == PttReleaseReason::PhysicalKeyUp {
             self.pressed = false;
-            self.emit(Event::PttReleased);
+            self.emit(Event::PttReleased { reason });
         }
     }
 
@@ -270,7 +271,7 @@ impl DryBackend {
                     }
                 }
                 set_defaults(&mut state, defaults)?;
-                state.release_ptt();
+                state.release_ptt(PttReleaseReason::UnavailableOrReset);
             }
             ScriptEvent::InvalidateDevice(id) => {
                 if !state.devices.contains_key(&id) {
@@ -282,7 +283,7 @@ impl DryBackend {
                 endpoint.generation = generation;
                 endpoint.leased = false;
                 state.emit(Event::Device(DeviceEvent::Invalidated(id)));
-                state.release_ptt();
+                state.release_ptt(PttReleaseReason::UnavailableOrReset);
             }
             ScriptEvent::SetDefaults(defaults) => set_defaults(&mut state, defaults)?,
             ScriptEvent::SetMute { device, muted } => {
@@ -415,17 +416,17 @@ impl DryBackend {
                     .ptt_expires_at_ns
                     .is_some_and(|expires| expires <= now_ns)
                 {
-                    state.release_ptt();
+                    state.release_ptt(PttReleaseReason::LeaseExpired);
                 }
             }
             ScriptEvent::PttRelease => {
                 if !self.capabilities.global_ptt || state.hotkey.is_none() {
                     return Err(BackendError::Unsupported);
                 }
-                state.release_ptt();
+                state.release_ptt(PttReleaseReason::PhysicalKeyUp);
             }
             ScriptEvent::CancelPtt(_) => {
-                state.release_ptt();
+                state.release_ptt(PttReleaseReason::UnavailableOrReset);
                 // Session loss requires explicit re-registration before accepting new presses.
                 state.hotkey = None;
             }
@@ -440,7 +441,7 @@ impl DryBackend {
                 if let Some(error) = error {
                     cancel_requests(&mut state, None, error);
                 }
-                state.release_ptt();
+                state.release_ptt(PttReleaseReason::UnavailableOrReset);
                 state.emit(Event::ResyncRequired);
             }
         }
@@ -735,7 +736,7 @@ impl Backend for DryBackend {
         }
         let mut state = lock(&self.state);
         state.available()?;
-        state.release_ptt();
+        state.release_ptt(PttReleaseReason::UnavailableOrReset);
         state.hotkey = hotkey;
         Ok(())
     }
@@ -747,7 +748,7 @@ impl Backend for DryBackend {
             state.events.retain(|event| {
                 !matches!(
                     event,
-                    Event::PttPressed { .. } | Event::PttRenewed { .. } | Event::PttReleased
+                    Event::PttPressed { .. } | Event::PttRenewed { .. } | Event::PttReleased { .. }
                 )
             });
             return Some(Event::ResyncRequired);

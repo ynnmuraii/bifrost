@@ -6,6 +6,7 @@
 //! events, worker stalls, shutdown and lost releases must all close the gate.
 
 use crate::Error;
+use audio_backend::PttReleaseReason;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -83,7 +84,9 @@ pub enum HotkeyEvent {
         expires_at: Instant,
         initial: bool,
     },
-    Released,
+    Released {
+        reason: PttReleaseReason,
+    },
 }
 impl HotkeyEvent {
     pub fn is_live(self, now: Instant) -> bool {
@@ -118,7 +121,11 @@ impl Hotkey {
             if ready_tx.send(Ok(())).is_err() {
                 return;
             }
-            let mut press = PressState::default();
+            // A replacement registration cannot inherit permission from an already-held chord.
+            let mut press = PressState {
+                blocked: true,
+                ..PressState::default()
+            };
             let mut message = MSG::default();
             while !stopped.load(Ordering::Acquire) {
                 // Bound each drain so a message flood cannot starve release polling.
@@ -141,7 +148,9 @@ impl Hotkey {
                 }
                 thread::sleep(POLL);
             }
-            let _ = tx.try_send(HotkeyEvent::Released);
+            let _ = tx.try_send(HotkeyEvent::Released {
+                reason: PttReleaseReason::UnavailableOrReset,
+            });
         });
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -236,8 +245,10 @@ impl PressState {
     }
     fn poll(&mut self, now: Instant, down: bool, tx: &SyncSender<HotkeyEvent>) {
         if !down {
-            if self.pressed {
-                let _ = tx.try_send(HotkeyEvent::Released);
+            if self.pressed || self.blocked {
+                let _ = tx.try_send(HotkeyEvent::Released {
+                    reason: PttReleaseReason::PhysicalKeyUp,
+                });
             }
             *self = Self::default();
             return;
@@ -249,7 +260,9 @@ impl PressState {
         {
             self.pressed = false;
             self.blocked = true;
-            let _ = tx.try_send(HotkeyEvent::Released);
+            let _ = tx.try_send(HotkeyEvent::Released {
+                reason: PttReleaseReason::LeaseExpired,
+            });
         }
         if !self.pressed || self.blocked {
             return;
@@ -267,7 +280,9 @@ impl PressState {
                 // Queue congestion is loss of lease, not permission to keep talking.
                 self.pressed = false;
                 self.blocked = true;
-                let _ = tx.try_send(HotkeyEvent::Released);
+                let _ = tx.try_send(HotkeyEvent::Released {
+                    reason: PttReleaseReason::UnavailableOrReset,
+                });
             } else {
                 self.announced = true;
                 self.next_renewal = Some(now + RENEW);
@@ -318,6 +333,59 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn registration_waits_for_observed_key_up_before_admitting_a_press() {
+        let now = Instant::now();
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut state = PressState {
+            blocked: true,
+            ..PressState::default()
+        };
+        state.activate(now);
+        state.poll(now, true, &tx);
+        state.activate(now + POLL);
+        state.poll(now + POLL, true, &tx);
+        assert!(state.blocked && !state.pressed);
+        assert!(rx.try_recv().is_err());
+
+        state.poll(now + POLL * 2, false, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HotkeyEvent::Released {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            }
+        ));
+        assert!(!state.blocked && !state.pressed);
+
+        let observed_at = now + POLL * 3;
+        state.activate(observed_at);
+        state.poll(observed_at, true, &tx);
+        let lease = rx.try_recv().unwrap();
+        assert!(lease.is_live(observed_at));
+        assert!(matches!(
+            lease,
+            HotkeyEvent::PressLease { initial: true, .. }
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn physical_key_up_is_distinct_from_lease_expiry() {
+        let now = Instant::now();
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut state = PressState::default();
+        state.activate(now);
+        state.poll(now, true, &tx);
+        assert!(rx.try_recv().unwrap().is_live(now));
+        state.poll(now + POLL, false, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HotkeyEvent::Released {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            }
+        ));
+        assert!(!state.pressed && !state.blocked);
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
     fn leases_expire_at_observation_not_receipt() {
         let now = Instant::now();
         let (tx, rx) = mpsc::sync_channel(2);
@@ -328,10 +396,21 @@ mod tests {
         assert!(lease.is_live(now));
         assert!(!lease.is_live(now + PRESS_LEASE));
         state.poll(now + PRESS_LEASE, true, &tx);
-        assert!(matches!(rx.try_recv().unwrap(), HotkeyEvent::Released));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HotkeyEvent::Released {
+                reason: PttReleaseReason::LeaseExpired,
+            }
+        ));
         state.activate(now + PRESS_LEASE);
         assert!(!state.pressed);
         state.poll(now + PRESS_LEASE, false, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HotkeyEvent::Released {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            }
+        ));
         state.activate(now + PRESS_LEASE);
         assert!(state.pressed);
     }
@@ -345,7 +424,14 @@ mod tests {
         state.poll(now + RENEW, true, &tx);
         assert!(state.blocked && !state.pressed);
         assert!(!rx.try_recv().unwrap().is_live(now + PRESS_LEASE));
+        assert!(rx.try_recv().is_err());
         state.poll(now + RENEW, false, &tx);
         assert!(!state.blocked);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HotkeyEvent::Released {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            }
+        ));
     }
 }

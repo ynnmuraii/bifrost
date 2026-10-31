@@ -21,6 +21,8 @@
 //!
 //! Supply all reserved KVM chords when configuring PTT. Consumers must check the absolute
 //! 250 ms press lease on every use; renewal events cannot reopen an expired gate.
+//! Release provenance distinguishes physical key-up polling from lease expiry, queue failure,
+//! reconfiguration and worker loss; synthetic releases never prove that a held key went up.
 //!
 //! # Hardware diagnostic
 //!

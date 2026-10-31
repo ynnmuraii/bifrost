@@ -16,6 +16,8 @@ pub(super) struct Controls<M: MuteGuard> {
     configured: bool,
     press: Option<(u64, Instant)>,
     last_press: Option<u64>,
+    native_epoch: u64,
+    native_blocked: bool,
     privacy: Arc<crate::privacy::Privacy>,
     pub(super) fence: Option<(u64, u64)>,
 }
@@ -42,8 +44,22 @@ impl<M: MuteGuard + 'static> Controls<M> {
             configured: false,
             press: None,
             last_press: None,
+            native_epoch: 0,
+            native_blocked: false,
             privacy,
             fence: None,
+        }
+    }
+
+    fn sync_native_fence(&mut self) {
+        let epoch = self
+            .privacy
+            .native_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if epoch != self.native_epoch {
+            self.native_epoch = epoch;
+            self.native_blocked = true;
+            self.press = None;
         }
     }
 
@@ -78,6 +94,7 @@ impl<M: MuteGuard + 'static> Controls<M> {
         admitted_at: Instant,
         emit: &mut impl FnMut(u64, Msg),
     ) -> Result<(), BackendError> {
+        self.sync_native_fence();
         let fence = self.fence.take().unwrap_or_else(|| {
             (
                 self.privacy
@@ -111,6 +128,9 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 // A completed release may leave reductions for that old guard in the mailbox.
                 while let Some(reduction) = self.privacy.next() {
                     match reduction {
+                        crate::privacy::Reduction::ReleaseAll(id) => {
+                            emit(id, Msg::PttEvent(talk_guard::event(0, 3, 2)));
+                        }
                         crate::privacy::Reduction::Revoke(id, grant) => {
                             emit(id, Msg::PttEvent(talk_guard::event(grant, 5, 2)))
                         }
@@ -193,8 +213,16 @@ impl<M: MuteGuard + 'static> Controls<M> {
             }
             Msg::ReleaseMicMute(_) => self.release(backend, request_id, emit),
             Msg::ConfigurePtt(request) => {
+                if fence.1
+                    != self
+                        .privacy
+                        .talk_epoch
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(BackendError::Stopped);
+                }
                 // Reconfiguration revokes the previous grant before native admission, even on failure.
-                self.revoke(backend, emit);
+                self.revoke(backend, 2, emit);
                 let binding = request.binding.as_ref().map(hotkey);
                 if request.reserved.len() > 16 {
                     return Err(BackendError::InvalidArgument);
@@ -212,7 +240,7 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 backend.configure_ptt(binding, &reserved[..request.reserved.len()])?;
                 self.configured = binding.is_some();
                 // Admission acknowledgment, not evidence that an OS permission prompt was granted.
-                emit(request_id, released());
+                emit(request_id, released(2));
                 Ok(())
             }
             _ => Err(BackendError::InvalidArgument),
@@ -270,14 +298,19 @@ impl<M: MuteGuard + 'static> Controls<M> {
         result
     }
 
-    fn revoke<B: Backend<Mute = M>>(&mut self, backend: &mut B, emit: &mut impl FnMut(u64, Msg)) {
+    fn revoke<B: Backend<Mute = M>>(
+        &mut self,
+        backend: &mut B,
+        reason: i32,
+        emit: &mut impl FnMut(u64, Msg),
+    ) {
         let held = self.press.take().is_some();
         if self.configured || held {
             let _ = backend.configure_ptt(None, &[]);
         }
         self.configured = false;
         if held {
-            emit(0, released());
+            emit(0, released(reason));
         }
     }
 
@@ -313,7 +346,22 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 let Some(clock) = now_ns else {
                     return;
                 };
+                if self
+                    .privacy
+                    .native_epoch
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != 0
+                    && *observed_at_ns
+                        <= self
+                            .privacy
+                            .native_fence_ns
+                            .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    self.native_blocked = true;
+                    return;
+                }
                 if !self.configured
+                    || self.native_blocked
                     || self.press.is_some()
                     || self.last_press.is_some_and(|last| *observed_at_ns <= last)
                     || *observed_at_ns > clock
@@ -328,6 +376,15 @@ impl<M: MuteGuard + 'static> Controls<M> {
                     *expires_at_ns,
                     now + Duration::from_nanos(*expires_at_ns - clock),
                 ));
+                if self.native_epoch
+                    != self
+                        .privacy
+                        .native_epoch
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    self.sync_native_fence();
+                    return;
+                }
                 emit(
                     0,
                     Msg::PttEvent(w::PttEvent {
@@ -364,13 +421,22 @@ impl<M: MuteGuard + 'static> Controls<M> {
                     }),
                 );
             }
-            Event::PttReleased => {
-                if self.press.take().is_some() {
-                    emit(0, released());
+            Event::PttReleased { reason } => {
+                let held = self.press.take().is_some();
+                match reason {
+                    audio_backend::PttReleaseReason::PhysicalKeyUp => {
+                        self.native_blocked = false;
+                        emit(0, released(8));
+                    }
+                    audio_backend::PttReleaseReason::LeaseExpired if held => emit(0, released(1)),
+                    audio_backend::PttReleaseReason::UnavailableOrReset if held => {
+                        emit(0, released(7))
+                    }
+                    _ => {}
                 }
             }
             Event::ResyncRequired => {
-                self.revoke(backend, emit);
+                self.revoke(backend, 7, emit);
                 if let Some(guard) = self.guard.as_ref() {
                     match guard.snapshot() {
                         Ok(snapshot) => self.publish(0, snapshot, emit),
@@ -391,12 +457,13 @@ impl<M: MuteGuard + 'static> Controls<M> {
         now: Instant,
         emit: &mut impl FnMut(u64, Msg),
     ) {
+        self.sync_native_fence();
         if now_ns.is_none()
             || self.press.is_some_and(|(expiry, deadline)| {
                 now_ns.is_some_and(|clock| clock >= expiry) || now >= deadline
             })
         {
-            self.revoke(backend, emit);
+            self.revoke(backend, if now_ns.is_none() { 7 } else { 1 }, emit);
         }
     }
 
@@ -405,7 +472,7 @@ impl<M: MuteGuard + 'static> Controls<M> {
         backend: &mut B,
         emit: &mut impl FnMut(u64, Msg),
     ) {
-        self.revoke(backend, emit);
+        self.revoke(backend, 2, emit);
         if self.guard.is_some() {
             let _ = self.release(backend, 0, emit);
         }
@@ -421,13 +488,13 @@ fn hotkey(key: &w::PttHotkey) -> PttHotkey {
         meta: key.meta,
     }
 }
-fn released() -> Msg {
+fn released(reason: i32) -> Msg {
     Msg::PttEvent(w::PttEvent {
         kind: 3,
         observed_at_ns: 0,
         expires_at_ns: 0,
         grant_id: 0,
-        reason: 0,
+        reason,
     })
 }
 
@@ -1136,5 +1203,132 @@ mod tests {
             }
         }
         assert!(failed);
+    }
+
+    #[test]
+    fn release_all_fences_a_held_native_key_across_synthetic_release_and_reconfigure() {
+        let (mut backend, mut controls, mut output) = fixture();
+        run(&mut controls, &mut backend, &mut output, configure(true)).unwrap();
+        let now = Instant::now();
+        let press = |observed| Event::PttPressed {
+            observed_at_ns: observed,
+            expires_at_ns: observed + 1_000_000,
+        };
+        controls.event(&mut backend, &press(100), Some(100), now, &mut |id, msg| {
+            output.push((id, msg))
+        });
+        assert_eq!(kinds(&output).last(), Some(&1));
+        for time in [200, 201] {
+            assert_eq!(
+                controls
+                    .privacy
+                    .admit_at(9, &Msg::PttReleaseAll(w::PttReleaseAll {}), Some(time)),
+                Some(Ok(false))
+            );
+        }
+        output.clear();
+        controls.event(
+            &mut backend,
+            &Event::PttRenewed {
+                expires_at_ns: 1_000_000,
+            },
+            Some(300),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        for reason in [
+            audio_backend::PttReleaseReason::LeaseExpired,
+            audio_backend::PttReleaseReason::UnavailableOrReset,
+        ] {
+            controls.event(
+                &mut backend,
+                &Event::PttReleased { reason },
+                Some(300),
+                now,
+                &mut |id, msg| output.push((id, msg)),
+            );
+        }
+        run(&mut controls, &mut backend, &mut output, configure(true)).unwrap();
+        controls.event(&mut backend, &press(400), Some(400), now, &mut |id, msg| {
+            output.push((id, msg))
+        });
+        assert!(!kinds(&output).iter().any(|kind| matches!(kind, 1 | 2)));
+        controls.event(
+            &mut backend,
+            &Event::PttReleased {
+                reason: audio_backend::PttReleaseReason::PhysicalKeyUp,
+            },
+            Some(500),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        assert!(matches!(output.last(), Some((0,Msg::PttEvent(event))) if event.reason == 8));
+        controls.event(&mut backend, &press(100), Some(500), now, &mut |id, msg| {
+            output.push((id, msg))
+        });
+        assert!(controls.native_blocked);
+        controls.event(
+            &mut backend,
+            &Event::PttReleased {
+                reason: audio_backend::PttReleaseReason::PhysicalKeyUp,
+            },
+            Some(600),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        controls.event(&mut backend, &press(700), Some(700), now, &mut |id, msg| {
+            output.push((id, msg))
+        });
+        assert_eq!(kinds(&output).last(), Some(&1));
+    }
+
+    #[test]
+    fn release_all_revokes_old_ids_but_allows_fresh_grants_and_persistent_unmute() {
+        let (mut backend, mut controls, mut output) = fixture();
+        run(&mut controls, &mut backend, &mut output, acquire()).unwrap();
+        let generation = backend.capture_mute(&selection()).unwrap().generation;
+        run(
+            &mut controls,
+            &mut backend,
+            &mut output,
+            Msg::SetMicMute(w::SetMicMute {
+                expected_generation: generation,
+                muted: true,
+            }),
+        )
+        .unwrap();
+        run(&mut controls, &mut backend, &mut output, grant(10, 250)).unwrap();
+        let privacy = controls.privacy.clone();
+        for request in [90, 91] {
+            assert_eq!(
+                privacy.admit(request, &Msg::PttReleaseAll(w::PttReleaseAll {})),
+                Some(Ok(true))
+            );
+            assert!(controls.guard.as_ref().unwrap().snapshot().unwrap().muted);
+        }
+        run(&mut controls, &mut backend, &mut output, grant(10, 250)).unwrap();
+        result(&output, 10, 4, 2);
+        run(&mut controls, &mut backend, &mut output, grant(11, 250)).unwrap();
+        result(&output, 11, 1, 0);
+        assert!(!backend.capture_mute(&selection()).unwrap().muted);
+        run(
+            &mut controls,
+            &mut backend,
+            &mut output,
+            Msg::SetMicMute(w::SetMicMute {
+                expected_generation: generation,
+                muted: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            privacy.admit(92, &Msg::PttReleaseAll(w::PttReleaseAll {})),
+            Some(Ok(true))
+        );
+        assert!(!controls.guard.as_ref().unwrap().snapshot().unwrap().muted);
+        run(&mut controls, &mut backend, &mut output, grant(12, 1)).unwrap();
+        result(&output, 12, 5, 6);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!controls.guard.as_ref().unwrap().snapshot().unwrap().muted);
     }
 }

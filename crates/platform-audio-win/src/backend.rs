@@ -51,11 +51,13 @@ impl WindowsBackend {
     fn poll_ptt(&mut self) -> Option<Event> {
         if self.pending_release {
             self.pending_release = false;
-            return Some(Event::PttReleased);
+            return Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            });
         }
         let result = self.ptt.as_ref()?.events().try_recv();
         match result {
-            Ok(HotkeyEvent::Released) => Some(Event::PttReleased),
+            Ok(HotkeyEvent::Released { reason }) => Some(Event::PttReleased { reason }),
             Ok(HotkeyEvent::PressLease {
                 observed_at,
                 expires_at,
@@ -64,7 +66,11 @@ impl WindowsBackend {
                 // Sample QPC before Instant so conversion can only shorten a lease.
                 let qpc = match self.qpc_now_ns() {
                     Ok(value) => value,
-                    Err(_) => return Some(Event::PttReleased),
+                    Err(_) => {
+                        return Some(Event::PttReleased {
+                            reason: PttReleaseReason::UnavailableOrReset,
+                        })
+                    }
                 };
                 let now = Instant::now();
                 let observed_at_ns = qpc.saturating_sub(
@@ -99,7 +105,9 @@ impl WindowsBackend {
             Err(TryRecvError::Disconnected) => {
                 self.ptt.take();
                 self.ptt_binding = None;
-                Some(Event::PttReleased)
+                Some(Event::PttReleased {
+                    reason: PttReleaseReason::UnavailableOrReset,
+                })
             }
         }
     }
@@ -418,6 +426,18 @@ fn binding(hotkey: PttHotkey) -> Result<HotkeyBinding, BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_reconfiguration_release_never_claims_physical_key_up() {
+        let mut backend = WindowsBackend::new().unwrap();
+        backend.pending_release = true;
+        assert_eq!(
+            backend.poll_ptt(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
+        assert_eq!(backend.poll_ptt(), None);
+    }
     #[test]
     fn construction_has_no_native_handles_and_hid_is_not_vk() {
         let mut backend = WindowsBackend::new().unwrap();

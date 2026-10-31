@@ -27,6 +27,7 @@ message AudioFrame {
     ConfigurePtt configure_ptt = 21;
     PttGrant ptt_grant = 22;
     PttRevoke ptt_revoke = 23;
+    PttReleaseAll ptt_release_all = 71;
     SetMediaWatch set_media_watch = 30;
     MediaCommand media_command = 31;
     Ready ready = 40;
@@ -165,11 +166,13 @@ message MuteSnapshot { string endpoint_id = 1; uint64 generation = 2; bool muted
 message PttHotkey { uint32 key_code = 1; bool control = 2; bool alt = 3; bool shift = 4; bool meta = 5; }
 message ConfigurePtt { optional PttHotkey binding = 1; repeated PttHotkey reserved = 2; } // <=16, unique, no binding collision.
 // Explicit toggles are persistent. Remote talk grants alone are lease-bounded.
-message PttGrant { uint64 grant_id = 1; uint32 ttl_ms = 2; } // Nonzero ID, TTL 1..250ms; Ping never renews.
+message PttGrant { uint64 grant_id = 1; uint32 ttl_ms = 2; } // Nonzero, strictly increasing fresh IDs within a child generation; same ID renews only a live grant. TTL 1..250ms; Ping never renews.
 message PttRevoke { uint64 grant_id = 1; } // Stale IDs never revoke a newer grant.
+message PttReleaseAll {} // Clears transient talk without changing explicit persistent unmute.
 enum PttEventKind { PTT_EVENT_KIND_UNSPECIFIED = 0; PTT_EVENT_KIND_PRESSED = 1; PTT_EVENT_KIND_RENEWED = 2; PTT_EVENT_KIND_RELEASED = 3; PTT_EVENT_KIND_REFUSED = 4; PTT_EVENT_KIND_NOOP = 5; }
-enum PttReleaseReason { PTT_RELEASE_REASON_UNSPECIFIED = 0; PTT_RELEASE_REASON_EXPIRED = 1; PTT_RELEASE_REASON_REVOKED = 2; PTT_RELEASE_REASON_REPLACED = 3; PTT_RELEASE_REASON_EXPLICIT_MUTE = 4; PTT_RELEASE_REASON_PRE_MUTED = 5; PTT_RELEASE_REASON_PERSISTENT_UNMUTE = 6; PTT_RELEASE_REASON_BACKEND_FAILED = 7; }
-// Physical observations use grant_id=0/reason=0. Talk grants use a nonzero ID.
+enum PttReleaseReason { PTT_RELEASE_REASON_UNSPECIFIED = 0; PTT_RELEASE_REASON_EXPIRED = 1; PTT_RELEASE_REASON_REVOKED = 2; PTT_RELEASE_REASON_REPLACED = 3; PTT_RELEASE_REASON_EXPLICIT_MUTE = 4; PTT_RELEASE_REASON_PRE_MUTED = 5; PTT_RELEASE_REASON_PERSISTENT_UNMUTE = 6; PTT_RELEASE_REASON_BACKEND_FAILED = 7; PTT_RELEASE_REASON_PHYSICAL_RELEASE = 8; }
+// Native physical release alone uses grant_id=0/reason=PhysicalRelease.
+// ReleaseAll replies use grant_id=0/Released/Revoked, never a physical observation.
 // Pressed: expires>observed, delta<=250ms. Renewed: observed=0, expires>0.
 // Released/Refused/Noop: timestamps zero. A positive outer ID correlates admission/result.
 message PttEvent { PttEventKind kind = 1; uint64 observed_at_ns = 2; uint64 expires_at_ns = 3; uint64 grant_id = 4; PttReleaseReason reason = 5; }

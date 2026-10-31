@@ -694,7 +694,12 @@ fn ptt_observes_release_unregisters_and_lock_session_timeout_fail_closed() {
         );
         assert_eq!(backend.poll_event(), None);
         backend.apply(ScriptEvent::CancelPtt(reason)).unwrap();
-        assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+        assert_eq!(
+            backend.poll_event(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
         assert_eq!(
             backend.apply(ScriptEvent::PttPress),
             Err(BackendError::Unsupported)
@@ -710,7 +715,12 @@ fn ptt_observes_release_unregisters_and_lock_session_timeout_fail_closed() {
             expires_at_ns: PTT_LEASE_NS
         })
     );
-    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::PhysicalKeyUp,
+        })
+    );
     backend.apply(ScriptEvent::PttPress).unwrap();
     backend.configure_ptt(None, &[]).unwrap();
     assert_eq!(
@@ -720,7 +730,79 @@ fn ptt_observes_release_unregisters_and_lock_session_timeout_fail_closed() {
             expires_at_ns: PTT_LEASE_NS
         })
     );
-    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::UnavailableOrReset,
+        })
+    );
+}
+
+#[test]
+fn ptt_availability_changes_never_claim_physical_release() {
+    for availability in [
+        Some(BackendError::ServerUnavailable),
+        Some(BackendError::PermissionDenied),
+        None,
+    ] {
+        let mut backend = backend();
+        backend.configure_ptt(Some(hotkey()), &[]).unwrap();
+        backend.apply(ScriptEvent::PttPress).unwrap();
+        drain(&mut backend);
+        backend
+            .apply(ScriptEvent::Availability(availability))
+            .unwrap();
+        assert_eq!(
+            backend.poll_event(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
+        assert_eq!(backend.poll_event(), Some(Event::ResyncRequired));
+        assert_eq!(backend.poll_event(), None);
+    }
+}
+
+#[test]
+fn physical_release_remains_observable_after_lease_expiry_or_overflow() {
+    for overflow in [false, true] {
+        let mut backend = backend();
+        backend.configure_ptt(Some(hotkey()), &[]).unwrap();
+        backend.apply(ScriptEvent::PttPress).unwrap();
+        drain(&mut backend);
+        if overflow {
+            for _ in 0..=EVENT_CAPACITY {
+                backend
+                    .apply(ScriptEvent::SetMute {
+                        device: id("mic"),
+                        muted: false,
+                    })
+                    .unwrap();
+            }
+            assert_eq!(backend.poll_event(), Some(Event::ResyncRequired));
+        } else {
+            backend
+                .apply(ScriptEvent::AdvanceTime {
+                    now_ns: PTT_LEASE_NS,
+                })
+                .unwrap();
+            assert_eq!(
+                backend.poll_event(),
+                Some(Event::PttReleased {
+                    reason: PttReleaseReason::LeaseExpired,
+                })
+            );
+        }
+        drain(&mut backend);
+        backend.apply(ScriptEvent::PttRelease).unwrap();
+        assert_eq!(
+            backend.poll_event(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            })
+        );
+        assert_eq!(backend.poll_event(), None);
+    }
 }
 
 #[test]
@@ -741,7 +823,7 @@ fn bounded_poll_overflow_revokes_held_press_and_discards_stale_edges() {
     while let Some(event) = backend.poll_event() {
         assert!(!matches!(
             event,
-            Event::PttPressed { .. } | Event::PttRenewed { .. } | Event::PttReleased
+            Event::PttPressed { .. } | Event::PttRenewed { .. } | Event::PttReleased { .. }
         ));
         count += 1;
     }
@@ -1043,7 +1125,12 @@ fn ptt_collisions_preserve_the_existing_binding_and_press() {
     );
     assert_eq!(backend.poll_event(), None);
     backend.apply(ScriptEvent::PttRelease).unwrap();
-    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::PhysicalKeyUp,
+        })
+    );
     let different = PttHotkey {
         alt: !chord.alt,
         ..chord
@@ -1082,7 +1169,12 @@ fn ptt_lease_renewal_expiry_and_stalled_consumer_fail_closed() {
     backend
         .apply(ScriptEvent::AdvanceTime { now_ns: expiry })
         .unwrap();
-    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::LeaseExpired,
+        })
+    );
     assert_eq!(
         backend.apply(ScriptEvent::PttRenew),
         Err(BackendError::Stopped)
@@ -1098,7 +1190,12 @@ fn ptt_lease_renewal_expiry_and_stalled_consumer_fail_closed() {
         panic!("queued press")
     };
     assert!(now >= expires_at_ns);
-    assert_eq!(backend.poll_event(), Some(Event::PttReleased));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::LeaseExpired,
+        })
+    );
     assert_eq!(
         backend.apply(ScriptEvent::AdvanceTime { now_ns: now - 1 }),
         Err(BackendError::InvalidArgument)

@@ -30,6 +30,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Recover Listener health when valid decoded PCM resumes after Wi-Fi loss instead of retaining a permanent degraded label; distinguish jitter rebuffer episodes from native zero-fill callbacks, keep peer receiver quality separate from local Source state, and fall back safely when a native render position stops advancing.
 - Document Listener-first authenticated UDP hole punching and one-second idle traffic as runtime invariants; report bounded path-probe/authentication observations on health and terminal timeouts without guessing which firewall blocked traffic.
 - Keep audio-child lifecycle and path-failure diagnostics in a separate bounded rotating log while retaining null stdio; log only allowlisted scalar fields and prevent dependency traces from exposing session keys, now-playing metadata or PCM, including at DEBUG level.
+- Release-all talk cancellation bypasses full control queues, fences stale grants and held native keys, and preserves explicitly persistent unmute; only a proven physical key-up can rearm native push-to-talk after a safety fence.
 
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
@@ -130,6 +131,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлены ограниченный локальный аудио-IPC с ревизиями, плеер удалённых потоков по подтверждённому состоянию, двуязычные аудионастройки/выбор устройств и индикаторы приватности/отключение звука/остановка в трее. До реализации обработчиков в службе управление честно показывает недоступность; изменение не запускает захват или передачу аудио. Метаданные медиасеансов не сохраняются и скрыты в отладочном выводе.
 
 **Внутренний аудиотракт**
+
+- Общий отзыв разрешений говорить обходит заполненные очереди, блокирует старые продления и удерживаемые нативные клавиши, сохраняя явное постоянное включение микрофона; после защитного отзыва нативный PTT возобновляется только при подтверждённом физическом отпускании и новом нажатии.
 
 - Состояние Listener восстанавливается после возобновления декодированного PCM при потерях Wi-Fi, а не остаётся навсегда ухудшенным; эпизоды повторного буферизования отделены от нативных callback с заполнением тишиной, отчёты удалённого приёмника — от локального состояния Source, а остановившаяся нативная позиция безопасно переключается на резервные часы.
 - Закреплены инварианты исходящего аутентифицированного UDP-запроса Listener до ожидания Source и секундного служебного трафика; Health и завершение по тайм-ауту передают ограниченные наблюдения проверки пути и аутентификации без догадок о виновном брандмауэре.
