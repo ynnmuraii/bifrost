@@ -25,6 +25,8 @@ message AudioFrame {
     SetMicMute set_mic_mute = 19;
     ReleaseMicMute release_mic_mute = 20;
     ConfigurePtt configure_ptt = 21;
+    PttGrant ptt_grant = 22;
+    PttRevoke ptt_revoke = 23;
     SetMediaWatch set_media_watch = 30;
     MediaCommand media_command = 31;
     Ready ready = 40;
@@ -39,7 +41,7 @@ message AudioFrame {
     MediaSessions media_sessions = 60;
     MediaCommandResult media_command_result = 61;
   }
-  reserved 22 to 29, 32 to 39, 49 to 59, 62 to 69;
+  reserved 24 to 29, 32 to 39, 49 to 59, 62 to 69;
 }
 
 enum BackendKind { BACKEND_KIND_UNSPECIFIED = 0; BACKEND_KIND_NATIVE = 1; BACKEND_KIND_DRY = 2; BACKEND_KIND_LINUX_PULSE = 3; BACKEND_KIND_WINDOWS_WASAPI = 4; }
@@ -142,10 +144,15 @@ message ReleaseMicMute {}
 message MuteSnapshot { string endpoint_id = 1; uint64 generation = 2; bool muted = 3; bool guard_active = 4; }
 message PttHotkey { uint32 key_code = 1; bool control = 2; bool alt = 3; bool shift = 4; bool meta = 5; }
 message ConfigurePtt { optional PttHotkey binding = 1; repeated PttHotkey reserved = 2; } // <=16, unique, no binding collision.
-enum PttEventKind { PTT_EVENT_KIND_UNSPECIFIED = 0; PTT_EVENT_KIND_PRESSED = 1; PTT_EVENT_KIND_RENEWED = 2; PTT_EVENT_KIND_RELEASED = 3; }
-// Pressed: expires > observed, delta <=250ms. Renewed: observed=0, expires>0.
-// Released: both timestamps zero. May acknowledge ConfigurePtt or push asynchronously.
-message PttEvent { PttEventKind kind = 1; uint64 observed_at_ns = 2; uint64 expires_at_ns = 3; }
+// Explicit toggles are persistent. Remote talk grants alone are lease-bounded.
+message PttGrant { uint64 grant_id = 1; uint32 ttl_ms = 2; } // Nonzero ID, TTL 1..250ms; Ping never renews.
+message PttRevoke { uint64 grant_id = 1; } // Stale IDs never revoke a newer grant.
+enum PttEventKind { PTT_EVENT_KIND_UNSPECIFIED = 0; PTT_EVENT_KIND_PRESSED = 1; PTT_EVENT_KIND_RENEWED = 2; PTT_EVENT_KIND_RELEASED = 3; PTT_EVENT_KIND_REFUSED = 4; PTT_EVENT_KIND_NOOP = 5; }
+enum PttReleaseReason { PTT_RELEASE_REASON_UNSPECIFIED = 0; PTT_RELEASE_REASON_EXPIRED = 1; PTT_RELEASE_REASON_REVOKED = 2; PTT_RELEASE_REASON_REPLACED = 3; PTT_RELEASE_REASON_EXPLICIT_MUTE = 4; PTT_RELEASE_REASON_PRE_MUTED = 5; PTT_RELEASE_REASON_PERSISTENT_UNMUTE = 6; }
+// Physical observations use grant_id=0/reason=0. Talk grants use a nonzero ID.
+// Pressed: expires>observed, delta<=250ms. Renewed: observed=0, expires>0.
+// Released/Refused/Noop: timestamps zero. A positive outer ID correlates admission/result.
+message PttEvent { PttEventKind kind = 1; uint64 observed_at_ns = 2; uint64 expires_at_ns = 3; uint64 grant_id = 4; PttReleaseReason reason = 5; }
 message SetMediaWatch { bool enabled = 1; } // Success is an asynchronous MediaSessions snapshot.
 enum MediaCommandKind { MEDIA_COMMAND_KIND_UNSPECIFIED = 0; MEDIA_COMMAND_KIND_PLAY = 1; MEDIA_COMMAND_KIND_PAUSE = 2; MEDIA_COMMAND_KIND_TOGGLE = 3; MEDIA_COMMAND_KIND_NEXT = 4; MEDIA_COMMAND_KIND_PREVIOUS = 5; }
 message MediaCommand { uint64 token = 1; uint64 expected_revision = 2; MediaCommandKind command = 3; }

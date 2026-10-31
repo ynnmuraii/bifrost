@@ -460,6 +460,7 @@ fn m5_m6_responses() -> Vec<Msg> {
             kind: 3,
             observed_at_ns: 0,
             expires_at_ns: 0,
+            ..Default::default()
         }),
         Msg::MediaSessions(media_snapshot()),
         Msg::MediaCommandResult(w::MediaCommandResult { result: 1 }),
@@ -617,12 +618,49 @@ fn ptt_event_timestamps_do_not_wrap_or_extend_press_grants() {
                     kind,
                     observed_at_ns,
                     expires_at_ns,
+                    ..Default::default()
                 })))
                 .is_ok(),
                 valid,
                 "{kind}/{observed_at_ns}/{expires_at_ns}"
             );
         }
+    }
+}
+
+#[test]
+fn remote_talk_grants_are_bounded_and_distinct_from_physical_observations() {
+    for grant_id in [0, 1, u64::MAX] {
+        for ttl_ms in [0, 1, 250, 251, u32::MAX] {
+            assert_eq!(
+                contract::validate_frame(&frame(Msg::PttGrant(w::PttGrant { grant_id, ttl_ms })))
+                    .is_ok(),
+                grant_id != 0 && (1..=250).contains(&ttl_ms)
+            );
+        }
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::PttRevoke(w::PttRevoke { grant_id }))).is_ok(),
+            grant_id != 0
+        );
+    }
+    for (kind, reason, valid) in [
+        (3, 1, true),
+        (4, 5, true),
+        (5, 6, true),
+        (3, 0, false),
+        (4, 6, false),
+        (5, 5, false),
+    ] {
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::PttEvent(w::PttEvent {
+                kind,
+                grant_id: 7,
+                reason,
+                ..Default::default()
+            })))
+            .is_ok(),
+            valid
+        );
     }
 }
 

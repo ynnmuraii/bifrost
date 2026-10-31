@@ -77,6 +77,25 @@ pub enum AudioSupervisorEvent {
         generation: u64,
         event: w::BackendEvent,
     },
+    MuteSnapshot {
+        generation: u64,
+        request_id: u64,
+        snapshot: w::MuteSnapshot,
+    },
+    PttEvent {
+        generation: u64,
+        request_id: u64,
+        event: w::PttEvent,
+    },
+    MediaSessions {
+        generation: u64,
+        sessions: w::MediaSessions,
+    },
+    MediaCommandResult {
+        generation: u64,
+        request_id: u64,
+        result: w::MediaCommandResult,
+    },
     CommandRejected {
         generation: u64,
         request_id: u64,
@@ -193,6 +212,57 @@ impl AudioHandle {
             session_id: session_id.to_vec(),
             gain_percent: percent,
             muted,
+        }))
+        .await
+    }
+    pub async fn acquire_mic_mute(&self, selection: w::DeviceSelection) -> Result<u64> {
+        self.written(Msg::AcquireMicMute(w::AcquireMicMute {
+            selection: Some(selection),
+        }))
+        .await
+    }
+    pub async fn set_mic_mute(&self, expected_generation: u64, muted: bool) -> Result<u64> {
+        self.written(Msg::SetMicMute(w::SetMicMute {
+            expected_generation,
+            muted,
+        }))
+        .await
+    }
+    pub async fn release_mic_mute(&self) -> Result<u64> {
+        self.written(Msg::ReleaseMicMute(w::ReleaseMicMute {}))
+            .await
+    }
+    pub async fn configure_ptt(
+        &self,
+        binding: Option<w::PttHotkey>,
+        reserved: Vec<w::PttHotkey>,
+    ) -> Result<u64> {
+        self.written(Msg::ConfigurePtt(w::ConfigurePtt { binding, reserved }))
+            .await
+    }
+    /// Opens a remote talk grant for at most 250 ms; Ping never renews it.
+    pub async fn ptt_grant(&self, grant_id: u64, ttl_ms: u32) -> Result<u64> {
+        self.written(Msg::PttGrant(w::PttGrant { grant_id, ttl_ms }))
+            .await
+    }
+    pub async fn ptt_revoke(&self, grant_id: u64) -> Result<u64> {
+        self.written(Msg::PttRevoke(w::PttRevoke { grant_id }))
+            .await
+    }
+    pub async fn set_media_watch(&self, enabled: bool) -> Result<u64> {
+        self.written(Msg::SetMediaWatch(w::SetMediaWatch { enabled }))
+            .await
+    }
+    pub async fn media_command(
+        &self,
+        token: u64,
+        expected_revision: u64,
+        command: w::MediaCommandKind,
+    ) -> Result<u64> {
+        self.written(Msg::MediaCommand(w::MediaCommand {
+            token,
+            expected_revision,
+            command: command as i32,
         }))
         .await
     }
@@ -486,6 +556,7 @@ async fn serve(
 ) -> Result<()> {
     let mut pending = BTreeMap::<u64, Pending>::new();
     let mut pending_starts = BTreeMap::<u64, [u8; 16]>::new();
+    let mut pending_controls = BTreeMap::<u64, (u8, Instant)>::new();
     let mut request = 1u64;
     let mut ping = 0u64;
     let mut pong = 0u64;
@@ -502,6 +573,7 @@ async fn serve(
                     // A timed-out RPC invalidates this child, so late replies can never
                     // be reused by a later request or a replacement generation.
                     if pending.values().any(|response| Instant::now() >= response.deadline) { return Err(AudioSupervisorError::Timeout); }
+                    if pending_controls.values().any(|(_, deadline)| Instant::now() >= *deadline) { return Err(AudioSupervisorError::Timeout); }
                     if child.process.try_wait().map_err(|_| AudioSupervisorError::ChildLost)?.is_some() { return Err(AudioSupervisorError::ChildLost); }
                     ping = ping.checked_add(1).ok_or(AudioSupervisorError::InvalidFrame)?;
                     send(child, 0, Msg::Ping(w::Ping { serial: ping })).await?;
@@ -551,11 +623,25 @@ async fn serve(
                             emit(events, AudioSupervisorEvent::Health { generation, health })?;
                         }
                         Msg::BackendEvent(event) => emit(events, AudioSupervisorEvent::BackendEvent { generation, event })?,
+                        Msg::MuteSnapshot(snapshot) => {
+                            if id != 0 && pending_controls.remove(&id).map(|(kind, _)| kind) != Some(1) {return Err(AudioSupervisorError::InvalidFrame);}
+                            emit(events, AudioSupervisorEvent::MuteSnapshot {generation,request_id:id,snapshot})?;
+                        }
+                        Msg::PttEvent(event) => {
+                            if id != 0 && pending_controls.remove(&id).map(|(kind, _)| kind) != Some(2) {return Err(AudioSupervisorError::InvalidFrame);}
+                            emit(events, AudioSupervisorEvent::PttEvent {generation,request_id:id,event})?;
+                        }
+                        Msg::MediaSessions(sessions) => emit(events, AudioSupervisorEvent::MediaSessions {generation,sessions})?,
+                        Msg::MediaCommandResult(result) => {
+                            if pending_controls.remove(&id).map(|(kind, _)| kind) != Some(3) {return Err(AudioSupervisorError::InvalidFrame);}
+                            emit(events, AudioSupervisorEvent::MediaCommandResult {generation,request_id:id,result})?;
+                        }
                         Msg::Error(error) => {
                             if id <= 1 || id > request { return Err(AudioSupervisorError::InvalidFrame); }
                             if let Some(response) = pending.remove(&id) { let _ = response.reply.send(Err(AudioSupervisorError::WorkerRejected(error.code))); }
                             // A rejected renewal/gain never deletes another live session.
                             if let Some(session) = pending_starts.remove(&id) { sessions.remove(&session); }
+                            pending_controls.remove(&id);
                             emit(events, AudioSupervisorEvent::CommandRejected { generation, request_id: id, error })?;
                         }
                         _ => return Err(AudioSupervisorError::InvalidFrame),
@@ -568,7 +654,7 @@ async fn serve(
                         let _ = command.reply.send(Err(AudioSupervisorError::Unavailable)); continue;
                     }
                     // The child holds one paged inventory snapshot at a time.
-                    if pending.len() >= QUEUE || (matches!(&command.message, Msg::ListDevices(_)) && pending.values().any(|response| response.inventory.is_some())) {
+                    if pending.len() + pending_controls.len() >= QUEUE || (matches!(&command.message, Msg::ListDevices(_)) && pending.values().any(|response| response.inventory.is_some())) {
                         let _ = command.reply.send(Err(AudioSupervisorError::QueueFull)); continue;
                     }
                     let next_request = request.checked_add(1).ok_or(AudioSupervisorError::InvalidFrame)?;
@@ -577,6 +663,12 @@ async fn serve(
                     let shutdown = matches!(message, Msg::Shutdown(_));
                     let inventory = match &message { Msg::ListDevices(query) => Some(Inventory { direction: query.direction, page: 0, revision: 0, devices: Vec::new() }), _ => None };
                     let response = matches!(message, Msg::ProbeBackend(_) | Msg::ListDevices(_));
+                    let control = match &message {
+                        Msg::AcquireMicMute(_) | Msg::SetMicMute(_) | Msg::ReleaseMicMute(_) => Some(1),
+                        Msg::ConfigurePtt(_) | Msg::PttGrant(_) | Msg::PttRevoke(_) => Some(2),
+                        Msg::MediaCommand(_) => Some(3),
+                        _ => None,
+                    };
                     let session = match &message { Msg::StartSession(start) => Some(start.session_id.as_slice().try_into().map_err(|_| AudioSupervisorError::InvalidFrame)?), _ => None };
                     if let Some(id) = session {
                         if sessions.len() >= contract::MAX_SESSIONS || sessions.contains(&id) {
@@ -586,6 +678,7 @@ async fn serve(
                     request = next_request;
                     if let Err(error) = send(child, request, message).await { let _ = command.reply.send(Err(error.clone())); return Err(error); }
                     if let Some(id) = session { sessions.insert(id); pending_starts.insert(request, id); }
+                    if let Some(kind) = control { pending_controls.insert(request, (kind, Instant::now() + COMMAND_TIMEOUT)); }
                     if shutdown {
                         available.store(0, Ordering::Release);
                         if timeout(IO_TIMEOUT, child.process.wait()).await.is_err() { child.reap().await; }
@@ -961,6 +1054,20 @@ mod tests {
                 Err(AudioSupervisorError::InvalidFrame)
             );
             assert!(rx.try_recv().is_err());
+            for invalid_ttl in [0, 251] {
+                assert_eq!(
+                    handle.ptt_grant(1, invalid_ttl).await,
+                    Err(AudioSupervisorError::InvalidFrame)
+                );
+            }
+            assert_eq!(
+                handle.ptt_grant(0, 250).await,
+                Err(AudioSupervisorError::InvalidFrame)
+            );
+            assert_eq!(
+                handle.ptt_revoke(0).await,
+                Err(AudioSupervisorError::InvalidFrame)
+            );
         }
     }
 
@@ -985,6 +1092,45 @@ mod tests {
             assert_eq!(result, Ok(42));
             assert!(rx.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn native_controls_are_correlated_generation_fenced_write_requests() {
+        let (commands, mut rx) = mpsc::channel(1);
+        let handle = AudioHandle {
+            commands,
+            generation: Arc::new(AtomicU64::new(7)),
+            shutdown: watch::channel(false).0,
+            stopped: watch::channel(true).1,
+        };
+        macro_rules! written {
+            ($call:expr, $pattern:pat) => {{
+                let (result, ()) = tokio::join!($call, async {
+                    let command = rx.recv().await.expect("explicit native control");
+                    assert_eq!(command.generation, 7);
+                    assert!(matches!(command.message, $pattern));
+                    assert!(command.reply.send(Ok(Reply::Written(42))).is_ok());
+                });
+                assert_eq!(result, Ok(42));
+            }};
+        }
+        written!(
+            handle.acquire_mic_mute(w::DeviceSelection {
+                selector: Some(w::device_selection::Selector::FollowDefault(2))
+            }),
+            Msg::AcquireMicMute(_)
+        );
+        written!(handle.set_mic_mute(1, false), Msg::SetMicMute(_));
+        written!(handle.release_mic_mute(), Msg::ReleaseMicMute(_));
+        written!(handle.configure_ptt(None, Vec::new()), Msg::ConfigurePtt(_));
+        written!(handle.ptt_grant(7, 250), Msg::PttGrant(_));
+        written!(handle.ptt_revoke(7), Msg::PttRevoke(_));
+        written!(handle.set_media_watch(false), Msg::SetMediaWatch(_));
+        written!(
+            handle.media_command(7, 1, w::MediaCommandKind::Play),
+            Msg::MediaCommand(_)
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1099,10 +1245,13 @@ mod tests {
                 request_id, error, ..
             } = next(&mut listener_events).await
             {
-                assert_eq!(request_id, stopped_renewal);
                 assert_eq!(error.code, 6);
                 assert_eq!(error.session_id, vec![13; 16]);
-                break;
+                // Automatic lease renewals queued before StopSession can also
+                // be rejected; only this explicit request completes the check.
+                if request_id == stopped_renewal {
+                    break;
+                }
             }
         }
         #[cfg(unix)]

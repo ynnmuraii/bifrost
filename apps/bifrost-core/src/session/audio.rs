@@ -1483,6 +1483,28 @@ impl Actor {
                     }
                 }
             }
+            AudioSupervisorEvent::MuteSnapshot {
+                generation: gen, ..
+            }
+            | AudioSupervisorEvent::PttEvent {
+                generation: gen, ..
+            }
+            | AudioSupervisorEvent::MediaSessions {
+                generation: gen, ..
+            }
+            | AudioSupervisorEvent::MediaCommandResult {
+                generation: gen, ..
+            } => {
+                // Unrequested optional controls cannot acquire authority from a child push.
+                if self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.generation == gen)
+                {
+                    let _ = self.stop_worker().await;
+                    self.worker_failed = true;
+                }
+            }
             AudioSupervisorEvent::CommandRejected {
                 generation: gen,
                 error,
