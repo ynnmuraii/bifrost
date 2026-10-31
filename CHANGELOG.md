@@ -33,7 +33,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Linux audio backend internals**
 
-- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute, media sessions and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
+- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
+
+**Linux MPRIS internals**
+
+- Discover session-bus media players with incarnation-scoped tokens, bounded private metadata, native capability checks, extrapolated timelines and bounded revision-checked command completions. Linux's current-player heuristic selects only the most recently observed Playing player. Opt-in live tests register/control only their own fake player and verify name cleanup.
 
 **Audio child IPC**
 
@@ -69,7 +73,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Внутренний аудиобэкенд Linux**
 
-- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса, безопасное владение заглушением, медиасеансы и глобальный PTT явно недоступны. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
+- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса, безопасное владение заглушением и глобальный PTT явно недоступны. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
+
+**Внутренний MPRIS Linux**
+
+- Добавлены обнаружение медиаплееров на шине сеанса, токены отдельных экземпляров, ограниченные приватные метаданные, проверка возможностей, экстраполяция позиции и ограниченные по времени команды с проверкой ревизии. Текущим считается только последний замеченный играющий плеер. Натурный тест включается отдельно, управляет только собственным фиктивным плеером и проверяет освобождение его имени.
 
 **IPC дочернего аудиопроцесса**
 
