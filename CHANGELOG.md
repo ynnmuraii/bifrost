@@ -38,6 +38,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Source and UDP receiver workers wait on lock-free capture/packet notifications and absolute media/control deadlines instead of idle polling. Capture clock hints prefer valid host/QPC timestamps and never use capture device positions, which may remain constant between process-loopback packets.
 - Expose bounded drift ratio ppm, filtered fill error, applied coarse-correction count and actual clock authority through private worker Health. Source reports no drift controller; Listener observations survive PI resets.
+- Bound Source inbound work to 64 packets before revisiting shutdown and media/control deadlines, so pinned-peer invalid-tag floods cannot starve pacing or shutdown.
 
 **Shared Listener media**
 
@@ -105,6 +106,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Обработчики Source и UDP-приёма ждут уведомлений захвата/пакетов без блокировок в callback и абсолютных сроков медиа/управления вместо опроса пустых очередей. Часы захвата используют достоверные временные метки host/QPC, а не позиции устройства, которые могут оставаться неизменными между пакетами process-loopback.
 - Закрытые сводки Health передают ограниченные ppm ресэмплинга, фильтрованную ошибку наполнения, число применённых грубых коррекций и фактический источник часов. У Source нет ПИ-регулятора дрейфа; счётчик Listener сохраняется при сбросах ПИ.
+- Входящая обработка Source ограничена 64 пакетами перед повторной проверкой остановки и сроков медиа/управления: поток пакетов с неверным тегом от закреплённого адреса не блокирует темп передачи и завершение.
 
 **Общий аудиовыход Listener**
 

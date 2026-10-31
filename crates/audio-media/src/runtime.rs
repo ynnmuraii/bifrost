@@ -904,7 +904,12 @@ impl SourceWorker {
                     .map_err(crypto_reason)?;
                 self.context.send(&outgoing[..n])?;
             }
-            while let Some(n) = self.context.receive(&mut packet)? {
+            let mut drained = 0;
+            while drained < 64 && !self.context.shared.is_stopped() {
+                let Some(n) = self.context.receive(&mut packet)? else {
+                    break;
+                };
+                drained += 1;
                 match self.opener.open(&mut packet[..n], |_| true) {
                     Ok((header, payload)) => {
                         if self.path.control(header, payload) {
@@ -934,9 +939,14 @@ impl SourceWorker {
                     Err(_) => lock(&self.context.shared.stats).rejected += 1,
                 }
             }
+            if self.context.shared.is_stopped() {
+                break;
+            }
             if !self.path.validated {
-                self.context
-                    .wait_until(self.path.deadline().expect("unvalidated path deadline"));
+                if drained < 64 {
+                    self.context
+                        .wait_until(self.path.deadline().expect("unvalidated path deadline"));
+                }
                 continue;
             }
             self.context.shared.started(&self.context.events);
@@ -1031,7 +1041,9 @@ impl SourceWorker {
             } else {
                 next_keepalive
             };
-            self.context.wait_until(deadline);
+            if drained < 64 {
+                self.context.wait_until(deadline);
+            }
         }
         Ok(())
     }
