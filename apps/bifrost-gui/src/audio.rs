@@ -11,6 +11,8 @@ pub enum AudioRequest {
     Snapshot,
     Devices,
     Mutation,
+    /// An urgent existing control must not own an outstanding system switch's ACK.
+    AuxiliaryMutation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,10 +20,10 @@ pub enum AudioAction {
     EditConfig(Box<ipc::AudioConfig>),
     ApplyConfig,
     Refresh,
-    UseThisListener,
+    Share(bool),
+    Receive(bool),
     ListDevices(ipc::AudioDeviceKind),
-    Start(Vec<u8>),
-    StopAll,
+    StopSystemAudio,
     SetMicrophoneMute(bool),
     SetPtt(bool),
     Player(AudioPlayerAction),
@@ -39,6 +41,9 @@ pub struct AudioView {
     pending_id: Option<u64>,
     pending_revision: Option<u64>,
     pending_since: Option<Instant>,
+    pending_snapshot_id: Option<u64>,
+    /// Pending switch intent, not an indication of active capture or playback.
+    pub system_intent: Option<(ipc::AudioRole, bool)>,
     device_requests: Vec<(u64, i32)>,
     pub dirty: bool,
     /// Ownership of a GUI hold button, separate from authoritative/global PTT state.
@@ -57,6 +62,8 @@ impl Default for AudioView {
             pending_id: None,
             pending_revision: None,
             pending_since: None,
+            pending_snapshot_id: None,
+            system_intent: None,
             device_requests: Vec::new(),
             dirty: false,
             gui_ptt_held: false,
@@ -92,6 +99,8 @@ impl AudioView {
         self.pending_id = None;
         self.pending_revision = None;
         self.pending_since = None;
+        self.pending_snapshot_id = None;
+        self.system_intent = None;
     }
     fn fail(&mut self, lang: Lang, key: Key) {
         self.settle();
@@ -103,6 +112,46 @@ impl AudioView {
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.pending_since.map(|t| t + Duration::from_secs(10))
+    }
+    pub fn sharing_requested(&self, role: ipc::AudioRole) -> bool {
+        if let Some((pending_role, enabled)) = self.system_intent {
+            return pending_role == role && enabled;
+        }
+        self.status.as_ref().is_some_and(|status| {
+            if status.role != role as i32 {
+                return false;
+            }
+            if let Some(requested) = status.system_sharing_requested {
+                return requested;
+            }
+            // Legacy policy has no requested-intent observation. Only an actually running,
+            // bilaterally authorized pipeline can display ON; never infer it from enabled.
+            status.sessions.iter().any(|session| {
+                session.local_role == role as i32
+                    && session.state == ipc::AudioSessionState::Running as i32
+                    && session.consent.as_ref().is_some_and(|consent| {
+                        let (Some(local), Some(remote)) = (&consent.local, &consent.remote) else {
+                            return false;
+                        };
+                        if role == ipc::AudioRole::Listener {
+                            local.allow_system_receive && remote.allow_system_send
+                        } else {
+                            local.allow_system_send
+                                && remote.allow_system_receive
+                                && session.sending == Some(true)
+                                && session.capture_active == Some(true)
+                        }
+                    })
+            })
+        })
+    }
+    pub fn error_message(&self, lang: Lang) -> Option<&str> {
+        self.error.as_deref().or_else(|| {
+            self.status
+                .as_ref()
+                .filter(|status| !self.pending && !status.system_sharing_error.is_empty())
+                .map(|status| text(lang, system_error_key(&status.system_sharing_error)))
+        })
     }
 }
 
@@ -120,6 +169,14 @@ pub fn error_key(code: &str) -> Key {
         "AUDIO_UNSUPPORTED_COMMAND" => Key::AudioUnsupportedCommand,
         "AUDIO_INVALID_CONFIG" => Key::AudioInvalidConfig,
         _ => Key::AudioUnavailable,
+    }
+}
+
+fn system_error_key(code: &str) -> Key {
+    if code == "AUDIO_CONSENT_REQUIRED" {
+        Key::AudioSystemConsentRequired
+    } else {
+        error_key(code)
     }
 }
 
@@ -179,19 +236,18 @@ impl ViewModel {
             self.audio.devices.push(page);
         }
     }
-    pub fn apply_audio_status(&mut self, status: ipc::AudioStatus) {
-        if self
-            .audio
-            .status
-            .as_ref()
-            .is_some_and(|old| old.revision >= status.revision)
-        {
+    pub fn apply_audio_status(&mut self, request_id: u64, status: ipc::AudioStatus) {
+        let correlated_snapshot = self.audio.pending_snapshot_id == Some(request_id);
+        if self.audio.status.as_ref().is_some_and(|old| {
+            old.revision > status.revision
+                || old.revision == status.revision && !correlated_snapshot
+        }) {
             return;
         }
         let Ok(model) = crate::audio_wire::decode_status(&status) else {
             self.audio.available = false;
             self.audio.fail(self.look.language, Key::AudioUnavailable);
-            self.audio_player.replace_cards(Vec::new());
+            self.audio_player.replace_cards(Vec::new(), false);
             return;
         };
         if !self.audio.dirty || self.audio.pending {
@@ -200,14 +256,23 @@ impl ViewModel {
             }
             self.audio.dirty = false;
         }
-        if self
-            .audio
-            .pending_revision
-            .is_some_and(|revision| status.revision > revision)
-        {
+        let intent_observed = self.audio.system_intent.is_none_or(|(role, enabled)| {
+            status.system_sharing_requested == Some(enabled)
+                && (!enabled || status.role == role as i32)
+                || enabled && !status.system_sharing_error.is_empty()
+        });
+        let settles_request = if self.audio.system_intent.is_some() {
+            // A push can predate this request even with a newer status revision.
+            // Only the read requested after this mutation's persistence ACK settles it.
+            correlated_snapshot && intent_observed
+        } else {
+            self.audio
+                .pending_revision
+                .is_some_and(|revision| status.revision > revision)
+        };
+        if settles_request {
             self.audio.settle();
         }
-        self.audio.error = None;
         self.audio.available = true;
         let cards = map_cards(
             &model,
@@ -215,8 +280,14 @@ impl ViewModel {
                 .as_ref()
                 .map_or(&[][..], |status| &status.members),
         );
+        let observed_active = self.audio.system_intent.is_none()
+            && status.system_sharing_requested != Some(false)
+            && model.sessions.iter().any(|session| {
+                session.local_role == model::AudioRole::Listener
+                    && session.state == model::SessionState::Running
+            });
+        self.audio_player.replace_cards(cards, observed_active);
         self.audio.status = Some(status);
-        self.audio_player.replace_cards(cards);
     }
     pub(crate) fn refresh_audio_peer_names(&mut self) {
         let Some(audio) = &self.audio.status else {
@@ -242,21 +313,42 @@ impl ViewModel {
                 .device_requests
                 .retain(|(request, _)| *request != id);
         }
+        if kind == AudioRequest::AuxiliaryMutation {
+            if !result.ok {
+                self.audio.error =
+                    Some(text(self.look.language, error_key(&result.error_code)).into());
+            } else {
+                self.request_audio_status(Instant::now());
+            }
+            return;
+        }
         if kind == AudioRequest::Mutation && self.audio.pending_id != Some(id) {
             return;
         }
         if !result.ok {
-            let key = error_key(&result.error_code);
+            let key = if self.audio.system_intent.is_some() {
+                system_error_key(&result.error_code)
+            } else {
+                error_key(&result.error_code)
+            };
             self.audio.fail(self.look.language, key);
             if key == Key::AudioUnavailable {
                 self.audio.available = false;
-                self.audio_player.replace_cards(Vec::new());
+                self.audio_player.replace_cards(Vec::new(), false);
             }
             return;
         }
-        // ACK means accepted/persisted, not active. Only a new snapshot settles controls.
+        // ACK means persisted intent, not active audio. Correlate a fresh read so an
+        // earlier queued failure cannot retire a newer switch or hide its OFF action.
         if kind == AudioRequest::Mutation {
-            self.request_audio_status(Instant::now());
+            if self.audio.system_intent.is_some() {
+                let id = self.begin_request(Request::Audio(AudioRequest::Snapshot), Instant::now());
+                self.audio.pending_snapshot_id = Some(id);
+                self.outgoing
+                    .push((id, Msg::GetAudioStatus(ipc::GetAudioStatus {})));
+            } else {
+                self.request_audio_status(Instant::now());
+            }
         }
     }
     pub fn tick_audio(&mut self, now: Instant) {
@@ -278,27 +370,6 @@ impl ViewModel {
         match action {
             AudioAction::EditConfig(config) => {
                 self.audio.draft.clone_from(config.as_ref());
-                self.audio.dirty = true;
-                return;
-            }
-            AudioAction::UseThisListener => {
-                use ring::rand::SecureRandom;
-                let was_listener = self.audio.draft.role == ipc::AudioRole::Listener as i32;
-                if !was_listener || self.audio.draft.group_id.len() != 16 {
-                    let mut id = vec![0; 16];
-                    if ring::rand::SystemRandom::new().fill(&mut id).is_err() {
-                        self.audio.error =
-                            Some(text(self.look.language, Key::AudioUnavailable).into());
-                        return;
-                    }
-                    self.audio.draft.group_id = id;
-                }
-                self.audio.draft.role = ipc::AudioRole::Listener as i32;
-                self.audio.draft.group_id_override = Some(false);
-                self.audio.draft.listener_node_id.clear();
-                if !was_listener {
-                    self.audio.draft.enabled = false;
-                }
                 self.audio.dirty = true;
                 return;
             }
@@ -342,7 +413,9 @@ impl ViewModel {
         // Fail-closed stop/mute/release remain admissible even when a status request failed.
         let urgent = matches!(
             action,
-            AudioAction::StopAll
+            AudioAction::Share(false)
+                | AudioAction::Receive(false)
+                | AudioAction::StopSystemAudio
                 | AudioAction::SetMicrophoneMute(true)
                 | AudioAction::SetPtt(false)
                 | AudioAction::Player(AudioPlayerAction::Stop(_))
@@ -359,7 +432,33 @@ impl ViewModel {
             return;
         };
         let revision = status.revision;
+        let status_role = status.role;
         let message = match action {
+            AudioAction::Share(enabled) | AudioAction::Receive(enabled) => {
+                let role = if matches!(action, AudioAction::Share(_)) {
+                    ipc::AudioRole::Source
+                } else {
+                    ipc::AudioRole::Listener
+                };
+                if *enabled
+                    && role == ipc::AudioRole::Source
+                    && self.audio.draft.listener_node_id.len() != 32
+                {
+                    self.audio.error =
+                        Some(text(self.look.language, Key::AudioSelectReceiver).into());
+                    return;
+                }
+                Msg::SetSystemAudioSharing(ipc::SetSystemAudioSharing {
+                    enabled: *enabled,
+                    role: role as i32,
+                    listener_node_id: if role == ipc::AudioRole::Source {
+                        self.audio.draft.listener_node_id.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    expected_revision: revision,
+                })
+            }
             AudioAction::ApplyConfig => {
                 if ::ipc::audio::validate_config(&self.audio.draft).is_err() {
                     self.audio.error =
@@ -371,19 +470,14 @@ impl ViewModel {
                     expected_revision: revision,
                 })
             }
-            AudioAction::Start(peer) => Msg::StartAudio(ipc::StartAudio {
-                peer_node_id: peer.clone(),
-                kind: ipc::AudioKind::System as i32,
-                profile: status
-                    .config
-                    .as_ref()
-                    .map_or(ipc::AudioProfile::Ethernet as i32, |c| c.profile),
-                expected_revision: revision,
-            }),
-            AudioAction::StopAll => Msg::StopAudio(ipc::StopAudio {
-                stop_all: true,
-                ..Default::default()
-            }),
+            AudioAction::StopSystemAudio => {
+                Msg::SetSystemAudioSharing(ipc::SetSystemAudioSharing {
+                    enabled: false,
+                    role: status_role,
+                    listener_node_id: Vec::new(),
+                    expected_revision: revision,
+                })
+            }
             AudioAction::SetMicrophoneMute(muted) => {
                 Msg::SetMicrophoneMute(ipc::SetMicrophoneMute {
                     muted: *muted,
@@ -403,12 +497,60 @@ impl ViewModel {
             }
             _ => return,
         };
-        let id = self.begin_request(Request::Audio(AudioRequest::Mutation), now);
+        if matches!(
+            action,
+            AudioAction::Share(false) | AudioAction::Receive(false) | AudioAction::StopSystemAudio
+        ) && self.audio.system_intent.is_some()
+        {
+            if let Some(superseded) = self.audio.pending_id {
+                self.inflight.retain(|request| request.id != superseded);
+                self.outgoing.retain(|(id, _)| *id != superseded);
+            }
+            if let Some(snapshot) = self.audio.pending_snapshot_id {
+                self.inflight.retain(|request| request.id != snapshot);
+                self.outgoing.retain(|(id, _)| *id != snapshot);
+            }
+        }
+        let auxiliary = self.audio.system_intent.is_some()
+            && !matches!(
+                action,
+                AudioAction::Share(_) | AudioAction::Receive(_) | AudioAction::StopSystemAudio
+            );
+        let kind = if auxiliary {
+            AudioRequest::AuxiliaryMutation
+        } else {
+            AudioRequest::Mutation
+        };
+        let id = self.begin_request(Request::Audio(kind), now);
+        match action {
+            AudioAction::Share(enabled) => {
+                self.audio.system_intent = Some((ipc::AudioRole::Source, *enabled));
+            }
+            AudioAction::Receive(enabled) => {
+                self.audio.system_intent = Some((ipc::AudioRole::Listener, *enabled));
+            }
+            AudioAction::StopSystemAudio => {
+                self.audio.system_intent = Some((
+                    if status_role == ipc::AudioRole::Listener as i32 {
+                        ipc::AudioRole::Listener
+                    } else {
+                        ipc::AudioRole::Source
+                    },
+                    false,
+                ));
+            }
+            _ => {}
+        }
         if let AudioAction::SetPtt(pressed) = action {
             self.audio.gui_ptt_held = *pressed;
         }
+        if auxiliary {
+            self.outgoing.push((id, message));
+            return;
+        }
         self.audio.pending = true;
         self.audio.pending_id = Some(id);
+        self.audio.pending_snapshot_id = None;
         self.audio.pending_revision = Some(revision);
         self.audio.pending_since = Some(now);
         self.audio.error = None;

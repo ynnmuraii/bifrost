@@ -1111,7 +1111,7 @@ impl ViewModel {
         }
         self.inflight.clear();
         self.audio = crate::audio::AudioView::default();
-        self.audio_player.replace_cards(Vec::new());
+        self.audio_player.replace_cards(Vec::new(), false);
         // History belongs to the lost core session, not to the last known status.
         self.clipboard_history.clear();
         self.silent = false;
@@ -1492,7 +1492,7 @@ impl ViewModel {
             self.take_inflight(frame.request_id);
         }
         match msg {
-            Msg::AudioStatus(status) => self.apply_audio_status(status),
+            Msg::AudioStatus(status) => self.apply_audio_status(frame.request_id, status),
             Msg::AudioDevices(devices) => self.apply_audio_devices(frame.request_id, devices),
             Msg::Status(status) => self.apply_status(status),
             Msg::TopologyDoc(doc) => self.apply_topology(doc),

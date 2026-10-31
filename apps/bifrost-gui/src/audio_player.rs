@@ -80,13 +80,13 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Replace a complete authoritative snapshot. Only an empty-to-active transition auto-opens.
-    pub fn replace_cards(&mut self, cards: Vec<AudioPlayerCard>) {
-        let active = !cards.is_empty();
-        if active && !self.had_streams {
+    /// Auto-open only after a worker-observed active stream, never a pending or failed path.
+    /// Rebuffering does not reopen a player the user already hid for this stream.
+    pub fn replace_cards(&mut self, cards: Vec<AudioPlayerCard>, observed_active: bool) {
+        if observed_active && !self.had_streams {
             self.open = true;
         }
-        self.had_streams = active;
+        self.had_streams = !cards.is_empty() && (self.had_streams || observed_active);
         self.cards = cards;
     }
 }

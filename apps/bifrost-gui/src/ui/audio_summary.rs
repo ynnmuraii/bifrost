@@ -22,20 +22,25 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                widgets::text(
-                    ui,
-                    text(lang, Key::AudioDiagnostics),
-                    16.0,
-                    super::theme::fam::sans_semibold(),
-                    pal.ink,
-                );
-                if widgets::small_button(ui, pal, text(lang, Key::AudioRefresh), !vm.audio.pending)
-                    .clicked()
-                {
-                    actions.push(Action::Audio(AudioAction::Refresh));
-                }
-            });
+            widgets::text(
+                ui,
+                text(lang, Key::AudioDiagnostics),
+                16.0,
+                super::theme::fam::sans_semibold(),
+                pal.ink,
+            );
+            if let Some(error) = vm.audio.error_message(lang) {
+                widgets::wrapped(ui, error, 13.0, super::theme::fam::sans(), pal.accent_ink);
+            }
+            let source_connecting = vm.audio.sharing_requested(AudioRole::Source)
+                && vm
+                    .audio
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.sessions.is_empty());
+            if vm.audio.pending && !source_connecting {
+                widgets::hint(ui, pal, text(lang, Key::AudioPending));
+            }
             let Some(status) = &vm.audio.status else {
                 widgets::hint(
                     ui,
@@ -54,8 +59,22 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
             if !vm.audio.available {
                 widgets::hint(ui, pal, text(lang, Key::AudioUnavailable));
             }
-            if status.sessions.is_empty() {
-                widgets::hint(ui, pal, text(lang, Key::AudioIdle));
+            if status.sessions.is_empty()
+                && vm.audio.error_message(lang).is_none()
+                && (!vm.audio.pending || source_connecting)
+            {
+                let key = if vm.audio.sharing_requested(AudioRole::Listener) {
+                    Key::AudioReceivingReady
+                } else if vm.audio.sharing_requested(AudioRole::Source) {
+                    Key::AudioSharingRequested
+                } else if status.role == AudioRole::Source as i32
+                    && status.system_sharing_requested == Some(false)
+                {
+                    Key::AudioSharingStopped
+                } else {
+                    Key::AudioIdle
+                };
+                widgets::hint(ui, pal, text(lang, key));
             }
             for session in &status.sessions {
                 widgets::wrapped(
@@ -181,98 +200,119 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
             }
             let connected = vm.connection.is_connected();
             let available = connected && vm.audio.available;
-            ui.horizontal_wrapped(|ui| {
-                if widgets::button(
-                    ui,
-                    pal,
-                    text(lang, Key::AudioStopAll),
-                    widgets::Kind::Plain,
-                    connected && !status.sessions.is_empty(),
-                )
-                .clicked()
-                {
-                    actions.push(Action::Audio(AudioAction::StopAll));
-                }
-                if let Some(mic) = status.microphone.as_ref().filter(|_| mic_control_enabled) {
-                    // A retained unmuted snapshot must never disable urgent mute.
-                    let can_mute = if mic.muted {
-                        available && mic.control_active && !vm.audio.pending
-                    } else {
-                        connected
-                    };
-                    if widgets::small_button(
-                        ui,
-                        pal,
-                        text(
-                            lang,
-                            if mic.muted {
-                                Key::AudioMicUnmute
-                            } else {
-                                Key::AudioMicMute
-                            },
-                        ),
-                        can_mute,
-                    )
-                    .clicked()
-                    {
-                        actions.push(Action::Audio(AudioAction::SetMicrophoneMute(!mic.muted)));
-                    }
-                    let ptt_enabled = status
-                        .config
-                        .as_ref()
-                        .and_then(|c| c.microphone.as_ref())
-                        .is_some_and(|m| m.control_enabled && m.ptt_enabled);
-                    if ptt_enabled {
-                        let can_hold = available
-                            && mic.control_active
-                            && (was_held || vm.audio.gui_ptt_held || !vm.audio.pending);
-                        let response = widgets::small_button(
-                            ui,
-                            pal,
-                            text(lang, Key::AudioPttPress),
-                            can_hold,
-                        )
-                        .on_hover_text(text(lang, Key::AudioPttReleaseHint));
-                        // Response helpers acquire egui memory: evaluate outside the input lock.
-                        let pointer_held = response.is_pointer_button_down_on();
-                        let focused_button = response.has_focus();
-                        held = can_hold
-                            && ui.ctx().input(|input| {
-                                fresh_press = pointer_held
-                                    && input.pointer.button_pressed(egui::PointerButton::Primary)
-                                    || focused_button
-                                        && input.events.iter().any(|event| {
-                                            matches!(
-                                                event,
-                                                egui::Event::Key {
-                                                    key: egui::Key::Space | egui::Key::Enter,
-                                                    pressed: true,
-                                                    repeat: false,
-                                                    ..
-                                                }
-                                            )
-                                        });
-                                input.focused
-                                    && (pointer_held
-                                        || focused_button
-                                            && (input.key_down(egui::Key::Space)
-                                                || input.key_down(egui::Key::Enter)))
-                            });
-                    }
-                }
-                if status
+            let has_controls = !status.sessions.is_empty()
+                || mic_control_enabled && status.microphone.is_some()
+                || status
                     .microphone
                     .as_ref()
-                    .is_some_and(|mic| mic.ptt_pressed)
-                    && widgets::small_button(ui, pal, text(lang, Key::AudioPttRelease), connected)
+                    .is_some_and(|mic| mic.ptt_pressed);
+            if has_controls {
+                ui.horizontal_wrapped(|ui| {
+                    if !status.sessions.is_empty()
+                        && widgets::button(
+                            ui,
+                            pal,
+                            text(lang, Key::AudioStopSystem),
+                            widgets::Kind::Plain,
+                            connected,
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::Audio(AudioAction::StopSystemAudio));
+                    }
+                    if let Some(mic) = status.microphone.as_ref().filter(|_| mic_control_enabled) {
+                        // A retained unmuted snapshot must never disable urgent mute.
+                        let can_mute = if mic.muted {
+                            available && mic.control_active && !vm.audio.pending
+                        } else {
+                            connected
+                        };
+                        if widgets::small_button(
+                            ui,
+                            pal,
+                            text(
+                                lang,
+                                if mic.muted {
+                                    Key::AudioMicUnmute
+                                } else {
+                                    Key::AudioMicMute
+                                },
+                            ),
+                            can_mute,
+                        )
+                        .clicked()
+                        {
+                            actions.push(Action::Audio(AudioAction::SetMicrophoneMute(!mic.muted)));
+                        }
+                        let ptt_enabled = status
+                            .config
+                            .as_ref()
+                            .and_then(|c| c.microphone.as_ref())
+                            .is_some_and(|m| m.control_enabled && m.ptt_enabled);
+                        if ptt_enabled {
+                            let can_hold = available
+                                && mic.control_active
+                                && (was_held || vm.audio.gui_ptt_held || !vm.audio.pending);
+                            let response = widgets::small_button(
+                                ui,
+                                pal,
+                                text(lang, Key::AudioPttPress),
+                                can_hold,
+                            )
+                            .on_hover_text(text(lang, Key::AudioPttReleaseHint));
+                            // Response helpers acquire egui memory: evaluate outside the input lock.
+                            let pointer_held = response.is_pointer_button_down_on();
+                            let focused_button = response.has_focus();
+                            held = can_hold
+                                && ui.ctx().input(|input| {
+                                    fresh_press = pointer_held
+                                        && input
+                                            .pointer
+                                            .button_pressed(egui::PointerButton::Primary)
+                                        || focused_button
+                                            && input.events.iter().any(|event| {
+                                                matches!(
+                                                    event,
+                                                    egui::Event::Key {
+                                                        key: egui::Key::Space | egui::Key::Enter,
+                                                        pressed: true,
+                                                        repeat: false,
+                                                        ..
+                                                    }
+                                                )
+                                            });
+                                    input.focused
+                                        && (pointer_held
+                                            || focused_button
+                                                && (input.key_down(egui::Key::Space)
+                                                    || input.key_down(egui::Key::Enter)))
+                                });
+                        }
+                    }
+                    if status
+                        .microphone
+                        .as_ref()
+                        .is_some_and(|mic| mic.ptt_pressed)
+                        && widgets::small_button(
+                            ui,
+                            pal,
+                            text(lang, Key::AudioPttRelease),
+                            connected,
+                        )
                         .on_hover_text(text(lang, Key::AudioPttReleaseHint))
                         .clicked()
-                {
-                    held = false;
-                    release_requested = true;
-                }
-            });
+                    {
+                        held = false;
+                        release_requested = true;
+                    }
+                });
+            }
             ui.collapsing(text(lang, Key::AudioDetails), |ui| {
+                if widgets::small_button(ui, pal, text(lang, Key::AudioRefresh), !vm.audio.pending)
+                    .clicked()
+                {
+                    actions.push(Action::Audio(AudioAction::Refresh));
+                }
                 backend_details(ui, pal, status, lang);
                 for session in &status.sessions {
                     if let Some(health) = &session.health {
