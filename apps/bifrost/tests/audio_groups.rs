@@ -230,6 +230,25 @@ fn resolved_source_follows_changed_listener_group_without_source_gui_clear_and_p
         progressed.config, before.config,
         "telemetry is not a preference edit"
     );
+    let mut listener_policy_revision = pair.listener.status().revision;
+    let await_remote_permission = |listener: &mut Window, after: u64, allowed: bool| {
+        listener.event(|message| match message {
+            gui_frame::Msg::AudioStatus(status)
+                if status.revision > after
+                    && status.sessions.iter().any(|session| {
+                        session.session_id == previous_session
+                            && session
+                                .consent
+                                .as_ref()
+                                .and_then(|consent| consent.remote.as_ref())
+                                .is_some_and(|consent| consent.allow_media_control == allowed)
+                    }) =>
+            {
+                Some(status.revision)
+            }
+            _ => None,
+        })
+    };
     let mut normal = before
         .config
         .clone()
@@ -246,6 +265,8 @@ fn resolved_source_follows_changed_listener_group_without_source_gui_clear_and_p
         before.revision, progressed.revision,
     );
     audio::assert_ok(pair.source.answer(request_id));
+    listener_policy_revision =
+        await_remote_permission(&mut pair.listener, listener_policy_revision, true);
     let accepted = pair.source.status();
     let future = pair
         .source
@@ -279,6 +300,8 @@ fn resolved_source_follows_changed_listener_group_without_source_gui_clear_and_p
         .expect("current Source preferences");
     returned.peers[0].allow_media_control = false;
     pair.source.configure(returned);
+    listener_policy_revision =
+        await_remote_permission(&mut pair.listener, listener_policy_revision, false);
     let returned = pair.source.status();
     assert_eq!(
         returned.config, before.config,
@@ -302,6 +325,7 @@ fn resolved_source_follows_changed_listener_group_without_source_gui_clear_and_p
         .expect("fresh Source preferences");
     normal.peers[0].allow_media_control = true;
     pair.source.configure(normal);
+    await_remote_permission(&mut pair.listener, listener_policy_revision, true);
     let mut listener_gain = pair
         .listener
         .status()

@@ -1129,19 +1129,82 @@ mod tests {
     use super::{discrete_units, route_event, select_devices, DeviceOffer, DeviceSelection};
     use input_model::{HidKey, InputEvent, KeyState, MouseButton, Position};
 
-    #[derive(Clone, Default)]
-    struct CapturedDiagnostics(std::sync::Arc<std::sync::Mutex<String>>);
+    #[derive(Clone, Debug, PartialEq)]
+    enum DiagnosticValue {
+        Number(i128),
+        Bool(bool),
+        Debug(String),
+    }
 
-    impl tracing::field::Visit for CapturedDiagnostics {
+    #[derive(Clone, Debug)]
+    struct DiagnosticEvent {
+        emitter: std::thread::ThreadId,
+        fields: std::collections::BTreeMap<&'static str, DiagnosticValue>,
+    }
+
+    impl tracing::field::Visit for DiagnosticEvent {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .insert(field.name(), DiagnosticValue::Number(value.into()));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields
+                .insert(field.name(), DiagnosticValue::Number(value.into()));
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.fields
+                .insert(field.name(), DiagnosticValue::Bool(value));
+        }
+
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write;
-            writeln!(self.0.lock().unwrap(), "{}={value:?}", field.name()).unwrap();
+            self.fields
+                .insert(field.name(), DiagnosticValue::Debug(format!("{value:?}")));
         }
     }
 
-    impl tracing::Subscriber for CapturedDiagnostics {
+    #[derive(Clone, Default)]
+    struct CapturedDiagnostics(std::sync::Arc<std::sync::Mutex<Vec<DiagnosticEvent>>>);
+
+    thread_local! {
+        static ACTIVE_DIAGNOSTICS: std::cell::RefCell<Option<CapturedDiagnostics>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    struct ResetDiagnostics(Option<CapturedDiagnostics>);
+
+    impl Drop for ResetDiagnostics {
+        fn drop(&mut self) {
+            ACTIVE_DIAGNOSTICS.with(|active| active.replace(self.0.take()));
+        }
+    }
+
+    impl CapturedDiagnostics {
+        fn capture(&self, action: impl FnOnce()) {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                // Interest must be stable across every test thread sharing the
+                // injection callsite. Route events locally, never filter locally.
+                tracing::subscriber::set_global_default(DiagnosticSubscriber)
+                    .expect("one process-wide test diagnostic subscriber");
+                tracing::callsite::rebuild_interest_cache();
+            });
+            let previous = ACTIVE_DIAGNOSTICS.with(|active| active.replace(Some(self.clone())));
+            let _reset = ResetDiagnostics(previous);
+            action();
+        }
+    }
+
+    struct DiagnosticSubscriber;
+
+    impl tracing::Subscriber for DiagnosticSubscriber {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
             *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::INFO)
         }
 
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -1154,8 +1217,44 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
 
         fn event(&self, event: &tracing::Event<'_>) {
-            event.record(&mut self.clone());
+            let Some(destination) = ACTIVE_DIAGNOSTICS.with(|active| active.borrow().clone())
+            else {
+                return;
+            };
+            let mut captured = DiagnosticEvent {
+                emitter: std::thread::current().id(),
+                fields: std::collections::BTreeMap::new(),
+            };
+            event.record(&mut captured);
+            destination.0.lock().unwrap().push(captured);
         }
+    }
+
+    #[test]
+    fn diagnostic_capture_survives_first_registration_on_another_thread() {
+        fn emit() {
+            tracing::info!(probe = 7_u64, "diagnostic probe");
+        }
+
+        let diagnostics = CapturedDiagnostics::default();
+        let owner = std::thread::current().id();
+        diagnostics.capture(|| {
+            let other = std::thread::spawn(|| {
+                emit();
+                std::thread::current().id()
+            })
+            .join()
+            .unwrap();
+            assert_ne!(owner, other);
+            emit();
+        });
+        let events = diagnostics.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "only the owning thread is captured");
+        assert_eq!(events[0].emitter, owner);
+        assert_eq!(
+            events[0].fields.get("probe"),
+            Some(&DiagnosticValue::Number(7))
+        );
     }
 
     #[tokio::test]
@@ -1232,7 +1331,8 @@ mod tests {
         // Exercise both a mapped key and an unmapped usage without a real keyboard.
         // Neither path emits an EIS frame on this button-only device.
         let diagnostics = CapturedDiagnostics::default();
-        tracing::subscriber::with_default(diagnostics.clone(), || {
+        let capture_thread = std::thread::current().id();
+        diagnostics.capture(|| {
             for key in [
                 HidKey::keyboard(0x04),
                 HidKey {
@@ -1248,11 +1348,41 @@ mod tests {
                 assert!(outcome.os_error.is_some());
             }
         });
-        let output = diagnostics.0.lock().unwrap().clone();
-        assert!(output.contains("EIS injection summary"));
-        assert!(output.contains("events=1"));
-        assert!(output.contains("keys=1"));
-        assert!(output.contains("applied=0"));
+        let captured = diagnostics.0.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2, "both key failures emit real diagnostics");
+        for event in &captured {
+            assert_eq!(event.emitter, capture_thread);
+            for (field, expected) in [
+                ("events", 1),
+                ("keys", 1),
+                ("pointers", 0),
+                ("buttons", 0),
+                ("scrolls", 0),
+                ("applied", 0),
+            ] {
+                assert_eq!(
+                    event.fields.get(field),
+                    Some(&DiagnosticValue::Number(expected))
+                );
+            }
+            assert_eq!(
+                event.fields.get("os_error"),
+                Some(&DiagnosticValue::Bool(true))
+            );
+            assert!(event.fields.keys().all(|field| matches!(
+                *field,
+                "message"
+                    | "events"
+                    | "keys"
+                    | "pointers"
+                    | "buttons"
+                    | "scrolls"
+                    | "applied"
+                    | "os_error"
+                    | "actual_position"
+            )));
+        }
+        let output = format!("{captured:?}");
         for private in [
             "first_key_mapping",
             "page",
