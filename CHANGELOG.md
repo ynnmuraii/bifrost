@@ -89,6 +89,12 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add bounded private microphone-mute/PTT and opt-in media-watch/command messages. Metadata is Debug-redacted, command completions are correlated, and lease/timestamp/hotkey validation remains fail-closed; core integration is separate.
 - Extend the supervisor with generation-fenced microphone, shortcut and consent-gated media controls and correlated completion events. Separate persistent mute toggles from nonzero-ID remote talk grants, bounded to 250 ms and explicitly revocable; Ping never extends a talk grant.
 
+**Audio M5/M6 child execution**
+
+- Execute owned microphone mute and shortcut observation, and keep persistent toggles separate from independently timed remote talk grants. Grant expiry remutes on a guard-owning thread even while other backend work stalls; native snapshots remain authoritative, pre-muted endpoints refuse grants, and Ping does not renew them.
+- Forward bounded media metadata only during an explicitly enabled authorized Source watch, recheck the current player before commands, and correlate completion/cancellation. The explicit Dry harness has documented deterministic revisioned media; native backends never synthesize it.
+
+
 ### Русский
 
 **Исправления**
@@ -173,6 +179,12 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Добавлены ограниченные закрытые сообщения микрофонного mute/PTT и явно включаемых медиаданных/команд. Метаданные скрыты в Debug, результаты команд связаны с запросами, сроки PTT и сочетания клавиш проверяются с безопасным отказом; интеграция core выполняется отдельно.
 - Супервизор дополнен управлением микрофоном, PTT и медиаданными с проверкой поколения и связанными результатами. Постоянное переключение mute отделено от удалённых разрешений говорить с ненулевым ID, сроком до 250 мс и явным отзывом; Ping не продлевает разрешение.
+
+**Исполнение M5/M6 в аудиопроцессе**
+
+- Реализованы владение заглушением микрофона и наблюдение PTT; постоянное переключение отделено от удалённых разрешений говорить. Независимый поток guard заглушает по истечении даже при задержке другой работы бэкенда; фактическое состояние подтверждают снимки, изначально заглушённый микрофон отклоняет разрешение, Ping его не продлевает.
+- Ограниченные медиаданные передаются только при явно включённом наблюдении разрешённого Source; перед командой повторно проверяется текущий плеер, результаты и отмены связаны с запросами. Только явный Dry-режим предоставляет документированный детерминированный медиасеанс с ревизиями.
+
 
 ## 0.4.0 — 2026-10-30
 

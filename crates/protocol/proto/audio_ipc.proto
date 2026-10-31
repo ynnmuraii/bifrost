@@ -148,7 +148,7 @@ message ConfigurePtt { optional PttHotkey binding = 1; repeated PttHotkey reserv
 message PttGrant { uint64 grant_id = 1; uint32 ttl_ms = 2; } // Nonzero ID, TTL 1..250ms; Ping never renews.
 message PttRevoke { uint64 grant_id = 1; } // Stale IDs never revoke a newer grant.
 enum PttEventKind { PTT_EVENT_KIND_UNSPECIFIED = 0; PTT_EVENT_KIND_PRESSED = 1; PTT_EVENT_KIND_RENEWED = 2; PTT_EVENT_KIND_RELEASED = 3; PTT_EVENT_KIND_REFUSED = 4; PTT_EVENT_KIND_NOOP = 5; }
-enum PttReleaseReason { PTT_RELEASE_REASON_UNSPECIFIED = 0; PTT_RELEASE_REASON_EXPIRED = 1; PTT_RELEASE_REASON_REVOKED = 2; PTT_RELEASE_REASON_REPLACED = 3; PTT_RELEASE_REASON_EXPLICIT_MUTE = 4; PTT_RELEASE_REASON_PRE_MUTED = 5; PTT_RELEASE_REASON_PERSISTENT_UNMUTE = 6; }
+enum PttReleaseReason { PTT_RELEASE_REASON_UNSPECIFIED = 0; PTT_RELEASE_REASON_EXPIRED = 1; PTT_RELEASE_REASON_REVOKED = 2; PTT_RELEASE_REASON_REPLACED = 3; PTT_RELEASE_REASON_EXPLICIT_MUTE = 4; PTT_RELEASE_REASON_PRE_MUTED = 5; PTT_RELEASE_REASON_PERSISTENT_UNMUTE = 6; PTT_RELEASE_REASON_BACKEND_FAILED = 7; }
 // Physical observations use grant_id=0/reason=0. Talk grants use a nonzero ID.
 // Pressed: expires>observed, delta<=250ms. Renewed: observed=0, expires>0.
 // Released/Refused/Noop: timestamps zero. A positive outer ID correlates admission/result.
