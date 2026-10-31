@@ -1,8 +1,8 @@
 //! Opt-in global push-to-talk observation, without input synthesis or suppression.
 //!
 //! RegisterHotKey observes presses; a narrowly filtered, non-suppressing keyboard
-//! observer confirms non-injected releases of configured chord members. Polling
-//! can revoke a lease, but an unavailable/zero key state never proves release.
+//! observer confirms non-injected releases of the configured non-modifier key.
+//! Polling can revoke a lease, but unavailable/zero key state never proves release.
 //! Registration starts unarmed: a physical press/release may be needed to arm it.
 //! Consumers MUST check absolute expiry; receipt never refreshes an initial edge.
 
@@ -342,20 +342,17 @@ fn is_physical_release(
     key: u32,
     flags: KBDLLHOOKSTRUCT_FLAGS,
 ) -> bool {
-    let member = key == u32::from(binding.virtual_key)
-        || (binding.modifiers & 1 != 0 && matches!(key, 0x12 | 0xa4 | 0xa5))
-        || (binding.modifiers & 2 != 0 && matches!(key, 0x11 | 0xa2 | 0xa3))
-        || (binding.modifiers & 4 != 0 && matches!(key, 0x10 | 0xa0 | 0xa1))
-        || (binding.modifiers & 8 != 0 && matches!(key, 0x5b | 0x5c));
-    member
+    // A side modifier's up does not prove chord-up: its other side may still be
+    // held (or unobservable). Only the configured non-modifier key is sufficient.
+    key == u32::from(binding.virtual_key)
         && matches!(message, WM_KEYUP | WM_SYSKEYUP)
         && flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) == 0
 }
 
 unsafe extern "system" fn release_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 && matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP) {
-        // Windows owns this structure for the duration of the callback. Only a
-        // configured chord member can change our single coalesced flag.
+        // Windows owns this structure for the duration of the callback. Only
+        // the configured non-modifier PTT key can set our coalesced release flag.
         let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         if let Some(mut observation) = RELEASE_OBSERVATION.get() {
             if is_physical_release(observation.binding, wparam.0 as u32, key.vkCode, key.flags) {
@@ -683,25 +680,34 @@ mod tests {
             virtual_key: 0x87,
             modifiers: 7,
         };
-        for key in [0x87, 0x12, 0xa4, 0xa5, 0x11, 0xa2, 0xa3, 0x10, 0xa0, 0xa1] {
-            assert!(is_physical_release(binding, WM_KEYUP, key, LLKHF_UP));
-            assert!(is_physical_release(binding, WM_SYSKEYUP, key, LLKHF_UP));
-            assert!(!is_physical_release(binding, WM_KEYDOWN, key, LLKHF_UP));
-            assert!(!is_physical_release(binding, WM_SYSKEYDOWN, key, LLKHF_UP));
-            for injected in [LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED] {
-                assert!(!is_physical_release(binding, WM_KEYUP, key, injected));
-            }
+        let key = u32::from(binding.virtual_key);
+        for message in [WM_KEYUP, WM_SYSKEYUP] {
+            assert!(is_physical_release(binding, message, key, LLKHF_UP));
         }
-        for key in [0x41, 0x70, 0x5b, 0x5c] {
-            assert!(!is_physical_release(binding, WM_KEYUP, key, LLKHF_UP));
+        for message in [WM_KEYDOWN, WM_SYSKEYDOWN] {
+            assert!(!is_physical_release(binding, message, key, LLKHF_UP));
         }
-        let meta = HotkeyBinding {
-            modifiers: 8,
-            ..binding
+        for injected in [LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED] {
+            assert!(!is_physical_release(binding, WM_KEYUP, key, injected));
+        }
+        for unrelated in [0x41, 0x70, 0x5b, 0x5c] {
+            assert!(!is_physical_release(binding, WM_KEYUP, unrelated, LLKHF_UP));
+        }
+    }
+    #[test]
+    fn modifier_release_cannot_prove_chord_up_when_the_other_side_is_held_or_unknown() {
+        let binding = HotkeyBinding {
+            virtual_key: 0x87,
+            modifiers: 15,
         };
-        assert!(is_physical_release(meta, WM_KEYUP, 0x5b, LLKHF_UP));
-        assert!(is_physical_release(meta, WM_KEYUP, 0x5c, LLKHF_UP));
-        assert!(!is_physical_release(meta, WM_KEYUP, 0x11, LLKHF_UP));
+        for key in [
+            0x12, 0xa4, 0xa5, 0x11, 0xa2, 0xa3, 0x10, 0xa0, 0xa1, 0x5b, 0x5c,
+        ] {
+            assert!(
+                !is_physical_release(binding, WM_KEYUP, key, LLKHF_UP),
+                "one modifier side being up does not prove its other side is up"
+            );
+        }
     }
     #[test]
     fn positive_release_coalesces_under_full_queue_without_rearming_a_held_press() {

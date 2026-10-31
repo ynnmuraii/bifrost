@@ -207,10 +207,12 @@ Windows registration-only tests temporarily reserve Ctrl+Alt+Shift+F23/F24 and r
 them; they never press keys or mutate a real capture endpoint.
 
 Windows global PTT starts **unarmed** after registration; after a safety fence it
-also requires a confirmed physical release before a new press can talk. If needed,
-press and release the configured chord once to arm it, then press again to talk.
-A narrowly filtered, non-suppressing native observer accepts only non-injected
-key-up events for that chord's key/modifiers; it stores no unrelated keys.
+also requires a confirmed physical release of the non-modifier PTT key before a
+new press can talk. If needed, press and release that PTT key once to arm it, then
+press the configured chord again to talk. A narrowly filtered, non-suppressing
+native observer accepts only non-injected key-up events for that PTT key; it
+stores no unrelated keys. Modifier changes can revoke but cannot rearm: releasing
+one side does not prove its other side is up.
 Unavailable/zero asynchronous key state only revokes a lease, never rearms it.
 Failure to install the release observer reports `Unsupported`; use GUI PTT instead.
 Hook timeout/removal also fails closed; reconfigure PTT to reinstall the observer.
