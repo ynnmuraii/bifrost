@@ -15,7 +15,6 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Disable TLS session resumption so every runtime and pairing connection re-runs certificate pin verification.
 - Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
 - Fix boxed auxiliary exporter storage with the locked zeroize version while retaining a stable heap allocation and erasure before deallocation.
-- Keep Unix-only audio-child test helpers out of Windows builds so all-target clippy remains warning-free.
 - Keep Source pacing independent of Winsock's coarse receive timeout: shared UDP reception and capture-ring notifications wake media workers without a millisecond polling loop.
 
 **New**
@@ -89,6 +88,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Execute owned microphone mute and shortcut observation, and keep persistent toggles separate from independently timed remote talk grants. Grant expiry remutes on a guard-owning thread even while other backend work stalls; native snapshots remain authoritative, pre-muted endpoints refuse grants, and Ping does not renew them.
 - Report failed timed remute writes separately from lease expiry; never present an expired permission as evidence that the physical endpoint is muted.
 - Forward bounded media metadata only during an explicitly enabled authorized Source watch, recheck the current player before commands, and correlate completion/cancellation. The explicit Dry harness has documented deterministic revisioned media; native backends never synthesize it.
+- Register Windows' authoritative current SMTC COM view even when it differs from the enumerated view; preserve exact tokens instead of guessing current identity from application metadata.
+- Exercise child mic/PTT leases over Windows named pipes using Dry targets, native hotkey registration without input, and an explicitly owned SMTC helper for consent-gated play/pause/next acceptance.
+- Pace explicitly pumped Dry child streams from absolute 10 ms deadlines and short high-resolution waits rather than coarse control-channel receive timeouts; native hardware event loops are unchanged.
 
 **Linux M5 native controls**
 
@@ -113,7 +115,6 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Возобновление TLS отключено: каждое рабочее и сопрягающее соединение заново проверяет закреплённый сертификат.
 - Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
 - Исправлено хранение корневого секрета экспорта с закреплённой версией zeroize: сохраняются стабильное размещение в куче и стирание до освобождения памяти.
-- Unix-only вспомогательный метод тестов аудиопроцесса исключён из сборки Windows, чтобы clippy всех целей не выдавал предупреждение.
 - Темп Source больше не зависит от грубого таймера приёма Winsock: общий UDP-приём и уведомления кольца захвата пробуждают обработчики без миллисекундного опроса.
 
 **Новое**
@@ -187,6 +188,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Реализованы владение заглушением микрофона и наблюдение PTT; постоянное переключение отделено от удалённых разрешений говорить. Независимый поток guard заглушает по истечении даже при задержке другой работы бэкенда; фактическое состояние подтверждают снимки, изначально заглушённый микрофон отклоняет разрешение, Ping его не продлевает.
 - Ошибка заглушения по таймеру сообщается отдельно от истечения разрешения: истёкший срок не выдаётся за подтверждение фактического mute устройства.
 - Ограниченные медиаданные передаются только при явно включённом наблюдении разрешённого Source; перед командой повторно проверяется текущий плеер, результаты и отмены связаны с запросами. Только явный Dry-режим предоставляет документированный детерминированный медиасеанс с ревизиями.
+- Windows сохраняет авторитетное представление COM текущего SMTC-сеанса, даже если оно отличается от перечисленного представления; токены не подменяются догадкой по метаданным приложения.
+- Проверки микрофонных/PTT-сроков дочернего процесса работают через Windows named pipes с Dry-целями; нативная проверка ограничена регистрацией hotkey без ввода, а play/pause/next и согласие проверяются только на собственном SMTC-плеере.
+- Явно прокачиваемые Dry-потоки дочернего процесса следуют абсолютным срокам 10 мс с коротким высокоточным ожиданием, а не грубому таймауту управляющего канала; нативные аппаратные циклы не меняются.
 
 **Нативное управление Linux M5**
 

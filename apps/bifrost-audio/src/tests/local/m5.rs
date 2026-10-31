@@ -464,7 +464,7 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
             49,
             Msg::PttGrant(w::PttGrant {
                 grant_id: 102,
-                ttl_ms: 1,
+                ttl_ms: 250, // Exercise persistent-unmute policy, not an expired transit window.
             }),
         )
         .await
@@ -528,5 +528,108 @@ async fn m5_mute_ownership_and_absolute_ptt_leases_over_audio_link() {
             .unwrap()
             .unwrap(),
         ExitReason::Shutdown,
+    );
+}
+
+/// Registers an unusual chord only; never acquires a microphone or synthesizes input.
+#[cfg(windows)]
+#[tokio::test]
+async fn native_windows_child_registers_and_releases_ptt_without_input() {
+    let mut fixture = child_with_backend(None, 1).await;
+    let key = w::PttHotkey {
+        key_code: 0x73, // HID F24: Ctrl+Alt+Shift+F24.
+        control: true,
+        alt: true,
+        shift: true,
+        meta: false,
+    };
+    fixture
+        .core
+        .send(
+            2,
+            Msg::ConfigurePtt(w::ConfigurePtt {
+                binding: Some(key),
+                reserved: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+    // A busy/unsupported desktop fails honestly instead of replacing another registration.
+    ptt(&mut fixture, 2, 3).await;
+    let until = tokio::time::Instant::now() + Duration::from_millis(300);
+    let mut ping = tokio::time::interval(Duration::from_millis(30));
+    let mut pongs = 0;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(until) => break,
+            _ = ping.tick() => {
+                fixture.core.send(0, Msg::Ping(w::Ping { serial: 73 })).await.unwrap();
+            }
+            received = fixture.core.recv() => {
+                let received = received.unwrap().frame;
+                assert_eq!(received.request_id, 0);
+                match received.msg.unwrap() {
+                    // scripted::next_frame sends this heartbeat while waiting for admission.
+                    Msg::Pong(pong) if pong.serial == 1 => {}
+                    Msg::Pong(pong) => {
+                        assert_eq!(pong.serial, 73);
+                        pongs += 1;
+                    }
+                    Msg::Health(_) => {}
+                    other => panic!("registration without input invented an event: {other:?}"),
+                }
+            }
+        }
+    }
+    assert!(pongs > 0);
+    fixture
+        .core
+        .send(
+            3,
+            Msg::ConfigurePtt(w::ConfigurePtt {
+                binding: None,
+                reserved: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+    ptt(&mut fixture, 3, 3).await;
+    // Re-registration also proves that explicit cleanup freed the native chord.
+    fixture
+        .core
+        .send(
+            4,
+            Msg::ConfigurePtt(w::ConfigurePtt {
+                binding: Some(key),
+                reserved: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+    ptt(&mut fixture, 4, 3).await;
+    fixture
+        .core
+        .send(
+            5,
+            Msg::ConfigurePtt(w::ConfigurePtt {
+                binding: None,
+                reserved: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+    ptt(&mut fixture, 5, 3).await;
+    fixture
+        .core
+        .send(6, Msg::Shutdown(w::Shutdown {}))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), fixture.handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        ExitReason::Shutdown
     );
 }
