@@ -115,6 +115,50 @@ impl Fixture {
 }
 
 #[test]
+fn overflowed_capture_recovers_immediately_after_delayed_validation() {
+    let mut f = Fixture::new();
+    let start = Instant::now();
+    let mut capture_due = Duration::ZERO;
+    while start.elapsed() < Duration::from_millis(550) {
+        while capture_due <= start.elapsed() {
+            f.capture();
+            capture_due += FRAME;
+        }
+        assert_eq!(f.drain(), 0, "media before authentication");
+        thread::sleep(Duration::from_micros(250));
+    }
+    assert!(
+        f.source.snapshot().capture_dropped_frames > 0,
+        "fixture did not overflow"
+    );
+    let validated = Instant::now();
+    f.validate();
+    let mut first = None;
+    let mut packets = 0;
+    while validated.elapsed() < Duration::from_millis(120) {
+        while capture_due <= start.elapsed() {
+            f.capture();
+            capture_due += FRAME;
+        }
+        let received = f.drain();
+        if received > 0 {
+            first.get_or_insert_with(|| validated.elapsed());
+        }
+        packets += received;
+        thread::sleep(Duration::from_micros(250));
+    }
+    f.source.stop().unwrap();
+    assert!(
+        first.is_some_and(|delay| delay <= FRAME),
+        "first media delay: {first:?}"
+    );
+    assert!(
+        packets >= 10,
+        "Source stalled after fresh post-overflow capture: {packets} packets"
+    );
+}
+
+#[test]
 fn hostile_input_does_not_starve_source_pacing_or_stop() {
     let mut f = Fixture::new();
     let start = Instant::now();
