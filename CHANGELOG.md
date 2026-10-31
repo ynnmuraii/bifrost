@@ -8,6 +8,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Fixes**
 
+- Refuse Windows CLI launches that have neither a console nor redirected output with exit code 69 and a core-log hint, before starting an invisible pairing ceremony; GUI and internal child-role startup stay unchanged.
 - Compile the audio test RMS accessor only for its Unix-only consumers, keeping Windows all-target Clippy checks warning-free.
 - Keep the input-loop future heap-owned across audio shutdown supervision, preventing Windows debug cores from overflowing their main-thread stack when clipboard sharing is toggled.
 - Enforce both peers' Hello requirements against stable implementation support and advertised offers, independent of transient agent readiness. Deliver compatibility refusals before graceful closure, select slow reconnects, and forbid bounded capability changes from withdrawing handshake requirements.
@@ -102,6 +103,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Исправления**
 
+- Команды CLI Windows без консоли и перенаправленного вывода завершаются с кодом 69 и подсказкой в журнале ядра до начала невидимой процедуры сопряжения; запуск GUI и внутренних дочерних ролей не изменён.
 - Вспомогательное чтение RMS в аудиотестах компилируется только для использующих его Unix-тестов, чтобы проверка Clippy всех целей Windows проходила без предупреждений.
 - Цикл ввода остаётся в отдельном future в куче при завершении аудиосупервизора: переключение обмена буфером больше не переполняет стек главного потока отладочного ядра Windows.
 - Требования Hello обеих сторон проверяются по реализованным возможностям и объявленным предложениям независимо от готовности агента. Отказ совместимости доставляется перед плавным закрытием, повторное подключение откладывается, а ограниченные обновления возможностей не могут отзывать обязательные возможности Hello.

@@ -14,6 +14,10 @@
 //! (`start /wait`, `| Out-Host`, `Start-Process -Wait`, a script or a program that spawns
 //! it, redirected output). `packaging/README_RU.txt` says so.
 //!
+//! A GUI host that launches this executable directly may supply neither a console-owning
+//! parent nor redirected output. CLI commands then log a launch hint and exit with code 69;
+//! they must not allocate a new console window or start an invisible pairing ceremony.
+//!
 //! Processes this program starts for itself (the core by the window, the agent by the core)
 //! are created with `CREATE_NO_WINDOW`, so no console appears for them either.
 
@@ -21,6 +25,36 @@
 pub fn attach_parent() {
     #[cfg(windows)]
     imp::attach_parent();
+}
+
+/// Attaches CLI output or records why a console-less host cannot display the command.
+/// Internal child roles keep using `attach_parent` without changing their launch contract.
+pub fn attach_cli(args: &[String]) -> Result<(), std::process::ExitCode> {
+    attach_parent();
+    #[cfg(windows)]
+    if !imp::output_available() {
+        use std::io::Write;
+
+        if let Ok(paths) = config::CliPaths::parse(args).resolve() {
+            let directory = paths.logs_dir();
+            if std::fs::create_dir_all(&directory).is_ok() {
+                if let Ok(mut log) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(directory.join("bifrost-core.log"))
+                {
+                    let _ = writeln!(
+                        log,
+                        "CLI command needs a console: run it from cmd/PowerShell or via cmd /c."
+                    );
+                }
+            }
+        }
+        return Err(std::process::ExitCode::from(69));
+    }
+    #[cfg(not(windows))]
+    let _ = args;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -33,6 +67,20 @@ mod imp {
         AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
         STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
+
+    pub fn output_available() -> bool {
+        use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_UNKNOWN};
+
+        [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .into_iter()
+            .any(|slot| {
+                // SAFETY: inspects this process's standard output handles without taking ownership.
+                let handle = unsafe { GetStdHandle(slot) };
+                !handle.is_null()
+                    && handle != INVALID_HANDLE_VALUE
+                    && unsafe { GetFileType(handle) } != FILE_TYPE_UNKNOWN
+            })
+    }
 
     pub fn attach_parent() {
         // SAFETY: plain Win32 calls with constant arguments. Failure means "no parent
