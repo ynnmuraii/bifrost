@@ -4631,6 +4631,16 @@ impl Session {
                 Some(prompt) => prompt_response(prompt).into(),
                 None => Handled::Deferred(prompt_of(self.pairing.wait_for_prompt())),
             },
+            ctl::Request::PairState(attempt) => match crate::command::hex16_decode(&attempt) {
+                Some(id) if self.pairing.is_pending(&id, self.now_ms()) => {
+                    ctl::Response::Status("pending".to_owned()).into()
+                }
+                _ => ctl::Response::Error {
+                    code: "PAIRING_CANCELLED".to_owned(),
+                    detail: "this SAS prompt is no longer active".to_owned(),
+                }
+                .into(),
+            },
             ctl::Request::PairAnswer { attempt, approve } => {
                 match crate::command::hex16_decode(&attempt) {
                     Some(attempt) => match self.pairing.answer(&attempt, approve) {
@@ -4701,8 +4711,7 @@ impl Session {
                 .into()
             }
             ctl::Request::PairWith(address) => {
-                let wait = self.pairing.dial_started();
-                self.spawn_pair_dial(address);
+                let wait = self.spawn_pair_dial(address);
                 Handled::Deferred(verdict_of(wait))
             }
             ctl::Request::LayoutDiscard => {

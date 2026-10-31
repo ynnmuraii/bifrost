@@ -44,6 +44,7 @@ fn audit_only_a_committed_pairing_outcome_shows_success() {
         let result = PairingResult {
             outcome: outcome as i32,
             peer_name: "LAPTOP".into(),
+            ..Default::default()
         };
         let bytes = protocol::encode_message(protocol::Channel::Ipc, &result).unwrap();
         let decoded = protocol::decode_message::<PairingResult>(protocol::Channel::Ipc, &bytes)

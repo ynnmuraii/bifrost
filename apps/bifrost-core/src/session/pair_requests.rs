@@ -293,7 +293,7 @@ impl Session {
                         tracing::info!("pairing request: accepted; starting SAS");
                     }
                     if start_pairing {
-                        self.spawn_pair_dial(address);
+                        drop(self.spawn_pair_dial(address));
                     }
                     self.pair_requests.outgoing_task = None;
                 }
@@ -396,7 +396,7 @@ impl Session {
         ));
         self.pair_requests.outgoing = Some(outgoing);
         if !request.supports_requests {
-            self.spawn_pair_dial(request.address);
+            drop(self.spawn_pair_dial(request.address));
             return result(true, "");
         }
         self.pair_requests.generation = self.pair_requests.generation.wrapping_add(1);

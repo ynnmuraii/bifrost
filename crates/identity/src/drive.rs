@@ -232,6 +232,9 @@ pub struct PairingDriver {
     listen_port: u16,
     /// The raw `PairHello.listen_port` the peer sent (0 = it listens on the default).
     peer_listen_port: u16,
+    /// Incremental decision frame retained when a local answer interrupts a socket read.
+    decision_frame: Vec<u8>,
+    decision_length: usize,
 }
 
 impl PairingDriver {
@@ -285,6 +288,93 @@ impl PairingDriver {
         self.peer_listen_port
     }
 
+    /// Watches the peer even while the local SAS prompt is unanswered.
+    /// Reads are cancellation-safe: partial framing stays with this driver.
+    pub async fn decide(
+        &mut self,
+        mut answer: tokio::sync::oneshot::Receiver<bool>,
+    ) -> Result<PairedPeer, PairError> {
+        let mut local_answered = false;
+        let mut remote_answered = false;
+        loop {
+            tokio::select! {
+                biased;
+                approved = &mut answer, if !local_answered => {
+                    local_answered = true;
+                    let outputs = self.fsm.handle(PairingInput::LocalDecision {
+                        approved: approved.unwrap_or(false),
+                    });
+                    self.execute(outputs).await?;
+                }
+                envelope = self.read_decision() => {
+                    let envelope = envelope?;
+                    if envelope.attempt_id != self.fsm.attempt_id().as_slice()
+                        || envelope.seq != 1
+                        || envelope.major != protocol::limits::PROTOCOL_MAJOR
+                    {
+                        return Err(PairError::Protocol("invalid decision context".into()));
+                    }
+                    let approved = decision_of(&envelope)?;
+                    if remote_answered && approved {
+                        return Err(PairError::Protocol("duplicate peer approval".into()));
+                    }
+                    remote_answered = true;
+                    let outputs = self.fsm.handle(PairingInput::RemoteDecision {
+                        approved,
+                        peer_node_id: decision_addressee(&envelope)?,
+                    });
+                    self.execute(outputs).await?;
+                }
+            }
+            if self.fsm.state() == PairingState::Committed {
+                return Ok(self.paired());
+            }
+        }
+    }
+
+    async fn read_decision(&mut self) -> Result<PairingEnvelope, PairError> {
+        loop {
+            let target = if self.decision_length == 0 {
+                4
+            } else {
+                self.decision_length
+            };
+            if self.decision_frame.len() == target {
+                if self.decision_length != 0 {
+                    let envelope =
+                        decode_message::<PairingEnvelope>(Channel::Pairing, &self.decision_frame)
+                            .map_err(|error| PairError::Protocol(format!("{error:?}")))?
+                            .ok_or_else(|| {
+                                PairError::Protocol("incomplete decision frame".into())
+                            })?;
+                    self.decision_frame.clear();
+                    self.decision_length = 0;
+                    return Ok(envelope);
+                }
+                let length = u32::from_be_bytes(
+                    self.decision_frame[..4]
+                        .try_into()
+                        .expect("four-byte prefix"),
+                ) as usize;
+                if length == 0 || length > Channel::Pairing.max_frame_len() {
+                    return Err(PairError::Protocol("invalid decision frame length".into()));
+                }
+                self.decision_length = 4 + length;
+                continue;
+            }
+            let mut bytes = [0u8; 1024];
+            let count = (target - self.decision_frame.len()).min(bytes.len());
+            let read = match &mut self.stream {
+                Stream::Server(stream) => stream.read(&mut bytes[..count]).await?,
+                Stream::Client(stream) => stream.read(&mut bytes[..count]).await?,
+            };
+            if read == 0 {
+                return Err(PairError::Io(std::io::ErrorKind::UnexpectedEof.into()));
+            }
+            self.decision_frame.extend_from_slice(&bytes[..read]);
+        }
+    }
+
     /// Approves locally and finishes with the peer's decision.
     ///
     /// This is the GUI's "the codes are equal" button: it writes `PairDecision{approved}`
@@ -322,8 +412,10 @@ impl PairingDriver {
         let outputs = self
             .fsm
             .handle(PairingInput::LocalDecision { approved: false });
-        self.execute(outputs).await?;
-        Ok(())
+        match self.execute(outputs).await {
+            Err(PairError::Rejected(RejectionReason::UserRejected)) => Ok(()),
+            result => result,
+        }
     }
 
     fn paired(&self) -> PairedPeer {
@@ -343,6 +435,7 @@ impl PairingDriver {
     }
 
     async fn execute(&mut self, outputs: Vec<PairingOutput>) -> Result<(), PairError> {
+        let mut rejection = None;
         for output in outputs {
             match output {
                 PairingOutput::SendHello {
@@ -373,11 +466,14 @@ impl PairingDriver {
                 }
                 // Handled by the caller (GUI) once `approve`/`reject` is called.
                 PairingOutput::ShowSas { .. } | PairingOutput::Commit { .. } => {}
-                PairingOutput::Rejected { reason } => return Err(PairError::Rejected(reason)),
+                PairingOutput::Rejected { reason } => rejection = Some(reason),
                 PairingOutput::Expired => return Err(PairError::Timeout),
             }
         }
-        Ok(())
+        match rejection {
+            Some(reason) => Err(PairError::Rejected(reason)),
+            None => Ok(()),
+        }
     }
 
     fn envelope(&self, payload: pairing_envelope::Payload) -> PairingEnvelope {
@@ -709,6 +805,8 @@ fn finish_driver(
         address,
         listen_port,
         peer_listen_port,
+        decision_frame: Vec::new(),
+        decision_length: 0,
     })
 }
 

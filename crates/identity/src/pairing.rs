@@ -565,7 +565,9 @@ impl PairingFsm {
     }
 
     fn on_local_decision(&mut self, approved: bool) -> Vec<PairingOutput> {
-        if self.state != PairingState::Comparing {
+        if self.state != PairingState::Comparing
+            && !(self.state == PairingState::LocalApproved && !approved)
+        {
             return Vec::new();
         }
         self.local_decision = Some(approved);

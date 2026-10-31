@@ -1386,6 +1386,7 @@ fn a_successful_pairing_promises_what_actually_happens() {
     vm.apply(event(Msg::PairingResult(protocol::ipc::PairingResult {
         outcome: protocol::ipc::PairingOutcome::Paired as i32,
         peer_name: pairing_prompt().peer_name,
+        ..Default::default()
     })));
     vm.apply(answer(
         id,
@@ -1880,6 +1881,7 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
     vm.apply(event(Msg::PairingResult(protocol::ipc::PairingResult {
         outcome: protocol::ipc::PairingOutcome::Paired as i32,
         peer_name: pairing_prompt().peer_name,
+        ..Default::default()
     })));
     vm.apply(answer(
         id,

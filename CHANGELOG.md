@@ -8,6 +8,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Fixes**
 
+- Starting a newer pairing ceremony cancels the previous pending SAS exchange on both computers. Old prompts, confirmations and delayed dial results cannot approve or replace the newest attempt; existing window/handshake budgets remain in force. Pairing outcome IPC now carries the ceremony identity and cancellation code for correlated clients.
 - Compile the audio test RMS accessor only for its Unix-only consumers, keeping Windows all-target Clippy checks warning-free.
 - Keep the input-loop future heap-owned across audio shutdown supervision, preventing Windows debug cores from overflowing their main-thread stack when clipboard sharing is toggled.
 - Windows process-loopback capture preserves QPC host timestamps without advertising packet-local positions as a monotonic device clock; render clock positions remain supported.
@@ -119,6 +120,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Исправления**
 
+- Новая попытка сопряжения отменяет предыдущую незавершённую сверку SAS на обоих компьютерах. Старые запросы, подтверждения и запоздавшие результаты подключения не могут подтвердить или подменить новую попытку; ограничения окна и числа подключений сохранены. IPC результата сопряжения дополнен идентификатором церемонии и кодом отмены для клиентов с проверкой соответствия.
 - Вспомогательное чтение RMS в аудиотестах компилируется только для использующих его Unix-тестов, чтобы проверка Clippy всех целей Windows проходила без предупреждений.
 - Цикл ввода остаётся в отдельном future в куче при завершении аудиосупервизора: переключение обмена буфером больше не переполняет стек главного потока отладочного ядра Windows.
 - Захват звука процессов Windows сохраняет временные метки QPC, но больше не выдаёт позиции внутри пакета за монотонные часы устройства; позиции часов воспроизведения сохранены.

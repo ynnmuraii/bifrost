@@ -101,10 +101,13 @@ impl PairingGate {
         }
     }
 
-    /// `pending -= 1`, `attempts += 1`; closes a window that is spent or expired.
-    pub fn finish(&self, now_ms: u64) {
+    /// Finishes only a ceremony admitted by this exact window.
+    pub fn finish(&self, now_ms: u64, attempt_id: identity::AttemptId) {
         let mut guard = self.lock();
-        if let Some(window) = guard.as_mut() {
+        if let Some(window) = guard
+            .as_mut()
+            .filter(|window| *window.attempt_id() == attempt_id)
+        {
             window.finish();
             if !window.is_open(now_ms) {
                 *guard = None;
@@ -228,7 +231,7 @@ mod tests {
         assert!(gate.window(0).is_none());
         assert!(gate.admit(0).is_err());
         // Finishing without a window is a no-op, not a panic.
-        gate.finish(0);
+        gate.finish(0, [0; 16]);
     }
 
     #[test]
@@ -302,7 +305,7 @@ mod tests {
         let window = gate.admit(0).expect("admitted");
         gate.admit_guard(*window.attempt_id()).disarm();
         assert_eq!(gate.window(0).map(|w| w.pending()), Some(1));
-        gate.finish(0);
+        gate.finish(0, *window.attempt_id());
         assert_eq!(gate.window(0).map(|w| w.pending()), Some(0));
     }
 
@@ -312,14 +315,14 @@ mod tests {
         gate.open(window_at([1u8; 16]));
         let admitted = gate.admit(0).expect("admitted");
         assert_eq!(admitted.attempt_id(), &[1u8; 16]);
-        gate.finish(0);
+        gate.finish(0, *admitted.attempt_id());
         let window = gate.window(0).expect("still open");
         assert_eq!(window.pending(), 0);
         assert_eq!(window.attempts(), 1);
         // Spend the rest of the attempts; the window closes when the last one finishes.
         for attempt in 1..MAX_ATTEMPTS {
             gate.admit(0).expect("admitted");
-            gate.finish(0);
+            gate.finish(0, [1; 16]);
             let _ = attempt;
         }
         assert!(gate.window(0).is_none(), "a spent window must close");
@@ -333,8 +336,25 @@ mod tests {
         assert!(gate.window(WINDOW_MS).is_none());
         assert!(gate.admit(WINDOW_MS).is_err());
         // `finish` on an expired window clears it rather than resurrecting it.
-        gate.finish(WINDOW_MS);
+        gate.finish(WINDOW_MS, [3; 16]);
         assert!(gate.window(0).is_none());
+    }
+
+    #[test]
+    fn old_finish_cannot_spend_a_replacement_window_budget() {
+        let gate = PairingGate::closed();
+        gate.open(window_at([1; 16]));
+        gate.admit(0).unwrap();
+        gate.open(window_at([2; 16]));
+        gate.admit(0).unwrap();
+        gate.finish(1, [1; 16]);
+        let replacement = gate.window(1).unwrap();
+        assert_eq!(replacement.pending(), 1);
+        assert_eq!(replacement.attempts(), 0);
+        gate.finish(1, [2; 16]);
+        let replacement = gate.window(1).unwrap();
+        assert_eq!(replacement.pending(), 0);
+        assert_eq!(replacement.attempts(), 1);
     }
 
     #[test]
