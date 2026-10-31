@@ -1,13 +1,13 @@
 # Third-party notices
 
 Generated file — do not edit by hand. It lists the third-party crates a shipped binary
-(`bifrost`: core, agent, GUI and lightweight tray roles) contains, with their terms.
+(`bifrost`: core, agent, GUI, lightweight tray and optional audio roles) contains, with their terms.
 The project itself is MIT: see [`../LICENSE`](../LICENSE).
 
 Regenerate from the repository root, after `cargo fetch`:
 
 ```sh
-cargo install cargo-about --locked     # or take the release binary for your target
+cargo install cargo-about --locked --features cli  # or take the release binary for your target
 cargo about generate --workspace --fail -o licenses/THIRD_PARTY_NOTICES.md licenses/notices.hbs
 ```
 
@@ -2039,6 +2039,7 @@ Used by:
 - ab_glyph 0.2.32 — https://github.com/alexheretic/ab-glyph
 - ab_glyph_rasterizer 0.1.10 — https://github.com/alexheretic/ab-glyph
 - accesskit_winit 0.32.2 — https://github.com/AccessKit/accesskit
+- audio-codec-algorithms 0.8.1 — https://github.com/karip/audio-codec-algorithms
 - gl_generator 0.14.0 — https://github.com/brendanzab/gl-rs/
 - khronos_api 3.1.0 — https://github.com/brendanzab/gl-rs/
 - owned_ttf_parser 0.25.1 — https://github.com/alexheretic/owned-ttf-parser
@@ -2160,6 +2161,839 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (C) 2013 Xiph.Org Foundation and contributors
+Copyright (c) 2013       Parrot
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifndef SILK_SIGPROC_FIX_ARMv4_H
+#define SILK_SIGPROC_FIX_ARMv4_H
+
+#undef silk_MLA
+static OPUS_INLINE opus_int32 silk_MLA_armv4(opus_int32 a, opus_int32 b,
+ opus_int32 c)
+{
+  opus_int32 res;
+  __asm__(
+      "#silk_MLA\n\t"
+      "mla %0, %1, %2, %3\n\t"
+      : "=&r"(res)
+      : "r"(b), "r"(c), "r"(a)
+  );
+  return res;
+}
+#define silk_MLA(a, b, c) (silk_MLA_armv4(a, b, c))
+
+#endif
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (C) 2015 Vidyo
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifndef SILK_MACROS_ARM64_H
+#define SILK_MACROS_ARM64_H
+
+#include <arm_neon.h>
+
+#undef silk_ADD_SAT32
+#define silk_ADD_SAT32(a, b) (vqadds_s32((a), (b)))
+
+#undef silk_SUB_SAT32
+#define silk_SUB_SAT32(a, b) (vqsubs_s32((a), (b)))
+
+#endif /* SILK_MACROS_ARM64_H */
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Copyright (c) 2013       Parrot
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifndef SILK_SIGPROC_FIX_ARMv5E_H
+#define SILK_SIGPROC_FIX_ARMv5E_H
+
+#undef silk_SMULTT
+static OPUS_INLINE opus_int32 silk_SMULTT_armv5e(opus_int32 a, opus_int32 b)
+{
+  opus_int32 res;
+  __asm__(
+      "#silk_SMULTT\n\t"
+      "smultt %0, %1, %2\n\t"
+      : "=r"(res)
+      : "%r"(a), "r"(b)
+  );
+  return res;
+}
+#define silk_SMULTT(a, b) (silk_SMULTT_armv5e(a, b))
+
+#undef silk_SMLATT
+static OPUS_INLINE opus_int32 silk_SMLATT_armv5e(opus_int32 a, opus_int32 b,
+ opus_int32 c)
+{
+  opus_int32 res;
+  __asm__(
+      "#silk_SMLATT\n\t"
+      "smlatt %0, %1, %2, %3\n\t"
+      : "=r"(res)
+      : "%r"(b), "r"(c), "r"(a)
+  );
+  return res;
+}
+#define silk_SMLATT(a, b, c) (silk_SMLATT_armv5e(a, b, c))
+
+#endif
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "SigProc_FIX.h"
+
+opus_int32 silk_inner_prod_aligned_scale(
+    const opus_int16 *const     inVec1,             /*    I input vector 1                                              */
+    const opus_int16 *const     inVec2,             /*    I input vector 2                                              */
+    const opus_int              scale,              /*    I number of bits to shift                                     */
+    const opus_int              len                 /*    I vector lengths                                              */
+)
+{
+    opus_int   i;
+    opus_int32 sum = 0;
+    for( i = 0; i < len; i++ ) {
+        sum = silk_ADD_RSHIFT32( sum, silk_SMULBB( inVec1[ i ], inVec2[ i ] ), scale );
+    }
+    return sum;
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "SigProc_FIX.h"
+#include "celt_lpc.h"
+
+/* Compute autocorrelation */
+void silk_autocorr(
+    opus_int32                  *results,           /* O    Result (length correlationCount)                            */
+    opus_int                    *scale,             /* O    Scaling of the correlation vector                           */
+    const opus_int16            *inputData,         /* I    Input data to correlate                                     */
+    const opus_int              inputDataSize,      /* I    Length of input                                             */
+    const opus_int              correlationCount,   /* I    Number of correlation taps to compute                       */
+    int                         arch                /* I    Run-time architecture                                       */
+)
+{
+    opus_int   corrCount;
+    corrCount = silk_min_int( inputDataSize, correlationCount );
+    *scale = _celt_autocorr(inputData, results, NULL, 0, corrCount-1, inputDataSize, arch);
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "SigProc_FIX.h"
+/* Approximation of 128 * log2() (very close inverse of silk_log2lin()) */
+/* Convert input to a log scale    */
+opus_int32 silk_lin2log(
+    const opus_int32            inLin               /* I  input in linear scale                                         */
+)
+{
+    opus_int32 lz, frac_Q7;
+
+    silk_CLZ_FRAC( inLin, &lz, &frac_Q7 );
+
+    /* Piece-wise parabolic approximation */
+    return silk_ADD_LSHIFT32( silk_SMLAWB( frac_Q7, silk_MUL( frac_Q7, 128 - frac_Q7 ), 179 ), 31 - lz, 7 );
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "SigProc_FLP.h"
+
+/* Chirp (bw expand) LP AR filter */
+void silk_bwexpander_FLP(
+    silk_float          *ar,                /* I/O  AR filter to be expanded (without leading 1)                */
+    const opus_int      d,                  /* I    length of ar                                                */
+    const silk_float    chirp               /* I    chirp factor (typically in range (0..1) )                   */
+)
+{
+    opus_int   i;
+    silk_float cfac = chirp;
+
+    for( i = 0; i < d - 1; i++ ) {
+        ar[ i ] *=  cfac;
+        cfac    *=  chirp;
+    }
+    ar[ d - 1 ] *=  cfac;
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "SigProc_FLP.h"
+
+/* multiply a vector by a constant */
+void silk_scale_vector_FLP(
+    silk_float          *data1,
+    silk_float          gain,
+    opus_int            dataSize
+)
+{
+    opus_int  i, dataSize4;
+
+    /* 4x unrolled loop */
+    dataSize4 = dataSize & 0xFFFC;
+    for( i = 0; i < dataSize4; i += 4 ) {
+        data1[ i + 0 ] *= gain;
+        data1[ i + 1 ] *= gain;
+        data1[ i + 2 ] *= gain;
+        data1[ i + 3 ] *= gain;
+    }
+
+    /* any remaining elements */
+    for( ; i < dataSize; i++ ) {
+        data1[ i ] *= gain;
+    }
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "main_FIX.h"
+
+/* Add noise to matrix diagonal */
+void silk_regularize_correlations_FIX(
+    opus_int32                      *XX,                                    /* I/O  Correlation matrices                                                        */
+    opus_int32                      *xx,                                    /* I/O  Correlation values                                                          */
+    opus_int32                      noise,                                  /* I    Noise to add                                                                */
+    opus_int                        D                                       /* I    Dimension of XX                                                             */
+)
+{
+    opus_int i;
+    for( i = 0; i < D; i++ ) {
+        matrix_ptr( &XX[ 0 ], i, i, D ) = silk_ADD32( matrix_ptr( &XX[ 0 ], i, i, D ), noise );
+    }
+    xx[ 0 ] += noise;
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "main_FLP.h"
+
+/* Add noise to matrix diagonal */
+void silk_regularize_correlations_FLP(
+    silk_float                      *XX,                                /* I/O  Correlation matrices                        */
+    silk_float                      *xx,                                /* I/O  Correlation values                          */
+    const silk_float                noise,                              /* I    Noise energy to add                         */
+    const opus_int                  D                                   /* I    Dimension of XX                             */
+)
+{
+    opus_int i;
+
+    for( i = 0; i < D; i++ ) {
+        matrix_ptr( &XX[ 0 ], i, i, D ) += noise;
+    }
+    xx[ 0 ] += noise;
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "typedef.h"
+#include "SigProc_FLP.h"
+
+/* compute autocorrelation */
+void silk_autocorrelation_FLP(
+    silk_float          *results,           /* O    result (length correlationCount)                            */
+    const silk_float    *inputData,         /* I    input data to correlate                                     */
+    opus_int            inputDataSize,      /* I    length of input                                             */
+    opus_int            correlationCount,    /* I    number of correlation taps to compute                       */
+    int                 arch
+)
+{
+    opus_int i;
+
+    if( correlationCount > inputDataSize ) {
+        correlationCount = inputDataSize;
+    }
+
+    for( i = 0; i < correlationCount; i++ ) {
+        results[ i ] =  (silk_float)silk_inner_product_FLP( inputData, inputData + i, inputDataSize - i, arch );
+    }
+}
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifndef BURG_H
+#define BURG_H
+
+
+float silk_burg_analysis(              /* O    returns residual energy                                     */
+    float          A[],                /* O    prediction coefficients (length order)                      */
+    const float    x[],                /* I    input signal, length: nb_subfr*(D+L_sub)                    */
+    const float    minInvGain,         /* I    minimum inverse prediction gain                             */
+    const int      subfr_length,       /* I    input signal subframe length (incl. D preceding samples)    */
+    const int      nb_subfr,           /* I    number of subframes stacked in x                            */
+    const int      D                   /* I    order                                                       */
+);
+
+#endif
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifndef SILK_RESAMPLER_STRUCTS_H
+#define SILK_RESAMPLER_STRUCTS_H
+
+#define SILK_RESAMPLER_MAX_FIR_ORDER                 36
+#define SILK_RESAMPLER_MAX_IIR_ORDER                 6
+
+typedef struct _silk_resampler_state_struct{
+    opus_int32       sIIR[ SILK_RESAMPLER_MAX_IIR_ORDER ]; /* this must be the first element of this struct */
+    union{
+        opus_int32   i32[ SILK_RESAMPLER_MAX_FIR_ORDER ];
+        opus_int16   i16[ SILK_RESAMPLER_MAX_FIR_ORDER ];
+    }                sFIR;
+    opus_int16       delayBuf[ 96 ];
+    opus_int         resampler_function;
+    opus_int         batchSize;
+    opus_int32       invRatio_Q16;
+    opus_int         FIR_Order;
+    opus_int         FIR_Fracs;
+    opus_int         Fs_in_kHz;
+    opus_int         Fs_out_kHz;
+    opus_int         inputDelay;
+    const opus_int16 *Coefs;
+} silk_resampler_state_struct;
+
+#endif /* SILK_RESAMPLER_STRUCTS_H */
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+/***********************************************************************
+Copyright (c) 2006-2011, Skype Limited. All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+- Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+***********************************************************************/
+
+#ifndef SILK_SIGPROC_FIX_MIPSR1_H
+#define SILK_SIGPROC_FIX_MIPSR1_H
+
+#undef silk_SAT16
+static inline short int silk_SAT16(int a)
+{
+    int c;
+    c = __builtin_mips_shll_s_w(a, 16);
+    c = c>>16;
+
+    return c;
+}
+
+#undef silk_LSHIFT_SAT32
+static inline int silk_LSHIFT_SAT32(int a, int shift)
+{
+    int r;
+
+    r = __builtin_mips_shll_s_w(a, shift);
+
+    return r;
+}
+
+#undef silk_RSHIFT_ROUND
+static inline int silk_RSHIFT_ROUND(int a, int shift)
+{
+    int r;
+
+    r = __builtin_mips_shra_r_w(a, shift);
+    return r;
+}
+
+#endif /* SILK_SIGPROC_FIX_MIPSR1_H */
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
 - tiny-skia-path 0.11.4 — https://github.com/RazrFalcon/tiny-skia/tree/master/path
 - tiny-skia 0.11.4 — https://github.com/RazrFalcon/tiny-skia
 
@@ -2236,6 +3070,61 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+- opusic-sys 0.7.6 — https://github.com/DoumanAsh/opusic-sys
+
+```text
+Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
+                    Jean-Marc Valin, Timothy B. Terriberry,
+                    CSIRO, Gregory Maxwell, Mark Borgerding,
+                    Erik de Castro Lopo, Mozilla, Amazon
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Opus is subject to the royalty-free patent licenses which are
+specified at:
+
+Xiph.Org Foundation:
+https://datatracker.ietf.org/ipr/1524/
+
+Microsoft Corporation:
+https://datatracker.ietf.org/ipr/1914/
+
+Broadcom Corporation:
+https://datatracker.ietf.org/ipr/1526/
+
+```
+
 ## Boost Software License 1.0
 
 Used by:
@@ -2273,7 +3162,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- clipboard-win 5.4.1 — https://github.com/DoumanAsh/clipboard-win
+- clipboard-win 5.4.3 — https://github.com/DoumanAsh/clipboard-win
 
 ```text
 Boost Software License - Version 1.0 - August 17th, 2003
@@ -2290,7 +3179,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- webpki-roots 1.0.10 — https://github.com/rustls/webpki-roots
+- webpki-roots 1.0.11 — https://github.com/rustls/webpki-roots
 
 ```text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -2520,6 +3409,43 @@ Used by:
 - ring 0.17.14 — https://github.com/briansmith/ring
 
 ```text
+// Copyright 2015-2024 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+#[cfg(target_pointer_width = "64")]
+type CompilerWord = u64;
+
+#[cfg(target_pointer_width = "32")]
+type CompilerWord = u32;
+
+/// A native word that isn't secret.
+///
+/// `LeakyWord` supports `as` conversions to/from native types.
+///
+/// XXX: This isn't the native word size on targets where a pointer isn't the
+/// same size as a native word. TODO: Fix this.
+pub(crate) type LeakyWord = CompilerWord;
+
+```
+
+## ISC License
+
+Used by:
+
+- ring 0.17.14 — https://github.com/briansmith/ring
+
+```text
 // Copyright 2015-2025 Brian Smith.
 //
 // Permission to use, copy, modify, and/or distribute this software for any
@@ -2641,6 +3567,48 @@ Used by:
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+#[cfg(target_arch = "x86")]
+pub fn shift_full_blocks<const BLOCK_LEN: usize>(
+    in_out: super::overlapping::Overlapping<'_, u8>,
+    mut transform: impl FnMut(&[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN],
+) {
+    let (in_out, src) = in_out.into_slice_src_mut();
+    let in_out_len = in_out[src.clone()].len();
+
+    for i in (0..in_out_len).step_by(BLOCK_LEN) {
+        let block = {
+            let input =
+                <&[u8; BLOCK_LEN]>::try_from(&in_out[(src.start + i)..][..BLOCK_LEN]).unwrap();
+            transform(input)
+        };
+        let output = <&mut [u8; BLOCK_LEN]>::try_from(&mut in_out[i..][..BLOCK_LEN]).unwrap();
+        *output = block;
+    }
+}
+
+```
+
+## ISC License
+
+Used by:
+
+- ring 0.17.14 — https://github.com/briansmith/ring
+
+```text
+// Copyright 2018 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 //! Serialization and deserialization.
 
 #[doc(hidden)]
@@ -2702,6 +3670,45 @@ mod ffi;
 pub(super) mod fallback;
 mod sha2_32;
 mod sha2_64;
+
+```
+
+## ISC License
+
+Used by:
+
+- ring 0.17.14 — https://github.com/briansmith/ring
+
+```text
+// Copyright 2022 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+/// Polyfill for `Option::unwrap()` as a const fn; feature `const_option`.
+/// https://github.com/rust-lang/rust/issues/67441.
+/// TODO(MSRV): Replace this with `x.unwrap()`.
+///
+/// `T: Copy` avoids "constant functions cannot evaluate destructors."
+pub const fn unwrap_const<T>(x: Option<T>) -> T
+where
+    T: Copy,
+{
+    if let Some(x) = x {
+        x
+    } else {
+        panic!("unwrap_const on `None`");
+    }
+}
 
 ```
 
@@ -2790,6 +3797,39 @@ Used by:
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+//! Utilities to make dealing with slices less tediuous.
+
+/// Replaces the first N elements of `a` with the first N elements of `b`, where
+/// N is `core::cmp::min(a.len(), b.len())`, leaving the rest unchanged.
+pub fn overwrite_at_start<T: Copy>(a: &mut [T], b: &[T]) {
+    a.iter_mut().zip(b).for_each(|(a, b)| {
+        *a = *b;
+    });
+}
+
+```
+
+## ISC License
+
+Used by:
+
+- ring 0.17.14 — https://github.com/briansmith/ring
+
+```text
+// Copyright 2024 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 pub use self::{
     array::Array,
     base::{IndexError, Overlapping},
@@ -2799,6 +3839,46 @@ pub use self::{
 mod array;
 mod base;
 mod partial_block;
+
+```
+
+## ISC License
+
+Used by:
+
+- ring 0.17.14 — https://github.com/briansmith/ring
+
+```text
+// Copyright 2024 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use crate::testutil;
+use core::{marker::PhantomData, mem::size_of};
+
+/// A ZST that can be added to any type to make the type `!Send`.
+#[derive(Clone, Copy)]
+pub struct NotSend(PhantomData<*mut ()>);
+
+impl NotSend {
+    pub const VALUE: Self = Self(PhantomData);
+}
+
+#[allow(deprecated)]
+const _: () = testutil::compile_time_assert_clone::<NotSend>();
+#[allow(deprecated)]
+const _: () = testutil::compile_time_assert_copy::<NotSend>();
+const _: () = assert!(size_of::<NotSend>() == 0);
 
 ```
 
@@ -3252,22 +4332,24 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- cc 1.8.0 — https://github.com/rust-lang/cc-rs
+- cc 1.10.0 — https://github.com/rust-lang/cc-rs
 - cfg-if 1.0.5 — https://github.com/rust-lang/cfg-if
+- cmake 0.1.58 — https://github.com/rust-lang/cmake-rs
 - filetime 0.2.29 — https://github.com/alexcrichton/filetime
-- find-msvc-tools 0.1.14 — https://github.com/rust-lang/cc-rs
+- find-msvc-tools 0.1.15 — https://github.com/rust-lang/cc-rs
+- futures-timer 3.0.4 — https://github.com/async-rs/futures-timer
 - jobserver 0.1.35 — https://github.com/rust-lang/jobserver-rs
-- js-sys 0.3.106 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
+- js-sys 0.3.107 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 - pkg-config 0.3.34 — https://github.com/rust-lang/pkg-config-rs
 - scoped-tls 1.0.1 — https://github.com/alexcrichton/scoped-tls
 - socket2 0.6.5 — https://github.com/rust-lang/socket2
 - toml 0.5.11 — https://github.com/toml-rs/toml
-- wasm-bindgen-futures 0.4.79 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
-- wasm-bindgen-macro-support 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support
-- wasm-bindgen-macro 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
-- wasm-bindgen-shared 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
-- wasm-bindgen 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen
-- web-sys 0.3.106 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys
+- wasm-bindgen-futures 0.4.80 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
+- wasm-bindgen-macro-support 0.2.130 — https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support
+- wasm-bindgen-macro 0.2.130 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
+- wasm-bindgen-shared 0.2.130 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
+- wasm-bindgen 0.2.130 — https://github.com/wasm-bindgen/wasm-bindgen
+- web-sys 0.3.107 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys
 
 ```text
 Copyright (c) 2014 Alex Crichton
@@ -3404,7 +4486,7 @@ Used by:
 
 - bitflags 1.3.2 — https://github.com/bitflags/bitflags
 - bitflags 2.13.2 — https://github.com/bitflags/bitflags
-- log 0.4.34 — https://github.com/rust-lang/log
+- log 0.4.35 — https://github.com/rust-lang/log
 - num-integer 0.1.47 — https://github.com/rust-num/num-integer
 - num-traits 0.2.19 — https://github.com/rust-num/num-traits
 - regex-automata 0.4.18 — https://github.com/rust-lang/regex
@@ -3444,7 +4526,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- uuid 1.28.0 — https://github.com/uuid-rs/uuid
+- uuid 1.29.0 — https://github.com/uuid-rs/uuid
 
 ```text
 Copyright (c) 2014 The Rust Project Developers
@@ -3592,7 +4674,7 @@ THE SOFTWARE.
 Used by:
 
 - tempfile 3.27.0 — https://github.com/Stebalien/tempfile
-- xattr 1.6.1 — https://github.com/Stebalien/xattr
+- xattr 1.7.0 — https://github.com/Stebalien/xattr
 
 ```text
 Copyright (c) 2015 Steven Allen
@@ -3851,11 +4933,15 @@ THE SOFTWARE.
 
 Used by:
 
+- futures-channel 0.3.34 — https://github.com/rust-lang/futures-rs
 - futures-core 0.3.34 — https://github.com/rust-lang/futures-rs
+- futures-executor 0.3.34 — https://github.com/rust-lang/futures-rs
 - futures-io 0.3.34 — https://github.com/rust-lang/futures-rs
 - futures-macro 0.3.34 — https://github.com/rust-lang/futures-rs
+- futures-sink 0.3.34 — https://github.com/rust-lang/futures-rs
 - futures-task 0.3.34 — https://github.com/rust-lang/futures-rs
 - futures-util 0.3.34 — https://github.com/rust-lang/futures-rs
+- futures 0.3.34 — https://github.com/rust-lang/futures-rs
 
 ```text
 Copyright (c) 2016 Alex Crichton
@@ -3980,6 +5066,35 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
+- opus 0.4.0 — https://github.com/SpaceManiac/opus-rs
+
+```text
+Copyright (c) 2016 Tad Hardesty
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
 - lock_api 0.4.14 — https://github.com/Amanieu/parking_lot
 - parking_lot 0.12.5 — https://github.com/Amanieu/parking_lot
 - parking_lot_core 0.9.12 — https://github.com/Amanieu/parking_lot
@@ -4089,7 +5204,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- equivalent 1.0.2 — https://github.com/indexmap-rs/equivalent
+- equivalent 1.0.3 — https://github.com/indexmap-rs/equivalent
 
 ```text
 Copyright (c) 2016--2023
@@ -4187,6 +5302,36 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- enum-primitive-derive 0.3.0 — https://gitlab.com/cardoe/enum-primitive-derive.git
+
+```text
+Copyright (c) 2017 Doug Goldstein <cardoe@cardoe.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+“Software”), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -4294,7 +5439,7 @@ Used by:
 
 - redox_syscall 0.4.1 — https://gitlab.redox-os.org/redox-os/syscall
 - redox_syscall 0.5.18 — https://gitlab.redox-os.org/redox-os/syscall
-- redox_syscall 0.9.4 — https://gitlab.redox-os.org/redox-os/kernel
+- redox_syscall 0.9.5 — https://gitlab.redox-os.org/redox-os/kernel
 
 ```text
 Copyright (c) 2017 Redox OS Developers
@@ -4384,6 +5529,41 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- arc-swap 1.9.3 — https://github.com/vorner/arc-swap
+
+```text
+Copyright (c) 2017 arc-swap developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -4701,7 +5881,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- smallvec 1.16.3 — https://github.com/servo/rust-smallvec
+- smallvec 1.16.4 — https://github.com/servo/rust-smallvec
 
 ```text
 Copyright (c) 2018 The Servo Project Developers
@@ -5096,7 +6276,7 @@ SOFTWARE.
 
 Used by:
 
-- font-types 0.12.6 — https://github.com/googlefonts/fontations
+- font-types 0.12.7 — https://github.com/googlefonts/fontations
 - read-fonts 0.41.0 — https://github.com/googlefonts/fontations
 - skrifa 0.44.0 — https://github.com/googlefonts/fontations
 
@@ -5242,6 +6422,34 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- rubato 5.0.1 — https://github.com/HEnquist/rubato
+
+```text
+Copyright (c) 2020 Henrik Enquist
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## MIT License
+
+Used by:
+
 - wasapi 0.26.0 — https://github.com/HEnquist/wasapi-rs
 
 ```text
@@ -5299,7 +6507,7 @@ SOFTWARE.
 
 Used by:
 
-- litrs 1.0.0 — https://github.com/LukasKalbertodt/litrs
+- litrs 1.0.1 — https://github.com/LukasKalbertodt/litrs
 
 ```text
 Copyright (c) 2020 Project Developers
@@ -5334,7 +6542,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- memmap2 0.9.11 — https://github.com/RazrFalcon/memmap2-rs
+- memmap2 0.9.12 — https://github.com/RazrFalcon/memmap2-rs
 
 ```text
 Copyright (c) 2020 Yevhenii Reizner
@@ -5406,7 +6614,7 @@ DEALINGS IN THE SOFTWARE.
 Used by:
 
 - const-oid 0.10.2 — https://github.com/RustCrypto/formats
-- der 0.8.2 — https://github.com/RustCrypto/formats
+- der 0.8.3 — https://github.com/RustCrypto/formats
 
 ```text
 Copyright (c) 2020-2026 The RustCrypto Project Developers
@@ -5724,7 +6932,7 @@ SOFTWARE.
 
 Used by:
 
-- deranged 0.5.8 — https://github.com/jhpratt/deranged
+- deranged 0.5.9 — https://github.com/jhpratt/deranged
 
 ```text
 Copyright (c) 2024 Jacob Pratt et al.
@@ -5755,10 +6963,10 @@ Used by:
 
 - zbus 5.19.0 — https://github.com/z-galaxy/zbus/
 - zbus_macros 5.19.0 — https://github.com/z-galaxy/zbus/
-- zbus_names 4.3.4 — https://github.com/z-galaxy/zbus/
+- zbus_names 4.3.5 — https://github.com/z-galaxy/zbus/
 - zbus_xml 5.2.1 — https://github.com/z-galaxy/zbus/
-- zvariant 5.15.0 — https://github.com/z-galaxy/zbus/
-- zvariant_derive 5.15.0 — https://github.com/z-galaxy/zbus/
+- zvariant 5.15.1 — https://github.com/z-galaxy/zbus/
+- zvariant_derive 5.15.1 — https://github.com/z-galaxy/zbus/
 
 ```text
 Copyright (c) 2024 Zeeshan Ali Khan & zbus contributors
@@ -5793,7 +7001,66 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- zcheapstr 1.1.0 — https://github.com/z-galaxy/zcheapstr/
+- windowfunctions 0.1.1 — https://github.com/HEnquist/windowfunctions-rs
+
+```text
+Copyright (c) 2025 Henrik Enquist
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## MIT License
+
+Used by:
+
+- audioadapter-buffers 5.2.0 — https://github.com/HEnquist/audioadapter-buffers-rs
+- audioadapter-sample 5.2.0 — https://github.com/HEnquist/audioadapter-sample-rs
+- audioadapter 5.0.0 — https://github.com/HEnquist/audioadapter-rs
+
+```text
+Copyright (c) 2026 Henrik Enquist
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- zcheapstr 1.2.0 — https://github.com/z-galaxy/zcheapstr/
 
 ```text
 Copyright (c) 2026 Zeeshan Ali Khan & zcheapstr contributors
@@ -5921,7 +7188,7 @@ SOFTWARE.
 
 Used by:
 
-- libc 0.2.190 — https://github.com/rust-lang/libc
+- libc 0.2.191 — https://github.com/rust-lang/libc
 
 ```text
 Copyright (c) The Rust Project Developers
@@ -6267,8 +7534,25 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- zerocopy-derive 0.8.62 — https://github.com/google/zerocopy
-- zerocopy 0.8.62 — https://github.com/google/zerocopy
+- pulseaudio 0.3.2 — https://github.com/colinmarc/pulseaudio-rs
+
+```text
+Copyright 2023 Colin Marc <hi@colinmarc.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- zerocopy-derive 0.8.63 — https://github.com/google/zerocopy
+- zerocopy 0.8.63 — https://github.com/google/zerocopy
 
 ```text
 Copyright 2023 The Fuchsia Authors
@@ -6304,7 +7588,8 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- utf8_iter 1.0.4 — https://github.com/hsivonen/utf8_iter
+- utf8_iter 1.1.0 — https://github.com/hsivonen/utf8_iter
+- utf_types 1.0.0 — https://github.com/hsivonen/utf_types
 
 ```text
 Copyright Mozilla Foundation
@@ -6490,7 +7775,7 @@ SOFTWARE.
 
 Used by:
 
-- crc32fast 1.5.2 — https://github.com/srijs/rust-crc32fast
+- crc32fast 1.5.3 — https://github.com/srijs/rust-crc32fast
 
 ```text
 MIT License
@@ -6541,7 +7826,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- ureq 3.4.2 — https://github.com/algesten/ureq
+- ureq 3.5.0 — https://github.com/algesten/ureq
 
 ```text
 MIT License
@@ -6778,7 +8063,7 @@ SOFTWARE.
 
 Used by:
 
-- arboard 3.6.1 — https://github.com/1Password/arboard
+- arboard 3.7.0 — https://github.com/1Password/arboard
 
 ```text
 MIT License
@@ -6871,6 +8156,37 @@ SOFTWARE.
 
 Used by:
 
+- visibility 0.1.1 — https://github.com/danielhenrymantilla/visibility.rs
+
+```text
+MIT License
+
+Copyright (c) 2024 Daniel Henry-Mantilla
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
 - accesskit 0.24.1 — https://github.com/AccessKit/accesskit
 - accesskit_atspi_common 0.18.1 — https://github.com/AccessKit/accesskit
 - accesskit_consumer 0.35.0 — https://github.com/AccessKit/accesskit
@@ -6923,6 +8239,7 @@ Used by:
 - windows-result 0.4.1 — https://github.com/microsoft/windows-rs
 - windows-strings 0.5.1 — https://github.com/microsoft/windows-rs
 - windows-sys 0.52.0 — https://github.com/microsoft/windows-rs
+- windows-sys 0.59.0 — https://github.com/microsoft/windows-rs
 - windows-sys 0.61.2 — https://github.com/microsoft/windows-rs
 - windows-targets 0.52.6 — https://github.com/microsoft/windows-rs
 - windows-threading 0.2.1 — https://github.com/microsoft/windows-rs
@@ -6962,7 +8279,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- tokio 1.53.2 — https://github.com/tokio-rs/tokio
+- tokio 1.54.1 — https://github.com/tokio-rs/tokio
 
 ```text
 MIT License
@@ -7297,7 +8614,7 @@ Used by:
 - reis 0.7.1 — https://github.com/ids1024/reis
 - rtrb 0.3.6 — https://github.com/mgeier/rtrb
 - rustix 0.38.44 — https://github.com/bytecodealliance/rustix
-- rustix 1.1.5 — https://github.com/bytecodealliance/rustix
+- rustix 1.1.6 — https://github.com/bytecodealliance/rustix
 - rustversion 1.0.23 — https://github.com/dtolnay/rustversion
 - semver 1.0.28 — https://github.com/dtolnay/semver
 - serde 1.0.229 — https://github.com/serde-rs/serde
@@ -7308,12 +8625,12 @@ Used by:
 - simd_cesu8 1.2.0 — https://github.com/seancroach/simd_cesu8
 - smol_str 0.2.2 — https://github.com/rust-analyzer/smol_str
 - syn 2.0.119 — https://github.com/dtolnay/syn
-- syn 3.0.7 — https://github.com/dtolnay/syn
+- syn 3.0.9 — https://github.com/dtolnay/syn
 - thiserror-impl 1.0.69 — https://github.com/dtolnay/thiserror
 - thiserror-impl 2.0.21 — https://github.com/dtolnay/thiserror
 - thiserror 1.0.69 — https://github.com/dtolnay/thiserror
 - thiserror 2.0.21 — https://github.com/dtolnay/thiserror
-- unicode-ident 1.0.26 — https://github.com/dtolnay/unicode-ident
+- unicode-ident 1.0.27 — https://github.com/dtolnay/unicode-ident
 - utf8-zero 0.8.1 — https://github.com/algesten/utf8-zero
 - wasi 0.11.1+wasi-snapshot-preview1 — https://github.com/bytecodealliance/wasi
 - wasip2 1.0.4+wasi-0.2.12 — https://github.com/bytecodealliance/wasi-rs
@@ -7540,6 +8857,7 @@ Used by:
 
 - aho-corasick 1.1.5 — https://github.com/BurntSushi/aho-corasick
 - byteorder-lite 0.1.0 — https://github.com/image-rs/byteorder-lite
+- byteorder 1.5.0 — https://github.com/BurntSushi/byteorder
 - memchr 2.8.3 — https://github.com/BurntSushi/memchr
 - walkdir 2.5.0 — https://github.com/BurntSushi/walkdir
 
@@ -7572,7 +8890,7 @@ THE SOFTWARE.
 
 Used by:
 
-- combine 4.6.8 — https://github.com/Marwes/combine
+- combine 4.6.9 — https://github.com/Marwes/combine
 
 ```text
 The MIT License (MIT)
@@ -7666,7 +8984,7 @@ SOFTWARE.
 
 Used by:
 
-- webbrowser 1.2.4 — https://github.com/amodm/webbrowser-rs
+- webbrowser 1.2.5 — https://github.com/amodm/webbrowser-rs
 
 ```text
 The MIT License (MIT)
@@ -7796,6 +9114,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- crossbeam-queue 0.3.14 — https://github.com/crossbeam-rs/crossbeam
 - crossbeam-utils 0.8.23 — https://github.com/crossbeam-rs/crossbeam
 
 ```text
@@ -8115,7 +9434,7 @@ THE SOFTWARE.
 
 Used by:
 
-- unicode-ident 1.0.26 — https://github.com/dtolnay/unicode-ident
+- unicode-ident 1.0.27 — https://github.com/dtolnay/unicode-ident
 
 ```text
 UNICODE LICENSE V3
@@ -8164,24 +9483,24 @@ authorization of the copyright holder.
 
 Used by:
 
-- icu_collections 2.3.0 — https://github.com/unicode-org/icu4x
-- icu_locale_core 2.3.0 — https://github.com/unicode-org/icu4x
-- icu_normalizer 2.3.0 — https://github.com/unicode-org/icu4x
-- icu_normalizer_data 2.3.0 — https://github.com/unicode-org/icu4x
-- icu_properties 2.3.0 — https://github.com/unicode-org/icu4x
-- icu_properties_data 2.3.0 — https://github.com/unicode-org/icu4x
-- icu_provider 2.3.1 — https://github.com/unicode-org/icu4x
+- icu_collections 2.4.0 — https://github.com/unicode-org/icu4x
+- icu_locale_core 2.4.0 — https://github.com/unicode-org/icu4x
+- icu_normalizer 2.4.0 — https://github.com/unicode-org/icu4x
+- icu_normalizer_data 2.4.0 — https://github.com/unicode-org/icu4x
+- icu_properties 2.4.0 — https://github.com/unicode-org/icu4x
+- icu_properties_data 2.4.0 — https://github.com/unicode-org/icu4x
+- icu_provider 2.4.0 — https://github.com/unicode-org/icu4x
 - litemap 0.8.3 — https://github.com/unicode-org/icu4x
 - potential_utf 0.1.6 — https://github.com/unicode-org/icu4x
-- tinystr 0.8.4 — https://github.com/unicode-org/icu4x
+- tinystr 0.8.5 — https://github.com/unicode-org/icu4x
 - writeable 0.6.4 — https://github.com/unicode-org/icu4x
 - yoke-derive 0.8.4 — https://github.com/unicode-org/icu4x
-- yoke 0.8.3 — https://github.com/unicode-org/icu4x
+- yoke 0.8.4 — https://github.com/unicode-org/icu4x
 - zerofrom-derive 0.1.8 — https://github.com/unicode-org/icu4x
 - zerofrom 0.1.8 — https://github.com/unicode-org/icu4x
 - zerotrie 0.2.5 — https://github.com/unicode-org/icu4x
-- zerovec-derive 0.11.6 — https://github.com/unicode-org/icu4x
-- zerovec 0.11.8 — https://github.com/unicode-org/icu4x
+- zerovec-derive 0.11.7 — https://github.com/unicode-org/icu4x
+- zerovec 0.11.9 — https://github.com/unicode-org/icu4x
 
 ```text
 UNICODE LICENSE V3
@@ -8237,7 +9556,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 Used by:
 
-- ksni 0.3.6 — https://github.com/iovxw/ksni
+- ksni 0.3.7 — https://github.com/iovxw/ksni
 
 ```text
 This is free and unencumbered software released into the public domain.

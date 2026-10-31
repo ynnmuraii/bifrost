@@ -1,13 +1,13 @@
 # Third-party notices
 
 Generated file — do not edit by hand. It lists the third-party crates a shipped binary
-(`bifrost`: core, agent, GUI and lightweight tray roles) contains, with their terms.
+(`bifrost`: core, agent, GUI, lightweight tray and optional audio roles) contains, with their terms.
 The project itself is MIT: see [`../LICENSE`](../LICENSE).
 
 Regenerate from the repository root, after `cargo fetch`:
 
 ```sh
-cargo install cargo-about --locked     # or take the release binary for your target
+cargo install cargo-about --locked --features cli  # or take the release binary for your target
 cargo about generate --workspace --fail -o licenses/THIRD_PARTY_NOTICES.md licenses/notices.hbs
 ```
 

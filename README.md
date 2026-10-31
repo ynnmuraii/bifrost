@@ -44,7 +44,7 @@ Input still shares one reliable TLS/TCP stream: packet loss can cause retransmis
 
 ## Download & install
 
-Get **0.4.0** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
+Get **0.5.0** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
 
 Versions from **0.1.4** can update from **Settings** or the startup update notice. The app checks for newer stable releases shortly after startup; turn this off in **Settings → Check on startup**, or check manually next to the version. Updates keep a binary backup and ask before restarting all roles; your configuration and pairing are preserved. System-wide, non-writable installations must be updated manually.
 
@@ -54,7 +54,7 @@ Versions from **0.1.4** can update from **Settings** or the startup update notic
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.4.0-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.5.0-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902 + UDP 47902 (discovery)** (multicast `239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
@@ -64,10 +64,10 @@ Settings are created automatically in `%APPDATA%\bifrost`; logs go to `%LOCALAPP
 
 ### Linux · x86_64
 
-Download **`bifrost-0.4.0-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.5.0-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.4.0-linux-x86_64.tar.gz
+tar -xzf bifrost-0.5.0-linux-x86_64.tar.gz
 ./install.sh
 ```
 
@@ -115,8 +115,9 @@ Optional system-wide mic mute/PTT controls the Listener's physical microphone, a
 3. On each Source, select the **Trusted Listener**, apply while sharing is disabled, wait for group confirmation, then enable audio.
 4. Allow sending on the Source and receiving on the Listener, apply, then **Start system audio** from the Source.
 
-**Firewall:** usually no extra UDP rule is needed on stateful LAN firewalls after the pinned TCP link; TCP 47901 must be reachable in at least one direction. If path validation fails, allow UDP 47903 from the Source's LAN address on the Listener (or `audio.media_port`). No rules are added automatically; Windows Firewall, AP/client isolation and VPN restrictions are not bypassed.
+**Firewall:** TCP 47901 must be reachable in at least one direction. Audio uses the configured UDP media port (default 47903); allow it between trusted LAN peers if path validation fails. Some stateful LAN firewalls need no extra rule, but this is not guaranteed. Bifrost adds no rules and does not bypass Windows Firewall, VPN or AP/client isolation.
 **Privacy:** pairing alone grants no audio permission. Bilateral consent gates capture and playback; ChaCha20-Poly1305 session keys come from the pinned mutual-TLS link. Now-playing metadata is shared only within active consented sessions; metadata, audio payloads and session keys are never logged or persisted.
+**Compatibility:** audio needs capable builds on both computers; 0.4.0 peers still share input and clipboard. Older binaries reject `[audio]`: restore the earlier `.pre-audio` backup where created, or remove audio tables before downgrading.
 
 | Platform | Audio backend |
 | --- | --- |
@@ -156,7 +157,7 @@ Optional system-wide mic mute/PTT controls the Listener's physical microphone, a
 
 Run CLI commands from cmd/PowerShell (also inside Windows Terminal), or use `cmd /c` in hosts that launch the windowed executable directly; without a console or redirected output, Bifrost exits with code 69 and records the launch hint in the configured core log.
 
-## Build from source
+## Development
 
 Use [Rust via rustup](https://rustup.rs/) with the repository's toolchain (Rust 1.99 or newer). Windows needs the MSVC C++ build tools and Windows SDK.
 
@@ -182,84 +183,21 @@ The executable is `target/release/bifrost` (`bifrost.exe` on Windows). `xvfb` an
 ```sh
 cargo build --workspace
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --target-dir target/clippy -- -D warnings
 cargo test --workspace
 ```
 
 Do **not** run ignored tests on your everyday desktop: some intentionally drive real input. Linux CI runs tests under `xvfb-run -a -s "-screen 0 1280x1024x24 -noreset"`.
 
-For an explicitly audible Windows audio smoke, run
-`cargo run -p bifrost-audio --example windows_e2e -- --audible`.
-It plays a six-second 1 kHz tone on the default multimedia output, opens two native audio
-workers and ephemeral localhost UDP sockets, and captures render loopback in memory.
-It never changes endpoint routing, volume or mute. A 500 ms test-only ciphertext delay
-separates the listener's remaining output from the helper's direct tone; reported latency
-includes that delay, and the delay-subtracted value is only an estimate. Muted or
-loopback-suppressed endpoints can fail the signal assertions; do not change real endpoint
-settings just to obtain a pass.
-The example reports the Listener's worker Health drift-controller ratio, fill error and
-coarse corrections beside its independent delivered-sample/QPC capture estimate. These
-measure different quantities; Source has no receiver drift controller.
-
-For a Windows timing-only diagnostic, run
-`cargo run -p platform-audio-win --example hw_probe -- --timing`.
-It initializes—but never starts—capture/render clients and prints actual buffer capacities,
-engine periods and available native latency queries. It plays no tone and changes no
-endpoint settings; process-loopback period/latency queries may report unsupported.
-
-For long-run Windows audio measurements, add `--seconds 60` to `windows_e2e --audible`.
-The helper streams into a bounded ring; the probe retains only onset/tail PCM and reports
-steady-state underruns after two seconds of tone warmup.
-
-Windows render attempts `IAudioClient3` shared/event mode with the smallest supported
-fundamental-multiple period at or above **5 ms**. The floor keeps a two-period queue
-at roughly 10 ms rather than relying on a minimum-period scheduling deadline. The
-adapter queues at most **two periods**, capped by the actual WASAPI buffer capacity.
-Process-loopback capture retains its existing EXCLUDE behavior and format.
-Unsupported exact formats, unavailable interfaces/periods and an engine period locked
-by another application fall back to the legacy shared-mode/conversion path. Native
-stream snapshots report the selected mode, period, capacity, queue limit and typed
-fallback reason/HRESULT. Legacy clients query the current shared engine period rather
-than assuming the default; when that query is unsupported, the snapshot explicitly
-labels the default-period estimate. Shared engine periods are endpoint-wide and can
-affect other applications; no endpoint routing, volume or mute setting is changed.
-
-`hw_probe --timing --period min|5ms|10ms` reports negotiated versus legacy timing without
-starting streams. For explicit audible candidate stress, use
-`cargo run -p platform-audio-win --example hw_probe -- --stress-period 5ms --seconds 60`.
-It uses a bounded tone ring and reports post-warmup source exhaustion separately from
-zero-padding observations and the two-period engine-starvation heuristic. The heuristic
-is not a driver xrun counter; on a buffer smaller than two periods, zero padding alone
-does not establish starvation.
-
-For isolated native media-control acceptance, run
-`cargo run -p bifrost-audio --example windows_media_e2e -- --owned-test`.
-It creates its own short-lived SMTC player with a generated tone and unique identity,
-authorizes a native Source over private IPC, and sends encrypted audio only to a local
-Dry discard listener. Metadata must remain absent before consent; play/pause/next are
-addressed only to that helper's exact token/revision. An ambiguous or non-owned current
-session fails closed rather than controlling another application. Owned processes are
-reaped and samples remain in memory. No microphone mute or synthesized input is used.
-
-Child mic/PTT tests use Dry mute targets for grants, expiry and persistent toggles.
-Windows registration-only tests temporarily reserve Ctrl+Alt+Shift+F23/F24 and release
-them; they never press keys or mutate a real capture endpoint.
-
-Windows global PTT starts **unarmed** after registration; after a safety fence it
-also requires a confirmed physical release of the non-modifier PTT key before a
-new press can talk. If needed, press and release that PTT key once to arm it, then
-press the configured chord again to talk. A narrowly filtered, non-suppressing
-native observer accepts only non-injected key-up events for that PTT key; it
-stores no unrelated keys. Modifier changes can revoke but cannot rearm: releasing
-one side does not prove its other side is up.
-Unavailable/zero asynchronous key state only revokes a lease, never rearms it.
-Failure to install the release observer reports `Unsupported`; use GUI PTT instead.
-Hook timeout/removal also fails closed; reconfigure PTT to reinstall the observer.
-Registration-only tests do not verify actual native physical edges or desktop
-transitions. Configured is not an armed-state acknowledgment: integrations must
-explain the release-to-arm requirement, and use the physical-release event to
-distinguish it from reset/expiry. Delayed initial presses retain their conservative
-native message timestamp, not the time the event queue is drained.
+Native Windows audio diagnostics are opt-in developer checks, not ordinary tests.
+See the [Windows backend developer contract](crates/platform-audio-win/src/lib.rs)
+for timing, render-period and native PTT details. The
+[audible audio check](apps/bifrost-audio/examples/windows_e2e.rs) and
+[owned media-player check](apps/bifrost-audio/examples/windows_media_e2e.rs)
+document their explicit flags and isolation limits; run audible checks only with
+permission on that desktop. Their reported timing is not synchronized physical
+end-to-end latency. Microphone lease tests use Dry targets; registration-only
+hotkey checks do not establish physical-key or real-microphone acceptance.
 
 ## License
 

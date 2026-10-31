@@ -2,293 +2,81 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
-## Unreleased
+## 0.5.0 — 2026-10-31
 
 ### English
 
-**Fixes**
-
-- Live audio health updates no longer invalidate settings, start or gain actions. Stale configuration/consent changes, future snapshots and A→B→A edits remain rejected without automatic retries.
-- Latch microphone mute/PTT release before bounded GUI admission, so continued polling cannot keep an old hold alive after queue saturation. Rejected stale/busy unmute requests leave legitimate holds untouched.
-- Correlate emergency PTT release completion by worker/request identity without treating a command acknowledgement as native rearming proof.
-- Never reopen an endpoint as failed-unmute rollback; persist queue-saturated safety mutes and retain muted runtime recovery intent when saving fails.
-- Retry only transiently refused or unconfirmed Source safety mutes on the same live consented link, at most 50 attempts within 5 seconds. Final refusal stops retrying without clearing muted intent; activation and unmute are never retried.
-- Keep an observed safety mute and its runtime recovery intent even when configuration persistence fails; report the write error without reopening the microphone.
-- Preserve absent/automatic/manual group-policy states through TOML, IPC and GUI edits; legacy Source pins survive restart instead of silently becoming automatic.
-- Treat zero native media token/revision as stale/unavailable, never an implicit current session; preserve a typed operation failure without executing a child command.
-- Refuse unauthorized media commands before validating native target identity; authorized commands still require a real nonzero session token and revision.
-- Explicit command-line pairing rejection or EOF cancellation exits unsuccessfully with the rejection reason, including through an already-running core.
-- Starting a newer pairing ceremony cancels the previous pending SAS exchange on both computers. Old prompts, confirmations and delayed dial results cannot approve or replace the newest attempt; existing window/handshake budgets remain in force. Pairing outcome IPC now carries the ceremony identity and cancellation code for correlated clients.
-- GUI pairing results are matched to the visible ceremony, including after its answer acknowledgement. Superseded confirmations cannot close a newer prompt; cancellation is explained in English and Russian instead of exposing a raw error code.
-- Superseded pairing attempts show a neutral informational notice without a failure prefix. The audio-settings headphones and popup-player speaker now have distinct sidebar glyphs, tooltips and accessible button names.
-- Refuse Windows CLI launches that have neither a console nor redirected output with exit code 69 and a core-log hint, before starting an invisible pairing ceremony; GUI and internal child-role startup stay unchanged.
-- Compile the audio test RMS accessor only for its Unix-only consumers, keeping Windows all-target Clippy checks warning-free.
-- Keep the input-loop future heap-owned across audio shutdown supervision, preventing Windows debug cores from overflowing their main-thread stack when clipboard sharing is toggled.
-- Windows process-loopback capture preserves QPC host timestamps without advertising packet-local positions as a monotonic device clock; render clock positions remain supported.
-- Audio settings quietly identify the current Listener and hide disabled microphone controls; system-audio popups use trusted computer names and a distinct app glyph.
-- Enforce both peers' Hello requirements against stable implementation support and advertised offers, independent of transient agent readiness. Deliver compatibility refusals before graceful closure, select slow reconnects, and forbid bounded capability changes from withdrawing handshake requirements.
-- Bound Hello advertised capability lists to 64 entries and required capability lists to 32 before membership or duplicate scans.
-- Clipboard channels inherit their parent input link's negotiated protocol version for both outgoing frames and incoming validation, preserving clipboard compatibility across future mixed-minor peers.
-- Keep input links usable when optional auxiliary export is unavailable; bind revocable key access to the current manager generation, erase roots on membership refusal, and return zeroizing keys through a closed purpose registry with bounded contexts.
-- Disable TLS session resumption so every runtime and pairing connection re-runs certificate pin verification.
-- Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
-- Fix boxed auxiliary exporter storage with the locked zeroize version while retaining a stable heap allocation and erasure before deallocation.
-- Keep Source pacing independent of Winsock's coarse receive timeout: shared UDP reception and capture-ring notifications wake media workers without a millisecond polling loop.
-
 **New**
 
-- Optional features can derive per-input-link keys without a new wire capability. The TLS exporter root stays inside transport, is erased on parent closure/replacement, and is accessible only through a redacted, revocable derivation view after validated Hello; consumers gate on their own feature capabilities.
-- Add internal audio backend/Dry and pure packet/replay/status contracts, with dependency-direction checks that keep native adapters outside core and the input stack.
-- Extend the audio backend contract with native clock/status snapshots, valid capture timestamps, reserved-hotkey collision checks and expiring, renewable PTT press leases.
-- Preserve unknown native playback states and expose the OS-selected current media-session token in the shared backend contract and Windows adapter.
-- Add bounded revisioned local audio IPC, an authoritative remote-audio popup, bilingual audio settings/device selection and tray privacy/mute/stop controls. Media metadata is transient and redacted from debug output.
-- Define bounded P1 audio control messages and capability-gated, parent-bound transport delivery with isolated audio refusal and reserved Stop capacity.
-- Add opt-in typed `[audio]` preferences, explicit directional consent, stable device selection and locked updates. Config version stays 2, but 0.5.0 configs containing `[audio]` are not downgrade-safe: restore the one-time `.pre-audio` copy made before adding audio to an audio-free config, or remove the audio tables. Hand-edited audio configs need their own earlier backup. Audio is disabled by default.
-- Add a pure consent/session control model with contributory nonce/context binding, per-parent replay reservations, worker/generation revocation, deadline-driven failure and automatic Listener-group discovery. Listener child startup must succeed before Commit can start the Source.
-- Add bounded Source-to-Listener StartRequest/StartRefusal negotiation with explicit request correlation, per-parent deduplication/rate limits and typed consent/capacity refusals; Listener still contributes the first nonce and starts before Commit. Track four peer control links separately from the three-session audio limit.
-- Preserve explicit enabled audio intent while a Listener group is being minted or a Source's selected trusted Listener is unresolved. Config and GUI validation accept these pending states without granting consent or claiming active media.
-- Wire optional system-audio control into core and GUI/tray requests: explicit bilateral consent, authenticated Listener-group discovery, parent-bound key derivation, isolated audio-child supervision, device listing and Listener-local gain/mute. Native startup precedes Commit, Active requires authenticated path validation, and per-session one-second leases fail closed independently of IPC heartbeat. Explicit disable removes the child and media sockets.
-- Exercise isolated multi-core audio with deterministic Dry children, real pairing/consent/group discovery, Source-side starts, shared Listener rendering, lifecycle failures and audio-enabled KVM suites. Unpaired fixtures own process and root cleanup, including pairing-request tests. The hidden Dry-audio switch requires a debug build, dry input and an explicit test root; production does not read the harness-only audio environment flag.
-- Choose each multi-core fixture's input and clipboard endpoints as one simultaneously bound batch, preventing duplicate ephemeral-port numbers before services start.
-- Follow Focus now ducks Listener-local system-audio streams using owner-authenticated committed input focus, including third-PC Listeners and reconnect snapshots. Default debounce is250ms and the gain envelope is150ms; Preparing/Releasing/Blocked and stale owners cannot select a new primary. Unknown focus holds the last primary for two seconds, then returns to equal focus multipliers while preserving user gain/mute. Microphone targeting and OS master volume are unchanged; focus-report capability alone never starts an audio child.
-- Define independent microphone-control/media-control wire capabilities, strict bounded and redacted messages, urgent mute/release admission, and pure Listener-authority PTT and session-scoped media permission policies.
-- Fence audio offers/answers with the latest peer consent revision. Track microphone intent provenance: withdrawn or disconnected remote unmute is re-muted and never becomes child-recovery intent; departed-parent history is pruned without losing live replay protection.
-- Recover an ownership claim superseded by newer self-owner gossip when a delayed, uncorrelated stale-serial refusal arrives. A fresh higher-serial claim uses the existing full deadline; old timers and receiver release cannot grant it early. Ordinary refusals and competing-owner validation remain unchanged.
-- Add Listener-authoritative microphone mute/PTT controls from opted-in group members. Persistent mute toggles are unleased; PTT uses Listener-issued challenges and short, independently enforced child grants. GUI holds end on release, disconnect, lock or missed existing GUI heartbeats; global hotkey conflicts and unavailable backends return typed errors. Guard teardown restores the original state and never clears a pre-existing mute.
-- Relay bounded, Debug-redacted now-playing metadata only for active consented streams. Listener media commands require Source permission, current session/token/revision and actual native completion; stopping clears metadata. Report observed local audio-stage latency without double-counting jitter occupancy or inventing unknown native output depth.
-- Keep minted Listener groups stable across normal GUI updates/restarts, automatically follow the selected authenticated Listener's group, and preserve explicit Advanced Source pins. Report group mismatches immediately with a typed result instead of a generic startup timeout.
-- Preserve explicit GUI group-policy presence: normal consent/gain edits keep automatic Listener discovery, while only Advanced edits deliberately pin a Source group. Legacy clients retain their absent-field behavior.
-- Bound audio starts per trusted identity across reconnects and retire exhausted native generations without replaying keys. Treat rejected privacy reductions as fatal, preserve PTT idle mute through lock/restart, and expose bounded path observations/UDP ports and separate remote receiver quality without mistaking degraded audio for a paused stream.
+- Optional shared system audio for Windows and Linux: one Listener plays sound from up to three authorized Sources. Audio is off by default.
+- **Mix All** combines Sources; **Follow Focus** makes the computer with committed input focus primary and quietens the others.
+- A popup mini-player shows now-playing information and playback timing where the Source's player supports it.
+- Play/pause, next and previous buttons require a separate permission on each Source; sharing sound alone does not grant media control.
+- Listener-local per-source volume and mute, output-device selection, and Ethernet/Wi-Fi buffering profiles.
+- Select a trusted Listener by name; its audio group is discovered automatically. Manual group pinning remains an Advanced option.
+- Optional system-wide microphone mute/PTT controls the Listener's physical microphone for all apps using it. Enable and permit it separately; no microphone audio is streamed.
 
-**Audio media internals**
+**Fixes**
 
-- Recover Listener health when valid decoded PCM resumes after Wi-Fi loss instead of retaining a permanent degraded label; distinguish jitter rebuffer episodes from native zero-fill callbacks, keep peer receiver quality separate from local Source state, and fall back safely when a native render position stops advancing.
-- Document Listener-first authenticated UDP hole punching and one-second idle traffic as runtime invariants; report bounded path-probe/authentication observations on health and terminal timeouts without guessing which firewall blocked traffic.
-- Keep audio-child lifecycle and path-failure diagnostics in a separate bounded rotating log while retaining null stdio; log only allowlisted scalar fields and prevent dependency traces from exposing session keys, now-playing metadata or PCM, including at DEBUG level.
-- Release-all talk cancellation bypasses full control queues, fences stale grants and held native keys, and preserves explicitly persistent unmute. Newer explicit mute invalidates older queued unmute; targeted revoke cannot cancel a newer grant, and old release-all never replays into new mic ownership.
-- Report native PTT registration and arming separately; rearming needs configured-key release or a distinct trusted portal logical release in the current safety epoch. Saturated supervisor safety admission reaps the child; genuine releases survive bounded Dry/Linux queue overflow.
-- Fail closed on unverifiable portal clocks, including current KDE zero timestamps and mapped events older than 250 ms; delayed first events may also disable native PTT. GUI hold-to-talk remains available independently.
-- Windows PTT preserves original queued press timestamps and rearms only from a non-injected native release of its configured non-modifier key; unavailable polling or releasing one modifier side cannot masquerade as chord release. Registration starts unarmed, and a saturated release queue retains its pending rearm edge without allowing a press through.
+- A newer pairing attempt visibly cancels the older ceremony on both computers; delayed confirmations cannot approve the replacement.
+- CLI pairing rejection and EOF cancellation now exit unsuccessfully, including when the pairing window belongs to an already-running core.
+- Windows CLI launches without a console or redirected output exit with code 69 and a core-log hint instead of starting an invisible operation.
+- Windows settings operations no longer overflow the main-thread stack; audio settings preserve automatic group selection and use trusted computer names.
+- Every TLS connection performs a full handshake and rechecks the pinned peer certificate.
+- Unsupported mandatory peer capabilities are rejected clearly without disrupting compatible older peers.
+- Clipboard grants are bound to the authenticated peer and parent connection; clipboard uses the parent's negotiated protocol version.
+- Normal Listener edits/restarts preserve its group. Automatic Sources follow authenticated group changes; explicit and legacy manual pins remain fixed.
+- Live health updates no longer spuriously invalidate settings, start or volume actions; genuinely stale configuration and consent changes remain rejected.
+- Audio quality degradation no longer masquerades as rebuffering. Source-local health stays separate from remote receiver quality, with observed latency and path diagnostics.
+- Stop, consent withdrawal and connection/worker loss revoke sessions; recovery negotiates fresh sessions rather than replaying old keys.
+- Emergency microphone mute/PTT release survives full control queues. Failed settings writes cannot undo an observed mute; stale activation cannot reopen a released talk grant.
 
-- Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters.
-- Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
-- Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling.
-- Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback tests cover loss/reorder/injection and device invalidation.
-- Both audio endpoints immediately authenticate the UDP path; Listener startup attempts its first challenge before returning, enabling Listener-first commit ordering and stateful outbound firewall state. Media remains gated on validation, with the existing three-attempt/500 ms-window/two-second bounds; a two-sided stateful-firewall relay test verifies recovery and audio flow.
+**Notes**
 
-**Audio worker timing**
-
-- Source and UDP receiver workers wait on lock-free capture/packet notifications and absolute media/control deadlines instead of idle polling. Capture clock hints prefer valid host/QPC timestamps and never use capture device positions, which may remain constant between process-loopback packets.
-- Keep the Source host clock advancing when its capture ring overflows before path validation, preventing a permanently future capture epoch. On Windows, short media deadlines use high-resolution waits instead of coarse park timeouts while long idle waits remain event-driven.
-- Expose bounded drift ratio ppm, filtered fill error, applied coarse-correction count and actual clock authority through private worker Health. Source reports no drift controller; Listener observations survive PI resets.
-- Bound Source inbound work to 64 packets before revisiting shutdown and media/control deadlines, so pinned-peer invalid-tag floods cannot starve pacing or shutdown.
-- Print receiver drift diagnostics and clock authority in the Windows audible E2E example alongside independent capture-clock estimates.
-- Drive Listener drift timing from a valid native playback position/frequency/host snapshot, not callback submission. Preserve a monotonic timeline across fallback and report native queued depth without assuming unknown depth is zero.
-- Discard preactivation capture and flush the live edge once when the UDP path validates, rather than transmitting old ring contents. Regression coverage keeps jitter anchoring on the first authenticated media frame, not control traffic or preactivation timestamps.
-- Keep an uninterrupted transmitted sample grid through capture silence without DTX. Fill uncovered host-time gaps with bounded silence (at most 200 ms), reanchor larger gaps, and report native discontinuity flags separately from actual capture repairs.
-- Expose bounded per-stage latency observations, use 5 ms aggregate mix blocks with a native-callback quantum floor, and bound decoded lane queues. A deterministic wired chirp fixture with a modeled 20 ms native FIFO improves from 86.688 to 81.688 ms without changing jitter profile targets; native hardware timing requires platform verification.
-- Wake the mixer from render consumption and refill a complete native quantum before parking. When safe before the next callback, honor an imminent jitter deadline rather than queueing an extra silent output period.
-- Compare native played/submitted frames from the same stream-zero origin, eliminating phantom startup FIFO depth; recreate that clock on render restart. Dry onset checks retain the wired planning budget and explicitly account for a complete callback quantum plus measured host-scheduler overshoot.
-- Make the Dry scheduling allowance portable: stage sum plus one callback quantum, the greater of measured host overshoot and a Windows 1 ms/Linux 0.1 ms floor, and one sample of onset-search epsilon. Keep the fixed Ethernet stage ceiling separate.
-- Windows render negotiates low-latency shared/event periods through IAudioClient3 with a 5 ms floor and a two-period queue bound. Unsupported/locked configurations retain typed diagnostics and fall back to legacy shared conversion; process-loopback capture semantics are unchanged.
-- Extend Windows audio diagnostics with negotiated periods, explicit audible candidate stress and bounded-memory long E2E runs reporting post-warmup underruns.
-
-**Shared Listener media**
-
-- Mix up to three independently authenticated sessions into one native Listener render stream with stable lanes, per-session gain/mute ramps and aggregate limiting. Queued authorization-subset frames let the realtime callback revoke one input without muting the others, taking locks or allocating.
-- Use one configured UDP port per audio child for all sessions, with one event-driven reader and bounded session-ID/pinned-peer demultiplexing. Unknown and cross-session tuple injections are silent drops; cryptographic counters and replay windows remain session-local.
-
-**Linux audio backend internals**
-
-- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion remains unsupported. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
-
-**Linux MPRIS internals**
-
-- Discover session-bus media players with incarnation-scoped tokens, bounded private metadata, native capability checks, extrapolated timelines and bounded revision-checked command completions. Linux's current-player heuristic selects only the most recently observed Playing player. Opt-in live tests register/control only their own fake player and verify name cleanup.
-
-**Audio child IPC**
-
-- Add a separate private audio-worker protobuf/AudioLink contract with bounded commands, version/generation/sequence checks, explicit backend probing, one-use secret extraction and recursive Debug redaction. Reuse existing same-user IPC endpoints; no samples or secrets enter GUI messages.
-- Add the internal audio child role behind the default-enabled binary `audio` feature. It lazily owns native/Dry backends and at most three authorized UDP sessions, revokes media on core silence/disconnect, rejects reused session/key material, and pushes bounded actual capture/send observations. No native device is opened before an explicit command; core supervises its independent lifetime and generation.
-- Add an explicitly audible Windows audio-child E2E example with same-user named-pipe authorization, encrypted UDP, process-tree exclusion and endpoint-loopback verification of a listener-only tone tail. Diagnostic capture requests 48 kHz stereo conversion without changing endpoint settings.
-
-**Audio process supervision**
-
-- Add an independent core-side audio supervisor with private one-use attach tokens, same-user IPC, bounded correlated commands, heartbeat/watchdog and isolated child containment. Restarted children receive no previous session keys; prior sessions fail and require renegotiation.
-
-**Audio authorization leases**
-
-- Require explicit per-session authorization grants of at most one second, renewed independently of IPC Ping. Expiration gates queued render PCM and outgoing media, stops only the expired session, and cannot be resurrected by a stale renewal.
-- Distinguish native `Started` acknowledgment from `PathValidated`, so the Listener can acknowledge initialization before the Source exists without deadlocking the commit handshake. Supervisor shutdown also has reserved admission during restart/backoff.
-
-**Audio M5/M6 worker contract**
-
-- Add bounded private microphone-mute/PTT and opt-in media-watch/command messages. Metadata is Debug-redacted, command completions are correlated, and lease/timestamp/hotkey validation remains fail-closed.
-- Extend the supervisor with generation-fenced microphone, shortcut and consent-gated media controls and correlated completion events. Separate persistent mute toggles from nonzero-ID remote talk grants, bounded to 250 ms and explicitly revocable; Ping never extends a talk grant.
-
-**Audio M5/M6 child execution**
-
-- Execute owned microphone mute and shortcut observation, and keep persistent toggles separate from independently timed remote talk grants. Grant expiry remutes on a guard-owning thread even while other backend work stalls; native snapshots remain authoritative, pre-muted endpoints refuse grants, and Ping does not renew them.
-- Report failed timed remute writes separately from lease expiry; never present an expired permission as evidence that the physical endpoint is muted.
-- Forward bounded media metadata only during an explicitly enabled authorized Source watch, recheck the current player before commands, and correlate completion/cancellation. The explicit Dry harness has documented deterministic revisioned media; native backends never synthesize it.
-- Register Windows' authoritative current SMTC COM view even when it differs from the enumerated view; preserve exact tokens instead of guessing current identity from application metadata.
-- Exercise child mic/PTT leases over Windows named pipes using Dry targets, native hotkey registration without input, and an explicitly owned SMTC helper for consent-gated play/pause/next acceptance.
-- Pace explicitly pumped Dry child streams from absolute 10 ms deadlines and short high-resolution waits rather than coarse control-channel receive timeouts; native hardware event loops are unchanged.
-
-**Linux M5 native controls**
-
-- Add Wayland GlobalShortcuts portal observation with both edges and 100 ms renewals of 250 ms leases; no binding occurs during availability probes. Missing portals and X11 remain honestly unsupported; X11 release observation is a later agent integration.
-- Add Pulse source mute with explicitly best-effort ownership: one matching change echo within 200 ms is attributable, while differing/late/ambiguous changes relinquish restoration. Owned-null-sink live tests cover set/restore/drop without touching defaults or audible endpoints.
-
-**Audio privacy admission and child lifetime**
-
-- Revoke metadata admission before bounded queueing, and give microphone mute/revoke/release a separate guard-owned priority path. Privacy reductions fence older queued openings; mailbox saturation fails closed and is surfaced as a typed fatal supervisor event.
-- Keep lifetime session/key tombstones intact, but retire the child at a soft 240-start budget before its 256-entry backstop. A typed restart-required outcome triggers bounded recycling; existing sessions fail and require fresh negotiation, never historical key replay.
-- Match pinned IPv6 peers by IP/port, ignoring flow labels and irrelevant global scopes while retaining link-local scope checks. Keep wrong-address/family and cross-session rejection.
-- Replace Source-side peer report snapshots instead of permanently pinning diagnostics to the largest authenticated value; locally measured counters remain independent.
+- Network protocol remains 1/0. Version 0.4.0 peers still share input and clipboard; audio requires capable builds on both computers.
+- Pairing does not grant audio consent. Capture/playback require both sides' permissions; encrypted audio and active-session metadata are never logged or persisted.
+- Configurations containing `[audio]` are not downgrade-safe. Before first adding audio to an existing audio-free config, Bifrost makes a one-time `.pre-audio` backup; restore it or remove audio tables before using an older binary.
+- Audio may need a UDP firewall rule for the configured media port (default 47903). Stateful LAN firewalls often work without one, but the tested network is not a universal traversal guarantee; no rules are added and VPN/AP isolation is not bypassed.
+- Native PTT starts unarmed: release the configured PTT key, then press again. Unverifiable Wayland portal clocks, including current KDE zero timestamps and incompatible Hyprland clocks, leave native PTT unavailable; GUI hold-to-talk remains usable.
+- Microphone mute affects other apps. Linux ownership/restoration is best-effort; **Release all PTT** preserves an independently persistent unmute—use **Mute microphone** to close it.
+- Device buffers, Wi-Fi and Bluetooth add latency; this is not studio-grade monitoring or AEC. Headphones are recommended. Microphone streaming, virtual-microphone routing and macOS remain unavailable.
 
 ### Русский
 
-**Исправления**
-
-- Обновления аудиометрик больше не мешают настройкам, запуску и громкости. Устаревшие изменения конфигурации/разрешений, будущие снимки и возврат A→B→A по-прежнему отклоняются без автоматических повторов.
-- Фиксировать выключение микрофона и отпускание PTT до ограниченной очереди GUI: опрос состояния не продлевает старое удержание при переполнении. Отклонённое устаревшее или занятое включение не отменяет действующее удержание.
-- Сопоставлять подтверждение аварийного отпускания PTT с процессом и запросом, не принимая ответ на команду за доказательство готовности горячей клавиши.
-- Не включать микрофон при откате неудачного сохранения unmute; сохранять аварийное mute при переполнении очереди и безопасное состояние восстановления при ошибке записи.
-- Повторять только временно отклонённое или неподтверждённое аварийное mute Source в том же живом соединении с разрешением: не более 50 попыток за 5 секунд. Окончательный отказ прекращает повторы, не сбрасывая намерение mute; включение и unmute не повторяются.
-- Сохранять подтверждённое выключение микрофона и безопасное состояние восстановления при ошибке записи конфигурации; сообщать об ошибке, не включая микрофон обратно.
-- Сохранять отсутствие, автоматический и ручной режим группы при записи TOML, обмене IPC и изменениях GUI; старые ручные группы Source переживают перезапуск.
-- Нулевые идентификатор или ревизия медиасессии означают недоступную/устаревшую цель, а не выбор текущей: команда дочернему процессу не выполняется, GUI получает служебный код отказа.
-- Отклонять медиакоманды без разрешения до проверки нативной цели; разрешённые команды по-прежнему требуют реальные ненулевые идентификатор и ревизию сессии.
-- Явный отказ от сопряжения в командной строке или отмена через EOF завершаются ошибкой с причиной, в том числе через уже запущенную службу.
-- Новая попытка сопряжения отменяет предыдущую незавершённую сверку SAS на обоих компьютерах. Старые запросы, подтверждения и запоздавшие результаты подключения не могут подтвердить или подменить новую попытку; ограничения окна и числа подключений сохранены. IPC результата сопряжения дополнен идентификатором церемонии и кодом отмены для клиентов с проверкой соответствия.
-- GUI сопоставляет результаты сопряжения с текущей церемонией, в том числе после подтверждения отправки ответа. Запоздавшие подтверждения не закрывают новый код; отмена объясняется по-русски и по-английски вместо показа служебного кода ошибки.
-- Отменённая предыдущая попытка сопряжения показывается нейтральным уведомлением без префикса ошибки. Настройки звука отмечены наушниками, мини-плеер — динамиком; у кнопок боковой панели разные подсказки и доступные имена.
-- Команды CLI Windows без консоли и перенаправленного вывода завершаются с кодом 69 и подсказкой в журнале ядра до начала невидимой процедуры сопряжения; запуск GUI и внутренних дочерних ролей не изменён.
-- Вспомогательное чтение RMS в аудиотестах компилируется только для использующих его Unix-тестов, чтобы проверка Clippy всех целей Windows проходила без предупреждений.
-- Цикл ввода остаётся в отдельном future в куче при завершении аудиосупервизора: переключение обмена буфером больше не переполняет стек главного потока отладочного ядра Windows.
-- Захват звука процессов Windows сохраняет временные метки QPC, но больше не выдаёт позиции внутри пакета за монотонные часы устройства; позиции часов воспроизведения сохранены.
-- Настройки аудио ненавязчиво отмечают текущий приёмник и скрывают отключённое управление микрофоном; окна системного звука показывают доверенное имя компьютера и отдельный значок приложения.
-- Требования Hello обеих сторон проверяются по реализованным возможностям и объявленным предложениям независимо от готовности агента. Отказ совместимости доставляется перед плавным закрытием, повторное подключение откладывается, а ограниченные обновления возможностей не могут отзывать обязательные возможности Hello.
-- Списки возможностей Hello ограничены 64 объявленными и 32 обязательными элементами до проверки включения и повторов.
-- Каналы буфера обмена используют согласованную версию родительского входного соединения при отправке и проверке кадров, сохраняя совместимость при будущих различиях младшей версии протокола.
-- Недоступность необязательного экспорта ключей не прерывает входное соединение; доступ к ключам привязан к текущему поколению менеджера, корни стираются при отказе членства, а вывод возвращает стираемые ключи через закрытый реестр назначений с ограниченным контекстом.
-- Возобновление TLS отключено: каждое рабочее и сопрягающее соединение заново проверяет закреплённый сертификат.
-- Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
-- Исправлено хранение корневого секрета экспорта с закреплённой версией zeroize: сохраняются стабильное размещение в куче и стирание до освобождения памяти.
-- Темп Source больше не зависит от грубого таймера приёма Winsock: общий UDP-приём и уведомления кольца захвата пробуждают обработчики без миллисекундного опроса.
-
 **Новое**
 
-- Необязательные функции могут выводить ключи входного соединения без новой сетевой возможности. Корневой секрет TLS остаётся внутри транспорта, стирается при закрытии или замене родителя и после проверки Hello доступен только через скрывающий секрет, отзываемый интерфейс вывода ключей; потребители проверяют возможности своих функций.
-- Добавлены внутренние контракты аудиобэкенда/Dry, чистых пакетов, защиты от повторов и статуса с проверкой зависимостей: нативные адаптеры не входят в core и стек ввода.
-- Контракт аудиобэкенда дополнен снимками часов/состояния потока, достоверностью временных меток, проверкой конфликтов горячих клавиш и возобновляемыми ограниченными по времени нажатиями PTT.
-- Общий контракт бэкенда и адаптер Windows сохраняют неизвестные состояния воспроизведения и предоставляют выбранный ОС текущий медиасеанс.
-- Добавлены ограниченный локальный аудио-IPC с ревизиями, плеер удалённых потоков по подтверждённому состоянию, двуязычные аудионастройки/выбор устройств и индикаторы приватности/отключение звука/остановка в трее. Метаданные медиасеансов не сохраняются и скрыты в отладочном выводе.
-- Определены ограниченные сообщения управления звуком P1 и доставка с проверкой возможностей и родительского соединения, изолированными отказами аудио и отдельным резервом для Stop.
-- Добавлены отключённые по умолчанию типизированные настройки `[audio]`, явные разрешения по направлениям, стабильный выбор устройств и запись под блокировкой. Версия конфига остаётся 2, но конфиги 0.5.0 с `[audio]` несовместимы со старыми бинарниками: восстановите предыдущую `.pre-audio` либо удалите аудиотаблицы. Для вручную отредактированных аудиоконфигов нужна своя предыдущая копия.
-- Добавлена чистая модель разрешений и аудиосеансов: вклады обеих сторон в nonce/контекст, защита от повтора в рамках родителя, отзыв по поколениям связи и воркера, тайм-ауты и поиск группы Listener. До Commit и запуска Source требуется подтверждение запуска дочернего сеанса Listener.
-- Добавлены ограниченные StartRequest/StartRefusal от Source к Listener с явной корреляцией запросов, защитой от повторов/ограничением частоты на родительском соединении и типизированными отказами разрешений/ёмкости. Первый nonce по-прежнему создаёт Listener, который запускается до Commit; четыре управляющих соединения учитываются отдельно от трёх аудиосеансов.
-- Сохраняется явное включение звука, пока создаётся группа Listener или разрешается выбранный доверенный Listener для Source. Валидаторы конфига и GUI принимают такие ожидающие состояния, не выдавая разрешений и не заявляя об активной передаче.
-- Управление системным звуком подключено к core и запросам GUI/трея: явные двусторонние разрешения, проверенный поиск группы Listener, ключи родительского соединения, отдельный аудиопроцесс, список устройств и локальная громкость/заглушение Listener. Нативный запуск предшествует Commit, Active требует проверки UDP-пути, а отдельные секундные разрешения сеансов истекают независимо от IPC heartbeat. Явное выключение убирает дочерний процесс и медиасокеты.
-- Добавлены проверки звука между изолированными core с детерминированными Dry-процессами: настоящее сопряжение, разрешения и поиск группы, запуск со стороны Source, общий рендер Listener, отказы жизненного цикла и KVM со включённым звуком. Несопряжённый стенд сам завершает процессы и удаляет корни, в том числе в тестах запросов сопряжения. Скрытый Dry-переключатель требует отладочной сборки, dry-ввода и явно заданного тестового корня; рабочий бинарник не читает аудиофлаг окружения тестового стенда.
-- Входные и буферные порты многопроцессного стенда выбираются одним одновременно связанным набором, чтобы ОС не выдала один временный порт двум службам до их запуска.
-- Follow Focus приглушает системные потоки у Listener по подтверждённому фокусу ввода от текущего владельца, включая третий ПК и запрос снимка после переподключения. По умолчанию задержка250мс, огибающая громкости150мс; Preparing/Releasing/Blocked и старый владелец не выбирают новый основной поток. Неизвестный фокус сохраняет прежний основной поток две секунды, затем выравнивает множители с сохранением пользовательской громкости и заглушения. Цель микрофона и системная громкость не меняются; возможность отчёта о фокусе сама по себе не запускает аудиопроцесс.
-- Определены отдельные сетевые возможности управления микрофоном и медиаплеером, строгие ограниченные сообщения с сокрытием метаданных, приоритет заглушения/отпускания и чистые политики PTT с владельцем Listener и разрешений медиасеанса.
-- Предложения и ответы аудиосеансов сверяются с последней ревизией согласия пира. Сохраняется происхождение намерения микрофона: удалённое снятие заглушения отменяется при отзыве разрешения или разрыве и не становится состоянием восстановления; история ушедших родителей очищается с сохранением защиты живых от повтора.
-- Восстанавливается захват владения, заменённый более новым сообщением о локальном владельце, если затем приходит запоздавший отказ со старым серийным номером без корреляции. Новая заявка с большим номером выдерживает прежний полный срок; старые таймеры и завершение освобождения не дают владение досрочно. Обычные отказы и проверка конкурирующего владельца не изменены.
-- Добавлено управление заглушением микрофона и PTT от явно разрешённых участников с единственным владельцем состояния Listener. Постоянное переключение не имеет срока; PTT использует вызовы Listener и короткие разрешения, независимо проверяемые аудиопроцессом. Удержание GUI заканчивается при отпускании, разрыве, блокировке или пропуске существующих heartbeat; конфликты клавиш и недоступные бэкенды возвращают типизированные ошибки. Завершение guard восстанавливает прежнее состояние, не снимая чужое исходное заглушение.
-- Ограниченные медиаданные с сокрытием Debug передаются только внутри активных разрешённых потоков. Команды Listener требуют разрешения Source, актуальных сеанса/токена/ревизии и реального завершения; остановка очищает метаданные. Оценка локальной задержки суммирует неперекрывающиеся стадии, не удваивая джиттер и не подменяя неизвестную глубину устройства нулём.
-- Группа Listener сохраняется при обычных обновлениях GUI и перезапусках; Source автоматически следует группе выбранного аутентифицированного Listener, сохраняя явную фиксацию Advanced. Несовпадение группы сразу возвращает типизированный результат вместо общего тайм-аута запуска.
-- Запуски аудио ограничены по доверенной личности независимо от переподключений; исчерпавшее бюджет поколение заменяется без повтора ключей. Отказ уменьшения доступа к приватным данным считается фатальным; PTT сохраняет заглушённое ожидание при блокировке/перезапуске. Статус передаёт ограниченные наблюдения пути, UDP-порты и отдельные отчёты удалённого приёмника, не принимая ухудшение качества за остановку потока.
+- Необязательная передача системного звука в Windows и Linux: один Listener воспроизводит звук до трёх разрешённых Sources. По умолчанию звук выключен.
+- **Mix All** смешивает источники; **Follow Focus** выделяет компьютер с подтверждённым фокусом ввода и приглушает остальные.
+- Всплывающий мини-плеер показывает текущий трек и время воспроизведения, если плеер источника это поддерживает.
+- Кнопки воспроизведения/паузы, следующего и предыдущего трека требуют отдельного разрешения на каждом источнике; передача звука сама по себе его не даёт.
+- Местные громкость и заглушение каждого источника на Listener, выбор выхода и профили буферизации Ethernet/Wi-Fi.
+- Доверенный Listener выбирается по имени; его аудиогруппа находится автоматически. Ручная фиксация группы остаётся в Advanced.
+- Необязательные системные mute/PTT управляют физическим микрофоном Listener во всех использующих его приложениях. Включение и разрешения задаются отдельно; звук микрофона не передаётся.
 
-**Внутренний аудиотракт**
+**Исправления**
 
-- Общий отзыв разрешений говорить обходит заполненные очереди и сохраняет явное постоянное включение микрофона. Новое mute отменяет старое отложенное unmute; адресный отзыв не отменяет новое разрешение, а старый общий отзыв не применяется к новому владению микрофоном.
-- Регистрация нативной PTT отделена от готовности: нужны отпускание настроенной клавиши либо отдельное доверенное логическое отпускание портала в текущей эпохе защиты. Переполнение защитной очереди супервизора завершает дочерний процесс; реальные отпускания сохраняются при переполнении Dry/Linux.
-- Непроверяемые часы портала, включая нулевые метки текущего KDE и события старше 250 мс, закрывают нативную PTT; задержка первого события тоже может сделать её недоступной. Кнопка «удерживать для разговора» в интерфейсе остаётся независимой.
-- PTT Windows сохраняет исходное время отложенных нажатий и возобновляется только после нативного, неинжектированного отпускания настроенной немодификаторной клавиши; недоступность опроса и отпускание одной стороны модификатора не считаются отпусканием сочетания. Регистрация требует отпускания PTT-клавиши для готовности, а заполненная очередь сохраняет подтверждение без пропуска новых нажатий.
+- Новая попытка сопряжения видимо отменяет старую на обоих компьютерах; запоздавшее подтверждение не может одобрить замену.
+- Отказ от сопряжения в CLI и отмена через EOF завершаются ошибкой, в том числе когда окно сопряжения обслуживает уже запущенная служба.
+- Команды Windows без консоли или перенаправленного вывода завершаются с кодом 69 и подсказкой в журнале вместо невидимой операции.
+- Изменения настроек Windows больше не переполняют стек главного потока; аудионастройки сохраняют автоматическую группу и показывают доверенные имена компьютеров.
+- Каждое TLS-соединение выполняет полное рукопожатие с повторной проверкой закреплённого сертификата.
+- Неподдерживаемые обязательные возможности пира дают понятный отказ, не нарушая соединения с совместимыми старыми версиями.
+- Разрешения буфера привязаны к проверенному пиру и родительскому соединению; канал буфера использует согласованную родителем версию протокола.
+- Обычные изменения и перезапуски Listener сохраняют группу. Автоматический Source следует проверенным изменениям группы; явная и старая ручная фиксация сохраняются.
+- Обновления метрик больше не мешают настройкам, запуску и громкости; действительно устаревшие изменения конфигурации и разрешений отклоняются.
+- Ухудшение качества больше не выдаётся за повторную буферизацию. Местное состояние Source отделено от отчётов приёмника; доступны наблюдаемые задержка и диагностика пути.
+- Остановка, отзыв разрешений и потеря связи/аудиопроцесса закрывают сеансы; восстановление согласует новые, не повторяя старые ключи.
+- Аварийное mute/отпускание PTT действует и при заполненной очереди. Ошибка записи настроек не отменяет подтверждённое mute; устаревшее включение не открывает закрытое разрешение говорить.
 
-- Состояние Listener восстанавливается после возобновления декодированного PCM при потерях Wi-Fi, а не остаётся навсегда ухудшенным; эпизоды повторного буферизования отделены от нативных callback с заполнением тишиной, отчёты удалённого приёмника — от локального состояния Source, а остановившаяся нативная позиция безопасно переключается на резервные часы.
-- Закреплены инварианты исходящего аутентифицированного UDP-запроса Listener до ожидания Source и секундного служебного трафика; Health и завершение по тайм-ауту передают ограниченные наблюдения проверки пути и аутентификации без догадок о виновном брандмауэре.
-- События аудиопроцесса и диагностика проверки пути сохраняются в отдельном ограниченном журнале с ротацией при по-прежнему закрытом stdio; записываются только разрешённые скалярные поля, а трассировка зависимостей не может раскрыть ключи, метаданные воспроизведения или PCM даже на уровне DEBUG.
+**Примечания**
 
-- Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования.
-- Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
-- Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле.
-- Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства.
-- Оба конца аудиосеанса сразу проверяют UDP-путь; Listener пытается отправить первый аутентифицированный запрос до возврата из запуска, позволяя сначала открыть исходящее состояние межсетевого экрана. Медиа остаётся закрытым до проверки пути; сохранены три попытки, окна 500 мс и предел две секунды. Тест с двусторонним stateful-фильтром проверяет восстановление пути и доставку звука.
-
-**Время аудиопроцесса**
-
-- Обработчики Source и UDP-приёма ждут уведомлений захвата/пакетов без блокировок в callback и абсолютных сроков медиа/управления вместо опроса пустых очередей. Часы захвата используют достоверные временные метки host/QPC, а не позиции устройства, которые могут оставаться неизменными между пакетами process-loopback.
-- Часы Source продолжают идти при переполнении кольца захвата до подтверждения пути, не позволяя эпохе захвата навсегда уйти в будущее. В Windows короткие медиадедлайны используют высокоточное ожидание вместо грубого park timeout; длинные ожидания сохраняют пробуждение по событиям.
-- Закрытые сводки Health передают ограниченные ppm ресэмплинга, фильтрованную ошибку наполнения, число применённых грубых коррекций и фактический источник часов. У Source нет ПИ-регулятора дрейфа; счётчик Listener сохраняется при сбросах ПИ.
-- Входящая обработка Source ограничена 64 пакетами перед повторной проверкой остановки и сроков медиа/управления: поток пакетов с неверным тегом от закреплённого адреса не блокирует темп передачи и завершение.
-- Звуковой E2E-пример Windows выводит диагностику дрейфа приёмника и источник часов рядом с независимой оценкой часов захвата.
-- Часы дрейфа Listener используют достоверные нативные позицию воспроизведения, частоту и время host, а не число переданных callback кадров. Переходы на резервные часы сохраняют монотонность; неизвестная глубина нативного буфера не подменяется нулём.
-- Захват до подтверждения UDP-пути отбрасывается, а при активации один раз очищается старый хвост кольца. Регрессионные тесты закрепляют начало джиттера по первому проверенному медиакадру, а не управляющим пакетам и времени до активации.
-- При тишине захвата сохраняется непрерывная временная сетка отправленных кадров без DTX. Непокрытые разрывы времени host заполняются тишиной до 200 мс; большие разрывы переустанавливают опорную точку. Нативные флаги discontinuity учитываются отдельно от реальных исправлений захвата.
-- Добавлены ограниченные наблюдения задержки по стадиям, блоки общего микшера 5 мс с запасом не меньше нативного callback и ограниченные очереди декодированных входов. Детерминированный тест с моделью нативного FIFO 20 мс улучшился с 86,688 до 81,688 мс без изменения профилей джиттера; нативные задержки проверяются на соответствующей платформе.
-- Микшер пробуждается при потреблении выхода и перед ожиданием заполняет весь нативный квант. Если запас до следующего callback позволяет, он ждёт близкий срок джиттера вместо постановки лишнего периода тишины в очередь.
-- Нативные воспроизведённые и переданные кадры сравниваются от общего нуля потока, без фиктивной стартовой глубины FIFO; при перезапуске часы создаются заново. Проверка Dry сохраняет проводной бюджет стадий и явно учитывает квант callback плюс измеренное опоздание планировщика.
-- Допуск Dry переносим между ОС: сумма стадий плюс квант callback, максимум измеренного опоздания и порога Windows 1 мс/Linux 0,1 мс, затем один сэмпл погрешности поиска начала. Фиксированный бюджет проводных стадий проверяется отдельно.
-- Вывод Windows согласует низкую задержку shared/event через IAudioClient3 с нижней границей 5 мс и очередью не более двух периодов. Неподдерживаемые и заблокированные конфигурации возвращаются к прежнему shared-преобразованию с типизированной причиной; семантика EXCLUDE-захвата не меняется.
-- Диагностика Windows дополнена согласованными периодами, явно запускаемой звуковой проверкой кандидатов и длительным E2E с ограниченной памятью и счётчиками underrun после прогрева.
-
-**Общий аудиовыход Listener**
-
-- До трёх независимо проверяемых сеансов микшируются в один нативный поток Listener со стабильными входами, плавной громкостью/заглушением и общим лимитером. Подготовленные варианты разрешённых входов позволяют callback немедленно отключить один источник, не заглушая остальные, без блокировок и выделений памяти.
-- Все сеансы аудиопроцесса используют один настроенный UDP-порт, один событийный поток приёма и ограниченную маршрутизацию по ID сеанса и закреплённому адресу отправителя. Неизвестные и подменённые межсеансовые пакеты молча отбрасываются; криптосчётчики и защита от повторов остаются отдельными для каждого сеанса.
-
-**Внутренний аудиобэкенд Linux**
-
-- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса остаётся неподдерживаемым. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
-
-**Внутренний MPRIS Linux**
-
-- Добавлены обнаружение медиаплееров на шине сеанса, токены отдельных экземпляров, ограниченные приватные метаданные, проверка возможностей, экстраполяция позиции и ограниченные по времени команды с проверкой ревизии. Текущим считается только последний замеченный играющий плеер. Натурный тест включается отдельно, управляет только собственным фиктивным плеером и проверяет освобождение его имени.
-
-**IPC дочернего аудиопроцесса**
-
-- Добавлен отдельный закрытый контракт protobuf/AudioLink аудиопроцесса с ограниченными командами, проверкой версии/поколения/последовательности, явным запросом проверки бэкенда, одноразовым извлечением секретов и скрытием их в Debug. Используются существующие локальные IPC-каналы того же пользователя; сэмплы и секреты не попадают в GUI.
-- Добавлена внутренняя роль дочернего аудиопроцесса под включённой по умолчанию функцией сборки `audio`. Бэкенды native/Dry создаются только по запросу; не более трёх разрешённых UDP-сеансов останавливаются при потере core, повторное использование сеансов/ключей отклоняется, фактические захват/отправка передаются в ограниченных сводках. До явной команды устройства не открываются; core контролирует независимые срок жизни и поколение.
-- Добавлен явно запускаемый звуковой E2E-пример аудиопроцесса Windows: авторизация через локальные named pipes, шифрованный UDP, исключение дерева процесса и проверка тона слушателя через endpoint loopback после остановки источника. Диагностический захват запрашивает преобразование в 48 кГц stereo без изменения настроек устройства.
-
-**Надзор аудиопроцесса**
-
-- Добавлен независимый надзор аудиопроцесса из core: приватные одноразовые токены, локальный IPC того же пользователя, ограниченные коррелированные команды, watchdog и изолированное завершение дочернего процесса. После перезапуска старые ключи не передаются, сеансы завершаются ошибкой и требуют нового согласования.
-
-**Разрешения аудиосеансов**
-
-- Каждый сеанс получает отдельное явное разрешение не более чем на секунду; продление не связано с IPC Ping. Истечение закрывает вывод подготовленного PCM и передачу медиа только этого сеанса; запоздалое продление не восстанавливает его.
-- Нативное подтверждение `Started` отделено от `PathValidated`: Listener подтверждает инициализацию до запуска Source, не блокируя commit. Остановка надзора имеет отдельный канал, доступный и во время перезапуска/backoff.
-
-**Контракт аудиопроцесса M5/M6**
-
-- Добавлены ограниченные закрытые сообщения микрофонного mute/PTT и явно включаемых медиаданных/команд. Метаданные скрыты в Debug, результаты команд связаны с запросами, сроки PTT и сочетания клавиш проверяются с безопасным отказом.
-- Супервизор дополнен управлением микрофоном, PTT и медиаданными с проверкой поколения и связанными результатами. Постоянное переключение mute отделено от удалённых разрешений говорить с ненулевым ID, сроком до 250 мс и явным отзывом; Ping не продлевает разрешение.
-
-**Исполнение M5/M6 в аудиопроцессе**
-
-- Реализованы владение заглушением микрофона и наблюдение PTT; постоянное переключение отделено от удалённых разрешений говорить. Независимый поток guard заглушает по истечении даже при задержке другой работы бэкенда; фактическое состояние подтверждают снимки, изначально заглушённый микрофон отклоняет разрешение, Ping его не продлевает.
-- Ошибка заглушения по таймеру сообщается отдельно от истечения разрешения: истёкший срок не выдаётся за подтверждение фактического mute устройства.
-- Ограниченные медиаданные передаются только при явно включённом наблюдении разрешённого Source; перед командой повторно проверяется текущий плеер, результаты и отмены связаны с запросами. Только явный Dry-режим предоставляет документированный детерминированный медиасеанс с ревизиями.
-- Windows сохраняет авторитетное представление COM текущего SMTC-сеанса, даже если оно отличается от перечисленного представления; токены не подменяются догадкой по метаданным приложения.
-- Проверки микрофонных/PTT-сроков дочернего процесса работают через Windows named pipes с Dry-целями; нативная проверка ограничена регистрацией hotkey без ввода, а play/pause/next и согласие проверяются только на собственном SMTC-плеере.
-- Явно прокачиваемые Dry-потоки дочернего процесса следуют абсолютным срокам 10 мс с коротким высокоточным ожиданием, а не грубому таймауту управляющего канала; нативные аппаратные циклы не меняются.
-
-**Нативное управление Linux M5**
-
-- Добавлено наблюдение обеих границ Wayland GlobalShortcuts с продлением каждые 100 мс срока 250 мс; проверка доступности не создаёт привязку. Отсутствующий портал и X11 явно не поддерживаются; X11 release требует дальнейшей интеграции агента.
-- Заглушение источника Pulse использует явно best-effort владение: допускается одно совпадающее эхо за 200 мс, а отличающееся, позднее или неоднозначное изменение отменяет восстановление. Натурные тесты set/restore/drop используют только собственный null-sink, не трогая defaults и слышимые устройства.
-
-**Приватность аудио и срок жизни процесса**
-
-- Метаданные отзываются до ограниченной очереди, а mute/revoke/release микрофона идут отдельным приоритетным путём guard. Старые запросы открытия блокируются; переполнение закрывает разрешения и передаётся как типизированная фатальная ошибка надзора.
-- История ID/ключей не удаляется; после 240 запусков процесс переинициализируется до жёсткого предела 256. Типизированный запрос перезапуска ограничен бюджетом надзора; сеансы требуют нового согласования без повтора старых ключей.
-- IPv6-пиры сравниваются по IP/порту без flow label и лишнего scope глобальных адресов; scope link-local и запрет чужих адресов/семейств/сеансов сохраняются.
-- Сводки удалённого получателя заменяют предыдущие значения Source, а не навсегда закрепляют максимальные счётчики; местные измерения остаются независимыми.
+- Сетевой протокол остаётся 1/0. С версией 0.4.0 сохраняется обмен вводом и буфером; аудио требует поддерживающие его сборки на обеих сторонах.
+- Сопряжение не даёт аудиоразрешений. Захват и воспроизведение требуют согласия обеих сторон; шифрованный звук и метаданные активного сеанса не записываются в журналы или на диск.
+- Конфиги с `[audio]` несовместимы со старыми бинарниками. Перед первым добавлением аудио в существующий конфиг без аудио создаётся однократная копия `.pre-audio`; восстановите её или удалите аудиотаблицы до отката.
+- Для настроенного медиапорта (по умолчанию 47903) может потребоваться правило UDP. На stateful-LAN часто достаточно исходящего трафика, но проверенная сеть не гарантирует обход любых экранов; правила не добавляются, изоляция VPN/AP не обходится.
+- Нативная PTT сначала не готова: отпустите настроенную PTT-клавишу, затем нажмите снова. Непроверяемые часы Wayland, включая нулевые метки текущего KDE и несовместимые часы Hyprland, делают её недоступной; кнопка разговора в GUI остаётся доступной.
+- Mute микрофона затрагивает другие приложения. В Linux владение и восстановление best-effort; **Сбросить все PTT** сохраняет отдельно заданное постоянное включение — для выключения используйте **Выключить микрофон**.
+- Буферы устройств, Wi-Fi и Bluetooth добавляют задержку; это не студийный мониторинг и не AEC. Рекомендуется гарнитура. Передача микрофона, виртуальный микрофон и macOS не поддерживаются.
 
 ## 0.4.0 — 2026-10-30
 
