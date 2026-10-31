@@ -8,7 +8,7 @@ use audio_model::{
     drift::{CoarseCorrection, DriftController},
     jitter::{InsertError, JitterBuffer, Playout, Profile},
     packet::MAX_PAYLOAD_LEN,
-    status::{AudioHealth, DriftDiagnostics, LatencyDiagnostics},
+    status::{AudioHealth, DriftDiagnostics, LatencyDiagnostics, StreamHealth},
     Header, PacketKind,
 };
 use audioadapter_buffers::direct::InterleavedSlice;
@@ -205,6 +205,17 @@ impl Receiver {
     pub fn health(&self) -> AudioHealth {
         self.jitter.health()
     }
+    /// Current decoding state, independent of cumulative loss and concealment counters.
+    /// A successfully decoded digital-silence frame is just as ready as audible PCM.
+    pub fn playout_health(&self) -> StreamHealth {
+        if self.paused {
+            StreamHealth::Buffering
+        } else if self.concealed > 0 {
+            StreamHealth::Degraded
+        } else {
+            StreamHealth::Ready
+        }
+    }
     pub fn drift_diagnostics(&self) -> DriftDiagnostics {
         DriftDiagnostics {
             ratio_ppm: self.drift.ratio_ppm().round() as i32,
@@ -323,7 +334,7 @@ impl Receiver {
         }
         self.paused = false;
         if self.concealed >= 5760 {
-            self.jitter.reset();
+            self.jitter.rebuffer();
             self.decoder.reset()?;
             self.resampler.reset();
             self.drift.reset(self.render_target);
@@ -392,6 +403,184 @@ mod tests {
     use super::*;
     use crate::crypto::DirectionMaterial;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn continuous_source_grid_recovers_after_concealment_limit_and_burst_loss() {
+        for first_timestamp in [98_765_431, u32::MAX - 137] {
+            for (profile, lost, total) in [
+                (Profile::Ethernet, 12, 240),
+                (Profile::Wifi, 6, 240),
+                (Profile::Wifi, 7, 240),
+                // 131 missing packets among 3,785 sends leaves 3,654 received.
+                (Profile::Wifi, 131, 3785),
+            ] {
+                simulate_burst_recovery(profile, first_timestamp, lost, total);
+            }
+        }
+    }
+
+    fn simulate_burst_recovery(profile: Profile, first_timestamp: u32, lost: u64, total: u64) {
+        let material = || DirectionMaterial::new(Zeroizing::new([42; 32]), Zeroizing::new([12; 4]));
+        let mut sender = Sender::new(
+            profile,
+            Sealer::new(material(), [8; 16], 0).unwrap(),
+            first_timestamp,
+        )
+        .unwrap();
+        let frame = u64::from(profile.frame_samples());
+        let frame_ms = frame / 48;
+        let mut receiver = Receiver::new(
+            profile,
+            Opener::new(material(), [8; 16]).unwrap(),
+            frame as u32,
+        )
+        .unwrap();
+        let mut output = vec![0.0; receiver.output_capacity_samples()];
+        let mut pcm = vec![0.0; frame as usize * 2];
+        let mut packet = [0; 1200];
+        let mut arrivals = Vec::new();
+        let loss_start = 40;
+        for index in 0..total {
+            for (sample, pair) in pcm.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let phase = (index * frame + sample as u64) as f64 * std::f64::consts::TAU * 440.0
+                    / 48_000.0;
+                pair.fill(phase.sin() as f32 * 0.2);
+            }
+            // Encode even dropped packets: Windows keeps advancing the source timestamp.
+            let n = sender.encode(index * frame_ms, &pcm, &mut packet).unwrap();
+            if !(loss_start..loss_start + lost).contains(&index) {
+                let delay = [3, 7, frame_ms + 5, 4, frame_ms / 2][index as usize % 5];
+                arrivals.push((index * frame_ms + delay, packet[..n].to_vec()));
+            }
+        }
+        arrivals.sort_by_key(|(arrival, _)| *arrival);
+        let mut arrivals = arrivals.into_iter().peekable();
+        let resume_ms = (loss_start + lost) * frame_ms;
+        let end_ms = total * frame_ms;
+        let mut next_poll = 0;
+        let mut polls = 0;
+        let mut saw_pause = false;
+        let mut recovered_at = None;
+        let mut tail_frames = 0;
+        let mut tail_energy = 0.0;
+        let mut tail_samples = 0;
+        for ms in 0..end_ms {
+            while arrivals.peek().is_some_and(|(arrival, _)| *arrival <= ms) {
+                let (_, mut packet) = arrivals.next().unwrap();
+                receiver.receive(ms * 48, &mut packet, |_| true).unwrap();
+            }
+            if ms < next_poll {
+                continue;
+            }
+            // Decode polling is independent of both source cadence and packet arrival.
+            next_poll = ms + [1, 3, 2, 7][polls % 4];
+            polls += 1;
+            let n = receiver
+                .playout(ms * 48, frame as f64, &mut output)
+                .unwrap();
+            if ms >= loss_start * frame_ms && ms < resume_ms + 200 {
+                saw_pause |= receiver.paused;
+            }
+            assert!(output[..n * 2].iter().all(|sample| sample.is_finite()));
+            let energy = output[..n * 2]
+                .iter()
+                .map(|sample| f64::from(*sample).powi(2))
+                .sum::<f64>();
+            if ms >= resume_ms
+                && saw_pause
+                && !receiver.paused
+                && energy > 0.01
+                && recovered_at.is_none()
+            {
+                recovered_at = Some(ms);
+            }
+            if ms >= end_ms - 1000 && n != 0 {
+                tail_frames += 1;
+                tail_energy += energy;
+                tail_samples += n * 2;
+            }
+        }
+        let health = receiver.health();
+        assert!(
+            saw_pause,
+            "{profile:?}: concealment must reach the rebuffer path"
+        );
+        let recovery_bound = u64::from(profile.delay_bounds().1) / 48 + frame_ms * 2 + 40;
+        assert!(
+            recovered_at.is_some_and(|ms| ms <= resume_ms + recovery_bound),
+            "{profile:?}, timestamp={first_timestamp}, lost={lost}: recovery={recovered_at:?}"
+        );
+        assert!(!receiver.paused);
+        assert_eq!(receiver.playout_health(), StreamHealth::Ready);
+        assert!(health.underruns >= 1);
+        assert!(receiver.next_playout_deadline().is_some());
+        assert_eq!(health.received_packets, total - lost);
+        assert!(health.lost_frames >= 5760 / frame);
+        assert_eq!(health.concealed_frames, health.lost_frames);
+        assert_eq!(health.late_frames, 0);
+        assert!(health.discontinuities > 0);
+        assert!(health.discontinuities <= 3, "{health:?}");
+        assert!(tail_frames >= 1000 / frame_ms - 2);
+        assert!(tail_samples > 0);
+        assert!((tail_energy / tail_samples as f64).sqrt() > 0.05);
+        assert_eq!(receiver.drift_diagnostics().coarse_corrections, 0);
+    }
+
+    #[test]
+    fn inactivity_resets_decoder_and_resampler_then_reanchors_continuous_source() {
+        let profile = Profile::Wifi;
+        let material = || DirectionMaterial::new(Zeroizing::new([42; 32]), Zeroizing::new([12; 4]));
+        let mut sender = Sender::new(
+            profile,
+            Sealer::new(material(), [8; 16], 0).unwrap(),
+            98_765_431,
+        )
+        .unwrap();
+        let mut receiver =
+            Receiver::new(profile, Opener::new(material(), [8; 16]).unwrap(), 960).unwrap();
+        let mut packet = [0; 1200];
+        let mut output = vec![0.0; receiver.output_capacity_samples()];
+        let pcm: Vec<f32> = (0..1920).map(|i| (i as f32 * 0.03).sin() * 0.2).collect();
+        for index in 0..20 {
+            let now = index * 960;
+            let n = sender.encode(now / 48, &pcm, &mut packet).unwrap();
+            receiver.receive(now, &mut packet[..n], |_| true).unwrap();
+            receiver.playout(now, 960.0, &mut output).unwrap();
+        }
+        assert!(!receiver.paused);
+        // No worker polling during inactivity: force pop's >1s arrival-time branch,
+        // rather than allowing the six-frame concealment path to run first.
+        for index in 20..80 {
+            sender.encode(index * 20, &pcm, &mut packet).unwrap();
+        }
+        assert_eq!(receiver.playout(80 * 960, 960.0, &mut output).unwrap(), 0);
+        assert!(receiver.paused && receiver.fade_in);
+        assert_eq!(receiver.concealed, 0);
+        assert_eq!(receiver.next_playout_deadline(), None);
+        assert_eq!(receiver.drift_diagnostics().ratio_ppm, 0);
+        let health = receiver.health();
+        assert_eq!(health.underruns, 1);
+        assert_eq!(health.discontinuities, 1);
+        assert_eq!(health.lost_frames, 0);
+        let mut audible = 0;
+        for index in 80..100 {
+            let now = index * 960;
+            let n = sender.encode(now / 48, &pcm, &mut packet).unwrap();
+            receiver.receive(now, &mut packet[..n], |_| true).unwrap();
+            let n = receiver.playout(now, 960.0, &mut output).unwrap();
+            if n != 0 {
+                assert!(output[..n * 2].iter().all(|sample| sample.is_finite()));
+                audible += usize::from(output[..n * 2].iter().any(|sample| sample.abs() > 0.01));
+            }
+        }
+        assert!(audible >= 14);
+        assert!(!receiver.paused && !receiver.fade_in);
+        assert_eq!(receiver.playout_health(), StreamHealth::Ready);
+        assert_eq!(receiver.health().received_packets, 40);
+        assert_eq!(receiver.health().lost_frames, 0);
+        assert_eq!(receiver.health().discontinuities, 1);
+        assert_eq!(receiver.health().underruns, 1);
+    }
 
     #[test]
     fn authenticated_controls_do_not_anchor_first_media_or_inflate_jitter() {

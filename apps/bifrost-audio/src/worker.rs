@@ -773,6 +773,15 @@ where
                         native_render_buffer_us: snapshot.latency.native_render_buffer_us,
                     }),
                     native_discontinuity_flags: snapshot.native_discontinuity_flags,
+                    jitter_rebuffers: snapshot.jitter_rebuffers,
+                    render_underruns: snapshot.render_underruns,
+                    remote_receiver_quality: snapshot.remote_receiver_quality.map(|quality| {
+                        w::RemoteReceiverQuality {
+                            received_packets: quality.received_packets,
+                            lost_frames: quality.lost_frames,
+                            late_frames: quality.late_frames,
+                        }
+                    }),
                 }
             })
             .collect();

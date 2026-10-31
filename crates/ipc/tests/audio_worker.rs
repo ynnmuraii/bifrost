@@ -248,6 +248,13 @@ fn pages_health_and_generation_are_bounded() {
             clock_source: 0,
             latency: None,
             native_discontinuity_flags: 0,
+            jitter_rebuffers: 2,
+            render_underruns: 3,
+            remote_receiver_quality: Some(w::RemoteReceiverQuality {
+                received_packets: 3654,
+                lost_frames: 131,
+                late_frames: 0,
+            }),
         }],
     }));
     health.request_id = 0;

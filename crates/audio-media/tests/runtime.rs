@@ -257,6 +257,7 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
     let mut mute_set = false;
     let mut unmute_set = false;
     let mut injection_done = false;
+    let mut recovered_after_loss = false;
     while start.elapsed() < Duration::from_millis(2400) {
         let elapsed = start.elapsed();
         if elapsed >= Duration::from_millis(900) && !gain_set {
@@ -345,6 +346,9 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
                 _ => {}
             }
         }
+        let current = listener.snapshot();
+        recovered_after_loss |= current.health.lost_frames > 0
+            && current.state == audio_model::status::StreamHealth::Ready;
         thread::sleep(Duration::from_millis(1));
     }
     let source_health = source.snapshot();
@@ -356,7 +360,20 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
         assert!(relay.stateful_dropped.load(Ordering::Relaxed) > 0);
     }
     assert!(listener_health.health.received_packets > 50);
-    assert!(source_health.health.received_packets > 30);
+    assert!(source_health
+        .remote_receiver_quality
+        .is_some_and(|quality| quality.received_packets > 30));
+    assert_eq!(source_health.health.received_packets, 0);
+    assert_eq!(
+        listener_health.health.underruns,
+        listener_health.jitter_rebuffers + listener_health.render_underruns
+    );
+    if loss {
+        assert!(
+            recovered_after_loss,
+            "valid PCM must recover current health after loss"
+        );
+    }
     assert!(listener_health.rejected_datagrams >= 16);
     assert!(listener_health.health.lost_frames < 40);
     assert!(loud.rms() > 0.08);

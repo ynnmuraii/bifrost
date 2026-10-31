@@ -78,6 +78,12 @@ pub enum MediaEvent {
 pub struct HealthSnapshot {
     pub health: AudioHealth,
     pub state: StreamHealth,
+    /// Jitter-buffer rebuffer episodes; excludes native callback starvation.
+    pub jitter_rebuffers: u64,
+    /// Native callbacks requiring zero-fill, not a count of missing PCM frames.
+    pub render_underruns: u64,
+    /// Authenticated peer observations, never local Source playout state.
+    pub remote_receiver_quality: Option<RemoteReceiverQuality>,
     pub sent_datagrams: u64,
     pub sent_media_packets: u64,
     pub capture_active: bool,
@@ -91,6 +97,12 @@ pub struct HealthSnapshot {
     /// Worker loop entries, including notifications and deadline wakes; not native callbacks.
     pub worker_wakeups: u64,
     pub native: StreamSnapshot,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteReceiverQuality {
+    pub received_packets: u64,
+    pub lost_frames: u64,
+    pub late_frames: u64,
 }
 #[derive(Debug)]
 pub enum EngineError {
@@ -133,14 +145,16 @@ struct Stats {
     rejected: u64,
     drift: Option<DriftDiagnostics>,
     latency: LatencyDiagnostics,
+    remote_receiver_quality: Option<RemoteReceiverQuality>,
 }
 impl Stats {
     fn receive_source_report(&mut self, payload: &[u8]) {
         if let Some(report) = ReceiverReport::decode(payload) {
-            // Source-side receive/loss/late values are remote snapshots, not local counters.
-            self.health.received_packets = report.received;
-            self.health.lost_frames = report.lost;
-            self.health.late_frames = report.late;
+            self.remote_receiver_quality = Some(RemoteReceiverQuality {
+                received_packets: report.received,
+                lost_frames: report.lost,
+                late_frames: report.late,
+            });
         }
     }
 }
@@ -230,6 +244,7 @@ impl Shared {
                 rejected: 0,
                 drift: None,
                 latency: LatencyDiagnostics::default(),
+                remote_receiver_quality: None,
             }),
         }
     }
@@ -299,6 +314,16 @@ impl Shared {
     fn degraded(&self, events: &SyncSender<MediaEvent>) {
         lock(&self.stats).state = StreamHealth::Degraded;
         if !self.degraded.swap(true, Ordering::AcqRel) {
+            let _ = events.try_send(MediaEvent::Degraded);
+        }
+    }
+    fn publish_playout_health(&self, state: StreamHealth, events: &SyncSender<MediaEvent>) {
+        lock(&self.stats).state = state;
+        if state == StreamHealth::Ready {
+            self.degraded.store(false, Ordering::Release);
+        } else if self.started.load(Ordering::Acquire)
+            && !self.degraded.swap(true, Ordering::AcqRel)
+        {
             let _ = events.try_send(MediaEvent::Degraded);
         }
     }
@@ -423,6 +448,9 @@ impl<S: Stream + 'static> MediaSession<S> {
         HealthSnapshot {
             health,
             state: stats.state,
+            jitter_rebuffers: stats.health.underruns,
+            render_underruns: self.shared.callback_underruns.load(Ordering::Acquire),
+            remote_receiver_quality: stats.remote_receiver_quality,
             sent_datagrams: stats.sent,
             sent_media_packets: media,
             capture_active: self.source
@@ -577,7 +605,8 @@ impl RenderClock {
                 let monotonic = self.previous_native.is_none_or(|last| position >= last)
                     && self.previous_host.is_none_or(|last| host >= last);
                 if monotonic {
-                    if self.previous_host != Some(host) || self.previous_native != Some(position) {
+                    // A fresh host stamp alone does not prove playback made progress.
+                    if self.previous_native != Some(position) {
                         self.changed_at = Some(now);
                     }
                     self.previous_host = Some(host);
@@ -1396,13 +1425,12 @@ mod path_tests {
         };
         stats.receive_source_report(&extreme.encode());
         assert_eq!(
-            stats.health,
-            AudioHealth {
+            stats.remote_receiver_quality,
+            Some(RemoteReceiverQuality {
                 received_packets: u64::MAX,
                 lost_frames: u64::MAX,
                 late_frames: u64::MAX,
-                ..local_health
-            },
+            }),
         );
         let normal = ReceiverReport {
             received: 100,
@@ -1412,20 +1440,48 @@ mod path_tests {
             buffer_samples: 5,
         };
         stats.receive_source_report(&normal.encode());
-        let expected = AudioHealth {
+        let expected = Some(RemoteReceiverQuality {
             received_packets: 100,
             lost_frames: 2,
             late_frames: 3,
-            ..local_health
-        };
-        assert_eq!(stats.health, expected);
+        });
+        assert_eq!(stats.remote_receiver_quality, expected);
         // A malformed report cannot erase the last valid snapshot.
         stats.receive_source_report(&[0; ReceiverReport::LEN - 1]);
-        assert_eq!(stats.health, expected);
+        assert_eq!(stats.remote_receiver_quality, expected);
+        assert_eq!(stats.health, local_health);
         assert_eq!(stats.sent, 11);
         assert_eq!(stats.rejected, 12);
         assert_eq!(stats.state, StreamHealth::Degraded);
         assert_eq!(stats.latency.packetization_us, 10_000);
+    }
+
+    #[test]
+    fn valid_playout_recovers_health_without_erasing_loss_or_rebuffer_counters() {
+        let shared = Shared::new(Arc::new(AtomicBool::new(true)));
+        let (events, received) = mpsc::sync_channel(8);
+        shared.started(&events);
+        assert_eq!(received.try_recv().unwrap(), MediaEvent::Started);
+        {
+            let mut stats = lock(&shared.stats);
+            stats.health.lost_frames = 131;
+            stats.health.concealed_frames = 131;
+            stats.health.underruns = 2;
+        }
+        for state in [StreamHealth::Degraded, StreamHealth::Buffering] {
+            shared.publish_playout_health(state, &events);
+            assert_eq!(lock(&shared.stats).state, state);
+        }
+        assert_eq!(received.try_recv().unwrap(), MediaEvent::Degraded);
+        assert!(received.try_recv().is_err());
+        shared.publish_playout_health(StreamHealth::Ready, &events);
+        let stats = *lock(&shared.stats);
+        assert_eq!(stats.state, StreamHealth::Ready);
+        assert_eq!(stats.health.lost_frames, 131);
+        assert_eq!(stats.health.concealed_frames, 131);
+        assert_eq!(stats.health.underruns, 2);
+        shared.publish_playout_health(StreamHealth::Degraded, &events);
+        assert_eq!(received.try_recv().unwrap(), MediaEvent::Degraded);
     }
 
     #[test]
@@ -1500,6 +1556,56 @@ mod path_tests {
                 .observe(snapshot, 15240, now + Duration::from_millis(180))
                 .1,
             ClockSource::RenderCallbackFrames
+        );
+    }
+
+    #[test]
+    fn render_clock_falls_back_when_only_native_host_time_advances() {
+        let now = Instant::now();
+        let mut snapshot = StreamSnapshot {
+            status: StreamStatus::Running,
+            device_position: Some(960),
+            clock_frequency: Some(48_000),
+            host_time_100ns: Some(200_000),
+            underrun_frames: 0,
+            dropped_capture_frames: 0,
+        };
+        let mut clock = RenderClock::default();
+        assert_eq!(
+            clock.observe(snapshot, 2880, now).1,
+            ClockSource::RenderDevicePosition
+        );
+        // Pulse can answer fresh timing queries without advancing its read offset.
+        for elapsed_ms in [50, 100, 150, 200] {
+            snapshot.host_time_100ns = Some(200_000 + elapsed_ms * 10_000);
+            let (played, source, _) = clock.observe(
+                snapshot,
+                2880 + elapsed_ms * 48,
+                now + Duration::from_millis(elapsed_ms),
+            );
+            if elapsed_ms < 100 {
+                assert_eq!(source, ClockSource::RenderDevicePosition);
+            } else {
+                assert_eq!(source, ClockSource::RenderCallbackFrames);
+                assert_eq!(played, (elapsed_ms - 100) * 48);
+            }
+        }
+        // Recovery adopts the callback epoch instead of replaying the native gap.
+        snapshot.device_position = Some(10560);
+        snapshot.host_time_100ns = Some(2_300_000);
+        assert_eq!(
+            clock
+                .observe(snapshot, 12960, now + Duration::from_millis(210))
+                .0,
+            4800
+        );
+        snapshot.device_position = Some(11040);
+        snapshot.host_time_100ns = Some(2_400_000);
+        assert_eq!(
+            clock
+                .observe(snapshot, 13440, now + Duration::from_millis(220))
+                .0,
+            5280
         );
     }
 

@@ -27,6 +27,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Audio media internals**
 
+- Recover Listener health when valid decoded PCM resumes after Wi-Fi loss instead of retaining a permanent degraded label; distinguish jitter rebuffer episodes from native zero-fill callbacks, keep peer receiver quality separate from local Source state, and fall back safely when a native render position stops advancing.
+
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
 - Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling.
@@ -126,6 +128,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлены ограниченный локальный аудио-IPC с ревизиями, плеер удалённых потоков по подтверждённому состоянию, двуязычные аудионастройки/выбор устройств и индикаторы приватности/отключение звука/остановка в трее. До реализации обработчиков в службе управление честно показывает недоступность; изменение не запускает захват или передачу аудио. Метаданные медиасеансов не сохраняются и скрыты в отладочном выводе.
 
 **Внутренний аудиотракт**
+
+- Состояние Listener восстанавливается после возобновления декодированного PCM при потерях Wi-Fi, а не остаётся навсегда ухудшенным; эпизоды повторного буферизования отделены от нативных callback с заполнением тишиной, отчёты удалённого приёмника — от локального состояния Source, а остановившаяся нативная позиция безопасно переключается на резервные часы.
 
 - Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования. Аудиоустройства и сетевые сеансы не активируются.
 - Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.

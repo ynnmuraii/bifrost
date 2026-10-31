@@ -419,13 +419,15 @@ fn mix_loop(
                 shared.clock_source.load(Ordering::Acquire),
                 Ordering::Release,
             );
-            input.shared.callback_underruns.store(
-                shared
-                    .callback_underruns
-                    .load(Ordering::Acquire)
-                    .saturating_sub(input.callback_underrun_base),
-                Ordering::Release,
-            );
+            let render_underruns = shared
+                .callback_underruns
+                .load(Ordering::Acquire)
+                .saturating_sub(input.callback_underrun_base);
+            let new_render_underrun = input
+                .shared
+                .callback_underruns
+                .swap(render_underruns, Ordering::AcqRel)
+                < render_underruns;
             if input.shared.is_stopped() {
                 input.shared.finish(&input.events);
                 inputs.slots[slot] = None;
@@ -439,9 +441,9 @@ fn mix_loop(
             } else {
                 Ok(0)
             };
+            let mut overflow = false;
             match result {
                 Ok(n) => {
-                    let mut overflow = false;
                     if let Some(converter) = input.converter.as_mut() {
                         for &sample in &input.decoded[..n * 2] {
                             input.staging[input.staged] = sample;
@@ -465,14 +467,12 @@ fn mix_loop(
                     } else {
                         overflow = true;
                     }
-                    if overflow {
-                        input.shared.degraded(&input.events);
-                    }
                 }
                 Err(error) => input.shared.request_stop(media_reason(error)),
             }
             let receiver = lock(&input.receiver);
             let health = receiver.health();
+            let mut state = receiver.playout_health();
             let drift = receiver.drift_diagnostics();
             let mut latency = receiver.latency_diagnostics();
             if input.queue.len() < block * 2 {
@@ -503,18 +503,19 @@ fn mix_loop(
             latency.native_render_buffer_us = lock(&shared.stats).latency.native_render_buffer_us;
             drop(receiver);
             let mut stats = lock(&input.shared.stats);
-            let lost = health.lost_frames > stats.health.lost_frames;
             stats.health = health;
             stats.drift = Some(drift);
             stats.latency = latency;
             drop(stats);
-            if lost
-                || input.shared.started.load(Ordering::Acquire)
-                    && input.start.elapsed().as_millis() as u64
-                        > input.shared.last_media_ms.load(Ordering::Acquire) + 1000
+            if input.shared.started.load(Ordering::Acquire)
+                && input.start.elapsed().as_millis() as u64
+                    > input.shared.last_media_ms.load(Ordering::Acquire) + 1000
             {
-                input.shared.degraded(&input.events);
+                state = StreamHealth::Buffering;
+            } else if overflow || new_render_underrun && state == StreamHealth::Ready {
+                state = StreamHealth::Degraded;
             }
+            input.shared.publish_playout_health(state, &input.events);
         }
         if let Some(deadline) = next_decode.filter(|_| shared.native_render_now().is_some()) {
             let now_ns = shared.clock.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
