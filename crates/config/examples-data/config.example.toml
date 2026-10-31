@@ -131,8 +131,13 @@ enabled = false
 role = "source"                     # off (по умолчанию) | source | listener
 # Выберите доверенный приёмник в GUI; ID — 64 hex, не имя/IP и не разрешение.
 listener_node_id = "1111111111111111111111111111111111111111111111111111111111111111"
-# group_id отсутствует: группа задаётся приёмником и подтверждается по доверенной связи.
-# Ручной Advanced override: 32 hex; не придумывайте новый ID для источника.
+# group_id отсутствует: группа задаётся выбранным приёмником по доверенной связи.
+# Сохранённый авторазрешённый group_id не фиксирует группу: приёмник может её обновить.
+# group_id_override = false          # по умолчанию false: следовать выбранному Listener
+# Ручная фиксация — только Source Advanced: измените group_id_override выше на true
+# и задайте group_id (32 hex), например:
+# group_id = "00112233445566778899aabbccddeeff"
+# Один сохранённый group_id без явного override не означает ручную фиксацию.
 media_port = 47903                  # UDP 1..65535, кроме discovery 47902; 0 запрещён
 # В stateful LAN обычно достаточно исходящих проб после закреплённого TCP-соединения.
 # Это не обход брандмауэра/AP/VPN. При неудачной проверке пути разрешите этот UDP-порт
@@ -157,24 +162,29 @@ background_gain_db = -18.0          # конечное число -60..0; при
 background_mute = false
 
 [audio.microphone]
-control_enabled = false             # отдельное согласие, не разрешение на передачу звука
+control_enabled = false             # отдельное согласие на mute/PTT, не передачу звука
 streaming_enabled = false           # true отклоняется: передача микрофона отложена
 experimental_acknowledged = false
 capture_device = { kind = "follow_default", role = "multimedia" }
 # Для коммуникационного default явно задайте role = "communications".
+# Только Listener управляет своим физическим микрофоном; Source пересылает команды.
+# Для удалённого управления нужны control_enabled и разрешение Source на Listener.
 allow_default_mic_changes = false
 virtual_device = ""                 # виртуальная маршрутизация отложена; оставьте пустым
 muted = true                        # предпочтение, не снимок состояния ОС
 ptt_enabled = false
-ptt_hotkey = ""                      # при ptt_enabled=true нужен явный допустимый hotkey
+ptt_hotkey = ""                      # при ptt_enabled=true: пусто — GUI PTT, hotkey — глобальная
 # pinned_target_node_id отсутствует: зависимый выбор микрофонной цели/UX отложен.
 # Не задавайте его для виртуальной маршрутизации.
 
 # Пример записи — раскомментировать только после выбора роли и доверенного пира.
 # Источник может дать media-control только своему единственному Listener; по умолчанию false.
+# Listener разрешает Source управлять своим микрофоном через allow_mic_control.
+# Медиа- и микрофонные разрешения независимы и по умолчанию выключены.
 # gain_percent/muted — местные настройки Listener; для Source оставьте 100/false.
 # [[audio.peers]]
 # node_id = "1111111111111111111111111111111111111111111111111111111111111111"
 # allow_media_control = false
+# allow_mic_control = false          # только Listener, для доверенного Source
 # gain_percent = 100                 # целое 0..100
 # muted = false

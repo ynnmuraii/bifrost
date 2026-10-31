@@ -18,7 +18,7 @@ Bifrost is a software KVM: share one keyboard, mouse and text clipboard—and, o
 - Edge glow to show where input is going.
 - Shared **text** clipboard with history, follow-cursor/broadcast policies and **Send to…**; separately opt-in **PNG images on Windows, X11 and KDE Wayland (data-control)** (images are never kept in history; no files).
 - Optional **shared audio**: one headset on a Listener, with system sound from authorized Sources; mix all sources or follow input focus.
-- A popup audio mini-player with local per-source volume and mute. Remote media-control permission is separate and off by default.
+- A popup audio mini-player with now-playing information, local per-source volume/mute and separately permitted media buttons; optional system-wide mute/PTT control of the Listener's physical microphone.
 - Game mode guards against accidental edge switches in fullscreen apps; manual mode is available on Wayland.
 - Configurable switching hotkeys and an emergency release shortcut.
 - Russian and English, light and dark themes.
@@ -106,7 +106,8 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 ## Shared audio
 
 One headset on a single **Listener**, system sound from up to three authorized **Sources**. **Mix All** plays them together; **Follow Focus** makes the focused computer primary and quietens the others. Audio is off by default.
-The popup mini-player provides local per-source volume and mute. Per-peer remote media-control permission is separate and off by default.
+The popup mini-player shows now-playing information and media buttons where the player supports them, plus local per-source volume/mute. Each Source separately permits its Listener's media commands; this is off by default.
+Optional system-wide mic mute/PTT controls the Listener's physical microphone, affecting all apps using it. Enable it separately on both computers and grant each controlling Source permission on the Listener; microphone control is off by default, and no microphone audio is streamed.
 
 1. Use the same audio-capable build on both computers, pair them, and keep both cores running.
 2. On the headset computer, open **Audio settings → Use this computer as the listener**, choose its output, apply, then enable audio.
@@ -114,25 +115,27 @@ The popup mini-player provides local per-source volume and mute. Per-peer remote
 4. Allow sending on the Source and receiving on the Listener, apply, then **Start system audio** from the Source.
 
 **Firewall:** usually no extra UDP rule is needed on stateful LAN firewalls after the pinned TCP link; TCP 47901 must be reachable in at least one direction. If path validation fails, allow UDP 47903 from the Source's LAN address on the Listener (or `audio.media_port`). No rules are added automatically; Windows Firewall, AP/client isolation and VPN restrictions are not bypassed.
-**Privacy:** pairing alone grants no audio permission. Bilateral consent gates capture and playback; ChaCha20-Poly1305 session keys come from the pinned mutual-TLS link. Audio payloads and session keys are never logged or persisted.
+**Privacy:** pairing alone grants no audio permission. Bilateral consent gates capture and playback; ChaCha20-Poly1305 session keys come from the pinned mutual-TLS link. Now-playing metadata is shared only within active consented sessions; metadata, audio payloads and session keys are never logged or persisted.
 
 | Platform | Audio backend |
 | --- | --- |
-| Windows 11 | WASAPI process-loopback excludes the audio worker's own process tree. |
-| Linux | PipeWire/PulseAudio through the local Pulse protocol; monitor capture and playback, without per-process exclusion. |
+| Windows 11 | WASAPI process-loopback excludes the audio worker's own process tree; native media/mic/PTT controls where available. |
+| Linux | Local PipeWire/PulseAudio monitor capture/playback, without process exclusion; MPRIS media sessions; mic-mute ownership is best-effort. |
+| Wayland global PTT | Requires a compatible KDE/GNOME GlobalShortcuts portal with press/release events; unavailable when the portal is missing, including GNOME 46. |
+| X11 PTT | No native global PTT; focused GUI PTT remains available without a global hotkey. |
 
 - **Latency:** device buffers affect delay; Wi-Fi uses more buffering and Bluetooth can add substantial latency. Prefer a wired LAN when delay matters.
 - **No microphone streaming or virtual microphone yet:** a Listener's headset mic does not appear on a Source; dependent microphone-target routing/UX is also deferred.
-- **No macOS or AEC; no native global X11 PTT:** headphones are recommended to avoid acoustic feedback. See the [commented configuration example](crates/config/examples-data/config.example.toml) for defaults and downgrade precautions.
+- **No macOS or AEC:** headphones are recommended to avoid acoustic feedback. See the [commented configuration example](crates/config/examples-data/config.example.toml) for defaults and downgrade precautions.
 
 ## Platform support
 
 | Platform | Input sharing | Shared audio |
 | --- | --- | --- |
-| Windows 11 | Capture and receive input | WASAPI system audio; excludes the audio worker's own process tree |
-| Linux X11 | Capture and receive input | Pulse-compatible monitor capture/playback; no native global X11 PTT |
-| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible monitor capture/playback |
-| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible monitor capture/playback |
+| Windows 11 | Capture and receive input | WASAPI system audio; process-tree exclusion and native media/mic/PTT controls where available |
+| Linux X11 | Capture and receive input | Pulse-compatible monitor audio/MPRIS; focused GUI PTT, not native global X11 PTT |
+| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible audio/MPRIS; global PTT requires a compatible GlobalShortcuts portal |
+| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible audio/MPRIS; global PTT only where the portal exists, not GNOME 46 |
 | wlroots-based Wayland desktops | Not supported | Not a supported Bifrost desktop |
 | macOS | Not supported | Not supported |
 
@@ -145,6 +148,7 @@ The popup mini-player provides local per-source volume and mute. Per-peer remote
 - Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
 - Shared audio is off by default and requires explicit permissions on both computers; pairing does not grant audio consent. A Source selects one Listener.
 - Linux monitor capture cannot exclude individual applications. Microphone streaming, virtual-microphone routing and dependent target UX are deferred; native global X11 PTT is unsupported.
+- Endpoint mute affects every app using that microphone. Linux mute restoration has best-effort ownership, not an atomic guarantee against other mute writers; Linux global PTT needs a compatible Wayland portal with both press and release events.
 - Audio includes driver/device buffering and is not a hard-realtime or studio-monitoring link. Wi-Fi and Bluetooth can add delay; there is no AEC, so headphones are recommended.
 
 ## Build from source
