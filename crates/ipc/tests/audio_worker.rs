@@ -244,12 +244,65 @@ fn pages_health_and_generation_are_bounded() {
             capture_active: Some(false),
             sending: Some(true),
             sent_media_packets: 1,
+            drift: None,
+            clock_source: 0,
         }],
     }));
     health.request_id = 0;
     assert!(contract::validate_frame(&health).is_ok());
     health.worker_generation = 0;
     assert!(contract::validate_frame(&health).is_err());
+}
+#[test]
+fn drift_health_validates_numeric_bounds_and_clock_codes() {
+    let session = w::SessionHealth {
+        session_id: vec![1; 16],
+        counters: Some(w::AudioHealth::default()),
+        state: 2,
+        ..Default::default()
+    };
+    let valid = |session| {
+        let mut message = frame(Msg::Health(w::Health {
+            sessions: vec![session],
+        }));
+        message.request_id = 0;
+        contract::validate_frame(&message).is_ok()
+    };
+    assert!(valid(session.clone()));
+    for clock_source in 0..=4 {
+        for (ratio_ppm, error) in [(-5000, -48_000.0), (5000, 48_000.0), (0, 0.0)] {
+            let mut session = session.clone();
+            session.clock_source = clock_source;
+            session.drift = Some(w::DriftDiagnostics {
+                ratio_ppm,
+                filtered_fill_error_frames: error,
+                coarse_corrections: u64::MAX,
+            });
+            assert!(valid(session));
+        }
+    }
+    for clock_source in [-1, 5, i32::MAX] {
+        let mut session = session.clone();
+        session.clock_source = clock_source;
+        assert!(!valid(session));
+    }
+    for (ratio_ppm, error) in [
+        (-5001, 0.0),
+        (5001, 0.0),
+        (0, -48_000.1),
+        (0, 48_000.1),
+        (0, f64::NAN),
+        (0, f64::INFINITY),
+        (0, f64::NEG_INFINITY),
+    ] {
+        let mut session = session.clone();
+        session.drift = Some(w::DriftDiagnostics {
+            ratio_ppm,
+            filtered_fill_error_frames: error,
+            coarse_corrections: 0,
+        });
+        assert!(!valid(session));
+    }
 }
 #[tokio::test]
 async fn link_roundtrip_extracts_single_use_secrets_and_binds_generation() {

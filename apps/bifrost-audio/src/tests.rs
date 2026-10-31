@@ -305,8 +305,22 @@ mod local {
                     renew(&mut listener.core,13,1000).await;
                     serial+=1;
                 },
-                frame=source.core.recv()=>{if let Some(Msg::Health(health))=frame.unwrap().frame.msg {source_active|=health.sessions.iter().any(|session|session.capture_active==Some(true)&&session.sending==Some(true)&&session.sent_media_packets>0);}},
-                frame=listener.core.recv()=>{if let Some(Msg::Health(health))=frame.unwrap().frame.msg {listener_received|=health.sessions.iter().any(|session|session.counters.as_ref().unwrap().received_packets>0&&session.capture_active==Some(false));}},
+                frame=source.core.recv()=>{if let Some(Msg::Health(health))=frame.unwrap().frame.msg {
+                    for session in &health.sessions {
+                        assert!(session.drift.is_none());
+                        if session.capture_active == Some(true) {
+                            assert!(matches!(session.clock_source, 1 | 2));
+                        }
+                    }
+                    source_active|=health.sessions.iter().any(|session|session.capture_active==Some(true)&&session.sending==Some(true)&&session.sent_media_packets>0);
+                }},
+                frame=listener.core.recv()=>{if let Some(Msg::Health(health))=frame.unwrap().frame.msg {
+                    listener_received|=health.sessions.iter().any(|session|
+                        session.counters.as_ref().unwrap().received_packets>0
+                            && session.capture_active==Some(false)
+                            && session.drift.is_some()
+                            && matches!(session.clock_source, 3 | 4));
+                }},
             }
         }
         (source_active, listener_received)
@@ -516,6 +530,15 @@ mod local {
             .unwrap()
             .received_packets
             > 10));
+        for session in &health.sessions {
+            let drift = session
+                .drift
+                .as_ref()
+                .expect("shared playout diagnostics reach child Health");
+            assert!((-1000..=1000).contains(&drift.ratio_ppm));
+            assert!(drift.filtered_fill_error_frames.is_finite());
+            assert!(matches!(session.clock_source, 3 | 4));
+        }
         // Three session-local native streams would pump three times per owner tick.
         let pumped = listener.observed.pumps.load(Ordering::Relaxed) - pumps;
         assert!((100..220).contains(&pumped), "render pumps: {pumped}");

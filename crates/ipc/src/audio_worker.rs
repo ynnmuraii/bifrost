@@ -442,6 +442,12 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 session_id(&session.session_id)?;
                 if session.counters.is_none()
                     || !matches!(session.state, 1..=3)
+                    || !matches!(session.clock_source, 0..=4)
+                    || session.drift.as_ref().is_some_and(|drift| {
+                        !(-5000..=5000).contains(&drift.ratio_ppm)
+                            || !drift.filtered_fill_error_frames.is_finite()
+                            || drift.filtered_fill_error_frames.abs() > 48_000.0
+                    })
                     || health.sessions[..index]
                         .iter()
                         .any(|other| other.session_id == session.session_id)

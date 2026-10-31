@@ -583,6 +583,12 @@ where
                     capture_active: Some(snapshot.capture_active),
                     sending: Some(snapshot.sending),
                     sent_media_packets: snapshot.sent_media_packets,
+                    drift: snapshot.drift.map(|drift| w::DriftDiagnostics {
+                        ratio_ppm: drift.ratio_ppm,
+                        filtered_fill_error_frames: drift.filtered_fill_error_frames,
+                        coarse_corrections: drift.coarse_corrections,
+                    }),
+                    clock_source: i32::from(snapshot.clock_source as u8),
                 }
             })
             .collect();

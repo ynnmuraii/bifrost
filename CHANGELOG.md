@@ -37,6 +37,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Audio worker timing**
 
 - Source and UDP receiver workers wait on lock-free capture/packet notifications and absolute media/control deadlines instead of idle polling. Capture clock hints prefer valid host/QPC timestamps and never use capture device positions, which may remain constant between process-loopback packets.
+- Expose bounded drift ratio ppm, filtered fill error, applied coarse-correction count and actual clock authority through private worker Health. Source reports no drift controller; Listener observations survive PI resets.
 
 **Shared Listener media**
 
@@ -99,6 +100,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Время аудиопроцесса**
 
 - Обработчики Source и UDP-приёма ждут уведомлений захвата/пакетов без блокировок в callback и абсолютных сроков медиа/управления вместо опроса пустых очередей. Часы захвата используют достоверные временные метки host/QPC, а не позиции устройства, которые могут оставаться неизменными между пакетами process-loopback.
+- Закрытые сводки Health передают ограниченные ppm ресэмплинга, фильтрованную ошибку наполнения, число применённых грубых коррекций и фактический источник часов. У Source нет ПИ-регулятора дрейфа; счётчик Listener сохраняется при сбросах ПИ.
 
 **Общий аудиовыход Listener**
 

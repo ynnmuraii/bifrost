@@ -1,6 +1,7 @@
 //! One native output, independently authenticated receivers, and an off-RT summing worker.
 use super::*;
 use crate::mixer::{Mixer, MAX_INPUTS};
+use audio_model::status::ClockSource;
 use rtrb::Producer;
 use std::{collections::VecDeque, sync::OnceLock};
 
@@ -118,10 +119,16 @@ impl<S: Stream + 'static> ListenerGroup<S> {
                     + (output.len() / 2) as u64;
                 let rate = callback_shared.native_rate.load(Ordering::Acquire);
                 if rate > 0 {
-                    callback_shared.render_clock.fetch_max(
-                        total.saturating_mul(48_000) / u64::from(rate),
-                        Ordering::AcqRel,
-                    );
+                    let clock = total.saturating_mul(48_000) / u64::from(rate);
+                    if callback_shared
+                        .render_clock
+                        .fetch_max(clock, Ordering::AcqRel)
+                        < clock
+                    {
+                        callback_shared
+                            .clock_source
+                            .store(ClockSource::RenderCallbackFrames as u8, Ordering::Release);
+                    }
                 }
             }),
         )?;
@@ -171,6 +178,10 @@ impl<S: Stream + 'static> ListenerGroup<S> {
         for input in inputs.slots.iter().flatten() {
             input.shared.render_clock.store(
                 self.output.shared.render_clock.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            input.shared.clock_source.store(
+                self.output.shared.clock_source.load(Ordering::Acquire),
                 Ordering::Release,
             );
             if self.output.shared.is_stopped() {
@@ -357,6 +368,10 @@ fn mix_loop(
                 continue;
             };
             input.shared.render_clock.store(now, Ordering::Release);
+            input.shared.clock_source.store(
+                shared.clock_source.load(Ordering::Acquire),
+                Ordering::Release,
+            );
             input.shared.callback_underruns.store(
                 shared
                     .callback_underruns
@@ -404,10 +419,14 @@ fn mix_loop(
                 }
                 Err(error) => input.shared.request_stop(media_reason(error)),
             }
-            let health = lock(&input.receiver).health();
+            let receiver = lock(&input.receiver);
+            let health = receiver.health();
+            let drift = receiver.drift_diagnostics();
+            drop(receiver);
             let mut stats = lock(&input.shared.stats);
             let lost = health.lost_frames > stats.health.lost_frames;
             stats.health = health;
+            stats.drift = Some(drift);
             drop(stats);
             if lost
                 || input.shared.started.load(Ordering::Acquire)
@@ -534,6 +553,10 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(
+            ClockSource::from_code(group.output.shared.clock_source.load(Ordering::Acquire)),
+            ClockSource::Unknown,
+        );
         let mut stream = group.output.stream.take().unwrap();
         let guard = lock(&group.inputs);
         let (tx, rx) = mpsc::sync_channel(1);
@@ -545,6 +568,10 @@ mod tests {
         drop(guard);
         let (result, stream) = result.expect("callback waited for the mixing lock");
         result.unwrap();
+        assert_eq!(
+            ClockSource::from_code(group.output.shared.clock_source.load(Ordering::Acquire)),
+            ClockSource::RenderCallbackFrames,
+        );
         group.output.stream = Some(stream);
         callback.join().unwrap();
         group.stop().unwrap();
