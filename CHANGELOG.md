@@ -24,6 +24,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Preserve unknown native playback states and expose the OS-selected current media-session token in the shared backend contract and Windows adapter.
 - Add bounded revisioned local audio IPC, an authoritative remote-audio popup, bilingual audio settings/device selection and tray privacy/mute/stop controls. Audio controls report unavailable until a core implements the audio handlers; this change does not activate audio capture or transport. Media metadata is transient and redacted from debug output.
 - Define bounded P1 audio control messages and capability-gated, parent-bound transport delivery with isolated audio refusal and reserved Stop capacity. No core audio coordinator or native capture is enabled.
+- Add opt-in typed `[audio]` preferences, explicit directional consent, stable device selection and locked updates. Config version stays 2, but 0.5.0 configs containing `[audio]` are not downgrade-safe: restore the one-time `.pre-audio` copy made before adding audio to an audio-free config, or remove the audio tables. Hand-edited audio configs need their own earlier backup. No audio is started.
 
 **Audio media internals**
 
@@ -61,6 +62,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Общий контракт бэкенда и адаптер Windows сохраняют неизвестные состояния воспроизведения и предоставляют выбранный ОС текущий медиасеанс.
 - Добавлены ограниченный локальный аудио-IPC с ревизиями, плеер удалённых потоков по подтверждённому состоянию, двуязычные аудионастройки/выбор устройств и индикаторы приватности/отключение звука/остановка в трее. До реализации обработчиков в службе управление честно показывает недоступность; изменение не запускает захват или передачу аудио. Метаданные медиасеансов не сохраняются и скрыты в отладочном выводе.
 - Определены ограниченные сообщения управления звуком P1 и доставка с проверкой возможностей и родительского соединения, изолированными отказами аудио и отдельным резервом для Stop. Координатор core и нативный захват не включаются.
+- Добавлены отключённые по умолчанию типизированные настройки `[audio]`, явные разрешения по направлениям, стабильный выбор устройств и запись под блокировкой. Версия конфига остаётся 2, но конфиги 0.5.0 с `[audio]` несовместимы со старыми бинарниками: восстановите однократную копию `.pre-audio`, созданную перед добавлением аудионастроек, либо удалите аудиотаблицы. Для вручную отредактированных аудиоконфигов нужна своя предыдущая копия. Аудио не запускается.
 
 **Внутренний аудиотракт**
 

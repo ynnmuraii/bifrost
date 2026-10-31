@@ -71,6 +71,40 @@ fn save_atomic_before_replace(
     Ok(())
 }
 
+/// Preserve only an actual pre-audio document, never an already audio-bearing file.
+pub(crate) fn preserve_pre_audio(path: &Path) -> Result<(), ConfigError> {
+    let backup = suffixed(path, ".pre-audio");
+    if backup.exists() || !path.exists() {
+        return Ok(());
+    }
+    let contents = fs::read_to_string(path).map_err(|source| io_error(path, source))?;
+    let document: toml::Value =
+        toml::from_str(&contents).map_err(|source| ConfigError::Parse { source })?;
+    if document.get("audio").is_some() {
+        return Ok(());
+    }
+    let temporary = suffixed(path, ".pre-audio.tmp");
+    let result = (|| {
+        fs::copy(path, &temporary)?;
+        fs::File::options()
+            .write(true)
+            .open(&temporary)?
+            .sync_all()?;
+        // hard_link is an atomic create-if-absent publication on both platforms.
+        match fs::hard_link(&temporary, &backup) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = fs::remove_file(&temporary);
+    result.map_err(|source| io_error(&backup, source))?;
+    if let Some(directory) = path.parent() {
+        sync_directory(directory);
+    }
+    Ok(())
+}
+
 fn write_synced(path: &Path, contents: &str) -> Result<(), ConfigError> {
     let mut file = fs::File::create(path).map_err(|source| io_error(path, source))?;
     file.write_all(contents.as_bytes())

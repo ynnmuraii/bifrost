@@ -218,6 +218,9 @@ pub struct Config {
     /// `[clipboard]`.
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    /// Explicit opt-in audio preferences; omitted until configured.
+    #[serde(default, skip_serializing_if = "crate::audio::AudioConfig::is_default")]
+    pub audio: crate::audio::AudioConfig,
     /// `[ui]`.
     #[serde(default)]
     pub ui: UiConfig,
@@ -251,6 +254,7 @@ impl Default for Config {
             timing: TimingConfig::default(),
             input: InputConfig::default(),
             clipboard: ClipboardConfig::default(),
+            audio: crate::audio::AudioConfig::default(),
             ui: UiConfig::default(),
             appearance: AppearanceConfig::default(),
             game_guard: crate::game_guard::GameGuardConfig::default(),
@@ -418,6 +422,7 @@ impl Config {
         self.timing.validate()?;
         self.input.validate()?;
         self.clipboard.validate()?;
+        self.audio.validate()?;
         self.log.validate()?;
         self.topology.validate()?;
         Ok(())
@@ -429,9 +434,19 @@ impl Config {
     }
 
     /// Serialize and write atomically (temp file, fsync, rename, `.bak`).
+    ///
+    /// The first non-default audio save preserves an existing audio-free document
+    /// as `.pre-audio`, without replacing an existing backup. A manually authored
+    /// audio-bearing file has no pre-audio image: downgrade requires explicitly
+    /// restoring an older document or removing all audio tables.
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), ConfigError> {
         let text = self.to_toml()?;
-        crate::save_atomic(path.as_ref(), &text)
+        let path = path.as_ref();
+        // Locked writers keep preservation inside their read/modify/write lock.
+        if !self.audio.is_default() {
+            crate::save::preserve_pre_audio(path)?;
+        }
+        crate::save_atomic(path, &text)
     }
 
     /// The documented file locations for the current user.

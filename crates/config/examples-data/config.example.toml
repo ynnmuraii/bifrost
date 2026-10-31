@@ -116,3 +116,49 @@ id = "a-right-to-b-left"
 from = { node = "peer:9c1e…", display = "eDP-1", edge = "right", start = 0, end = 1080 }
 to   = { node = "peer:4f70…", display = "eDP-1", edge = "left", start = 0, end = 1080 }
 bidirectional = true
+
+# Optional audio: pairing alone grants no audio permission. No devices/sockets
+# are activated by this disabled, unresolved Source selection.
+# Downgrade: older binaries reject [audio]. Restore config.toml.pre-audio or
+# remove all audio tables before downgrade; .bak rotates and is not that backup.
+[audio]
+enabled = false
+role = "source"                     # off (default) | source | listener
+# Select a trusted computer by name in GUI; this example ID is not permission.
+listener_node_id = "1111111111111111111111111111111111111111111111111111111111111111"
+# group_id intentionally absent: authenticated Listener setup resolves it.
+# Manual 32-hex group IDs belong only in an Advanced override.
+media_port = 47903                  # UDP, 1..65535 except discovery 47902
+profile = "auto"                    # auto | ethernet | wifi
+mode = "mix_all"                    # mix_all | follow_focus
+allow_send_to = []                  # explicit Source -> selected Listener consent
+allow_system_audio_from = []        # explicit Listener <- Source consent, max 3
+peers = []                          # no per-peer media control consent
+output_device = { kind = "follow_default", role = "multimedia" }
+# Stable selection: { kind = "stable_id", id = "<opaque native endpoint ID>" }
+output_fallback_to_default = false  # disappearance does not permit rerouting
+capture_device = { kind = "default_monitor" }
+resume_system_audio = false
+focus_debounce_ms = 250             # load clamps 100..2000 with a warning
+focus_ramp_ms = 150                 # load clamps 20..1000 with a warning
+background_gain_db = -18            # load clamps -60..0 with a warning
+background_mute = false
+
+[audio.microphone]
+control_enabled = false
+streaming_enabled = false          # true rejected while streaming is deferred
+experimental_acknowledged = false
+capture_device = { kind = "follow_default", role = "communications" }
+allow_default_mic_changes = false
+virtual_device = ""
+muted = true
+ptt_enabled = false
+ptt_hotkey = ""
+# pinned_target_node_id is absent; selecting a target never grants consent.
+
+# Listener-local gain/mute (0..100); Source media control permission is separate.
+# [[audio.peers]]
+# node_id = "<trusted 64-hex ID>"
+# allow_media_control = false
+# gain_percent = 100
+# muted = false

@@ -18,6 +18,10 @@
 //!   carries its `CONFIG_*` code ([`ErrorCode`]).
 //! * [`save_atomic`] — temp file, `fsync`, rename, `.bak`, as required by
 //!   «Правила записи».
+//!   [`Config::save`] preserves a one-time `.pre-audio` copy before adding audio
+//!   preferences to an existing audio-free config; generic byte writes do not.
+//! * [`audio`] — native-free typed audio preferences and locked persistence;
+//!   activation authorization always belongs to the runtime caller.
 //! * [`first_run`] — the `config.toml` the first `bifrost-core run` writes when there
 //!   is none, and the LAN-address chooser `bifrost-gui` drives from its settings
 //!   screen.
@@ -33,9 +37,9 @@
 //!   with `"self"` / `"peer:<hex>"` node references resolved against a local
 //!   node id.
 //!
-//! The loadable copy of the example is
-//! `crates/config/examples-data/config.example.toml`, byte-identical to
-//! `docs/config.example.toml` (which is git-ignored); keep the two in sync.
+//! The loadable shipped example is
+//! `crates/config/examples-data/config.example.toml`, including audio consent
+//! defaults and the pre-audio backup/downgrade policy.
 //!
 //! # Deliberate boundaries
 //!
@@ -57,6 +61,7 @@
 //!   Unix `getifaddrs`) to choose a `listen_address`, and creates the
 //!   configuration directory itself, `0700` on Unix.
 
+pub mod audio;
 pub mod cli;
 pub mod error;
 pub mod first_run;
@@ -71,6 +76,11 @@ pub mod save;
 pub mod schema;
 pub mod topology;
 
+pub use audio::{
+    save_audio_locked, AudioConfig, AudioDeviceSelector, AudioGroupId, AudioMicrophoneConfig,
+    AudioMode, AudioNodeId, AudioPeerConfig, AudioProfile, AudioRole, DefaultDeviceRole, HexId,
+    SystemCaptureSelector,
+};
 pub use cli::{CliPaths, Taken, PATH_FLAGS};
 pub use error::{ConfigError, ErrorCode};
 pub use first_run::{
