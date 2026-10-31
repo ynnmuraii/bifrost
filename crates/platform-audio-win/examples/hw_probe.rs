@@ -1,9 +1,12 @@
-//! Explicitly audible diagnostic; never run as part of cargo test.
+//! Explicit native diagnostic; --timing initializes streams without starting or playing them.
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use audio_backend::{Backend, Stream};
     use platform_audio_win::stream::*;
     use std::{thread, time::Duration};
+    if std::env::args().nth(1).as_deref() == Some("--timing") {
+        return timing();
+    }
     let mut backend = platform_audio_win::WindowsBackend::new()?;
     let fixed = audio_backend::AudioFormat {
         sample_rate: SAMPLE_RATE,
@@ -127,6 +130,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err("FAIL capture/render thresholds".into())
     }
+}
+
+#[cfg(windows)]
+fn timing() -> Result<(), Box<dyn std::error::Error>> {
+    use wasapi::{
+        AudioClient, DeviceEnumerator, Direction, Role, SampleType, StreamMode, WaveFormat,
+    };
+    wasapi::initialize_mta().ok()?;
+    struct Com;
+    impl Drop for Com {
+        fn drop(&mut self) {
+            wasapi::deinitialize();
+        }
+    }
+    let _com = Com;
+    let format = WaveFormat::new(32, 32, &SampleType::Float, 48_000, 2, None);
+    let device = DeviceEnumerator::new()?
+        .get_default_device_for_role(&Direction::Render, &Role::Multimedia)?;
+    let mut capture = AudioClient::new_application_loopback_client(std::process::id(), false)?;
+    capture.initialize_client(
+        &format,
+        &Direction::Capture,
+        &StreamMode::EventsShared {
+            autoconvert: true,
+            buffer_duration_hns: 0,
+        },
+    )?;
+    let raw = capture.as_iaudioclient();
+    println!(
+        "TIMING process_capture buffer_frames={} period={:?} stream_latency_hns={:?}",
+        unsafe { raw.GetBufferSize()? },
+        capture.get_device_period(),
+        unsafe { raw.GetStreamLatency() }
+    );
+    for duration in [0, 100_000] {
+        let mut client = device.get_iaudioclient()?;
+        let period = client.get_device_period()?;
+        client.initialize_client(
+            &format,
+            &Direction::Render,
+            &StreamMode::EventsShared {
+                autoconvert: true,
+                buffer_duration_hns: duration,
+            },
+        )?;
+        let raw = client.as_iaudioclient();
+        println!("TIMING render requested_duration_hns={duration} buffer_frames={} default_period_hns={} minimum_period_hns={} stream_latency_hns={}", unsafe { raw.GetBufferSize()? }, period.0, period.1, unsafe { raw.GetStreamLatency()? });
+    }
+    println!("PASS timing-only: no stream started, no endpoint settings changed");
+    Ok(())
 }
 #[cfg(not(windows))]
 fn main() {
