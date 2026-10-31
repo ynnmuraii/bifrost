@@ -90,9 +90,6 @@ fn request_accept_requires_both_sas_decisions_before_trust() {
             .contains(peer));
     }
     print_evidence(&two);
-    let dir = two.dir.clone();
-    drop(two);
-    std::fs::remove_dir_all(dir).expect("clean isolated roots");
 }
 
 #[test]
@@ -125,9 +122,6 @@ fn decline_and_cancel_never_open_a_trust_ceremony() {
         assert!(!trust.contains("[[peers]]"));
     }
     print_evidence(&two);
-    let dir = two.dir.clone();
-    drop(two);
-    std::fs::remove_dir_all(dir).expect("clean isolated roots");
 }
 
 #[test]
@@ -145,9 +139,6 @@ fn cancelling_the_wait_dismisses_the_remote_prompt() {
     two.b.ctl("pair-request-cancel").expect("cancel");
     wait_line(&two.a, "pair-request-prompt", "none");
     assert_eq!(two.b.ctl("pair-request-status").unwrap(), "OK cancelled");
-    let dir = two.dir.clone();
-    drop(two);
-    std::fs::remove_dir_all(dir).expect("clean isolated roots");
 }
 
 #[test]
@@ -170,7 +161,4 @@ fn disabled_request_policy_survives_restart_and_refuses_without_prompt() {
         .unwrap();
     wait_line(&two.b, "pair-request-status", "disabled");
     assert_eq!(two.a.ctl("pair-request-prompt").unwrap(), "OK none");
-    let dir = two.dir.clone();
-    drop(two);
-    std::fs::remove_dir_all(dir).expect("clean isolated roots");
 }
