@@ -1,6 +1,6 @@
 use ipc::{
-    audio_worker::{self as contract, AudioLink},
     Framed,
+    audio_worker::{self as contract, AudioLink},
 };
 use prost::Message;
 use protocol::audio_worker::{self as w, audio_frame::Msg};
@@ -246,6 +246,7 @@ fn pages_health_and_generation_are_bounded() {
             sent_media_packets: 1,
             drift: None,
             clock_source: 0,
+            native_discontinuity_flags: 0,
         }],
     }));
     health.request_id = 0;
@@ -328,10 +329,12 @@ async fn link_roundtrip_extracts_single_use_secrets_and_binds_generation() {
     assert_eq!(&*key, &[167; 32]);
     assert_eq!(&*prefix, &[9; 4]);
     assert_eq!(child.generation(), Some(7));
-    assert!(child
-        .send(0, Msg::Ping(w::Ping { serial: 1 }))
-        .await
-        .is_err());
+    assert!(
+        child
+            .send(0, Msg::Ping(w::Ping { serial: 1 }))
+            .await
+            .is_err()
+    );
     core.send(
         3,
         Msg::RenewSession(w::RenewSession {
@@ -347,16 +350,18 @@ async fn link_roundtrip_extracts_single_use_secrets_and_binds_generation() {
     assert!(
         matches!(received.frame.msg, Some(Msg::RenewSession(renew)) if renew.session_id == vec![3; 16] && renew.ttl_ms == 1000)
     );
-    assert!(child
-        .send(
-            4,
-            Msg::RenewSession(w::RenewSession {
-                session_id: vec![3; 16],
-                ttl_ms: 1000,
-            }),
-        )
-        .await
-        .is_err());
+    assert!(
+        child
+            .send(
+                4,
+                Msg::RenewSession(w::RenewSession {
+                    session_id: vec![3; 16],
+                    ttl_ms: 1000,
+                }),
+            )
+            .await
+            .is_err()
+    );
 }
 #[tokio::test]
 async fn invalid_frames_do_not_advance_sequence() {

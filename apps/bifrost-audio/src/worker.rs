@@ -5,7 +5,7 @@ use audio_media::{
     socket::MediaSocket,
 };
 use audio_model::{jitter::Profile, status::StreamHealth};
-use ring::digest::{digest, SHA256};
+use ring::digest::{SHA256, digest};
 use std::{
     net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket},
     sync::mpsc::{Receiver, RecvTimeoutError},
@@ -589,6 +589,7 @@ where
                         coarse_corrections: drift.coarse_corrections,
                     }),
                     clock_source: i32::from(snapshot.clock_source as u8),
+                    native_discontinuity_flags: snapshot.native_discontinuity_flags,
                 }
             })
             .collect();

@@ -43,6 +43,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Print receiver drift diagnostics and clock authority in the Windows audible E2E example alongside independent capture-clock estimates.
 - Drive Listener drift timing from a valid native playback position/frequency/host snapshot, not callback submission. Preserve a monotonic timeline across fallback and report native queued depth without assuming unknown depth is zero.
 - Discard preactivation capture and flush the live edge once when the UDP path validates, rather than transmitting old ring contents. Regression coverage keeps jitter anchoring on the first authenticated media frame, not control traffic or preactivation timestamps.
+- Keep an uninterrupted transmitted sample grid through capture silence without DTX. Fill uncovered host-time gaps with bounded silence (at most 200 ms), reanchor larger gaps, and report native discontinuity flags separately from actual capture repairs.
 
 **Shared Listener media**
 
@@ -115,6 +116,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Звуковой E2E-пример Windows выводит диагностику дрейфа приёмника и источник часов рядом с независимой оценкой часов захвата.
 - Часы дрейфа Listener используют достоверные нативные позицию воспроизведения, частоту и время host, а не число переданных callback кадров. Переходы на резервные часы сохраняют монотонность; неизвестная глубина нативного буфера не подменяется нулём.
 - Захват до подтверждения UDP-пути отбрасывается, а при активации один раз очищается старый хвост кольца. Регрессионные тесты закрепляют начало джиттера по первому проверенному медиакадру, а не управляющим пакетам и времени до активации.
+- При тишине захвата сохраняется непрерывная временная сетка отправленных кадров без DTX. Непокрытые разрывы времени host заполняются тишиной до 200 мс; большие разрывы переустанавливают опорную точку. Нативные флаги discontinuity учитываются отдельно от реальных исправлений захвата.
 
 **Общий аудиовыход Listener**
 

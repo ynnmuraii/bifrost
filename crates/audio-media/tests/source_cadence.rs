@@ -29,7 +29,7 @@ fn source_keeps_100_fps_when_control_peer_is_silent() {
 }
 
 #[test]
-fn source_recovers_after_capture_overflow_before_path_validation() {
+fn source_discards_capture_before_path_validation() {
     exercise(Duration::from_millis(500));
 }
 
@@ -123,8 +123,8 @@ fn exercise(reply_after: Duration) {
     source.stop().unwrap();
     assert!(stop_start.elapsed() < Duration::from_millis(200));
     assert!(
-        idle_wakes <= 4,
-        "empty capture ring kept waking: {idle_wakes}"
+        (15..=25).contains(&idle_wakes),
+        "silence synthesis should wake at media deadlines, not poll: {idle_wakes}"
     );
     let wake_rate = health.worker_wakeups as f64 / (warmup + duration).as_secs_f64();
     let polling_start = Instant::now();
@@ -146,14 +146,10 @@ fn exercise(reply_after: Duration) {
         (99.0..=101.0).contains(&fps),
         "control starvation changed media cadence: {fps} fps"
     );
-    if reply_after.is_zero() {
-        assert_eq!(health.capture_dropped_frames, 0);
-    } else {
-        assert!(
-            health.capture_dropped_frames > 0,
-            "fixture must overflow before validation"
-        );
-    }
+    assert_eq!(
+        health.capture_dropped_frames, 0,
+        "preactivation capture was retained"
+    );
     assert_eq!(
         timestamp_last.wrapping_sub(timestamp_first.unwrap()),
         (measured - 1) as u32 * 480,

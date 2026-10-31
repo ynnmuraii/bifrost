@@ -230,3 +230,60 @@ fn hostile_input_does_not_starve_source_pacing_or_stop() {
     );
 }
 
+#[test]
+fn silent_capture_keeps_media_grid_and_resumes_without_a_burst() {
+    let mut f = Fixture::new();
+    let start = Instant::now();
+    while f.token.is_empty() {
+        f.drain();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(1));
+    }
+    f.validate();
+    let measured = Instant::now();
+    let mut bytes = [0; MAX_DATAGRAM_LEN];
+    let mut previous = None;
+    let mut silent_packets = 0;
+    let mut resumed_packets = 0;
+    let mut capture_due = Duration::from_millis(1100);
+    let mut first_received = None;
+    while measured.elapsed() < Duration::from_millis(1350) {
+        if measured.elapsed() >= capture_due {
+            f.capture();
+            capture_due += FRAME;
+        }
+        while let Ok((n, _)) = f.peer.recv_from(&mut bytes) {
+            let (header, _) = f.opener.open(&mut bytes[..n], |_| true).unwrap();
+            if header.kind != PacketKind::Opus {
+                continue;
+            }
+            if let Some(previous) = previous {
+                assert_eq!(header.media_timestamp - previous, 480);
+            } else {
+                assert_eq!(header.media_timestamp, 0);
+                first_received = Some(measured.elapsed());
+            }
+            previous = Some(header.media_timestamp);
+            if measured.elapsed() < Duration::from_millis(1100) {
+                silent_packets += 1;
+            } else {
+                resumed_packets += 1;
+            }
+        }
+        thread::sleep(Duration::from_micros(250));
+    }
+    let health = f.source.snapshot();
+    f.source.stop().unwrap();
+    assert!(first_received.is_some_and(|delay| delay <= FRAME));
+    assert!(
+        silent_packets >= 100,
+        "silence stopped UDP: {silent_packets}"
+    );
+    assert!(
+        (20..=28).contains(&resumed_packets),
+        "resume burst/stall: {resumed_packets}"
+    );
+    assert_eq!(health.health.discontinuities, 0);
+    assert_eq!(health.health.lost_frames, 0);
+    assert_eq!(health.health.late_frames, 0);
+}

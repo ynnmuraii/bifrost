@@ -8,7 +8,7 @@ use audio_model::{
     drift::{CoarseCorrection, DriftController},
     jitter::{InsertError, JitterBuffer, Playout, Profile},
     packet::MAX_PAYLOAD_LEN,
-    status::{AudioHealth, DriftDiagnostics},
+    status::{AudioHealth, DriftDiagnostics, LatencyDiagnostics},
     Header, PacketKind,
 };
 use audioadapter_buffers::direct::InterleavedSlice;
@@ -56,6 +56,13 @@ impl Sender {
             encoded: [0; MAX_PAYLOAD_LEN],
         })
     }
+    /// Algorithmic delay queried from the configured Opus encoder, not a profile estimate.
+    pub fn codec_lookahead_us(&mut self) -> Result<u32, MediaError> {
+        Ok(
+            (u64::from(self.encoder.lookahead_samples()?) * 1_000_000 / 48_000).min(2_000_000)
+                as u32,
+        )
+    }
     /// One caller-paced frame. A failed send is never retried by this layer.
     pub fn encode(
         &mut self,
@@ -76,14 +83,6 @@ impl Sender {
             &self.encoded[..n],
             datagram,
         )?)
-    }
-    pub(crate) fn skip_frame(&mut self) {
-        self.skip_frames(1);
-    }
-    pub(crate) fn skip_frames(&mut self, count: u64) {
-        self.timestamp = self
-            .timestamp
-            .wrapping_add(count.wrapping_mul(u64::from(self.profile.frame_samples())) as u32);
     }
     /// Control/probes share the same owned nonce counter as media packets.
     pub(crate) fn control(
@@ -211,6 +210,19 @@ impl Receiver {
             ratio_ppm: self.drift.ratio_ppm().round() as i32,
             filtered_fill_error_frames: self.drift.filtered_fill_error_frames(),
             coarse_corrections: self.coarse_corrections,
+        }
+    }
+    /// Encoded media and interpolation delay only; caller-owned PCM queues are separate.
+    /// Jitter storage overlaps its scheduling target and must not be added to it.
+    pub fn latency_diagnostics(&self) -> LatencyDiagnostics {
+        LatencyDiagnostics {
+            jitter_target_us: (u64::from(self.jitter.target_samples()) * 1_000_000 / 48_000)
+                .min(2_000_000) as u32,
+            jitter_buffer_us: (u64::from(self.jitter.buffered_samples()) * 1_000_000 / 48_000)
+                .min(2_000_000) as u32,
+            resampler_delay_us: (self.resampler.output_delay() as u64 * 1_000_000 / 48_000)
+                .min(2_000_000) as u32,
+            ..LatencyDiagnostics::default()
         }
     }
     pub fn target_delay_samples(&self) -> u32 {
@@ -377,6 +389,51 @@ mod tests {
     use super::*;
     use crate::crypto::DirectionMaterial;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn authenticated_controls_do_not_anchor_first_media_or_inflate_jitter() {
+        let material = || DirectionMaterial::new(Zeroizing::new([42; 32]), Zeroizing::new([12; 4]));
+        let mut sender = Sender::new(
+            Profile::Ethernet,
+            Sealer::new(material(), [8; 16], 0).unwrap(),
+            98_765_431,
+        )
+        .unwrap();
+        let mut receiver = Receiver::new(
+            Profile::Ethernet,
+            Opener::new(material(), [8; 16]).unwrap(),
+            480,
+        )
+        .unwrap();
+        let mut packet = [0; 1200];
+        let mut output = vec![0.0; receiver.output_capacity_samples()];
+        for ms in (0..500).step_by(10) {
+            let n = sender
+                .control(ms, PacketKind::Keepalive, &[1], &mut packet)
+                .unwrap();
+            receiver
+                .receive(ms * 48, &mut packet[..n], |_| true)
+                .unwrap();
+            assert_eq!(receiver.playout(ms * 48, 0.0, &mut output).unwrap(), 0);
+        }
+        assert_eq!(receiver.latency_diagnostics().jitter_buffer_us, 0);
+        for frame in 0..160 {
+            let now = 24_000 + frame * 480;
+            let pcm = if frame < 110 { [0.0; 960] } else { [0.1; 960] };
+            let n = sender.encode(now / 48, &pcm, &mut packet).unwrap();
+            receiver.receive(now, &mut packet[..n], |_| true).unwrap();
+            receiver.playout(now, 480.0, &mut output).unwrap();
+        }
+        let health = receiver.health();
+        assert_eq!(health.received_packets, 160);
+        assert_eq!(health.lost_frames, 0);
+        assert_eq!(health.late_frames, 0);
+        assert_eq!(health.concealed_frames, 0);
+        assert_eq!(health.discontinuities, 0);
+        assert_eq!(health.underruns, 0);
+        assert_eq!(receiver.target_delay_samples(), 1440);
+        assert_eq!(receiver.drift_diagnostics().coarse_corrections, 0);
+    }
 
     #[test]
     fn diagnostics_count_applied_drop_duplicate_and_survive_rebuffer() {
