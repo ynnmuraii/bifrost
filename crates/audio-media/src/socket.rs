@@ -40,6 +40,14 @@ impl Notification {
     pub fn wait_timeout(&self, timeout: Duration) {
         self.worker.get_or_init(thread::current);
         if !self.pending.swap(false, Ordering::AcqRel) {
+            // WaitOnAddress-backed park timeouts are coarse on Windows. Use std's
+            // high-resolution sleep for the final media-frame deadline instead.
+            // Notifications stay latched; stop can be delayed by at most 10 ms.
+            #[cfg(windows)]
+            if timeout <= Duration::from_millis(10) {
+                thread::sleep(timeout);
+                return;
+            }
             // An intervening notify leaves an unpark token, even before park begins.
             thread::park_timeout(timeout);
         }
