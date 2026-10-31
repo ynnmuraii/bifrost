@@ -120,6 +120,61 @@ mod local {
     async fn child() -> Fixture {
         child_with_factory(None).await
     }
+    #[tokio::test]
+    async fn dry_capture_pump_keeps_realtime_cadence() {
+        let mut fixture = child().await;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = ports().0;
+        fixture
+            .core
+            .send(
+                2,
+                Msg::StartSession(start(
+                    1,
+                    local,
+                    u32::from(peer.local_addr().unwrap().port()),
+                )),
+            )
+            .await
+            .unwrap();
+        session_event(&mut fixture.core, 1, local).await;
+        let first = fixture.observed.pumps.load(Ordering::Relaxed);
+        let began = Instant::now();
+        let measurement = tokio::time::sleep(Duration::from_millis(1200));
+        tokio::pin!(measurement);
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = &mut measurement => break,
+                _ = heartbeat.tick() => {
+                    fixture.core.send(0, Msg::Ping(w::Ping { serial: 1 })).await.unwrap();
+                    renew(&mut fixture.core, 13, 1000).await;
+                }
+                received = fixture.core.recv() => {
+                    match received.unwrap().frame.msg.unwrap() {
+                        Msg::Error(error) => panic!("cadence fixture rejected: {}", error.code),
+                        Msg::SessionEvent(event) if event.kind == 5 => panic!("capture stopped early: {}", event.reason),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let seconds = began.elapsed().as_secs_f64();
+        let callbacks = fixture.observed.pumps.load(Ordering::Relaxed) - first;
+        let fps = callbacks as f64 / seconds;
+        println!("Dry capture cadence on {}: {callbacks} callbacks / {seconds:.4}s = {fps:.3} fps (480-frame/10ms blocks)", std::env::consts::OS);
+        assert!(
+            (95.0..=105.0).contains(&fps),
+            "Dry callback clock must track real time: {fps:.3}fps"
+        );
+        fixture
+            .core
+            .send(3, Msg::Shutdown(w::Shutdown {}))
+            .await
+            .unwrap();
+        assert_eq!(fixture.handle.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
     async fn child_with_factory(
         factory: Option<fn() -> Result<DryBackend, BackendError>>,
     ) -> Fixture {
