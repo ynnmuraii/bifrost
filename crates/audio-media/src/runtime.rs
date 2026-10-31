@@ -444,6 +444,9 @@ where
         return Err(EngineError::Unauthorized);
     }
     socket_setup(&config.socket)?;
+    // Control reception must never gate capture/send deadlines. In particular,
+    // Winsock's SO_RCVTIMEO rounds a 2 ms wait up to approximately 16 ms.
+    config.socket.set_nonblocking(true)?;
     let start = Instant::now();
     let shared = Arc::new(Shared::new(config.authorized.clone()));
     let (events_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
@@ -928,6 +931,7 @@ impl SourceWorker {
                 }
             }
             if !self.path.validated {
+                thread::sleep(Duration::from_millis(1));
                 continue;
             }
             self.context.shared.started(&self.context.events);
@@ -994,6 +998,16 @@ impl SourceWorker {
                     next_frame = Instant::now() + frame_duration;
                 }
             }
+            // The absolute media grid, not receive timeouts or sleep durations, owns pacing.
+            // Poll the capture ring at most every millisecond without busy-spinning.
+            let wait = next_frame
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(1));
+            thread::sleep(if wait.is_zero() {
+                Duration::from_millis(1)
+            } else {
+                wait
+            });
         }
         Ok(())
     }
