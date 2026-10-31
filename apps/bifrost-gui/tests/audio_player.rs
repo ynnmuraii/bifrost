@@ -233,13 +233,13 @@ fn disabled_media_controls_never_emit_commands_but_local_mute_does() {
 fn authoritative_snapshots_open_only_on_first_stream_transition() {
     let mut player = AudioPlayer::default();
     assert!(!player.open);
-    player.replace_cards(vec![card("one")]);
+    player.replace_cards(vec![card("one")], true);
     assert!(player.open);
     player.open = false;
-    player.replace_cards(vec![card("one"), card("two")]);
+    player.replace_cards(vec![card("one"), card("two")], true);
     assert!(!player.open);
-    player.replace_cards(Vec::new());
-    player.replace_cards(vec![card("three")]);
+    player.replace_cards(Vec::new(), false);
+    player.replace_cards(vec![card("three")], true);
     assert!(player.open);
 }
 
@@ -257,7 +257,7 @@ fn zero_or_unknown_duration_hides_progress_without_hiding_session_controls() {
         assert!(!texts(&output.shapes)
             .iter()
             .any(|value| value == "0:05" || value == "0:00"));
-        assert_eq!(audio_player::height(&cards), 120.0);
+        assert_eq!(audio_player::height(&cards), 128.0);
         assert!(output
             .platform_output
             .accesskit_update
@@ -295,6 +295,116 @@ fn optional_offscreen_fixture_pngs() {
                     .unwrap()
                     .save(dir.join(format!("player-{scene}-{lang_tag}-{theme_tag}.png")))
                     .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn production_viewport_keeps_empty_and_three_cards_inside_opaque_client_at_native_scales() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for scale in [1.0, 1.5, 2.0] {
+                for count in [0, 1, 3] {
+                    let cards = (0..count)
+                        .map(|i| card(&format!("viewport-{i}")))
+                        .collect::<Vec<_>>();
+                    let mut player = AudioPlayer::default();
+                    player.cards = cards;
+                    player.open = true;
+                    let ctx = egui::Context::default();
+                    ui::install_fonts(&ctx);
+                    ctx.set_embed_viewports(false);
+                    ctx.enable_accesskit();
+                    let frames = Rc::new(RefCell::new(Vec::new()));
+                    let captured = frames.clone();
+                    egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+                        let size = viewport.builder.inner_size.expect("client size");
+                        assert_eq!(viewport.builder.transparent, Some(false));
+                        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let mut input = egui::RawInput {
+                            viewport_id: viewport.ids.this,
+                            screen_rect: Some(rect),
+                            ..Default::default()
+                        };
+                        input.viewports.insert(
+                            viewport.ids.this,
+                            egui::ViewportInfo {
+                                parent: Some(viewport.ids.parent),
+                                native_pixels_per_point: Some(scale),
+                                monitor_size: Some(egui::vec2(1920.0, 1080.0)),
+                                inner_rect: Some(rect),
+                                ..Default::default()
+                            },
+                        );
+                        let mut output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
+                        output.textures_delta.clear();
+                        captured.borrow_mut().push((rect, output));
+                    });
+                    for _ in 0..3 {
+                        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                            assert!(audio_player::viewport(ui.ctx(), &mut player, theme, lang)
+                                .is_empty());
+                        });
+                        output.textures_delta.clear();
+                    }
+                    let frames = frames.borrow();
+                    let (client, output) = frames.last().expect("real viewport callback");
+                    if count > 0 {
+                        assert_eq!(client.height(), audio_player::height(&player.cards));
+                    }
+                    fn check_text(shape: &Shape, client: egui::Rect, clip: egui::Rect) {
+                        match shape {
+                            Shape::Text(text) => {
+                                let bounds =
+                                    egui::Rect::from_min_size(text.pos, text.galley.size());
+                                assert!(
+                                    client.contains_rect(bounds),
+                                    "text outside client: {bounds:?}"
+                                );
+                                assert!(
+                                    clip.expand(0.5).contains_rect(bounds),
+                                    "clipped text: {bounds:?} {clip:?}"
+                                );
+                            }
+                            Shape::Vec(shapes) => {
+                                for shape in shapes {
+                                    check_text(shape, client, clip);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for shape in &output.shapes {
+                        check_text(&shape.shape, *client, shape.clip_rect);
+                    }
+                    let values = texts(&output.shapes);
+                    assert_eq!(
+                        values.iter().any(|s| s == text(lang, Key::AudioEmpty)),
+                        count == 0
+                    );
+                    assert!(!values.iter().any(|s| s == text(lang, Key::AudioHide)));
+                    let tree = output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .expect("hit targets");
+                    for (_, node) in &tree.nodes {
+                        if let Some(bounds) = node.bounds() {
+                            if matches!(
+                                node.role(),
+                                egui::accesskit::Role::Button | egui::accesskit::Role::Slider
+                            ) {
+                                assert!(bounds.x0 >= 12.0 && bounds.y0 >= 12.0);
+                                assert!(bounds.x1 <= f64::from(client.right()) - 8.0);
+                                assert!(bounds.y1 <= f64::from(client.bottom()) - 8.0);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

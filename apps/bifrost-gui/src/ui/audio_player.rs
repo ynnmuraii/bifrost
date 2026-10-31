@@ -22,9 +22,9 @@ fn has_progress(card: &AudioPlayerCard) -> bool {
 
 pub fn height(cards: &[AudioPlayerCard]) -> f32 {
     if cards.is_empty() {
-        return 92.0;
+        return 48.0;
     }
-    16.0 + cards.iter().map(card_height).sum::<f32>() + 8.0 * cards.len().saturating_sub(1) as f32
+    24.0 + cards.iter().map(card_height).sum::<f32>() + 8.0 * cards.len().saturating_sub(1) as f32
 }
 
 fn card_height(card: &AudioPlayerCard) -> f32 {
@@ -33,6 +33,22 @@ fn card_height(card: &AudioPlayerCard) -> f32 {
     } else {
         104.0
     }
+}
+
+fn empty_height(ctx: &egui::Context, width: f32, lang: Lang) -> f32 {
+    ctx.fonts_mut(|fonts| {
+        fonts
+            .layout(
+                text(lang, Key::AudioEmpty).to_owned(),
+                font(13.0, fam::sans_medium()),
+                Color32::WHITE,
+                (width - 36.0).max(1.0),
+            )
+            .size()
+            .y
+            .ceil()
+            .max(24.0)
+    })
 }
 
 /// Draw at any width >= 225 logical pixels; the wide single-card reference uses the same layout.
@@ -51,16 +67,43 @@ pub fn draw(ui: &mut egui::Ui, cards: &[AudioPlayerCard], theme: Theme, lang: La
     let mut actions = Vec::new();
     ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
     if cards.is_empty() {
-        egui::Frame::new()
-            .fill(pal.card)
-            .corner_radius(16)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(text(lang, Key::AudioEmpty)).color(pal.ink2));
-                if ui.button(text(lang, Key::AudioHide)).clicked() {
-                    actions.push(Action::HidePlayer);
-                }
-            });
+        let size = Vec2::new(
+            ui.available_width(),
+            empty_height(ui.ctx(), ui.available_width(), lang),
+        );
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        let close = Rect::from_min_size(
+            Pos2::new(rect.right() - 24.0, rect.top()),
+            Vec2::splat(24.0),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(Rect::from_min_max(
+                rect.min,
+                Pos2::new(close.left() - 12.0, rect.bottom()),
+            )),
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(text(lang, Key::AudioEmpty))
+                            .font(font(13.0, fam::sans_medium()))
+                            .color(pal.ink2),
+                    )
+                    .wrap(),
+                );
+            },
+        );
+        if button(
+            ui,
+            close,
+            Glyph::Close,
+            text(lang, Key::AudioHide),
+            true,
+            &pal,
+        )
+        .clicked()
+        {
+            actions.push(Action::HidePlayer);
+        }
     }
     for card in cards {
         ui.push_id(&card.stream_id, |ui| {
@@ -531,58 +574,67 @@ pub fn viewport(
     if !model.open {
         return Vec::new();
     }
-    let max_height = work_area(ctx).map_or(720.0, |work| (work.height() - 32.0).max(80.0));
-    let size = Vec2::new(WIDTH, height(&model.cards).min(max_height));
+    let max_height = work_area(ctx).map_or(720.0, |work| (work.height() - 32.0).max(48.0));
+    let content_height = if model.cards.is_empty() {
+        24.0 + empty_height(ctx, WIDTH - 24.0, lang)
+    } else {
+        height(&model.cards)
+    };
+    let size = Vec2::new(WIDTH, content_height.min(max_height));
     let mut actions = Vec::new();
     let builder = egui::ViewportBuilder::default()
         .with_title(text(lang, Key::AudioPlayer))
         .with_inner_size(size)
-        .with_min_inner_size([225.0, 80.0])
+        .with_min_inner_size([225.0, 48.0])
         .with_resizable(false)
         .with_decorations(false)
-        .with_transparent(true)
+        .with_transparent(false)
         .with_always_on_top()
         .with_taskbar(false);
     ctx.show_viewport_immediate(
         egui::ViewportId::from_hash_of("audio-player"),
         builder,
-        |ctx, class| {
-            if ctx.input(|i| i.viewport().close_requested()) {
+        |ui, class| {
+            if ui.input(|i| i.viewport().close_requested()) {
                 model.open = false;
             }
-            if class == egui::ViewportClass::EmbeddedWindow {
-                egui::Window::new(text(lang, Key::AudioPlayer))
-                    .open(&mut model.open)
-                    .show(ctx, |ui| {
-                        actions = draw(ui, &model.cards, theme, lang);
-                    });
-            } else {
-                let positioned = ctx.data_mut(|d| {
+            if class != egui::ViewportClass::EmbeddedWindow {
+                let positioned = ui.data_mut(|d| {
                     d.get_temp::<bool>(egui::Id::new("audio-positioned"))
                         .unwrap_or(false)
                 });
                 if !positioned {
-                    if let Some(work) = work_area(ctx) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(
-                            (work.right() - size.x - 16.0).max(work.left()),
-                            (work.bottom() - size.y - 16.0).max(work.top()),
-                        )));
-                        ctx.data_mut(|d| d.insert_temp(egui::Id::new("audio-positioned"), true));
+                    if let Some(work) = work_area(ui.ctx()) {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(
+                                (work.right() - size.x - 16.0).max(work.left()),
+                                (work.bottom() - size.y - 16.0).max(work.top()),
+                            )));
+                        ui.data_mut(|d| d.insert_temp(egui::Id::new("audio-positioned"), true));
                     }
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .fill(Color32::TRANSPARENT)
-                            .inner_margin(8.0),
-                    )
-                    .show(ctx, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            actions = draw(ui, &model.cards, theme, lang);
-                        });
-                    });
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
+            // egui 0.36 already supplies the viewport's root Ui (and an embedded window
+            // on unsupported backends). Render into it, never create another window.
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(Palette::of(theme).card)
+                        .inner_margin(12.0),
+                )
+                .show(ui, |ui| {
+                    if content_height > size.y {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                actions = draw(ui, &model.cards, theme, lang);
+                            });
+                    } else {
+                        actions = draw(ui, &model.cards, theme, lang);
+                    }
+                });
         },
     );
     actions

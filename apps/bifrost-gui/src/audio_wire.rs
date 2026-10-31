@@ -418,6 +418,8 @@ mod tests {
         let status = model::AudioStatus {
             revision: 1,
             enabled: false,
+            system_sharing_requested: None,
+            system_sharing_error: None,
             role: model::AudioRole::Source,
             mode: model::AudioMode::MixAll,
             backend: Vec::new(),
@@ -450,6 +452,8 @@ mod tests {
         let model = model::AudioStatus {
             revision: 42,
             enabled: true,
+            system_sharing_requested: None,
+            system_sharing_error: None,
             role: model::AudioRole::Listener,
             mode: model::AudioMode::MixAll,
             backend: vec![model::CapabilityAvailability {
@@ -554,6 +558,8 @@ mod tests {
         let status = model::AudioStatus {
             revision: 7,
             enabled: true,
+            system_sharing_requested: None,
+            system_sharing_error: None,
             role: model::AudioRole::Source,
             mode: model::AudioMode::MixAll,
             backend: Vec::new(),
@@ -648,5 +654,24 @@ mod tests {
             .unwrap()
             .native_render_buffer_us = Some(2_000_001);
         assert!(decode_status(&encoded).is_err());
+    }
+
+    #[test]
+    fn canonical_runtime_intent_and_typed_error_survive_status_conversion() {
+        for requested in [None, Some(false), Some(true)] {
+            for error in [None, Some("AUDIO_CONSENT_REQUIRED".to_owned())] {
+                let status = model::AudioStatus {
+                    revision: 1,
+                    role: model::AudioRole::Listener,
+                    system_sharing_requested: requested,
+                    system_sharing_error: error,
+                    ..Default::default()
+                };
+                let encoded =
+                    encode_status(&status, config(), wire::AudioMicrophoneState::default())
+                        .unwrap();
+                assert_eq!(decode_status(&encoded).unwrap(), status);
+            }
+        }
     }
 }
