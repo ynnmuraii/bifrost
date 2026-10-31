@@ -270,6 +270,8 @@ fn is_core(message: &w::audio_frame::Msg) -> bool {
             | w::audio_frame::Msg::SetMicMute(_)
             | w::audio_frame::Msg::ReleaseMicMute(_)
             | w::audio_frame::Msg::ConfigurePtt(_)
+            | w::audio_frame::Msg::PttGrant(_)
+            | w::audio_frame::Msg::PttRevoke(_)
             | w::audio_frame::Msg::SetMediaWatch(_)
             | w::audio_frame::Msg::MediaCommand(_)
     )
@@ -308,6 +310,8 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 | Msg::SetMicMute(_)
                 | Msg::ReleaseMicMute(_)
                 | Msg::ConfigurePtt(_)
+                | Msg::PttGrant(_)
+                | Msg::PttRevoke(_)
                 | Msg::SetMediaWatch(_)
                 | Msg::MediaCommand(_)
                 | Msg::MediaCommandResult(_)
@@ -555,6 +559,16 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 }
             }
         }
+        Msg::PttGrant(request) => {
+            if request.grant_id == 0 || !(1..=250).contains(&request.ttl_ms) {
+                return Err(invalid());
+            }
+        }
+        Msg::PttRevoke(request) => {
+            if request.grant_id == 0 {
+                return Err(invalid());
+            }
+        }
         Msg::MuteSnapshot(snapshot) => {
             text(&snapshot.endpoint_id, 512, false)?;
             if snapshot.generation == 0 {
@@ -568,10 +582,21 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                         && event.expires_at_ns - event.observed_at_ns <= MAX_PTT_GRANT_NS
                 }
                 2 => event.observed_at_ns == 0 && event.expires_at_ns > 0,
-                3 => event.observed_at_ns == 0 && event.expires_at_ns == 0,
+                3..=5 => event.observed_at_ns == 0 && event.expires_at_ns == 0,
                 _ => false,
             };
-            if !valid {
+            let scope_valid = if event.grant_id == 0 {
+                event.reason == 0 && matches!(event.kind, 1..=3)
+            } else {
+                match event.kind {
+                    1 | 2 => event.reason == 0,
+                    3 => matches!(event.reason, 1..=4),
+                    4 => event.reason == 5,
+                    5 => event.reason == 6,
+                    _ => false,
+                }
+            };
+            if !valid || !scope_valid {
                 return Err(invalid());
             }
         }

@@ -78,6 +78,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Audio M5/M6 worker contract**
 
 - Add bounded private microphone-mute/PTT and opt-in media-watch/command messages. Metadata is Debug-redacted, command completions are correlated, and lease/timestamp/hotkey validation remains fail-closed; core integration is separate.
+- Extend the supervisor with generation-fenced microphone, shortcut and consent-gated media controls and correlated completion events. Separate persistent mute toggles from nonzero-ID remote talk grants, bounded to 250 ms and explicitly revocable; Ping never extends a talk grant.
 
 ### Русский
 
@@ -153,6 +154,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Контракт аудиопроцесса M5/M6**
 
 - Добавлены ограниченные закрытые сообщения микрофонного mute/PTT и явно включаемых медиаданных/команд. Метаданные скрыты в Debug, результаты команд связаны с запросами, сроки PTT и сочетания клавиш проверяются с безопасным отказом; интеграция core выполняется отдельно.
+- Супервизор дополнен управлением микрофоном, PTT и медиаданными с проверкой поколения и связанными результатами. Постоянное переключение mute отделено от удалённых разрешений говорить с ненулевым ID, сроком до 250 мс и явным отзывом; Ping не продлевает разрешение.
 
 ## 0.4.0 — 2026-10-30
 
