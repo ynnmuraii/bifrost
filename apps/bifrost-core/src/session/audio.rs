@@ -1297,6 +1297,7 @@ impl Actor {
             .ok_or(ipc::audio::codes::AUDIO_UNAVAILABLE)?;
         let (handle, mut events) = AudioSupervisor::start(AudioSupervisorConfig {
             program,
+            logs_dir: self.paths.logs_dir(),
             private_dir: self
                 .paths
                 .runtime_dir()

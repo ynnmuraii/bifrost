@@ -174,7 +174,15 @@ pub(crate) fn run<B: Backend + 'static>(
     }
     worker.shared.stop_all();
     for mut session in worker.sessions.drain(..) {
-        let _ = session.media.stop();
+        let stopped = session.media.stop().is_ok();
+        // IPC may already be gone; keep the native cleanup observation in the child log.
+        tracing::info!(
+            session = ?session.id,
+            event_kind = 5,
+            stop_reason = "child_stopping",
+            stopped,
+            "audio session lifecycle"
+        );
         worker.shared.remove(&session.id);
     }
     if let Some(group) = worker.listener.as_mut() {

@@ -16,6 +16,9 @@ audio-model = { path = "../../crates/audio-model" }
 audio-media = { path = "../../crates/audio-media" }
 ipc = { path = "../../crates/ipc" }
 protocol = { path = "../../crates/protocol" }
+logging = { path = "../../crates/logging" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
 ring = "0.17"
 zeroize = "1"
