@@ -208,6 +208,14 @@ mod windows {
                 for session in health.sessions {
                     worker.observed_capture |= session.capture_active == Some(true);
                     worker.sent = worker.sent.max(session.sent_media_packets);
+                    if let Some(drift) = session.drift {
+                        println!("DRIFT {label} ratio_ppm={} filtered_fill_error_frames={:.3} coarse_corrections={} clock_source={}", drift.ratio_ppm, drift.filtered_fill_error_frames, drift.coarse_corrections, session.clock_source);
+                    } else {
+                        println!(
+                            "DRIFT {label} receiver_PI=absent clock_source={}",
+                            session.clock_source
+                        );
+                    }
                     if let Some(counters) = session.counters {
                         println!("HEALTH {label} sent={} received={} delta_received={} loss={} delta_loss={} underruns={} delta_underruns={} late={} concealed={} discontinuities={}",
                             session.sent_media_packets, counters.received_packets,
@@ -294,7 +302,7 @@ mod windows {
         let sample_span = frames.len().saturating_sub(1);
         let ppm =
             (sample_span as f64 / (qpc_span as f64 * 48_000.0 / 10_000_000.0) - 1.0) * 1_000_000.0;
-        println!("CLOCK {label} delivered_sample_vs_QPC_drift_ppm={ppm:.3} duration_ms={:.1} native_position_first={} native_position_last={}; worker Health has no drift field", qpc_span as f64 / 10_000.0, first.device_position, last.device_position);
+        println!("CLOCK {label} delivered_sample_vs_QPC_drift_ppm={ppm:.3} duration_ms={:.1} native_position_first={} native_position_last={}; independent capture estimate, NOT the worker receiver PI ratio", qpc_span as f64 / 10_000.0, first.device_position, last.device_position);
         Ok(())
     }
 
