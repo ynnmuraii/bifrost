@@ -237,7 +237,16 @@ fn draw_card(
         );
         glyph(ui, app_rect, Glyph::Play, Color32::WHITE);
     } else {
-        glyph(ui, app_rect, Glyph::Volume, pal.ink2);
+        glyph(
+            ui,
+            app_rect,
+            if c.has_media_session {
+                Glyph::Volume
+            } else {
+                Glyph::SystemAudio
+            },
+            pal.ink2,
+        );
     }
     let controls = [
         (
@@ -345,6 +354,7 @@ enum Glyph {
     Pause,
     Next,
     Volume,
+    SystemAudio,
     Muted,
     Expand,
     Close,
@@ -411,6 +421,16 @@ fn glyph(ui: &egui::Ui, rect: Rect, icon: Glyph, color: Color32) {
         ));
     };
     match icon {
+        Glyph::SystemAudio => {
+            p.rect_stroke(
+                Rect::from_min_max(point(-7.0, -6.0), point(7.0, 3.0)),
+                1,
+                Stroke::new(1.5, color),
+                egui::StrokeKind::Inside,
+            );
+            line(point(0.0, 3.0), point(0.0, 6.0));
+            line(point(-4.0, 6.0), point(4.0, 6.0));
+        }
         Glyph::Play => triangle(1.0),
         Glyph::Previous | Glyph::Next => {
             let f = if matches!(icon, Glyph::Previous) {

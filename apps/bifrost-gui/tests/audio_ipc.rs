@@ -164,13 +164,57 @@ fn denied_media_permission_and_missing_session_do_not_dispatch() {
         .allow_media_control = false;
     assert!(audio::player_request(&status, &AudioPlayerAction::Next(id.clone())).is_none());
     let model = bifrost_gui::audio_wire::decode_status(&status).unwrap();
-    assert!(!audio::map_cards(&model, ui_text::Lang::En)[0].can_next);
+    assert!(!audio::map_cards(&model, &[])[0].can_next);
     status.sessions[0].media_info = None;
     let cards = audio::map_cards(
         &bifrost_gui::audio_wire::decode_status(&status).unwrap(),
-        ui_text::Lang::En,
+        &[],
     );
     assert!(!cards[0].has_media_session);
+}
+
+#[test]
+fn popup_source_names_follow_trusted_membership_in_either_ipc_order() {
+    for media in [true, false] {
+        for members_first in [true, false] {
+            let mut vm = view();
+            let mut audio = snapshot(5);
+            audio.sessions[0].source_name = "source".into();
+            if !media {
+                audio.sessions[0].media_info = None;
+            }
+            let mut membership = support::status_with("LOCAL");
+            membership.members[1].node_id = "02".repeat(32).to_uppercase();
+            membership.members[1].display_name = "LAPTOP".into();
+            if members_first {
+                vm.apply(event(Msg::Status(membership.clone())));
+            }
+            vm.apply(event(Msg::AudioStatus(audio)));
+            if !members_first {
+                assert_eq!(vm.audio_player.cards[0].source_name, "02020202");
+                vm.apply(event(Msg::Status(membership.clone())));
+            }
+            assert_eq!(vm.audio_player.cards[0].source_name, "LAPTOP");
+            assert_eq!(vm.audio_player.cards[0].stream_id, "01".repeat(16));
+            membership.members[1].display_name = "HTPC".into();
+            vm.apply(event(Msg::Status(membership.clone())));
+            assert_eq!(vm.audio_player.cards[0].source_name, "HTPC");
+            membership.members[1].display_name = "   ".into();
+            vm.apply(event(Msg::Status(membership.clone())));
+            assert_eq!(vm.audio_player.cards[0].source_name, "02020202");
+            membership.members[1].node_id = "03".repeat(32);
+            membership.members[1].display_name = "Wrong peer".into();
+            vm.apply(event(Msg::Status(membership)));
+            assert_eq!(vm.audio_player.cards[0].source_name, "02020202");
+            let request = audio::player_request(
+                vm.audio.status.as_ref().unwrap(),
+                &AudioPlayerAction::Stop("01".repeat(16)),
+            );
+            assert!(
+                matches!(request, Some(Msg::StopAudio(stop)) if stop.session_id == vec![1; 16] && stop.peer_node_id == vec![2; 32])
+            );
+        }
+    }
 }
 
 #[test]

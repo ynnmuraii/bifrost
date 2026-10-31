@@ -77,7 +77,12 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                     widgets::hint(ui, pal, &capture);
                 }
             }
-            if let Some(mic) = &status.microphone {
+            let mic_control_enabled = status
+                .config
+                .as_ref()
+                .and_then(|config| config.microphone.as_ref())
+                .is_some_and(|mic| mic.control_enabled);
+            if let Some(mic) = status.microphone.as_ref().filter(|_| mic_control_enabled) {
                 let mut summary = format!(
                     "{} · {}",
                     text(
@@ -122,7 +127,7 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                 {
                     actions.push(Action::Audio(AudioAction::StopAll));
                 }
-                if let Some(mic) = &status.microphone {
+                if let Some(mic) = status.microphone.as_ref().filter(|_| mic_control_enabled) {
                     // A retained unmuted snapshot must never disable urgent mute.
                     let can_mute = if mic.muted {
                         available && mic.control_active && !vm.audio.pending
@@ -173,18 +178,16 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                                                 || input.key_down(egui::Key::Enter)))
                             });
                     }
-                    if mic.ptt_pressed
-                        && widgets::small_button(
-                            ui,
-                            pal,
-                            text(lang, Key::AudioPttRelease),
-                            connected,
-                        )
+                }
+                if status
+                    .microphone
+                    .as_ref()
+                    .is_some_and(|mic| mic.ptt_pressed)
+                    && widgets::small_button(ui, pal, text(lang, Key::AudioPttRelease), connected)
                         .clicked()
-                    {
-                        held = false;
-                        release_requested = true;
-                    }
+                {
+                    held = false;
+                    release_requested = true;
                 }
             });
             ui.collapsing(text(lang, Key::AudioDetails), |ui| {
@@ -219,41 +222,10 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
 }
 
 pub(super) fn peer_name(vm: &ViewModel, id: &[u8]) -> String {
-    let member = vm.status.as_ref().and_then(|status| {
-        status
-            .members
-            .iter()
-            .find(|member| matches_id(&member.node_id, id))
-    });
-    if let Some(member) = member.filter(|member| !member.display_name.trim().is_empty()) {
-        return member.display_name.clone();
-    }
-    short_hex(id)
-}
-
-fn matches_id(hex: &str, id: &[u8]) -> bool {
-    hex.len() == id.len() * 2
-        && hex
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(id)
-            .all(|(pair, byte)| {
-                let digit = |b: u8| (b as char).to_digit(16);
-                digit(pair[0])
-                    .zip(digit(pair[1]))
-                    .is_some_and(|(hi, lo)| (hi * 16 + lo) as u8 == *byte)
-            })
-}
-
-fn short_hex(id: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut result = String::with_capacity(8);
-    for byte in id.iter().take(4) {
-        let _ = write!(result, "{byte:02x}");
-    }
-    result
+    crate::audio::peer_name(
+        vm.status.as_ref().map_or(&[][..], |status| &status.members),
+        id,
+    )
 }
 
 fn session_summary(vm: &ViewModel, session: &ipc::AudioSessionStatus) -> String {
@@ -374,7 +346,11 @@ mod tests {
 
     #[test]
     fn fallback_is_eight_lowercase_hex_digits() {
-        assert_eq!(short_hex(&[0, 15, 128, 255, 42]), "000f80ff");
+        use crate::audio::matches_id;
+        assert_eq!(
+            crate::audio::peer_name(&[], &[0, 15, 128, 255, 42]),
+            "000f80ff"
+        );
         assert!(matches_id("000F80FF", &[0, 15, 128, 255]));
         assert!(!matches_id("000f80fz", &[0, 15, 128, 255]));
         assert!(!matches_id("000f80", &[0, 15, 128, 255]));
