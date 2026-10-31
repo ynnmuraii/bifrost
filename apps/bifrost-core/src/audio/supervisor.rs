@@ -31,6 +31,7 @@ pub struct AudioSupervisorConfig {
     /// Production callers use `std::env::current_exe()`.
     pub program: PathBuf,
     pub private_dir: PathBuf,
+    pub logs_dir: PathBuf,
     pub backend: w::BackendKind,
 }
 
@@ -44,6 +45,16 @@ pub enum AudioPrivacyOperation {
     StopSession,
 }
 impl AudioPrivacyOperation {
+    fn log_label(self) -> &'static str {
+        match self {
+            Self::DisableMediaWatch => "disable_media_watch",
+            Self::MuteMicrophone => "mute_microphone",
+            Self::RevokePtt => "revoke_ptt",
+            Self::ReleaseMicMute => "release_mic_mute",
+            Self::StopSession => "stop_session",
+        }
+    }
+
     fn of(message: &Msg) -> Option<Self> {
         match message {
             Msg::SetMediaWatch(w::SetMediaWatch { enabled: false }) => {
@@ -81,6 +92,22 @@ impl fmt::Display for AudioSupervisorError {
     }
 }
 impl std::error::Error for AudioSupervisorError {}
+impl AudioSupervisorError {
+    fn log_reason(&self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::QueueFull => "queue_full",
+            Self::PrivacyControlRejected => "privacy_control_rejected",
+            Self::RestartRequired(AudioRestartReason::SessionBudget) => "session_budget",
+            Self::Timeout => "timeout",
+            Self::InvalidFrame => "invalid_frame",
+            Self::WorkerRejected(_) => "worker_rejected",
+            Self::Launch(_) => "launch_failed",
+            Self::ChildLost => "child_lost",
+            Self::EventOverflow => "event_overflow",
+        }
+    }
+}
 type Result<T, E = AudioSupervisorError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -217,12 +244,18 @@ impl AudioHandle {
                 admitted_at,
                 reply,
             })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) if privacy.is_some() => {
+            .map_err(|error| match (error, privacy) {
+                (mpsc::error::TrySendError::Full(_), Some(operation)) => {
+                    tracing::info!(
+                        generation,
+                        operation = operation.log_label(),
+                        reason = "queue_full",
+                        "audio supervisor privacy control rejected"
+                    );
                     AudioSupervisorError::PrivacyControlRejected
                 }
-                mpsc::error::TrySendError::Full(_) => AudioSupervisorError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => AudioSupervisorError::Unavailable,
+                (mpsc::error::TrySendError::Full(_), None) => AudioSupervisorError::QueueFull,
+                (mpsc::error::TrySendError::Closed(_), _) => AudioSupervisorError::Unavailable,
             })?;
         timeout(COMMAND_TIMEOUT, rx)
             .await
@@ -472,6 +505,11 @@ async fn launch(
     generation: u64,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Child> {
+    tracing::info!(
+        generation,
+        backend = config.backend as i32,
+        "audio supervisor launching child"
+    );
     use std::io::Write;
     // Names are process-global, so independent supervisors cannot steal each other's files.
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -514,6 +552,10 @@ async fn launch(
         .arg(endpoint.describe())
         .arg("--token-file")
         .arg(&token_file.0)
+        .arg("--logs-dir")
+        .arg(&config.logs_dir)
+        .arg("--worker-generation")
+        .arg(generation.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -793,6 +835,13 @@ fn worker_rejection(
 ) -> Result<w::Error> {
     if error.code == w::ErrorCode::ResourceLimit as i32 {
         if let Some(operation) = privacy {
+            tracing::info!(
+                generation,
+                request_id,
+                operation = operation.log_label(),
+                reason = "resource_limit",
+                "audio supervisor privacy control rejected"
+            );
             emit(
                 events,
                 AudioSupervisorEvent::PrivacyControlRejected {
@@ -857,6 +906,11 @@ async fn run(
                     return;
                 }
                 if let Some(first) = first.take() {
+                    tracing::info!(
+                        generation,
+                        reason = error.log_reason(),
+                        "audio supervisor terminal child failure"
+                    );
                     let _ = first.send(Err(error));
                     return;
                 }
@@ -870,6 +924,11 @@ async fn run(
                 )
                 .is_err()
                 {
+                    tracing::info!(
+                        generation,
+                        reason = "event_overflow",
+                        "audio supervisor terminal child failure"
+                    );
                     return;
                 }
                 // A failed restart consumes the same bounded restart budget as a lost child.
@@ -880,10 +939,26 @@ async fn run(
                     restarts.pop_front();
                 }
                 if restarts.len() >= 3 {
+                    tracing::info!(
+                        generation,
+                        reason = "restart_budget_exhausted",
+                        "audio supervisor terminal child failure"
+                    );
                     return;
                 }
                 restarts.push_back(Instant::now());
+                tracing::info!(
+                    generation,
+                    attempt = restarts.len(),
+                    reason = "launch_failed",
+                    "audio supervisor restarting child"
+                );
                 let Some(next_generation) = generation.checked_add(1) else {
+                    tracing::info!(
+                        generation,
+                        reason = "generation_exhausted",
+                        "audio supervisor terminal child failure"
+                    );
                     return;
                 };
                 generation = next_generation;
@@ -893,6 +968,11 @@ async fn run(
                 continue;
             }
         };
+        tracing::info!(
+            generation,
+            pid = child.pid,
+            "audio supervisor child attached"
+        );
         if emit(
             &events,
             AudioSupervisorEvent::Ready {
@@ -903,6 +983,11 @@ async fn run(
         )
         .is_err()
         {
+            tracing::info!(
+                generation,
+                reason = "event_overflow",
+                "audio supervisor terminal child failure"
+            );
             child.reap().await;
             return;
         }
@@ -965,10 +1050,31 @@ async fn run(
         )
         .is_err();
         if overflow || !restartable {
+            tracing::info!(
+                generation,
+                reason = if overflow {
+                    "event_overflow"
+                } else {
+                    reason.log_reason()
+                },
+                attempts = restarts.len(),
+                "audio supervisor terminal child failure"
+            );
             return;
         }
         restarts.push_back(Instant::now());
+        tracing::info!(
+            generation,
+            attempt = restarts.len(),
+            reason = reason.log_reason(),
+            "audio supervisor restarting child"
+        );
         let Some(next_generation) = generation.checked_add(1) else {
+            tracing::info!(
+                generation,
+                reason = "generation_exhausted",
+                "audio supervisor terminal child failure"
+            );
             return;
         };
         generation = next_generation;
@@ -1054,6 +1160,7 @@ mod tests {
             AudioSupervisorConfig {
                 program: binary(),
                 private_dir: self.0.join(name),
+                logs_dir: self.0.join(name).join("logs"),
                 backend: w::BackendKind::Dry,
             }
         }
@@ -1329,20 +1436,29 @@ mod tests {
         source.start_session(start(1, a, b)).await.unwrap();
         let mut sending = false;
         let mut receiving = false;
+        let mut metadata_seen = false;
+        let mut watch_requested = false;
         let mut renew = tokio::time::interval(Duration::from_millis(100));
         timeout(Duration::from_secs(10), async {
-            while !sending || !receiving {
+            while !sending || !receiving || !metadata_seen {
                 tokio::select! {
                     _ = renew.tick() => {
                         source.renew_session([13; 16], 1000).await.unwrap();
                         listener.renew_session([13; 16], 1000).await.unwrap();
                     },
                     event = source_events.recv() => match event.expect("source events") {
+                        AudioSupervisorEvent::MediaSessions { sessions, .. } => {
+                            metadata_seen |= sessions.sessions.iter().any(|session| session.title == "Dry media");
+                        },
                         AudioSupervisorEvent::Health { health, .. } => {
                             if let Some(session) = health.sessions.iter().find(|session| session.sending == Some(true) && session.capture_active == Some(true) && session.sent_media_packets > 0) {
                                 assert_eq!(session.clock_source, 1, "Dry capture uses valid host timestamps");
                                 assert!(session.drift.is_none(), "Source does not run a drift PI");
                                 sending = true;
+                            }
+                            if sending && !watch_requested {
+                                source.set_media_watch(true).await.unwrap();
+                                watch_requested = true;
                             }
                         },
                         AudioSupervisorEvent::Failed { reason, .. } => panic!("source failed: {reason}"),
@@ -1472,6 +1588,68 @@ mod tests {
         }
         source.shutdown().await.unwrap();
         listener.shutdown().await.unwrap();
+        for name in ["s", "l"] {
+            let path = root.config(name).logs_dir.join("bifrost-audio.log");
+            let bytes = std::fs::read(&path).expect("audio child must create its rotating log");
+            let log = std::str::from_utf8(&bytes).expect("UTF-8 child log");
+            assert!(
+                log.contains("audio child attached"),
+                "missing attach lifecycle"
+            );
+            assert!(
+                log.contains("audio child stopped"),
+                "missing graceful shutdown"
+            );
+            assert!(
+                log.contains("audio backend probe result"),
+                "missing probe lifecycle"
+            );
+            assert!(
+                log.contains("audio session lifecycle"),
+                "missing session lifecycle"
+            );
+            assert!(
+                log.contains("event_kind=1"),
+                "missing started session event"
+            );
+            if name == "l" {
+                assert!(
+                    log.contains("event_kind=5"),
+                    "missing stopped session event"
+                );
+            }
+            if name == "s" {
+                assert!(
+                    log.contains("audio child restarted"),
+                    "missing restart lifecycle"
+                );
+                assert!(
+                    log.lines().any(|line| line.contains("audio child attached")
+                        && line.contains("worker_generation=2")),
+                    "replacement attach must identify its worker generation"
+                );
+            }
+            assert!(
+                !log.contains("Dry media"),
+                "private media title reached disk"
+            );
+            let session = start(1, a, b);
+            for secret in [
+                session.forward.as_ref().unwrap().key.as_slice(),
+                session.reverse.as_ref().unwrap().key.as_slice(),
+            ] {
+                assert!(
+                    !bytes.windows(secret.len()).any(|window| window == secret),
+                    "raw secret reached child log"
+                );
+                let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+                assert!(!log.contains(&hex), "hex secret reached child log");
+                assert!(
+                    !log.contains(&hex.to_ascii_uppercase()),
+                    "uppercase hex secret reached child log"
+                );
+            }
+        }
         #[cfg(target_os = "linux")]
         for pid in [source_pid, replacement_pid, listener_pid] {
             assert!(

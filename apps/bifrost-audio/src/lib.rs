@@ -15,6 +15,7 @@
 //! Admission fences prevent older queued openings from reviving withdrawn authority.
 #![forbid(unsafe_code)]
 mod clock;
+mod lifecycle;
 mod privacy;
 mod ptt_lease;
 mod worker;
@@ -296,6 +297,11 @@ where
     )
     .await
     .map_err(|_| RoleError::WorkerFailed)??;
+    tracing::info!(
+        backend_kind = kind,
+        worker_generation = first.frame.worker_generation,
+        "audio child attached"
+    );
     match requested {
         2 => {
             let pump: worker::Pump<DryStream> = Box::new(move |stream| {
@@ -528,6 +534,7 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     request_id: u64,
     message: Msg,
 ) -> Result<(), RoleError> {
+    lifecycle::message(&message);
     tokio::time::timeout(WRITE_TIMEOUT, link.send(request_id, message))
         .await
         .map_err(|_| RoleError::WorkerFailed)??;
@@ -537,15 +544,28 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(
 struct Args {
     endpoint: String,
     token_file: PathBuf,
+    logs_dir: Option<PathBuf>,
+    worker_generation: u64,
 }
 fn parse(args: Vec<String>) -> Result<Args, ()> {
     let mut args = args.into_iter();
     let (mut endpoint, mut token_file) = (None, None);
+    let (mut logs_dir, mut worker_generation) = (None, None);
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--ipc-endpoint" if endpoint.is_none() => endpoint = Some(args.next().ok_or(())?),
             "--token-file" if token_file.is_none() => {
                 token_file = Some(PathBuf::from(args.next().ok_or(())?))
+            }
+            "--logs-dir" if logs_dir.is_none() => {
+                logs_dir = Some(PathBuf::from(args.next().ok_or(())?));
+            }
+            "--worker-generation" if worker_generation.is_none() => {
+                let generation = args.next().ok_or(())?.parse::<u64>().map_err(|_| ())?;
+                if generation == 0 {
+                    return Err(());
+                }
+                worker_generation = Some(generation);
             }
             _ => return Err(()),
         }
@@ -553,17 +573,24 @@ fn parse(args: Vec<String>) -> Result<Args, ()> {
     Ok(Args {
         endpoint: endpoint.ok_or(())?,
         token_file: token_file.ok_or(())?,
+        logs_dir,
+        worker_generation: worker_generation.unwrap_or(1),
     })
 }
 /// Internal role dispatch; token *bytes* never appear in arguments/environment/logs.
+///
+/// `--logs-dir` follows the input agent's launch contract. Only scalar lifecycle
+/// observations enter `bifrost-audio.log`; media metadata, keys and PCM never do.
 pub fn run_audio(args: Vec<String>) -> ExitCode {
     let Ok(args) = parse(args) else {
-        eprintln!("usage: bifrost audio --ipc-endpoint <local endpoint> --token-file <private one-use file>");
+        eprintln!("usage: bifrost audio --ipc-endpoint <local endpoint> --token-file <private one-use file> [--logs-dir <path>] [--worker-generation <nonzero integer>]");
         return ExitCode::from(2);
     };
+    lifecycle::init(args.logs_dir.as_deref(), args.worker_generation);
     let token = match contract::take_launch_token(&args.token_file) {
         Ok(token) => token,
         Err(_) => {
+            tracing::error!("audio child launch token unavailable");
             eprintln!("bifrost audio: launch token unavailable");
             return ExitCode::FAILURE;
         }
@@ -577,15 +604,27 @@ pub fn run_audio(args: Vec<String>) -> ExitCode {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(_) => return ExitCode::FAILURE,
+        Err(_) => {
+            tracing::error!("audio child runtime initialization failed");
+            return ExitCode::FAILURE;
+        }
     };
     let result = runtime.block_on(async {
         let io = ipc::transport::connect(&endpoint).await?;
         run_connection(io, token).await
     });
     match result {
-        Ok(ExitReason::Shutdown) => ExitCode::SUCCESS,
-        Ok(_) | Err(_) => {
+        Ok(reason) => {
+            tracing::info!(exit_reason = ?reason, "audio child stopped");
+            if reason == ExitReason::Shutdown {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            // RoleError's Display is a fixed category, never its embedded IPC/native data.
+            tracing::error!(reason = %error, "audio child failed");
             eprintln!("bifrost audio: stopped or lost core");
             ExitCode::FAILURE
         }
