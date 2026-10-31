@@ -316,8 +316,8 @@ async fn auxiliary_export_is_restricted_to_runtime_input_alpn() {
         assert!(pair.server.handle.auxiliary_secret().is_none());
         pair.client.handle.close();
         pair.server.handle.close();
-        pair.client.task.await.unwrap();
-        pair.server.task.await.unwrap();
+        (&mut pair.client.task).await.unwrap();
+        (&mut pair.server.task).await.unwrap();
     }
     std::fs::remove_dir_all(root).unwrap();
 }

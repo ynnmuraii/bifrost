@@ -20,7 +20,7 @@ use crate::{NodeId, Stream, TransportError};
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-bifrost-aux-v1";
 const HKDF_SALT: &[u8] = b"bifrost-aux-hkdf-v1";
 
-pub(crate) type ExporterRoot = Zeroizing<Box<[u8; 32]>>;
+pub(crate) type ExporterRoot = Box<Zeroizing<[u8; 32]>>;
 
 /// Registered, direction-specific uses of auxiliary key material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,7 +218,7 @@ fn derive_key(root: &[u8; 32], purpose: AuxPurpose, context: &[u8]) -> DerivedKe
 }
 
 pub(crate) fn export(stream: &Stream) -> Result<ExporterRoot, TransportError> {
-    let mut root = Zeroizing::new(Box::new([0; 32]));
+    let mut root = Box::new(Zeroizing::new([0; 32]));
     match stream {
         Stream::Client(stream) => {
             let connection = stream.get_ref().1;
@@ -286,7 +286,7 @@ mod tests {
         };
         assert!(state.handle().is_none());
         state.invalidate();
-        state.establish(Zeroizing::new(Box::new([4; 32])), binding);
+        state.establish(Box::new(Zeroizing::new([4; 32])), binding);
         assert!(state.handle().is_none());
     }
 }
