@@ -266,6 +266,9 @@ pub fn decode_status(status: &wire::AudioStatus) -> Result<model::AudioStatus> {
     Ok(model::AudioStatus {
         revision: status.revision,
         enabled: status.enabled,
+        system_sharing_requested: status.system_sharing_requested,
+        system_sharing_error: (!status.system_sharing_error.is_empty())
+            .then(|| status.system_sharing_error.clone()),
         role: decode_role(status.role)?,
         mode: decode_mode(status.mode)?,
         backend,
@@ -380,6 +383,8 @@ pub fn encode_status(
         sessions,
         config: Some(config),
         microphone: Some(microphone),
+        system_sharing_requested: status.system_sharing_requested,
+        system_sharing_error: status.system_sharing_error.clone().unwrap_or_default(),
     };
     validate_status(&result)?;
     Ok(result)
