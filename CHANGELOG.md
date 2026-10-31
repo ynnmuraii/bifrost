@@ -6,6 +6,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 ### English
 
+
 **New**
 
 - Optional shared system audio for Windows and Linux: one Listener plays sound from up to three authorized Sources. Audio is off by default.
@@ -18,6 +19,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Fixes**
 
+- Audio settings and popup warnings show observed path-failure reasons and local/peer UDP ports, with conditional role-scoped guidance rather than unproven firewall blame.
 - A newer pairing attempt visibly cancels the older ceremony on both computers; delayed confirmations cannot approve the replacement.
 - CLI pairing rejection and EOF cancellation now exit unsuccessfully, including when the pairing window belongs to an already-running core.
 - Windows CLI launches without a console or redirected output exit with code 69 and a core-log hint instead of starting an invisible operation.
@@ -43,6 +45,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 ### Русский
 
+
 **Новое**
 
 - Необязательная передача системного звука в Windows и Linux: один Listener воспроизводит звук до трёх разрешённых Sources. По умолчанию звук выключен.
@@ -55,6 +58,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Исправления**
 
+- Настройки и предупреждения плеера показывают наблюдаемую причину отказа аудиопути и местный/удалённый UDP-порты; подсказки учитывают роль и не объявляют брандмауэр виновным без доказательств.
 - Новая попытка сопряжения видимо отменяет старую на обоих компьютерах; запоздавшее подтверждение не может одобрить замену.
 - Отказ от сопряжения в CLI и отмена через EOF завершаются ошибкой, в том числе когда окно сопряжения обслуживает уже запущенная служба.
 - Команды Windows без консоли или перенаправленного вывода завершаются с кодом 69 и подсказкой в журнале вместо невидимой операции.

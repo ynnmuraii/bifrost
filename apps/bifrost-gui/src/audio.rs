@@ -454,12 +454,18 @@ pub fn map_cards(
     status
         .sessions
         .iter()
-        .filter(|s| eligible(s))
-        .map(|s| {
+        .filter_map(|s| {
+            let path = crate::audio_path::AudioPathObservation::from_model(s);
+            let diagnosed_failure = s.local_role == model::AudioRole::Listener
+                && s.state == model::SessionState::Failed
+                && path.is_some_and(|observation| observation.has_diagnostic());
+            if !eligible(s) && !diagnosed_failure {
+                return None;
+            }
             let media = s.media_info.as_ref();
             let playing = media.is_some_and(|m| m.playback == model::PlaybackState::Playing);
             let allowed = media_allowed(s);
-            AudioPlayerCard {
+            Some(AudioPlayerCard {
                 stream_id: stream_id(&s.session_id),
                 source_name: peer_name(members, &s.peer),
                 title: media
@@ -486,7 +492,9 @@ pub fn map_cards(
                     }),
                 muted: s.muted,
                 gain_percent: s.gain_percent,
+                path,
                 state: match s.state {
+                    model::SessionState::Failed => StreamState::Failed,
                     model::SessionState::DevicePaused => StreamState::Degraded,
                     model::SessionState::PathValidation | model::SessionState::Rebuffering => {
                         StreamState::Buffering
@@ -498,7 +506,7 @@ pub fn map_cards(
                     },
                 },
                 background: status.mode == model::AudioMode::FollowFocus && !s.focus_primary,
-            }
+            })
         })
         .collect()
 }

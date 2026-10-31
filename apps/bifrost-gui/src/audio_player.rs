@@ -18,9 +18,10 @@ pub enum StreamState {
     Ready,
     Buffering,
     Degraded,
+    Failed,
 }
 
-/// One active Source stream, populated only from authoritative status.
+/// One Source stream or diagnosed failed Listener path, populated only from authoritative status.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AudioPlayerCard {
     pub stream_id: String,
@@ -40,6 +41,7 @@ pub struct AudioPlayerCard {
     pub muted: bool,
     pub gain_percent: u8,
     pub state: StreamState,
+    pub path: Option<crate::audio_path::AudioPathObservation>,
     /// Follow Focus background streams remain visible, with reduced emphasis.
     pub background: bool,
 }

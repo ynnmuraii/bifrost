@@ -146,7 +146,19 @@ fn draw_card(
     {
         out.push(Action::Stop(c.stream_id.clone()));
     }
-    let subtitle = if title.is_some() {
+    let unavailable =
+        c.state == StreamState::Failed && c.path.is_some_and(|path| path.has_diagnostic());
+    let subtitle = if unavailable {
+        if title.is_some() {
+            format!(
+                "{} · {}",
+                text(lang, Key::AudioPathUnavailable),
+                c.source_name
+            )
+        } else {
+            text(lang, Key::AudioPathUnavailable).to_owned()
+        }
+    } else if title.is_some() {
         c.subtitle
             .as_ref()
             .filter(|s| !s.trim().is_empty())
@@ -177,6 +189,8 @@ fn draw_card(
         }
         StreamState::Buffering => Key::AudioBuffering,
         StreamState::Degraded => Key::AudioDegraded,
+        StreamState::Failed if unavailable => Key::AudioPathUnavailable,
+        StreamState::Failed => Key::AudioDegraded,
     };
     let dot = Pos2::new(right - 2.0, top + 31.0);
     ui.painter().circle_filled(
@@ -189,14 +203,23 @@ fn draw_card(
         },
     );
     let health = ui.interact(
-        Rect::from_center_size(dot, Vec2::splat(12.0)),
+        Rect::from_min_max(
+            Pos2::new(left, top + 23.0),
+            Pos2::new(right + 4.0, top + 41.0),
+        ),
         ui.id().with("health"),
         Sense::hover(),
     );
-    health.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text(lang, state_key))
+    let path_tooltip = c.path.map(|path| {
+        format!(
+            "{}\n{}",
+            text(lang, state_key),
+            path.tooltip(lang, &c.source_name)
+        )
     });
-    health.on_hover_text(text(lang, state_key));
+    let health_text = path_tooltip.as_deref().unwrap_or(text(lang, state_key));
+    health.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, health_text));
+    health.on_hover_text(health_text);
     if has_progress(c) {
         let y = top + 57.0;
         let elapsed = c.position_ms.unwrap_or(0).min(c.duration_ms.unwrap_or(0));
