@@ -15,6 +15,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Disable TLS session resumption so every runtime and pairing connection re-runs certificate pin verification.
 - Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
 - Fix boxed auxiliary exporter storage with the locked zeroize version while retaining a stable heap allocation and erasure before deallocation.
+- Keep Unix-only audio-child test helpers out of Windows builds so all-target clippy remains warning-free.
+- Avoid Winsock's coarse receive-timeout pacing in Windows audio workers; poll nonblocking UDP with a short idle wait so 10 ms media frames are not throttled by 16 ms socket waits.
 
 **New**
 
@@ -39,6 +41,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Add a separate private audio-worker protobuf/AudioLink contract with bounded commands, version/generation/sequence checks, explicit backend probing, one-use secret extraction and recursive Debug redaction. Reuse existing same-user IPC endpoints; no samples or secrets enter GUI messages.
 - Add the internal audio child role behind the default-enabled binary `audio` feature. It lazily owns native/Dry backends and at most three authorized UDP sessions, revokes media on core silence/disconnect, rejects reused session/key material, and pushes bounded actual capture/send observations. No native device is opened before an explicit command; core supervision remains a separate integration step.
+- Add an explicitly audible Windows audio-child E2E example with same-user named-pipe authorization, encrypted UDP, process-tree exclusion and endpoint-loopback verification of a listener-only tone tail. Diagnostic capture requests 48 kHz stereo conversion without changing endpoint settings.
 
 ### Русский
 
@@ -51,6 +54,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Возобновление TLS отключено: каждое рабочее и сопрягающее соединение заново проверяет закреплённый сертификат.
 - Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
 - Исправлено хранение корневого секрета экспорта с закреплённой версией zeroize: сохраняются стабильное размещение в куче и стирание до освобождения памяти.
+- Unix-only вспомогательный метод тестов аудиопроцесса исключён из сборки Windows, чтобы clippy всех целей не выдавал предупреждение.
+- Аудиопроцессы Windows используют неблокирующий UDP с коротким ожиданием пустой очереди: грубый таймер приёма Winsock больше не ограничивает отправку кадров 10 мс ожиданиями около 16 мс.
 
 **Новое**
 
@@ -75,6 +80,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Добавлен отдельный закрытый контракт protobuf/AudioLink аудиопроцесса с ограниченными командами, проверкой версии/поколения/последовательности, явным запросом проверки бэкенда, одноразовым извлечением секретов и скрытием их в Debug. Используются существующие локальные IPC-каналы того же пользователя; сэмплы и секреты не попадают в GUI.
 - Добавлена внутренняя роль дочернего аудиопроцесса под включённой по умолчанию функцией сборки `audio`. Бэкенды native/Dry создаются только по запросу; не более трёх разрешённых UDP-сеансов останавливаются при потере core, повторное использование сеансов/ключей отклоняется, фактические захват/отправка передаются в ограниченных сводках. До явной команды устройства не открываются; надзор core интегрируется отдельно.
+- Добавлен явно запускаемый звуковой E2E-пример аудиопроцесса Windows: авторизация через локальные named pipes, шифрованный UDP, исключение дерева процесса и проверка тона слушателя через endpoint loopback после остановки источника. Диагностический захват запрашивает преобразование в 48 кГц stereo без изменения настроек устройства.
 
 ## 0.4.0 — 2026-10-30
 

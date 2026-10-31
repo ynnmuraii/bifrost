@@ -619,8 +619,10 @@ dependencies = [
  "platform-audio-win",
  "protocol",
  "ring",
+ "rtrb",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
