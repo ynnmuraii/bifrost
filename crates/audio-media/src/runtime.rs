@@ -16,7 +16,7 @@ use audio_backend::{
 use audio_model::{
     jitter::Profile,
     packet::{HEADER_LEN, MAX_DATAGRAM_LEN},
-    status::{AudioHealth, StreamHealth},
+    status::{AudioHealth, ClockSource, DriftDiagnostics, StreamHealth},
     Header, PacketKind,
 };
 use ring::rand::{SecureRandom, SystemRandom};
@@ -40,7 +40,6 @@ pub use listener_group::ListenerGroup;
 pub const PCM_RING_SAMPLES: usize = 32_768;
 pub const EVENT_CAPACITY: usize = 16;
 pub const STOP_DEADLINE: Duration = Duration::from_secs(2);
-const IO_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// Socket is bound by the caller; peer must match the authenticated parent's IP and accepted port.
 /// The engine pins that complete tuple. Authenticated rebinding is intentionally unsupported.
@@ -85,6 +84,10 @@ pub struct HealthSnapshot {
     pub sending: bool,
     pub rejected_datagrams: u64,
     pub capture_dropped_frames: u64,
+    pub drift: Option<DriftDiagnostics>,
+    pub clock_source: ClockSource,
+    /// Worker loop entries, including notifications and deadline wakes; not native callbacks.
+    pub worker_wakeups: u64,
     pub native: StreamSnapshot,
 }
 #[derive(Debug)]
@@ -126,6 +129,7 @@ struct Stats {
     state: StreamHealth,
     sent: u64,
     rejected: u64,
+    drift: Option<DriftDiagnostics>,
 }
 struct Shared {
     stopped: AtomicBool,
@@ -148,6 +152,9 @@ struct Shared {
     authorized: Arc<AtomicBool>,
     clock: Instant,
     capture_frames: AtomicU64,
+    capture_clock_ns: AtomicU64,
+    clock_source: AtomicU8,
+    worker_wakeups: AtomicU64,
     last_capture_ms: AtomicU64,
     sent_media_packets: AtomicU64,
     last_send_ms: AtomicU64,
@@ -183,6 +190,9 @@ impl Shared {
             authorized,
             clock: Instant::now(),
             capture_frames: AtomicU64::new(0),
+            capture_clock_ns: AtomicU64::new(0),
+            clock_source: AtomicU8::new(ClockSource::Unknown as u8),
+            worker_wakeups: AtomicU64::new(0),
             last_capture_ms: AtomicU64::new(0),
             sent_media_packets: AtomicU64::new(0),
             last_send_ms: AtomicU64::new(0),
@@ -193,6 +203,7 @@ impl Shared {
                 state: StreamHealth::Buffering,
                 sent: 0,
                 rejected: 0,
+                drift: None,
             }),
         }
     }
@@ -320,7 +331,12 @@ impl<S: Stream + 'static> MediaSession<S> {
                         let count = (u128::from(position.saturating_sub(base)) * 48_000
                             / u128::from(frequency))
                         .min(u128::from(u64::MAX)) as u64;
-                        self.shared.render_clock.fetch_max(count, Ordering::AcqRel);
+                        let previous = self.shared.render_clock.fetch_max(count, Ordering::AcqRel);
+                        if count > previous {
+                            self.shared
+                                .clock_source
+                                .store(ClockSource::RenderDevicePosition as u8, Ordering::Release);
+                        }
                     }
                 }
             }
@@ -362,6 +378,9 @@ impl<S: Stream + 'static> MediaSession<S> {
                 .capture_dropped
                 .load(Ordering::Acquire)
                 .saturating_add(self.last_native.dropped_capture_frames),
+            drift: stats.drift,
+            clock_source: ClockSource::from_code(self.shared.clock_source.load(Ordering::Acquire)),
+            worker_wakeups: self.shared.worker_wakeups.load(Ordering::Relaxed),
             native: self.last_native,
         }
     }
@@ -455,12 +474,52 @@ fn make_session<S: Stream + 'static>(
         event_tx,
         workers: Vec::with_capacity(2),
         native_stop: None,
-        initial_position: snapshot.device_position,
+        initial_position: if source {
+            None
+        } else {
+            snapshot.device_position
+        },
         last_native: snapshot,
         source,
         group_native: None,
         group_owner: None,
         stop_attempted: false,
+    }
+}
+
+#[derive(Default)]
+struct CaptureClock {
+    previous_host: Option<u64>,
+    previous_duration: u64,
+    elapsed_ns: u64,
+}
+
+impl CaptureClock {
+    fn advance(
+        &mut self,
+        timestamp: u64,
+        valid: bool,
+        frames: usize,
+        rate: u32,
+    ) -> (u64, ClockSource) {
+        let duration = (frames as u64).saturating_mul(1_000_000_000) / u64::from(rate.max(1));
+        let host_delta = self
+            .previous_host
+            .filter(|previous| valid && timestamp > *previous)
+            .map(|previous| timestamp - previous);
+        let source = if valid && (self.previous_host.is_none() || host_delta.is_some()) {
+            ClockSource::CaptureHostTimestamp
+        } else {
+            ClockSource::CaptureCallbackFrames
+        };
+        self.elapsed_ns = self
+            .elapsed_ns
+            .saturating_add(host_delta.unwrap_or(self.previous_duration))
+            .saturating_add(duration)
+            .saturating_sub(self.previous_duration);
+        self.previous_host = valid.then_some(timestamp);
+        self.previous_duration = duration;
+        (self.elapsed_ns, source)
     }
 }
 
@@ -489,6 +548,7 @@ where
     let (events_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
     let (mut producer, consumer) = RingBuffer::<f32>::new(PCM_RING_SAMPLES);
     let callback_shared = shared.clone();
+    let mut capture_clock = CaptureClock::default();
     let mut stream = backend.start_capture(
         spec,
         Box::new(move |block| {
@@ -512,8 +572,17 @@ where
                 callback_shared
                     .callback_invalid
                     .store(true, Ordering::Release);
+                callback_shared.notification.notify();
                 return;
             }
+            // Process-loopback position may stay constant: only host time or callback frames
+            // advance the capture clock. Device position is deliberately never consulted.
+            let (clock_ns, source) = capture_clock.advance(
+                block.timestamp_ns,
+                block.timestamp_valid,
+                block.frames,
+                block.format.sample_rate,
+            );
             if block.discontinuity {
                 callback_shared
                     .capture_discontinuities
@@ -531,6 +600,12 @@ where
             for &sample in block.samples {
                 let _ = producer.push(sample);
             }
+            callback_shared
+                .capture_clock_ns
+                .store(clock_ns, Ordering::Release);
+            callback_shared
+                .clock_source
+                .store(source as u8, Ordering::Release);
             callback_shared.notification.notify();
         }),
     )?;
@@ -665,12 +740,14 @@ impl Context {
     fn receive(&mut self, packet: &mut [u8]) -> Result<Option<usize>, StopReason> {
         match self.endpoint.try_recv(packet) {
             Ok(Some(n)) => Ok(Some(n)),
-            Ok(None) => {
-                self.shared.notification.wait_timeout(IO_TIMEOUT);
-                Ok(None)
-            }
+            Ok(None) => Ok(None),
             Err(_) => Err(StopReason::NetworkFailure),
         }
+    }
+    fn wait_until(&self, deadline: Instant) {
+        self.shared
+            .notification
+            .wait_timeout(deadline.saturating_duration_since(Instant::now()));
     }
     fn finish(&self, result: Result<(), StopReason>) {
         if let Err(reason) = result {
@@ -714,6 +791,15 @@ impl PathState {
             validated: false,
             last_reply: None,
         })
+    }
+    fn deadline(&self) -> Option<Instant> {
+        if self.validated {
+            None
+        } else if self.attempts < 3 {
+            Some(self.next.min(self.start + Duration::from_secs(2)))
+        } else {
+            Some(self.start + Duration::from_secs(2))
+        }
     }
     fn probe(&mut self) -> Result<Option<[u8; 16]>, StopReason> {
         if self.validated {
@@ -783,8 +869,13 @@ impl SourceWorker {
         let mut next_frame = Instant::now();
         let mut next_keepalive = Instant::now();
         let mut dropped = 0;
+        let mut capture_epoch = None;
         let mut discontinuities = 0;
         while !self.context.shared.is_stopped() {
+            self.context
+                .shared
+                .worker_wakeups
+                .fetch_add(1, Ordering::Relaxed);
             if self.context.shared.callback_invalid.load(Ordering::Acquire) {
                 self.context.shared.invalidate(&self.context.events);
                 return Err(StopReason::DeviceInvalidated);
@@ -813,10 +904,7 @@ impl SourceWorker {
                     .map_err(crypto_reason)?;
                 self.context.send(&outgoing[..n])?;
             }
-            for _ in 0..8 {
-                let Some(n) = self.context.receive(&mut packet)? else {
-                    break;
-                };
+            while let Some(n) = self.context.receive(&mut packet)? {
                 match self.opener.open(&mut packet[..n], |_| true) {
                     Ok((header, payload)) => {
                         if self.path.control(header, payload) {
@@ -847,7 +935,8 @@ impl SourceWorker {
                 }
             }
             if !self.path.validated {
-                thread::sleep(Duration::from_millis(1));
+                self.context
+                    .wait_until(self.path.deadline().expect("unvalidated path deadline"));
                 continue;
             }
             self.context.shared.started(&self.context.events);
@@ -890,6 +979,23 @@ impl SourceWorker {
                 .converter
                 .as_ref()
                 .map_or(self.frame, NativeRate::input_frames);
+            if self.input.slots() >= needed * 2 {
+                let clock = Duration::from_nanos(
+                    self.context.shared.capture_clock_ns.load(Ordering::Acquire),
+                );
+                let epoch = *capture_epoch.get_or_insert_with(|| {
+                    Instant::now()
+                        .checked_sub(clock)
+                        .unwrap_or_else(Instant::now)
+                });
+                let queued = Duration::from_nanos(
+                    (self.input.slots() / 2) as u64 * 1_000_000_000 / u64::from(self.rate),
+                );
+                // Host/QPC progression (or callback-frame fallback) bounds the oldest PCM's
+                // send time, while the absolute media grid still prevents catch-up bursts.
+                let capture_due = epoch + clock.saturating_sub(queued);
+                next_frame = next_frame.max(capture_due);
+            }
             if self.input.slots() >= needed * 2 && Instant::now() >= next_frame {
                 for sample in &mut input[..needed * 2] {
                     *sample = self.input.pop().map_err(|_| StopReason::WorkerFailed)?;
@@ -910,20 +1016,22 @@ impl SourceWorker {
                     .map_err(media_reason)?;
                 self.context.send(&outgoing[..n])?;
                 next_frame += frame_duration;
-                if Instant::now().saturating_duration_since(next_frame) > frame_duration * 2 {
+                if Instant::now() >= next_frame {
+                    // Never send a catch-up burst after a stalled callback or scheduler.
                     next_frame = Instant::now() + frame_duration;
                 }
             }
-            // The absolute media grid, not receive timeouts or sleep durations, owns pacing.
-            // Poll the capture ring at most every millisecond without busy-spinning.
-            let wait = next_frame
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(1));
-            thread::sleep(if wait.is_zero() {
-                Duration::from_millis(1)
+            let needed = self
+                .converter
+                .as_ref()
+                .map_or(self.frame, NativeRate::input_frames);
+            // An expired media deadline cannot wake us when capture has no complete frame.
+            let deadline = if self.input.slots() >= needed * 2 {
+                next_keepalive.min(next_frame)
             } else {
-                wait
-            });
+                next_keepalive
+            };
+            self.context.wait_until(deadline);
         }
         Ok(())
     }
@@ -962,8 +1070,17 @@ impl ReceiveWorker {
         let mut outgoing = [0; MAX_DATAGRAM_LEN];
         let mut next_report = Instant::now();
         while !self.context.shared.is_stopped() {
+            self.context
+                .shared
+                .worker_wakeups
+                .fetch_add(1, Ordering::Relaxed);
             self.send_probe(&mut outgoing)?;
-            if let Some(n) = self.context.receive(&mut packet)? {
+            let mut drained = 0;
+            while drained < 64 && !self.context.shared.is_stopped() {
+                let Some(n) = self.context.receive(&mut packet)? else {
+                    break;
+                };
+                drained += 1;
                 let now = self.context.shared.render_clock.load(Ordering::Acquire);
                 let result = lock(&self.receiver).receive(now, &mut packet[..n], |header| {
                     header.kind != PacketKind::Opus || self.path.validated
@@ -1025,6 +1142,12 @@ impl ReceiveWorker {
                     next_report = Instant::now() + Duration::from_secs(1);
                 }
             }
+            // Revisit stop/path/report deadlines even under a continuously full queue.
+            // A full batch can leave queued packets after their notification was consumed.
+            if drained < 64 {
+                self.context
+                    .wait_until(self.path.deadline().unwrap_or(next_report));
+            }
         }
         Ok(())
     }
@@ -1033,6 +1156,125 @@ impl ReceiveWorker {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+    #[test]
+    fn exhausted_path_attempts_wait_for_timeout_not_expired_probe() {
+        let start = Instant::now();
+        let mut path = PathState::new(start).unwrap();
+        path.attempts = 3;
+        path.next = start - Duration::from_secs(1);
+        assert_eq!(path.deadline(), Some(start + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn constant_capture_position_host_clock_and_fallback_keep_media_flowing() {
+        use audio_backend::CaptureBlock;
+        use zeroize::Zeroizing;
+        for valid in [true, false] {
+            let socket =
+                MediaSocket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let shared = Arc::new(Shared::new(Arc::new(AtomicBool::new(true))));
+            let endpoint = socket
+                .register(
+                    [8; 16],
+                    peer.local_addr().unwrap(),
+                    shared.socket_rejected.clone(),
+                    shared.notification.clone(),
+                )
+                .unwrap();
+            let (events, _events_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+            let (mut producer, input) = RingBuffer::new(PCM_RING_SAMPLES);
+            let keys = SessionKeys::new(
+                Endpoint::MediaSender,
+                [8; 16],
+                0,
+                DirectionMaterial::new(Zeroizing::new([1; 32]), Zeroizing::new([2; 4])),
+                DirectionMaterial::new(Zeroizing::new([3; 32]), Zeroizing::new([4; 4])),
+            )
+            .unwrap();
+            let start = Instant::now();
+            let mut path = PathState::new(start).unwrap();
+            path.validated = true;
+            let worker = SourceWorker {
+                context: Context {
+                    endpoint,
+                    shared: shared.clone(),
+                    events,
+                    start,
+                },
+                sender: Sender::new(Profile::Ethernet, keys.send, 0).unwrap(),
+                opener: keys.receive,
+                input,
+                converter: None,
+                frame: 480,
+                rate: 48_000,
+                path,
+            };
+            let worker = thread::spawn(move || worker.run());
+            let samples = [0.0; 960];
+            let mut clock = CaptureClock::default();
+            let mut previous = 0;
+            for index in 0..30 {
+                let block = CaptureBlock {
+                    samples: &samples,
+                    frames: 480,
+                    format: AudioFormat {
+                        sample_rate: 48_000,
+                        channels: 2,
+                    },
+                    timestamp_ns: 9_000_000_000 + index * 10_000_000,
+                    timestamp_valid: valid,
+                    device_position: Some(0),
+                    discontinuity: false,
+                };
+                let (time, source) = clock.advance(
+                    block.timestamp_ns,
+                    block.timestamp_valid,
+                    block.frames,
+                    block.format.sample_rate,
+                );
+                assert!(time > previous);
+                previous = time;
+                assert_eq!(
+                    source,
+                    if valid {
+                        ClockSource::CaptureHostTimestamp
+                    } else {
+                        ClockSource::CaptureCallbackFrames
+                    }
+                );
+                shared.capture_clock_ns.store(time, Ordering::Release);
+                for &sample in block.samples {
+                    producer.push(sample).unwrap();
+                }
+                shared.notification.notify();
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(shared.sent_media_packets.load(Ordering::Acquire) >= 28);
+            let before_idle = shared.worker_wakeups.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(200));
+            assert!(shared.worker_wakeups.load(Ordering::Relaxed) - before_idle <= 4);
+            assert!(shared.worker_wakeups.load(Ordering::Relaxed) < 160);
+            let stopped = Instant::now();
+            shared.request_stop(StopReason::User);
+            worker.join().unwrap();
+            assert!(stopped.elapsed() < Duration::from_millis(200));
+        }
+    }
+
+    #[test]
+    fn capture_host_clock_authority_uses_host_delta_and_invalid_time_uses_frames() {
+        let mut clock = CaptureClock::default();
+        assert_eq!(clock.advance(0, true, 480, 48_000).0, 10_000_000);
+        assert_eq!(clock.advance(15_000_000, true, 480, 48_000).0, 25_000_000);
+        assert_eq!(
+            clock.advance(u64::MAX, false, 480, 48_000),
+            (35_000_000, ClockSource::CaptureCallbackFrames),
+        );
+        assert_eq!(clock.advance(0, false, 480, 48_000).0, 45_000_000);
+    }
+
     #[test]
     fn startup_icmp_refusal_never_validates_and_stops_being_transient_after_validation() {
         let socket = MediaSocket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();

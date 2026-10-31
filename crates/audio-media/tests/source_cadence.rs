@@ -107,7 +107,29 @@ fn source_keeps_100_fps_when_control_peer_is_silent() {
         thread::sleep(Duration::from_millis(1));
     }
     let health = source.snapshot();
+    let idle_start = source.snapshot().worker_wakeups;
+    thread::sleep(Duration::from_millis(200));
+    let idle_wakes = source.snapshot().worker_wakeups - idle_start;
+    let stop_start = Instant::now();
     source.stop().unwrap();
+    assert!(stop_start.elapsed() < Duration::from_millis(200));
+    assert!(
+        idle_wakes <= 4,
+        "empty capture ring kept waking: {idle_wakes}"
+    );
+    let wake_rate = health.worker_wakeups as f64 / (warmup + duration).as_secs_f64();
+    let polling_start = Instant::now();
+    let mut polling_wakes = 0;
+    while polling_start.elapsed() < Duration::from_millis(200) {
+        thread::sleep(Duration::from_millis(1));
+        polling_wakes += 1;
+    }
+    let polling_rate = polling_wakes as f64 / polling_start.elapsed().as_secs_f64();
+    println!("source loop wakes/s={wake_rate:.1}; local 1ms polling reference wakes/s={polling_rate:.1}; Windows reported baseline=718 wakes/s; idle wakes/200ms={idle_wakes}");
+    assert!(
+        wake_rate < 718.0 * 0.6,
+        "source still polls excessively: {wake_rate} wakes/s"
+    );
     let fps = measured as f64 / duration.as_secs_f64();
     println!("silent-control source: measured_packets={measured} duration_s=5 fps={fps:.3} capture_dropped_frames={}", health.capture_dropped_frames);
     assert!(replied, "authenticated path never validated");

@@ -16,7 +16,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
 - Fix boxed auxiliary exporter storage with the locked zeroize version while retaining a stable heap allocation and erasure before deallocation.
 - Keep Unix-only audio-child test helpers out of Windows builds so all-target clippy remains warning-free.
-- Avoid Winsock's coarse receive-timeout pacing in Windows audio workers; poll nonblocking UDP with a short idle wait so 10 ms media frames are not throttled by 16 ms socket waits.
+- Keep Source pacing independent of Winsock's coarse receive timeout: shared UDP reception and capture-ring notifications wake media workers without a millisecond polling loop.
 
 **New**
 
@@ -33,6 +33,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling.
 - Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback-only tests cover loss/reorder/injection and device invalidation; core/IPC integration remains disabled.
 - Both audio endpoints immediately authenticate the UDP path; Listener startup attempts its first challenge before returning, enabling Listener-first commit ordering and stateful outbound firewall state. Media remains gated on validation, with the existing three-attempt/500 ms-window/two-second bounds; a two-sided stateful-firewall relay test verifies recovery and audio flow.
+
+**Audio worker timing**
+
+- Source and UDP receiver workers wait on lock-free capture/packet notifications and absolute media/control deadlines instead of idle polling. Capture clock hints prefer valid host/QPC timestamps and never use capture device positions, which may remain constant between process-loopback packets.
 
 **Shared Listener media**
 
@@ -74,7 +78,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
 - Исправлено хранение корневого секрета экспорта с закреплённой версией zeroize: сохраняются стабильное размещение в куче и стирание до освобождения памяти.
 - Unix-only вспомогательный метод тестов аудиопроцесса исключён из сборки Windows, чтобы clippy всех целей не выдавал предупреждение.
-- Аудиопроцессы Windows используют неблокирующий UDP с коротким ожиданием пустой очереди: грубый таймер приёма Winsock больше не ограничивает отправку кадров 10 мс ожиданиями около 16 мс.
+- Темп Source больше не зависит от грубого таймера приёма Winsock: общий UDP-приём и уведомления кольца захвата пробуждают обработчики без миллисекундного опроса.
 
 **Новое**
 
@@ -91,6 +95,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле.
 - Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства; интеграция core/IPC пока не включена.
 - Оба конца аудиосеанса сразу проверяют UDP-путь; Listener пытается отправить первый аутентифицированный запрос до возврата из запуска, позволяя сначала открыть исходящее состояние межсетевого экрана. Медиа остаётся закрытым до проверки пути; сохранены три попытки, окна 500 мс и предел две секунды. Тест с двусторонним stateful-фильтром проверяет восстановление пути и доставку звука.
+
+**Время аудиопроцесса**
+
+- Обработчики Source и UDP-приёма ждут уведомлений захвата/пакетов без блокировок в callback и абсолютных сроков медиа/управления вместо опроса пустых очередей. Часы захвата используют достоверные временные метки host/QPC, а не позиции устройства, которые могут оставаться неизменными между пакетами process-loopback.
 
 **Общий аудиовыход Listener**
 
