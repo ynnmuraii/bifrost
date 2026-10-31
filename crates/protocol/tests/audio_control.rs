@@ -78,7 +78,7 @@ fn stable_tags_enums_and_roundtrips() {
     assert_eq!(wire::Capability::SystemAudioSource as i32, 17);
     assert_eq!(wire::Capability::AudioFocusReportV1 as i32, 19);
     assert_eq!(wire::Capability::AudioListener as i32, 20);
-    for value in [18, 21, 22, 23] {
+    for value in [21, 22] {
         assert!(wire::Capability::try_from(value).is_err());
     }
     assert_eq!(wire::AudioNodeRole::Source as i32, 1);
@@ -451,7 +451,7 @@ fn setup_requires_ids_contributory_nonces_format_epoch_ttl_and_typed_refusal() {
 
 #[test]
 fn complete_encoded_ceiling_precedes_scans_and_unknown_body_is_audio_only() {
-    let unknown = wire::AudioControl::decode(&[8, 1, 0xb2, 1, 0][..]).unwrap(); // unknown body22
+    let unknown = wire::AudioControl::decode(&[8, 1, 0xfa, 3, 0][..]).unwrap(); // unknown body63
     assert_eq!(audio_control(&unknown), Err(AudioViolation::MissingBody));
     assert_eq!(
         audio_control(&wire::AudioControl {
@@ -700,4 +700,391 @@ fn focus_requires_positive_namespace_and_exact_committed_shapes() {
     let mut bad = valid;
     bad.committed = false;
     assert_eq!(check(bad), Err(AudioViolation::Lease));
+}
+
+#[test]
+fn microphone_and_media_append_only_tags_and_roundtrip() {
+    assert_eq!(wire::Capability::MicControlV1 as i32, 18);
+    assert_eq!(wire::Capability::MediaControlV1 as i32, 23);
+    let bodies = [
+        (
+            18,
+            Body::MicState(wire::MicState {
+                group_id: vec![1; 16],
+                revision: 1,
+                ..Default::default()
+            }),
+        ),
+        (
+            19,
+            Body::MicAck(wire::MicAck {
+                group_id: vec![1; 16],
+                request_id: vec![2; 16],
+                revision: 1,
+                result: 0,
+            }),
+        ),
+        (
+            22,
+            Body::MediaInfo(wire::MediaInfo {
+                session_id: vec![3; 16],
+                ..Default::default()
+            }),
+        ),
+        (
+            23,
+            Body::MediaCommand(wire::MediaCommand {
+                request_id: vec![2; 16],
+                session_id: vec![3; 16],
+                token: 1,
+                revision: 1,
+                command: wire::MediaCommandKind::Play as i32,
+            }),
+        ),
+        (
+            24,
+            Body::MediaAck(wire::MediaAck {
+                request_id: vec![2; 16],
+                session_id: vec![3; 16],
+                result: 0,
+            }),
+        ),
+        (
+            27,
+            Body::MicControl(wire::MicControl {
+                group_id: vec![1; 16],
+                request_id: vec![2; 16],
+                expected_revision: 1,
+                op: wire::MicControlOp::SetMute as i32,
+                muted: true,
+                ..Default::default()
+            }),
+        ),
+    ];
+    for (tag, body) in bodies {
+        let message = control(body);
+        assert_eq!(audio_control(&message), Ok(()));
+        let encoded = message.encode_to_vec();
+        let mut bytes = encoded.as_slice();
+        let mut found = false;
+        while !bytes.is_empty() {
+            let (key, ty) = prost::encoding::decode_key(&mut bytes).unwrap();
+            found |= key == tag;
+            prost::encoding::skip_field(ty, key, &mut bytes, Default::default()).unwrap();
+        }
+        assert!(found);
+        assert_eq!(
+            wire::AudioControl::decode(encoded.as_slice()).unwrap(),
+            message
+        );
+    }
+}
+
+#[test]
+fn microphone_shapes_and_unknown_control_enums_are_rejected() {
+    let press = wire::MicControl {
+        group_id: vec![1; 16],
+        request_id: vec![2; 16],
+        expected_revision: 1,
+        op: wire::MicControlOp::Press as i32,
+        press_id: vec![3; 16],
+        challenge: 1,
+        expires_ns: 250_000_000,
+        muted: false,
+    };
+    assert_eq!(
+        audio_control(&control(Body::MicControl(press.clone()))),
+        Ok(())
+    );
+    for bad in [
+        wire::MicControl {
+            group_id: vec![1; 15],
+            ..press.clone()
+        },
+        wire::MicControl {
+            request_id: vec![],
+            ..press.clone()
+        },
+        wire::MicControl {
+            expected_revision: 0,
+            ..press.clone()
+        },
+        wire::MicControl {
+            op: 0,
+            ..press.clone()
+        },
+        wire::MicControl {
+            op: 99,
+            ..press.clone()
+        },
+        wire::MicControl {
+            muted: true,
+            ..press.clone()
+        },
+        wire::MicControl {
+            press_id: vec![],
+            ..press.clone()
+        },
+        wire::MicControl {
+            challenge: 0,
+            ..press.clone()
+        },
+        wire::MicControl {
+            expires_ns: 0,
+            ..press.clone()
+        },
+        wire::MicControl {
+            op: wire::MicControlOp::SetMute as i32,
+            ..press.clone()
+        },
+        wire::MicControl {
+            op: wire::MicControlOp::Release as i32,
+            ..press
+        },
+    ] {
+        assert!(audio_control(&control(Body::MicControl(bad))).is_err());
+    }
+    assert_eq!(
+        audio_control(&control(Body::MicAck(wire::MicAck {
+            group_id: vec![1; 16],
+            request_id: vec![2; 16],
+            revision: 1,
+            result: 99,
+        }))),
+        Err(AudioViolation::Reason)
+    );
+}
+
+#[test]
+fn media_metadata_bounds_clear_shape_and_nested_debug_are_private() {
+    let info = wire::MediaInfo {
+        session_id: vec![3; 16],
+        present: true,
+        token: 1,
+        revision: 1,
+        app: "a".repeat(128),
+        title: "é".repeat(128),
+        subtitle: "s".repeat(256),
+        position_ms: Some(10),
+        duration_ms: Some(20),
+        playback: wire::MediaPlayback::Playing as i32,
+        commands: 31,
+        allow_control: false,
+    };
+    assert_eq!(
+        audio_control(&control(Body::MediaInfo(info.clone()))),
+        Ok(())
+    );
+    for bad in [
+        wire::MediaInfo {
+            app: "a".repeat(129),
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            title: "é".repeat(129),
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            subtitle: "s".repeat(257),
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            title: "private\nmetadata".into(),
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            playback: 99,
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            commands: 32,
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            position_ms: Some(21),
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            present: false,
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            token: 0,
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            revision: 0,
+            ..info.clone()
+        },
+        wire::MediaInfo {
+            session_id: vec![],
+            ..info
+        },
+    ] {
+        assert!(audio_control(&control(Body::MediaInfo(bad))).is_err());
+    }
+    let private = wire::MediaInfo {
+        session_id: vec![3; 16],
+        present: true,
+        token: 0x123456789abcdef,
+        revision: 1,
+        app: "PRIVATE_APP_SENTINEL".into(),
+        title: "PRIVATE_TITLE_SENTINEL".into(),
+        subtitle: "PRIVATE_SUBTITLE_SENTINEL".into(),
+        ..Default::default()
+    };
+    let debug = format!(
+        "{:?}",
+        wire::Envelope {
+            payload: Some(wire::envelope::Payload::AudioControl(control(
+                Body::MediaInfo(private)
+            ))),
+            ..Default::default()
+        }
+    );
+    assert!(debug.contains("REDACTED"));
+    for secret in [
+        "PRIVATE_APP_SENTINEL",
+        "PRIVATE_TITLE_SENTINEL",
+        "PRIVATE_SUBTITLE_SENTINEL",
+        "81985529216486895",
+    ] {
+        assert!(!debug.contains(secret));
+    }
+    assert_eq!(
+        audio_control(&control(Body::MediaInfo(wire::MediaInfo {
+            session_id: vec![3; 16],
+            revision: 12,
+            ..Default::default()
+        }))),
+        Ok(())
+    );
+}
+
+#[test]
+fn control_identifiers_results_and_media_command_enums_are_strict() {
+    let bad_bodies = [
+        Body::MicState(wire::MicState {
+            group_id: vec![1; 15],
+            revision: 1,
+            ..Default::default()
+        }),
+        Body::MicState(wire::MicState {
+            group_id: vec![1; 16],
+            revision: 1,
+            reason: 99,
+            ..Default::default()
+        }),
+        Body::MicState(wire::MicState {
+            group_id: vec![1; 16],
+            revision: 1,
+            controller_node_id: vec![2; 31],
+            ..Default::default()
+        }),
+        Body::MicState(wire::MicState {
+            group_id: vec![1; 16],
+            revision: 1,
+            challenge: 1,
+            expires_ns: 0,
+            ..Default::default()
+        }),
+        Body::MicState(wire::MicState {
+            group_id: vec![1; 16],
+            revision: 1,
+            ptt_active: true,
+            ..Default::default()
+        }),
+        Body::MicAck(wire::MicAck {
+            group_id: vec![1; 16],
+            request_id: vec![2; 15],
+            revision: 1,
+            result: 0,
+        }),
+        Body::MediaCommand(wire::MediaCommand {
+            request_id: vec![1; 16],
+            session_id: vec![2; 15],
+            token: 1,
+            revision: 1,
+            command: 1,
+        }),
+        Body::MediaCommand(wire::MediaCommand {
+            request_id: vec![1; 15],
+            session_id: vec![2; 16],
+            token: 1,
+            revision: 1,
+            command: 1,
+        }),
+        Body::MediaCommand(wire::MediaCommand {
+            request_id: vec![1; 16],
+            session_id: vec![2; 16],
+            token: 0,
+            revision: 1,
+            command: 1,
+        }),
+        Body::MediaCommand(wire::MediaCommand {
+            request_id: vec![1; 16],
+            session_id: vec![2; 16],
+            token: 1,
+            revision: 0,
+            command: 1,
+        }),
+        Body::MediaCommand(wire::MediaCommand {
+            request_id: vec![1; 16],
+            session_id: vec![2; 16],
+            token: 1,
+            revision: 1,
+            command: 0,
+        }),
+        Body::MediaCommand(wire::MediaCommand {
+            request_id: vec![1; 16],
+            session_id: vec![2; 16],
+            token: 1,
+            revision: 1,
+            command: 99,
+        }),
+        Body::MediaAck(wire::MediaAck {
+            request_id: vec![1; 16],
+            session_id: vec![2; 15],
+            result: 0,
+        }),
+        Body::MediaAck(wire::MediaAck {
+            request_id: vec![1; 16],
+            session_id: vec![2; 16],
+            result: 99,
+        }),
+    ];
+    for bad in bad_bodies {
+        assert!(audio_control(&control(bad)).is_err());
+    }
+    for result in 0..=11 {
+        assert_eq!(
+            audio_control(&control(Body::MicAck(wire::MicAck {
+                group_id: vec![1; 16],
+                request_id: vec![2; 16],
+                revision: 1,
+                result,
+            }))),
+            Ok(())
+        );
+        assert_eq!(
+            audio_control(&control(Body::MediaAck(wire::MediaAck {
+                request_id: vec![1; 16],
+                session_id: vec![2; 16],
+                result,
+            }))),
+            Ok(())
+        );
+    }
+    for command in 1..=5 {
+        assert_eq!(
+            audio_control(&control(Body::MediaCommand(wire::MediaCommand {
+                request_id: vec![1; 16],
+                session_id: vec![2; 16],
+                token: 1,
+                revision: 1,
+                command,
+            }))),
+            Ok(())
+        );
+    }
 }

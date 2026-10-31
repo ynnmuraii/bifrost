@@ -22,6 +22,8 @@ pub enum AudioViolation {
     ParentConnection,
     Capability,
     QueueFull,
+    Shape,
+    Metadata,
 }
 
 impl AudioViolation {
@@ -124,6 +126,12 @@ fn epoch(value: u32) -> Result<(), AudioViolation> {
         return Err(AudioViolation::Epoch);
     }
     Ok(())
+}
+
+fn result(value: i32) -> Result<(), AudioViolation> {
+    wire::AudioControlResult::try_from(value)
+        .map(|_| ())
+        .map_err(|_| AudioViolation::Reason)
 }
 
 /// Bound the complete message before any membership/duplicate scans. Envelope and
@@ -264,6 +272,116 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
             }
         }
         Body::FocusRequest(request) => id(&request.group_id, 16)?,
+        Body::MicControl(control) => {
+            id(&control.group_id, 16)?;
+            id(&control.request_id, 16)?;
+            if control.expected_revision == 0 {
+                return Err(AudioViolation::Epoch);
+            }
+            match wire::MicControlOp::try_from(control.op) {
+                Ok(wire::MicControlOp::SetMute) => {
+                    if !control.press_id.is_empty()
+                        || control.challenge != 0
+                        || control.expires_ns != 0
+                    {
+                        return Err(AudioViolation::Shape);
+                    }
+                }
+                Ok(wire::MicControlOp::Press | wire::MicControlOp::Renew) => {
+                    id(&control.press_id, 16)?;
+                    if control.muted || control.challenge == 0 || control.expires_ns == 0 {
+                        return Err(AudioViolation::Shape);
+                    }
+                }
+                Ok(wire::MicControlOp::Release) => {
+                    id(&control.press_id, 16)?;
+                    if control.muted || control.challenge != 0 || control.expires_ns != 0 {
+                        return Err(AudioViolation::Shape);
+                    }
+                }
+                _ => return Err(AudioViolation::Shape),
+            }
+        }
+        Body::MicState(state) => {
+            id(&state.group_id, 16)?;
+            if state.revision == 0 {
+                return Err(AudioViolation::Epoch);
+            }
+            result(state.reason)?;
+            if !state.controller_node_id.is_empty() {
+                id(&state.controller_node_id, 32)?;
+            }
+            if !state.press_id.is_empty() {
+                id(&state.press_id, 16)?;
+            }
+            if (state.challenge == 0) != (state.expires_ns == 0)
+                || (state.ptt_active
+                    && (!state.ptt_enabled || state.muted || state.press_id.is_empty()))
+                || (!state.ptt_active && !state.press_id.is_empty())
+            {
+                return Err(AudioViolation::Shape);
+            }
+        }
+        Body::MicAck(ack) => {
+            id(&ack.group_id, 16)?;
+            id(&ack.request_id, 16)?;
+            if ack.revision == 0 {
+                return Err(AudioViolation::Epoch);
+            }
+            result(ack.result)?;
+        }
+        Body::MediaInfo(info) => {
+            id(&info.session_id, 16)?;
+            if info.app.len() > 128
+                || info.title.len() > 256
+                || info.subtitle.len() > 256
+                || info
+                    .app
+                    .chars()
+                    .chain(info.title.chars())
+                    .chain(info.subtitle.chars())
+                    .any(char::is_control)
+                || wire::MediaPlayback::try_from(info.playback).is_err()
+                || info.commands & !31 != 0
+                || matches!((info.position_ms, info.duration_ms), (Some(p), Some(d)) if p > d)
+            {
+                return Err(AudioViolation::Metadata);
+            }
+            if info.present {
+                if info.token == 0 || info.revision == 0 {
+                    return Err(AudioViolation::Epoch);
+                }
+            } else if info.token != 0
+                || !info.app.is_empty()
+                || !info.title.is_empty()
+                || !info.subtitle.is_empty()
+                || info.position_ms.is_some()
+                || info.duration_ms.is_some()
+                || info.playback != wire::MediaPlayback::Stopped as i32
+                || info.commands != 0
+                || info.allow_control
+            {
+                return Err(AudioViolation::Shape);
+            }
+        }
+        Body::MediaCommand(command) => {
+            id(&command.request_id, 16)?;
+            id(&command.session_id, 16)?;
+            if command.token == 0 || command.revision == 0 {
+                return Err(AudioViolation::Epoch);
+            }
+            match wire::MediaCommandKind::try_from(command.command) {
+                Ok(wire::MediaCommandKind::Unspecified) | Err(_) => {
+                    return Err(AudioViolation::Shape)
+                }
+                Ok(_) => {}
+            }
+        }
+        Body::MediaAck(ack) => {
+            id(&ack.request_id, 16)?;
+            id(&ack.session_id, 16)?;
+            result(ack.result)?;
+        }
         Body::Consent(consent) => {
             id(&consent.group_id, 16)?;
             directions(consent.allowed_directions)?;

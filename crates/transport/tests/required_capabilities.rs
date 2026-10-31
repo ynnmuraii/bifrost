@@ -281,6 +281,8 @@ async fn implemented_requirements_use_static_support_not_runtime_offers() {
             wire::Capability::SystemAudioSource as i32,
             wire::Capability::AudioFocusReportV1 as i32,
             wire::Capability::AudioListener as i32,
+            wire::Capability::MicControlV1 as i32,
+            wire::Capability::MediaControlV1 as i32,
         ] {
             for available in [false, true] {
                 let (mut session, mut remote) = Session::new(

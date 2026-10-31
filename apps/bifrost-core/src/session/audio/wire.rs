@@ -318,7 +318,14 @@ pub fn decode_control(
             request_id: fixed(&r.request_id)?,
             reason: decode_stop_reason(r.reason)?,
         },
-        Body::Focus(_) | Body::FocusRequest(_) => return Err(Error::Unsupported),
+        Body::Focus(_)
+        | Body::FocusRequest(_)
+        | Body::MicControl(_)
+        | Body::MicState(_)
+        | Body::MicAck(_)
+        | Body::MediaInfo(_)
+        | Body::MediaCommand(_)
+        | Body::MediaAck(_) => return Err(Error::Unsupported),
     };
     Ok(DecodedControl::Control { message, extras })
 }

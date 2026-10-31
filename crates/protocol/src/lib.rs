@@ -85,6 +85,14 @@ impl std::fmt::Debug for ipc::MediaInfo {
     }
 }
 
+impl std::fmt::Debug for wire::MediaInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaInfo")
+            .field("metadata", &"[REDACTED]")
+            .finish()
+    }
+}
+
 pub use frame::{
     decode_message, encode, encode_message, encode_to, Channel, DecodeError, Frame, FrameDecoder,
     FrameError, LENGTH_PREFIX_LEN,

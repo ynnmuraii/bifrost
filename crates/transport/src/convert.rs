@@ -50,6 +50,8 @@ pub(crate) const IMPLEMENTED_CAPABILITIES: &[i32] = &[
     wire::Capability::SystemAudioSource as i32,
     wire::Capability::AudioFocusReportV1 as i32,
     wire::Capability::AudioListener as i32,
+    wire::Capability::MicControlV1 as i32,
+    wire::Capability::MediaControlV1 as i32,
 ];
 
 /// A message that cannot be expressed on the wire.
@@ -1110,6 +1112,10 @@ pub struct PeerInfo {
     pub audio_focus_report: bool,
     /// Whether the peer advertises audio rendering (capability 20).
     pub audio_listener: bool,
+    /// Whether the peer supports independent physical microphone control (18).
+    pub mic_control: bool,
+    /// Whether the peer supports consented media-session metadata and commands (23).
+    pub media_control: bool,
 }
 
 impl PeerInfo {
@@ -1187,6 +1193,12 @@ impl PeerInfo {
             audio_listener: hello
                 .capabilities
                 .contains(&(wire::Capability::AudioListener as i32)),
+            mic_control: hello
+                .capabilities
+                .contains(&(wire::Capability::MicControlV1 as i32)),
+            media_control: hello
+                .capabilities
+                .contains(&(wire::Capability::MediaControlV1 as i32)),
         })
     }
 }
@@ -1228,6 +1240,8 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::SystemAudioSource
             | WireCapability::AudioFocusReportV1
             | WireCapability::AudioListener
+            | WireCapability::MicControlV1
+            | WireCapability::MediaControlV1
             | WireCapability::ClipboardSession => {}
         }
     }

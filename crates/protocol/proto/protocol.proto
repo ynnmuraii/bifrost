@@ -86,10 +86,11 @@ enum Capability {
   CAPABILITY_CLIPBOARD_IMAGE = 15;
   CAPABILITY_AUDIO_CONTROL_V1 = 16;
   CAPABILITY_SYSTEM_AUDIO_SOURCE = 17;
-  // Future: 18 mic-control.
+  CAPABILITY_MIC_CONTROL_V1 = 18;
   CAPABILITY_AUDIO_FOCUS_REPORT_V1 = 19;
   CAPABILITY_AUDIO_LISTENER = 20;
-  // Future: 21 mic-stream, 22 virtual-mic, 23 media-control.
+  // Future: 21 mic-stream, 22 virtual-mic.
+  CAPABILITY_MEDIA_CONTROL_V1 = 23;
 }
 
 enum SessionKind {
@@ -190,11 +191,16 @@ message AudioControl {
     AudioKeepalive keepalive = 15;
     AudioReport report = 16;
     AudioFocusSnapshot focus = 17;
-    // Future: 18 mic-state, 19 mic-ack.
+    MicState mic_state = 18;
+    MicAck mic_ack = 19;
     AudioConsentChanged consent = 20;
     AudioFocusRequest focus_request = 21;
+    MediaInfo media_info = 22;
+    MediaCommand media_command = 23;
+    MediaAck media_ack = 24;
     AudioStartRequest start_request = 25; // Source asks Listener to create a normal Offer
     AudioStartRefusal start_refusal = 26; // request correlation, never a session stop
+    MicControl mic_control = 27;
   }
 }
 message AudioFocusSnapshot {
@@ -339,6 +345,98 @@ message AudioConsentChanged {
   bytes group_id = 1;
   uint32 consent_revision = 2;
   uint32 allowed_directions = 3;
+}
+
+enum AudioControlResult {
+  AUDIO_CONTROL_RESULT_OK = 0;
+  AUDIO_CONTROL_RESULT_DISABLED = 1;
+  AUDIO_CONTROL_RESULT_CONSENT_REQUIRED = 2;
+  AUDIO_CONTROL_RESULT_STALE_REVISION = 3;
+  AUDIO_CONTROL_RESULT_UNSUPPORTED = 4;
+  AUDIO_CONTROL_RESULT_DEVICE_GONE = 5;
+  AUDIO_CONTROL_RESULT_CONFLICT = 6;
+  AUDIO_CONTROL_RESULT_EXPIRED = 7;
+  AUDIO_CONTROL_RESULT_BUSY = 8;
+  AUDIO_CONTROL_RESULT_TIMEOUT = 9;
+  AUDIO_CONTROL_RESULT_CANCELLED = 10;
+  AUDIO_CONTROL_RESULT_INVALID = 11;
+}
+enum MicControlOp {
+  MIC_CONTROL_OP_UNSPECIFIED = 0;
+  MIC_CONTROL_OP_SET_MUTE = 1;
+  MIC_CONTROL_OP_PRESS = 2;
+  MIC_CONTROL_OP_RENEW = 3;
+  MIC_CONTROL_OP_RELEASE = 4;
+}
+message MicControl {
+  bytes group_id = 1;
+  bytes request_id = 2;
+  uint64 expected_revision = 3;
+  MicControlOp op = 4;
+  bool muted = 5;
+  bytes press_id = 6;
+  uint64 challenge = 7;
+  uint64 expires_ns = 8; // Listener-issued absolute monotonic deadline; echoed unchanged
+}
+message MicState {
+  bytes group_id = 1;
+  uint64 revision = 2;
+  bool muted = 3;
+  bool ptt_enabled = 4;
+  bool ptt_active = 5;
+  bool supported = 6;
+  AudioControlResult reason = 7;
+  bytes controller_node_id = 8;
+  bytes press_id = 9;
+  uint64 challenge = 10;
+  uint64 expires_ns = 11;
+  bool desired_muted = 12;
+}
+message MicAck {
+  bytes group_id = 1;
+  bytes request_id = 2;
+  uint64 revision = 3;
+  AudioControlResult result = 4;
+}
+enum MediaPlayback {
+  MEDIA_PLAYBACK_STOPPED = 0;
+  MEDIA_PLAYBACK_PLAYING = 1;
+  MEDIA_PLAYBACK_PAUSED = 2;
+  MEDIA_PLAYBACK_UNKNOWN = 3;
+}
+enum MediaCommandKind {
+  MEDIA_COMMAND_KIND_UNSPECIFIED = 0;
+  MEDIA_COMMAND_KIND_PLAY = 1;
+  MEDIA_COMMAND_KIND_PAUSE = 2;
+  MEDIA_COMMAND_KIND_PLAY_PAUSE = 3;
+  MEDIA_COMMAND_KIND_NEXT = 4;
+  MEDIA_COMMAND_KIND_PREVIOUS = 5;
+}
+message MediaInfo {
+  bytes session_id = 1;
+  bool present = 2;
+  uint64 token = 3;
+  uint64 revision = 4;
+  string app = 5; // <=128 UTF-8 bytes; never log/persist metadata
+  string title = 6; // <=256
+  string subtitle = 7; // <=256
+  optional uint64 position_ms = 8;
+  optional uint64 duration_ms = 9;
+  MediaPlayback playback = 10;
+  uint32 commands = 11; // Play, Pause, PlayPause, Next, Previous: bits0..4
+  bool allow_control = 12; // Source-authoritative peer permission, not inferred from OS commands.
+}
+message MediaCommand {
+  bytes request_id = 1;
+  bytes session_id = 2;
+  uint64 token = 3;
+  uint64 revision = 4;
+  MediaCommandKind command = 5;
+}
+message MediaAck {
+  bytes request_id = 1;
+  bytes session_id = 2;
+  AudioControlResult result = 3;
 }
 
 // Only a version is supplied: releases are resolved from the receiver's trusted source.

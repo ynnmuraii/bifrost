@@ -789,7 +789,7 @@ async fn malformed_and_unknown_focus_metadata_are_bounded_audio_only_failures() 
     }
     let cases = [
         (malformed.encode_to_vec(), Some(AudioViolation::Epoch)),
-        (vec![8, 1, 0xb2, 1, 0], Some(AudioViolation::MissingBody)),
+        (vec![8, 1, 0xfa, 3, 0], Some(AudioViolation::MissingBody)),
     ];
     let mut seq = 2;
     for (audio, violation) in cases
@@ -855,4 +855,247 @@ async fn malformed_and_unknown_focus_metadata_are_bounded_audio_only_failures() 
     assert_eq!(message(report(&mut rx).await), Inbound::Focus(focus()));
     link.handle.close();
     link.task.abort();
+}
+
+fn mic_media_bodies(cap: i32) -> Vec<wire::AudioControl> {
+    use wire::audio_control::Body;
+    let bodies = if cap == wire::Capability::MicControlV1 as i32 {
+        vec![
+            Body::MicState(wire::MicState {
+                group_id: vec![1; 16],
+                revision: 1,
+                ..Default::default()
+            }),
+            Body::MicAck(wire::MicAck {
+                group_id: vec![1; 16],
+                request_id: vec![2; 16],
+                revision: 1,
+                result: 0,
+            }),
+            Body::MicControl(wire::MicControl {
+                group_id: vec![1; 16],
+                request_id: vec![2; 16],
+                expected_revision: 1,
+                op: wire::MicControlOp::SetMute as i32,
+                muted: true,
+                ..Default::default()
+            }),
+        ]
+    } else {
+        vec![
+            Body::MediaInfo(wire::MediaInfo {
+                session_id: vec![3; 16],
+                present: true,
+                token: 1,
+                revision: 1,
+                app: "player".into(),
+                title: "private title".into(),
+                commands: 31,
+                ..Default::default()
+            }),
+            Body::MediaCommand(wire::MediaCommand {
+                request_id: vec![2; 16],
+                session_id: vec![3; 16],
+                token: 1,
+                revision: 1,
+                command: wire::MediaCommandKind::PlayPause as i32,
+            }),
+            Body::MediaAck(wire::MediaAck {
+                request_id: vec![2; 16],
+                session_id: vec![3; 16],
+                result: 0,
+            }),
+        ]
+    };
+    bodies
+        .into_iter()
+        .map(|body| wire::AudioControl {
+            control_version: 1,
+            body: Some(body),
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mic_and_media_need_only_their_own_bilateral_capability_over_real_tls() {
+    for cap in [
+        wire::Capability::MicControlV1 as i32,
+        wire::Capability::MediaControlV1 as i32,
+    ] {
+        let root = Root::new();
+        let client = root.identity("client");
+        let server = root.identity("server");
+        let (a, b) = streams(&client, &server).await;
+        let (left, mut left_rx) = spawn(a, client.node_id(), server.node_id(), true, vec![cap]);
+        let (right, mut right_rx) = spawn(b, server.node_id(), client.node_id(), false, vec![cap]);
+        let connection = up(report(&mut left_rx).await);
+        assert_eq!(up(report(&mut right_rx).await), connection);
+        for audio in mic_media_bodies(cap) {
+            for handle in [&left.handle, &right.handle] {
+                handle.send_audio_control(audio.clone()).await.unwrap();
+            }
+            for inbound in [
+                message(report(&mut left_rx).await),
+                message(report(&mut right_rx).await),
+            ] {
+                assert_eq!(
+                    inbound,
+                    Inbound::Audio {
+                        message: audio.clone(),
+                        connection_id: connection
+                    }
+                );
+            }
+        }
+        assert!(matches!(
+            left.handle.send_audio_control(stop()).await,
+            Err(TransportError::Audio(AudioViolation::Capability))
+        ));
+        right.handle.send_capabilities(vec![]).await.unwrap();
+        assert!(
+            matches!(message(report(&mut left_rx).await), Inbound::CapabilitiesChanged(caps) if caps.is_empty())
+        );
+        for handle in [&left.handle, &right.handle] {
+            for audio in mic_media_bodies(cap) {
+                assert!(matches!(
+                    handle.send_audio_control(audio).await,
+                    Err(TransportError::Audio(AudioViolation::Capability))
+                ));
+            }
+            handle.send(focus()).await.unwrap();
+        }
+        assert_eq!(message(report(&mut left_rx).await), Inbound::Focus(focus()));
+        assert_eq!(
+            message(report(&mut right_rx).await),
+            Inbound::Focus(focus())
+        );
+        left.handle.close();
+        right.handle.close();
+        left.task.abort();
+        right.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mic_and_media_missing_own_capability_refuse_despite_system_audio_support() {
+    for cap in [
+        wire::Capability::MicControlV1 as i32,
+        wire::Capability::MediaControlV1 as i32,
+    ] {
+        for (left_caps, right_caps) in [(vec![cap, CAP], vec![CAP]), (vec![CAP], vec![cap, CAP])] {
+            let root = Root::new();
+            let client = root.identity("client");
+            let server = root.identity("server");
+            let (a, b) = streams(&client, &server).await;
+            let (left, mut left_rx) = spawn(a, client.node_id(), server.node_id(), true, left_caps);
+            let (right, mut right_rx) =
+                spawn(b, server.node_id(), client.node_id(), false, right_caps);
+            up(report(&mut left_rx).await);
+            up(report(&mut right_rx).await);
+            for handle in [&left.handle, &right.handle] {
+                for audio in mic_media_bodies(cap) {
+                    assert!(matches!(
+                        handle.send_audio_control(audio).await,
+                        Err(TransportError::Audio(AudioViolation::Capability))
+                    ));
+                }
+                handle.send(focus()).await.unwrap();
+            }
+            assert_eq!(message(report(&mut left_rx).await), Inbound::Focus(focus()));
+            assert_eq!(
+                message(report(&mut right_rx).await),
+                Inbound::Focus(focus())
+            );
+            left.handle.close();
+            right.handle.close();
+            left.task.abort();
+            right.task.abort();
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_media_and_missing_mic_cap_are_audio_only_on_real_tls() {
+    let root = Root::new();
+    let client = root.identity("client");
+    let server = root.identity("server");
+    let media = wire::Capability::MediaControlV1 as i32;
+    let (mut raw, b) = streams(&client, &server).await;
+    let (right, mut rx) = spawn(b, server.node_id(), client.node_id(), false, vec![media]);
+    let connection = [8; 16];
+    transport::write_frame(
+        &mut raw,
+        &envelope(
+            connection,
+            1,
+            wire::envelope::Payload::Hello(wire::Hello {
+                node_id: client.node_id().as_bytes().to_vec(),
+                capabilities: vec![media],
+                ..Default::default()
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    transport::read_frame(&mut raw).await.unwrap();
+    assert_eq!(up(report(&mut rx).await), connection);
+    let bad = wire::AudioControl {
+        control_version: 1,
+        body: Some(wire::audio_control::Body::MediaInfo(wire::MediaInfo {
+            session_id: vec![3; 16],
+            present: true,
+            token: 1,
+            revision: 1,
+            title: "x".repeat(257),
+            ..Default::default()
+        })),
+    };
+    let missing = mic_media_bodies(wire::Capability::MicControlV1 as i32).remove(0);
+    for (seq, audio, violation) in [
+        (2, bad, AudioViolation::Metadata),
+        (3, missing, AudioViolation::Capability),
+    ] {
+        transport::write_frame(
+            &mut raw,
+            &envelope(
+                connection,
+                seq,
+                wire::envelope::Payload::AudioControl(audio),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            message(report(&mut rx).await),
+            Inbound::AudioRejected {
+                violation,
+                connection_id: connection
+            }
+        );
+    }
+    transport::write_frame(
+        &mut raw,
+        &envelope(
+            connection,
+            4,
+            wire::envelope::Payload::Ping(wire::Ping { nonce: 99 }),
+        ),
+    )
+    .await
+    .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), transport::read_frame(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        pong.payload,
+        Some(wire::envelope::Payload::Pong(wire::Pong { nonce: 99 }))
+    ));
+    let frame =
+        transport::convert::to_envelope(&focus(), 5, &connection, Some(&[4; 16]), "").unwrap();
+    transport::write_frame(&mut raw, &frame).await.unwrap();
+    assert_eq!(message(report(&mut rx).await), Inbound::Focus(focus()));
+    assert!(!right.task.is_finished());
+    right.handle.close();
+    right.task.abort();
 }

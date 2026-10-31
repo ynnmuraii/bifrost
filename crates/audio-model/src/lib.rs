@@ -6,6 +6,8 @@ pub mod drift;
 pub mod focus;
 pub mod jitter;
 pub mod keys;
+pub mod media;
+pub mod microphone;
 pub mod packet;
 pub mod replay;
 pub mod session;

@@ -36,6 +36,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Exercise isolated multi-core audio with deterministic Dry children, real pairing/consent/group discovery, Source-side starts, shared Listener rendering, lifecycle failures and audio-enabled KVM suites. Unpaired fixtures own process and root cleanup, including pairing-request tests. The hidden Dry-audio switch requires a debug build, dry input and an explicit test root; production does not read the harness-only audio environment flag.
 - Choose each multi-core fixture's input and clipboard endpoints as one simultaneously bound batch, preventing duplicate ephemeral-port numbers before services start.
 - Follow Focus now ducks Listener-local system-audio streams using owner-authenticated committed input focus, including third-PC Listeners and reconnect snapshots. Default debounce is250ms and the gain envelope is150ms; Preparing/Releasing/Blocked and stale owners cannot select a new primary. Unknown focus holds the last primary for two seconds, then returns to equal focus multipliers while preserving user gain/mute. Microphone targeting and OS master volume are unchanged; focus-report capability alone never starts an audio child.
+- Define independent microphone-control/media-control wire capabilities, strict bounded and redacted messages, urgent mute/release admission, and pure Listener-authority PTT and session-scoped media permission policies.
 
 **Audio media internals**
 
@@ -129,6 +130,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлены проверки звука между изолированными core с детерминированными Dry-процессами: настоящее сопряжение, разрешения и поиск группы, запуск со стороны Source, общий рендер Listener, отказы жизненного цикла и KVM со включённым звуком. Несопряжённый стенд сам завершает процессы и удаляет корни, в том числе в тестах запросов сопряжения. Скрытый Dry-переключатель требует отладочной сборки, dry-ввода и явно заданного тестового корня; рабочий бинарник не читает аудиофлаг окружения тестового стенда.
 - Входные и буферные порты многопроцессного стенда выбираются одним одновременно связанным набором, чтобы ОС не выдала один временный порт двум службам до их запуска.
 - Follow Focus приглушает системные потоки у Listener по подтверждённому фокусу ввода от текущего владельца, включая третий ПК и запрос снимка после переподключения. По умолчанию задержка250мс, огибающая громкости150мс; Preparing/Releasing/Blocked и старый владелец не выбирают новый основной поток. Неизвестный фокус сохраняет прежний основной поток две секунды, затем выравнивает множители с сохранением пользовательской громкости и заглушения. Цель микрофона и системная громкость не меняются; возможность отчёта о фокусе сама по себе не запускает аудиопроцесс.
+- Определены отдельные сетевые возможности управления микрофоном и медиаплеером, строгие ограниченные сообщения с сокрытием метаданных, приоритет заглушения/отпускания и чистые политики PTT с владельцем Listener и разрешений медиасеанса.
 
 **Внутренний аудиотракт**
 
