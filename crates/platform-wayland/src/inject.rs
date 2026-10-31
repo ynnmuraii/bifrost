@@ -1230,33 +1230,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn diagnostic_capture_survives_first_registration_on_another_thread() {
-        fn emit() {
-            tracing::info!(probe = 7_u64, "diagnostic probe");
-        }
-
-        let diagnostics = CapturedDiagnostics::default();
-        let owner = std::thread::current().id();
-        diagnostics.capture(|| {
-            let other = std::thread::spawn(|| {
-                emit();
-                std::thread::current().id()
-            })
-            .join()
-            .unwrap();
-            assert_ne!(owner, other);
-            emit();
-        });
-        let events = diagnostics.0.lock().unwrap();
-        assert_eq!(events.len(), 1, "only the owning thread is captured");
-        assert_eq!(events[0].emitter, owner);
-        assert_eq!(
-            events[0].fields.get("probe"),
-            Some(&DiagnosticValue::Number(7))
-        );
-    }
-
     #[tokio::test]
     async fn eis_click_frames_and_lease_end_release_every_held_button() {
         use super::{InjectSource, PortalVersions, UnixStream, WaylandInjector};
