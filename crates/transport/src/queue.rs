@@ -6,6 +6,8 @@
 //! eight-to-one whole-frame fairness. Critical admission overflow closes the link instead
 //! of silently discarding an edge. Pure classification/coalescing helpers below describe
 //! the vocabulary; live admission is implemented by the shared queue state.
+//! Handshake refusal has one reserved slot behind Hello, bypassing readiness without
+//! releasing normal traffic; admitting it discards normal traffic and seals admission.
 
 use focus_router as fr;
 use input_model::InputEvent;
@@ -196,6 +198,12 @@ pub(crate) struct InputSample {
 #[derive(Debug)]
 pub(crate) enum Intent {
     Hello(protocol::wire::Envelope),
+    Refuse {
+        connection_id: [u8; 16],
+        code: protocol::wire::ErrorCode,
+        related_seq: u64,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     Payload(protocol::wire::envelope::Payload),
     Outbound(Outbound),
     Input {
@@ -219,9 +227,11 @@ struct QueueState {
     boundary_seen: bool,
     unpair_allowed: bool,
     closed: bool,
+    refusing: bool,
     ready: bool,
     close_deadline: Option<Instant>,
     hello: Option<Intent>,
+    refusal: Option<Intent>,
     latest: Option<(u64, [u8; 16], InputSample)>,
     admission: u64,
     ordered: VecDeque<(u64, Intent)>,
@@ -258,6 +268,7 @@ impl InputQueue {
                 active_lease: None,
                 accepting: false,
                 closed: false,
+                refusing: false,
                 minimum_generation: 0,
                 boundary_seen: false,
                 unpair_allowed: false,
@@ -265,6 +276,7 @@ impl InputQueue {
                 invalidated_selection: None,
                 ready: false,
                 hello: None,
+                refusal: None,
                 latest: None,
                 close_deadline: None,
                 admission: 0,
@@ -292,8 +304,42 @@ impl InputQueue {
         self.wake.notify_one();
     }
 
+    /// Seals normal admission and reserves one refusal without opening the Hello barrier.
+    /// The writer completes `reply` with whether it successfully wrote the refusal.
+    pub fn refuse(
+        &self,
+        connection_id: [u8; 16],
+        code: protocol::wire::ErrorCode,
+        related_seq: u64,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    ) -> Result<(), crate::TransportError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || state.refusing {
+            return Err(crate::TransportError::LinkClosed);
+        }
+        state.refusing = true;
+        state.accepting = false;
+        state.unpair_allowed = false;
+        state.latest = None;
+        state.ordered.clear();
+        state.urgent.clear();
+        state.auxiliary.clear();
+        state.refusal = Some(Intent::Refuse {
+            connection_id,
+            code,
+            related_seq,
+            reply,
+        });
+        drop(state);
+        self.wake.notify_one();
+        Ok(())
+    }
+
     pub fn ready(&self, unpair_allowed: bool) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || state.refusing {
+            return;
+        }
         state.ready = true;
         state.unpair_allowed = unpair_allowed;
         drop(state);
@@ -304,6 +350,7 @@ impl InputQueue {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
         state.generation = state.generation.wrapping_add(1);
+        state.refusal = None;
         state.latest = None;
         state.ordered.clear();
         state.urgent.clear();
@@ -374,6 +421,7 @@ impl InputQueue {
     pub fn valid_generation(&self, generation: u64) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         !state.closed
+            && !state.refusing
             && generation >= state.minimum_generation
             && state.invalidated_selection != Some(generation)
     }
@@ -385,6 +433,7 @@ impl InputQueue {
     ) -> Result<u64, crate::TransportError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.closed
+            && !state.refusing
             && state.close_deadline.is_none()
             && !state.boundary_seen
             && state.active_lease.is_none()
@@ -392,7 +441,11 @@ impl InputQueue {
             state.active_lease = Some(lease_id);
             state.accepting = true;
         }
-        if state.closed || !state.accepting || state.active_lease != Some(lease_id) {
+        if state.closed
+            || state.refusing
+            || !state.accepting
+            || state.active_lease != Some(lease_id)
+        {
             return Err(crate::TransportError::LinkClosed);
         }
         let generation = state.generation;
@@ -460,7 +513,7 @@ impl InputQueue {
 
     pub fn push(&self, item: Outbound) -> Result<(), crate::TransportError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.closed {
+        if state.closed || state.refusing {
             return Err(crate::TransportError::LinkClosed);
         }
         let admission = state.next_admission()?;
@@ -561,7 +614,7 @@ impl InputQueue {
 
     pub fn urgent(&self, intent: Intent) -> Result<(), crate::TransportError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.closed {
+        if state.closed || state.refusing {
             return Err(crate::TransportError::LinkClosed);
         }
         if matches!(&intent, Intent::Unpair(..)) {
@@ -604,6 +657,12 @@ impl InputQueue {
         }
         if let Some(hello) = state.hello.take() {
             return Some(hello);
+        }
+        if let Some(refusal) = state.refusal.take() {
+            return Some(refusal);
+        }
+        if state.refusing {
+            return None;
         }
         if !state.ready {
             return None;
@@ -686,5 +745,178 @@ impl InputQueue {
         }
         state.input_run = 0;
         state.auxiliary.pop_front().map(|(_, intent)| intent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::wire;
+    use tokio::sync::oneshot;
+
+    const CONNECTION: [u8; 16] = [1; 16];
+    const LEASE: [u8; 16] = [2; 16];
+
+    fn motion() -> InputSample {
+        InputSample {
+            event: InputEvent::PointerAbsolute(input_model::Position::new(1.0, 1.0)),
+            capture_host_us: None,
+            capture_to_enqueue_us: None,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    fn ping() -> Intent {
+        Intent::Payload(wire::envelope::Payload::Ping(wire::Ping { nonce: 1 }))
+    }
+
+    #[tokio::test]
+    async fn refusal_bypasses_readiness_without_releasing_input_and_preserves_reply() {
+        let queue = InputQueue::new(1);
+        queue.input(LEASE, vec![motion()]).unwrap();
+        assert!(queue.pop().is_none());
+        let (reply, receive) = oneshot::channel();
+        queue
+            .refuse(CONNECTION, wire::ErrorCode::UnsupportedVersion, 7, reply)
+            .unwrap();
+        let Some(Intent::Refuse {
+            connection_id,
+            code,
+            related_seq,
+            reply,
+        }) = queue.pop()
+        else {
+            panic!("refusal was blocked by readiness");
+        };
+        assert_eq!(connection_id, CONNECTION);
+        assert_eq!(code, wire::ErrorCode::UnsupportedVersion);
+        assert_eq!(related_seq, 7);
+        assert!(!queue.state.lock().unwrap().ready);
+        assert!(queue.pop().is_none());
+        reply.send(true).unwrap();
+        assert!(receive.await.unwrap());
+    }
+
+    #[test]
+    fn pending_hello_precedes_refusal_even_when_close_has_begun() {
+        let queue = InputQueue::new(1);
+        let hello = wire::Envelope {
+            seq: 1,
+            ..Default::default()
+        };
+        queue.hello(hello.clone());
+        queue.begin_close();
+        let (reply, _receive) = oneshot::channel();
+        queue
+            .refuse(CONNECTION, wire::ErrorCode::InvalidFrame, 2, reply)
+            .unwrap();
+        assert!(matches!(queue.pop(), Some(Intent::Hello(value)) if value == hello));
+        assert!(matches!(queue.pop(), Some(Intent::Refuse { .. })));
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn refusal_is_bounded_and_cannot_be_replaced_after_pop() {
+        let queue = InputQueue::new(1);
+        let (reply, _receive) = oneshot::channel();
+        queue
+            .refuse(CONNECTION, wire::ErrorCode::InvalidFrame, 1, reply)
+            .unwrap();
+        for pop_first in [false, true] {
+            if pop_first {
+                assert!(matches!(
+                    queue.pop(),
+                    Some(Intent::Refuse { related_seq: 1, .. })
+                ));
+            }
+            let (reply, _receive) = oneshot::channel();
+            assert!(matches!(
+                queue.refuse(CONNECTION, wire::ErrorCode::InvalidSequence, 2, reply),
+                Err(crate::TransportError::LinkClosed)
+            ));
+        }
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn refusal_discards_all_normal_traffic_and_seals_every_admission_path() {
+        let queue = InputQueue::new(2);
+        queue.ready(true);
+        let mut edge = motion();
+        edge.event = InputEvent::Button {
+            button: input_model::MouseButton::Left,
+            state: input_model::KeyState::Down,
+        };
+        queue.input(LEASE, vec![edge]).unwrap();
+        let Some(Intent::Input { generation, .. }) = queue.pop() else {
+            panic!("input selection missing");
+        };
+        queue.input(LEASE, vec![motion()]).unwrap();
+        queue
+            .push(Outbound::Guaranteed(fr::Message::EnterCommit {
+                lease_id: LEASE,
+            }))
+            .unwrap();
+        queue.urgent(ping()).unwrap();
+        queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
+        let (reply, _receive) = oneshot::channel();
+        queue
+            .refuse(CONNECTION, wire::ErrorCode::InvalidFrame, 1, reply)
+            .unwrap();
+        {
+            let state = queue.state.lock().unwrap();
+            assert!(state.latest.is_none());
+            assert!(state.ordered.is_empty());
+            assert!(state.urgent.is_empty());
+            assert!(state.auxiliary.is_empty());
+        }
+        assert!(!queue.valid_generation(generation));
+        assert!(!queue.unpair_allowed());
+        queue.ready(true);
+        assert!(!queue.unpair_allowed());
+        assert!(matches!(
+            queue.input(LEASE, vec![motion()]),
+            Err(crate::TransportError::LinkClosed)
+        ));
+        assert!(matches!(
+            queue.input([3; 16], vec![motion()]),
+            Err(crate::TransportError::LinkClosed)
+        ));
+        assert!(matches!(
+            queue.push(Outbound::CapabilitiesChanged(vec![])),
+            Err(crate::TransportError::LinkClosed)
+        ));
+        assert!(matches!(
+            queue.push(Outbound::Guaranteed(fr::Message::EnterCommit {
+                lease_id: LEASE
+            })),
+            Err(crate::TransportError::LinkClosed)
+        ));
+        assert!(matches!(
+            queue.urgent(ping()),
+            Err(crate::TransportError::LinkClosed)
+        ));
+        assert!(matches!(queue.pop(), Some(Intent::Refuse { .. })));
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn abort_drops_pending_refusal_reply_and_rejects_refusal() {
+        let queue = InputQueue::new(1);
+        let (reply, mut receive) = oneshot::channel();
+        queue
+            .refuse(CONNECTION, wire::ErrorCode::InvalidFrame, 1, reply)
+            .unwrap();
+        queue.abort();
+        assert!(matches!(
+            receive.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(queue.pop().is_none());
+        let (reply, _receive) = oneshot::channel();
+        assert!(matches!(
+            queue.refuse(CONNECTION, wire::ErrorCode::InvalidFrame, 2, reply),
+            Err(crate::TransportError::LinkClosed)
+        ));
     }
 }

@@ -1172,3 +1172,34 @@ fn clipboard_routing_conversion_validates_metadata_and_lease_scope() {
     }));
     assert!(inbound_from_envelope(&envelope).is_err());
 }
+
+#[test]
+fn capability_changes_are_bounded_before_they_are_copied() {
+    use transport::convert::{inbound_from_envelope, Inbound};
+    let limit = protocol::limits::MAX_HELLO_CAPABILITIES;
+    let mut envelope = wire::Envelope {
+        payload: Some(wire::envelope::Payload::CapabilitiesChanged(
+            wire::CapabilitiesChanged {
+                capabilities: vec![999; limit],
+            },
+        )),
+        ..Default::default()
+    };
+    assert_eq!(
+        inbound_from_envelope(&envelope),
+        Ok(Inbound::CapabilitiesChanged(vec![999; limit]))
+    );
+    envelope.payload = Some(wire::envelope::Payload::CapabilitiesChanged(
+        wire::CapabilitiesChanged {
+            capabilities: vec![999; limit + 1],
+        },
+    ));
+    let Err(ConvertError::Violation(violation)) = inbound_from_envelope(&envelope) else {
+        panic!("overbound capability change must be a wire violation");
+    };
+    assert_eq!(
+        violation,
+        protocol::validate::Violation::TooManyCapabilities { got: limit + 1 }
+    );
+    assert_eq!(violation.error_code(), wire::ErrorCode::InvalidFrame);
+}

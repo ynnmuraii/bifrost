@@ -327,6 +327,8 @@ pub enum PlaybackState {
     Playing,
     Paused,
     Stopped,
+    /// Native MPRIS/SMTC states that do not map to playing, paused or stopped.
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,6 +469,8 @@ pub enum Event {
     Device(DeviceEvent),
     /// Includes external same-value writes when observable, never only our requested state.
     MuteChanged(MuteSnapshot),
+    /// Metadata changed, a session disappeared, or the OS current-session choice changed.
+    /// Refresh `Backend::current_media_session` when handling this notification.
     MediaChanged {
         session: MediaSessionToken,
         info: Option<MediaInfo>,
@@ -519,6 +523,10 @@ pub trait Backend {
     fn acquire_mute(&mut self, selection: &DeviceSelection) -> Result<Self::Mute, BackendError>;
     /// Empty is a valid successful result, not an unavailable media subsystem.
     fn media_sessions(&self) -> Result<Vec<MediaInfo>, BackendError>;
+    /// The OS-selected current session, not the first entry or an app-id guess.
+    /// None is valid even with a nonempty session list. Queries are not an atomic
+    /// snapshot with `media_sessions`; a session may disappear before a command.
+    fn current_media_session(&self) -> Result<Option<MediaSessionToken>, BackendError>;
     /// Bounded asynchronous admission. Every admitted request yields exactly one completion;
     /// Busy means not admitted. Native workers finish within MEDIA_COMMAND_TIMEOUT_MS after
     /// admission or report Timeout and cancel remaining work. Timeout is an unknown native outcome,

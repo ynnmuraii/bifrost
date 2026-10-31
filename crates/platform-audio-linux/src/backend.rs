@@ -492,6 +492,9 @@ impl Backend for LinuxBackend {
     fn media_sessions(&self) -> Result<Vec<MediaInfo>, BackendError> {
         Err(BackendError::Unsupported)
     }
+    fn current_media_session(&self) -> Result<Option<MediaSessionToken>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
     fn media_command(&mut self, _: MediaCommandRequest) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }

@@ -1,4 +1,5 @@
 //! Lightweight desktop tray. It observes an existing core; it never starts one.
+mod audio;
 mod geometry;
 mod menu;
 #[cfg(target_os = "linux")]
@@ -25,6 +26,7 @@ fn language_of(file: Option<&std::path::Path>) -> Lang {
 struct State {
     status: Option<wire::Status>,
     topology: Option<wire::TopologyDoc>,
+    audio: audio::Audio,
     local_name: String,
     /// The window's own `gui.toml`, read every time the menu is built.
     look_file: Option<std::path::PathBuf>,
@@ -44,7 +46,17 @@ impl State {
                 }
             }
         }
+        let audio_items = self.audio.items(lang);
+        let end = items.len().saturating_sub(2);
+        items.splice(end..end, audio_items);
         items
+    }
+}
+
+impl State {
+    fn tooltip(&self) -> String {
+        let lang = language_of(self.look_file.as_deref());
+        self.audio.labels(lang).join("\n")
     }
 }
 
@@ -158,12 +170,18 @@ async fn worker(
         };
         if let Some(stream) = stream {
             let mut link = ipc::GuiLink::new(stream);
+            state.send_modify(|s| s.audio = audio::Audio::default());
+            let mut poll = tokio::time::interval(audio::POLL_INTERVAL);
             let mut failed = false;
             for msg in [
                 Msg::GetStatus(wire::GetStatus {}),
                 Msg::GetTopology(wire::GetTopology {}),
+                Msg::GetAudioStatus(wire::GetAudioStatus {}),
             ] {
                 id += 1;
+                if matches!(&msg, Msg::GetAudioStatus(_)) {
+                    state.send_modify(|s| s.audio.queried(id, std::time::Instant::now()));
+                }
                 if link.send(id, msg).await.is_err() {
                     failed = true;
                     break;
@@ -171,11 +189,28 @@ async fn worker(
             }
             while !failed {
                 tokio::select! {
+                    _ = poll.tick() => {
+                        state.send_modify(|s| s.audio.expire(std::time::Instant::now()));
+                        if state.borrow().audio.can_query() {
+                            id += 1;
+                            state.send_modify(|s| s.audio.queried(id, std::time::Instant::now()));
+                            failed = link.send(id, Msg::GetAudioStatus(wire::GetAudioStatus {})).await.is_err();
+                        }
+                    }
                     frame = link.recv() => match frame {
                         Ok(frame) => match frame.msg {
                             Some(Msg::Status(status)) => { state.send_modify(|s| s.status = Some(status)); }
                             Some(Msg::TopologyDoc(topology)) => { state.send_modify(|s| s.topology = Some(topology)); }
-                            _ => {}
+                            Some(msg) => {
+                                let mut refresh = false;
+                                state.send_modify(|s| refresh = s.audio.receive(frame.request_id, &msg));
+                                if refresh && state.borrow().audio.can_query() {
+                                    id += 1;
+                                    state.send_modify(|s| s.audio.queried(id, std::time::Instant::now()));
+                                    failed = link.send(id, Msg::GetAudioStatus(wire::GetAudioStatus {})).await.is_err();
+                                }
+                            }
+                            None => {}
                         },
                         Err(_) => break,
                     },
@@ -192,15 +227,23 @@ async fn worker(
                                 block_apps: status.game_guard_block_apps.clone(),
                                 allow_apps: status.game_guard_allow_apps.clone(),
                             })),
+                            Some(action @ (Action::StopAllAudio | Action::AudioReceiveMute(_) | Action::MicMute | Action::MicPttRelease)) => state.borrow().audio.request(&action),
                             other => { if offline_action(other, &flags) { return; } None }
                         };
-                        if let Some(msg) = msg { id += 1; failed = link.send(id, msg).await.is_err(); }
+                        if let Some(msg) = msg {
+                            id += 1;
+                            if matches!(&msg, Msg::StopAudio(_) | Msg::SetAudioPeerGain(_) | Msg::SetMicrophoneMute(_) | Msg::SetPtt(_)) {
+                                state.send_modify(|s| s.audio.sent(id, std::time::Instant::now()));
+                            }
+                            failed = link.send(id, msg).await.is_err();
+                        }
                     }
                 }
             }
             state.send_modify(|s| {
                 s.status = None;
                 s.topology = None;
+                s.audio.disconnected();
             });
         }
         let delay = tokio::time::sleep(Duration::from_secs(3));
@@ -217,12 +260,83 @@ async fn worker(
 fn offline_action(action: Option<Action>, flags: &[OsString]) -> bool {
     match action {
         None | Some(Action::Exit) => true,
-        Some(Action::Open) => {
-            if let Err(error) = bifrost_desktop::spawn_role(bifrost_desktop::Role::Gui, flags) {
+        Some(action @ (Action::Open | Action::OpenAudioPlayer | Action::OpenAudioSettings)) => {
+            let mut launch = flags.to_vec();
+            if let Some((argument, destination)) = navigation(&action) {
+                let args: Vec<_> = flags
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                match paths(&args).and_then(|paths| {
+                    std::fs::create_dir_all(paths.state_dir())
+                        .and_then(|()| {
+                            std::fs::write(
+                                paths.state_dir().join("gui-audio-navigation"),
+                                destination,
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(()) => launch.push(argument.into()),
+                    Err(error) => {
+                        eprintln!("bifrost tray: audio navigation: {error}");
+                        return false;
+                    }
+                }
+            }
+            if let Err(error) = bifrost_desktop::spawn_role(bifrost_desktop::Role::Gui, &launch) {
                 eprintln!("Не удалось открыть окно: {error}");
             }
             false
         }
         _ => false,
+    }
+}
+
+fn navigation(action: &Action) -> Option<(&'static str, &'static str)> {
+    match action {
+        Action::OpenAudioPlayer => Some(("--audio-player", "player")),
+        Action::OpenAudioSettings => Some(("--audio-settings", "settings")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_navigation_uses_only_fixed_destinations() {
+        assert_eq!(
+            navigation(&Action::OpenAudioPlayer),
+            Some(("--audio-player", "player"))
+        );
+        assert_eq!(
+            navigation(&Action::OpenAudioSettings),
+            Some(("--audio-settings", "settings"))
+        );
+        assert_eq!(navigation(&Action::Open), None);
+        assert_eq!(navigation(&Action::AudioReceiveMute(vec![1; 32])), None);
+    }
+
+    #[test]
+    fn stopped_service_still_offers_audio_navigation_without_audio_commands() {
+        let state = State::default();
+        let items = state.items();
+        assert!(items
+            .iter()
+            .any(|item| item.action == Some(Action::OpenAudioPlayer)));
+        assert!(items
+            .iter()
+            .any(|item| item.action == Some(Action::OpenAudioSettings)));
+        assert!(!items.iter().any(|item| matches!(
+            item.action,
+            Some(
+                Action::StopAllAudio
+                    | Action::MicMute
+                    | Action::MicPttRelease
+                    | Action::AudioReceiveMute(_)
+            )
+        )));
     }
 }

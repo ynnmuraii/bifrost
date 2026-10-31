@@ -588,7 +588,7 @@ async fn the_membership_cap_refuses_the_extra_member() {
     let refused_peer = if admitted[0] == id_b { id_c } else { id_b };
     let refusal = wait_for_event(
         &mut a.events,
-        |event| matches!(event, LinkEvent::Down { peer, reason: LinkDownReason::MembershipFull } if *peer == refused_peer),
+        |event| matches!(event, LinkEvent::Down { peer, reason: LinkDownReason::MembershipFull, .. } if *peer == refused_peer),
         EVENT_TIMEOUT,
     )
     .await;
@@ -830,7 +830,7 @@ async fn an_abrupt_kill_is_reported_as_a_liveness_timeout() {
             Err(_) => break,
             Ok(Some(event)) => {
                 match &event {
-                    LinkEvent::Down { peer, reason } if *peer == id_a => match reason {
+                    LinkEvent::Down { peer, reason, .. } if *peer == id_a => match reason {
                         LinkDownReason::Timeout | LinkDownReason::Io(_) => {
                             detected = Some(reason.clone());
                         }
@@ -885,6 +885,7 @@ async fn an_abrupt_kill_is_reported_as_a_liveness_timeout() {
                 Some(LinkEvent::Down {
                     peer,
                     reason: LinkDownReason::LocalClosed,
+                    ..
                 }) if peer == id_a => resurrected = true,
                 Some(_) => continue,
                 None => break,
@@ -967,6 +968,80 @@ async fn a_deliberate_shutdown_is_reported_as_such() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manager_auxiliary_secret_tracks_event_generation_across_reconnect() {
+    let root = temp_root("auxiliary-manager-binding");
+    let address_a = free_address().await;
+    let address_b = free_address().await;
+    let identity_a = Arc::new(identity_at(&root, "a"));
+    let identity_b = Arc::new(identity_at(&root, "b"));
+    let (id_a, id_b) = (identity_a.node_id(), identity_b.node_id());
+    let mut a = spawn_node("a", identity_a, address_a, &[(id_b, address_b)], &[], 3).await;
+    assert!(a.manager.auxiliary_secret(&id_b).await.is_none());
+    let mut previous: Option<transport::AuxiliarySecret> = None;
+    for _ in 0..2 {
+        let mut b = spawn_node(
+            "b",
+            Arc::clone(&identity_b),
+            address_b,
+            &[(id_a, address_a)],
+            &[address_a],
+            3,
+        )
+        .await;
+        let up = wait_for_event(
+            &mut a.events,
+            |event| matches!(event, LinkEvent::Up { peer, .. } if *peer == id_b),
+            FORM_TIMEOUT,
+        )
+        .await
+        .expect("authenticated input link comes up");
+        let LinkEvent::Up {
+            peer,
+            generation,
+            connection_id,
+            ..
+        } = up
+        else {
+            unreachable!()
+        };
+        let secret = a.manager.auxiliary_secret(&peer).await.unwrap();
+        let binding = secret.binding();
+        assert_eq!(binding.peer, peer);
+        assert_eq!(binding.generation, generation);
+        assert_eq!(binding.connection_id, connection_id);
+        if let Some(previous) = previous.as_ref() {
+            assert_ne!(binding.generation, previous.binding().generation);
+            assert_ne!(binding.connection_id, previous.binding().connection_id);
+            assert!(matches!(
+                previous.derive(transport::AuxPurpose::AudioForwardKey, &[7; 64]),
+                Err(transport::AuxiliaryDeriveError::LinkClosed)
+            ));
+        }
+        assert!(secret
+            .derive(transport::AuxPurpose::AudioForwardKey, &[7; 64])
+            .is_ok());
+        b.kill().await;
+        let _ = (&mut b.runner).await;
+        let down = wait_for_event(
+            &mut a.events,
+            |event| matches!(event, LinkEvent::Down { peer, .. } if *peer == id_b),
+            OFFLINE_TIMEOUT,
+        )
+        .await
+        .expect("parent link loss is reported");
+        assert!(matches!(down, LinkEvent::Down { generation: down, .. } if down == generation));
+        assert!(a.manager.auxiliary_secret(&id_b).await.is_none());
+        assert!(matches!(
+            secret.derive(transport::AuxPurpose::AudioForwardKey, &[7; 64]),
+            Err(transport::AuxiliaryDeriveError::LinkClosed)
+        ));
+        previous = Some(secret);
+    }
+    a.kill().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_all_reports_local_close_for_each_member() {
     let root = temp_root("kill-all-down");
     let address_a = free_address().await;
@@ -1028,7 +1103,7 @@ async fn kill_all_reports_local_close_for_each_member() {
         .await
         .expect("kill_all reports each removed member");
         match event {
-            LinkEvent::Down { peer, reason } => {
+            LinkEvent::Down { peer, reason, .. } => {
                 assert_eq!(reason, LinkDownReason::LocalClosed);
                 removed.insert(peer);
             }

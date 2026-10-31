@@ -664,6 +664,7 @@ dependencies = [
 name = "bifrost-gui"
 version = "0.4.0"
 dependencies = [
+ "audio-model",
  "bifrost-desktop",
  "config",
  "eframe",

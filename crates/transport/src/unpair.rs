@@ -211,7 +211,11 @@ pub(crate) async fn notify_only<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| TransportError::Protocol("invalid local Hello identity".into()))?;
     let mut handshake = HelloHandshake::acceptor(limits::PROTOCOL_MAJOR, limits::PROTOCOL_MINOR);
     let negotiated = handshake
-        .on_remote_hello(&remote, &local_hello.capabilities)
+        .on_remote_hello(
+            &remote,
+            crate::convert::IMPLEMENTED_CAPABILITIES,
+            &local_hello.required_capabilities,
+        )
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
     let hello = handshake
         .local_hello(local_hello)
@@ -302,12 +306,15 @@ mod tests {
             tokio::spawn(async move { notify_only(&mut server, peer, hello(local, true)).await });
         let mut handshake =
             HelloHandshake::dialer(limits::PROTOCOL_MAJOR, limits::PROTOCOL_MINOR, [3; 16]);
-        write_frame(
-            &mut client,
-            &handshake.local_hello(hello(peer, true)).unwrap(),
-        )
-        .await
-        .unwrap();
+        let mut remote = hello(peer, true);
+        // Runtime offers need not enable every capability the implementation supports.
+        remote.capabilities.push(wire::Capability::Capture as i32);
+        remote
+            .required_capabilities
+            .push(wire::Capability::Capture as i32);
+        write_frame(&mut client, &handshake.local_hello(remote).unwrap())
+            .await
+            .unwrap();
         for (index, payload) in [
             wire::envelope::Payload::EnterCommit(wire::EnterCommit::default()),
             wire::envelope::Payload::Topology(wire::Topology::default()),
@@ -332,7 +339,7 @@ mod tests {
         client.shutdown().await.unwrap();
         let remote_hello = read_frame(&mut client).await.unwrap();
         handshake
-            .on_remote_hello(&remote_hello, &[wire::Capability::UnpairNotice as i32])
+            .on_remote_hello(&remote_hello, crate::convert::IMPLEMENTED_CAPABILITIES, &[])
             .unwrap();
         let envelope = read_frame(&mut client).await.unwrap();
         let Some(wire::envelope::Payload::Unpaired(notice)) = &envelope.payload else {
@@ -342,6 +349,27 @@ mod tests {
         assert_eq!(envelope.seq, 2);
         assert!(read_frame(&mut client).await.is_err());
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn notify_only_rejects_peer_missing_local_requirement() {
+        let peer = NodeId::new([1; 32]);
+        let (mut client, mut server) = tokio::io::duplex(16384);
+        let mut local_hello = hello(NodeId::new([2; 32]), true);
+        let required = wire::Capability::ClipboardSession as i32;
+        local_hello.capabilities.push(required);
+        local_hello.required_capabilities.push(required);
+        let task = tokio::spawn(async move { notify_only(&mut server, peer, local_hello).await });
+        let mut handshake =
+            HelloHandshake::dialer(limits::PROTOCOL_MAJOR, limits::PROTOCOL_MINOR, [3; 16]);
+        write_frame(
+            &mut client,
+            &handshake.local_hello(hello(peer, true)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert!(read_frame(&mut client).await.is_err());
     }
 
     #[tokio::test]

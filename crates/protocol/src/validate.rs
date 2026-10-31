@@ -33,11 +33,11 @@ pub enum Violation {
     DisplayNameTooLong { len: usize },
     /// `Hello.displays` exceeds 16 entries.
     TooManyDisplays { got: usize },
-    /// `Hello.capabilities` exceeds its bounded implementation offer.
+    /// An advertised capability list exceeds its wire entry bound.
     TooManyCapabilities { got: usize },
     /// `Hello.required_capabilities` exceeds its bounded requirement list.
     TooManyRequiredCapabilities { got: usize },
-    /// A required capability is unknown or not advertised by the local implementation.
+    /// A required capability is unknown or unsupported by the other side.
     UnsupportedRequiredCapability { capability: i32 },
     /// A requirement is UNSPECIFIED, repeated, or absent from the sender's offer.
     InvalidRequiredCapability { capability: i32 },
@@ -119,6 +119,16 @@ pub fn hello(hello: &wire::Hello) -> Result<(), Violation> {
     hello_required_capabilities(hello, &hello.capabilities)
 }
 
+/// Bound advertised wire entries, including unknown values and duplicates.
+pub fn capabilities(capabilities: &[i32]) -> Result<(), Violation> {
+    if capabilities.len() > crate::limits::MAX_HELLO_CAPABILITIES {
+        return Err(Violation::TooManyCapabilities {
+            got: capabilities.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Validate requirements against implementation capabilities, not runtime preferences.
 ///
 /// Unknown optional capabilities are deliberately ignored. Diagnostics retain only one
@@ -127,11 +137,7 @@ pub fn hello_required_capabilities(
     hello: &wire::Hello,
     local_capabilities: &[i32],
 ) -> Result<(), Violation> {
-    if hello.capabilities.len() > crate::limits::MAX_HELLO_CAPABILITIES {
-        return Err(Violation::TooManyCapabilities {
-            got: hello.capabilities.len(),
-        });
-    }
+    capabilities(&hello.capabilities)?;
     if hello.required_capabilities.len() > crate::limits::MAX_REQUIRED_CAPABILITIES {
         return Err(Violation::TooManyRequiredCapabilities {
             got: hello.required_capabilities.len(),

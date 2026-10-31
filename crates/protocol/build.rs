@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     prost_build::Config::new()
         .out_dir(&out_dir)
+        .skip_debug([".bifrost.ipc.v1.MediaInfo"])
         .compile_fds(fds)?;
 
     let audio_fds = protox::compile(["proto/audio_ipc.proto"], ["proto"])?;

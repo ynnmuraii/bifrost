@@ -77,6 +77,14 @@ pub use bifrost::ipc::v1 as ipc;
 /// The wire messages (`bifrost.v1`).
 pub use bifrost::v1 as wire;
 
+impl std::fmt::Debug for ipc::MediaInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaInfo")
+            .field("metadata", &"[REDACTED]")
+            .finish()
+    }
+}
+
 pub use frame::{
     decode_message, encode, encode_message, encode_to, Channel, DecodeError, Frame, FrameDecoder,
     FrameError, LENGTH_PREFIX_LEN,

@@ -1,7 +1,9 @@
 //! Bifrost transport: pinned TLS links, mesh dedup and liveness (KVM-032/070).
 
 mod auxiliary;
-pub use auxiliary::{AuxiliaryBinding, AuxiliarySecret};
+pub use auxiliary::{
+    AuxPurpose, AuxiliaryBinding, AuxiliaryDeriveError, AuxiliarySecret, DerivedKey,
+};
 pub mod clipboard;
 pub mod convert;
 pub mod input_metrics;

@@ -8,8 +8,8 @@
 //! принимающая сторона отвечает своим `Hello` с тем же `connection_id`. Version
 //! `major` должен совпасть; negotiated `minor = min` обеих сторон.»
 //!
-//! [`HelloHandshake`] checks those first-envelope rules and the peer's capability
-//! requirements against the local implementation's advertised capabilities.
+//! [`HelloHandshake`] checks those first-envelope rules and both peers' capability
+//! requirements against the other side's implementation capabilities.
 //! Payload validation after Hello belongs to the lease FSM.
 
 use crate::limits::CONNECTION_ID_LEN;
@@ -52,7 +52,7 @@ pub enum HandshakeError {
     NotHello,
     /// No common major version.
     MajorMismatch { local: u32, remote: u32 },
-    /// The peer's capability requirements cannot be satisfied or are malformed.
+    /// Either side's capability requirements cannot be satisfied or are malformed.
     RequiredCapability(crate::validate::Violation),
 }
 
@@ -179,13 +179,15 @@ impl HelloHandshake {
     /// Rejects a second `Hello`, a non-`Hello` payload, `seq != 1`, a
     /// `connection_id` that is not 16 bytes or that differs from the dialer's,
     /// a `major` mismatch, and malformed or unsupported capability requirements.
-    /// `local_capabilities` is the local Hello's implementation offer, not enabled
-    /// preferences. The link is only fully established once both sides have sent;
-    /// check [`HelloHandshake::is_established`] for that.
+    /// `implemented_capabilities` is the local implementation's support, not enabled
+    /// preferences. `local_required_capabilities` must also be offered by the peer,
+    /// including peers that send no requirements. The link is only fully established
+    /// once both sides have sent; check [`HelloHandshake::is_established`] for that.
     pub fn on_remote_hello(
         &mut self,
         envelope: &wire::Envelope,
-        local_capabilities: &[i32],
+        implemented_capabilities: &[i32],
+        local_required_capabilities: &[i32],
     ) -> Result<Negotiated, HandshakeError> {
         if self.remote_received {
             return Err(HandshakeError::NotHello);
@@ -217,8 +219,22 @@ impl HelloHandshake {
                 remote: envelope.major,
             });
         }
-        crate::validate::hello_required_capabilities(hello, local_capabilities)
+        crate::validate::hello_required_capabilities(hello, implemented_capabilities)
             .map_err(HandshakeError::RequiredCapability)?;
+        if local_required_capabilities.len() > crate::limits::MAX_REQUIRED_CAPABILITIES {
+            return Err(HandshakeError::RequiredCapability(
+                crate::validate::Violation::TooManyRequiredCapabilities {
+                    got: local_required_capabilities.len(),
+                },
+            ));
+        }
+        for &capability in local_required_capabilities {
+            if !hello.capabilities.contains(&capability) {
+                return Err(HandshakeError::RequiredCapability(
+                    crate::validate::Violation::UnsupportedRequiredCapability { capability },
+                ));
+            }
+        }
         // Accepted: an acceptor adopts the dialer's id here.
         if self.connection_id.is_none() {
             self.connection_id = Some(connection_id);

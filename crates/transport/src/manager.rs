@@ -702,6 +702,18 @@ impl LinkManager {
             .map(|link| link.handle.clone())
     }
 
+    /// Returns a revocable view of the currently admitted input link's auxiliary secret.
+    ///
+    /// Compare its binding with the event generation and connection id before use.
+    pub async fn auxiliary_secret(&self, peer: &NodeId) -> Option<crate::AuxiliarySecret> {
+        self.inner
+            .lock()
+            .await
+            .links
+            .get(peer)
+            .and_then(|link| link.handle.auxiliary_secret())
+    }
+
     /// Samples cumulative lease counters for the current or last established connection.
     ///
     /// Counters survive link removal so final lease diagnostics can include link loss.
@@ -763,8 +775,9 @@ impl LinkManager {
         let peers = std::mem::take(&mut inner.links)
             .into_iter()
             .map(|(peer, link)| {
+                link.handle.close();
                 link.task.abort();
-                peer
+                (peer, link.key)
             })
             .collect::<Vec<_>>();
         for (_, pending) in std::mem::take(&mut inner.pending) {
@@ -779,11 +792,12 @@ impl LinkManager {
             dialer.abort();
         }
         drop(inner);
-        for peer in peers {
+        for (peer, generation) in peers {
             let _ = self
                 .events_tx
                 .send(LinkEvent::Down {
                     peer,
+                    generation,
                     reason: LinkDownReason::LocalClosed,
                 })
                 .await;
@@ -944,6 +958,7 @@ impl LinkManager {
                         .events_tx
                         .send(LinkEvent::Down {
                             peer,
+                            generation: live.key,
                             reason: LinkDownReason::LocalClosed,
                         })
                         .await;
@@ -1035,8 +1050,20 @@ impl LinkManager {
                         inner.release_dial_waiters(peer);
                         removed
                     };
-                    if removed || reason == LinkDownReason::MembershipFull {
-                        let _ = self.events_tx.send(LinkEvent::Down { peer, reason }).await;
+                    if removed
+                        || matches!(
+                            reason,
+                            LinkDownReason::MembershipFull | LinkDownReason::Incompatible
+                        )
+                    {
+                        let _ = self
+                            .events_tx
+                            .send(LinkEvent::Down {
+                                peer,
+                                generation: key,
+                                reason,
+                            })
+                            .await;
                     }
                 }
             },
@@ -1088,7 +1115,7 @@ impl LinkManager {
             pending.handle.close();
             return;
         }
-        if replaced {
+        if let Some(generation) = existing_key.filter(|_| replaced) {
             // The incoming link wins; the replaced one gets a `Shutdown` and ends by itself.
             if let Some(existing) = self.inner.lock().await.links.remove(&peer) {
                 existing.handle.close();
@@ -1103,6 +1130,7 @@ impl LinkManager {
                 .events_tx
                 .send(LinkEvent::Down {
                     peer,
+                    generation,
                     reason: LinkDownReason::LocalClosed,
                 })
                 .await;
@@ -1153,11 +1181,13 @@ impl LinkManager {
                 // through its own reader; a peer that does not is bounded by the liveness
                 // timeout («офлайн через 3 s без `Pong`»). The pending entry is already
                 // removed, so a retry is not blocked by this one.
+                pending.handle.invalidate_auxiliary();
                 drop(pending);
                 let _ = self
                     .events_tx
                     .send(LinkEvent::Down {
                         peer,
+                        generation: key,
                         reason: LinkDownReason::MembershipFull,
                     })
                     .await;
@@ -1195,6 +1225,7 @@ impl LinkManager {
             .events_tx
             .send(LinkEvent::Up {
                 peer,
+                generation: key,
                 hello,
                 connection_id,
                 version,
@@ -1482,7 +1513,7 @@ async fn accept_one(
     let Ok(key) = identity::random16() else {
         return;
     };
-    start_link(
+    let _ = start_link(
         LinkSpawn {
             key,
             peer,
@@ -1582,7 +1613,7 @@ async fn dial_loop(
                 peer = Some(dialed);
                 if let Ok(key) = identity::random16() {
                     let hello = local_hello.read().await.clone();
-                    start_link(
+                    let reason = start_link(
                         LinkSpawn {
                             key,
                             peer: dialed,
@@ -1595,7 +1626,11 @@ async fn dial_loop(
                         settings,
                     )
                     .await;
-                    attempt = 0;
+                    attempt = if reason == Some(LinkDownReason::Incompatible) {
+                        u32::MAX
+                    } else {
+                        0
+                    };
                 }
             }
         }
@@ -1636,7 +1671,7 @@ async fn start_link(
     local_hello: wire::Hello,
     messages: mpsc::Sender<ManagerMessage>,
     settings: LinkSettings,
-) {
+) -> Option<LinkDownReason> {
     let LinkSpawn {
         key,
         peer,
@@ -1655,7 +1690,7 @@ async fn start_link(
         queue_capacity: settings.queue_capacity,
         liveness: settings.liveness,
     }) else {
-        return;
+        return None;
     };
     let handle = link.handle.clone();
     if messages
@@ -1670,15 +1705,20 @@ async fn start_link(
         .await
         .is_err()
     {
-        return;
+        return None;
     }
     // Forward reports until the link's task is gone (the channel closes) or the manager
     // stops listening.
+    let mut reason = None;
     while let Some(report) = reports_rx.recv().await {
+        if let LinkReport::Down { reason: down, .. } = &report {
+            reason = Some(down.clone());
+        }
         if messages.send(ManagerMessage::Report(report)).await.is_err() {
-            return;
+            return reason;
         }
     }
+    reason
 }
 
 #[cfg(test)]
@@ -1925,6 +1965,182 @@ mod tests {
         assert_eq!(inner.discovered_routes[&peer], old);
         assert_eq!(inner.links[&peer].key, [5; 16]);
         inner.links.remove(&peer).unwrap().task.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_incompatibility_is_reported_without_removing_current_generation() {
+        let (root, local, expected, _) = discovery_fixture("pending-incompatible");
+        let local_id = local.node_id();
+        let peer = expected.node_id();
+        let mut manager = discovery_manager(local, &[peer]);
+        let (events, mut receiver) = mpsc::channel(8);
+        manager.events_tx = events;
+        let generation = [8; 16];
+        let task = tokio::spawn(std::future::pending());
+        let abort = task.abort_handle();
+        {
+            let mut inner = manager.inner.lock().await;
+            insert_live(&mut inner, peer);
+            inner.pending.insert(
+                generation,
+                PendingLink {
+                    peer,
+                    handle: LinkHandle::for_counter_test(peer),
+                    initiator: local_id,
+                    local_capabilities: Vec::new(),
+                    task,
+                    registered_at_ns: 0,
+                    replace_existing: true,
+                },
+            );
+        }
+        let mut listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        manager
+            .on_message(
+                ManagerMessage::Report(LinkReport::Down {
+                    key: generation,
+                    peer,
+                    reason: LinkDownReason::Incompatible,
+                }),
+                local_id,
+                &mut listener,
+            )
+            .await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            LinkEvent::Down {
+                peer: reported_peer,
+                generation: reported_generation,
+                reason: LinkDownReason::Incompatible,
+            } if reported_peer == peer && reported_generation == generation
+        ));
+        {
+            let inner = manager.inner.lock().await;
+            assert!(!inner.pending.contains_key(&generation));
+            assert_eq!(inner.links[&peer].key, [5; 16]);
+        }
+        abort.abort();
+        manager.kill_all().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn membership_refusal_revokes_auxiliary_before_peer_closes() {
+        use protocol::frame::{decode_message, encode_message, Channel};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn receive(
+            stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+        ) -> wire::Envelope {
+            let length = stream.read_u32().await.unwrap();
+            assert!((1..=Channel::InputControl.max_frame_len() as u32).contains(&length));
+            let mut frame = vec![0; length as usize + 4];
+            frame[..4].copy_from_slice(&length.to_be_bytes());
+            stream.read_exact(&mut frame[4..]).await.unwrap();
+            decode_message(Channel::InputControl, &frame)
+                .unwrap()
+                .unwrap()
+        }
+
+        let (root, local, expected, other) = discovery_fixture("refusal-auxiliary");
+        let local_id = local.node_id();
+        let peer = expected.node_id();
+        let mut manager = discovery_manager(Arc::clone(&local), &[peer, other.node_id()]);
+        manager.max_members = 1;
+        insert_live(&mut *manager.inner.lock().await, other.node_id());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = identity::server_config(
+            &expected,
+            TrustPolicy::Pinned(BTreeSet::from([local_id])),
+            &identity::LINK_ALPN,
+        )
+        .unwrap();
+        let accepting = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                .accept(tcp)
+                .await
+                .unwrap()
+        });
+        manager
+            .refresh_discovered_route(peer, address)
+            .await
+            .unwrap();
+        let handle = manager
+            .inner
+            .lock()
+            .await
+            .pending
+            .values()
+            .find(|pending| pending.peer == peer)
+            .unwrap()
+            .handle
+            .clone();
+        let mut remote = accepting.await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(10), receive(&mut remote))
+            .await
+            .unwrap();
+        let response = wire::Envelope {
+            major: limits::PROTOCOL_MAJOR,
+            minor: limits::PROTOCOL_MINOR,
+            connection_id: request.connection_id,
+            seq: 1,
+            payload: Some(wire::envelope::Payload::Hello(wire::Hello {
+                node_id: peer.as_bytes().to_vec(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        remote
+            .write_all(&encode_message(Channel::InputControl, &response).unwrap())
+            .await
+            .unwrap();
+        remote.flush().await.unwrap();
+        let mut manager_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = manager.messages_rx.lock().await.recv().await.unwrap();
+                if matches!(&message, ManagerMessage::Report(LinkReport::Up { .. })) {
+                    break message;
+                }
+                manager
+                    .on_message(message, local_id, &mut manager_listener)
+                    .await;
+            }
+        })
+        .await
+        .unwrap();
+        let secret = handle
+            .auxiliary_secret()
+            .expect("validated pending Hello exports");
+        assert!(secret
+            .derive(crate::AuxPurpose::AudioForwardKey, &[7; 64])
+            .is_ok());
+        manager
+            .on_message(report, local_id, &mut manager_listener)
+            .await;
+        assert!(handle.auxiliary_secret().is_none());
+        assert!(matches!(
+            secret.derive(crate::AuxPurpose::AudioForwardKey, &[7; 64]),
+            Err(crate::AuxiliaryDeriveError::LinkClosed)
+        ));
+        let refusal = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(wire::envelope::Payload::Error(error)) =
+                    receive(&mut remote).await.payload
+                {
+                    break error;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(refusal.code, wire::ErrorCode::MembershipFull as i32);
+        handle.close();
+        manager.kill_all().await;
+        drop(remote);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

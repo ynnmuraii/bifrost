@@ -17,7 +17,7 @@
 //! Timeout or cancellation does not prove an already-dispatched OS command had no effect;
 //! never retry automatically. Metadata is UTF-8 bounded and Debug-redacted; never log it.
 //! Native session methods retain current-session identity and exact playback status; the
-//! shared playback vocabulary maps unknown native states conservatively to Stopped.
+//! shared playback vocabulary preserves unmapped native states as Unknown.
 //!
 //! Supply all reserved KVM chords when configuring PTT. Consumers must check the absolute
 //! 250 ms press lease on every use; renewal events cannot reopen an expired gate.
