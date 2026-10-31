@@ -242,6 +242,27 @@ fn peer_gain_and_media_permission_are_independent() {
 }
 
 #[test]
+fn modern_source_retains_inactive_media_grants_without_changing_legacy_validation() {
+    let selected = "11".repeat(32);
+    let previous = "22".repeat(32);
+    let source = format!(
+        "role = 'source'\nlistener_node_id = '{selected}'\n\
+         [[audio.peers]]\nnode_id = '{previous}'\nallow_media_control = true"
+    );
+    assert!(
+        !valid(&source),
+        "legacy policy remains selected-peer strict"
+    );
+    for sharing in [false, true] {
+        assert!(valid(&format!("system_sharing = {sharing}\n{source}")));
+        assert!(!valid(&format!(
+            "system_sharing = {sharing}\nrole = 'listener'\n\
+             [[audio.peers]]\nnode_id = '{previous}'\nallow_media_control = true"
+        )));
+    }
+}
+
+#[test]
 fn typed_device_selectors_roundtrip() {
     let config = parse("role = 'listener'\n[audio.output_device]\nkind = 'stable_id'\nid = 'endpoint:headset'\n[audio.capture_device]\nkind = 'default_monitor'\n[audio.microphone.capture_device]\nkind = 'follow_default'\nrole = 'communications'").unwrap();
     config.validate().unwrap();

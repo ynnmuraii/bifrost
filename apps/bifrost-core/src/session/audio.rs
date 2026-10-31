@@ -121,7 +121,7 @@ pub(super) struct Coordinator {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 impl Coordinator {
-    pub(super) fn spawn(
+    fn prepare(
         config: config::AudioConfig,
         local: NodeId,
         manager: Arc<LinkManager>,
@@ -129,7 +129,7 @@ impl Coordinator {
         listen: SocketAddr,
         test_dry: bool,
         events: broadcast::Sender<Outgoing>,
-    ) -> Self {
+    ) -> (Self, Actor) {
         let (commands, rx) = mpsc::channel(COMMANDS);
         let (gui_commands, gui_rx) = mpsc::channel(16);
         let (gui_safety, safety_rx) = watch::channel(safety::Latch::default());
@@ -137,8 +137,7 @@ impl Coordinator {
         let system_requested = config.enabled
             && config.system_sharing == Some(true)
             && config.role == config::AudioRole::Listener;
-        let (gui_safety_target, target_rx) = watch::channel(None);
-        let independent_safety_rx = safety_rx.clone();
+        let (gui_safety_target, _target_rx) = watch::channel(None);
         let (links, link_rx) = watch::channel(Links::default());
         let (focus_tx, focus_rx) = watch::channel(CommittedFocus::default());
         let (control, control_rx) = watch::channel(ControlContext::default());
@@ -210,8 +209,39 @@ impl Coordinator {
             pending_starts: BTreeMap::new(),
             deferred_starts: BTreeMap::new(),
         };
+        (
+            Self {
+                commands,
+                gui_commands,
+                gui_safety,
+                system_intents,
+                links,
+                focus: focus_tx,
+                control,
+                caps,
+                stopping,
+                optional_drops,
+                task: None,
+            },
+            actor,
+        )
+    }
+
+    pub(super) fn spawn(
+        config: config::AudioConfig,
+        local: NodeId,
+        manager: Arc<LinkManager>,
+        paths: config::Paths,
+        listen: SocketAddr,
+        test_dry: bool,
+        events: broadcast::Sender<Outgoing>,
+    ) -> Self {
+        let (mut coordinator, actor) =
+            Self::prepare(config, local, manager, paths, listen, test_dry, events);
+        let independent_safety_rx = actor.gui_safety.clone();
+        let target_rx = actor.gui_safety_target.subscribe();
         let independent_stop_rx = actor.stopping.clone();
-        let task = tokio::spawn(async move {
+        coordinator.task = Some(tokio::spawn(async move {
             let safety_task = tokio::spawn(safety::watch_safety(
                 independent_safety_rx,
                 target_rx,
@@ -220,20 +250,8 @@ impl Coordinator {
             Box::pin(actor.run()).await;
             safety_task.abort();
             let _ = safety_task.await;
-        });
-        Self {
-            commands,
-            gui_commands,
-            gui_safety,
-            system_intents,
-            links,
-            focus: focus_tx,
-            control,
-            caps,
-            stopping,
-            optional_drops,
-            task: Some(task),
-        }
+        }));
+        coordinator
     }
     pub(super) fn hotkeys(&self, hotkeys: &config::HotkeyBindings) {
         self.control.send_if_modified(|context| {
@@ -866,7 +884,7 @@ impl Actor {
             self.publish_caps();
             self.publish(cause);
             self.service_deferred().await;
-            self.service_system_start().await;
+            self.reconcile_system().await;
         }
         self.stop_all(fsm::Reason::UserStop);
         self.drain().await;
@@ -3638,6 +3656,7 @@ mod observation_tests {
             commands,
             gui_commands,
             gui_safety: watch::channel(safety::Latch::default()).0,
+            system_intents: watch::channel(sharing::Intent::default()).0,
             links,
             focus,
             control,

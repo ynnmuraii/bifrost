@@ -1,5 +1,6 @@
 //! One explicit user intent through real core IPC, authenticated links and Dry workers.
-//! Only media ports/device preferences are fixture setup: no consent lists or Start RPC.
+//! Clean-default flows set only media ports/device preferences, without grants or Start RPC.
+//! The retarget regression deliberately retains an existing user's legacy grant.
 #![cfg(feature = "audio")]
 
 mod common;
@@ -103,11 +104,34 @@ fn one_toggle_from_defaults_starts_real_media_and_off_preserves_user_preferences
     pair.receive();
     let receiving = pair.listener.status();
     assert_eq!(receiving.system_sharing_requested, Some(true));
+    assert_eq!(receiving.role, wire::AudioRole::Listener as i32);
+    assert_eq!(
+        receiving
+            .config
+            .as_ref()
+            .expect("persisted receive policy")
+            .system_sharing,
+        Some(true)
+    );
     assert!(
         receiving.sessions.is_empty(),
         "receive policy alone is not native media"
     );
     pair.share();
+    // The first request-ID-correlated read after the actual persistence ACK,
+    // before any polling for media readiness or accepting unsolicited snapshots.
+    let requested = pair.source.status();
+    assert_eq!(requested.system_sharing_requested, Some(true));
+    assert_eq!(requested.role, wire::AudioRole::Source as i32);
+    assert_eq!(
+        requested
+            .config
+            .as_ref()
+            .expect("persisted share policy")
+            .system_sharing,
+        Some(true)
+    );
+    assert!(requested.system_sharing_error.is_empty());
     let session = audio::healthy(
         &mut pair.listener,
         &mut pair.source,
@@ -141,6 +165,18 @@ fn one_toggle_from_defaults_starts_real_media_and_off_preserves_user_preferences
             listener_node_id: vec![255],
             expected_revision: 0,
         }));
+    let acknowledged_off = pair.source.status();
+    assert_eq!(acknowledged_off.system_sharing_requested, Some(false));
+    assert_eq!(acknowledged_off.role, wire::AudioRole::Source as i32);
+    assert_eq!(
+        acknowledged_off
+            .config
+            .as_ref()
+            .expect("persisted OFF policy")
+            .system_sharing,
+        Some(false)
+    );
+    assert!(acknowledged_off.system_sharing_error.is_empty());
     pair.source.stopped(&session);
     pair.listener.stopped(&session);
     assert_eq!(pair.source.status().system_sharing_requested, Some(false));
@@ -404,12 +440,22 @@ fn source_on_waits_for_selected_listener_then_starts_once_without_another_click(
     assert!(pending.config.expect("pending config").group_id.is_empty());
     assert!(pending.sessions.is_empty());
     pair.receive();
-    audio::healthy(
+    let session = audio::healthy(
         &mut pair.listener,
         &mut pair.source,
         &pair.listener_id,
         &pair.source_id,
     );
+    let source = pair.source.status();
+    let listener = pair.listener.status();
+    assert_eq!(
+        source.sessions.len(),
+        1,
+        "one deliberate intent starts one session"
+    );
+    assert_eq!(listener.sessions.len(), 1);
+    assert_eq!(source.sessions[0].session_id, session);
+    assert_eq!(listener.sessions[0].session_id, session);
 }
 
 #[test]
@@ -464,4 +510,157 @@ fn off_persistence_failure_reports_failure_but_cannot_restore_capture_or_resume_
         }));
     assert_eq!(saved(&pair.nodes.b).system_sharing, Some(false));
     assert!(pair.source.status().system_sharing_error.is_empty());
+}
+
+#[test]
+fn queued_on_from_pre_failure_snapshot_cannot_rearm_after_terminal_native_failure() {
+    let _guard = common::serial();
+    let mut pair = Pair::new("sharing-failure-barrier");
+    // A real native session-initialization failure, not a fabricated worker event.
+    let occupied = std::net::UdpSocket::bind(("127.0.0.1", pair.ports[1]))
+        .expect("occupy only the isolated Source media endpoint");
+    pair.receive();
+    pair.share();
+    // This genuine publication precedes reconciliation of requested intent.
+    // Model/worker failure is observable before a queued stale action is handled.
+    let before_reconciliation = pair.source.event(|message| match message {
+        Msg::AudioStatus(status)
+            if status.system_sharing_requested == Some(true)
+                && status
+                    .sessions
+                    .iter()
+                    .any(|session| session.state == wire::AudioSessionState::Failed as i32) =>
+        {
+            Some(status.clone())
+        }
+        _ => None,
+    });
+    let reply = pair
+        .source
+        .request(Msg::SetSystemAudioSharing(wire::SetSystemAudioSharing {
+            enabled: true,
+            role: wire::AudioRole::Source as i32,
+            listener_node_id: pair.listener_id.clone(),
+            expected_revision: before_reconciliation.revision,
+        }));
+    assert!(
+        matches!(&reply, Msg::OpResult(result)
+        if !result.ok && result.error_code == "AUDIO_REVISION_CONFLICT"),
+        "stale queued activation from revision {} must not rearm: {reply:?}",
+        before_reconciliation.revision
+    );
+    let stopped = pair.source.status();
+    assert_eq!(stopped.system_sharing_requested, Some(false));
+    assert!(stopped
+        .sessions
+        .iter()
+        .all(|session| session.capture_active != Some(true) && session.sending != Some(true)));
+    assert_eq!(saved(&pair.nodes.b).system_sharing, Some(true));
+    assert!(!saved(&pair.nodes.b).resume_system_audio);
+    drop(occupied);
+    audio::assert_no_audio_resources(&pair.nodes.b, pair.ports[1]);
+}
+
+#[test]
+fn retarget_preserves_inactive_media_permission_and_revokes_old_system_scope() {
+    let _guard = common::serial();
+    let (cluster, ()) = common::Cluster::start_with("sharing-retarget", |roots, _, _| {
+        for root in roots {
+            audio::mark_dry(root);
+        }
+    });
+    for node in &cluster.nodes {
+        node.wait_for("trusted three-core mesh", TIMEOUT, |status| {
+            status.agent == "ready" && status.members == 2
+        })
+        .expect("trusted fixture links");
+    }
+    let source_id = audio::node_id(&cluster.nodes[0].id);
+    let a_id = audio::node_id(&cluster.nodes[1].id);
+    let b_id = audio::node_id(&cluster.nodes[2].id);
+    let mut source = Window::open(&cluster.nodes[0]);
+    let mut a = Window::open(&cluster.nodes[1]);
+    let mut b = Window::open(&cluster.nodes[2]);
+    for (window, port) in [&mut source, &mut a, &mut b]
+        .into_iter()
+        .zip(audio::ports(3))
+    {
+        let mut config = window.status().config.expect("default configuration");
+        assert!(!config.enabled);
+        config.udp_port = u32::from(port);
+        window.configure(config);
+    }
+    // This is an existing user's positive legacy SYSTEM grant and independent
+    // media permission, not a shortcut granting the new target consent.
+    let mut existing = source.status().config.expect("Source preferences");
+    existing.listener_node_id = a_id.clone();
+    existing.peers = vec![
+        wire::AudioPeerConfig {
+            node_id: a_id.clone(),
+            allow_system_send: true,
+            system_send_override: Some(true),
+            allow_media_control: true,
+            volume_percent: 100,
+            ..Default::default()
+        },
+        wire::AudioPeerConfig {
+            node_id: b_id.clone(),
+            volume_percent: 100,
+            ..Default::default()
+        },
+    ];
+    source.configure(existing);
+    sharing(&mut a, true, wire::AudioRole::Listener, &[]);
+    sharing(&mut b, true, wire::AudioRole::Listener, &[]);
+    sharing(&mut source, true, wire::AudioRole::Source, &a_id);
+    let old_session = audio::healthy(&mut a, &mut source, &a_id, &source_id);
+
+    // Exactly one new user intent, with no hidden permission editor or Start RPC.
+    sharing(&mut source, true, wire::AudioRole::Source, &b_id);
+    let accepted = source.status();
+    assert_eq!(accepted.system_sharing_requested, Some(true));
+    assert_eq!(
+        accepted
+            .config
+            .as_ref()
+            .expect("persisted target")
+            .listener_node_id,
+        b_id
+    );
+    let new_session = audio::healthy(&mut b, &mut source, &b_id, &source_id);
+    assert_ne!(new_session, old_session);
+    a.stopped(&old_session);
+    source.stopped(&old_session);
+    let config = saved(&cluster.nodes[0]);
+    assert_eq!(
+        config.listener_node_id,
+        Some(config::audio::HexId(b_id.try_into().unwrap()))
+    );
+    assert!(config.allow_send_to.is_empty(), "old SYSTEM grant revoked");
+    let old = config
+        .peers
+        .iter()
+        .find(|p| p.node_id.0.as_slice() == a_id)
+        .unwrap();
+    assert!(
+        old.allow_media_control,
+        "unrelated USER media opt-in retained"
+    );
+    assert_eq!(old.system_send_override, None);
+    let selected = config
+        .peers
+        .iter()
+        .find(|p| Some(p.node_id) == config.listener_node_id)
+        .unwrap();
+    assert!(
+        !selected.allow_media_control,
+        "media consent never transferred"
+    );
+    sharing(&mut source, false, wire::AudioRole::Source, &[]);
+    source.stopped(&new_session);
+    assert_eq!(saved(&cluster.nodes[0]).system_sharing, Some(false));
+    assert!(saved(&cluster.nodes[0])
+        .peers
+        .iter()
+        .any(|p| p.allow_media_control));
 }

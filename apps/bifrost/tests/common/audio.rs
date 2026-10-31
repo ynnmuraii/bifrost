@@ -610,9 +610,39 @@ pub fn assert_single_audio_socket(node: &Node, media_port: u16) {
     assert_eq!(bound, 1, "both sessions share one bound media UDP socket");
 }
 
+/// Observe the real core's worker/capture state and released media endpoint on
+/// every platform, with Linux FD ownership and Windows OS process/UDP inspection.
+pub fn assert_no_audio_resources(node: &Node, media_port: u16) {
+    let status = Window::open(node).status();
+    assert!(
+        status
+            .backend
+            .iter()
+            .all(|capability| capability.availability
+                == wire::AudioAvailability::Unavailable as i32
+                && capability.reason == wire::AudioUnavailableReason::WorkerUnavailable as i32),
+        "stopped system audio still reports an owned worker: {:?}",
+        status.backend
+    );
+    assert!(
+        status
+            .sessions
+            .iter()
+            .all(|session| session.capture_active != Some(true) && session.sending != Some(true)),
+        "stopped system audio still reports native capture/send: {:?}",
+        status.sessions
+    );
+    #[cfg(target_os = "linux")]
+    assert_linux_audio_resources(node);
+    #[cfg(windows)]
+    assert_windows_audio_resources(node);
+    let _reservation =
+        UdpSocket::bind(("127.0.0.1", media_port)).expect("stopped media endpoint released");
+}
+
 /// Per-process FD ownership, not /proc/PID/net's namespace-wide socket listing.
 #[cfg(target_os = "linux")]
-pub fn assert_no_audio_resources(node: &Node, media_port: u16) {
+fn assert_linux_audio_resources(node: &Node) {
     assert!(
         audio_children(node).is_empty(),
         "disabled core owns an audio child"
@@ -645,6 +675,54 @@ pub fn assert_no_audio_resources(node: &Node, media_port: u16) {
             }
         }
     }
-    let _reservation =
-        UdpSocket::bind(("127.0.0.1", media_port)).expect("disabled media port released");
+}
+
+/// Inspect only the fixture core's children and UDP ownership, never processes by name.
+#[cfg(windows)]
+fn assert_windows_audio_resources(node: &Node) {
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+try {{
+    $core = Get-CimInstance Win32_Process -Filter "ProcessId = {pid}"
+    if ($null -eq $core) {{ throw 'fixture core is not running' }}
+    Get-CimInstance Win32_Process -Filter "ParentProcessId = {pid}" | ForEach-Object {{
+        if ([string]::IsNullOrWhiteSpace($_.CommandLine)) {{
+            throw 'fixture child command line is unavailable'
+        }}
+        if ($_.CommandLine -match '^\s*(?:"[^"]+"|\S+)\s+audio(?:\s|$)') {{
+            "AUDIO $($_.ProcessId)"
+        }}
+    }}
+    Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetUDPEndpoint `
+        -Filter "OwningProcess = {pid}" | ForEach-Object {{ "UDP $($_.LocalPort)" }}
+}} catch {{
+    [Console]::Error.WriteLine($_)
+    exit 1
+}}"#,
+        pid = node.pid
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("inspect fixture core processes and UDP ownership");
+    assert!(
+        output.status.success(),
+        "fixture core {} resource inspection failed: {}",
+        node.pid,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::str::from_utf8(&output.stdout).expect("ASCII process/UDP inspection");
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (kind, value) = line.split_once(' ').expect("resource inspection row");
+        let value: u32 = value.parse().expect("resource inspection numeric value");
+        match kind {
+            "AUDIO" => panic!("disabled core {} owns audio child {value}", node.pid),
+            "UDP" => assert_eq!(
+                value, 47902,
+                "disabled core {} owns non-discovery UDP {value}",
+                node.pid
+            ),
+            _ => panic!("unexpected resource inspection row: {line}"),
+        }
+    }
 }

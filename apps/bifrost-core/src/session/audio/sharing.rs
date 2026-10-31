@@ -14,7 +14,7 @@ pub(super) struct PendingIntent {
 
 pub(super) struct Start {
     peer: NodeId,
-    deadline: u64,
+    deadline: Option<u64>,
     request_id: Option<[u8; 16]>,
 }
 
@@ -53,6 +53,19 @@ pub(super) fn submit(
 }
 
 impl Actor {
+    pub(super) async fn reconcile_system(&mut self) {
+        self.service_system_start().await;
+        self.drain().await;
+        if !self.worker_needed() && self.worker.is_some() {
+            let _ = self.stop_worker().await;
+            self.drain().await;
+        }
+        // Reconciliation may revoke intent after the ordinary event publication.
+        // Advance its semantic barrier before another queued activation is selected.
+        self.publish_caps();
+        self.publish("system_reconciliation");
+    }
+
     pub(super) fn system_enabled(&self) -> bool {
         self.config.system_enabled()
             && self.applied_system_off == self.system_intents.borrow().off_epoch
@@ -112,14 +125,8 @@ impl Actor {
             return;
         }
         let result = self.enable_system(set, intent.off_epoch).await;
-        if let Err(code) = result {
-            // A rejected edit does not mutate unrelated, already accepted intent.
-            if !self.system_requested && intent.off_epoch == self.system_intents.borrow().off_epoch
-            {
-                self.system_error = Some(code);
-                self.dirty = true;
-            }
-        }
+        // Validation/CAS/save failures answer only this request. They must not
+        // replace the asynchronous outcome of a newer accepted intent.
         self.publish_caps();
         self.publish("system_intent");
         reply(request, result).await;
@@ -179,6 +186,16 @@ impl Actor {
             if !pinned && (self.config.role != role || next.listener_node_id != listener) {
                 next.group_id = None;
             }
+            if self.config.role == role && next.listener_node_id != listener {
+                // Selecting B explicitly revokes only obsolete SYSTEM grants to
+                // A. Independent media preferences and known denials survive.
+                next.allow_send_to.retain(|peer| Some(*peer) == listener);
+                for peer in &mut next.peers {
+                    if Some(peer.node_id) != listener && peer.system_send_override == Some(true) {
+                        peer.system_send_override = None;
+                    }
+                }
+            }
             next.listener_node_id = listener;
         } else if self.config.role != role || next.group_id.is_none() {
             next.group_id = Some(config::audio::HexId(
@@ -212,7 +229,7 @@ impl Actor {
         if let Some(listener) = listener {
             self.system_start = Some(Start {
                 peer: NodeId::new(listener.0),
-                deadline: self.now().saturating_add(REQUEST_TIMEOUT_MS),
+                deadline: None,
                 request_id: None,
             });
         }
@@ -287,7 +304,16 @@ impl Actor {
             return;
         }
         let peer = start.peer;
-        if self.now() >= start.deadline {
+        // Offline/not-yet-enabled receivers are pending discovery. Local consent
+        // and trust revocation are different: they cancel even without a Hello.
+        if !self.allowed(peer) || !self.links.borrow().trusted.contains(&peer) {
+            self.system_failed(ipc::audio::codes::AUDIO_CONSENT_REQUIRED);
+            return;
+        }
+        if start
+            .deadline
+            .is_some_and(|deadline| self.now() >= deadline)
+        {
             self.system_failed(ipc::audio::codes::AUDIO_UNAVAILABLE);
             return;
         }
@@ -316,10 +342,6 @@ impl Actor {
         if !self.start_ready(peer) {
             return;
         }
-        if !self.allowed(peer) || !self.peers.get(&peer).is_some_and(|p| p.trusted) {
-            self.system_failed(ipc::audio::codes::AUDIO_CONSENT_REQUIRED);
-            return;
-        }
         if self
             .records
             .get(&peer)
@@ -344,8 +366,10 @@ impl Actor {
             config::AudioProfile::Wifi => Profile::Wifi,
             _ => Profile::Ethernet,
         };
+        let deadline = self.now().saturating_add(REQUEST_TIMEOUT_MS);
         if let Some(start) = self.system_start.as_mut() {
             start.request_id = Some(request_id);
+            start.deadline = Some(deadline);
         }
         if let Err(code) = self.feed(fsm::Input::RequestStart {
             parent,
@@ -356,5 +380,622 @@ impl Actor {
             self.system_failed(code);
         }
         self.drain().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reconciliation_failure_is_published_before_queued_activation_cas() {
+        let root = std::env::temp_dir().join(format!(
+            "bifrost-sharing-cas-{}-{}",
+            std::process::id(),
+            u128::from_be_bytes(identity::random16().expect("owned fixture ID")),
+        ));
+        let paths = config::Paths::new(&root, &root, &root, Some(root.clone()));
+        let identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(&root))
+                .expect("owned identity")
+                .0,
+        );
+        let local = identity.node_id();
+        let peer = NodeId::new([7; 32]);
+        let mut trust = identity::TrustStore::new();
+        trust.trust(identity::TrustedPeer::paired(peer, "receiver", None, 0));
+        let (manager, _link_events) = LinkManager::new(transport::ManagerConfig {
+            identity,
+            trust: trust.clone(),
+            local_hello: net::Hello::default(),
+            listen: "127.0.0.1:0".parse().expect("owned listen address"),
+            peers: Vec::new(),
+            max_members: 4,
+            queue_capacity: 32,
+            liveness: Default::default(),
+            backoff: Default::default(),
+            pairing: transport::PairingGate::closed(),
+        })
+        .expect("real manager");
+        let audio = config::AudioConfig {
+            enabled: true,
+            system_sharing: Some(true),
+            role: config::AudioRole::Source,
+            group_id: Some(config::audio::HexId([3; 16])),
+            listener_node_id: Some(config::audio::HexId(*peer.as_bytes())),
+            ..Default::default()
+        };
+        let mut persisted = config::Config {
+            audio: audio.clone(),
+            ..Default::default()
+        };
+        persisted.network.listen_address = "127.0.0.1".into();
+        persisted
+            .validate()
+            .expect("valid owned config before testing persistence");
+        persisted
+            .save(paths.config_file())
+            .expect("real accepted consent persistence");
+        let (events, mut consumer) = broadcast::channel(16);
+        let (coordinator, mut actor) = Coordinator::prepare(
+            audio,
+            local,
+            Arc::new(manager),
+            paths.clone(),
+            "127.0.0.1:0".parse().expect("owned address"),
+            true,
+            events,
+        );
+        coordinator.trusted(&trust);
+        // Accepted pending intent with no native facts fabricated: worker is absent.
+        actor.system_requested = true;
+        actor.system_start = Some(Start {
+            peer,
+            deadline: None,
+            request_id: None,
+        });
+        actor.configure().expect("pending model configuration");
+        actor.drain().await;
+        actor.epoch = actor
+            .epoch
+            .checked_sub(Duration::from_secs(11))
+            .expect("clock anchor");
+        Box::pin(actor.reconcile_system()).await;
+        assert!(actor.system_requested, "no pre-Hello ten-second expiry");
+        assert!(actor.system_error.is_none());
+        let waiting = actor
+            .system_start
+            .as_ref()
+            .expect("initial intent still waiting");
+        assert!(
+            waiting.deadline.is_none() && waiting.request_id.is_none(),
+            "waiting cannot issue or retry a P1 request"
+        );
+        assert!(actor.worker.is_none());
+        // Now exercise a genuine post-dispatch timeout phase, not initial discovery.
+        actor.system_start = Some(Start {
+            peer,
+            deadline: Some(REQUEST_TIMEOUT_MS),
+            request_id: Some([6; 16]),
+        });
+        actor.publish("pending_intent");
+        let mut snapshot = None;
+        while let Ok((_, gui::gui_frame::Msg::AudioStatus(status))) = consumer.try_recv() {
+            snapshot = Some(status);
+        }
+        let snapshot = snapshot.expect("actual published pending state");
+        assert_eq!(snapshot.system_sharing_requested, Some(true));
+        assert!(snapshot.sessions.is_empty());
+        let (out, mut replies) = mpsc::channel(4);
+        coordinator
+            .submit(Request {
+                request_id: 41,
+                connection_id: [8; 16],
+                message: gui::gui_frame::Msg::SetSystemAudioSharing(gui::SetSystemAudioSharing {
+                    enabled: true,
+                    role: gui::AudioRole::Source as i32,
+                    listener_node_id: peer.as_bytes().to_vec(),
+                    expected_revision: snapshot.revision,
+                }),
+                out,
+            })
+            .expect("actual bounded intent admission");
+        // Expiry reconciles the pending intent while the earlier GUI action is queued.
+        Box::pin(actor.reconcile_system()).await;
+        Box::pin(actor.system_intent()).await;
+        let (request_id, message) = replies.recv().await.expect("actual correlated reply");
+        assert_eq!(request_id, 41);
+        assert!(
+            matches!(&message, gui::gui_frame::Msg::OpResult(result)
+            if !result.ok && result.error_code == ipc::audio::codes::AUDIO_REVISION_CONFLICT),
+            "pre-failure queued activation must be refused: {message:?}"
+        );
+        assert!(!actor.system_requested);
+        assert!(actor.worker.is_none());
+        let mut stopped = None;
+        while let Ok((_, gui::gui_frame::Msg::AudioStatus(status))) = consumer.try_recv() {
+            stopped = Some(status);
+        }
+        let stopped = stopped.expect("consumer receives reconciliation before another command");
+        assert_eq!(stopped.system_sharing_requested, Some(false));
+        assert!(stopped.revision > snapshot.revision);
+        assert_eq!(
+            config::Config::load(paths.config_file())
+                .expect("real config")
+                .audio
+                .system_sharing,
+            Some(true),
+            "runtime failure does not invent persisted OFF"
+        );
+        drop(actor);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).expect("remove owned fixture");
+    }
+
+    async fn next_audio(
+        events: &mut mpsc::Receiver<transport::LinkEvent>,
+    ) -> (NodeId, [u8; 16], net::AudioControl) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("live authenticated link") {
+                    transport::LinkEvent::Message {
+                        peer,
+                        message:
+                            transport::convert::Inbound::Audio {
+                                message,
+                                connection_id,
+                            },
+                    } => return (peer, connection_id, message),
+                    transport::LinkEvent::Message {
+                        message: transport::convert::Inbound::AudioRejected { .. },
+                        ..
+                    } => panic!("fixture must deliver a valid authenticated control message"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("bounded authenticated AudioControl delivery")
+    }
+
+    async fn next_up(
+        events: &mut mpsc::Receiver<transport::LinkEvent>,
+    ) -> (
+        NodeId,
+        [u8; 16],
+        [u8; 16],
+        transport::convert::PeerInfo,
+        SocketAddr,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let transport::LinkEvent::Up {
+                    peer,
+                    generation,
+                    connection_id,
+                    hello,
+                    remote,
+                    ..
+                } = events.recv().await.expect("live manager")
+                {
+                    return (peer, generation, connection_id, hello, remote);
+                }
+            }
+        })
+        .await
+        .expect("real pinned TLS and Hello establishment")
+    }
+
+    fn manager_for(
+        identity: Arc<identity::NodeIdentity>,
+        peer: NodeId,
+        address: Option<SocketAddr>,
+        capabilities: Vec<i32>,
+    ) -> (
+        Arc<LinkManager>,
+        mpsc::Receiver<transport::LinkEvent>,
+        identity::TrustStore,
+    ) {
+        let mut trust = identity::TrustStore::new();
+        trust.trust(identity::TrustedPeer::paired(
+            peer,
+            "fixture",
+            address.map(|address| address.to_string()),
+            0,
+        ));
+        let local = identity.node_id();
+        let (manager, events) = LinkManager::new(transport::ManagerConfig {
+            identity,
+            trust: trust.clone(),
+            local_hello: net::Hello {
+                node_id: local.as_bytes().to_vec(),
+                display_name: "fixture".into(),
+                session_kind: net::SessionKind::X11 as i32,
+                capabilities,
+                ..Default::default()
+            },
+            listen: "127.0.0.1:0".parse().expect("owned listener"),
+            peers: address.into_iter().collect(),
+            max_members: 2,
+            queue_capacity: 32,
+            liveness: Default::default(),
+            backoff: Default::default(),
+            pairing: transport::PairingGate::closed(),
+        })
+        .expect("real TLS manager");
+        (Arc::new(manager), events, trust)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SourceSetup {
+        Restart,
+        TerminalFailure,
+        Legacy,
+        WaitingLocalDeny,
+        WaitingUnpair,
+    }
+
+    async fn unsolicited_offer_with_stored_consent(setup: SourceSetup) {
+        let terminal_failure = setup == SourceSetup::TerminalFailure;
+        let legacy = setup == SourceSetup::Legacy;
+        let unpaired = setup == SourceSetup::WaitingUnpair;
+        let root = std::env::temp_dir().join(format!(
+            "bifrost-sharing-offer-{}",
+            u128::from_be_bytes(identity::random16().expect("owned fixture ID"))
+        ));
+        let source_root = root.join("source");
+        let listener_root = root.join("listener");
+        let source_identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(
+                &source_root,
+            ))
+            .expect("Source identity")
+            .0,
+        );
+        let listener_identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(
+                &listener_root,
+            ))
+            .expect("Listener identity")
+            .0,
+        );
+        let source_id = source_identity.node_id();
+        let listener_id = listener_identity.node_id();
+        let (source_manager, mut source_events, source_trust) = manager_for(
+            source_identity,
+            listener_id,
+            None,
+            vec![
+                net::Capability::AudioControlV1 as i32,
+                net::Capability::AudioFocusReportV1 as i32,
+            ],
+        );
+        let source_runner = tokio::spawn({
+            let manager = Arc::clone(&source_manager);
+            async move {
+                manager.run().await.expect("Source manager");
+            }
+        });
+        // Rebind port 0 atomically: no free-port reservation/handoff race.
+        let source_address = source_manager
+            .rebind_listener("127.0.0.1:0".parse().expect("owned address"))
+            .await
+            .expect("bound Source listener");
+        let (listener_manager, mut listener_events, _) = manager_for(
+            listener_identity,
+            source_id,
+            Some(source_address),
+            vec![
+                net::Capability::AudioControlV1 as i32,
+                net::Capability::AudioListener as i32,
+            ],
+        );
+        let listener_runner = tokio::spawn({
+            let manager = Arc::clone(&listener_manager);
+            async move {
+                manager.run().await.expect("Listener manager");
+            }
+        });
+        let (peer, generation, connection, hello, remote) = next_up(&mut source_events).await;
+        assert_eq!(peer, listener_id);
+        let (_, _, listener_connection, _, _) = next_up(&mut listener_events).await;
+        assert_eq!(connection, listener_connection);
+        let paths = config::Paths::new(
+            &source_root,
+            &source_root,
+            &source_root,
+            Some(source_root.clone()),
+        );
+        let audio = config::AudioConfig {
+            enabled: true,
+            system_sharing: if legacy { None } else { Some(true) },
+            role: config::AudioRole::Source,
+            group_id: Some(config::audio::HexId([3; 16])),
+            listener_node_id: Some(config::audio::HexId(*listener_id.as_bytes())),
+            allow_send_to: if legacy {
+                vec![config::audio::HexId(*listener_id.as_bytes())]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let mut persisted = config::Config {
+            audio: audio.clone(),
+            ..Default::default()
+        };
+        persisted.network.listen_address = "127.0.0.1".into();
+        persisted
+            .save(paths.config_file())
+            .expect("stored consent, not current activation");
+        let (events, _status) = broadcast::channel(32);
+        let (coordinator, mut actor) = Coordinator::prepare(
+            audio,
+            source_id,
+            Arc::clone(&source_manager),
+            paths.clone(),
+            source_address,
+            true,
+            events,
+        );
+        coordinator.trusted(&source_trust);
+        coordinator.link_up(peer, generation, connection, &hello, remote, true);
+        actor.configure().expect("startup configuration");
+        actor.sync_links();
+        actor.drain().await;
+        assert!(
+            !actor.system_requested,
+            "modern Source restart has no volatile activation"
+        );
+        if matches!(
+            setup,
+            SourceSetup::WaitingLocalDeny | SourceSetup::WaitingUnpair
+        ) {
+            // Current accepted intent, but no AudioHello and no first P1 attempt.
+            actor.system_requested = true;
+            actor.system_start = Some(Start {
+                peer: listener_id,
+                deadline: None,
+                request_id: None,
+            });
+            actor.configure().expect("initial waiting intent");
+            actor.drain().await;
+            actor.epoch = actor
+                .epoch
+                .checked_sub(Duration::from_secs(11))
+                .expect("clock anchor");
+            Box::pin(actor.reconcile_system()).await;
+            assert!(
+                actor.system_requested,
+                "walking to the receiver must not expire intent"
+            );
+            assert!(actor.system_error.is_none());
+            let waiting = actor.system_start.as_ref().expect("still waiting");
+            assert!(waiting.request_id.is_none() && waiting.deadline.is_none());
+            assert!(actor.worker.is_none(), "waiting has no native capture");
+            if unpaired {
+                coordinator.trusted(&identity::TrustStore::new());
+            } else {
+                actor.config.peers.push(config::AudioPeerConfig {
+                    node_id: config::audio::HexId(*listener_id.as_bytes()),
+                    system_send_override: Some(false),
+                    system_receive_override: None,
+                    allow_media_control: false,
+                    allow_mic_control: false,
+                    gain_percent: 100,
+                    muted: false,
+                });
+                actor
+                    .save(actor.config.clone())
+                    .await
+                    .expect("real Advanced deny persistence");
+                actor
+                    .configure()
+                    .expect("apply local permission withdrawal");
+            }
+            Box::pin(actor.reconcile_system()).await;
+            assert!(
+                !actor.system_requested,
+                "local revocation precedes any late Hello"
+            );
+            assert!(actor.system_start.is_none());
+            assert_eq!(
+                actor.system_error,
+                Some(ipc::audio::codes::AUDIO_CONSENT_REQUIRED)
+            );
+        }
+        let listener_hello = wire::encode_control(
+            &fsm::Control::Hello(fsm::Hello {
+                role: model::AudioRole::Listener,
+                group: Some([3; 16]),
+                listener: *listener_id.as_bytes(),
+                available: true,
+                allowed: true,
+                consent_revision: 1,
+            }),
+            model::AudioRole::Listener,
+            44913,
+            connection,
+        )
+        .expect("valid Listener Hello");
+        listener_manager
+            .send_audio_control(&source_id, listener_hello)
+            .await
+            .expect("real TLS send");
+        let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
+        coordinator.receive(peer, envelope_connection, message);
+        if unpaired {
+            assert!(
+                matches!(
+                    actor.commands.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ),
+                "already authenticated but locally revoked parent cannot enqueue Hello"
+            );
+        } else {
+            let command = actor
+                .commands
+                .recv()
+                .await
+                .expect("real coordinator ingress");
+            actor.on_network(command.parent, command.message.expect("validated control"));
+            actor.drain().await;
+        }
+        if terminal_failure {
+            // Real accepted user persistence followed by real child startup failure:
+            // this lib-test executable is not an audio-role executable. No native
+            // Ready/Started/health facts or successful child ACK are fabricated.
+            actor.publish("before_attempt");
+            let (out, mut replies) = mpsc::channel(4);
+            coordinator
+                .submit(Request {
+                    request_id: 57,
+                    connection_id: [9; 16],
+                    out,
+                    message: gui::gui_frame::Msg::SetSystemAudioSharing(
+                        gui::SetSystemAudioSharing {
+                            enabled: true,
+                            role: gui::AudioRole::Source as i32,
+                            listener_node_id: listener_id.as_bytes().to_vec(),
+                            expected_revision: actor.revision,
+                        },
+                    ),
+                })
+                .expect("explicit current user intent");
+            Box::pin(actor.system_intent()).await;
+            let (_, reply) = replies.recv().await.expect("actual persistence ACK");
+            assert!(matches!(reply, gui::gui_frame::Msg::OpResult(result) if result.ok));
+            assert!(!actor.system_requested);
+            assert!(
+                actor.system_error.is_some(),
+                "failed native startup is authoritative"
+            );
+            Box::pin(actor.reconcile_system()).await;
+        }
+        let session = identity::random16().expect("fresh incoming session ID");
+        let format = format(Profile::Ethernet);
+        let offer = wire::encode_control(
+            &fsm::Control::Offer(fsm::Offer {
+                request_id: None,
+                session,
+                listener_nonce: [4; 32],
+                parent_connection_id: connection,
+                group: [3; 16],
+                listener: *listener_id.as_bytes(),
+                source: *source_id.as_bytes(),
+                format,
+                format_sha256: wire::format_sha256(format),
+                listener_port: 44913,
+                consent_revision: 1,
+            }),
+            model::AudioRole::Listener,
+            44913,
+            connection,
+        )
+        .expect("valid unsolicited Offer");
+        listener_manager
+            .send_audio_control(&source_id, offer)
+            .await
+            .expect("authenticated unsolicited Offer");
+        let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
+        assert!(
+            matches!(&message.body, Some(net::audio_control::Body::Offer(offer))
+            if offer.session_id == session && offer.parent_connection_id == envelope_connection)
+        );
+        coordinator.receive(peer, envelope_connection, message);
+        if unpaired {
+            assert!(
+                matches!(
+                    actor.commands.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ),
+                "late Offer is fenced at the revoked Source parent boundary"
+            );
+        } else {
+            let command = actor
+                .commands
+                .recv()
+                .await
+                .expect("Offer reaches Source coordinator");
+            assert_eq!(command.parent.connection_id, connection);
+            actor.on_network(
+                command.parent,
+                command.message.expect("valid parent-bound Offer"),
+            );
+            actor.drain().await;
+            let answer = timeout(Duration::from_secs(5), async {
+                loop {
+                    let (_, _, message) = next_audio(&mut listener_events).await;
+                    if let Some(net::audio_control::Body::Answer(answer)) = message.body {
+                        if answer.session_id == session {
+                            break answer;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("Source sends a correlated refusal over authenticated link");
+            assert!(!answer.accepted);
+            assert!(
+                answer.source_nonce.is_empty(),
+                "first nonce/key/native Prepare was not authorized"
+            );
+            assert_eq!(
+                answer.reason,
+                if legacy {
+                    net::AudioStopCode::DeviceUnavailable
+                } else {
+                    net::AudioStopCode::Disabled
+                } as i32
+            );
+        }
+        assert!(actor.model.session(*listener_id.as_bytes()).is_none());
+        assert!(
+            actor.worker.is_none(),
+            "external Offer cannot spawn a media worker"
+        );
+        assert!(
+            actor.records.is_empty(),
+            "no native session/materials were prepared"
+        );
+        let saved = config::Config::load(paths.config_file()).expect("actual persisted config");
+        assert_eq!(
+            saved.audio.system_sharing,
+            if legacy { None } else { Some(true) }
+        );
+        assert!(!saved.audio.resume_system_audio);
+        source_manager.kill_all().await;
+        listener_manager.kill_all().await;
+        source_runner.abort();
+        listener_runner.abort();
+        let _ = source_runner.await;
+        let _ = listener_runner.await;
+        drop(actor);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).expect("remove owned TLS fixture");
+    }
+
+    #[tokio::test]
+    async fn authenticated_unsolicited_offer_cannot_activate_restarted_modern_source() {
+        unsolicited_offer_with_stored_consent(SourceSetup::Restart).await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_unsolicited_offer_cannot_rearm_terminally_failed_modern_source() {
+        unsolicited_offer_with_stored_consent(SourceSetup::TerminalFailure).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_explicit_source_consent_remains_distinct_from_modern_runtime_intent() {
+        unsolicited_offer_with_stored_consent(SourceSetup::Legacy).await;
+    }
+
+    #[tokio::test]
+    async fn waiting_past_ten_seconds_local_deny_cancels_before_late_authenticated_hello_offer() {
+        unsolicited_offer_with_stored_consent(SourceSetup::WaitingLocalDeny).await;
+    }
+
+    #[tokio::test]
+    async fn waiting_past_ten_seconds_unpair_cancels_before_late_authenticated_hello_offer() {
+        unsolicited_offer_with_stored_consent(SourceSetup::WaitingUnpair).await;
     }
 }
