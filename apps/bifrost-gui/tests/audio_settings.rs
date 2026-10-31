@@ -1320,3 +1320,93 @@ fn main_audio_tasks_follow_current_role_without_duplicate_pending_or_error_instr
         }
     }
 }
+
+#[test]
+fn receiver_picker_retargets_live_source_once_but_off_selection_is_draft_only() {
+    for lang in [Lang::En, Lang::Ru] {
+        for sharing in [false, true] {
+            let mut vm = fixture(lang, Theme::Dark, if sharing { "source" } else { "ready" });
+            let mut receiver_b = vm.status.as_ref().unwrap().members[1].clone();
+            receiver_b.node_id = "cc33".repeat(16);
+            receiver_b.display_name = "HTPC".into();
+            vm.status.as_mut().unwrap().members.push(receiver_b);
+            let status = vm.audio.status.as_mut().unwrap();
+            status.system_sharing_requested = Some(sharing);
+            status.config.as_mut().unwrap().system_sharing = Some(sharing);
+            vm.audio.draft = status.config.clone().unwrap();
+            let a = vm.audio.draft.listener_node_id.clone();
+            let b = [0xcc, 0x33].repeat(16);
+            let revision = status.revision;
+            let ctx = egui::Context::default();
+            ui::install_fonts(&ctx);
+            let size = egui::vec2(400.0, 1800.0);
+            frame(&ctx, &vm, size, Vec::new());
+            let (output, _) = frame(&ctx, &vm, size, Vec::new());
+            let picker = labels(&output)
+                .into_iter()
+                .find(|(s, _)| s == "LAPTOP")
+                .unwrap()
+                .1
+                .center();
+            frame(&ctx, &vm, size, click(picker));
+            let (output, _) = frame(&ctx, &vm, size, Vec::new());
+            let destination = labels(&output)
+                .into_iter()
+                .find(|(s, _)| s == "HTPC")
+                .unwrap()
+                .1
+                .center();
+            let (_, actions) = frame(&ctx, &vm, size, click(destination));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::Audio(AudioAction::Retarget(_))))
+                    .count(),
+                usize::from(sharing)
+            );
+            for action in actions {
+                let Action::Audio(action) = action else {
+                    panic!("audio action")
+                };
+                vm.audio_action(&action, std::time::Instant::now());
+            }
+            let commands = vm.take_outgoing();
+            if sharing {
+                assert_eq!(commands.len(), 1);
+                assert!(
+                    matches!(&commands[0].1, ipc::gui_frame::Msg::SetSystemAudioSharing(request)
+                    if request.enabled && request.role == ipc::AudioRole::Source as i32
+                        && request.listener_node_id == b && request.expected_revision == revision)
+                );
+                assert!(vm.audio.pending && vm.audio.retargeting);
+                assert_eq!(
+                    vm.audio
+                        .status
+                        .as_ref()
+                        .unwrap()
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .listener_node_id,
+                    a
+                );
+                let (output, _) = frame(&ctx, &vm, size, Vec::new());
+                let values = labels(&output);
+                assert!(values
+                    .iter()
+                    .any(|(s, _)| s == text(lang, Key::AudioSwitchingReceiver)));
+                assert!(values.iter().any(
+                    |(s, _)| s.contains("LAPTOP") && s.contains(text(lang, Key::AudioSharing))
+                ));
+                assert!(!values
+                    .iter()
+                    .any(|(s, _)| s.contains("HTPC") && s.contains(text(lang, Key::AudioSharing))));
+            } else {
+                assert!(commands.is_empty());
+                assert!(!vm.audio.pending);
+                assert!(!vm.audio.sharing_requested(ipc::AudioRole::Source));
+            }
+            assert_eq!(vm.audio.draft.listener_node_id, b);
+        }
+    }
+}

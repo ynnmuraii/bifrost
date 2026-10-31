@@ -841,3 +841,147 @@ fn urgent_card_mute_ack_cannot_replace_pending_system_intent_persistence_result(
         ))
     );
 }
+
+fn running_source_snapshot(revision: u64, target: [u8; 32]) -> ipc::AudioStatus {
+    let mut status = sharing_snapshot(revision, ipc::AudioRole::Source, true);
+    status.config.as_mut().unwrap().listener_node_id = target.to_vec();
+    let mut session = snapshot(revision).sessions.remove(0);
+    session.peer = target.to_vec();
+    session.local_role = ipc::AudioRole::Source as i32;
+    session.media_info = None;
+    session.capture_active = Some(true);
+    session.sending = Some(true);
+    session.consent = Some(ipc::AudioSessionConsent {
+        local: Some(ipc::AudioConsentFlags {
+            allow_system_send: true,
+            ..Default::default()
+        }),
+        remote: Some(ipc::AudioConsentFlags {
+            allow_system_receive: true,
+            ..Default::default()
+        }),
+    });
+    status.sessions.push(session);
+    bifrost_gui::audio_wire::decode_status(&status).expect("valid observed Source pipeline");
+    status
+}
+
+#[test]
+fn source_retarget_uses_one_sparse_request_and_reconciles_only_authoritative_target() {
+    let a = [2; 32];
+    let b = [3; 32];
+    for outcome in ["reject", "success", "wrong-target", "postpersist-failure"] {
+        let mut vm = view();
+        vm.apply(event(Msg::AudioStatus(running_source_snapshot(5, a))));
+        let original_config = vm.audio.draft.clone();
+        vm.audio_action(&AudioAction::Retarget(b), Instant::now());
+        let mut commands = vm.take_outgoing();
+        assert_eq!(commands.len(), 1);
+        let (id, message) = commands.remove(0);
+        assert!(matches!(message, Msg::SetSystemAudioSharing(request)
+            if request.enabled && request.role == ipc::AudioRole::Source as i32
+                && request.listener_node_id == b && request.expected_revision == 5));
+        assert!(vm.audio.pending && vm.audio.retargeting);
+        assert_eq!(vm.audio.draft.listener_node_id, b);
+        assert_eq!(
+            vm.audio.status.as_ref().unwrap().config.as_ref().unwrap(),
+            &original_config
+        );
+
+        vm.apply(event(Msg::AudioStatus(running_source_snapshot(6, a))));
+        vm.audio_result(
+            id + 100,
+            audio::AudioRequest::Mutation,
+            ipc::OpResult {
+                ok: true,
+                error_code: String::new(),
+            },
+        );
+        assert!(vm.audio.pending && vm.audio.retargeting);
+        assert_eq!(
+            vm.audio.draft.listener_node_id, b,
+            "queued A status cannot replace selected B"
+        );
+        assert_eq!(vm.audio.status.as_ref().unwrap().sessions[0].peer, a);
+
+        if outcome == "reject" {
+            vm.apply(support::answer(
+                id,
+                Msg::OpResult(ipc::OpResult {
+                    ok: false,
+                    error_code: "AUDIO_CONFIG_WRITE".into(),
+                }),
+            ));
+            assert!(!vm.audio.pending && !vm.audio.retargeting);
+            assert_eq!(vm.audio.draft.listener_node_id, a);
+            assert!(vm.audio.sharing_requested(ipc::AudioRole::Source));
+            let (read_id, message) = vm
+                .take_outgoing()
+                .pop()
+                .expect("fresh failure reconciliation");
+            assert!(matches!(message, Msg::GetAudioStatus(_)));
+            let mut same_revision = running_source_snapshot(6, a);
+            same_revision.sessions[0].latency_estimate_ms = Some(77);
+            vm.apply(support::answer(read_id, Msg::AudioStatus(same_revision)));
+            assert_eq!(
+                vm.audio.status.as_ref().unwrap().sessions[0].latency_estimate_ms,
+                Some(77)
+            );
+            assert!(vm.audio.sharing_requested(ipc::AudioRole::Source));
+            assert_eq!(
+                vm.audio.error_message(vm.look.language),
+                Some(ui_text::text(
+                    vm.look.language,
+                    ui_text::Key::AudioConfigWrite
+                ))
+            );
+        } else {
+            vm.apply(support::answer(
+                id,
+                Msg::OpResult(ipc::OpResult {
+                    ok: true,
+                    error_code: String::new(),
+                }),
+            ));
+            let (read_id, message) = vm.take_outgoing().pop().expect("fresh post-ACK read");
+            assert!(matches!(message, Msg::GetAudioStatus(_)));
+            let mut authoritative =
+                running_source_snapshot(7, if outcome == "wrong-target" { a } else { b });
+            if outcome == "postpersist-failure" {
+                authoritative.system_sharing_requested = Some(false);
+                authoritative.system_sharing_error = "AUDIO_DEVICE_UNAVAILABLE".into();
+                authoritative.sessions.clear();
+            }
+            vm.apply(support::answer(read_id, Msg::AudioStatus(authoritative)));
+            if outcome == "wrong-target" {
+                assert!(vm.audio.pending && vm.audio.retargeting);
+                assert_eq!(vm.audio.draft.listener_node_id, b);
+                assert_eq!(vm.audio.status.as_ref().unwrap().sessions[0].peer, a);
+                vm.audio_action(&AudioAction::Share(false), Instant::now());
+                let (_, off) = vm.take_outgoing().pop().expect("OFF remains actionable");
+                assert!(matches!(off, Msg::SetSystemAudioSharing(request) if !request.enabled));
+            } else {
+                assert!(!vm.audio.pending && !vm.audio.retargeting);
+                assert_eq!(vm.audio.draft.listener_node_id, b);
+                if outcome == "postpersist-failure" {
+                    assert!(!vm.audio.sharing_requested(ipc::AudioRole::Source));
+                    assert!(vm.audio.status.as_ref().unwrap().sessions.is_empty());
+                    assert_eq!(
+                        vm.audio.error_message(vm.look.language),
+                        Some(ui_text::text(
+                            vm.look.language,
+                            ui_text::Key::AudioDeviceUnavailable
+                        ))
+                    );
+                } else {
+                    assert!(vm.audio.sharing_requested(ipc::AudioRole::Source));
+                    assert_eq!(vm.audio.status.as_ref().unwrap().sessions[0].peer, b);
+                }
+            }
+        }
+        assert!(
+            vm.take_outgoing().is_empty(),
+            "no implicit activation or retry of A"
+        );
+    }
+}
