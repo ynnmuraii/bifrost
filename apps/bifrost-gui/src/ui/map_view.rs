@@ -1964,7 +1964,11 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
         );
         let size = galley.size() + Vec2::new(52.0, 24.0);
         let pill = Rect::from_min_size(Pos2::new(center - size.x / 2.0, y), size);
-        let edge = if outcome.ok { pal.ok } else { pal.accent };
+        let edge = match outcome.kind {
+            crate::view_model::OutcomeKind::Success => pal.ok,
+            crate::view_model::OutcomeKind::Failure => pal.accent,
+            crate::view_model::OutcomeKind::Info => pal.line,
+        };
         let response = ui
             .interact(pill, egui::Id::new("outcome"), Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);

@@ -847,7 +847,12 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
     wait_for(
         &mut follower,
         "the owner to refuse the stale follower edit",
-        |view| view.outcome.as_ref().filter(|outcome| !outcome.ok).cloned(),
+        |view| {
+            view.outcome
+                .as_ref()
+                .filter(|outcome| !outcome.is_success())
+                .cloned()
+        },
     );
     let refusal = follower
         .view()
@@ -855,7 +860,7 @@ fn the_first_owner_layout_apply_reaches_both_windows() {
         .as_ref()
         .expect("the refusal is shown");
     assert!(
-        !refusal.ok,
+        !refusal.is_success(),
         "the stale follower edit is refused: {refusal:?}"
     );
     assert_eq!(owner.view().editor.revision, 2);
@@ -972,7 +977,7 @@ fn the_pairing_wizard_pairs_two_cores_through_the_view_model() {
     let verdict = |view: &ViewModel| {
         view.outcome
             .as_ref()
-            .filter(|outcome| outcome.ok && outcome.text.contains("сопряжён"))
+            .filter(|outcome| outcome.is_success() && outcome.text.contains("сопряжён"))
             .map(|outcome| outcome.line(ui_text::Lang::Ru))
     };
     let left_line = wait_for(&mut left, "the left window's pairing verdict", verdict);

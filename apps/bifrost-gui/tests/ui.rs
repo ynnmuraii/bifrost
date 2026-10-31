@@ -1989,6 +1989,10 @@ fn cancelled_pairing_shows_localized_status_without_the_old_code() {
                 &frame,
                 &[ui_text::text(lang, ui_text::Key::PairingCancelled)],
             );
+            assert!(frame
+                .texts
+                .iter()
+                .any(|(line, _)| line == ui_text::text(lang, ui_text::Key::PairingCancelled)));
             assert!(!shows(&frame, "482 913"));
             assert!(!shows(
                 &frame,
@@ -2030,6 +2034,59 @@ fn optional_cancelled_pairing_pngs() {
                 .unwrap()
                 .save(dir.join(format!("pairing-cancelled-{language}-{theme_name}.png")))
                 .unwrap();
+        }
+    }
+}
+
+#[test]
+fn audio_sidebar_destinations_have_distinct_accessible_names_and_tooltips() {
+    for lang in [ui_text::Lang::En, ui_text::Lang::Ru] {
+        let mut vm = connected();
+        vm.look.language = lang;
+        let settings = Modal::Audio.title(lang);
+        let player = ui_text::text(lang, ui_text::Key::AudioPlayer);
+        assert_ne!(settings, player);
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let now = Instant::now();
+        let mut state = UiState::new(now);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE)),
+                ..Default::default()
+            },
+            |ui| {
+                ui::draw(
+                    ui,
+                    &vm,
+                    &mut state,
+                    Env {
+                        now,
+                        animate: false,
+                    },
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for label in [settings, player] {
+            assert!(tree
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some(label)));
+        }
+        let mut harness = Harness::new();
+        harness.settle(&vm, false);
+        let settings_slot = Modal::ALL
+            .iter()
+            .position(|modal| *modal == Modal::Audio)
+            .unwrap();
+        for (slot, label) in [(settings_slot, settings), (Modal::ALL.len() + 1, player)] {
+            let at = egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + slot as f32 * 50.0 + 22.0);
+            let frame = harness.frame(&vm, false, SIZE, vec![egui::Event::PointerMoved(at)]);
+            expect(&frame, &[label]);
         }
     }
 }

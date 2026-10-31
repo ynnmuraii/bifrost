@@ -63,7 +63,9 @@ fn audit_only_a_committed_pairing_outcome_shows_success() {
             (outcome == PairingOutcome::Paired).then_some("LAPTOP")
         );
         assert_eq!(
-            vm.outcome.as_ref().is_some_and(|result| result.ok),
+            vm.outcome
+                .as_ref()
+                .is_some_and(|result| result.is_success()),
             outcome == PairingOutcome::Paired
         );
         assert!(vm.pairing.prompt.is_none());
@@ -93,7 +95,7 @@ fn matching_and_legacy_results_survive_the_answer_ack_removing_the_prompt() {
             ..Default::default()
         })));
         assert_eq!(vm.pairing.paired.as_deref(), Some("LAPTOP"));
-        assert!(vm.outcome.as_ref().unwrap().ok);
+        assert!(vm.outcome.as_ref().unwrap().is_success());
     }
 }
 
@@ -206,7 +208,11 @@ fn cancellation_results_and_pair_request_failures_use_the_localized_status() {
             assert!(vm.pairing.prompt.is_none());
             assert!(vm.pairing.paired.is_none());
             let status = vm.outcome.as_ref().unwrap();
-            assert!(!status.ok);
+            assert_eq!(status.kind, bifrost_gui::view_model::OutcomeKind::Info);
+            assert_eq!(
+                status.line(lang),
+                ui_text::text(lang, ui_text::Key::PairingCancelled)
+            );
             assert_eq!(
                 status.text,
                 ui_text::text(lang, ui_text::Key::PairingCancelled)

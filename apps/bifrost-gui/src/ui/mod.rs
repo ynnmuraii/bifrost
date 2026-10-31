@@ -421,7 +421,7 @@ fn rail_draw(
         Icon::Clip,
         Icon::Diag,
         Icon::Settings,
-        Icon::Audio,
+        Icon::Headphones,
     ];
     let mut tip: Option<(Rect, &'static str)> = None;
     // Service sections, appearance, and the independent popup entry share the rail.
@@ -519,6 +519,9 @@ fn rail_button(
     let response = ui
         .interact(btn, ui.id().with(("rail", num)), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, title)
+    });
     let hover = response.hovered() || response.has_focus();
     if on {
         painter.rect(

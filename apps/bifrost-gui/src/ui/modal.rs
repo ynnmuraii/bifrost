@@ -96,7 +96,11 @@ pub fn draw(
                     pal.ink,
                     (width - 56.0).max(40.0),
                 ),
-                if outcome.ok { pal.ok } else { pal.accent },
+                match outcome.kind {
+                    crate::view_model::OutcomeKind::Success => pal.ok,
+                    crate::view_model::OutcomeKind::Failure => pal.accent,
+                    crate::view_model::OutcomeKind::Info => pal.line,
+                },
             )
         });
     let feedback_h = clipboard_feedback

@@ -365,12 +365,19 @@ pub struct StartedCore {
     pub pid: Option<u32>,
 }
 
+/// Presentation and semantics of a completed operation or informational notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeKind {
+    Success,
+    Failure,
+    Info,
+}
+
 /// A finished operation, as the window shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// `true` for «Готово», `false` for «Не получилось».
-    pub ok: bool,
-    /// The sentence, already in Russian.
+    pub kind: OutcomeKind,
+    /// The already-localized sentence.
     pub text: String,
 }
 
@@ -378,7 +385,7 @@ impl Outcome {
     /// A success.
     pub fn done(text: impl Into<String>) -> Self {
         Outcome {
-            ok: true,
+            kind: OutcomeKind::Success,
             text: text.into(),
         }
     }
@@ -386,17 +393,29 @@ impl Outcome {
     /// A failure.
     pub fn failed(text: impl Into<String>) -> Self {
         Outcome {
-            ok: false,
+            kind: OutcomeKind::Failure,
             text: text.into(),
         }
     }
 
+    /// An informational notice: neither an error nor a successful operation.
+    pub fn info(text: impl Into<String>) -> Self {
+        Outcome {
+            kind: OutcomeKind::Info,
+            text: text.into(),
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.kind == OutcomeKind::Success
+    }
+
     /// The line as the screens draw it.
     pub fn line(&self, lang: Lang) -> String {
-        if self.ok {
-            fill(lang, Key::Done, &[&self.text])
-        } else {
-            fill(lang, Key::Failed, &[&self.text])
+        match self.kind {
+            OutcomeKind::Success => fill(lang, Key::Done, &[&self.text]),
+            OutcomeKind::Failure => fill(lang, Key::Failed, &[&self.text]),
+            OutcomeKind::Info => self.text.clone(),
         }
     }
 }
@@ -1403,7 +1422,7 @@ impl ViewModel {
                         .lan
                         .applied
                         .as_ref()
-                        .is_some_and(|applied| applied.ok)
+                        .is_some_and(Outcome::is_success)
                     {
                         self.settings.lan.applied =
                             Some(Outcome::done("Адрес сохранён, служба перезапущена"));
@@ -1492,6 +1511,8 @@ impl ViewModel {
                         .unwrap_or_else(|| text(lang, Key::ComputerTitle));
                     let line = fill_named(lang, Key::NameIsPaired, &[("name", &name)]);
                     self.set_outcome(Outcome::done(line));
+                } else if result.error_code == "PAIRING_CANCELLED" {
+                    self.set_outcome(Outcome::info(text(lang, Key::PairingCancelled)));
                 } else if !result.error_code.is_empty() {
                     self.set_outcome(Outcome::failed(code_label(lang, &result.error_code)));
                 }
@@ -1979,7 +2000,11 @@ impl ViewModel {
         if matches!(request, Request::PairWith | Request::PairingAnswer) {
             self.finish_pairing(false);
         }
-        self.set_outcome(Outcome::failed(failure));
+        self.set_outcome(if code == "PAIRING_CANCELLED" {
+            Outcome::info(failure)
+        } else {
+            Outcome::failed(failure)
+        });
     }
 
     /// Shows `outcome` as the toast; its timer starts when it is first drawn.
@@ -3301,7 +3326,7 @@ impl Bridge {
                     .lan
                     .applied
                     .as_ref()
-                    .is_some_and(|applied| applied.ok) =>
+                    .is_some_and(Outcome::is_success) =>
             {
                 self.restart_core(now);
             }
@@ -4454,7 +4479,14 @@ mod restart_tests {
             "timeout never launches a duplicate"
         );
         assert!(bridge.view.settings.service.restart.is_none());
-        assert!(!bridge.view.settings.service.line.as_ref().unwrap().ok);
+        assert!(!bridge
+            .view
+            .settings
+            .service
+            .line
+            .as_ref()
+            .unwrap()
+            .is_success());
     }
 
     #[tokio::test]
