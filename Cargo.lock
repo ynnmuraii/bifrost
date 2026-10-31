@@ -3318,6 +3318,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "platform-audio-linux"
 version = "0.4.0"
 dependencies = [
+ "ashpd",
  "audio-backend",
  "audio-media",
  "audio-model",
@@ -3325,6 +3326,9 @@ dependencies = [
  "futures-timer",
  "pulseaudio",
  "rtrb",
+ "rustix 1.1.6",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
  "zbus",
  "zeroize",
 ]

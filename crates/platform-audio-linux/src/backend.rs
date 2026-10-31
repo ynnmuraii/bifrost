@@ -1,4 +1,6 @@
 use crate::{
+    mute::{LinuxMuteGuard, MuteWatches},
+    ptt::PortalPtt,
     raw::{self, Config, Connection},
     stream::{LinuxStream, Signals},
 };
@@ -20,19 +22,21 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limitation {
     ProcessExclusionUnavailable,
-    EndpointMuteOwnershipUnavailable,
-    GlobalPttDeferredM5,
+    /// Pulse cannot identify the writer: source-mute ownership is best-effort ownership.
+    EndpointMuteBestEffortOwnership,
+    /// Native release requires a Wayland GlobalShortcuts portal; X11 audio PTT is unsupported.
+    GlobalPttWaylandPortalOnly,
 }
 const LIMITS: [Limitation; 3] = [
     Limitation::ProcessExclusionUnavailable,
-    Limitation::EndpointMuteOwnershipUnavailable,
-    Limitation::GlobalPttDeferredM5,
+    Limitation::EndpointMuteBestEffortOwnership,
+    Limitation::GlobalPttWaylandPortalOnly,
 ];
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub device: Device,
     pub generation: u64,
-    index: u32,
+    pub(crate) index: u32,
     pub monitor: Option<String>,
 }
 pub(crate) type Key = (bool, String);
@@ -49,6 +53,7 @@ pub(crate) struct State {
     catalog: Mutex<Catalog>,
     pub alive: AtomicBool,
     pub clock: Instant,
+    pub(crate) mutes: MuteWatches,
 }
 pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
@@ -61,6 +66,7 @@ impl State {
             catalog: Mutex::new(Catalog::default()),
             alive: AtomicBool::new(true),
             clock: Instant::now(),
+            mutes: MuteWatches::default(),
         }
     }
     fn emit(catalog: &mut Catalog, event: Event) {
@@ -95,6 +101,7 @@ impl State {
     }
     pub fn invalidate_all(&self) {
         self.alive.store(false, Ordering::Release);
+        self.mutes.invalidate_all();
         let mut catalog = lock(&self.catalog);
         for (_, _, stream) in &catalog.streams {
             if let Some(signals) = stream.upgrade() {
@@ -136,6 +143,28 @@ impl State {
                     Event::Device(DeviceEvent::Invalidated(entry.device.id)),
                 );
             }
+        }
+    }
+    pub(crate) fn valid(&self, key: &Key, generation: u64) -> bool {
+        self.alive.load(Ordering::Acquire)
+            && lock(&self.catalog)
+                .entries
+                .get(key)
+                .is_some_and(|entry| entry.generation == generation)
+    }
+    fn mute_changed(&self, index: u32, muted: bool) {
+        let mut catalog = lock(&self.catalog);
+        let snapshot = catalog
+            .entries
+            .iter()
+            .find(|(key, entry)| key.0 && entry.index == index)
+            .map(|(_, entry)| MuteSnapshot {
+                endpoint: entry.device.id.clone(),
+                generation: entry.generation,
+                muted,
+            });
+        if let Some(snapshot) = snapshot {
+            Self::emit(&mut catalog, Event::MuteChanged(snapshot));
         }
     }
     fn replace(&self, mut entries: BTreeMap<Key, Entry>, defaults: Defaults, notify: bool) {
@@ -221,6 +250,8 @@ pub struct LinuxBackend {
     watch_socket: UnixStream,
     watcher: Option<JoinHandle<()>>,
     media: crate::mpris::Mpris,
+    ptt: PortalPtt,
+    ptt_availability: Availability,
 }
 impl LinuxBackend {
     pub fn connect() -> Result<Self, BackendError> {
@@ -244,10 +275,15 @@ impl LinuxBackend {
                     if !watch_state.alive.load(Ordering::Acquire) {
                         return;
                     }
+                    // Queries run on this control thread, never under the catalog/reactor lock.
+                    let mute = watch_state.mutes.observe(event, &watch_client);
                     watch_state.removed(event);
                     match enumerate(&watch_client) {
                         Ok((entries, defaults)) => watch_state.replace(entries, defaults, true),
                         Err(_) => break,
+                    }
+                    if let Some((index, muted)) = mute {
+                        watch_state.mute_changed(index, muted);
                     }
                 }
                 if watch_state.alive.load(Ordering::Acquire) {
@@ -262,6 +298,8 @@ impl LinuxBackend {
             watch_socket,
             watcher: Some(handle),
             media: crate::mpris::Mpris::start(),
+            ptt: PortalPtt::new(),
+            ptt_availability: Availability::Unavailable(BackendError::Unsupported),
         })
     }
     pub fn limitations(&self) -> &'static [Limitation] {
@@ -393,22 +431,29 @@ fn enumerate(client: &Client) -> Result<(BTreeMap<Key, Entry>, Defaults), Backen
 }
 impl Backend for LinuxBackend {
     type Stream = LinuxStream;
-    type Mute = UnsupportedMute;
+    type Mute = LinuxMuteGuard;
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             system_capture: true,
+            endpoint_mute: self.state.alive.load(Ordering::Acquire),
             media: self.media.availability() == Availability::Available,
+            global_ptt: self.ptt_availability == Availability::Available,
             ..Capabilities::default()
         }
     }
     fn probe_capabilities(&mut self) -> CapabilityProbe {
+        self.ptt_availability = match PortalPtt::probe() {
+            Ok(_) => Availability::Available,
+            Err(error) => Availability::Unavailable(error),
+        };
         CapabilityProbe {
             os_build: None,
             process_exclude: Availability::Unavailable(BackendError::Unsupported),
-            endpoint_mute: Availability::Unavailable(BackendError::Unsupported),
+            endpoint_mute: self.monitor_availability(),
             media: self.media.availability(),
-            ptt: Availability::Unavailable(BackendError::Unsupported),
-            ptt_release: None,
+            ptt: self.ptt_availability,
+            ptt_release: (self.ptt_availability == Availability::Available)
+                .then_some(ReleaseObservation::Native),
         }
     }
     fn devices(&self) -> Result<Vec<Device>, BackendError> {
@@ -488,8 +533,12 @@ impl Backend for LinuxBackend {
             muted: info.muted,
         })
     }
-    fn acquire_mute(&mut self, _: &DeviceSelection) -> Result<UnsupportedMute, BackendError> {
-        Err(BackendError::Unsupported)
+    fn acquire_mute(
+        &mut self,
+        selection: &DeviceSelection,
+    ) -> Result<LinuxMuteGuard, BackendError> {
+        let (key, entry) = self.resolve(selection, true)?;
+        LinuxMuteGuard::acquire(self.config.clone(), self.state.clone(), key, entry)
     }
     fn media_sessions(&self) -> Result<Vec<MediaInfo>, BackendError> {
         self.media.sessions()
@@ -506,15 +555,26 @@ impl Backend for LinuxBackend {
     fn configure_ptt(
         &mut self,
         hotkey: Option<PttHotkey>,
-        _: &[PttHotkey],
+        reserved: &[PttHotkey],
     ) -> Result<(), BackendError> {
-        if hotkey.is_some() {
-            Err(BackendError::Unsupported)
-        } else {
-            Ok(())
+        if hotkey.is_some() && self.ptt_availability != Availability::Available {
+            self.ptt_availability = match PortalPtt::probe() {
+                Ok(_) => Availability::Available,
+                Err(error) => Availability::Unavailable(error),
+            };
+            if let Availability::Unavailable(error) = self.ptt_availability {
+                return Err(error);
+            }
         }
+        self.ptt.configure(hotkey, reserved)
     }
     fn poll_event(&mut self) -> Option<Event> {
+        if let Some(event) = self.ptt.poll_event() {
+            if matches!(event, Event::ResyncRequired) {
+                self.ptt_availability = Availability::Unavailable(BackendError::Unsupported);
+            }
+            return Some(event);
+        }
         if let Some(event) = self.media.poll_completion() {
             return Some(event);
         }
@@ -528,22 +588,6 @@ impl Backend for LinuxBackend {
                 .pop_front()
                 .or_else(|| self.media.poll_changed())
         }
-    }
-}
-/// No mute guard can be constructed until Pulse ownership/restoration semantics are defined.
-pub enum UnsupportedMute {}
-impl MuteGuard for UnsupportedMute {
-    fn original_muted(&self) -> bool {
-        match *self {}
-    }
-    fn snapshot(&self) -> Result<MuteSnapshot, BackendError> {
-        match *self {}
-    }
-    fn set_capture_mute(&mut self, _: u64, _: bool) -> Result<(), BackendError> {
-        match *self {}
-    }
-    fn restore(&mut self) -> Result<(), BackendError> {
-        match *self {}
     }
 }
 #[cfg(test)]

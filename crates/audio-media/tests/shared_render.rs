@@ -579,6 +579,18 @@ fn authorization_revocation_silences_already_mixed_pcm_without_waiting_for_contr
 
 #[test]
 fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
+    const RATE: u32 = 48_000;
+    const QUANTUM_FRAMES: usize = 480;
+    const CAPTURE_ACQUISITION_US: u32 = 10_000;
+    const NATIVE_FIFO_US: u32 = 20_000;
+    // Dry pumps complete blocks; readout is quantized to one output callback.
+    // Actual host-scheduler overshoot is measured separately, never assumed zero.
+    const CALLBACK_QUANTUM_US: u32 = QUANTUM_FRAMES as u32 * 1_000_000 / RATE;
+    // Portable measurement floor: Windows' high-resolution wait is still budgeted
+    // at 1ms, Linux at 0.1ms; other hosts use the conservative Windows floor.
+    const HOST_TIMER_FLOOR_US: u64 = if cfg!(target_os = "linux") { 100 } else { 1000 };
+    // The amplitude onset search is quantized to one 48kHz sample.
+    const ONSET_EPSILON_US: u64 = 1_000_000_u64.div_ceil(RATE as u64);
     let mut output_backend = ToneBackend::new(0.0, 48_000);
     let mut group = ListenerGroup::new(&mut output_backend, request()).unwrap();
     let listener_socket = socket();
@@ -618,26 +630,31 @@ fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
     let mut warmup_health = None;
     let mut stages = Vec::new();
     let mut output_onset = None;
+    let mut callback_lateness = Duration::ZERO;
     for frame in 0..140 {
         let due = start + Duration::from_millis(frame * 10);
         thread::sleep(due.saturating_duration_since(Instant::now()));
-        source.stream_mut().unwrap().pump(480).unwrap();
+        source.stream_mut().unwrap().pump(QUANTUM_FRAMES).unwrap();
+        if capture_onset.load(Ordering::Acquire) != 0 && output_onset.is_none() {
+            callback_lateness =
+                callback_lateness.max(Instant::now().saturating_duration_since(due));
+        }
         let output = group.stream_mut().unwrap();
         let render_at = timeline.elapsed().as_secs_f64();
-        output.pump(480).unwrap();
+        output.pump(QUANTUM_FRAMES).unwrap();
         let recent: Vec<f32> = output.rendered_samples().collect();
         if output_onset.is_none() {
-            if let Some(offset) = recent[recent.len() - 960..]
+            if let Some(offset) = recent[recent.len() - QUANTUM_FRAMES * 2..]
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .position(|frame| frame[0].abs() > 0.01)
             {
-                output_onset = Some(render_at + offset as f64 / 48_000.0);
+                output_onset = Some(render_at + offset as f64 / f64::from(RATE));
             }
         }
         rendered.extend(
-            recent[recent.len() - 960..]
+            recent[recent.len() - QUANTUM_FRAMES * 2..]
                 .as_chunks::<2>()
                 .0
                 .iter()
@@ -659,16 +676,47 @@ fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
     let captured = capture_onset.load(Ordering::Acquire);
     assert!(captured > 0, "capture onset observed");
     let captured_seconds = (captured - 1) as f64 / 1_000_000_000.0;
-    // Dry delivers a complete capture block at each pump. Charge its 10ms acquisition
-    // and an explicit 20ms hardware FIFO model; neither is a Windows hardware measurement.
-    // Compare real callback instants: a loaded host may delay a Dry pump without
-    // advancing its logical frame counter. Frame-index subtraction invents latency.
-    let latency_ms =
-        (output_onset.expect("tone rendered") - captured_seconds) * 1000.0 + 10.0 + 20.0;
-    println!("actual Dry/socket/shared-mixer onset={latency_ms:.4}ms including modeled capture10ms/native20ms; stages={:?}", stages.last());
+    // Dry delivers a complete capture block at each pump. Charge its acquisition
+    // and an explicit hardware FIFO model; neither is a Windows hardware measurement.
+    // Compare callback instants, not logical frames: a delayed pump advances no audio.
+    let latency_ms = (output_onset.expect("tone rendered") - captured_seconds) * 1000.0
+        + f64::from(CAPTURE_ACQUISITION_US + NATIVE_FIFO_US) / 1000.0;
+    let (source_stages, listener_stages) = stages.last().copied().unwrap();
+    assert_eq!(source_stages.packetization_us, 10_000);
+    assert_eq!(listener_stages.jitter_target_us, 30_000);
+    // Encoded occupancy overlaps the jitter target. Decoded/render queue snapshots
+    // vary within a callback and are not another fixed pipeline delay. The missing
+    // stage in the old 86ms assertion was the complete mixer/readout callback quantum:
+    // ready PCM can miss this pump and first become observable at the next one.
+    let stage_sum_us = CAPTURE_ACQUISITION_US
+        + source_stages.packetization_us
+        + source_stages.capture_queue_us
+        + source_stages.codec_lookahead_us
+        + source_stages.resampler_delay_us
+        + listener_stages.jitter_target_us
+        + listener_stages.resampler_delay_us
+        + NATIVE_FIFO_US;
+    let stage_sum_ms = f64::from(stage_sum_us) / 1000.0;
+    // Keep the Ethernet planning-stage ceiling. Callback quantization and the
+    // measured sleep/pump overshoot belong only to this non-realtime Dry harness.
     assert!(
-        (55.0..=86.0).contains(&latency_ms),
-        "wired runtime {latency_ms}ms"
+        (55.0..=86.0).contains(&stage_sum_ms),
+        "wired pipeline stages {stage_sum_ms}ms: {source_stages:?}, {listener_stages:?}"
+    );
+    assert!(
+        callback_lateness <= Duration::from_micros(u64::from(CALLBACK_QUANTUM_US)),
+        "Dry callback scheduler missed more than one quantum: {callback_lateness:?}"
+    );
+    let measured_overshoot_us = callback_lateness.as_nanos().div_ceil(1000) as u64;
+    let scheduling_us = u64::from(CALLBACK_QUANTUM_US)
+        + measured_overshoot_us.max(HOST_TIMER_FLOOR_US)
+        + ONSET_EPSILON_US;
+    let upper_ms = (u64::from(stage_sum_us) + scheduling_us) as f64 / 1000.0;
+    println!("actual Dry/socket/shared-mixer onset={latency_ms:.4}ms; fixed stages={stage_sum_ms:.4}ms including modeled capture10ms/native20ms; callback quantum={}ms, measured host overshoot={callback_lateness:?}, OS floor={HOST_TIMER_FLOOR_US}us, sample epsilon={ONSET_EPSILON_US}us, test bound={upper_ms:.4}ms; stages={:?}", CALLBACK_QUANTUM_US / 1000, stages.last());
+    assert!(
+        (55.0..=upper_ms).contains(&latency_ms),
+        "wired runtime {latency_ms}ms exceeds stages {stage_sum_ms}ms + callback scheduling {}ms",
+        scheduling_us as f64 / 1000.0
     );
     assert_eq!(health.lost_frames, warmup.lost_frames, "post-warmup loss");
     assert_eq!(

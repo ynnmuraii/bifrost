@@ -15,6 +15,21 @@ use std::{
 
 pub(crate) type Pump<S> = Box<dyn FnMut(&mut S) -> Result<(), BackendError> + Send>;
 const MAX_STARTS: usize = 256;
+const RETIRE_STARTS: usize = MAX_STARTS - COMMAND_CAPACITY;
+
+fn admit_start(used_ids: &[[u8; 16]], id: &[u8; 16], active: usize) -> Result<(), i32> {
+    if used_ids.contains(id) {
+        return Err(4);
+    }
+    // Leave one admission queue of headroom; never evict nonce/key-reuse history.
+    if used_ids.len() >= RETIRE_STARTS {
+        return Err(9);
+    }
+    if active >= contract::MAX_SESSIONS {
+        return Err(3);
+    }
+    Ok(())
+}
 struct Running<S: Stream + 'static> {
     id: [u8; 16],
     role: i32,
@@ -66,9 +81,10 @@ pub(crate) fn run<B: Backend + 'static>(
 {
     let timer_responses = responses.clone();
     let timer_shared = shared.clone();
-    let mic_controls = mic_controls::Controls::new_with_events(move |id, message| {
-        emit_response(&timer_responses, &timer_shared, id, message);
-    });
+    let mic_controls =
+        mic_controls::Controls::with_privacy(shared.privacy.clone(), move |id, message| {
+            emit_response(&timer_responses, &timer_shared, id, message);
+        });
     let mut worker = Worker {
         backend: None,
         factory,
@@ -162,6 +178,8 @@ where
         let Command {
             request_id,
             admitted_at,
+            privacy_epoch,
+            talk_epoch,
             message,
             secrets,
             permit,
@@ -171,6 +189,20 @@ where
         } else {
             None
         };
+        self.mic_controls.fence = Some((privacy_epoch, talk_epoch));
+        if matches!(&message, Msg::AcquireMicMute(_))
+            && (privacy_epoch != self.shared.privacy.epoch.load(Ordering::Acquire)
+                || self.shared.privacy.failed.load(Ordering::Acquire))
+        {
+            self.response(
+                request_id,
+                Msg::Error(w::Error {
+                    code: 6,
+                    session_id: Vec::new(),
+                }),
+            );
+            return;
+        }
         let result = match message {
             Msg::ProbeBackend(_) => {
                 self.probe(request_id);
@@ -426,12 +458,7 @@ where
         let id: [u8; 16] = start.session_id.as_slice().try_into().map_err(|_| 6)?;
         let secrets = secrets?;
         let authorized = authorized?;
-        if self.used_ids.contains(&id) {
-            return Err(4);
-        }
-        if self.used_ids.len() >= MAX_STARTS || self.sessions.len() >= contract::MAX_SESSIONS {
-            return Err(3);
-        }
+        admit_start(&self.used_ids, &id, self.sessions.len())?;
         let fingerprint = |key: &[u8]| -> [u8; 32] {
             digest(&SHA256, key)
                 .as_ref()
@@ -820,5 +847,30 @@ fn control_code(error: BackendError) -> i32 {
         BackendError::Busy => 3,
         BackendError::Stopped | BackendError::InvalidArgument | BackendError::StaleRevision => 6,
         error => code(error),
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn lifetime_budget_requests_recycle_without_forgetting_duplicate_ids() {
+        let mut history: Vec<_> = (0..RETIRE_STARTS)
+            .map(|value| {
+                let mut id = [0; 16];
+                id[..8].copy_from_slice(&(value as u64).to_le_bytes());
+                id
+            })
+            .collect();
+        assert_eq!(
+            admit_start(&history[..RETIRE_STARTS - 1], &[255; 16], 0),
+            Ok(())
+        );
+        assert_eq!(admit_start(&history, &[255; 16], 0), Err(9));
+        assert_eq!(admit_start(&history, &history[0], 0), Err(4));
+        history.resize(MAX_STARTS, [254; 16]);
+        assert_eq!(admit_start(&history, &[255; 16], 0), Err(9));
+        assert_eq!(admit_start(&[], &[255; 16], contract::MAX_SESSIONS), Err(3));
     }
 }

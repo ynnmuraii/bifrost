@@ -16,6 +16,8 @@ pub(super) struct Controls<M: MuteGuard> {
     configured: bool,
     press: Option<(u64, Instant)>,
     last_press: Option<u64>,
+    privacy: Arc<crate::privacy::Privacy>,
+    pub(super) fence: Option<(u64, u64)>,
 }
 
 impl<M: MuteGuard + 'static> Controls<M> {
@@ -24,7 +26,15 @@ impl<M: MuteGuard + 'static> Controls<M> {
         Self::new_with_events(|_, _| {})
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_events(events: impl Fn(u64, Msg) + Send + Sync + 'static) -> Self {
+        Self::with_privacy(crate::privacy::Privacy::new(), events)
+    }
+
+    pub(super) fn with_privacy(
+        privacy: Arc<crate::privacy::Privacy>,
+        events: impl Fn(u64, Msg) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             guard: None,
             events: Arc::new(events),
@@ -32,6 +42,8 @@ impl<M: MuteGuard + 'static> Controls<M> {
             configured: false,
             press: None,
             last_press: None,
+            privacy,
+            fence: None,
         }
     }
 
@@ -66,10 +78,53 @@ impl<M: MuteGuard + 'static> Controls<M> {
         admitted_at: Instant,
         emit: &mut impl FnMut(u64, Msg),
     ) -> Result<(), BackendError> {
+        let fence = self.fence.take().unwrap_or_else(|| {
+            (
+                self.privacy
+                    .epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+                self.privacy
+                    .talk_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        });
         match message {
             Msg::AcquireMicMute(request) => {
+                if self.guard.as_ref().is_some_and(|guard| guard.finished()) {
+                    self.guard.take();
+                }
+                if fence.0
+                    != self
+                        .privacy
+                        .epoch
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || self
+                        .privacy
+                        .failed
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(BackendError::Stopped);
+                }
                 if self.guard.is_some() {
                     return Err(BackendError::Busy);
+                }
+                // A completed release may leave reductions for that old guard in the mailbox.
+                while let Some(reduction) = self.privacy.next() {
+                    match reduction {
+                        crate::privacy::Reduction::Revoke(id, grant) => {
+                            emit(id, Msg::PttEvent(talk_guard::event(grant, 5, 2)))
+                        }
+                        crate::privacy::Reduction::Mute(id, _)
+                        | crate::privacy::Reduction::Release(id) => {
+                            emit(
+                                id,
+                                Msg::Error(w::Error {
+                                    code: 6,
+                                    session_id: Vec::new(),
+                                }),
+                            );
+                        }
+                    }
                 }
                 let selection = super::selection(
                     request
@@ -90,7 +145,20 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 })();
                 match snapshot {
                     Ok(snapshot) => {
-                        self.guard = Some(talk_guard::Guard::new(guard, self.events.clone())?);
+                        if fence.0
+                            != self
+                                .privacy
+                                .epoch
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            let _ = guard.restore();
+                            return Err(BackendError::Stopped);
+                        }
+                        self.guard = Some(talk_guard::Guard::new(
+                            guard,
+                            self.events.clone(),
+                            self.privacy.clone(),
+                        )?);
                         self.snapshot = None;
                         self.publish(request_id, snapshot, emit);
                         Ok(())
@@ -103,14 +171,14 @@ impl<M: MuteGuard + 'static> Controls<M> {
             }
             Msg::SetMicMute(request) => {
                 let guard = self.guard.as_ref().ok_or(BackendError::Stopped)?;
-                let snapshot = guard.set(request.expected_generation, request.muted)?;
+                let snapshot = guard.set(request.expected_generation, request.muted, fence)?;
                 self.publish(request_id, snapshot, emit);
                 Ok(())
             }
             Msg::PttGrant(request) => {
                 let result = self.guard.as_ref().map_or_else(
-                    || talk_guard::event(request.grant_id, 4, 0),
-                    |guard| guard.grant(request.grant_id, request.ttl_ms, admitted_at),
+                    || talk_guard::event(request.grant_id, 4, 7),
+                    |guard| guard.grant(request.grant_id, request.ttl_ms, admitted_at, fence),
                 );
                 emit(request_id, Msg::PttEvent(result));
                 Ok(())
@@ -164,7 +232,7 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 generation: snapshot.generation,
                 muted: snapshot.muted,
                 // A local handle is held; the generic trait cannot prove native restoration ownership.
-                guard_active: self.guard.is_some(),
+                guard_active: self.guard.as_ref().is_some_and(|guard| !guard.finished()),
             }),
         );
         if self.guard.is_none()
@@ -693,7 +761,7 @@ mod tests {
         let Msg::ConfigurePtt(mut request) = configure(true) else {
             unreachable!()
         };
-        request.reserved.push(request.binding.clone().unwrap());
+        request.reserved.push(request.binding.unwrap());
         assert_eq!(
             run(
                 &mut controls,
@@ -1034,5 +1102,39 @@ mod tests {
         let (id, snapshot) = receive.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(id, 0);
         assert!(snapshot.guard_active && snapshot.muted);
+    }
+
+    #[test]
+    fn expiry_reports_native_mute_failure_without_fabricating_muted_state() {
+        let (mut backend, _, mut output) = fixture();
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut controls = Controls::new_with_events(move |_, message| {
+            let _ = send.send(message);
+        });
+        run(&mut controls, &mut backend, &mut output, acquire()).unwrap();
+        run(&mut controls, &mut backend, &mut output, grant(31, 100)).unwrap();
+        while receive.try_recv().is_ok() {}
+        backend
+            .apply(ScriptEvent::SetMute {
+                device: DeviceId::new("mic").unwrap(),
+                muted: false,
+            })
+            .unwrap();
+        let (mut failed, mut released, mut observed) = (false, false, false);
+        while !released || !observed {
+            match receive.recv_timeout(Duration::from_secs(1)).unwrap() {
+                Msg::Error(_) => failed = true,
+                Msg::PttEvent(event) => {
+                    assert_eq!((event.grant_id, event.kind, event.reason), (31, 3, 1));
+                    released = true;
+                }
+                Msg::MuteSnapshot(snapshot) => {
+                    assert!(!snapshot.muted, "an external owner must not be overwritten");
+                    observed = true;
+                }
+                _ => panic!("unexpected mute timer response"),
+            }
+        }
+        assert!(failed);
     }
 }

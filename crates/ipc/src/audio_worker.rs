@@ -529,7 +529,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             _ => return Err(invalid()),
         },
         Msg::Error(error) => {
-            if !matches!(error.code, 1..=8)
+            if !matches!(error.code, 1..=9)
                 || !error.session_id.is_empty() && error.session_id.len() != 16
             {
                 return Err(invalid());

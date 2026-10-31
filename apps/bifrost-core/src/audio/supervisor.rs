@@ -34,10 +34,40 @@ pub struct AudioSupervisorConfig {
     pub backend: w::BackendKind,
 }
 
+/// Privacy reductions must never be treated as a harmless dropped UI update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioPrivacyOperation {
+    DisableMediaWatch,
+    MuteMicrophone,
+    RevokePtt,
+    ReleaseMicMute,
+    StopSession,
+}
+impl AudioPrivacyOperation {
+    fn of(message: &Msg) -> Option<Self> {
+        match message {
+            Msg::SetMediaWatch(w::SetMediaWatch { enabled: false }) => {
+                Some(Self::DisableMediaWatch)
+            }
+            Msg::SetMicMute(w::SetMicMute { muted: true, .. }) => Some(Self::MuteMicrophone),
+            Msg::PttRevoke(_) => Some(Self::RevokePtt),
+            Msg::ReleaseMicMute(_) => Some(Self::ReleaseMicMute),
+            Msg::StopSession(_) => Some(Self::StopSession),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioRestartReason {
+    SessionBudget,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioSupervisorError {
     Unavailable,
     QueueFull,
+    PrivacyControlRejected,
+    RestartRequired(AudioRestartReason),
     Timeout,
     InvalidFrame,
     WorkerRejected(i32),
@@ -101,6 +131,18 @@ pub enum AudioSupervisorEvent {
         request_id: u64,
         error: w::Error,
     },
+    /// Fatal: core must invalidate native state rather than assume the reduction happened.
+    PrivacyControlRejected {
+        generation: u64,
+        request_id: u64,
+        operation: AudioPrivacyOperation,
+        error: w::Error,
+    },
+    /// The child retains key/ID tombstones until it is recycled, never evicts them.
+    RestartRequired {
+        generation: u64,
+        reason: AudioRestartReason,
+    },
     ChildExited {
         generation: u64,
         pid: u32,
@@ -132,6 +174,23 @@ struct Command {
     admitted_at: Instant,
     reply: oneshot::Sender<Result<Reply>>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlReply {
+    Mute,
+    Ptt,
+    Media,
+}
+struct PendingControl {
+    kind: ControlReply,
+    deadline: Instant,
+}
+struct PendingPrivacy {
+    operation: AudioPrivacyOperation,
+    // No native reply exists for StopSession/watch-off. A later Pong proves that
+    // their synchronous queue-admission decision (including Error) has passed.
+    after_ping: Option<u64>,
+}
+
 impl AudioHandle {
     async fn command(&self, message: Msg) -> Result<Reply> {
         let admitted_at = Instant::now();
@@ -149,6 +208,7 @@ impl AudioHandle {
         };
         contract::validate_frame(&frame).map_err(|_| AudioSupervisorError::InvalidFrame)?;
         let message = frame.msg.take().ok_or(AudioSupervisorError::InvalidFrame)?;
+        let privacy = AudioPrivacyOperation::of(&message);
         let (reply, rx) = oneshot::channel();
         self.commands
             .try_send(Command {
@@ -158,6 +218,9 @@ impl AudioHandle {
                 reply,
             })
             .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) if privacy.is_some() => {
+                    AudioSupervisorError::PrivacyControlRejected
+                }
                 mpsc::error::TrySendError::Full(_) => AudioSupervisorError::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => AudioSupervisorError::Unavailable,
             })?;
@@ -559,7 +622,8 @@ async fn serve(
 ) -> Result<()> {
     let mut pending = BTreeMap::<u64, Pending>::new();
     let mut pending_starts = BTreeMap::<u64, [u8; 16]>::new();
-    let mut pending_controls = BTreeMap::<u64, (u8, Instant)>::new();
+    let mut pending_controls = BTreeMap::<u64, PendingControl>::new();
+    let mut pending_privacy = BTreeMap::<u64, PendingPrivacy>::new();
     let mut request = 1u64;
     let mut ping = 0u64;
     let mut pong = 0u64;
@@ -576,7 +640,7 @@ async fn serve(
                     // A timed-out RPC invalidates this child, so late replies can never
                     // be reused by a later request or a replacement generation.
                     if pending.values().any(|response| Instant::now() >= response.deadline) { return Err(AudioSupervisorError::Timeout); }
-                    if pending_controls.values().any(|(_, deadline)| Instant::now() >= *deadline) { return Err(AudioSupervisorError::Timeout); }
+                    if pending_controls.values().any(|control| Instant::now() >= control.deadline) { return Err(AudioSupervisorError::Timeout); }
                     if child.process.try_wait().map_err(|_| AudioSupervisorError::ChildLost)?.is_some() { return Err(AudioSupervisorError::ChildLost); }
                     ping = ping.checked_add(1).ok_or(AudioSupervisorError::InvalidFrame)?;
                     send(child, 0, Msg::Ping(w::Ping { serial: ping })).await?;
@@ -587,7 +651,10 @@ async fn serve(
                     last_frame = Instant::now();
                     let id = received.frame.request_id;
                     match received.frame.msg.take().ok_or(AudioSupervisorError::InvalidFrame)? {
-                        Msg::Pong(value) if value.serial > pong && value.serial <= ping => { pong = value.serial; }
+                        Msg::Pong(value) if value.serial > pong && value.serial <= ping => {
+                            pong = value.serial;
+                            pending_privacy.retain(|_, pending| pending.after_ping.is_none_or(|sent| pong <= sent));
+                        }
                         Msg::Ready(ready) => {
                             let response = pending.remove(&id).ok_or(AudioSupervisorError::InvalidFrame)?;
                             if response.inventory.is_some() || !ready.probed || ready.backend != child.ready.backend { return Err(AudioSupervisorError::InvalidFrame); }
@@ -627,20 +694,23 @@ async fn serve(
                         }
                         Msg::BackendEvent(event) => emit(events, AudioSupervisorEvent::BackendEvent { generation, event })?,
                         Msg::MuteSnapshot(snapshot) => {
-                            if id != 0 && pending_controls.remove(&id).map(|(kind, _)| kind) != Some(1) {return Err(AudioSupervisorError::InvalidFrame);}
+                            if id != 0 && pending_controls.remove(&id).map(|control| control.kind) != Some(ControlReply::Mute) {return Err(AudioSupervisorError::InvalidFrame);}
+                            pending_privacy.remove(&id);
                             emit(events, AudioSupervisorEvent::MuteSnapshot {generation,request_id:id,snapshot})?;
                         }
                         Msg::PttEvent(event) => {
-                            if id != 0 && pending_controls.remove(&id).map(|(kind, _)| kind) != Some(2) {return Err(AudioSupervisorError::InvalidFrame);}
+                            if id != 0 && pending_controls.remove(&id).map(|control| control.kind) != Some(ControlReply::Ptt) {return Err(AudioSupervisorError::InvalidFrame);}
+                            pending_privacy.remove(&id);
                             emit(events, AudioSupervisorEvent::PttEvent {generation,request_id:id,event})?;
                         }
                         Msg::MediaSessions(sessions) => emit(events, AudioSupervisorEvent::MediaSessions {generation,sessions})?,
                         Msg::MediaCommandResult(result) => {
-                            if pending_controls.remove(&id).map(|(kind, _)| kind) != Some(3) {return Err(AudioSupervisorError::InvalidFrame);}
+                            if pending_controls.remove(&id).map(|control| control.kind) != Some(ControlReply::Media) {return Err(AudioSupervisorError::InvalidFrame);}
                             emit(events, AudioSupervisorEvent::MediaCommandResult {generation,request_id:id,result})?;
                         }
                         Msg::Error(error) => {
                             if id <= 1 || id > request { return Err(AudioSupervisorError::InvalidFrame); }
+                            let error = worker_rejection(events, generation, id, pending_privacy.remove(&id).map(|pending| pending.operation), pending_starts.contains_key(&id), error)?;
                             if let Some(response) = pending.remove(&id) { let _ = response.reply.send(Err(AudioSupervisorError::WorkerRejected(error.code))); }
                             // A rejected renewal/gain never deletes another live session.
                             if let Some(session) = pending_starts.remove(&id) { sessions.remove(&session); }
@@ -657,8 +727,16 @@ async fn serve(
                         let _ = command.reply.send(Err(AudioSupervisorError::Unavailable)); continue;
                     }
                     // The child holds one paged inventory snapshot at a time.
-                    if pending.len() + pending_controls.len() >= QUEUE || (matches!(&command.message, Msg::ListDevices(_)) && pending.values().any(|response| response.inventory.is_some())) {
-                        let _ = command.reply.send(Err(AudioSupervisorError::QueueFull)); continue;
+                    let privacy = AudioPrivacyOperation::of(&command.message);
+                    let no_reply_privacy = pending_privacy.values().filter(|pending| pending.after_ping.is_some()).count();
+                    if pending.len() + pending_controls.len() + no_reply_privacy >= QUEUE || (matches!(&command.message, Msg::ListDevices(_)) && pending.values().any(|response| response.inventory.is_some())) {
+                        if let Some(operation) = privacy {
+                            let _ = command.reply.send(Err(AudioSupervisorError::PrivacyControlRejected));
+                            worker_rejection(events, generation, 0, Some(operation), false, w::Error {code: 3, session_id: Vec::new()})?;
+                        } else {
+                            let _ = command.reply.send(Err(AudioSupervisorError::QueueFull));
+                        }
+                        continue;
                     }
                     let next_request = request.checked_add(1).ok_or(AudioSupervisorError::InvalidFrame)?;
                     // Handle validation bounds the queue; AudioLink validates the actual wire frame.
@@ -670,9 +748,9 @@ async fn serve(
                     let inventory = match &message { Msg::ListDevices(query) => Some(Inventory { direction: query.direction, page: 0, revision: 0, devices: Vec::new() }), _ => None };
                     let response = matches!(message, Msg::ProbeBackend(_) | Msg::ListDevices(_));
                     let control = match &message {
-                        Msg::AcquireMicMute(_) | Msg::SetMicMute(_) | Msg::ReleaseMicMute(_) => Some(1),
-                        Msg::ConfigurePtt(_) | Msg::PttGrant(_) | Msg::PttRevoke(_) => Some(2),
-                        Msg::MediaCommand(_) => Some(3),
+                        Msg::AcquireMicMute(_) | Msg::SetMicMute(_) | Msg::ReleaseMicMute(_) => Some(ControlReply::Mute),
+                        Msg::ConfigurePtt(_) | Msg::PttGrant(_) | Msg::PttRevoke(_) => Some(ControlReply::Ptt),
+                        Msg::MediaCommand(_) => Some(ControlReply::Media),
                         _ => None,
                     };
                     let session = match &message { Msg::StartSession(start) => Some(start.session_id.as_slice().try_into().map_err(|_| AudioSupervisorError::InvalidFrame)?), _ => None };
@@ -684,7 +762,10 @@ async fn serve(
                     request = next_request;
                     if let Err(error) = send(child, request, message).await { let _ = command.reply.send(Err(error.clone())); return Err(error); }
                     if let Some(id) = session { sessions.insert(id); pending_starts.insert(request, id); }
-                    if let Some(kind) = control { pending_controls.insert(request, (kind, Instant::now() + COMMAND_TIMEOUT)); }
+                    if let Some(kind) = control { pending_controls.insert(request, PendingControl {kind, deadline: Instant::now() + COMMAND_TIMEOUT}); }
+                    if let Some(operation) = privacy {
+                        pending_privacy.insert(request, PendingPrivacy { operation, after_ping: control.is_none().then_some(ping) });
+                    }
                     if shutdown {
                         available.store(0, Ordering::Release);
                         if timeout(IO_TIMEOUT, child.process.wait()).await.is_err() { child.reap().await; }
@@ -700,6 +781,42 @@ async fn serve(
         let _ = response.reply.send(Err(AudioSupervisorError::ChildLost));
     }
     result
+}
+
+fn worker_rejection(
+    events: &mpsc::Sender<AudioSupervisorEvent>,
+    generation: u64,
+    request_id: u64,
+    privacy: Option<AudioPrivacyOperation>,
+    is_start: bool,
+    error: w::Error,
+) -> Result<w::Error> {
+    if error.code == w::ErrorCode::ResourceLimit as i32 {
+        if let Some(operation) = privacy {
+            emit(
+                events,
+                AudioSupervisorEvent::PrivacyControlRejected {
+                    generation,
+                    request_id,
+                    operation,
+                    error,
+                },
+            )?;
+            return Err(AudioSupervisorError::PrivacyControlRejected);
+        }
+    }
+    if error.code == w::ErrorCode::RestartRequired as i32 {
+        if !is_start {
+            return Err(AudioSupervisorError::InvalidFrame);
+        }
+        let reason = AudioRestartReason::SessionBudget;
+        emit(
+            events,
+            AudioSupervisorEvent::RestartRequired { generation, reason },
+        )?;
+        return Err(AudioSupervisorError::RestartRequired(reason));
+    }
+    Ok(error)
 }
 
 // Whole milliseconds round down: time in the supervisor queue never extends a grant.
@@ -1619,5 +1736,253 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = next_pid;
+    }
+
+    #[tokio::test]
+    async fn privacy_resource_limits_are_typed_fatal_not_generic_rejections() {
+        let (events, mut received) = mpsc::channel(8);
+        for (message, operation) in [
+            (
+                Msg::SetMediaWatch(w::SetMediaWatch { enabled: false }),
+                AudioPrivacyOperation::DisableMediaWatch,
+            ),
+            (
+                Msg::SetMicMute(w::SetMicMute {
+                    expected_generation: 1,
+                    muted: true,
+                }),
+                AudioPrivacyOperation::MuteMicrophone,
+            ),
+            (
+                Msg::PttRevoke(w::PttRevoke { grant_id: 1 }),
+                AudioPrivacyOperation::RevokePtt,
+            ),
+            (
+                Msg::ReleaseMicMute(w::ReleaseMicMute {}),
+                AudioPrivacyOperation::ReleaseMicMute,
+            ),
+            (
+                Msg::StopSession(w::StopSession {
+                    session_id: vec![1; 16],
+                }),
+                AudioPrivacyOperation::StopSession,
+            ),
+        ] {
+            assert_eq!(AudioPrivacyOperation::of(&message), Some(operation));
+            assert_eq!(
+                worker_rejection(
+                    &events,
+                    7,
+                    12,
+                    Some(operation),
+                    false,
+                    w::Error {
+                        code: 3,
+                        session_id: Vec::new()
+                    }
+                ),
+                Err(AudioSupervisorError::PrivacyControlRejected)
+            );
+            assert!(
+                matches!(received.recv().await, Some(AudioSupervisorEvent::PrivacyControlRejected { generation: 7, request_id: 12, operation: actual, error }) if actual == operation && error.code == 3)
+            );
+        }
+        assert!(
+            AudioPrivacyOperation::of(&Msg::SetMediaWatch(w::SetMediaWatch { enabled: true }))
+                .is_none()
+        );
+        assert!(AudioPrivacyOperation::of(&Msg::SetMicMute(w::SetMicMute {
+            expected_generation: 1,
+            muted: false
+        }))
+        .is_none());
+        assert!(worker_rejection(
+            &events,
+            7,
+            13,
+            None,
+            false,
+            w::Error {
+                code: 3,
+                session_id: Vec::new()
+            }
+        )
+        .is_ok());
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            worker_rejection(
+                &events,
+                7,
+                14,
+                None,
+                true,
+                w::Error {
+                    code: 9,
+                    session_id: vec![1; 16]
+                }
+            ),
+            Err(AudioSupervisorError::RestartRequired(
+                AudioRestartReason::SessionBudget
+            ))
+        );
+        assert!(matches!(
+            received.recv().await,
+            Some(AudioSupervisorEvent::RestartRequired {
+                generation: 7,
+                reason: AudioRestartReason::SessionBudget
+            })
+        ));
+        assert_eq!(
+            worker_rejection(
+                &events,
+                7,
+                15,
+                None,
+                false,
+                w::Error {
+                    code: 9,
+                    session_id: Vec::new()
+                }
+            ),
+            Err(AudioSupervisorError::InvalidFrame)
+        );
+    }
+
+    #[tokio::test]
+    async fn full_supervisor_admission_distinguishes_privacy_reductions() {
+        let (commands, mut queue) = mpsc::channel(1);
+        let (reply, _receive) = oneshot::channel();
+        commands
+            .try_send(Command {
+                generation: 7,
+                message: Msg::ProbeBackend(w::ProbeBackend {}),
+                admitted_at: Instant::now(),
+                reply,
+            })
+            .unwrap_or_else(|_| panic!("fill admission"));
+        let handle = AudioHandle {
+            commands,
+            generation: Arc::new(AtomicU64::new(7)),
+            shutdown: watch::channel(false).0,
+            stopped: watch::channel(true).1,
+        };
+        assert_eq!(
+            handle.set_media_watch(false).await,
+            Err(AudioSupervisorError::PrivacyControlRejected)
+        );
+        assert_eq!(
+            handle.set_mic_mute(1, true).await,
+            Err(AudioSupervisorError::PrivacyControlRejected)
+        );
+        assert_eq!(
+            handle.ptt_revoke(1).await,
+            Err(AudioSupervisorError::PrivacyControlRejected)
+        );
+        assert_eq!(
+            handle.release_mic_mute().await,
+            Err(AudioSupervisorError::PrivacyControlRejected)
+        );
+        assert_eq!(
+            handle.stop_session([1; 16]).await,
+            Err(AudioSupervisorError::PrivacyControlRejected)
+        );
+        assert_eq!(
+            handle.set_media_watch(true).await,
+            Err(AudioSupervisorError::QueueFull)
+        );
+        assert_eq!(
+            handle.set_gain([1; 16], 50, false).await,
+            Err(AudioSupervisorError::QueueFull)
+        );
+        assert!(queue.try_recv().is_ok());
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_child_recycles_session_budget_before_hard_exhaustion() {
+        async fn session(events: &mut mpsc::Receiver<AudioSupervisorEvent>, id: &[u8], kind: i32) {
+            loop {
+                match next(events).await {
+                    AudioSupervisorEvent::SessionEvent { event, .. }
+                        if event.session_id == id && event.kind == kind =>
+                    {
+                        return
+                    }
+                    AudioSupervisorEvent::Failed { reason, .. } => {
+                        panic!("budget fixture failed: {reason}")
+                    }
+                    AudioSupervisorEvent::CommandRejected { error, .. } => {
+                        panic!("budget fixture rejected: {error:?}")
+                    }
+                    AudioSupervisorEvent::RestartRequired { .. } => {
+                        panic!("recycled before soft boundary")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let root = Root::new();
+        let (handle, mut events) = AudioSupervisor::start(root.config("budget")).await.unwrap();
+        let (generation, _) = ready(&mut events).await;
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = port();
+        let request = |index: u16| {
+            let mut request = start(2, local, peer.local_addr().unwrap().port());
+            request.session_id[..2].copy_from_slice(&index.to_be_bytes());
+            for (direction, material) in [
+                (1, request.forward.as_mut().unwrap()),
+                (2, request.reverse.as_mut().unwrap()),
+            ] {
+                material.key.fill(0);
+                material.key[0] = direction;
+                material.key[1..3].copy_from_slice(&index.to_be_bytes());
+            }
+            request
+        };
+        timeout(Duration::from_secs(60), async {
+            for index in 0..240 {
+                let request = request(index);
+                let id = request.session_id.clone();
+                handle.start_session(request).await.unwrap();
+                session(&mut events, &id, 1).await;
+                handle
+                    .stop_session(id.as_slice().try_into().unwrap())
+                    .await
+                    .unwrap();
+                session(&mut events, &id, 5).await;
+                if index % 32 == 31 {
+                    // Let a post-admission Pong retire no-reply safety requests;
+                    // this fixture tests the child's lifetime budget, not IPC flooding.
+                    tokio::time::sleep(Duration::from_millis(contract::PING_INTERVAL_MS + 10))
+                        .await;
+                }
+            }
+            handle.start_session(request(240)).await.unwrap();
+            loop {
+                if let AudioSupervisorEvent::RestartRequired {
+                    generation: actual,
+                    reason,
+                } = next(&mut events).await
+                {
+                    assert_eq!(actual, generation);
+                    assert_eq!(reason, AudioRestartReason::SessionBudget);
+                    break;
+                }
+            }
+            let (fresh, _) = ready(&mut events).await;
+            assert!(fresh > generation);
+            let request = request(241);
+            let id = request.session_id.clone();
+            handle.start_session(request).await.unwrap();
+            session(&mut events, &id, 1).await;
+            handle
+                .stop_session(id.as_slice().try_into().unwrap())
+                .await
+                .unwrap();
+            session(&mut events, &id, 5).await;
+        })
+        .await
+        .expect("bounded child recycle at session soft budget");
+        handle.shutdown().await.unwrap();
     }
 }

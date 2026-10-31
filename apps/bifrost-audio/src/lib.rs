@@ -10,8 +10,12 @@
 //! observation needs no mic guard and GUI-only talk grants need no native hotkey.
 //! Clean release/shutdown restores via the backend guard contract (best-effort on
 //! Linux); a fresh child never reacquires or unmutes an endpoint automatically.
+//! Privacy reductions bypass the generic native-control queue. Watch withdrawal blanks
+//! metadata at IPC admission; mute/revoke/release wake the independent guard timer.
+//! Admission fences prevent older queued openings from reviving withdrawn authority.
 #![forbid(unsafe_code)]
 mod clock;
+mod privacy;
 mod ptt_lease;
 mod worker;
 use audio_backend::{
@@ -76,6 +80,7 @@ struct Shared {
     stopping: AtomicBool,
     media_enabled: AtomicBool,
     permits: Mutex<Vec<Permit>>,
+    privacy: Arc<privacy::Privacy>,
 }
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
@@ -88,6 +93,7 @@ impl Shared {
             stopping: AtomicBool::new(false),
             media_enabled: AtomicBool::new(false),
             permits: Mutex::new(Vec::with_capacity(contract::MAX_SESSIONS)),
+            privacy: privacy::Privacy::new(),
         }
     }
     fn has_source(&self, now: Instant) -> bool {
@@ -159,6 +165,8 @@ impl Drop for AuthorityGuard {
 struct Command {
     request_id: u64,
     admitted_at: Instant,
+    privacy_epoch: u64,
+    talk_epoch: u64,
     message: Msg,
     secrets: Option<contract::SessionSecrets>,
     permit: Option<Arc<AtomicBool>>,
@@ -434,6 +442,16 @@ where
                             && send(&mut link,request_id,Msg::Error(w::Error {code:6,session_id:renew.session_id})).await.is_err(){break;}
                     },
                     message=>{
+                        if let Some(result)=shared.privacy.admit(request_id,&message) {
+                            if let Err(code)=result {
+                                let response=if code==6 {match &message {
+                                    Msg::PttRevoke(revoke)=>Msg::PttEvent(w::PttEvent {grant_id:revoke.grant_id,kind:5,reason:2,observed_at_ns:0,expires_at_ns:0}),
+                                    _=>Msg::Error(w::Error {code,session_id:Vec::new()}),
+                                }} else {Msg::Error(w::Error {code,session_id:Vec::new()})};
+                                if send(&mut link,request_id,response).await.is_err(){break;}
+                            }
+                            continue;
+                        }
                         let mut permit=None;
                         if let Msg::StopSession(stop)=&message {shared.revoke(&stop.session_id);}
                         if let Msg::StartSession(start)=&message {
@@ -444,7 +462,13 @@ where
                         }
                         let id=if let Msg::StartSession(start)=&message{Some(start.session_id.clone())}else{None};
                         let media_watch=if let Msg::SetMediaWatch(watch)=&message {Some(watch.enabled)} else{None};
-                        if command_tx.try_send(Command {request_id,admitted_at:Instant::now(),message,secrets:received.secrets.take(),permit}).is_err(){
+                        if media_watch == Some(false) {
+                            shared.media_enabled.store(false,Ordering::Release);
+                            let Some(revision)=media_revision.checked_add(1) else{failure=Some(RoleError::WorkerFailed);break;};
+                            media_revision=revision;media_present=false;
+                            if send(&mut link,0,Msg::MediaSessions(w::MediaSessions {sessions:Vec::new(),current_token:None,revision})).await.is_err(){break;}
+                        }
+                        if command_tx.try_send(Command {request_id,admitted_at:Instant::now(),privacy_epoch:shared.privacy.epoch.load(Ordering::Acquire),talk_epoch:shared.privacy.talk_epoch.load(Ordering::Acquire),message,secrets:received.secrets.take(),permit}).is_err(){
                             if let Some(id)=id {shared.revoke(&id);shared.remove(&id);}
                             if send(&mut link,request_id,Msg::Error(w::Error {code:3,session_id:Vec::new()})).await.is_err(){break;}
                         } else if let Some(enabled)=media_watch {
@@ -465,7 +489,9 @@ where
                                 snapshot.sessions.clear();snapshot.current_token=None;
                             }
                             let Some(revision)=media_revision.checked_add(1) else{failure=Some(RoleError::WorkerFailed);break;};
-                            media_revision=revision;snapshot.revision=revision;media_present=!snapshot.sessions.is_empty();
+                            media_revision = revision;
+                            snapshot.revision = revision;
+                            media_present = !snapshot.sessions.is_empty();
                             Msg::MediaSessions(snapshot)
                         },
                         message=>message,

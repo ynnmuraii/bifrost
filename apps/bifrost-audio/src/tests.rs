@@ -88,6 +88,7 @@ fn arguments_reject_secrets_and_implicit_backend_switches() {
 mod local {
     mod m5;
     mod m6;
+    mod privacy;
     mod scripted;
     use super::*;
     use ipc::{

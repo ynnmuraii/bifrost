@@ -61,6 +61,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Keep an uninterrupted transmitted sample grid through capture silence without DTX. Fill uncovered host-time gaps with bounded silence (at most 200 ms), reanchor larger gaps, and report native discontinuity flags separately from actual capture repairs.
 - Expose bounded per-stage latency observations, use 5 ms aggregate mix blocks with a native-callback quantum floor, and bound decoded lane queues. A deterministic wired chirp fixture with a modeled 20 ms native FIFO improves from 86.688 to 81.688 ms without changing jitter profile targets; native hardware timing requires platform verification.
 - Wake the mixer from render consumption and refill a complete native quantum before parking. When safe before the next callback, honor an imminent jitter deadline rather than queueing an extra silent output period.
+- Compare native played/submitted frames from the same stream-zero origin, eliminating phantom startup FIFO depth; recreate that clock on render restart. Dry onset checks retain the wired planning budget and explicitly account for a complete callback quantum plus measured host-scheduler overshoot.
+- Make the Dry scheduling allowance portable: stage sum plus one callback quantum, the greater of measured host overshoot and a Windows 1 ms/Linux 0.1 ms floor, and one sample of onset-search epsilon. Keep the fixed Ethernet stage ceiling separate.
+- Windows render negotiates low-latency shared/event periods through IAudioClient3 with a 5 ms floor and a two-period queue bound. Unsupported/locked configurations retain typed diagnostics and fall back to legacy shared conversion; process-loopback capture semantics are unchanged.
+- Extend Windows audio diagnostics with negotiated periods, explicit audible candidate stress and bounded-memory long E2E runs reporting post-warmup underruns.
 
 **Shared Listener media**
 
@@ -69,7 +73,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Linux audio backend internals**
 
-- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
+- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion remains unsupported. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
 
 **Linux MPRIS internals**
 
@@ -98,8 +102,18 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Audio M5/M6 child execution**
 
 - Execute owned microphone mute and shortcut observation, and keep persistent toggles separate from independently timed remote talk grants. Grant expiry remutes on a guard-owning thread even while other backend work stalls; native snapshots remain authoritative, pre-muted endpoints refuse grants, and Ping does not renew them.
+- Report failed timed remute writes separately from lease expiry; never present an expired permission as evidence that the physical endpoint is muted.
 - Forward bounded media metadata only during an explicitly enabled authorized Source watch, recheck the current player before commands, and correlate completion/cancellation. The explicit Dry harness has documented deterministic revisioned media; native backends never synthesize it.
 
+**Linux M5 native controls**
+
+- Add Wayland GlobalShortcuts portal observation with both edges and 100 ms renewals of 250 ms leases; no binding occurs during availability probes. Missing portals and X11 remain honestly unsupported; X11 release observation is a later agent integration.
+- Add Pulse source mute with explicitly best-effort ownership: one matching change echo within 200 ms is attributable, while differing/late/ambiguous changes relinquish restoration. Owned-null-sink live tests cover set/restore/drop without touching defaults or audible endpoints.
+
+**Audio privacy admission and child lifetime**
+
+- Revoke metadata admission before bounded queueing, and give microphone mute/revoke/release a separate guard-owned priority path. Privacy reductions fence older queued openings; mailbox saturation fails closed and is surfaced as a typed fatal supervisor event.
+- Keep lifetime session/key tombstones intact, but retire the child at a soft 240-start budget before its 256-entry backstop. A typed restart-required outcome triggers bounded recycling; existing sessions fail and require fresh negotiation, never historical key replay.
 
 ### Русский
 
@@ -158,6 +172,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - При тишине захвата сохраняется непрерывная временная сетка отправленных кадров без DTX. Непокрытые разрывы времени host заполняются тишиной до 200 мс; большие разрывы переустанавливают опорную точку. Нативные флаги discontinuity учитываются отдельно от реальных исправлений захвата.
 - Добавлены ограниченные наблюдения задержки по стадиям, блоки общего микшера 5 мс с запасом не меньше нативного callback и ограниченные очереди декодированных входов. Детерминированный тест с моделью нативного FIFO 20 мс улучшился с 86,688 до 81,688 мс без изменения профилей джиттера; нативные задержки проверяются на соответствующей платформе.
 - Микшер пробуждается при потреблении выхода и перед ожиданием заполняет весь нативный квант. Если запас до следующего callback позволяет, он ждёт близкий срок джиттера вместо постановки лишнего периода тишины в очередь.
+- Нативные воспроизведённые и переданные кадры сравниваются от общего нуля потока, без фиктивной стартовой глубины FIFO; при перезапуске часы создаются заново. Проверка Dry сохраняет проводной бюджет стадий и явно учитывает квант callback плюс измеренное опоздание планировщика.
+- Допуск Dry переносим между ОС: сумма стадий плюс квант callback, максимум измеренного опоздания и порога Windows 1 мс/Linux 0,1 мс, затем один сэмпл погрешности поиска начала. Фиксированный бюджет проводных стадий проверяется отдельно.
+- Вывод Windows согласует низкую задержку shared/event через IAudioClient3 с нижней границей 5 мс и очередью не более двух периодов. Неподдерживаемые и заблокированные конфигурации возвращаются к прежнему shared-преобразованию с типизированной причиной; семантика EXCLUDE-захвата не меняется.
+- Диагностика Windows дополнена согласованными периодами, явно запускаемой звуковой проверкой кандидатов и длительным E2E с ограниченной памятью и счётчиками underrun после прогрева.
 
 **Общий аудиовыход Listener**
 
@@ -166,7 +184,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Внутренний аудиобэкенд Linux**
 
-- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса, безопасное владение заглушением и глобальный PTT явно недоступны. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
+- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса остаётся неподдерживаемым. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
 
 **Внутренний MPRIS Linux**
 
@@ -195,8 +213,18 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Исполнение M5/M6 в аудиопроцессе**
 
 - Реализованы владение заглушением микрофона и наблюдение PTT; постоянное переключение отделено от удалённых разрешений говорить. Независимый поток guard заглушает по истечении даже при задержке другой работы бэкенда; фактическое состояние подтверждают снимки, изначально заглушённый микрофон отклоняет разрешение, Ping его не продлевает.
+- Ошибка заглушения по таймеру сообщается отдельно от истечения разрешения: истёкший срок не выдаётся за подтверждение фактического mute устройства.
 - Ограниченные медиаданные передаются только при явно включённом наблюдении разрешённого Source; перед командой повторно проверяется текущий плеер, результаты и отмены связаны с запросами. Только явный Dry-режим предоставляет документированный детерминированный медиасеанс с ревизиями.
 
+**Нативное управление Linux M5**
+
+- Добавлено наблюдение обеих границ Wayland GlobalShortcuts с продлением каждые 100 мс срока 250 мс; проверка доступности не создаёт привязку. Отсутствующий портал и X11 явно не поддерживаются; X11 release требует дальнейшей интеграции агента.
+- Заглушение источника Pulse использует явно best-effort владение: допускается одно совпадающее эхо за 200 мс, а отличающееся, позднее или неоднозначное изменение отменяет восстановление. Натурные тесты set/restore/drop используют только собственный null-sink, не трогая defaults и слышимые устройства.
+
+**Приватность аудио и срок жизни процесса**
+
+- Метаданные отзываются до ограниченной очереди, а mute/revoke/release микрофона идут отдельным приоритетным путём guard. Старые запросы открытия блокируются; переполнение закрывает разрешения и передаётся как типизированная фатальная ошибка надзора.
+- История ID/ключей не удаляется; после 240 запусков процесс переинициализируется до жёсткого предела 256. Типизированный запрос перезапуска ограничен бюджетом надзора; сеансы требуют нового согласования без повтора старых ключей.
 
 ## 0.4.0 — 2026-10-30
 

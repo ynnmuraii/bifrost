@@ -324,10 +324,28 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
         .send(10, Msg::SetMediaWatch(w::SetMediaWatch { enabled: false }))
         .await
         .unwrap();
-    result(&mut source, &mut listener, 9, 5, None).await;
-    let disabled = snapshot(&mut source, &mut listener).await;
-    assert_empty(&disabled);
-    assert!(disabled.revision > first.revision);
+    let mut disabled = None;
+    let mut cancelled = false;
+    while disabled.is_none() || !cancelled {
+        let (from_source, mut received) = next_pair(&mut source, &mut listener, None).await;
+        match received.frame.msg.take().unwrap() {
+            Msg::MediaSessions(snapshot) => {
+                assert!(from_source);
+                assert_empty(&snapshot);
+                assert!(snapshot.revision > first.revision);
+                disabled = Some(snapshot);
+            }
+            Msg::MediaCommandResult(result) => {
+                assert!(from_source);
+                assert_eq!(received.frame.request_id, 9);
+                assert_eq!(result.result, 5);
+                cancelled = true;
+            }
+            Msg::Error(error) => panic!("unexpected wire error: {}", error.code),
+            _ => {}
+        }
+    }
+    let disabled = disabled.expect("metadata withdrawal observed");
     script
         .send(Script::Event(ScriptEvent::SetMedia {
             session: MediaSessionToken(1),

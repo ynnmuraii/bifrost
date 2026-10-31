@@ -1483,6 +1483,22 @@ impl Actor {
                     }
                 }
             }
+            AudioSupervisorEvent::PrivacyControlRejected {
+                generation: gen, ..
+            }
+            | AudioSupervisorEvent::RestartRequired {
+                generation: gen, ..
+            } => {
+                if self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.generation == gen)
+                {
+                    self.fail_pending(ipc::audio::codes::AUDIO_UNAVAILABLE)
+                        .await;
+                    self.worker_lost();
+                }
+            }
             AudioSupervisorEvent::MuteSnapshot {
                 generation: gen, ..
             }
