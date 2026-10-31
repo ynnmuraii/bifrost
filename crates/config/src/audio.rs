@@ -127,6 +127,9 @@ impl Default for SystemCaptureSelector {
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
     pub enabled: bool,
+    /// None preserves legacy allowlists; false disables only system audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_sharing: Option<bool>,
     pub role: AudioRole,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<AudioGroupId>,
@@ -159,6 +162,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            system_sharing: None,
             role: AudioRole::Off,
             group_id: None,
             group_id_override: Some(false),
@@ -187,6 +191,10 @@ impl Default for AudioConfig {
 #[serde(deny_unknown_fields)]
 pub struct AudioPeerConfig {
     pub node_id: AudioNodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_send_override: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_receive_override: Option<bool>,
     #[serde(default)]
     pub allow_mic_control: bool,
     #[serde(default)]
@@ -266,6 +274,44 @@ impl AudioConfig {
         self.role == AudioRole::Source && self.group_id_override.unwrap_or(self.group_id.is_some())
     }
 
+    /// System policy master gate, independent of microphone and media controls.
+    /// This is configured intent, not native capture or playback activity.
+    pub fn system_enabled(&self) -> bool {
+        self.enabled && self.role != AudioRole::Off && self.system_sharing != Some(false)
+    }
+
+    /// Pure local policy. The caller MUST check current trust, authenticated
+    /// Listener identity/group, and bilateral consent before sending.
+    pub fn system_send_allowed(&self, node_id: AudioNodeId) -> bool {
+        self.system_enabled()
+            && self.role == AudioRole::Source
+            && self.listener_node_id == Some(node_id)
+            && self
+                .peers
+                .iter()
+                .find(|peer| peer.node_id == node_id)
+                .and_then(|peer| peer.system_send_override)
+                .unwrap_or_else(|| {
+                    self.system_sharing == Some(true) || self.allow_send_to.contains(&node_id)
+                })
+    }
+
+    /// Pure local policy. The caller MUST check current trust, membership in
+    /// this Listener's own authenticated group, and bilateral consent.
+    pub fn system_receive_allowed(&self, node_id: AudioNodeId) -> bool {
+        self.system_enabled()
+            && self.role == AudioRole::Listener
+            && self
+                .peers
+                .iter()
+                .find(|peer| peer.node_id == node_id)
+                .and_then(|peer| peer.system_receive_override)
+                .unwrap_or_else(|| {
+                    self.system_sharing == Some(true)
+                        || self.allow_system_audio_from.contains(&node_id)
+                })
+    }
+
     /// Structural policy only. The caller MUST recheck current trust, self identity,
     /// Listener group ownership, runtime device availability and bilateral consent
     /// at activation. Pairing never populates either explicit consent list.
@@ -306,6 +352,20 @@ impl AudioConfig {
             if peer.gain_percent > 100 {
                 return Err(invalid("audio.peers.gain_percent", "integer 0..=100"));
             }
+            if peer.system_send_override == Some(true)
+                && (self.role != AudioRole::Source || Some(peer.node_id) != self.listener_node_id)
+            {
+                return Err(invalid(
+                    "audio.peers.system_send_override",
+                    "Source permission for selected Listener only",
+                ));
+            }
+            if peer.system_receive_override == Some(true) && self.role != AudioRole::Listener {
+                return Err(invalid(
+                    "audio.peers.system_receive_override",
+                    "Listener permission for a configured Source only",
+                ));
+            }
             if peer.allow_media_control
                 && (self.role != AudioRole::Source || Some(peer.node_id) != self.listener_node_id)
             {
@@ -337,6 +397,7 @@ impl AudioConfig {
         match self.role {
             AudioRole::Off => {
                 if self.enabled
+                    || self.system_sharing == Some(true)
                     || !self.allow_send_to.is_empty()
                     || !self.allow_system_audio_from.is_empty()
                     || self.microphone.control_enabled

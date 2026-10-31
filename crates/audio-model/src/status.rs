@@ -287,6 +287,12 @@ pub struct SessionStatus {
 pub struct AudioStatus {
     pub revision: u64,
     pub enabled: bool,
+    /// Explicit runtime request, not observed native activity. None is legacy/unknown.
+    /// Source intent resets on restart unless resumed; Listener intent is receive policy.
+    pub system_sharing_requested: Option<bool>,
+    /// Bounded typed AUDIO_* code only; never native error text or metadata.
+    /// None means no current system-sharing error.
+    pub system_sharing_error: Option<String>,
     pub role: AudioRole,
     pub mode: AudioMode,
     pub backend: Vec<CapabilityAvailability>,
@@ -306,10 +312,22 @@ pub enum StatusError {
     SourceNameTooLong,
     InvalidUdpPort,
     LatencyOutOfRange,
+    InvalidSystemSharingError,
 }
 
 impl AudioStatus {
     pub fn validate(&self) -> Result<(), StatusError> {
+        if self.system_sharing_error.as_ref().is_some_and(|code| {
+            code.len() > 64
+                || !code.strip_prefix("AUDIO_").is_some_and(|suffix| {
+                    !suffix.is_empty()
+                        && suffix.bytes().all(|byte| {
+                            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                        })
+                })
+        }) {
+            return Err(StatusError::InvalidSystemSharingError);
+        }
         if self.sessions.len() > MAX_AUDIO_SESSIONS {
             return Err(StatusError::TooManySessions);
         }
@@ -395,6 +413,55 @@ mod tests {
             peer_udp_port: 0,
             remote_quality: None,
             latency_stages: None,
+        }
+    }
+
+    #[test]
+    fn system_request_preserves_presence_without_claiming_native_activity() {
+        assert_eq!(AudioStatus::default().system_sharing_requested, None);
+        for requested in [None, Some(false), Some(true)] {
+            let status = AudioStatus {
+                system_sharing_requested: requested,
+                ..Default::default()
+            };
+            assert_eq!(status.clone().system_sharing_requested, requested);
+            assert!(!status.enabled);
+            assert!(status.sessions.is_empty());
+            assert_eq!(status.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn system_error_requires_bounded_typed_code_not_native_text() {
+        assert_eq!(AudioStatus::default().system_sharing_error, None);
+        for code in [
+            "AUDIO_DEVICE_UNAVAILABLE".to_owned(),
+            format!("AUDIO_{}", "X".repeat(58)),
+        ] {
+            let status = AudioStatus {
+                system_sharing_error: Some(code),
+                ..Default::default()
+            };
+            assert_eq!(status.validate(), Ok(()));
+        }
+        for code in [
+            String::new(),
+            "AUDIO_".to_owned(),
+            "DEVICE_UNAVAILABLE".to_owned(),
+            "AUDIO_native_error".to_owned(),
+            "AUDIO_DEVICE unavailable".to_owned(),
+            "AUDIO_ERROR\n".to_owned(),
+            "AUDIO_É".to_owned(),
+            format!("AUDIO_{}", "X".repeat(59)),
+        ] {
+            let status = AudioStatus {
+                system_sharing_error: Some(code),
+                ..Default::default()
+            };
+            assert_eq!(
+                status.validate(),
+                Err(StatusError::InvalidSystemSharingError)
+            );
         }
     }
 

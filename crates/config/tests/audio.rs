@@ -435,6 +435,8 @@ fn programmatic_peer_gains_reject_out_of_range_values() {
         role: AudioRole::Listener,
         peers: vec![AudioPeerConfig {
             node_id: HexId([1; 32]),
+            system_send_override: None,
+            system_receive_override: None,
             allow_mic_control: false,
             allow_media_control: false,
             gain_percent: 101,
@@ -502,4 +504,220 @@ fn physical_microphone_target_is_listener_local_only() {
     assert!(audio
         .validate_identity(local, &BTreeSet::from([remote]))
         .is_err());
+}
+
+#[test]
+fn system_policy_preserves_legacy_lists_and_applies_explicit_consent() {
+    let selected = HexId([1; 32]);
+    let other = HexId([2; 32]);
+    for role in [AudioRole::Source, AudioRole::Listener] {
+        let mut audio = AudioConfig {
+            enabled: true,
+            role,
+            listener_node_id: (role == AudioRole::Source).then_some(selected),
+            ..Default::default()
+        };
+        assert!(audio.system_enabled());
+        assert!(!audio.system_send_allowed(selected));
+        assert!(!audio.system_receive_allowed(selected));
+        if role == AudioRole::Source {
+            audio.allow_send_to.push(selected);
+        } else {
+            audio.allow_system_audio_from.push(selected);
+        }
+        assert_eq!(
+            audio.system_send_allowed(selected),
+            role == AudioRole::Source
+        );
+        assert_eq!(
+            audio.system_receive_allowed(selected),
+            role == AudioRole::Listener
+        );
+        assert!(!audio.system_send_allowed(other));
+        assert!(!audio.system_receive_allowed(other));
+
+        for sharing in [None, Some(false), Some(true)] {
+            audio.system_sharing = sharing;
+            for permission in [None, Some(false), Some(true)] {
+                audio.peers = vec![AudioPeerConfig {
+                    node_id: selected,
+                    system_send_override: (role == AudioRole::Source)
+                        .then_some(permission)
+                        .flatten(),
+                    system_receive_override: (role == AudioRole::Listener)
+                        .then_some(permission)
+                        .flatten(),
+                    allow_mic_control: false,
+                    allow_media_control: false,
+                    gain_percent: 100,
+                    muted: false,
+                }];
+                for listed in [false, true] {
+                    audio.allow_send_to.clear();
+                    audio.allow_system_audio_from.clear();
+                    if listed {
+                        if role == AudioRole::Source {
+                            audio.allow_send_to.push(selected);
+                        } else {
+                            audio.allow_system_audio_from.push(selected);
+                        }
+                    }
+                    audio.validate().unwrap();
+                    let allowed = sharing != Some(false)
+                        && permission.unwrap_or(sharing == Some(true) || listed);
+                    assert_eq!(
+                        audio.system_send_allowed(selected),
+                        role == AudioRole::Source && allowed
+                    );
+                    assert_eq!(
+                        audio.system_receive_allowed(selected),
+                        role == AudioRole::Listener && allowed
+                    );
+                    assert!(!audio.system_send_allowed(other));
+                    assert_eq!(
+                        audio.system_receive_allowed(other),
+                        role == AudioRole::Listener && sharing == Some(true)
+                    );
+                    audio.enabled = false;
+                    assert!(!audio.system_enabled());
+                    assert!(!audio.system_send_allowed(selected));
+                    assert!(!audio.system_receive_allowed(selected));
+                    audio.enabled = true;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn system_policy_never_bypasses_role_or_source_selection() {
+    let selected = HexId([1; 32]);
+    let other = HexId([2; 32]);
+    let mut audio = AudioConfig {
+        enabled: true,
+        role: AudioRole::Source,
+        listener_node_id: Some(selected),
+        system_sharing: Some(true),
+        peers: vec![AudioPeerConfig {
+            node_id: other,
+            system_send_override: Some(true),
+            system_receive_override: None,
+            allow_mic_control: false,
+            allow_media_control: false,
+            gain_percent: 100,
+            muted: false,
+        }],
+        ..Default::default()
+    };
+    assert!(!audio.system_send_allowed(other));
+    assert!(audio.validate().is_err());
+    audio.listener_node_id = None;
+    assert!(!audio.system_send_allowed(selected));
+    assert!(!audio.system_send_allowed(other));
+    audio.role = AudioRole::Listener;
+    assert!(audio.validate().is_err());
+    audio.peers[0].system_send_override = None;
+    audio.peers[0].system_receive_override = Some(true);
+    audio.validate().unwrap();
+    audio.role = AudioRole::Source;
+    assert!(audio.validate().is_err());
+    audio.role = AudioRole::Off;
+    assert!(!audio.system_enabled());
+    assert!(!audio.system_send_allowed(other));
+    assert!(!audio.system_receive_allowed(other));
+    assert!(audio.validate().is_err());
+    audio.enabled = false;
+    audio.peers.clear();
+    assert!(audio.validate().is_err());
+    audio.system_sharing = Some(false);
+    audio.validate().unwrap();
+}
+
+#[test]
+fn system_policy_toml_roundtrips_presence_and_unrelated_preferences() {
+    let id = "11".repeat(32);
+    for role in [AudioRole::Source, AudioRole::Listener] {
+        let role_text = if role == AudioRole::Source {
+            "source"
+        } else {
+            "listener"
+        };
+        let mut config = parse(&format!(
+            "role = '{role_text}'\nenabled = true\nlistener_node_id = '{id}'\n\
+             profile = 'wifi'\nmode = 'follow_focus'\nresume_system_audio = true\n\
+             media_port = 48001\noutput_fallback_to_default = true\n\
+             focus_debounce_ms = 300\nfocus_ramp_ms = 200\nbackground_gain_db = -24.0\n\
+             background_mute = true\n\
+             [audio.output_device]\nkind = 'stable_id'\nid = 'speaker'\n\
+             [audio.capture_device]\nkind = 'stable_id'\nid = 'monitor'\n\
+             [audio.microphone]\ncontrol_enabled = true\nptt_enabled = true\n\
+             ptt_hotkey = ''\nmuted = false\nvirtual_device = 'existing-mic'\n\
+             [audio.microphone.capture_device]\nkind = 'stable_id'\nid = 'physical-mic'\n\
+             [[audio.peers]]\nnode_id = '{id}'\nallow_mic_control = {}\n\
+             allow_media_control = {}\ngain_percent = {}\nmuted = {}",
+            role == AudioRole::Listener,
+            role == AudioRole::Source,
+            if role == AudioRole::Listener { 42 } else { 100 },
+            role == AudioRole::Listener,
+        ))
+        .unwrap();
+        let original = config.audio.clone();
+        assert_eq!(original.system_sharing, None);
+        assert_eq!(original.peers[0].system_send_override, None);
+        assert_eq!(original.peers[0].system_receive_override, None);
+        for sharing in [None, Some(false), Some(true)] {
+            for permission in [None, Some(false), Some(true)] {
+                config.audio.system_sharing = sharing;
+                if role == AudioRole::Source {
+                    config.audio.peers[0].system_send_override = permission;
+                } else {
+                    config.audio.peers[0].system_receive_override = permission;
+                }
+                config.audio.validate().unwrap();
+                let saved = config.to_toml().unwrap();
+                assert_eq!(saved.contains("system_sharing ="), sharing.is_some());
+                let permission_key = if role == AudioRole::Source {
+                    "system_send_override ="
+                } else {
+                    "system_receive_override ="
+                };
+                assert_eq!(saved.contains(permission_key), permission.is_some());
+                let mut restored = Config::from_str(&saved).unwrap();
+                assert_eq!(restored, config);
+                restored.audio.system_sharing = None;
+                restored.audio.peers[0].system_send_override = None;
+                restored.audio.peers[0].system_receive_override = None;
+                assert_eq!(restored.audio, original);
+            }
+        }
+    }
+}
+
+#[test]
+fn system_overrides_use_existing_peer_identity_and_count_bounds() {
+    let local = HexId([1; 32]);
+    let remote = HexId([2; 32]);
+    let mut audio = parse(&format!(
+        "role = 'listener'\nenabled = true\nsystem_sharing = true\n\
+         [[audio.peers]]\nnode_id = '{remote}'\nsystem_receive_override = false"
+    ))
+    .unwrap()
+    .audio;
+    assert!(audio.validate_identity(local, &BTreeSet::new()).is_err());
+    audio
+        .validate_identity(local, &BTreeSet::from([remote]))
+        .unwrap();
+    audio.peers.push(audio.peers[0].clone());
+    assert!(audio.validate().is_err());
+    audio.peers.pop();
+    for byte in 3..=5 {
+        let mut peer = audio.peers[0].clone();
+        peer.node_id = HexId([byte; 32]);
+        audio.peers.push(peer);
+    }
+    assert!(audio.validate().is_err());
+    assert!(parse(
+        "role = 'listener'\n[[audio.peers]]\nnode_id = 'bad'\nsystem_receive_override = true"
+    )
+    .is_err());
 }
