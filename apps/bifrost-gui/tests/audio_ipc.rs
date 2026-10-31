@@ -796,3 +796,48 @@ fn legacy_unknown_receive_intent_displays_only_authorized_running_pipeline_and_e
     vm.apply(event(Msg::AudioStatus(status)));
     assert!(!vm.audio.sharing_requested(ipc::AudioRole::Listener));
 }
+
+#[test]
+fn urgent_card_mute_ack_cannot_replace_pending_system_intent_persistence_result() {
+    let mut vm = view();
+    let mut status = sharing_snapshot(5, ipc::AudioRole::Listener, false);
+    status.sessions = snapshot(5).sessions;
+    bifrost_gui::audio_wire::decode_status(&status).expect("valid retained active stream");
+    vm.apply(event(Msg::AudioStatus(status)));
+    vm.audio_action(&AudioAction::Receive(true), Instant::now());
+    let (system_id, _) = vm.take_outgoing().pop().unwrap();
+    vm.audio_action(
+        &AudioAction::Player(AudioPlayerAction::SetMuted {
+            stream_id: "01".repeat(16),
+            muted: true,
+        }),
+        Instant::now(),
+    );
+    let (mute_id, message) = vm.take_outgoing().pop().expect("urgent card mute");
+    assert!(matches!(message, Msg::SetAudioPeerGain(request) if request.muted));
+    vm.apply(support::answer(
+        mute_id,
+        Msg::OpResult(ipc::OpResult {
+            ok: true,
+            error_code: String::new(),
+        }),
+    ));
+    assert!(vm.audio.pending);
+    assert!(vm.audio.sharing_requested(ipc::AudioRole::Listener));
+    vm.apply(support::answer(
+        system_id,
+        Msg::OpResult(ipc::OpResult {
+            ok: false,
+            error_code: "AUDIO_CONFIG_WRITE".into(),
+        }),
+    ));
+    assert!(!vm.audio.pending);
+    assert!(!vm.audio.sharing_requested(ipc::AudioRole::Listener));
+    assert_eq!(
+        vm.audio.error_message(vm.look.language),
+        Some(ui_text::text(
+            vm.look.language,
+            ui_text::Key::AudioConfigWrite
+        ))
+    );
+}

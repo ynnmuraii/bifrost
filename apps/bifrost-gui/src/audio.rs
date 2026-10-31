@@ -11,6 +11,8 @@ pub enum AudioRequest {
     Snapshot,
     Devices,
     Mutation,
+    /// An urgent existing control must not own an outstanding system switch's ACK.
+    AuxiliaryMutation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,6 +313,15 @@ impl ViewModel {
                 .device_requests
                 .retain(|(request, _)| *request != id);
         }
+        if kind == AudioRequest::AuxiliaryMutation {
+            if !result.ok {
+                self.audio.error =
+                    Some(text(self.look.language, error_key(&result.error_code)).into());
+            } else {
+                self.request_audio_status(Instant::now());
+            }
+            return;
+        }
         if kind == AudioRequest::Mutation && self.audio.pending_id != Some(id) {
             return;
         }
@@ -500,7 +511,17 @@ impl ViewModel {
                 self.outgoing.retain(|(id, _)| *id != snapshot);
             }
         }
-        let id = self.begin_request(Request::Audio(AudioRequest::Mutation), now);
+        let auxiliary = self.audio.system_intent.is_some()
+            && !matches!(
+                action,
+                AudioAction::Share(_) | AudioAction::Receive(_) | AudioAction::StopSystemAudio
+            );
+        let kind = if auxiliary {
+            AudioRequest::AuxiliaryMutation
+        } else {
+            AudioRequest::Mutation
+        };
+        let id = self.begin_request(Request::Audio(kind), now);
         match action {
             AudioAction::Share(enabled) => {
                 self.audio.system_intent = Some((ipc::AudioRole::Source, *enabled));
@@ -522,6 +543,10 @@ impl ViewModel {
         }
         if let AudioAction::SetPtt(pressed) = action {
             self.audio.gui_ptt_held = *pressed;
+        }
+        if auxiliary {
+            self.outgoing.push((id, message));
+            return;
         }
         self.audio.pending = true;
         self.audio.pending_id = Some(id);
