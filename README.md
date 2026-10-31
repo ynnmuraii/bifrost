@@ -206,6 +206,20 @@ Child mic/PTT tests use Dry mute targets for grants, expiry and persistent toggl
 Windows registration-only tests temporarily reserve Ctrl+Alt+Shift+F23/F24 and release
 them; they never press keys or mutate a real capture endpoint.
 
+Windows global PTT starts **unarmed** after registration; after a safety fence it
+also requires a confirmed physical release before a new press can talk. If needed,
+press and release the configured chord once to arm it, then press again to talk.
+A narrowly filtered, non-suppressing native observer accepts only non-injected
+key-up events for that chord's key/modifiers; it stores no unrelated keys.
+Unavailable/zero asynchronous key state only revokes a lease, never rearms it.
+Failure to install the release observer reports `Unsupported`; use GUI PTT instead.
+Hook timeout/removal also fails closed; reconfigure PTT to reinstall the observer.
+Registration-only tests do not verify actual native physical edges or desktop
+transitions. Configured is not an armed-state acknowledgment: integrations must
+explain the release-to-arm requirement, and use the physical-release event to
+distinguish it from reset/expiry. Delayed initial presses retain their conservative
+native message timestamp, not the time the event queue is drained.
+
 ## License
 
 [MIT](LICENSE). Distributed third-party components are listed in [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).
