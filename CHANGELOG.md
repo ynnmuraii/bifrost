@@ -54,6 +54,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Add an independent core-side audio supervisor with private one-use attach tokens, same-user IPC, bounded correlated commands, heartbeat/watchdog and isolated child containment. Restarted children receive no previous session keys; prior sessions fail and require renegotiation. The coordinator is integrated separately.
 
+**Audio authorization leases**
+
+- Require explicit per-session authorization grants of at most one second, renewed independently of IPC Ping. Expiration gates queued render PCM and outgoing media, stops only the expired session, and cannot be resurrected by a stale renewal.
+- Distinguish native `Started` acknowledgment from `PathValidated`, so the Listener can acknowledge initialization before the Source exists without deadlocking the commit handshake. Supervisor shutdown also has reserved admission during restart/backoff.
+
 ### Русский
 
 **Исправления**
@@ -103,6 +108,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Надзор аудиопроцесса**
 
 - Добавлен независимый надзор аудиопроцесса из core: приватные одноразовые токены, локальный IPC того же пользователя, ограниченные коррелированные команды, watchdog и изолированное завершение дочернего процесса. После перезапуска старые ключи не передаются, сеансы завершаются ошибкой и требуют нового согласования. Координатор интегрируется отдельно.
+
+**Разрешения аудиосеансов**
+
+- Каждый сеанс получает отдельное явное разрешение не более чем на секунду; продление не связано с IPC Ping. Истечение закрывает вывод подготовленного PCM и передачу медиа только этого сеанса; запоздалое продление не восстанавливает его.
+- Нативное подтверждение `Started` отделено от `PathValidated`: Listener подтверждает инициализацию до запуска Source, не блокируя commit. Остановка надзора имеет отдельный канал, доступный и во время перезапуска/backoff.
 
 ## 0.4.0 — 2026-10-30
 

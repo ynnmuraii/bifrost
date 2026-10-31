@@ -16,7 +16,6 @@ const MAX_STARTS: usize = 256;
 struct Running<S: Stream + 'static> {
     id: [u8; 16],
     role: i32,
-    port: u32,
     authorized: Arc<AtomicBool>,
     media: MediaSession<S>,
 }
@@ -163,7 +162,7 @@ where
             Msg::ListDevices(query) => self.devices(request_id, query),
             Msg::StartSession(start) => self.start(start, secrets.ok_or(6), permit.ok_or(6)),
             Msg::StopSession(stop) => {
-                self.stop(&stop.session_id, 1);
+                self.stop(&stop.session_id, self.shared.stop_reason(&stop.session_id));
                 Ok(())
             }
             Msg::SetGain(gain) => {
@@ -184,10 +183,14 @@ where
             _ => Err(6),
         };
         if let Err(code) = result {
-            if let Some(id) = &start_id {
+            let authorization_lost = if let Some(id) = &start_id {
                 self.shared.revoke(id);
+                let expired = self.shared.stop_reason(id) == 9;
                 self.shared.remove(id);
-            }
+                expired
+            } else {
+                false
+            };
             if self.sessions.is_empty() {
                 if let Some(mut group) = self.listener.take() {
                     if group.stop().is_err() {
@@ -195,6 +198,10 @@ where
                     }
                 }
                 self.socket = None;
+            }
+            if authorization_lost {
+                self.event(start_id.as_ref().expect("expired start"), 5, 9, 0);
+                return;
             }
             self.response(
                 request_id,
@@ -396,7 +403,7 @@ where
         if !authorized.load(Ordering::Acquire) {
             return Err(6);
         }
-        let media = if start.role == 1 {
+        let mut media = if start.role == 1 {
             if let Some(mut group) = self.listener.take() {
                 group.stop().map_err(|_| 8)?;
             }
@@ -434,13 +441,17 @@ where
                 .join(config, material)
         }
         .map_err(media_error)?;
+        if !authorized.load(Ordering::Acquire) || self.shared.stopping.load(Ordering::Acquire) {
+            let _ = media.stop();
+            return Err(6);
+        }
         self.sessions.push(Running {
             id,
             role: start.role,
-            port,
             authorized,
             media,
         });
+        self.event(&id, 1, 0, port);
         Ok(())
     }
     fn stop(&mut self, id: &[u8], reason: i32) {
@@ -521,14 +532,14 @@ where
         while index < self.sessions.len() {
             if !self.sessions[index].authorized.load(Ordering::Acquire) {
                 let id = self.sessions[index].id;
-                self.stop(&id, 1);
+                self.stop(&id, self.shared.stop_reason(&id));
                 continue;
             }
             let mut ended = None;
             while let Some(event) = self.sessions[index].media.poll_event() {
                 let session = &self.sessions[index];
                 match event {
-                    media::MediaEvent::Started => self.event(&session.id, 1, 0, session.port),
+                    media::MediaEvent::Started => self.event(&session.id, 6, 0, 0),
                     media::MediaEvent::Degraded => self.event(&session.id, 2, 0, 0),
                     media::MediaEvent::DeviceInvalidated => self.event(&session.id, 3, 0, 0),
                     media::MediaEvent::RotationRequired => self.event(&session.id, 4, 0, 0),
@@ -643,6 +654,6 @@ fn stop_reason(reason: media::StopReason) -> i32 {
         media::StopReason::WorkerFailed => 4,
         media::StopReason::PathTimeout => 5,
         media::StopReason::RotationRequired => 6,
-        media::StopReason::AuthorizationLost => 7,
+        media::StopReason::AuthorizationLost => 9,
     }
 }

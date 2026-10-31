@@ -10,7 +10,7 @@ use std::time::Duration;
 use ipc::audio_worker::{self as contract, AudioLink, LaunchToken};
 use ipc::transport::{self, ClientStream, Endpoint};
 use protocol::audio_worker::{self as w, audio_frame::Msg};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{timeout, Instant};
 
 const QUEUE: usize = 64;
@@ -98,6 +98,8 @@ pub enum AudioSupervisorEvent {
 pub struct AudioHandle {
     commands: mpsc::Sender<Command>,
     generation: Arc<AtomicU64>,
+    shutdown: watch::Sender<bool>,
+    stopped: watch::Receiver<bool>,
 }
 enum Reply {
     Written(u64),
@@ -177,6 +179,15 @@ impl AudioHandle {
         }))
         .await
     }
+    /// Acknowledges only the wire write; rejection arrives as `CommandRejected`.
+    /// The caller alone authorizes renewals; the supervisor never renews automatically.
+    pub async fn renew_session(&self, session_id: [u8; 16], ttl_ms: u32) -> Result<u64> {
+        self.written(Msg::RenewSession(w::RenewSession {
+            session_id: session_id.to_vec(),
+            ttl_ms,
+        }))
+        .await
+    }
     pub async fn set_gain(&self, session_id: [u8; 16], percent: u32, muted: bool) -> Result<u64> {
         self.written(Msg::SetGain(w::SetGain {
             session_id: session_id.to_vec(),
@@ -186,10 +197,23 @@ impl AudioHandle {
         .await
     }
     pub async fn shutdown(&self) -> Result<()> {
-        match self.command(Msg::Shutdown(w::Shutdown {})).await? {
-            Reply::Shutdown => Ok(()),
-            _ => Err(AudioSupervisorError::InvalidFrame),
-        }
+        // Reserved stop admission: disabling audio also interrupts backoff/launch
+        // and cannot be blocked by the ordinary command queue or generation zero.
+        self.shutdown.send_replace(true);
+        let mut stopped = self.stopped.clone();
+        timeout(LAUNCH_TIMEOUT + IO_TIMEOUT * 2, async {
+            loop {
+                if *stopped.borrow_and_update() {
+                    return Ok(());
+                }
+                stopped
+                    .changed()
+                    .await
+                    .map_err(|_| AudioSupervisorError::Unavailable)?;
+            }
+        })
+        .await
+        .map_err(|_| AudioSupervisorError::Timeout)?
     }
 }
 
@@ -205,7 +229,13 @@ impl AudioSupervisor {
         let (events, event_rx) = mpsc::channel(QUEUE);
         let generation = Arc::new(AtomicU64::new(0));
         let (started, ready) = oneshot::channel();
-        tokio::spawn(run(config, rx, events, generation.clone(), started));
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (stopped_tx, stopped) = watch::channel(false);
+        let actor_generation = generation.clone();
+        tokio::spawn(async move {
+            run(config, rx, events, actor_generation, started, shutdown_rx).await;
+            stopped_tx.send_replace(true);
+        });
         // Dropping this receiver on timeout also makes the actor reap a late child.
         timeout(LAUNCH_TIMEOUT, ready)
             .await
@@ -215,6 +245,8 @@ impl AudioSupervisor {
             AudioHandle {
                 commands,
                 generation,
+                shutdown,
+                stopped,
             },
             event_rx,
         ))
@@ -299,7 +331,11 @@ fn configure_lifetime(command: &mut tokio::process::Command) {
     command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
 }
 
-async fn launch(config: &AudioSupervisorConfig, generation: u64) -> Result<Child> {
+async fn launch(
+    config: &AudioSupervisorConfig,
+    generation: u64,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Child> {
     use std::io::Write;
     // Names are process-global, so independent supervisors cannot steal each other's files.
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -357,7 +393,7 @@ async fn launch(config: &AudioSupervisorConfig, generation: u64) -> Result<Child
             return Err(AudioSupervisorError::Launch(error.to_string()));
         }
     };
-    let attached = timeout(LAUNCH_TIMEOUT, async {
+    let attaching = timeout(LAUNCH_TIMEOUT, async {
         let stream = listener
             .accept(&ipc::peer::SameUser::current())
             .await
@@ -389,9 +425,12 @@ async fn launch(config: &AudioSupervisorConfig, generation: u64) -> Result<Child
             }
             _ => Err(AudioSupervisorError::InvalidFrame),
         }
-    })
-    .await
-    .unwrap_or(Err(AudioSupervisorError::Timeout));
+    });
+    let attached = tokio::select! {
+        biased;
+        _ = shutdown_requested(shutdown) => Err(AudioSupervisorError::Unavailable),
+        result = attaching => result.unwrap_or(Err(AudioSupervisorError::Timeout)),
+    };
     match attached {
         Ok((link, ready)) => Ok(Child {
             pid: process.id().ok_or(AudioSupervisorError::ChildLost)?,
@@ -446,6 +485,7 @@ async fn serve(
     sessions: &mut BTreeSet<[u8; 16]>,
 ) -> Result<()> {
     let mut pending = BTreeMap::<u64, Pending>::new();
+    let mut pending_starts = BTreeMap::<u64, [u8; 16]>::new();
     let mut request = 1u64;
     let mut ping = 0u64;
     let mut pong = 0u64;
@@ -495,7 +535,13 @@ async fn serve(
                         }
                         Msg::SessionEvent(event) => {
                             let session: [u8; 16] = event.session_id.as_slice().try_into().map_err(|_| AudioSupervisorError::InvalidFrame)?;
-                            if !sessions.contains(&session) { return Err(AudioSupervisorError::InvalidFrame); }
+                            if !sessions.contains(&session) {
+                                if event.kind == 5 { continue; }
+                                return Err(AudioSupervisorError::InvalidFrame);
+                            }
+                            if matches!(event.kind, 1 | 5) {
+                                pending_starts.retain(|_, id| *id != session);
+                            }
                             if event.kind == 5 { sessions.remove(&session); }
                             emit(events, AudioSupervisorEvent::SessionEvent { generation, event })?;
                         }
@@ -508,7 +554,8 @@ async fn serve(
                         Msg::Error(error) => {
                             if id <= 1 || id > request { return Err(AudioSupervisorError::InvalidFrame); }
                             if let Some(response) = pending.remove(&id) { let _ = response.reply.send(Err(AudioSupervisorError::WorkerRejected(error.code))); }
-                            if let Ok(session) = <[u8;16]>::try_from(error.session_id.as_slice()) { sessions.remove(&session); }
+                            // A rejected renewal/gain never deletes another live session.
+                            if let Some(session) = pending_starts.remove(&id) { sessions.remove(&session); }
                             emit(events, AudioSupervisorEvent::CommandRejected { generation, request_id: id, error })?;
                         }
                         _ => return Err(AudioSupervisorError::InvalidFrame),
@@ -538,7 +585,7 @@ async fn serve(
                     }
                     request = next_request;
                     if let Err(error) = send(child, request, message).await { let _ = command.reply.send(Err(error.clone())); return Err(error); }
-                    if let Some(id) = session { sessions.insert(id); }
+                    if let Some(id) = session { sessions.insert(id); pending_starts.insert(request, id); }
                     if shutdown {
                         available.store(0, Ordering::Release);
                         if timeout(IO_TIMEOUT, child.process.wait()).await.is_err() { child.reap().await; }
@@ -562,14 +609,21 @@ async fn run(
     events: mpsc::Sender<AudioSupervisorEvent>,
     available: Arc<AtomicU64>,
     started: oneshot::Sender<Result<()>>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut first = Some(started);
     let mut generation = 1u64;
     let mut restarts = VecDeque::<Instant>::new();
     loop {
-        let mut child = match launch(&config, generation).await {
+        if *shutdown.borrow() || commands.is_closed() || events.is_closed() {
+            return;
+        }
+        let mut child = match launch(&config, generation, &mut shutdown).await {
             Ok(child) => child,
             Err(error) => {
+                if *shutdown.borrow() {
+                    return;
+                }
                 if let Some(first) = first.take() {
                     let _ = first.send(Err(error));
                     return;
@@ -601,7 +655,7 @@ async fn run(
                     return;
                 };
                 generation = next_generation;
-                if !backoff(&mut commands, &events, restarts.len()).await {
+                if !backoff(&mut commands, &events, restarts.len(), &mut shutdown).await {
                     return;
                 }
                 continue;
@@ -629,16 +683,20 @@ async fn run(
             }
         }
         let mut sessions = BTreeSet::new();
-        let outcome = serve(
-            &mut child,
-            generation,
-            &mut commands,
-            &events,
-            &available,
-            &mut sessions,
-        )
-        .await;
+        let outcome = tokio::select! {
+            biased;
+            _ = shutdown_requested(&mut shutdown) => Ok(()),
+            outcome = serve(&mut child, generation, &mut commands, &events, &available, &mut sessions) => outcome,
+        };
         available.store(0, Ordering::Release);
+        if outcome.is_ok() {
+            let _ = timeout(
+                Duration::from_millis(250),
+                child.link.send(u64::MAX, Msg::Shutdown(w::Shutdown {})),
+            )
+            .await;
+            let _ = timeout(IO_TIMEOUT, child.process.wait()).await;
+        }
         child.reap().await;
         while let Ok(command) = commands.try_recv() {
             let _ = command.reply.send(Err(AudioSupervisorError::Unavailable));
@@ -682,20 +740,34 @@ async fn run(
             return;
         };
         generation = next_generation;
-        if !backoff(&mut commands, &events, restarts.len()).await {
+        if !backoff(&mut commands, &events, restarts.len(), &mut shutdown).await {
             return;
         }
     }
 }
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn backoff(
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<AudioSupervisorEvent>,
     attempt: usize,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
     let delay = tokio::time::sleep(Duration::from_secs(1 << (attempt - 1)));
     tokio::pin!(delay);
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown_requested(shutdown) => return false,
             _ = &mut delay => return true,
             _ = events.closed() => return false,
             command = commands.recv() => match command {
@@ -816,6 +888,7 @@ mod tests {
             }),
             local_scope_id: 0,
             peer_scope_id: 0,
+            initial_authorization_ms: 1000,
         }
     }
 
@@ -861,6 +934,8 @@ mod tests {
         let handle = AudioHandle {
             commands,
             generation: Arc::new(AtomicU64::new(1)),
+            shutdown: watch::channel(false).0,
+            stopped: watch::channel(true).1,
         };
         let mut invalid = start(1, 40001, 40002);
         invalid.forward.as_mut().unwrap().key.push(0);
@@ -874,26 +949,71 @@ mod tests {
             Err(AudioSupervisorError::InvalidFrame)
         );
         assert!(rx.try_recv().is_err());
+        for ttl_ms in [0, 1001] {
+            assert_eq!(
+                handle.renew_session([1; 16], ttl_ms).await,
+                Err(AudioSupervisorError::InvalidFrame)
+            );
+            let mut invalid = start(1, 40001, 40002);
+            invalid.initial_authorization_ms = ttl_ms;
+            assert_eq!(
+                handle.start_session(invalid).await,
+                Err(AudioSupervisorError::InvalidFrame)
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn renew_accepts_boundary_ttls_and_acknowledges_only_writes() {
+        let (commands, mut rx) = mpsc::channel(1);
+        let handle = AudioHandle {
+            commands,
+            generation: Arc::new(AtomicU64::new(7)),
+            shutdown: watch::channel(false).0,
+            stopped: watch::channel(true).1,
+        };
+        for ttl_ms in [1, 1000] {
+            let (result, ()) = tokio::join!(handle.renew_session([3; 16], ttl_ms), async {
+                let command = rx.recv().await.expect("explicit renewal");
+                assert_eq!(command.generation, 7);
+                assert!(
+                    matches!(command.message, Msg::RenewSession(renew) if renew.session_id == vec![3; 16] && renew.ttl_ms == ttl_ms)
+                );
+                assert!(command.reply.send(Ok(Reply::Written(42))).is_ok());
+            });
+            assert_eq!(result, Ok(42));
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
     async fn backoff_rejects_queued_previous_generation() {
         let (tx, mut rx) = mpsc::channel(1);
         let (events, _events_rx) = mpsc::channel(1);
-        let (reply, response) = oneshot::channel();
-        tx.send(Command {
-            generation: 1,
-            message: Msg::StartSession(start(1, 40001, 40002)),
-            reply,
-        })
-        .await
-        .unwrap_or_else(|_| panic!("command queue"));
-        assert!(backoff(&mut rx, &events, 1).await);
-        assert!(matches!(
-            response.await.unwrap(),
-            Err(AudioSupervisorError::Unavailable)
-        ));
-        assert!(rx.try_recv().is_err());
+        let (_shutdown, mut shutdown) = watch::channel(false);
+        for message in [
+            Msg::StartSession(start(1, 40001, 40002)),
+            Msg::RenewSession(w::RenewSession {
+                session_id: vec![13; 16],
+                ttl_ms: 1000,
+            }),
+        ] {
+            let (reply, response) = oneshot::channel();
+            tx.send(Command {
+                generation: 1,
+                message,
+                reply,
+            })
+            .await
+            .unwrap_or_else(|_| panic!("command queue"));
+            assert!(backoff(&mut rx, &events, 1, &mut shutdown).await);
+            assert!(matches!(
+                response.await.unwrap(),
+                Err(AudioSupervisorError::Unavailable)
+            ));
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -923,9 +1043,14 @@ mod tests {
         source.start_session(start(1, a, b)).await.unwrap();
         let mut sending = false;
         let mut receiving = false;
+        let mut renew = tokio::time::interval(Duration::from_millis(100));
         timeout(Duration::from_secs(10), async {
             while !sending || !receiving {
                 tokio::select! {
+                    _ = renew.tick() => {
+                        source.renew_session([13; 16], 1000).await.unwrap();
+                        listener.renew_session([13; 16], 1000).await.unwrap();
+                    },
                     event = source_events.recv() => match event.expect("source events") {
                         AudioSupervisorEvent::Health { health, .. } => sending |= health.sessions.iter().any(|session| session.sending == Some(true) && session.capture_active == Some(true) && session.sent_media_packets > 0),
                         AudioSupervisorEvent::Failed { reason, .. } => panic!("source failed: {reason}"),
@@ -942,6 +1067,29 @@ mod tests {
             }
         }).await.expect("real Dry media sending and receiving");
         listener.set_gain([13; 16], 75, false).await.unwrap();
+        listener.stop_session([13; 16]).await.unwrap();
+        loop {
+            if let AudioSupervisorEvent::SessionEvent { event, .. } =
+                next(&mut listener_events).await
+            {
+                if event.kind == 5 {
+                    assert_eq!(event.reason, 1);
+                    break;
+                }
+            }
+        }
+        let stopped_renewal = listener.renew_session([13; 16], 1000).await.unwrap();
+        loop {
+            if let AudioSupervisorEvent::CommandRejected {
+                request_id, error, ..
+            } = next(&mut listener_events).await
+            {
+                assert_eq!(request_id, stopped_renewal);
+                assert_eq!(error.code, 6);
+                assert_eq!(error.session_id, vec![13; 16]);
+                break;
+            }
+        }
         #[cfg(unix)]
         assert!(std::process::Command::new("kill")
             .arg("-KILL")
@@ -1006,7 +1154,18 @@ mod tests {
                 break;
             }
         }
-        listener.stop_session([13; 16]).await.unwrap();
+        let rejected = source.renew_session([13; 16], 1000).await.unwrap();
+        loop {
+            if let AudioSupervisorEvent::CommandRejected {
+                request_id, error, ..
+            } = next(&mut source_events).await
+            {
+                assert_eq!(request_id, rejected);
+                assert_eq!(error.code, 6);
+                assert_eq!(error.session_id, vec![13; 16]);
+                break;
+            }
+        }
         source.shutdown().await.unwrap();
         listener.shutdown().await.unwrap();
         #[cfg(target_os = "linux")]
@@ -1067,5 +1226,70 @@ mod tests {
             w::BackendKind::Native,
             w::BackendKind::Native as i32
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_has_reserved_admission_without_a_live_generation() {
+        let (commands, mut queue) = mpsc::channel(1);
+        let (reply, _response) = oneshot::channel();
+        commands
+            .try_send(Command {
+                generation: 1,
+                message: Msg::ProbeBackend(w::ProbeBackend {}),
+                reply,
+            })
+            .unwrap_or_else(|_| panic!("fixture queue"));
+        let (shutdown, mut requested) = watch::channel(false);
+        let (finished, stopped) = watch::channel(false);
+        let handle = AudioHandle {
+            commands,
+            generation: Arc::new(AtomicU64::new(0)),
+            shutdown,
+            stopped,
+        };
+        let (result, ()) = tokio::join!(handle.shutdown(), async {
+            shutdown_requested(&mut requested).await;
+            assert_eq!(queue.len(), 1, "shutdown bypasses the saturated data queue");
+            assert!(queue.try_recv().is_ok());
+            finished.send_replace(true);
+        });
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn real_child_shutdown_during_backoff_prevents_restart() {
+        let root = Root::new();
+        let (handle, mut events) = AudioSupervisor::start(root.config("shutdown-backoff"))
+            .await
+            .unwrap();
+        let (_, pid) = ready(&mut events).await;
+        #[cfg(unix)]
+        assert!(std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success());
+        #[cfg(windows)]
+        assert!(std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        loop {
+            if let AudioSupervisorEvent::ChildExited { restartable, .. } = next(&mut events).await {
+                assert!(restartable);
+                break;
+            }
+        }
+        handle.shutdown().await.unwrap();
+        while let Some(event) = events.recv().await {
+            assert!(
+                !matches!(event, AudioSupervisorEvent::Ready { .. }),
+                "shutdown must not restart a child"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 }
