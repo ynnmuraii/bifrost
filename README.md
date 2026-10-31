@@ -107,7 +107,7 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 
 One headset on a single **Listener**, system sound from up to three authorized **Sources**. **Mix All** plays them together; **Follow Focus** makes the focused computer primary and quietens the others. Audio is off by default.
 The popup mini-player shows now-playing information and media buttons where the player supports them, plus local per-source volume/mute. Each Source separately permits its Listener's media commands; this is off by default.
-Optional system-wide mic mute/PTT controls the Listener's physical microphone, affecting all apps using it. Enable it separately on both computers and grant each controlling Source permission on the Listener; microphone control is off by default, and no microphone audio is streamed.
+Optional system-wide mic mute/PTT controls the Listener's physical microphone, affecting all apps using it. Enable it separately on both computers and grant each controlling Source permission on the Listener; microphone control is off by default, and no microphone audio is streamed. Windows native PTT starts unarmed: press and release the configured PTT key once, then press again to talk; GUI hold-to-talk does not require native arming.
 
 1. Use the same audio-capable build on both computers, pair them, and keep both cores running.
 2. On the headset computer, open **Audio settings → Use this computer as the listener**, choose its output, apply, then enable audio.
@@ -121,7 +121,7 @@ Optional system-wide mic mute/PTT controls the Listener's physical microphone, a
 | --- | --- |
 | Windows 11 | WASAPI process-loopback excludes the audio worker's own process tree; native media/mic/PTT controls where available. |
 | Linux | Local PipeWire/PulseAudio monitor capture/playback, without process exclusion; MPRIS media sessions; mic-mute ownership is best-effort. |
-| Wayland global PTT | Requires a compatible KDE/GNOME GlobalShortcuts portal with press/release events; unavailable when the portal is missing, including GNOME 46. |
+| Wayland global PTT | Requires trusted elapsed-ms portal clocks and events no older than 250 ms; current KDE zero timestamps and incompatible Hyprland clocks are unavailable. Use GUI hold-to-talk. |
 | X11 PTT | No native global PTT; focused GUI PTT remains available without a global hotkey. |
 
 - **Latency:** device buffers affect delay; Wi-Fi uses more buffering and Bluetooth can add substantial latency. Prefer a wired LAN when delay matters.
@@ -134,8 +134,8 @@ Optional system-wide mic mute/PTT controls the Listener's physical microphone, a
 | --- | --- | --- |
 | Windows 11 | Capture and receive input | WASAPI system audio; process-tree exclusion and native media/mic/PTT controls where available |
 | Linux X11 | Capture and receive input | Pulse-compatible monitor audio/MPRIS; focused GUI PTT, not native global X11 PTT |
-| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible audio/MPRIS; global PTT requires a compatible GlobalShortcuts portal |
-| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible audio/MPRIS; global PTT only where the portal exists, not GNOME 46 |
+| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible audio/MPRIS; current zero portal timestamps cannot prove native PTT freshness; GUI hold-to-talk remains available |
+| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible audio/MPRIS; native PTT requires a present portal with verifiable fresh timestamps, not GNOME 46 |
 | wlroots-based Wayland desktops | Not supported | Not a supported Bifrost desktop |
 | macOS | Not supported | Not supported |
 
@@ -147,8 +147,8 @@ Optional system-wide mic mute/PTT controls the Listener's physical microphone, a
 - The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
 - Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
 - Shared audio is off by default and requires explicit permissions on both computers; pairing does not grant audio consent. A Source selects one Listener.
-- Linux monitor capture cannot exclude individual applications. Microphone streaming, virtual-microphone routing and dependent target UX are deferred; native global X11 PTT is unsupported.
-- Endpoint mute affects every app using that microphone. Linux mute restoration has best-effort ownership, not an atomic guarantee against other mute writers; Linux global PTT needs a compatible Wayland portal with both press and release events.
+- Linux monitor capture cannot exclude individual applications. Native portal PTT fails closed on unverifiable clocks or conservative event age over 250 ms, including delayed first events; use GUI hold-to-talk. Microphone streaming, virtual-microphone routing and dependent target UX are deferred; native global X11 PTT is unsupported.
+- Endpoint mute affects every app using that microphone. Linux mute restoration has best-effort ownership, not an atomic guarantee against other mute writers; native portal PTT additionally requires the verifiable clocks described above.
 - Audio includes driver/device buffering and is not a hard-realtime or studio-monitoring link. Wi-Fi and Bluetooth can add delay; there is no AEC, so headphones are recommended.
 
 ## Build from source
