@@ -102,6 +102,7 @@ pub enum Key {
     AudioSelectReceiver,
     AudioSharingStopped,
     AudioSharingRequested,
+    AudioSwitchingReceiver,
     AudioReceivingReady,
     AudioPermissionDefault,
     AudioPermissionDeny,
@@ -1081,6 +1082,7 @@ const fn ru(key: Key) -> &'static str {
         Key::AudioSelectReceiver => "Выберите доверенный приёмник, затем включите передачу.",
         Key::AudioSharingStopped => "Передача выключена. Включите её, когда будете готовы.",
         Key::AudioSharingRequested => "Подключаем системный звук. Передача ещё не началась.",
+        Key::AudioSwitchingReceiver => "Переключаем приёмник…",
         Key::AudioReceivingReady => "Приём разрешён. Ожидаем звук от источника.",
         Key::AudioPermissionDefault => "По общему разрешению",
         Key::AudioPermissionDeny => "Запретить",
@@ -1713,6 +1715,7 @@ const fn en(key: Key) -> &'static str {
         Key::AudioSelectReceiver => "Choose a trusted receiver, then turn sharing on.",
         Key::AudioSharingStopped => "Sharing is off. Turn it on when you are ready.",
         Key::AudioSharingRequested => "Connecting system audio. Sharing has not started yet.",
+        Key::AudioSwitchingReceiver => "Switching receiver…",
         Key::AudioReceivingReady => "Receiving is allowed. Waiting for sound from a source.",
         Key::AudioPermissionDefault => "Use shared consent",
         Key::AudioPermissionDeny => "Deny",
@@ -2540,7 +2543,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 574] = [
+    pub const EVERY: [Key; 575] = [
         Key::AudioHide,
         Key::AudioPlayer,
         Key::AudioSettings,
@@ -2553,6 +2556,7 @@ mod tests {
         Key::AudioSelectReceiver,
         Key::AudioSharingStopped,
         Key::AudioSharingRequested,
+        Key::AudioSwitchingReceiver,
         Key::AudioReceivingReady,
         Key::AudioPermissionDefault,
         Key::AudioPermissionDeny,

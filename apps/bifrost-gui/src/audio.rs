@@ -22,6 +22,7 @@ pub enum AudioAction {
     Refresh,
     Share(bool),
     Receive(bool),
+    Retarget([u8; 32]),
     ListDevices(ipc::AudioDeviceKind),
     StopSystemAudio,
     SetMicrophoneMute(bool),
@@ -42,6 +43,8 @@ pub struct AudioView {
     pending_revision: Option<u64>,
     pending_since: Option<Instant>,
     pending_snapshot_id: Option<u64>,
+    pending_target: Option<[u8; 32]>,
+    pub retargeting: bool,
     /// Pending switch intent, not an indication of active capture or playback.
     pub system_intent: Option<(ipc::AudioRole, bool)>,
     device_requests: Vec<(u64, i32)>,
@@ -63,6 +66,8 @@ impl Default for AudioView {
             pending_revision: None,
             pending_since: None,
             pending_snapshot_id: None,
+            pending_target: None,
+            retargeting: false,
             system_intent: None,
             device_requests: Vec::new(),
             dirty: false,
@@ -100,6 +105,8 @@ impl AudioView {
         self.pending_revision = None;
         self.pending_since = None;
         self.pending_snapshot_id = None;
+        self.pending_target = None;
+        self.retargeting = false;
         self.system_intent = None;
     }
     fn fail(&mut self, lang: Lang, key: Key) {
@@ -250,7 +257,15 @@ impl ViewModel {
             self.audio_player.replace_cards(Vec::new(), false);
             return;
         };
-        if !self.audio.dirty || self.audio.pending {
+        let target_observed = self.audio.pending_target.as_ref().is_none_or(|target| {
+            status
+                .config
+                .as_ref()
+                .is_some_and(|config| config.listener_node_id.as_slice() == target)
+        });
+        if (!self.audio.dirty || self.audio.pending)
+            && (self.audio.system_intent.is_none() || correlated_snapshot && target_observed)
+        {
             if let Some(config) = status.config.as_ref() {
                 self.audio.draft = config.clone();
             }
@@ -264,7 +279,7 @@ impl ViewModel {
         let settles_request = if self.audio.system_intent.is_some() {
             // A push can predate this request even with a newer status revision.
             // Only the read requested after this mutation's persistence ACK settles it.
-            correlated_snapshot && intent_observed
+            correlated_snapshot && target_observed && intent_observed
         } else {
             self.audio
                 .pending_revision
@@ -288,6 +303,9 @@ impl ViewModel {
             });
         self.audio_player.replace_cards(cards, observed_active);
         self.audio.status = Some(status);
+        if correlated_snapshot && !self.audio.pending {
+            self.audio.pending_snapshot_id = None;
+        }
     }
     pub(crate) fn refresh_audio_peer_names(&mut self) {
         let Some(audio) = &self.audio.status else {
@@ -306,6 +324,12 @@ impl ViewModel {
                 card.source_name = peer_name(members, &session.peer);
             }
         }
+    }
+    fn request_audio_reconciliation(&mut self) {
+        let id = self.begin_request(Request::Audio(AudioRequest::Snapshot), Instant::now());
+        self.audio.pending_snapshot_id = Some(id);
+        self.outgoing
+            .push((id, Msg::GetAudioStatus(ipc::GetAudioStatus {})));
     }
     pub fn audio_result(&mut self, id: u64, kind: AudioRequest, result: ipc::OpResult) {
         if kind == AudioRequest::Devices {
@@ -326,6 +350,8 @@ impl ViewModel {
             return;
         }
         if !result.ok {
+            let system_request =
+                kind == AudioRequest::Mutation && self.audio.system_intent.is_some();
             let key = if self.audio.system_intent.is_some() {
                 system_error_key(&result.error_code)
             } else {
@@ -336,16 +362,16 @@ impl ViewModel {
                 self.audio.available = false;
                 self.audio_player.replace_cards(Vec::new(), false);
             }
+            if system_request {
+                self.request_audio_reconciliation();
+            }
             return;
         }
         // ACK means persisted intent, not active audio. Correlate a fresh read so an
         // earlier queued failure cannot retire a newer switch or hide its OFF action.
         if kind == AudioRequest::Mutation {
             if self.audio.system_intent.is_some() {
-                let id = self.begin_request(Request::Audio(AudioRequest::Snapshot), Instant::now());
-                self.audio.pending_snapshot_id = Some(id);
-                self.outgoing
-                    .push((id, Msg::GetAudioStatus(ipc::GetAudioStatus {})));
+                self.request_audio_reconciliation();
             } else {
                 self.request_audio_status(Instant::now());
             }
@@ -459,6 +485,17 @@ impl ViewModel {
                     expected_revision: revision,
                 })
             }
+            AudioAction::Retarget(target) => {
+                if !self.audio.sharing_requested(ipc::AudioRole::Source) {
+                    return;
+                }
+                Msg::SetSystemAudioSharing(ipc::SetSystemAudioSharing {
+                    enabled: true,
+                    role: ipc::AudioRole::Source as i32,
+                    listener_node_id: target.to_vec(),
+                    expected_revision: revision,
+                })
+            }
             AudioAction::ApplyConfig => {
                 if ::ipc::audio::validate_config(&self.audio.draft).is_err() {
                     self.audio.error =
@@ -514,7 +551,10 @@ impl ViewModel {
         let auxiliary = self.audio.system_intent.is_some()
             && !matches!(
                 action,
-                AudioAction::Share(_) | AudioAction::Receive(_) | AudioAction::StopSystemAudio
+                AudioAction::Share(_)
+                    | AudioAction::Receive(_)
+                    | AudioAction::Retarget(_)
+                    | AudioAction::StopSystemAudio
             );
         let kind = if auxiliary {
             AudioRequest::AuxiliaryMutation
@@ -523,6 +563,11 @@ impl ViewModel {
         };
         let id = self.begin_request(Request::Audio(kind), now);
         match action {
+            AudioAction::Retarget(target) => {
+                self.audio.system_intent = Some((ipc::AudioRole::Source, true));
+                self.audio.draft.listener_node_id.clear();
+                self.audio.draft.listener_node_id.extend_from_slice(target);
+            }
             AudioAction::Share(enabled) => {
                 self.audio.system_intent = Some((ipc::AudioRole::Source, *enabled));
             }
@@ -551,6 +596,14 @@ impl ViewModel {
         self.audio.pending = true;
         self.audio.pending_id = Some(id);
         self.audio.pending_snapshot_id = None;
+        self.audio.retargeting = matches!(action, AudioAction::Retarget(_));
+        self.audio.pending_target = match action {
+            AudioAction::Retarget(target) => Some(*target),
+            AudioAction::Share(true) => {
+                self.audio.draft.listener_node_id.as_slice().try_into().ok()
+            }
+            _ => None,
+        };
         self.audio.pending_revision = Some(revision);
         self.audio.pending_since = Some(now);
         self.audio.error = None;

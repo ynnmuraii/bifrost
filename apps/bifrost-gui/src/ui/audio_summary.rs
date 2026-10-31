@@ -32,14 +32,26 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
             if let Some(error) = vm.audio.error_message(lang) {
                 widgets::wrapped(ui, error, 13.0, super::theme::fam::sans(), pal.accent_ink);
             }
-            let source_connecting = vm.audio.sharing_requested(AudioRole::Source)
+            let source_connecting = !vm.audio.retargeting
+                && vm.audio.sharing_requested(AudioRole::Source)
                 && vm
                     .audio
                     .status
                     .as_ref()
                     .is_some_and(|status| status.sessions.is_empty());
             if vm.audio.pending && !source_connecting {
-                widgets::hint(ui, pal, text(lang, Key::AudioPending));
+                widgets::hint(
+                    ui,
+                    pal,
+                    text(
+                        lang,
+                        if vm.audio.retargeting {
+                            Key::AudioSwitchingReceiver
+                        } else {
+                            Key::AudioPending
+                        },
+                    ),
+                );
             }
             let Some(status) = &vm.audio.status else {
                 widgets::hint(

@@ -41,11 +41,23 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
         receive_control(ui, pal, vm, editable, actions);
     }
     ui.add_space(12.0);
+    let previous_target = config.listener_node_id.as_slice().try_into().ok();
     ui.add_enabled_ui(editable, |ui| {
         setting(ui, pal, text(lang, Key::AudioListenerTarget), |ui| {
             peer_selector(ui, vm, "audio-listener", &mut config.listener_node_id);
         });
     });
+    if editable && audio.sharing_requested(AudioRole::Source) {
+        if let Ok(target) = config.listener_node_id.as_slice().try_into() {
+            if previous_target != Some(target) {
+                actions.push(Action::Audio(AudioAction::Retarget(target)));
+            }
+        } else {
+            config
+                .listener_node_id
+                .clone_from(&audio.draft.listener_node_id);
+        }
+    }
     let connected = vm.connection.is_connected();
     let mut share = audio.sharing_requested(AudioRole::Source);
     let can_share = if share {
