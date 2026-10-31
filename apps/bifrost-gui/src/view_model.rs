@@ -4255,6 +4255,7 @@ fn message_name(msg: &Msg) -> &'static str {
     match msg {
         Msg::GetAudioStatus(_) => "GetAudioStatus",
         Msg::SetAudio(_) => "SetAudio",
+        Msg::SetSystemAudioSharing(_) => "SetSystemAudioSharing",
         Msg::StartAudio(_) => "StartAudio",
         Msg::StopAudio(_) => "StopAudio",
         Msg::SetMicrophoneMute(_) => "SetMicrophoneMute",
