@@ -106,14 +106,19 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 ## Shared audio
 
 One headset on a single **Listener**, system sound from up to three authorized **Sources**. **Mix All** plays them together; **Follow Focus** makes the focused computer primary and quietens the others. Audio is off by default.
-The popup mini-player shows now-playing information and media buttons where the player supports them, plus local per-source volume/mute. Each Source separately permits its Listener's media commands; this is off by default.
+The independent, always-on-top mini-player shows now-playing information where the Source's player supports it, plus local per-source volume/mute. It opens automatically after an observed running stream; an empty player has only a close action, not playback controls. Each Source separately permits its Listener's media commands; sharing system audio does not enable them.
 Optional system-wide mic mute/PTT controls the Listener's physical microphone, affecting all apps using it. Enable it separately on both computers and grant each controlling Source permission on the Listener; microphone control is off by default, and no microphone audio is streamed. Windows native PTT starts unarmed: press and release the configured PTT key once, then press again to talk; GUI hold-to-talk does not require native arming.
 **Release all PTT** is an emergency release of every GUI/hotkey talk grant on that Listener. Held hotkeys must be released before pressing again. In PTT mode this returns to muted idle; an independently, explicitly unmuted microphone stays unmuted—use **Mute microphone** to close it.
 
 1. Use the same audio-capable build on both computers, pair them, and keep both cores running.
-2. On the headset computer, open **Audio settings → Use this computer as the listener**, choose its output, apply, then enable audio.
-3. On each Source, select the **Trusted Listener**, apply while sharing is disabled, wait for group confirmation, then enable audio.
-4. Allow sending on the Source and receiving on the Listener, apply, then **Start system audio** from the Source.
+2. On the headset computer, open **Audio settings** and turn on **Receive system audio**.
+3. On each Source, choose the trusted headset computer under **Destination**, then turn on **Share system audio**. This saves the sharing intent and starts connecting; the group is automatic.
+
+No separate **Apply**, **Start**, manual group ID or per-computer system-audio grant is needed for this path. The default configuration selects system devices; change devices, mixing, profiles or explicit per-computer denies in **Advanced** when needed. An explicit deny takes priority over shared consent. Microphone/PTT and media-control permissions remain separate and are not enabled by either system-audio switch.
+
+Turning sharing or receiving **off** cancels a pending start and withdraws system-audio consent without changing microphone/PTT or media-control settings. **Stop system audio** has the same system-only scope; a mini-player card's stop action stops just that stream.
+
+**Connecting** or an accepted setting is not proof that sound is flowing. Status distinguishes the request from an observed running stream and shows startup failures with guidance in the audio panel. With **Resume system audio after reconnect** off (`audio.resume_system_audio = false`), restarting a Source leaves sharing stopped even if its saved consent is still on; turn **Share system audio** on again to start it. Enabling sharing does not silently change the resume preference.
 
 **Firewall:** TCP 47901 must be reachable in at least one direction. Audio uses the configured UDP media port (default 47903); allow it between trusted LAN peers if path validation fails. Some stateful LAN firewalls need no extra rule, but this is not guaranteed. Bifrost adds no rules and does not bypass Windows Firewall, VPN or AP/client isolation.
 **Privacy:** pairing alone grants no audio permission. Bilateral consent gates capture and playback; ChaCha20-Poly1305 session keys come from the pinned mutual-TLS link. Now-playing metadata is shared only within active consented sessions; metadata, audio payloads and session keys are never logged or persisted.
