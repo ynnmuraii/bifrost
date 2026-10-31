@@ -4,6 +4,9 @@
 //! explicitly restart with the original selection (or re-resolve FollowDefault).
 use crate::{
     common::{Apartment, Event, ProAudio},
+    render_config::{
+        initialize_legacy_render, initialize_shared_render, RenderConfiguration, SAFE_PERIOD_FRAMES,
+    },
     Error,
 };
 use rtrb::{Consumer, Producer};
@@ -66,6 +69,14 @@ pub struct StreamSnapshot {
     pub transferred_frames: u64,
     pub dropped_capture_frames: u64,
     pub underrun_frames: u64,
+    /// Zero padding on render event wakes after prefill, including single-period buffers.
+    /// This is an observed queue condition, not an OS-reported audio glitch.
+    pub render_padding_zero_events: u64,
+    /// Subset of zero-padding events when the configured queue holds two full periods.
+    /// Only in that case should one period normally remain at an on-time wake.
+    pub engine_starvation_events: u64,
+    /// None for capture; render negotiation is immutable for the stream lifetime.
+    pub render_configuration: Option<RenderConfiguration>,
     /// Render clock units and frequency (not necessarily audio sample frames).
     pub device_position: u64,
     pub clock_frequency: u64,
@@ -80,6 +91,8 @@ struct State {
     frames: AtomicU64,
     dropped: AtomicU64,
     underruns: AtomicU64,
+    padding_zero: AtomicU64,
+    starvations: AtomicU64,
     position: AtomicU64,
     frequency: AtomicU64,
     qpc: AtomicU64,
@@ -90,6 +103,7 @@ struct State {
 pub struct StreamHandle {
     state: Arc<State>,
     worker: Option<JoinHandle<()>>,
+    render_configuration: Option<RenderConfiguration>,
 }
 impl StreamHandle {
     pub fn snapshot(&self) -> StreamSnapshot {
@@ -119,6 +133,9 @@ impl StreamHandle {
             transferred_frames: self.state.frames.load(Ordering::Relaxed),
             dropped_capture_frames: self.state.dropped.load(Ordering::Relaxed),
             underrun_frames: self.state.underruns.load(Ordering::Relaxed),
+            render_padding_zero_events: self.state.padding_zero.load(Ordering::Relaxed),
+            engine_starvation_events: self.state.starvations.load(Ordering::Relaxed),
+            render_configuration: self.render_configuration,
             device_position: position,
             clock_frequency: frequency,
             qpc_100ns: qpc,
@@ -178,16 +195,19 @@ fn attach_event(client: &IAudioClient) -> Result<Event, Error> {
 }
 fn start_worker<F>(run: F) -> Result<StreamHandle, Error>
 where
-    F: FnOnce(Arc<State>, mpsc::SyncSender<Result<(), Error>>) + Send + 'static,
+    F: FnOnce(Arc<State>, mpsc::SyncSender<Result<Option<RenderConfiguration>, Error>>)
+        + Send
+        + 'static,
 {
     let state = Arc::new(State::default());
     let shared = state.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || run(shared, tx));
     match rx.recv() {
-        Ok(Ok(())) => Ok(StreamHandle {
+        Ok(Ok(render_configuration)) => Ok(StreamHandle {
             state,
             worker: Some(worker),
+            render_configuration,
         }),
         Ok(Err(error)) => {
             let _ = worker.join();
@@ -331,7 +351,7 @@ fn start_capture(target: CaptureTarget, mut sink: CaptureSink) -> Result<StreamH
             let _ = ready.send(Err(e.into()));
             return;
         }
-        let _ = ready.send(Ok(()));
+        let _ = ready.send(Ok(None));
         let result = capture_loop(&state, &capture, &event, &mut sink);
         let _ = unsafe { raw.Stop() };
         finish(&state, result);
@@ -521,21 +541,49 @@ fn capture_loop(
 }
 /// Shared-mode engine conversion accepts 48 kHz f32 stereo even on another native mix.
 /// Explicit IDs are never silently replaced. DeviceInvalidated requires a caller-driven rebuild.
+/// Prefer IAudioClient3 with a >=5 ms period; unsupported configurations use legacy shared mode.
+/// Both paths queue at most two engine periods, irrespective of the WASAPI buffer allocation.
 pub fn start_render(
     selection: EndpointSelection,
     source: Consumer<StereoFrame>,
 ) -> Result<StreamHandle, Error> {
-    start_render_source(selection, RenderSource::Ring(source))
+    start_render_source(
+        selection,
+        RenderSource::Ring(source),
+        Some(SAFE_PERIOD_FRAMES),
+    )
 }
 pub(crate) fn start_render_callback(
     selection: EndpointSelection,
     callback: audio_backend::RenderCallback,
 ) -> Result<StreamHandle, Error> {
-    start_render_source(selection, RenderSource::Callback(callback))
+    start_render_source(
+        selection,
+        RenderSource::Callback(callback),
+        Some(SAFE_PERIOD_FRAMES),
+    )
+}
+/// Diagnostic candidate floor only; does not change production policy or endpoint settings.
+#[doc(hidden)]
+pub fn start_render_for_probe(
+    selection: EndpointSelection,
+    source: Consumer<StereoFrame>,
+    floor_frames: u32,
+) -> Result<StreamHandle, Error> {
+    start_render_source(selection, RenderSource::Ring(source), Some(floor_frames))
+}
+/// Diagnostic comparison using legacy shared initialization and the same two-period bound.
+#[doc(hidden)]
+pub fn start_legacy_render_for_probe(
+    selection: EndpointSelection,
+    source: Consumer<StereoFrame>,
+) -> Result<StreamHandle, Error> {
+    start_render_source(selection, RenderSource::Ring(source), None)
 }
 fn start_render_source(
     selection: EndpointSelection,
     mut source: RenderSource,
+    floor_frames: Option<u32>,
 ) -> Result<StreamHandle, Error> {
     start_worker(move |state, ready| {
         let setup = || -> Result<_, Error> {
@@ -546,28 +594,18 @@ fn start_render_source(
                     .get_default_device_for_role(&Direction::Render, &wasapi::Role::Multimedia)?,
                 EndpointSelection::Id(id) => enumerator.get_device(id)?,
             };
-            let mut client = device.get_iaudioclient()?;
-            client.initialize_client(
-                &format(),
-                &Direction::Render,
-                &StreamMode::EventsShared {
-                    autoconvert: true,
-                    buffer_duration_hns: 0,
-                },
-            )?;
-            let raw = client.as_iaudioclient().clone();
+            let (raw, config) = match floor_frames {
+                Some(floor) => initialize_shared_render(&device, floor)?,
+                None => initialize_legacy_render(&device, None)?,
+            };
             let event = attach_event(&raw)?;
             let render: IAudioRenderClient = unsafe { raw.GetService()? };
             let clock: IAudioClock = unsafe { raw.GetService()? };
-            let capacity = unsafe { raw.GetBufferSize()? };
-            if capacity == 0 || capacity > SAMPLE_RATE {
-                return Err(Error::Unsupported("render buffer outside one-second bound"));
-            }
             let frequency = unsafe { clock.GetFrequency()? };
             state.frequency.store(frequency, Ordering::SeqCst);
-            Ok((apartment, client, raw, event, render, clock, capacity))
+            Ok((apartment, raw, event, render, clock, config))
         };
-        let (_apartment, _client, raw, event, render, clock, capacity) = match setup() {
+        let (_apartment, raw, event, render, clock, config) = match setup() {
             Ok(v) => v,
             Err(e) => {
                 let _ = ready.send(Err(e));
@@ -575,12 +613,15 @@ fn start_render_source(
             }
         };
         let _priority = ProAudio::enter();
-        if let Err(e) = unsafe { raw.Start() } {
+        // Prime before Start so the first signalled wake has the same queue invariant.
+        if let Err(e) = render_frames(&state, &render, config.queue_limit_frames, &mut source)
+            .and_then(|()| unsafe { raw.Start() })
+        {
             let _ = ready.send(Err(e.into()));
             return;
         }
-        let _ = ready.send(Ok(()));
-        let result = render_loop(&state, &raw, &event, &render, &clock, capacity, &mut source);
+        let _ = ready.send(Ok(Some(config)));
+        let result = render_loop(&state, &raw, &event, &render, &clock, config, &mut source);
         let _ = unsafe { raw.Stop() };
         finish(&state, result);
     })
@@ -591,7 +632,7 @@ fn render_loop(
     event: &Event,
     render: &IAudioRenderClient,
     clock: &IAudioClock,
-    capacity: u32,
+    config: RenderConfiguration,
     source: &mut RenderSource,
 ) -> windows::core::Result<()> {
     while !state.stop.load(Ordering::Acquire) {
@@ -603,51 +644,16 @@ fn render_loop(
         if wait != WAIT_OBJECT_0 {
             return Err(windows::core::Error::from_thread());
         }
-        let available = capacity.saturating_sub(unsafe { raw.GetCurrentPadding()? });
+        let padding = unsafe { raw.GetCurrentPadding()? };
+        if padding == 0 {
+            state.padding_zero.fetch_add(1, Ordering::Relaxed);
+            if config.queue_limit_frames >= config.period_frames.saturating_mul(2) {
+                state.starvations.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let available = config.queue_limit_frames.saturating_sub(padding);
         if available != 0 {
-            let pointer = unsafe { render.GetBuffer(available)? };
-            if pointer.is_null() {
-                let _ =
-                    unsafe { render.ReleaseBuffer(available, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) };
-                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
-                    0x80004003u32 as i32,
-                )));
-            }
-            let packet = RenderPacket {
-                client: render,
-                frames: Some(available),
-            };
-            let mut missing = 0;
-            match source {
-                RenderSource::Callback(callback) => {
-                    let samples = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            pointer.cast::<f32>(),
-                            available as usize * 2,
-                        )
-                    };
-                    samples.fill(0.0);
-                    callback(samples);
-                }
-                RenderSource::Ring(source) => {
-                    for index in 0..available {
-                        let frame = source.pop().unwrap_or_else(|_| {
-                            missing += 1;
-                            [0.0; 2]
-                        });
-                        unsafe {
-                            let p = pointer.cast::<f32>().add(index as usize * 2);
-                            p.write_unaligned(frame[0]);
-                            p.add(1).write_unaligned(frame[1]);
-                        }
-                    }
-                }
-            }
-            packet.release()?;
-            state
-                .frames
-                .fetch_add(u64::from(available), Ordering::Relaxed);
-            state.underruns.fetch_add(missing, Ordering::Relaxed);
+            render_frames(state, render, available, source)?;
         }
         let (mut position, mut qpc) = (0, 0);
         unsafe {
@@ -659,6 +665,53 @@ fn render_loop(
         state.clock_valid.store(true, Ordering::SeqCst);
         state.sequence.fetch_add(1, Ordering::SeqCst);
     }
+    Ok(())
+}
+fn render_frames(
+    state: &State,
+    render: &IAudioRenderClient,
+    available: u32,
+    source: &mut RenderSource,
+) -> windows::core::Result<()> {
+    let pointer = unsafe { render.GetBuffer(available)? };
+    if pointer.is_null() {
+        let _ = unsafe { render.ReleaseBuffer(available, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) };
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x80004003u32 as i32,
+        )));
+    }
+    let packet = RenderPacket {
+        client: render,
+        frames: Some(available),
+    };
+    let mut missing = 0;
+    match source {
+        RenderSource::Callback(callback) => {
+            let samples = unsafe {
+                std::slice::from_raw_parts_mut(pointer.cast::<f32>(), available as usize * 2)
+            };
+            samples.fill(0.0);
+            callback(samples);
+        }
+        RenderSource::Ring(source) => {
+            for index in 0..available {
+                let frame = source.pop().unwrap_or_else(|_| {
+                    missing += 1;
+                    [0.0; 2]
+                });
+                unsafe {
+                    let p = pointer.cast::<f32>().add(index as usize * 2);
+                    p.write_unaligned(frame[0]);
+                    p.add(1).write_unaligned(frame[1]);
+                }
+            }
+        }
+    }
+    packet.release()?;
+    state
+        .frames
+        .fetch_add(u64::from(available), Ordering::Relaxed);
+    state.underruns.fetch_add(missing, Ordering::Relaxed);
     Ok(())
 }
 
