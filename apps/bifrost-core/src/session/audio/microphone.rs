@@ -62,20 +62,28 @@ impl Remote {
     }
 }
 const SAFETY_MUTE_RETRY_MS: u64 = 100;
+const SAFETY_MUTE_BUDGET_MS: u64 = 5_000;
+const SAFETY_MUTE_MAX_ATTEMPTS: u8 = 50;
 struct SafetyMute {
     parent: fsm::Parent,
     group: [u8; 16],
     request: [u8; 16],
     revision: u64,
     next: u64,
+    deadline: u64,
+    attempts: u8,
     replace_request: bool,
 }
 impl SafetyMute {
+    fn exhausted(&self, now: u64) -> bool {
+        now >= self.deadline || self.attempts >= SAFETY_MUTE_MAX_ATTEMPTS
+    }
     fn begin_retry(&mut self, now: u64) -> bool {
-        if now < self.next {
+        if now < self.next || self.exhausted(now) {
             return false;
         }
         self.next = now.saturating_add(SAFETY_MUTE_RETRY_MS);
+        self.attempts += 1;
         true
     }
     fn control(&self) -> net::MicControl {
@@ -142,18 +150,33 @@ impl State {
         parent: fsm::Parent,
         request: [u8; 16],
         code: ResultCode,
-    ) {
-        if let Some(pending) = self
+    ) -> bool {
+        let Some(pending) = self
             .safety_mute
             .as_mut()
             .filter(|pending| pending.parent == parent && pending.request == request)
-        {
-            if matches!(code, ResultCode::Ok | ResultCode::ConsentRequired) {
-                self.safety_mute = None;
-            } else {
+        else {
+            return false;
+        };
+        match code {
+            ResultCode::Busy | ResultCode::Cancelled | ResultCode::Expired => {
                 pending.replace_request = true;
+                false
+            }
+            _ => {
+                self.safety_mute = None;
+                code != ResultCode::Ok
             }
         }
+    }
+    fn expire_safety_mute(&mut self, now: u64) -> Option<u8> {
+        let pending = self.safety_mute.as_ref()?;
+        if !pending.exhausted(now) {
+            return None;
+        }
+        let attempts = pending.attempts;
+        self.safety_mute = None;
+        Some(attempts)
     }
     fn ptt_outcome(
         &mut self,
@@ -938,6 +961,10 @@ impl Actor {
     async fn mic_retry_safety_mute(&mut self) {
         self.mic_on_parents_changed();
         let now = self.now();
+        if let Some(attempts) = self.mic.expire_safety_mute(now) {
+            tracing::warn!(attempts, "Source safety mute confirmation budget exhausted");
+            return;
+        }
         let Some(pending) = self.mic.safety_mute.as_mut() else {
             return;
         };
@@ -977,12 +1004,15 @@ impl Actor {
                     .zip(self.config.group_id)
                 {
                     let request = self.mic_next_id(parent.connection_id);
+                    let retry_now = self.now();
                     self.mic.safety_mute = Some(SafetyMute {
                         parent,
                         group: group.0,
                         request,
                         revision,
-                        next: self.now(),
+                        next: retry_now,
+                        deadline: retry_now.saturating_add(SAFETY_MUTE_BUDGET_MS),
+                        attempts: 0,
                         replace_request: false,
                     });
                 }
@@ -1130,7 +1160,10 @@ impl Actor {
             self.mic_send(parent, net::audio_control::Body::MicControl(c))
                 .await;
         } else {
-            let now = listener_now.unwrap();
+            let Some(now) = listener_now else {
+                reply(&request, gui_result(ResultCode::Disabled)).await;
+                return;
+            };
             let (challenge, expires_ns) = self.mic.authority.challenge(now);
             let c = Control {
                 request: request_id,
@@ -1500,7 +1533,9 @@ impl Actor {
                     return;
                 };
                 let code = ResultCode::try_from(a.result).unwrap_or(ResultCode::Invalid);
-                self.mic.acknowledge_safety_mute(parent, key, code);
+                if self.mic.acknowledge_safety_mute(parent, key, code) {
+                    tracing::warn!(result = code as i32, "Source safety mute refused");
+                }
                 if code != ResultCode::Ok
                     && (self
                         .mic
@@ -2311,6 +2346,8 @@ mod tests {
             request: id(1, [2; 16]),
             revision: 7,
             next: 0,
+            deadline: SAFETY_MUTE_BUDGET_MS,
+            attempts: 0,
             replace_request: false,
         }
     }
@@ -2375,7 +2412,7 @@ mod tests {
         assert_eq!(state.safety_mute.as_ref().unwrap().parent, parent);
         assert_eq!(state.safety_mute.as_ref().unwrap().request, request);
         assert_eq!(state.safety_mute.as_ref().unwrap().group, [4; 16]);
-        state.acknowledge_safety_mute(parent, request, ResultCode::DeviceGone);
+        state.acknowledge_safety_mute(parent, request, ResultCode::Busy);
         assert!(state.safety_mute.as_ref().unwrap().replace_request);
         state.acknowledge_safety_mute(parent, request, ResultCode::Ok);
         assert!(state.safety_mute.is_none());
@@ -2383,6 +2420,85 @@ mod tests {
         state.safety_mute = Some(safety_mute());
         state.acknowledge_safety_mute(parent, request, ResultCode::ConsentRequired);
         assert!(state.safety_mute.is_none());
+    }
+    #[test]
+    fn safety_mute_final_refusal_stops_without_reverting_local_mute() {
+        for code in [
+            ResultCode::DeviceGone,
+            ResultCode::Unsupported,
+            ResultCode::Disabled,
+            ResultCode::Invalid,
+            ResultCode::ConsentRequired,
+            ResultCode::StaleRevision,
+            ResultCode::Conflict,
+            ResultCode::Timeout,
+        ] {
+            let pending = safety_mute();
+            let (parent, request) = (pending.parent, pending.request);
+            let mut state = State {
+                safety_mute: Some(pending),
+                ..Default::default()
+            };
+            state.set_local_intent(true);
+            assert!(state.acknowledge_safety_mute(parent, request, code));
+            assert!(state.safety_mute.is_none());
+            assert!(!state.acknowledge_safety_mute(parent, request, code));
+            assert_eq!(state.config_muted, Some(true));
+            assert!(state.authority.recovery_muted());
+        }
+    }
+    #[test]
+    fn only_transient_safety_refusals_retry_and_can_complete() {
+        for code in [ResultCode::Busy, ResultCode::Cancelled, ResultCode::Expired] {
+            let pending = safety_mute();
+            let (parent, request) = (pending.parent, pending.request);
+            let mut state = State {
+                safety_mute: Some(pending),
+                ..Default::default()
+            };
+            assert!(!state.acknowledge_safety_mute(parent, request, code));
+            let pending = state.safety_mute.as_mut().unwrap();
+            assert!(pending.replace_request);
+            pending.request = id(2, parent.connection_id);
+            assert!(pending.begin_retry(100));
+            let control = pending.control();
+            assert_eq!(control.op, MicControlOp::SetMute as i32);
+            assert!(control.muted);
+            assert_eq!(control.challenge, 0);
+            assert!(control.press_id.is_empty());
+            assert!(!state.acknowledge_safety_mute(
+                parent,
+                id(2, parent.connection_id),
+                ResultCode::Ok
+            ));
+            assert!(state.safety_mute.is_none());
+        }
+    }
+    #[test]
+    fn silent_safety_mute_expires_by_time_or_fifty_attempts_without_opening() {
+        let mut state = State {
+            safety_mute: Some(safety_mute()),
+            ..Default::default()
+        };
+        state.set_local_intent(true);
+        for attempt in 0..SAFETY_MUTE_MAX_ATTEMPTS {
+            let now = u64::from(attempt) * SAFETY_MUTE_RETRY_MS;
+            assert_eq!(state.expire_safety_mute(now), None);
+            assert!(state.safety_mute.as_mut().unwrap().begin_retry(now));
+        }
+        assert!(!state
+            .safety_mute
+            .as_mut()
+            .unwrap()
+            .begin_retry(SAFETY_MUTE_BUDGET_MS));
+        assert_eq!(state.expire_safety_mute(SAFETY_MUTE_BUDGET_MS), Some(50));
+        assert!(state.safety_mute.is_none());
+        state.safety_mute = Some(safety_mute());
+        assert!(state.safety_mute.as_mut().unwrap().begin_retry(0));
+        assert_eq!(state.expire_safety_mute(SAFETY_MUTE_BUDGET_MS), Some(1));
+        assert_eq!(state.expire_safety_mute(SAFETY_MUTE_BUDGET_MS), None);
+        assert_eq!(state.config_muted, Some(true));
+        assert!(state.authority.recovery_muted());
     }
     #[test]
     fn pending_duplicate_safety_mute_cannot_complete_before_native_outcome() {

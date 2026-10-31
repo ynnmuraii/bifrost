@@ -173,11 +173,15 @@ mod cli {
     struct PairCli {
         root: PathBuf,
         child: Child,
+        remove_root: bool,
     }
 
     impl PairCli {
         fn start(args: &[&str]) -> Self {
-            let root = super::common::unique_dir("pair-cli-rejection");
+            Self::start_at(super::common::unique_dir("pair-cli-rejection"), args, true)
+        }
+
+        fn start_at(root: PathBuf, args: &[&str], remove_root: bool) -> Self {
             let output = std::fs::File::create(root.join("cli.log")).unwrap();
             let child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
                 .arg("--root")
@@ -187,8 +191,12 @@ mod cli {
                 .stdout(Stdio::from(output.try_clone().unwrap()))
                 .stderr(Stdio::from(output))
                 .spawn()
-                .expect("pair CLI starts without a core or agent");
-            Self { root, child }
+                .expect("pair CLI starts in its isolated profile");
+            Self {
+                root,
+                child,
+                remove_root,
+            }
         }
 
         fn output(&self) -> String {
@@ -237,7 +245,9 @@ mod cli {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
-            let _ = std::fs::remove_dir_all(&self.root);
+            if self.remove_root {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
         }
     }
 
@@ -287,6 +297,42 @@ mod cli {
                     );
                     assert!(!cli.output().contains("paired with"), "{}", cli.output());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn running_core_window_rejection_and_eof_exit_nonzero_without_trust() {
+        let _guard = super::common::serial();
+        for eof in [false, true] {
+            let two = super::common::Unpaired::start("pair-cli-running-core-reject");
+            two.wait_ready();
+            let trust = two.a.root.join("config/trust.toml");
+            let before = std::fs::read(&trust).ok();
+            let mut opener = PairCli::start_at(two.a.root.clone(), &["pair", "--open"], false);
+            opener.until("ядро уже запущено");
+            let address = format!("127.0.0.1:{}", two.a_port);
+            let mut dialer = PairCli::start(&["pair", "--dial", &address]);
+            opener.until("codes match? [y/N]");
+            dialer.until("codes match? [y/N]");
+            dialer.answer(b"y\n");
+            if eof {
+                drop(opener.child.stdin.take());
+            } else {
+                opener.answer(b"n\n");
+            }
+            assert_eq!(opener.finish().code(), Some(1), "{}", opener.output());
+            assert!(opener.output().contains("pairing rejected: UserRejected"));
+            assert_eq!(dialer.finish().code(), Some(1), "{}", dialer.output());
+            assert!(dialer.output().contains("pairing rejected: PeerRejected"));
+            assert_eq!(std::fs::read(&trust).ok(), before);
+            assert!(!dialer.root.join("config/trust.toml").exists());
+            assert!(!opener.output().contains("paired with"));
+            assert!(!dialer.output().contains("paired with"));
+            for node in [&two.a, &two.b] {
+                let status = node.status().expect("running core survives rejection");
+                assert_eq!(status.members, 0);
+                assert_eq!(status.agent, "ready");
             }
         }
     }

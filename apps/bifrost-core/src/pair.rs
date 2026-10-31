@@ -233,6 +233,9 @@ async fn window_on_running_core(paths: &Paths) -> Result<Option<Result<(), Failu
     let outcome = ask_core(&endpoint, &answer, WINDOW + Duration::from_secs(10))
         .await
         .map_err(Failure::Run)?;
+    if !approved {
+        return Err(Failure::Run("pairing rejected: UserRejected".to_owned()));
+    }
     println!("{outcome}");
     Ok(Some(Ok(())))
 }
@@ -465,7 +468,7 @@ mod tests {
                 )
                 .await
                 .expect("the local pairing exchange completes");
-                assert!(matches!(result, Ok(Some(Ok(())))));
+                assert!(matches!(result, Err(Failure::Run(message)) if message == "pairing rejected: UserRejected"));
                 peer.await.unwrap();
                 std::fs::remove_dir_all(root).unwrap();
             });
