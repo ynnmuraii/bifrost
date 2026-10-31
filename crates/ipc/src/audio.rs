@@ -1,5 +1,6 @@
 //! Strict local audio IPC boundary. Errors never contain user metadata.
 //! Identity trust, self-targeting and bilateral consent remain core checks.
+use prost::Message;
 use protocol::ipc as wire;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,9 +197,16 @@ pub fn validate_config(config: &wire::AudioConfig) -> Result<()> {
         require(peer.volume_percent <= 100, "audio volume out of range")?;
         require(
             match role {
-                wire::AudioRole::Source => !peer.allow_system_receive && !peer.allow_mic_send,
+                wire::AudioRole::Source => {
+                    !peer.allow_system_receive
+                        && peer.system_receive_override != Some(true)
+                        && !peer.allow_mic_send
+                }
                 wire::AudioRole::Listener => {
-                    !peer.allow_system_send && !peer.allow_mic_receive && !peer.allow_media_control
+                    !peer.allow_system_send
+                        && peer.system_send_override != Some(true)
+                        && !peer.allow_mic_receive
+                        && !peer.allow_media_control
                 }
                 wire::AudioRole::Unspecified => false,
             },
@@ -206,7 +214,7 @@ pub fn validate_config(config: &wire::AudioConfig) -> Result<()> {
         )?;
         require(
             role != wire::AudioRole::Source
-                || !peer.allow_system_send
+                || (!peer.allow_system_send && peer.system_send_override != Some(true))
                 || peer.node_id == config.listener_node_id,
             "audio send peer is not selected listener",
         )?;
@@ -217,6 +225,28 @@ pub fn validate_config(config: &wire::AudioConfig) -> Result<()> {
 pub fn validate_status(status: &wire::AudioStatus) -> Result<()> {
     decode_role(status.role)?;
     decode_mode(status.mode)?;
+    require(
+        status.system_sharing_error.len() <= 64
+            && (status.system_sharing_error.is_empty()
+                || [
+                    codes::AUDIO_CONSENT_REQUIRED,
+                    codes::AUDIO_ROLE_CONFLICT,
+                    codes::AUDIO_GROUP_MISMATCH,
+                    codes::AUDIO_UNSUPPORTED_BACKEND,
+                    codes::AUDIO_NO_UDP_PATH,
+                    codes::AUDIO_DEVICE_UNAVAILABLE,
+                    codes::AUDIO_VIRTUAL_MIC_MISSING,
+                    codes::AUDIO_CONFIG_WRITE,
+                    codes::AUDIO_REVISION_CONFLICT,
+                    codes::AUDIO_STALE_MEDIA,
+                    codes::AUDIO_UNSUPPORTED_COMMAND,
+                    codes::AUDIO_UNAVAILABLE,
+                    codes::AUDIO_START_RATE_LIMITED,
+                    codes::AUDIO_WORKER_RESTARTING,
+                ]
+                .contains(&status.system_sharing_error.as_str())),
+        "invalid system sharing error code",
+    )?;
     let config = status
         .config
         .as_ref()
@@ -394,6 +424,27 @@ pub fn validate_frame(frame: &wire::GuiFrame) -> Result<()> {
                 .as_ref()
                 .ok_or(AudioError("missing requested audio config"))?,
         )?,
+        Msg::SetSystemAudioSharing(request) => {
+            require(
+                frame.encoded_len() <= protocol::Channel::Ipc.max_frame_len(),
+                "audio frame too large",
+            )?;
+            // OFF only reduces consent; stale preference fields cannot prevent it.
+            if request.enabled {
+                match decode_role(request.role)? {
+                    wire::AudioRole::Source => id(&request.listener_node_id, 32, false)?,
+                    wire::AudioRole::Listener => require(
+                        request.listener_node_id.is_empty(),
+                        "listener sharing request must not specify target",
+                    )?,
+                    wire::AudioRole::Unspecified => unreachable!(),
+                }
+                require(
+                    request.expected_revision != 0,
+                    "audio sharing requires revision",
+                )?;
+            }
+        }
         Msg::StartAudio(request) => {
             id(&request.peer_node_id, 32, false)?;
             require(

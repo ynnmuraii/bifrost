@@ -590,3 +590,264 @@ fn latency_stages_are_bounded_and_preserve_native_depth_presence() {
         Some(0)
     );
 }
+
+#[test]
+fn system_sharing_on_requires_role_target_revision_and_correlation() {
+    use wire::gui_frame::Msg;
+    for role in [wire::AudioRole::Source, wire::AudioRole::Listener] {
+        let request = wire::SetSystemAudioSharing {
+            enabled: true,
+            role: role as i32,
+            listener_node_id: if role == wire::AudioRole::Source {
+                vec![2; 32]
+            } else {
+                Vec::new()
+            },
+            expected_revision: 1,
+        };
+        let valid = frame(Msg::SetSystemAudioSharing(request.clone()));
+        assert!(validate_frame(&valid).is_ok());
+        assert_eq!(
+            wire::GuiFrame::decode(valid.encode_to_vec().as_slice()).unwrap(),
+            valid
+        );
+        for revision in [1, u64::MAX] {
+            let mut value = request.clone();
+            value.expected_revision = revision;
+            assert!(validate_frame(&frame(Msg::SetSystemAudioSharing(value))).is_ok());
+        }
+        let mut value = request.clone();
+        value.expected_revision = 0;
+        assert!(validate_frame(&frame(Msg::SetSystemAudioSharing(value))).is_err());
+        for invalid_role in [0, -1, 3, i32::MAX] {
+            let mut value = request.clone();
+            value.role = invalid_role;
+            assert!(validate_frame(&frame(Msg::SetSystemAudioSharing(value))).is_err());
+        }
+        for length in [0, 1, 31, 32, 33] {
+            let mut value = request.clone();
+            value.listener_node_id = vec![2; length];
+            assert_eq!(
+                validate_frame(&frame(Msg::SetSystemAudioSharing(value))).is_ok(),
+                if role == wire::AudioRole::Source {
+                    length == 32
+                } else {
+                    length == 0
+                }
+            );
+        }
+        let mut uncorrelated = valid;
+        uncorrelated.request_id = 0;
+        assert!(validate_frame(&uncorrelated).is_err());
+    }
+}
+
+#[test]
+fn system_sharing_off_ignores_stale_preferences_but_retains_frame_bounds() {
+    use wire::gui_frame::Msg;
+    for role in [0, -1, 1, 2, i32::MAX] {
+        for expected_revision in [0, 1, u64::MAX] {
+            for length in [0, 1, 31, 32, 33] {
+                let value = wire::SetSystemAudioSharing {
+                    enabled: false,
+                    role,
+                    listener_node_id: vec![2; length],
+                    expected_revision,
+                };
+                assert!(validate_frame(&frame(Msg::SetSystemAudioSharing(value))).is_ok());
+            }
+        }
+    }
+    let mut value = frame(Msg::SetSystemAudioSharing(
+        wire::SetSystemAudioSharing::default(),
+    ));
+    value.request_id = 0;
+    assert!(validate_frame(&value).is_err());
+    let oversized = frame(Msg::SetSystemAudioSharing(wire::SetSystemAudioSharing {
+        listener_node_id: vec![2; 65536],
+        ..Default::default()
+    }));
+    assert!(validate_frame(&oversized).is_err());
+    assert!(protocol::encode_message(protocol::Channel::Ipc, &oversized).is_err());
+}
+
+#[test]
+fn system_sharing_presence_preserves_legacy_config_limits_and_pending_auto_group() {
+    for system_sharing in [None, Some(false), Some(true)] {
+        for role in [wire::AudioRole::Source, wire::AudioRole::Listener] {
+            let mut value = config();
+            value.enabled = true;
+            value.role = role as i32;
+            value.system_sharing = system_sharing;
+            if role == wire::AudioRole::Source {
+                value.listener_node_id = vec![2; 32];
+            }
+            assert!(value.group_id.is_empty());
+            assert!(validate_config(&value).is_ok());
+            let decoded = wire::AudioConfig::decode(value.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(decoded.system_sharing, system_sharing);
+            value.udp_port = 47902;
+            assert!(validate_config(&value).is_err());
+        }
+        let mut value = status();
+        value.system_sharing_requested = system_sharing;
+        assert!(validate_status(&value).is_ok());
+        let decoded = wire::AudioStatus::decode(value.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(decoded.system_sharing_requested, system_sharing);
+    }
+}
+
+#[test]
+fn system_overrides_preserve_presence_and_cannot_bypass_role_or_source_target() {
+    for role in [wire::AudioRole::Source, wire::AudioRole::Listener] {
+        for send in [None, Some(false), Some(true)] {
+            for receive in [None, Some(false), Some(true)] {
+                let mut value = config();
+                value.role = role as i32;
+                value.listener_node_id = vec![2; 32];
+                value.peers.push(wire::AudioPeerConfig {
+                    node_id: vec![2; 32],
+                    system_send_override: send,
+                    system_receive_override: receive,
+                    volume_percent: 100,
+                    ..Default::default()
+                });
+                let valid = match role {
+                    wire::AudioRole::Source => receive != Some(true),
+                    wire::AudioRole::Listener => send != Some(true),
+                    wire::AudioRole::Unspecified => unreachable!(),
+                };
+                assert_eq!(validate_config(&value).is_ok(), valid);
+                let decoded = wire::AudioConfig::decode(value.encode_to_vec().as_slice()).unwrap();
+                assert_eq!(decoded, value);
+                value.peers[0].node_id = vec![3; 32];
+                assert_eq!(
+                    validate_config(&value).is_ok(),
+                    valid && (role != wire::AudioRole::Source || send != Some(true))
+                );
+            }
+        }
+    }
+    let mut value = config();
+    value.peers.push(wire::AudioPeerConfig {
+        node_id: vec![2; 32],
+        system_receive_override: Some(true),
+        volume_percent: 101,
+        ..Default::default()
+    });
+    assert!(validate_config(&value).is_err());
+    // An explicit deny does not relax Advanced's preexisting structural checks.
+    value.peers[0].volume_percent = 100;
+    value.peers[0].allow_system_send = true;
+    value.peers[0].system_send_override = Some(false);
+    assert!(validate_config(&value).is_err());
+}
+
+#[tokio::test]
+async fn gui_link_validates_system_sharing_in_both_directions() {
+    use wire::gui_frame::Msg;
+    let (a, b) = tokio::io::duplex(4096);
+    let mut sender = ipc::GuiLink::new(a);
+    let mut receiver = ipc::GuiLink::new(b);
+    let invalid = wire::SetSystemAudioSharing {
+        enabled: true,
+        ..Default::default()
+    };
+    assert!(sender
+        .send(1, Msg::SetSystemAudioSharing(invalid.clone()))
+        .await
+        .is_err());
+    assert_eq!(sender.outbound_next(), 1);
+    sender
+        .send(
+            1,
+            Msg::SetSystemAudioSharing(wire::SetSystemAudioSharing::default()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receiver.recv().await.unwrap().seq, 1);
+    sender
+        .framed()
+        .send(&wire::GuiFrame {
+            seq: 2,
+            request_id: 2,
+            msg: Some(Msg::SetSystemAudioSharing(invalid)),
+        })
+        .await
+        .unwrap();
+    assert!(receiver.recv().await.is_err());
+    assert_eq!(receiver.inbound_expected(), 2);
+}
+
+#[test]
+fn system_sharing_status_error_is_only_a_bounded_existing_typed_code() {
+    use ipc::audio::codes;
+    for code in [
+        "",
+        codes::AUDIO_CONSENT_REQUIRED,
+        codes::AUDIO_ROLE_CONFLICT,
+        codes::AUDIO_GROUP_MISMATCH,
+        codes::AUDIO_UNSUPPORTED_BACKEND,
+        codes::AUDIO_NO_UDP_PATH,
+        codes::AUDIO_DEVICE_UNAVAILABLE,
+        codes::AUDIO_VIRTUAL_MIC_MISSING,
+        codes::AUDIO_CONFIG_WRITE,
+        codes::AUDIO_REVISION_CONFLICT,
+        codes::AUDIO_STALE_MEDIA,
+        codes::AUDIO_UNSUPPORTED_COMMAND,
+        codes::AUDIO_UNAVAILABLE,
+        codes::AUDIO_START_RATE_LIMITED,
+        codes::AUDIO_WORKER_RESTARTING,
+    ] {
+        let mut value = status();
+        value.system_sharing_error = code.into();
+        assert!(validate_status(&value).is_ok());
+        let encoded = frame(wire::gui_frame::Msg::AudioStatus(value));
+        let restored = wire::GuiFrame::decode(encoded.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(restored, encoded);
+        assert!(validate_frame(&restored).is_ok());
+    }
+    for code in [
+        "AUDIO_UNKNOWN_CODE".to_owned(),
+        "device secret payload".to_owned(),
+        "AUDIO_UNAVAILABLE\n".to_owned(),
+        "audio_unavailable".to_owned(),
+        "AUDIO_".to_owned(),
+        "AUDIO_é".to_owned(),
+        "A".repeat(65),
+        "é".repeat(33),
+    ] {
+        let mut value = status();
+        value.system_sharing_error = code;
+        assert!(validate_status(&value).is_err());
+        assert!(validate_frame(&frame(wire::gui_frame::Msg::AudioStatus(value))).is_err());
+    }
+}
+
+#[test]
+fn advanced_audio_config_remains_strict_when_system_sharing_is_off() {
+    for system_sharing in [None, Some(false), Some(true)] {
+        let mut value = config();
+        value.system_sharing = system_sharing;
+        value.role = -1;
+        assert!(
+            validate_frame(&frame(wire::gui_frame::Msg::SetAudio(wire::SetAudio {
+                config: Some(value),
+                expected_revision: 1,
+            })))
+            .is_err()
+        );
+        let mut value = config();
+        value.system_sharing = system_sharing;
+        value.listener_node_id = vec![2; 31];
+        assert!(
+            validate_frame(&frame(wire::gui_frame::Msg::SetAudio(wire::SetAudio {
+                config: Some(value),
+                expected_revision: 1,
+            })))
+            .is_err()
+        );
+    }
+}
