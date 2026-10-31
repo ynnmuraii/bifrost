@@ -73,7 +73,6 @@ impl Observed {
             );
         }
     }
-    #[cfg(unix)]
     fn rms(&self) -> f64 {
         f64::from_bits(self.rms.load(Ordering::Relaxed))
     }
@@ -84,7 +83,7 @@ fn arguments_reject_secrets_and_implicit_backend_switches() {
     assert!(parse(vec!["--token".into(), "secret".into()]).is_err());
     assert!(parse(vec![]).is_err());
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod local {
     mod m5;
     mod m6;
@@ -96,8 +95,23 @@ mod local {
         transport::{self, Endpoint},
     };
     use std::net::UdpSocket;
+    fn test_endpoint(_directory: &tempfile::TempDir) -> Endpoint {
+        #[cfg(unix)]
+        {
+            Endpoint::socket(_directory.path().join("audio.sock"))
+        }
+        #[cfg(windows)]
+        {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            Endpoint::pipe(format!(
+                r"\\.\pipe\bifrost-audio-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+        }
+    }
     struct Fixture {
-        core: AudioLink<tokio::net::UnixStream>,
+        core: AudioLink<transport::ClientStream>,
         handle: tokio::task::JoinHandle<Result<ExitReason, RoleError>>,
         observed: Arc<Observed>,
         renew_ids: Vec<u8>,
@@ -106,11 +120,72 @@ mod local {
     async fn child() -> Fixture {
         child_with_factory(None).await
     }
+    #[tokio::test]
+    async fn dry_capture_pump_keeps_realtime_cadence() {
+        let mut fixture = child().await;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = ports().0;
+        fixture
+            .core
+            .send(
+                2,
+                Msg::StartSession(start(
+                    1,
+                    local,
+                    u32::from(peer.local_addr().unwrap().port()),
+                )),
+            )
+            .await
+            .unwrap();
+        session_event(&mut fixture.core, 1, local).await;
+        let first = fixture.observed.pumps.load(Ordering::Relaxed);
+        let began = Instant::now();
+        let measurement = tokio::time::sleep(Duration::from_millis(1200));
+        tokio::pin!(measurement);
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = &mut measurement => break,
+                _ = heartbeat.tick() => {
+                    fixture.core.send(0, Msg::Ping(w::Ping { serial: 1 })).await.unwrap();
+                    renew(&mut fixture.core, 13, 1000).await;
+                }
+                received = fixture.core.recv() => {
+                    match received.unwrap().frame.msg.unwrap() {
+                        Msg::Error(error) => panic!("cadence fixture rejected: {}", error.code),
+                        Msg::SessionEvent(event) if event.kind == 5 => panic!("capture stopped early: {}", event.reason),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let seconds = began.elapsed().as_secs_f64();
+        let callbacks = fixture.observed.pumps.load(Ordering::Relaxed) - first;
+        let fps = callbacks as f64 / seconds;
+        println!("Dry capture cadence on {}: {callbacks} callbacks / {seconds:.4}s = {fps:.3} fps (480-frame/10ms blocks)", std::env::consts::OS);
+        assert!(
+            (95.0..=105.0).contains(&fps),
+            "Dry callback clock must track real time: {fps:.3}fps"
+        );
+        fixture
+            .core
+            .send(3, Msg::Shutdown(w::Shutdown {}))
+            .await
+            .unwrap();
+        assert_eq!(fixture.handle.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
     async fn child_with_factory(
         factory: Option<fn() -> Result<DryBackend, BackendError>>,
     ) -> Fixture {
+        child_with_backend(factory, 2).await
+    }
+    async fn child_with_backend(
+        factory: Option<fn() -> Result<DryBackend, BackendError>>,
+        backend: i32,
+    ) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
-        let endpoint = Endpoint::socket(directory.path().join("audio.sock"));
+        let endpoint = test_endpoint(&directory);
         let mut listener = transport::listen(&endpoint).unwrap();
         let observed = Arc::new(Observed::default());
         let child_observed = observed.clone();
@@ -133,7 +208,7 @@ mod local {
             1,
             Msg::Attach(w::Attach {
                 launch_token: vec![71; 32],
-                backend: 2,
+                backend,
                 core_silence_ms: 1000,
             }),
         )
@@ -156,7 +231,7 @@ mod local {
             _directory: directory,
         }
     }
-    async fn next(core: &mut AudioLink<tokio::net::UnixStream>) -> Msg {
+    async fn next(core: &mut AudioLink<transport::ClientStream>) -> Msg {
         tokio::time::timeout(Duration::from_secs(3), core.recv())
             .await
             .unwrap()
@@ -211,7 +286,7 @@ mod local {
             initial_authorization_ms: 1000,
         }
     }
-    async fn renew(core: &mut AudioLink<tokio::net::UnixStream>, id: u8, ttl_ms: u32) {
+    async fn renew(core: &mut AudioLink<transport::ClientStream>, id: u8, ttl_ms: u32) {
         core.send(
             100,
             Msg::RenewSession(w::RenewSession {
@@ -223,7 +298,7 @@ mod local {
         .unwrap();
     }
     async fn session_event(
-        core: &mut AudioLink<tokio::net::UnixStream>,
+        core: &mut AudioLink<transport::ClientStream>,
         kind: i32,
         port: u32,
     ) -> w::SessionEvent {
@@ -326,6 +401,10 @@ mod local {
         assert_eq!(session_event(&mut listener.core, 1, b).await.reason, 0);
         let stopped = session_event(&mut listener.core, 5, 0).await;
         assert_eq!(stopped.reason, 5);
+        assert_eq!(
+            stopped.path_diagnostic,
+            w::PathDiagnostic::NoAuthenticatedPeerPackets as i32
+        );
         assert!(began.elapsed() >= Duration::from_secs(2));
         listener
             .core
@@ -361,10 +440,18 @@ mod local {
                         if session.capture_active == Some(true) {
                             assert!(matches!(session.clock_source, 1 | 2));
                         }
+                        if session.sending == Some(true) {
+                            assert!(session.path.as_ref().unwrap().validated);
+                        }
                     }
                     source_active|=health.sessions.iter().any(|session|session.capture_active==Some(true)&&session.sending==Some(true)&&session.sent_media_packets>0);
                 }},
                 frame=listener.core.recv()=>{if let Some(Msg::Health(health))=frame.unwrap().frame.msg {
+                    for session in &health.sessions {
+                        if session.counters.as_ref().unwrap().received_packets > 0 {
+                            assert!(session.path.as_ref().unwrap().validated);
+                        }
+                    }
                     listener_received|=health.sessions.iter().any(|session|
                         session.counters.as_ref().unwrap().received_packets>0
                             && session.capture_active==Some(false)
@@ -572,7 +659,9 @@ mod local {
             sources.push(source);
         }
         let pumps = listener.observed.pumps.load(Ordering::Relaxed);
-        let health = drive_many(&mut sources, &mut listener, Duration::from_millis(1600)).await;
+        let cadence_started = Instant::now();
+        let health = drive_many(&mut sources, &mut listener, Duration::from_secs(3)).await;
+        let cadence_seconds = cadence_started.elapsed().as_secs_f64();
         assert_eq!(health.sessions.len(), 3);
         assert!(health.sessions.iter().all(|session| session
             .counters
@@ -591,7 +680,9 @@ mod local {
         }
         // Three session-local native streams would pump three times per owner tick.
         let pumped = listener.observed.pumps.load(Ordering::Relaxed) - pumps;
-        assert!((100..220).contains(&pumped), "render pumps: {pumped}");
+        let fps = pumped as f64 / cadence_seconds;
+        println!("shared Dry render: pumps={pumped} duration_s={cadence_seconds:.6} fps={fps:.3}");
+        assert!((99.0..=101.0).contains(&fps), "render cadence: {fps} fps");
         assert!(listener.observed.rms() > 0.1);
         listener
             .core

@@ -151,6 +151,12 @@ impl JitterBuffer {
         self.variation = 0.0;
         self.health.discontinuities = self.health.discontinuities.saturating_add(1);
     }
+    /// Enter buffering after playout starvation, including a caller's PLC cutoff.
+    /// Count one episode, not each missing packet or pending initial deadline.
+    pub fn rebuffer(&mut self) {
+        self.health.underruns = self.health.underruns.saturating_add(1);
+        self.reset();
+    }
     pub fn insert(
         &mut self,
         now: u64,
@@ -264,8 +270,7 @@ impl JitterBuffer {
             return Playout::Pending;
         }
         if now.saturating_sub(self.last_arrival) > 48_000 || self.concealed_samples >= 5760 {
-            self.health.underruns = self.health.underruns.saturating_add(1);
-            self.reset();
+            self.rebuffer();
             return Playout::Underrun;
         }
         self.started = true;

@@ -134,6 +134,7 @@ fn started_ack_requires_native_port_without_implying_path_validation() {
         kind: w::EventKind::Started as i32,
         reason: 0,
         local_udp_port: 40000,
+        path_diagnostic: 0,
     }));
     event.request_id = 0;
     // Native initialization is acknowledged independently of peer/path readiness.
@@ -163,6 +164,7 @@ fn session_event_kinds_reasons_and_ports_preserve_wire_contract() {
                     kind,
                     reason,
                     local_udp_port,
+                    path_diagnostic: 0,
                 }));
                 event.request_id = 0;
                 let valid = (1..=6).contains(&kind)
@@ -194,12 +196,60 @@ fn stopped_authorization_lost_is_valid_but_unknown_reasons_are_not() {
             kind: 5,
             reason,
             local_udp_port: 0,
+            path_diagnostic: 0,
         }));
         stopped.request_id = 0;
         assert_eq!(
             contract::validate_frame(&stopped).is_ok(),
             (1..=9).contains(&reason)
         );
+    }
+}
+
+#[test]
+fn path_failure_diagnostics_are_bounded_and_only_terminal_timeouts_carry_them() {
+    for diagnostic in -1..=5 {
+        for reason in [1, 5] {
+            let mut event = frame(Msg::SessionEvent(w::SessionEvent {
+                session_id: vec![3; 16],
+                kind: 5,
+                reason,
+                path_diagnostic: diagnostic,
+                ..Default::default()
+            }));
+            event.request_id = 0;
+            assert_eq!(
+                contract::validate_frame(&event).is_ok(),
+                diagnostic == 0 || reason == 5 && (1..=4).contains(&diagnostic)
+            );
+        }
+    }
+    for (diagnostic, validated, probes_sent, valid) in [
+        (0, false, 3, true),
+        (0, true, 3, true),
+        (1, false, 3, true),
+        (4, false, 3, true),
+        (1, true, 3, false),
+        (5, false, 3, false),
+        (0, false, 4, false),
+    ] {
+        let mut health = frame(Msg::Health(w::Health {
+            sessions: vec![w::SessionHealth {
+                session_id: vec![3; 16],
+                counters: Some(w::AudioHealth::default()),
+                state: 2,
+                path: Some(w::PathHealth {
+                    diagnostic,
+                    validated,
+                    probes_sent,
+                    peer_probes: u32::MAX,
+                    auth_failures: u64::MAX,
+                }),
+                ..Default::default()
+            }],
+        }));
+        health.request_id = 0;
+        assert_eq!(contract::validate_frame(&health).is_ok(), valid);
     }
 }
 
@@ -248,6 +298,14 @@ fn pages_health_and_generation_are_bounded() {
             clock_source: 0,
             latency: None,
             native_discontinuity_flags: 0,
+            jitter_rebuffers: 2,
+            render_underruns: 3,
+            path: None,
+            remote_receiver_quality: Some(w::RemoteReceiverQuality {
+                received_packets: 3654,
+                lost_frames: 131,
+                late_frames: 0,
+            }),
         }],
     }));
     health.request_id = 0;

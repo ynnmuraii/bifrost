@@ -101,6 +101,9 @@ impl std::fmt::Debug for MediaSession {
 
 #[derive(Clone, Debug)]
 pub struct MediaSnapshot {
+    /// Distinct native COM views, with the OS-current view first. Windows can return
+    /// different views of a player from GetSessions and GetCurrentSession; metadata
+    /// is never used to merge their identities.
     pub sessions: Vec<MediaSession>,
     pub current: Option<SessionToken>,
 }
@@ -343,6 +346,21 @@ struct State {
     // Last field: all COM objects/subscriptions are released before apartment teardown.
     _apartment: WinRt,
 }
+
+fn current_session(manager: &Manager) -> Result<Option<Session>, Error> {
+    // S_OK + null is valid; the generated non-null projection rejects an empty desktop.
+    let mut pointer = std::ptr::null_mut();
+    unsafe {
+        (Interface::vtable(manager).GetCurrentSession)(Interface::as_raw(manager), &mut pointer)
+            .ok()?;
+    }
+    Ok(if pointer.is_null() {
+        None
+    } else {
+        Some(unsafe { Session::from_raw(pointer) })
+    })
+}
+
 impl State {
     fn open(sink: EventSink, pending: Arc<Mutex<Vec<Weak<Pending>>>>) -> Result<Self, Error> {
         let apartment = WinRt::open()?;
@@ -378,10 +396,17 @@ impl State {
         Ok(state)
     }
 
-    fn reconcile(&mut self) -> Result<(), Error> {
+    fn reconcile(&mut self) -> Result<Option<SessionToken>, Error> {
+        // GetCurrentSession may expose a stable COM view distinct from GetSessions.
+        // Register the actual OS-selected handle; never infer identity from application metadata.
+        let current = current_session(&self.manager)?;
+        let current_identity = current
+            .as_ref()
+            .map(|session| session.cast::<IUnknown>())
+            .transpose()?;
         let sessions = self.manager.GetSessions()?;
         let mut live = Vec::new();
-        for session in sessions {
+        for session in sessions.into_iter().chain(current) {
             let identity: IUnknown = session.cast()?;
             if !self.entries.iter().any(|entry| entry.identity == identity) {
                 let token = SessionToken(self.next);
@@ -441,33 +466,26 @@ impl State {
                 pending.finish(Err(BackendError::DeviceGone));
             }
         }
-        Ok(())
-    }
-
-    fn snapshot(&mut self) -> Result<MediaSnapshot, Error> {
-        self.reconcile()?;
-        // The WinRT method legitimately returns S_OK + null for an empty desktop.
-        // The generated non-null wrapper turns that into an Error with S_OK.
-        let mut pointer = std::ptr::null_mut();
-        unsafe {
-            (Interface::vtable(&self.manager).GetCurrentSession)(
-                Interface::as_raw(&self.manager),
-                &mut pointer,
-            )
-            .ok()?;
-        }
-        let current = if pointer.is_null() {
-            None
-        } else {
-            let session = unsafe { Session::from_raw(pointer) };
-            let identity: IUnknown = session.cast()?;
+        Ok(current_identity.and_then(|identity| {
             self.entries
                 .iter()
                 .find(|entry| entry.identity == identity)
                 .map(|entry| entry.token)
-        };
+        }))
+    }
+
+    fn snapshot(&mut self) -> Result<MediaSnapshot, Error> {
+        let current = self.reconcile()?;
         let mut sessions = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
+        let current_entry = self
+            .entries
+            .iter()
+            .filter(|entry| Some(entry.token) == current);
+        let other_entries = self
+            .entries
+            .iter()
+            .filter(|entry| Some(entry.token) != current);
+        for entry in current_entry.chain(other_entries) {
             // Capture before reads: a concurrent native change invalidates this snapshot's revision.
             let revision = entry.revision.load(Ordering::Acquire);
             let metadata = complete!(entry.session.TryGetMediaPropertiesAsync());

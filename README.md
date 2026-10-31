@@ -193,6 +193,19 @@ zero-padding observations and the two-period engine-starvation heuristic. The he
 is not a driver xrun counter; on a buffer smaller than two periods, zero padding alone
 does not establish starvation.
 
+For isolated native media-control acceptance, run
+`cargo run -p bifrost-audio --example windows_media_e2e -- --owned-test`.
+It creates its own short-lived SMTC player with a generated tone and unique identity,
+authorizes a native Source over private IPC, and sends encrypted audio only to a local
+Dry discard listener. Metadata must remain absent before consent; play/pause/next are
+addressed only to that helper's exact token/revision. An ambiguous or non-owned current
+session fails closed rather than controlling another application. Owned processes are
+reaped and samples remain in memory. No microphone mute or synthesized input is used.
+
+Child mic/PTT tests use Dry mute targets for grants, expiry and persistent toggles.
+Windows registration-only tests temporarily reserve Ctrl+Alt+Shift+F23/F24 and release
+them; they never press keys or mutate a real capture endpoint.
+
 ## License
 
 [MIT](LICENSE). Distributed third-party components are listed in [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).

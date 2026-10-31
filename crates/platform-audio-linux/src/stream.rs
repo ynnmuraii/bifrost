@@ -131,7 +131,9 @@ impl LinuxStream {
                             break;
                         }
                     }
-                    thread::park_timeout(Duration::from_millis(100));
+                    // Leave margin inside the media clock's 100 ms freshness window.
+                    // Polling at that exact boundary causes periodic false fallback/unknown depth.
+                    thread::park_timeout(Duration::from_millis(25));
                 }
             })
             .map_err(|_| BackendError::ServerUnavailable)?;

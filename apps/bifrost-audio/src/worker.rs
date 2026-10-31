@@ -4,13 +4,13 @@ use super::*;
 use audio_media::{
     crypto::DirectionMaterial,
     runtime::{self as media, MediaSession},
-    socket::MediaSocket,
+    socket::{MediaSocket, Notification},
 };
 use audio_model::{jitter::Profile, status::StreamHealth};
 use ring::digest::{digest, SHA256};
 use std::{
     net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket},
-    sync::mpsc::{Receiver, RecvTimeoutError},
+    sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError},
 };
 
 pub(crate) type Pump<S> = Box<dyn FnMut(&mut S) -> Result<(), BackendError> + Send>;
@@ -105,8 +105,21 @@ pub(crate) fn run<B: Backend + 'static>(
         mic_controls,
     };
     let (mut next_pump, mut next_health) = (Instant::now(), Instant::now());
+    let pump_wait = Notification::new();
     while !worker.shared.stopping.load(Ordering::Acquire) {
-        match commands.recv_timeout(Duration::from_millis(5)) {
+        // Dry's callback clock must not be paced by coarse Windows channel timeouts.
+        // Native streams own their hardware event loops and retain blocking control reception.
+        let has_pump = worker.pump.is_some();
+        let command = if has_pump {
+            commands.try_recv().map_err(|error| match error {
+                TryRecvError::Empty => RecvTimeoutError::Timeout,
+                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            })
+        } else {
+            commands.recv_timeout(Duration::from_millis(5))
+        };
+        let idle = matches!(command, Err(RecvTimeoutError::Timeout));
+        match command {
             Ok(command) => worker.command(command),
             Err(RecvTimeoutError::Disconnected) => {
                 worker.shared.stop_all();
@@ -142,6 +155,14 @@ pub(crate) fn run<B: Backend + 'static>(
             // The IPC task still sends at 1 Hz; a fresher watch slot avoids a second
             // of phase lag and stale session membership when its timer fires first.
             next_health = Instant::now() + Duration::from_millis(200);
+        }
+        if has_pump && idle {
+            let deadline = next_pump.min(next_health);
+            pump_wait.wait_timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            );
         }
     }
     if let Some(backend) = worker.backend.as_mut() {
@@ -581,6 +602,11 @@ where
     fn stop(&mut self, id: &[u8], reason: i32) {
         if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
             let mut session = self.sessions.remove(index);
+            let path_diagnostic = if reason == 5 {
+                session.media.snapshot().path.diagnostic as i32
+            } else {
+                0
+            };
             session.authorized.store(false, Ordering::Release);
             if session.media.stop().is_err() {
                 self.shared.stop_all();
@@ -596,10 +622,13 @@ where
                 self.socket = None;
             }
             self.shared.remove(id);
-            self.event(id, 5, reason, 0);
+            self.event_with_path(id, 5, reason, 0, path_diagnostic);
         }
     }
     fn event(&self, id: &[u8], kind: i32, reason: i32, port: u32) {
+        self.event_with_path(id, kind, reason, port, 0);
+    }
+    fn event_with_path(&self, id: &[u8], kind: i32, reason: i32, port: u32, path_diagnostic: i32) {
         self.response(
             0,
             Msg::SessionEvent(w::SessionEvent {
@@ -607,6 +636,7 @@ where
                 kind,
                 reason,
                 local_udp_port: port,
+                path_diagnostic,
             }),
         );
     }
@@ -752,6 +782,22 @@ where
                         native_render_buffer_us: snapshot.latency.native_render_buffer_us,
                     }),
                     native_discontinuity_flags: snapshot.native_discontinuity_flags,
+                    jitter_rebuffers: snapshot.jitter_rebuffers,
+                    render_underruns: snapshot.render_underruns,
+                    path: Some(w::PathHealth {
+                        diagnostic: snapshot.path.diagnostic as i32,
+                        validated: snapshot.path.validated,
+                        probes_sent: snapshot.path.probes_sent,
+                        peer_probes: snapshot.path.peer_probes,
+                        auth_failures: snapshot.path.auth_failures,
+                    }),
+                    remote_receiver_quality: snapshot.remote_receiver_quality.map(|quality| {
+                        w::RemoteReceiverQuality {
+                            received_packets: quality.received_packets,
+                            lost_frames: quality.lost_frames,
+                            late_frames: quality.late_frames,
+                        }
+                    }),
                 }
             })
             .collect();

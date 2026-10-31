@@ -465,6 +465,8 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 || (event.kind != 5 && event.reason != 0)
                 || (event.kind == 1 && !port(event.local_udp_port, false))
                 || (event.kind != 1 && event.local_udp_port != 0)
+                || !matches!(event.path_diagnostic, 0..=4)
+                || (event.path_diagnostic != 0 && (event.kind != 5 || event.reason != 5))
             {
                 return Err(invalid());
             }
@@ -478,6 +480,11 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 if session.counters.is_none()
                     || !matches!(session.state, 1..=3)
                     || !matches!(session.clock_source, 0..=4)
+                    || session.path.as_ref().is_some_and(|path| {
+                        !matches!(path.diagnostic, 0..=4)
+                            || path.probes_sent > 3
+                            || path.validated && path.diagnostic != 0
+                    })
                     || session.latency.as_ref().is_some_and(|latency| {
                         [
                             latency.packetization_us,

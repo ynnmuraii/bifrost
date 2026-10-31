@@ -107,7 +107,22 @@ message Devices { Direction direction = 1; uint32 page = 2; uint64 inventory_rev
 // Only Started carries a port; every other event requires local_udp_port=0.
 // Path failure is Stopped with reason=PathTimeout; Stopped requires a known,
 // nonzero reason. Every other event requires reason=Unspecified.
-message SessionEvent { bytes session_id = 1; EventKind kind = 2; StopReason reason = 3; uint32 local_udp_port = 4; }
+message SessionEvent { bytes session_id = 1; EventKind kind = 2; StopReason reason = 3; uint32 local_udp_port = 4; PathDiagnostic path_diagnostic = 5; }
+// Observations at PathTimeout, not assertions about which firewall blocked traffic.
+enum PathDiagnostic {
+  PATH_DIAGNOSTIC_NONE = 0;
+  PATH_DIAGNOSTIC_NO_AUTHENTICATED_PEER_PACKETS = 1;
+  PATH_DIAGNOSTIC_PEER_PROBES_MISSING = 2;
+  PATH_DIAGNOSTIC_PROBE_RESPONSES_MISSING = 3;
+  PATH_DIAGNOSTIC_AUTHENTICATION_FAILURES = 4;
+}
+message PathHealth {
+  PathDiagnostic diagnostic = 1; // None while pending or validated.
+  bool validated = 2;
+  uint32 probes_sent = 3; // <=3.
+  uint32 peer_probes = 4; // Saturating authenticated observations.
+  uint64 auth_failures = 5;
+}
 message AudioHealth { uint64 received_packets = 1; uint64 lost_frames = 2; uint64 late_frames = 3; uint64 concealed_frames = 4; uint64 underruns = 5; uint64 discontinuities = 6; uint64 limiter_frames = 7; }
 message DriftDiagnostics {
   sint32 ratio_ppm = 1;
@@ -132,7 +147,12 @@ message SessionHealth {
   ClockSource clock_source = 8;
   LatencyDiagnostics latency = 9;
   uint64 native_discontinuity_flags = 10; // Native flags only; AudioHealth.discontinuities counts actual gap fill/reanchor.
+  uint64 jitter_rebuffers = 11; // Rebuffer episodes, not concealed/missing frames.
+  uint64 render_underruns = 12; // Native callbacks requiring zero-fill.
+  PathHealth path = 13;
+  RemoteReceiverQuality remote_receiver_quality = 14; // Source only; never local playout state.
 }
+message RemoteReceiverQuality { uint64 received_packets = 1; uint64 lost_frames = 2; uint64 late_frames = 3; }
 message Health { repeated SessionHealth sessions = 1; } // <=3, coalesced, at most ~1 Hz.
 message BackendEvent { BackendEventKind kind = 1; string device_id = 2; Direction direction = 3; DefaultRole default_role = 4; }
 message Error { ErrorCode code = 1; bytes session_id = 2; } // Fixed codes only; no keys, paths or device text.

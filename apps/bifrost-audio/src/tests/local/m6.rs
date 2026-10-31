@@ -233,6 +233,9 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
                             assert_eq!(event.local_udp_port, 0);
                             listener_path = true;
                         }
+                        // Transient media degradation is not a lifecycle transition.
+                        // Still require both Started/PathValidated events and real sending.
+                        (_, 2) => assert_eq!(event.local_udp_port, 0),
                         _ => panic!("unexpected session event: {}", event.kind),
                     }
                 }
@@ -306,6 +309,32 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
     result(&mut source, &mut listener, 8, 3, Some(&script)).await;
     // Drain single-shot pumps before admitting the deliberately pending command.
     quiet(&mut source, &mut listener, Duration::from_millis(200), true).await;
+
+    // Failed native admission is a correlated failure result, never a fabricated success.
+    for (request_id, error) in [
+        (20, BackendError::PermissionDenied),
+        (21, BackendError::ServerUnavailable),
+    ] {
+        let (ready, applied) = tokio::sync::oneshot::channel();
+        script.send(Script::FailMedia(error, ready)).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), applied)
+            .await
+            .unwrap()
+            .unwrap();
+        source
+            .core
+            .send(
+                request_id,
+                Msg::MediaCommand(w::MediaCommand {
+                    token: 1,
+                    expected_revision: 2,
+                    command: 1,
+                }),
+            )
+            .await
+            .unwrap();
+        result(&mut source, &mut listener, request_id, 3, None).await;
+    }
 
     source
         .core

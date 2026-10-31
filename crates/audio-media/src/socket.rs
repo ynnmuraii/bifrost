@@ -1,5 +1,6 @@
 //! One readiness-blocking UDP reader shared by up to three pinned media sessions.
 //! Routing validates framing only; authentication and replay state belong to each session.
+//! Peer identity is IP + port, plus the interface scope for link-local IPv6 only.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -264,6 +265,19 @@ impl Drop for SessionEndpoint {
     }
 }
 
+fn same_peer(pinned: SocketAddr, received: SocketAddr) -> bool {
+    match (pinned, received) {
+        (SocketAddr::V4(pinned), SocketAddr::V4(received)) => pinned == received,
+        (SocketAddr::V6(pinned), SocketAddr::V6(received)) => {
+            pinned.ip() == received.ip()
+                && pinned.port() == received.port()
+                && (!pinned.ip().is_unicast_link_local()
+                    || pinned.scope_id() == received.scope_id())
+        }
+        _ => false,
+    }
+}
+
 fn receive_loop(state: Arc<State>, mut poll: Poll, socket: mio::net::UdpSocket) {
     // Receive the entire UDP payload on both OSes (Windows errors on truncation).
     let mut bytes = [0u8; 65_536];
@@ -314,7 +328,7 @@ fn receive_loop(state: Arc<State>, mut poll: Poll, socket: mio::net::UdpSocket) 
             state.rejected.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        if route.peer != peer || route.packets.slots() == 0 {
+        if !same_peer(route.peer, peer) || route.packets.slots() == 0 {
             route.rejected.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -342,6 +356,85 @@ mod tests {
 
     fn udp() -> UdpSocket {
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()
+    }
+
+    #[test]
+    fn pinned_ipv4_peer_requires_exact_ip_port_and_family() {
+        let pinned: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        assert!(same_peer(pinned, pinned));
+        for wrong in [
+            "192.0.2.2:5000",
+            "192.0.2.1:5001",
+            "[::ffff:192.0.2.1]:5000",
+        ] {
+            let wrong = wrong.parse().unwrap();
+            assert!(!same_peer(pinned, wrong));
+            assert!(!same_peer(wrong, pinned));
+        }
+    }
+
+    #[test]
+    fn pinned_ipv6_peer_ignores_flowinfo_and_only_scopes_link_local() {
+        use std::net::SocketAddrV6;
+
+        // Include both ends of fe80::/10 and adjacent non-link-local prefixes.
+        for ip in ["2001:db8::1", "fe7f::1", "fe80::1", "febf::1", "fec0::1"] {
+            let ip: Ipv6Addr = ip.parse().unwrap();
+            let pinned = SocketAddrV6::new(ip, 5000, 0, 3);
+            let flow = SocketAddrV6::new(ip, 5000, 123, 3);
+            assert!(same_peer(pinned.into(), flow.into()));
+            assert!(same_peer(flow.into(), pinned.into()));
+            for scope in [0, 4] {
+                let received = SocketAddrV6::new(ip, 5000, 456, scope);
+                assert_eq!(
+                    same_peer(pinned.into(), received.into()),
+                    !ip.is_unicast_link_local(),
+                );
+                assert_eq!(
+                    same_peer(received.into(), pinned.into()),
+                    !ip.is_unicast_link_local(),
+                );
+            }
+            for wrong in [
+                SocketAddrV6::new(ip, 5001, 123, 3),
+                SocketAddrV6::new("2001:db8::2".parse().unwrap(), 5000, 123, 3),
+            ] {
+                assert!(!same_peer(pinned.into(), wrong.into()));
+                assert!(!same_peer(wrong.into(), pinned.into()));
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_session_registration_is_rejected_regardless_of_peer_metadata() {
+        use std::net::SocketAddrV6;
+
+        let owner = MediaSocket::new(udp()).unwrap();
+        let ip = "2001:db8::1".parse().unwrap();
+        let pinned = SocketAddrV6::new(ip, 5000, 0, 3);
+        let _endpoint = owner
+            .register(
+                [1; 16],
+                pinned.into(),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(Notification::new()),
+            )
+            .unwrap();
+        for peer in [
+            SocketAddrV6::new(ip, 5000, 123, 4).into(),
+            SocketAddrV6::new(ip, 5001, 0, 3).into(),
+            "192.0.2.1:5000".parse().unwrap(),
+        ] {
+            assert!(matches!(
+                owner.register(
+                    [1; 16],
+                    peer,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(Notification::new()),
+                ),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists
+            ));
+        }
     }
 
     #[test]

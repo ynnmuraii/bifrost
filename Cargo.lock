@@ -623,6 +623,8 @@ dependencies = [
  "rtrb",
  "tempfile",
  "tokio",
+ "windows",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

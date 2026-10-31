@@ -19,7 +19,6 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Disable TLS session resumption so every runtime and pairing connection re-runs certificate pin verification.
 - Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
 - Fix boxed auxiliary exporter storage with the locked zeroize version while retaining a stable heap allocation and erasure before deallocation.
-- Keep Unix-only audio-child test helpers out of Windows builds so all-target clippy remains warning-free.
 - Keep Source pacing independent of Winsock's coarse receive timeout: shared UDP reception and capture-ring notifications wake media workers without a millisecond polling loop.
 
 **New**
@@ -43,6 +42,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Recover an ownership claim superseded by newer self-owner gossip when a delayed, uncorrelated stale-serial refusal arrives. A fresh higher-serial claim uses the existing full deadline; old timers and receiver release cannot grant it early. Ordinary refusals and competing-owner validation remain unchanged.
 
 **Audio media internals**
+
+- Recover Listener health when valid decoded PCM resumes after Wi-Fi loss instead of retaining a permanent degraded label; distinguish jitter rebuffer episodes from native zero-fill callbacks, keep peer receiver quality separate from local Source state, and fall back safely when a native render position stops advancing.
+- Document Listener-first authenticated UDP hole punching and one-second idle traffic as runtime invariants; report bounded path-probe/authentication observations on health and terminal timeouts without guessing which firewall blocked traffic.
 
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
@@ -105,6 +107,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Execute owned microphone mute and shortcut observation, and keep persistent toggles separate from independently timed remote talk grants. Grant expiry remutes on a guard-owning thread even while other backend work stalls; native snapshots remain authoritative, pre-muted endpoints refuse grants, and Ping does not renew them.
 - Report failed timed remute writes separately from lease expiry; never present an expired permission as evidence that the physical endpoint is muted.
 - Forward bounded media metadata only during an explicitly enabled authorized Source watch, recheck the current player before commands, and correlate completion/cancellation. The explicit Dry harness has documented deterministic revisioned media; native backends never synthesize it.
+- Register Windows' authoritative current SMTC COM view even when it differs from the enumerated view; preserve exact tokens instead of guessing current identity from application metadata.
+- Exercise child mic/PTT leases over Windows named pipes using Dry targets, native hotkey registration without input, and an explicitly owned SMTC helper for consent-gated play/pause/next acceptance.
+- Pace explicitly pumped Dry child streams from absolute 10 ms deadlines and short high-resolution waits rather than coarse control-channel receive timeouts; native hardware event loops are unchanged.
 
 **Linux M5 native controls**
 
@@ -115,6 +120,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Revoke metadata admission before bounded queueing, and give microphone mute/revoke/release a separate guard-owned priority path. Privacy reductions fence older queued openings; mailbox saturation fails closed and is surfaced as a typed fatal supervisor event.
 - Keep lifetime session/key tombstones intact, but retire the child at a soft 240-start budget before its 256-entry backstop. A typed restart-required outcome triggers bounded recycling; existing sessions fail and require fresh negotiation, never historical key replay.
+- Match pinned IPv6 peers by IP/port, ignoring flow labels and irrelevant global scopes while retaining link-local scope checks. Keep wrong-address/family and cross-session rejection.
+- Replace Source-side peer report snapshots instead of permanently pinning diagnostics to the largest authenticated value; locally measured counters remain independent.
 
 ### Русский
 
@@ -131,7 +138,6 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Возобновление TLS отключено: каждое рабочее и сопрягающее соединение заново проверяет закреплённый сертификат.
 - Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
 - Исправлено хранение корневого секрета экспорта с закреплённой версией zeroize: сохраняются стабильное размещение в куче и стирание до освобождения памяти.
-- Unix-only вспомогательный метод тестов аудиопроцесса исключён из сборки Windows, чтобы clippy всех целей не выдавал предупреждение.
 - Темп Source больше не зависит от грубого таймера приёма Winsock: общий UDP-приём и уведомления кольца захвата пробуждают обработчики без миллисекундного опроса.
 
 **Новое**
@@ -155,6 +161,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Восстанавливается захват владения, заменённый более новым сообщением о локальном владельце, если затем приходит запоздавший отказ со старым серийным номером без корреляции. Новая заявка с большим номером выдерживает прежний полный срок; старые таймеры и завершение освобождения не дают владение досрочно. Обычные отказы и проверка конкурирующего владельца не изменены.
 
 **Внутренний аудиотракт**
+
+- Состояние Listener восстанавливается после возобновления декодированного PCM при потерях Wi-Fi, а не остаётся навсегда ухудшенным; эпизоды повторного буферизования отделены от нативных callback с заполнением тишиной, отчёты удалённого приёмника — от локального состояния Source, а остановившаяся нативная позиция безопасно переключается на резервные часы.
+- Закреплены инварианты исходящего аутентифицированного UDP-запроса Listener до ожидания Source и секундного служебного трафика; Health и завершение по тайм-ауту передают ограниченные наблюдения проверки пути и аутентификации без догадок о виновном брандмауэре.
 
 - Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования.
 - Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
@@ -217,6 +226,9 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Реализованы владение заглушением микрофона и наблюдение PTT; постоянное переключение отделено от удалённых разрешений говорить. Независимый поток guard заглушает по истечении даже при задержке другой работы бэкенда; фактическое состояние подтверждают снимки, изначально заглушённый микрофон отклоняет разрешение, Ping его не продлевает.
 - Ошибка заглушения по таймеру сообщается отдельно от истечения разрешения: истёкший срок не выдаётся за подтверждение фактического mute устройства.
 - Ограниченные медиаданные передаются только при явно включённом наблюдении разрешённого Source; перед командой повторно проверяется текущий плеер, результаты и отмены связаны с запросами. Только явный Dry-режим предоставляет документированный детерминированный медиасеанс с ревизиями.
+- Windows сохраняет авторитетное представление COM текущего SMTC-сеанса, даже если оно отличается от перечисленного представления; токены не подменяются догадкой по метаданным приложения.
+- Проверки микрофонных/PTT-сроков дочернего процесса работают через Windows named pipes с Dry-целями; нативная проверка ограничена регистрацией hotkey без ввода, а play/pause/next и согласие проверяются только на собственном SMTC-плеере.
+- Явно прокачиваемые Dry-потоки дочернего процесса следуют абсолютным срокам 10 мс с коротким высокоточным ожиданием, а не грубому таймауту управляющего канала; нативные аппаратные циклы не меняются.
 
 **Нативное управление Linux M5**
 
@@ -227,6 +239,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Метаданные отзываются до ограниченной очереди, а mute/revoke/release микрофона идут отдельным приоритетным путём guard. Старые запросы открытия блокируются; переполнение закрывает разрешения и передаётся как типизированная фатальная ошибка надзора.
 - История ID/ключей не удаляется; после 240 запусков процесс переинициализируется до жёсткого предела 256. Типизированный запрос перезапуска ограничен бюджетом надзора; сеансы требуют нового согласования без повтора старых ключей.
+- IPv6-пиры сравниваются по IP/порту без flow label и лишнего scope глобальных адресов; scope link-local и запрет чужих адресов/семейств/сеансов сохраняются.
+- Сводки удалённого получателя заменяют предыдущие значения Source, а не навсегда закрепляют максимальные счётчики; местные измерения остаются независимыми.
 
 ## 0.4.0 — 2026-10-30
 

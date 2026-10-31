@@ -278,7 +278,29 @@ mod live {
         eprintln!("owned null sinks Linux→UDP→Linux 1 kHz amplitude={remote_amplitude:.4}; listener health={:?}",listener.snapshot().health);
         assert_eq!(started, 2);
         assert!(remote_amplitude > 0.06 && remote_amplitude < 0.30);
-        assert!(source.snapshot().health.received_packets > 50);
+        assert!(source
+            .snapshot()
+            .remote_receiver_quality
+            .is_some_and(|quality| quality.received_packets > 50));
+        wait_until(|| {
+            listener
+                .snapshot()
+                .latency
+                .native_render_buffer_us
+                .is_some()
+        });
+        let health = listener.snapshot();
+        eprintln!(
+            "owned null sink native clock={:?}, render depth={:?} us, jitter rebuffer episodes={}, render zero-fill callbacks={}",
+            health.clock_source,
+            health.latency.native_render_buffer_us,
+            health.jitter_rebuffers,
+            health.render_underruns,
+        );
+        assert_eq!(
+            health.clock_source,
+            audio_model::status::ClockSource::RenderDevicePosition
+        );
         listener.stop().unwrap();
         source.stop().unwrap();
         tone.stop().unwrap();

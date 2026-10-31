@@ -147,27 +147,62 @@ impl Drop for Relay {
 struct Energy {
     sum: f64,
     count: u64,
-    real: f64,
-    imaginary: f64,
+    tone_sum: f64,
 }
 impl Energy {
     fn add(&mut self, samples: impl Iterator<Item = f32>, frequency: f64, rate: u32) {
+        // Accumulate magnitudes per native callback, not phase across the whole 400 ms
+        // observation. Valid drift trimming (up to 5000 ppm) changes phase appreciably over
+        // that interval; a coarse correction can also move it without removing the tone.
+        let (mut real, mut imaginary, mut count) = (0.0, 0.0, 0u64);
         for x in samples {
             assert!(x.is_finite());
             self.sum += f64::from(x).powi(2);
-            let phase =
-                std::f64::consts::TAU * frequency * (self.count / 2) as f64 / f64::from(rate);
-            self.real += f64::from(x) * phase.cos();
-            self.imaginary += f64::from(x) * phase.sin();
-            self.count += 1;
+            let phase = std::f64::consts::TAU * frequency * (count / 2) as f64 / f64::from(rate);
+            real += f64::from(x) * phase.cos();
+            imaginary += f64::from(x) * phase.sin();
+            count += 1;
         }
+        self.count += count;
+        self.tone_sum += 2.0 * real.hypot(imaginary);
     }
     fn rms(&self) -> f64 {
         (self.sum / self.count.max(1) as f64).sqrt()
     }
     fn tone_amplitude(&self) -> f64 {
-        2.0 * self.real.hypot(self.imaginary) / self.count.max(1) as f64
+        self.tone_sum / self.count.max(1) as f64
     }
+}
+
+#[test]
+fn callback_tone_measurement_tolerates_clock_trim_but_rejects_unrelated_pcm() {
+    let mut tone = Energy::default();
+    let mut unrelated = Energy::default();
+    for block in 0..40 {
+        let phase_jump = if block >= 20 {
+            std::f64::consts::PI
+        } else {
+            0.0
+        };
+        tone.add(
+            (0..960).map(|sample| {
+                let time = (block * 480 + sample / 2) as f64 / 48_000.0;
+                (0.3 * (std::f64::consts::TAU * 375.0 * 1.005 * time + phase_jump).sin()) as f32
+            }),
+            375.0,
+            48_000,
+        );
+        unrelated.add(
+            (0..960).map(|sample| {
+                (0.3 * (std::f64::consts::TAU * 1000.0 * (sample / 2) as f64 / 48_000.0).sin())
+                    as f32
+            }),
+            375.0,
+            48_000,
+        );
+    }
+    assert!((0.25..0.35).contains(&tone.tone_amplitude()));
+    assert!(unrelated.tone_amplitude() < 0.1);
 }
 
 #[test]
@@ -257,6 +292,7 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
     let mut mute_set = false;
     let mut unmute_set = false;
     let mut injection_done = false;
+    let mut recovered_after_loss = false;
     while start.elapsed() < Duration::from_millis(2400) {
         let elapsed = start.elapsed();
         if elapsed >= Duration::from_millis(900) && !gain_set {
@@ -345,6 +381,9 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
                 _ => {}
             }
         }
+        let current = listener.snapshot();
+        recovered_after_loss |= current.health.lost_frames > 0
+            && current.state == audio_model::status::StreamHealth::Ready;
         thread::sleep(Duration::from_millis(1));
     }
     let source_health = source.snapshot();
@@ -356,7 +395,20 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
         assert!(relay.stateful_dropped.load(Ordering::Relaxed) > 0);
     }
     assert!(listener_health.health.received_packets > 50);
-    assert!(source_health.health.received_packets > 30);
+    assert!(source_health
+        .remote_receiver_quality
+        .is_some_and(|quality| quality.received_packets > 30));
+    assert_eq!(source_health.health.received_packets, 0);
+    assert_eq!(
+        listener_health.health.underruns,
+        listener_health.jitter_rebuffers + listener_health.render_underruns
+    );
+    if loss {
+        assert!(
+            recovered_after_loss,
+            "valid PCM must recover current health after loss"
+        );
+    }
     assert!(listener_health.rejected_datagrams >= 16);
     assert!(listener_health.health.lost_frames < 40);
     assert!(loud.rms() > 0.08);
