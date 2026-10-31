@@ -209,7 +209,7 @@ impl Backend for WindowsBackend {
             media,
             ptt,
             ptt_release: matches!(ptt, Availability::Available)
-                .then_some(ReleaseObservation::Polling { interval_ms: 10 }),
+                .then_some(ReleaseObservation::Native),
         }
     }
     fn devices(&self) -> Result<Vec<Device>, BackendError> {
