@@ -174,7 +174,6 @@ mod tests {
             let press = gui::gui_frame::Msg::SetPtt(gui::SetPtt {
                 pressed: true,
                 expected_revision: 1,
-                ..Default::default()
             });
             assert!(submit(&queue, &safety, request(1, press)).is_ok());
             let action = if mute {
@@ -186,7 +185,6 @@ mod tests {
                 gui::gui_frame::Msg::SetPtt(gui::SetPtt {
                     pressed: false,
                     expected_revision: 0,
-                    ..Default::default()
                 })
             };
             let (id, _) = submit(&queue, &safety, request(2, action)).unwrap_err();
@@ -265,7 +263,6 @@ mod tests {
                 gui::gui_frame::Msg::SetPtt(gui::SetPtt {
                     pressed: false,
                     expected_revision: 0,
-                    ..Default::default()
                 }),
             ),
         );
@@ -401,11 +398,23 @@ mod tests {
             );
             let safety_task = tokio::spawn(watch_safety(actor_latch.clone(), target_rx, stop_rx));
             let renew_handle = handle.clone();
+            let renew_latch = actor_latch.clone();
+            let admission_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let renew_refused = Arc::clone(&admission_refused);
             let renewing = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(100));
                 loop {
                     tick.tick().await;
-                    renew_handle.ptt_grant(73, 250).await.unwrap();
+                    match renew_handle.ptt_grant(73, 250).await {
+                        Ok(_) => {}
+                        Err(crate::audio::AudioSupervisorError::Unavailable)
+                            if renew_latch.borrow().generation > 0 =>
+                        {
+                            // The supervisor may reject the stale ID before child admission.
+                            renew_refused.store(true, Ordering::Relaxed);
+                        }
+                        Err(error) => panic!("live pre-safety renewal failed: {error}"),
+                    }
                 }
             });
             let path = root.0.join("config.toml");
@@ -441,7 +450,6 @@ mod tests {
                 gui::gui_frame::Msg::SetPtt(gui::SetPtt {
                     pressed: false,
                     expected_revision: 0,
-                    ..Default::default()
                 })
             };
             assert!(submit(&queue, &admission, request(2, action)).is_err());
@@ -493,10 +501,15 @@ mod tests {
                     }
                 }
             }
-            assert!(refused_old_renewal);
+            assert!(
+                refused_old_renewal || admission_refused.load(Ordering::Relaxed),
+                "the old grant must be refused by the supervisor or the child"
+            );
             assert!(!blocked_write.is_finished());
             renewing.abort();
-            let _ = renewing.await;
+            if let Err(error) = renewing.await {
+                assert!(error.is_cancelled(), "renewer failed unexpectedly: {error}");
+            }
             // Ordinary observations of the same endpoint must not acknowledge a latch.
             publish_target(
                 &targets,

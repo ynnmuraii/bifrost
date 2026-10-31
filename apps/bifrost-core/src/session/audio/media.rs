@@ -316,11 +316,6 @@ impl Actor {
         let gui::gui_frame::Msg::SendMediaCommand(command) = &request.message else {
             return;
         };
-        // Zero is an unavailable/stale native identity, never "choose current".
-        if command.session_token == 0 || command.media_revision == 0 {
-            reply(&request, Err(ipc::audio::codes::AUDIO_STALE_MEDIA)).await;
-            return;
-        }
         let Ok(raw_peer) = <[u8; 32]>::try_from(command.peer_node_id.as_slice()) else {
             reply(&request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await;
             return;
@@ -337,6 +332,16 @@ impl Actor {
             reply(&request, Err(ipc::audio::codes::AUDIO_STALE_MEDIA)).await;
             return;
         }
+        let allowed = self.media_allowed(peer);
+        if !allowed {
+            reply(&request, Err(ipc::audio::codes::AUDIO_CONSENT_REQUIRED)).await;
+            return;
+        }
+        // Zero is an unavailable/stale native identity, never "choose current".
+        if command.session_token == 0 || command.media_revision == 0 {
+            reply(&request, Err(ipc::audio::codes::AUDIO_STALE_MEDIA)).await;
+            return;
+        }
         let Some(kind) = gui_command(command.command) else {
             reply(&request, Err(ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND)).await;
             return;
@@ -348,12 +353,7 @@ impl Actor {
             .filter(|r| r.view() == Some(scope.view))
             .ok_or(Refusal::Inactive)
             .and_then(|r| {
-                r.authorize(
-                    self.media_allowed(peer),
-                    command.session_token,
-                    command.media_revision,
-                    kind,
-                )
+                r.authorize(allowed, command.session_token, command.media_revision, kind)
             });
         if let Err(error) = result {
             reply(&request, result_code(refusal(error))).await;

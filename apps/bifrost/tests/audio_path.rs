@@ -153,7 +153,7 @@ impl RawPeer {
                                                 session_id: offer.session_id.clone(),
                                                 accepted: true,
                                                 reason: 0,
-                                                accepted_format: offer.format.clone(),
+                                                accepted_format: offer.format,
                                                 udp_port: u32::from(port),
                                                 consent_revision: 1,
                                                 source_nonce: nonce,

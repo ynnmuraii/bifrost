@@ -111,6 +111,7 @@ fn mute(window: &mut Window, muted: bool) -> u64 {
     revision
 }
 
+#[track_caller]
 fn ptt(source: &mut Window, pressed: bool) {
     let revision = source.status().revision;
     match source.request(gui_frame::Msg::SetPtt(wire::SetPtt {
@@ -118,7 +119,11 @@ fn ptt(source: &mut Window, pressed: bool) {
         expected_revision: revision,
     })) {
         gui_frame::Msg::OpResult(result) => {
-            assert!(result.ok, "PTT pressed={pressed}: {result:?}");
+            assert!(
+                result.ok,
+                "PTT pressed={pressed} expected_revision={revision}: {result:?}; latest={:?}",
+                source.status()
+            );
         }
         other => panic!("PTT pressed={pressed} answered {other:?}"),
     }
@@ -511,15 +516,7 @@ fn stale_unmute_does_not_cancel_an_existing_gui_ptt_hold() {
 fn failed_local_mute_persistence_keeps_the_native_endpoint_and_replacement_child_muted() {
     let _guard = common::serial();
     let (two, mut listener, mut source) = pair("audio-mic-failed-mute-save");
-    let owner = std::cmp::max(two.a_id.as_str(), two.b_id.as_str());
-    for node in [&two.a, &two.b] {
-        node.wait_for(
-            "settled ownership before holding config lock",
-            audio::TIMEOUT,
-            |status| status.serial > 0 && status.owner == owner,
-        )
-        .expect("ownership has settled");
-    }
+    settle_privacy_ownership(&two);
     mute(&mut listener, false);
     agree(&mut listener, &mut source, false, false);
     let path = two.a.root.join("config/config.toml");
@@ -552,8 +549,16 @@ struct PausedAudioChild(u32);
 #[cfg(target_os = "linux")]
 impl PausedAudioChild {
     fn source(two: &Unpaired) -> Self {
-        assert!(audio::dry_launch(&two.b.root));
-        let children = audio::audio_children(&two.b);
+        Self::owned(two, &two.b)
+    }
+
+    fn listener(two: &Unpaired) -> Self {
+        Self::owned(two, &two.a)
+    }
+
+    fn owned(two: &Unpaired, node: &common::Node) -> Self {
+        assert!(audio::dry_launch(&node.root));
+        let children = audio::audio_children(node);
         assert_eq!(children.len(), 1);
         let pid = children[0];
         assert_ne!(pid, two.a.pid());
@@ -688,6 +693,11 @@ fn another_gui_emergency_release_is_group_wide_idempotent_and_requires_a_fresh_p
     hold(&mut listener, &mut source, true, false);
     ptt(&mut listener_tray, false);
     agree(&mut listener, &mut source, true, false);
+    // A genuine new button cycle includes the Source's own up edge. Its
+    // correlated authority ACK follows the current MicState on that parent,
+    // unlike the other computer's local tray ACK. This is a distinct user
+    // action, not a retry/rebase of a rejected activation.
+    ptt(&mut source, false);
     ptt(&mut source, true);
     agree(&mut listener, &mut source, false, true);
     let mut source_tray = Window::open(&two.b);
@@ -704,4 +714,218 @@ fn another_gui_emergency_release_is_group_wide_idempotent_and_requires_a_fresh_p
     hold(&mut listener, &mut source, false, false);
     audio::disable(&two.b, &mut source);
     audio::disable(&two.a, &mut listener);
+}
+
+fn settle_privacy_ownership(two: &Unpaired) {
+    let deadline = Instant::now() + audio::TIMEOUT;
+    loop {
+        let a = two.a.status().expect("Listener core status");
+        let b = two.b.status().expect("Source core status");
+        // The first committed owner may be either node; a later claim need not
+        // displace it merely because its identity sorts higher.
+        if a.serial > 0
+            && a.serial == b.serial
+            && a.owner == b.owner
+            && ((a.role == "owner" && b.role == "follower")
+                || (a.role == "follower" && b.role == "owner"))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ownership did not settle before persistence interleave: {a:?}; {b:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn unmute_persistence_starts(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.contains("microphone configuration persistence started")
+                && line.contains("desired_muted=false")
+        })
+        .count()
+}
+
+fn observe_closed_after_confirmation(status: &wire::AudioStatus, confirmed: &mut bool) {
+    if microphone(status, true, false) {
+        *confirmed = true;
+    }
+    if *confirmed {
+        assert!(
+            microphone(status, true, false),
+            "observed safety mute reopened: {status:?}"
+        );
+    }
+}
+
+#[test]
+fn newer_safety_mute_supersedes_a_blocked_unmute_save_without_reopening() {
+    let _guard = common::serial();
+    for save_fails in [false, true] {
+        let (two, mut listener, mut source) = pair(if save_fails {
+            "audio-mic-unmute-save-fails"
+        } else {
+            "audio-mic-unmute-save-races"
+        });
+        settle_privacy_ownership(&two);
+        mute(&mut listener, false);
+        agree(&mut listener, &mut source, false, false);
+        let path = two.a.root.join("config/config.toml");
+        assert!(!config::Config::load(&path).unwrap().audio.microphone.muted);
+        let log = two.a.root.join("a.log");
+        let starts = unmute_persistence_starts(&log);
+        let mut unmuter = Window::open(&two.a);
+        let revision = unmuter.status().revision;
+        drop(unmuter.drain_events());
+        let mut lock = Some(config::lock::FileLock::acquire(&path).unwrap());
+        let pending = unmuter.send(gui_frame::Msg::SetMicrophoneMute(wire::SetMicrophoneMute {
+            muted: false,
+            expected_revision: revision,
+        }));
+        let deadline = Instant::now() + audio::TIMEOUT;
+        while unmute_persistence_starts(&log) == starts {
+            assert!(
+                Instant::now() < deadline,
+                "the real Actor must enter its locked save"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let safety = listener.send(gui_frame::Msg::SetMicrophoneMute(wire::SetMicrophoneMute {
+            muted: true,
+            expected_revision: 0,
+        }));
+        let barrier = listener.send(gui_frame::Msg::GetStatus(wire::GetStatus {}));
+        listener.answers_through(barrier);
+        if !save_fails {
+            drop(lock.take());
+        }
+        match unmuter.answer(pending) {
+            gui_frame::Msg::OpResult(result) => {
+                assert!(
+                    !result.ok,
+                    "a newer safety mute supersedes the blocked unmute"
+                );
+                if save_fails {
+                    assert_eq!(result.error_code, ipc::audio::codes::AUDIO_CONFIG_WRITE);
+                }
+            }
+            other => panic!("pending unmute answered {other:?}"),
+        }
+        drop(lock.take());
+        audio::assert_ok(listener.answer(safety));
+        let mut confirmed = false;
+        let until = Instant::now() + Duration::from_millis(650);
+        while Instant::now() < until {
+            let status = unmuter.status();
+            for event in unmuter.drain_events() {
+                if let gui_frame::Msg::AudioStatus(status) = event {
+                    observe_closed_after_confirmation(&status, &mut confirmed);
+                }
+            }
+            observe_closed_after_confirmation(&status, &mut confirmed);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(confirmed, "an actual owned muted snapshot must be observed");
+        agree(&mut listener, &mut source, true, false);
+        assert!(config::Config::load(&path).unwrap().audio.microphone.muted);
+        audio::disable(&two.b, &mut source);
+        audio::disable(&two.a, &mut listener);
+        drop(unmuter);
+        two.a.status().expect("Listener core remains alive");
+        two.b.status().expect("Source core remains alive");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn saturated_listener_safety_mute_is_persisted_or_retained_for_child_recovery() {
+    let _guard = common::serial();
+    for save_fails in [false, true] {
+        let (mut two, mut listener, mut source) = pair(if save_fails {
+            "audio-mic-latched-save-fails"
+        } else {
+            "audio-mic-latched-save-restart"
+        });
+        settle_privacy_ownership(&two);
+        mute(&mut listener, false);
+        agree(&mut listener, &mut source, false, false);
+        let path = two.a.root.join("config/config.toml");
+        assert!(!config::Config::load(&path).unwrap().audio.microphone.muted);
+        let lock = save_fails.then(|| config::lock::FileLock::acquire(&path).unwrap());
+        let mut flood = Window::open(&two.a);
+        let mut paused = PausedAudioChild::listener(&two);
+        for _ in 0..64 {
+            flood.send(gui_frame::Msg::ListAudioDevices(wire::ListAudioDevices {
+                kind: wire::AudioDeviceKind::Output as i32,
+            }));
+        }
+        let barrier = flood.send(gui_frame::Msg::GetStatus(wire::GetStatus {}));
+        let replies = flood.answers_through(barrier);
+        assert!(
+            replies.iter().any(|(_, message)| matches!(
+                message, gui_frame::Msg::OpResult(result)
+                    if !result.ok && result.error_code == ipc::audio::codes::AUDIO_UNAVAILABLE
+            )),
+            "the real Listener audio queue must be saturated"
+        );
+        let result = listener.request(gui_frame::Msg::SetMicrophoneMute(wire::SetMicrophoneMute {
+            muted: true,
+            expected_revision: 0,
+        }));
+        assert!(matches!(result, gui_frame::Msg::OpResult(result)
+            if !result.ok && result.error_code == ipc::audio::codes::AUDIO_UNAVAILABLE));
+        paused.resume();
+        drop(flood);
+        let deadline = Instant::now() + audio::TIMEOUT;
+        loop {
+            match listener.request(gui_frame::Msg::GetAudioStatus(wire::GetAudioStatus {})) {
+                gui_frame::Msg::AudioStatus(status) => {
+                    ipc::audio::validate_status(&status).unwrap();
+                    if microphone(&status, true, false)
+                        && status
+                            .config
+                            .as_ref()
+                            .and_then(|config| config.microphone.as_ref())
+                            .is_some_and(|mic| mic.muted)
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "latched mute missing: {status:?}"
+                    );
+                }
+                gui_frame::Msg::OpResult(result) => {
+                    assert!(!result.ok);
+                    assert_eq!(result.error_code, ipc::audio::codes::AUDIO_UNAVAILABLE);
+                    assert!(Instant::now() < deadline, "audio queue did not recover");
+                }
+                other => panic!("GetAudioStatus answered {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            config::Config::load(&path).unwrap().audio.microphone.muted,
+            !save_fails
+        );
+        drop(lock);
+        if save_fails {
+            restart_listener_child(&two, &mut listener);
+        } else {
+            drop(listener);
+            two.a.restart_without_input();
+            two.wait_ready();
+            listener = Window::open(&two.a);
+        }
+        agree(&mut listener, &mut source, true, false);
+        hold(&mut listener, &mut source, true, false);
+        audio::disable(&two.b, &mut source);
+        audio::disable(&two.a, &mut listener);
+        two.a.status().expect("Listener core remains alive");
+        two.b.status().expect("Source core remains alive");
+    }
 }

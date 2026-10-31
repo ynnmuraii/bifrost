@@ -440,11 +440,27 @@ fn gui_controls_use_authoritative_state_and_require_explicit_control_consent() {
     }
     // System-audio consent does not implicitly authorize media commands, even
     // when the Source has a real native media session.
+    let metadata = listener
+        .wait("native metadata for consent-intent request", |status| {
+            status.sessions.iter().any(|session| {
+                session.session_id == session_id
+                    && session
+                        .media_info
+                        .as_ref()
+                        .is_some_and(|info| info.session_token != 0 && info.revision != 0)
+            })
+        })
+        .sessions
+        .into_iter()
+        .find(|session| session.session_id == session_id)
+        .and_then(|session| session.media_info)
+        .expect("observed native metadata");
+    let (session_token, media_revision) = (metadata.session_token, metadata.revision);
     match listener.request(gui_frame::Msg::SendMediaCommand(wire::SendMediaCommand {
         peer_node_id: source_id,
         session_id,
-        session_token: 0,
-        media_revision: 0,
+        session_token,
+        media_revision,
         command: wire::AudioMediaCommand::Play as i32,
     })) {
         gui_frame::Msg::OpResult(result) => {

@@ -156,6 +156,10 @@ impl Window {
         }
     }
 
+    pub fn drain_events(&mut self) -> std::vec::Drain<'_, gui_frame::Msg> {
+        self.events.drain(..)
+    }
+
     pub fn status(&mut self) -> wire::AudioStatus {
         match self.request(gui_frame::Msg::GetAudioStatus(wire::GetAudioStatus {})) {
             gui_frame::Msg::AudioStatus(status) => {

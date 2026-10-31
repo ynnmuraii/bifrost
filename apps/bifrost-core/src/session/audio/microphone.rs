@@ -11,7 +11,7 @@ struct Held {
     next: u64,
 }
 enum Reply {
-    Gui(Request),
+    Gui(Box<Request>),
     Network(fsm::Parent, Vec<u8>),
 }
 struct PendingMic {
@@ -61,6 +61,36 @@ impl Remote {
         }
     }
 }
+const SAFETY_MUTE_RETRY_MS: u64 = 100;
+struct SafetyMute {
+    parent: fsm::Parent,
+    group: [u8; 16],
+    request: [u8; 16],
+    revision: u64,
+    next: u64,
+    replace_request: bool,
+}
+impl SafetyMute {
+    fn begin_retry(&mut self, now: u64) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now.saturating_add(SAFETY_MUTE_RETRY_MS);
+        true
+    }
+    fn control(&self) -> net::MicControl {
+        net::MicControl {
+            group_id: self.group.to_vec(),
+            request_id: self.request.to_vec(),
+            expected_revision: self.revision,
+            op: MicControlOp::SetMute as i32,
+            muted: true,
+            press_id: Vec::new(),
+            challenge: 0,
+            expires_ns: 0,
+        }
+    }
+}
 #[derive(Default)]
 pub(super) struct State {
     authority: Authority,
@@ -78,6 +108,7 @@ pub(super) struct State {
     native_worker_generation: Option<[u8; 16]>,
     outbound: BTreeMap<[u8; 16], (fsm::Parent, Request, u64)>,
     remote: Option<Remote>,
+    safety_mute: Option<SafetyMute>,
     held: Option<Held>,
     native_expires: u64,
     native_press: Option<[u8; 16]>,
@@ -99,6 +130,31 @@ pub(super) struct State {
     warned_native_orphan: bool,
 }
 impl State {
+    fn pending_mute(&self, parent: fsm::Parent, request: [u8; 16]) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.muted == Some(true)
+                && matches!(&pending.reply, Reply::Network(owner, id)
+                    if *owner == parent && id.as_slice() == request.as_slice())
+        })
+    }
+    fn acknowledge_safety_mute(
+        &mut self,
+        parent: fsm::Parent,
+        request: [u8; 16],
+        code: ResultCode,
+    ) {
+        if let Some(pending) = self
+            .safety_mute
+            .as_mut()
+            .filter(|pending| pending.parent == parent && pending.request == request)
+        {
+            if matches!(code, ResultCode::Ok | ResultCode::ConsentRequired) {
+                self.safety_mute = None;
+            } else {
+                pending.replace_request = true;
+            }
+        }
+    }
     fn ptt_outcome(
         &mut self,
         worker_generation: [u8; 16],
@@ -175,7 +231,7 @@ impl State {
             self.native_parent = None;
             self.native_expires = 0;
         }
-        self.native_status = Some(status.clone());
+        self.native_status = Some(*status);
         true
     }
     fn native_arming(&self) -> Option<i32> {
@@ -287,7 +343,11 @@ impl State {
         if revision != current {
             return Err(ResultCode::StaleRevision);
         }
-        if self.pending.is_some() || self.pending_release.is_some() || self.outbound.len() >= 16 {
+        if self.pending.is_some()
+            || self.pending_release.is_some()
+            || self.safety_mute.is_some()
+            || self.outbound.len() >= 16
+        {
             return Err(ResultCode::Busy);
         }
         Ok(())
@@ -544,9 +604,7 @@ impl Actor {
             let _ = w.handle.configure_ptt(None, Vec::new()).await;
             if self.config.role == config::AudioRole::Listener {
                 if let Err(error) = w.handle.release_mic_mute().await {
-                    if self.native_privacy_failure(&error) {
-                        return;
-                    }
+                    self.native_privacy_failure(&error);
                 }
             }
         }
@@ -690,6 +748,17 @@ impl Actor {
     }
     /// Call after sync_links; native privacy effects are drained on the next tick.
     pub(super) fn mic_on_parents_changed(&mut self) {
+        if self.mic.safety_mute.as_ref().is_some_and(|pending| {
+            self.config.role != config::AudioRole::Source
+                || !self.mic_configured()
+                || self
+                    .config
+                    .group_id
+                    .is_none_or(|group| group.0 != pending.group)
+                || !self.mic_parent_allowed(pending.parent)
+        }) {
+            self.mic.safety_mute = None;
+        }
         let local = self.mic_local_parent([0; 16]);
         let enabled = self.mic_enabled();
         let links = &self.links;
@@ -859,8 +928,38 @@ impl Actor {
         }
         self.dirty = true;
     }
+    async fn mic_save(&self, config: config::AudioConfig) -> Result<(), Code> {
+        tracing::info!(
+            desired_muted = config.microphone.muted,
+            "microphone configuration persistence started"
+        );
+        self.save(config).await
+    }
+    async fn mic_retry_safety_mute(&mut self) {
+        self.mic_on_parents_changed();
+        let now = self.now();
+        let Some(pending) = self.mic.safety_mute.as_mut() else {
+            return;
+        };
+        if !pending.begin_retry(now) {
+            return;
+        }
+        let parent = pending.parent;
+        let request = if pending.replace_request {
+            self.mic_next_id(parent.connection_id)
+        } else {
+            pending.request
+        };
+        let pending = self.mic.safety_mute.as_mut().unwrap();
+        pending.request = request;
+        pending.replace_request = false;
+        let control = pending.control();
+        self.mic_send(parent, net::audio_control::Body::MicControl(control))
+            .await;
+    }
     pub(super) async fn mic_gui_safety(&mut self, mute: bool) {
         self.mic_bind_native_worker();
+        self.mic_on_parents_changed();
         let now = host_ns().unwrap_or(u64::MAX);
         self.mic.fence_holds(now);
         self.mic.authority.release_all();
@@ -868,28 +967,45 @@ impl Actor {
             self.config.microphone.muted = true;
             self.mic.set_local_intent(true);
             self.mic.recovery = None;
+            if self.config.role == config::AudioRole::Source && self.mic.safety_mute.is_none() {
+                if let Some(((parent, revision), group)) = self
+                    .mic
+                    .remote
+                    .as_ref()
+                    .map(|remote| (remote.parent, remote.state.revision))
+                    .filter(|(parent, _)| self.mic_parent_allowed(*parent))
+                    .zip(self.config.group_id)
+                {
+                    let request = self.mic_next_id(parent.connection_id);
+                    self.mic.safety_mute = Some(SafetyMute {
+                        parent,
+                        group: group.0,
+                        request,
+                        revision,
+                        next: self.now(),
+                        replace_request: false,
+                    });
+                }
+            }
         }
         if let Some(pending) = self.mic.take_activation(mute) {
             self.mic_reply(pending.reply, ResultCode::Cancelled).await;
         }
-        if self.mic_effect(Effect::ReleaseAll, now).await {
-            return;
-        }
-        if self.config.role == config::AudioRole::Source {
-            if let Some(parent) = self.mic.remote.as_ref().map(|remote| remote.parent) {
-                self.mic_source_control(
-                    parent,
-                    [0; 16],
-                    if mute {
-                        Op::SetMute(true)
-                    } else {
-                        Op::ReleaseAll
-                    },
-                )
-                .await;
+        self.mic_retry_safety_mute().await;
+        if !self.mic_effect(Effect::ReleaseAll, now).await {
+            if self.config.role == config::AudioRole::Source {
+                if !mute {
+                    if let Some(parent) = self.mic.remote.as_ref().map(|remote| remote.parent) {
+                        self.mic_source_control(parent, [0; 16], Op::ReleaseAll)
+                            .await;
+                    }
+                }
+            } else if mute {
+                self.mic_effect(Effect::SetMute(true), now).await;
             }
-        } else if mute && self.mic_effect(Effect::SetMute(true), now).await {
-            return;
+        }
+        if mute && self.mic_save(self.config.clone()).await.is_err() {
+            tracing::warn!("microphone safety mute persistence failed");
         }
         self.dirty = true;
     }
@@ -916,22 +1032,32 @@ impl Actor {
             reply(&request, gui_result(code)).await;
             return;
         }
-        if self.mic.outbound.len() >= 16 {
-            if let Some((_, (_, r, _))) = self.mic.outbound.pop_first() {
-                reply(&r, gui_result(ResultCode::Cancelled)).await;
-            }
-        }
         let connection = request.connection_id;
-        let press = if op == Op::Press {
-            if self.mic.held.is_some() {
-                reply(&request, gui_result(ResultCode::Conflict)).await;
+        if op == Op::Press && self.mic.held.is_some() {
+            reply(&request, gui_result(ResultCode::Conflict)).await;
+            return;
+        }
+        let listener_now = if self.config.role == config::AudioRole::Listener {
+            let admissible = self.mic_ready()
+                || op == Op::ReleaseAll
+                || (op == Op::SetMute(true)
+                    && self
+                        .mic
+                        .endpoint
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.guard_active));
+            if !admissible {
+                reply(&request, gui_result(self.mic_state_reason())).await;
                 return;
             }
-            self.mic_next_id(connection)
+            let Some(now) = host_ns() else {
+                reply(&request, gui_result(ResultCode::Disabled)).await;
+                return;
+            };
+            Some(now)
         } else {
-            self.mic.held.as_ref().map(|h| h.press).unwrap_or([0; 16])
+            None
         };
-        let request_id = self.mic_next_id(connection);
         let parent = if self.config.role == config::AudioRole::Listener {
             self.mic_local_parent(connection)
         } else {
@@ -939,8 +1065,24 @@ impl Actor {
                 reply(&request, gui_result(ResultCode::DeviceGone)).await;
                 return;
             };
-            remote.parent
+            let parent = remote.parent;
+            if !self.mic_parent_allowed(parent) {
+                reply(&request, gui_result(ResultCode::ConsentRequired)).await;
+                return;
+            }
+            parent
         };
+        if self.mic.outbound.len() >= 16 {
+            if let Some((_, (_, r, _))) = self.mic.outbound.pop_first() {
+                reply(&r, gui_result(ResultCode::Cancelled)).await;
+            }
+        }
+        let press = if op == Op::Press {
+            self.mic_next_id(connection)
+        } else {
+            self.mic.held.as_ref().map(|h| h.press).unwrap_or([0; 16])
+        };
+        let request_id = self.mic_next_id(connection);
         if matches!(op, Op::SetMute(_) | Op::ReleaseAll) {
             self.mic.take_holds();
         }
@@ -959,11 +1101,6 @@ impl Actor {
             let Some(remote) = &self.mic.remote else {
                 return;
             };
-            if !self.mic_parent_allowed(parent) {
-                self.mic.held = None;
-                reply(&request, gui_result(ResultCode::ConsentRequired)).await;
-                return;
-            }
             let c = net::MicControl {
                 group_id: remote.state.group_id.clone(),
                 request_id: request_id.to_vec(),
@@ -993,10 +1130,7 @@ impl Actor {
             self.mic_send(parent, net::audio_control::Body::MicControl(c))
                 .await;
         } else {
-            let Some(now) = host_ns() else {
-                reply(&request, gui_result(ResultCode::Disabled)).await;
-                return;
-            };
+            let now = listener_now.unwrap();
             let (challenge, expires_ns) = self.mic.authority.challenge(now);
             let c = Control {
                 request: request_id,
@@ -1006,7 +1140,8 @@ impl Actor {
                 challenge,
                 expires_ns,
             };
-            self.mic_apply(now, parent, c, Reply::Gui(request)).await;
+            self.mic_apply(now, parent, c, Reply::Gui(Box::new(request)))
+                .await;
         }
     }
     fn mic_warn_refusal(&mut self, code: ResultCode, revision_matches: bool) {
@@ -1031,6 +1166,9 @@ impl Actor {
         );
     }
     async fn mic_apply(&mut self, now: u64, parent: fsm::Parent, c: Control, to: Reply) {
+        if c.op == Op::SetMute(true) && self.mic.pending_mute(parent, c.request) {
+            return;
+        }
         self.mic_on_parents_changed();
         if let Some(effect) = self.mic.privacy_effect.take() {
             if self.mic_effect(effect, now).await {
@@ -1073,7 +1211,14 @@ impl Actor {
         let enabled = self.mic_enabled();
         let consent = local || self.mic_parent_allowed(parent);
         let previous_expiry = self.mic.authority.grant.map(|g| g.expires_ns);
-        let decision = self.mic.authority.decide(now, parent, enabled, consent, c);
+        let mut decision = self.mic.authority.decide(now, parent, enabled, consent, c);
+        if c.op == Op::SetMute(true)
+            && decision.effect == Effect::None
+            && decision.result == policy::ResultCode::Ok
+            && !self.mic_ready()
+        {
+            decision.effect = Effect::SetMute(true);
+        }
         if decision.result != policy::ResultCode::Ok {
             if matches!(c.op, Op::Press | Op::Renew) {
                 self.mic_warn_refusal(
@@ -1355,6 +1500,7 @@ impl Actor {
                     return;
                 };
                 let code = ResultCode::try_from(a.result).unwrap_or(ResultCode::Invalid);
+                self.mic.acknowledge_safety_mute(parent, key, code);
                 if code != ResultCode::Ok
                     && (self
                         .mic
@@ -1504,23 +1650,46 @@ impl Actor {
                         self.mic.recovery_error = None;
                         ResultCode::Ok
                     } else {
+                        let safety_generation = self.applied_gui_safety;
                         let mut next = self.config.clone();
                         next.microphone.muted = desired;
-                        let saved = self.save(next.clone()).await;
-                        if saved.is_ok() || desired {
-                            // Observed safety mute survives disk failure and child recovery.
-                            self.config = next;
-                            self.mic.set_local_intent(desired);
-                            self.mic.recovered = true;
-                            self.mic.recovery_error = None;
-                        } else {
-                            if p.previous {
-                                self.mic_bind_native_worker();
-                                self.mic.fence_holds(host_ns().unwrap_or(u64::MAX));
+                        let saved = self.mic_save(next.clone()).await;
+                        self.sync_gui_safety().await;
+                        let superseded;
+                        {
+                            // Order the local commit against a concurrently raised mute latch.
+                            let latch = self.gui_safety.borrow();
+                            superseded = !desired && latch.pending(safety_generation) == Some(true);
+                            if !superseded {
+                                if saved.is_ok() || desired {
+                                    self.config = next;
+                                    self.mic.set_local_intent(desired);
+                                    self.mic.recovered = true;
+                                    self.mic.recovery_error = None;
+                                } else {
+                                    self.mic
+                                        .authority
+                                        .set_local_muted(self.config.microphone.muted);
+                                }
                             }
+                        }
+                        if superseded {
+                            self.sync_gui_safety().await;
+                            if let Err(error) = saved {
+                                if let Reply::Gui(request) = p.reply {
+                                    reply(&request, Err(error)).await;
+                                }
+                            } else {
+                                self.mic_reply(p.reply, ResultCode::Cancelled).await;
+                            }
+                            return;
+                        }
+                        if saved.is_err() && !desired && p.previous {
+                            self.mic_bind_native_worker();
+                            self.mic.fence_holds(host_ns().unwrap_or(u64::MAX));
                             if let Some(w) = &self.worker {
                                 if let Err(error) =
-                                    w.handle.set_mic_mute(snapshot.generation, p.previous).await
+                                    w.handle.set_mic_mute(snapshot.generation, true).await
                                 {
                                     if self.native_privacy_failure(&error) {
                                         self.mic_reply(p.reply, ResultCode::DeviceGone).await;
@@ -1528,9 +1697,6 @@ impl Actor {
                                     }
                                 }
                             }
-                            self.mic
-                                .authority
-                                .set_local_muted(self.config.microphone.muted);
                         }
                         if let Err(error) = saved {
                             if let Reply::Gui(request) = p.reply {
@@ -1652,6 +1818,7 @@ impl Actor {
         }
     }
     pub(super) async fn mic_tick(&mut self) {
+        self.mic_retry_safety_mute().await;
         self.mic_on_parents_changed();
         if let Some(effect) = self.mic.privacy_effect.take() {
             if self.mic_effect(effect, host_ns().unwrap_or(u64::MAX)).await {
@@ -1727,10 +1894,11 @@ impl Actor {
                     }
                     self.mic.configured = None;
                     self.mic.authority.ptt_enabled = self.config.microphone.ptt_enabled;
-                    if self.config.role == config::AudioRole::Listener && self.mic.mute_on_lock() {
-                        if self.mic_effect(Effect::SetMute(true), now).await {
-                            return;
-                        }
+                    if self.config.role == config::AudioRole::Listener
+                        && self.mic.mute_on_lock()
+                        && self.mic_effect(Effect::SetMute(true), now).await
+                    {
+                        return;
                     }
                     self.mic.lock_paused = true;
                 }
@@ -1988,6 +2156,9 @@ impl Actor {
         .await;
     }
     async fn mic_source_control(&mut self, parent: fsm::Parent, press: [u8; 16], op: Op) {
+        if matches!(op, Op::Press | Op::Renew) && self.mic.safety_mute.is_some() {
+            return;
+        }
         if !self.mic_parent_allowed(parent) {
             return;
         }
@@ -2034,9 +2205,7 @@ impl Actor {
                 .is_some_and(|g| g.parent == parent && g.press == press)
             {
                 let e = self.mic.authority.revoke();
-                if self.mic_effect(e, now).await {
-                    return;
-                }
+                self.mic_effect(e, now).await;
             }
         }
     }
@@ -2061,9 +2230,7 @@ impl Actor {
                 expires_ns,
             };
             let d = self.mic.authority.decide(now, parent, true, true, c);
-            if self.mic_effect(d.effect, now).await {
-                return;
-            }
+            self.mic_effect(d.effect, now).await;
         }
     }
 }
@@ -2133,6 +2300,157 @@ fn reserved_hotkeys(bindings: &config::HotkeyBindings) -> Result<Vec<worker::Ptt
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn safety_mute() -> SafetyMute {
+        SafetyMute {
+            parent: fsm::Parent {
+                peer: [1; 32],
+                connection_id: [2; 16],
+                generation: [3; 16],
+            },
+            group: [4; 16],
+            request: id(1, [2; 16]),
+            revision: 7,
+            next: 0,
+            replace_request: false,
+        }
+    }
+    #[test]
+    fn safety_mute_retry_is_constant_state_same_id_and_at_most_once_per_100ms() {
+        let mut pending = safety_mute();
+        let request = pending.request;
+        for now in [0, 100, 200] {
+            assert!(pending.begin_retry(now));
+            assert!(!pending.begin_retry(now));
+            assert!(!pending.begin_retry(now + 99));
+            assert_eq!(pending.next, now + 100);
+            assert_eq!(pending.request, request);
+            let control = pending.control();
+            assert_eq!(control.request_id, request);
+            assert_eq!(control.group_id, pending.group);
+            assert_eq!(control.expected_revision, 7);
+            assert_eq!(control.op, MicControlOp::SetMute as i32);
+            assert!(control.muted);
+            assert!(control.press_id.is_empty());
+            assert_eq!(control.challenge, 0);
+            assert_eq!(control.expires_ns, 0);
+        }
+    }
+    #[test]
+    fn safety_mute_requires_matching_ack_and_survives_own_child_reset() {
+        let mut state = State::default();
+        let pending = safety_mute();
+        let parent = pending.parent;
+        let request = pending.request;
+        state.safety_mute = Some(pending);
+        state.acknowledge_safety_mute(parent, id(2, parent.connection_id), ResultCode::Ok);
+        let replacement = fsm::Parent {
+            generation: [5; 16],
+            ..parent
+        };
+        state.acknowledge_safety_mute(replacement, request, ResultCode::Ok);
+        assert!(state.safety_mute.is_some());
+        state.update_remote(
+            parent,
+            &net::MicState {
+                group_id: [4; 16].to_vec(),
+                revision: 7,
+                muted: true,
+                ..Default::default()
+            },
+            0,
+            0,
+        );
+        assert!(state.safety_mute.is_some());
+        assert_eq!(state.gui_activation(Op::Press, 7, 7), Err(ResultCode::Busy));
+        assert_eq!(
+            state.gui_activation(Op::SetMute(false), 7, 7),
+            Err(ResultCode::Busy)
+        );
+        assert_eq!(state.gui_activation(Op::SetMute(true), 0, 7), Ok(()));
+        assert_eq!(state.gui_activation(Op::ReleaseAll, 0, 7), Ok(()));
+        state.bind_native_worker([6; 16]);
+        state.authority.reset();
+        state.remote = None;
+        state.bind_native_worker([7; 16]);
+        assert_eq!(state.safety_mute.as_ref().unwrap().parent, parent);
+        assert_eq!(state.safety_mute.as_ref().unwrap().request, request);
+        assert_eq!(state.safety_mute.as_ref().unwrap().group, [4; 16]);
+        state.acknowledge_safety_mute(parent, request, ResultCode::DeviceGone);
+        assert!(state.safety_mute.as_ref().unwrap().replace_request);
+        state.acknowledge_safety_mute(parent, request, ResultCode::Ok);
+        assert!(state.safety_mute.is_none());
+        assert_eq!(state.gui_activation(Op::Press, 7, 7), Ok(()));
+        state.safety_mute = Some(safety_mute());
+        state.acknowledge_safety_mute(parent, request, ResultCode::ConsentRequired);
+        assert!(state.safety_mute.is_none());
+    }
+    #[test]
+    fn pending_duplicate_safety_mute_cannot_complete_before_native_outcome() {
+        let pending = safety_mute();
+        let parent = pending.parent;
+        let control = Control {
+            request: pending.request,
+            revision: 7,
+            op: Op::SetMute(true),
+            press: [0; 16],
+            challenge: 0,
+            expires_ns: 0,
+        };
+        let mut state = State::default();
+        assert_eq!(
+            state
+                .authority
+                .decide(0, parent, true, true, control)
+                .effect,
+            Effect::SetMute(true)
+        );
+        state.pending = Some(PendingMic {
+            reply: Reply::Network(parent, control.request.to_vec()),
+            worker_generation: [5; 16],
+            request: 9,
+            deadline: 1000,
+            muted: Some(true),
+            previous: false,
+            endpoint_generation: 1,
+        });
+        assert!(state.pending_mute(parent, control.request));
+        assert!(!state.pending_mute(parent, id(2, parent.connection_id)));
+        assert!(!state.pending_mute(
+            fsm::Parent {
+                generation: [6; 16],
+                ..parent
+            },
+            control.request
+        ));
+        assert_eq!(
+            state
+                .authority
+                .decide(1, parent, true, true, control)
+                .effect,
+            Effect::None,
+            "the accepted decision cache alone is not native confirmation"
+        );
+        assert_eq!(state.pending.as_ref().unwrap().request, 9);
+        state.pending = None;
+        state
+            .authority
+            .complete(parent, control.request, policy::ResultCode::DeviceGone);
+        assert_eq!(
+            state
+                .authority
+                .decide(2, parent, true, true, control)
+                .result,
+            policy::ResultCode::DeviceGone
+        );
+        let retry = Control {
+            request: id(2, parent.connection_id),
+            ..control
+        };
+        assert_eq!(
+            state.authority.decide(3, parent, true, true, retry).effect,
+            Effect::SetMute(true)
+        );
+    }
     #[test]
     fn correlated_release_ack_completes_without_native_epoch_proof_or_persistent_cancellation() {
         let parent = fsm::Parent {
@@ -2844,9 +3162,11 @@ mod tests {
     }
     #[test]
     fn global_release_fence_rejects_queued_native_edges_and_ownerless_renewals() {
-        let mut state = State::default();
-        state.native_press = Some([1; 16]);
-        state.native_expires = 200;
+        let mut state = State {
+            native_press: Some([1; 16]),
+            native_expires: 200,
+            ..Default::default()
+        };
         state.fence_holds(100);
         assert!(state.observe_native_status(&worker::PttStatus {
             state: worker::PttArmingState::Armed as i32,
@@ -2893,34 +3213,36 @@ mod tests {
                 generation: [3; 16],
             };
             let (out, _receive) = mpsc::channel(1);
-            let mut state = State::default();
-            state.held = Some(Held {
-                connection: [4; 16],
-                out: out.clone(),
-                press: [5; 16],
-                parent,
-                next: 100,
-            });
-            state.native_parent = Some(parent);
-            state.native_press = Some([6; 16]);
-            state.native_expires = 250_000_000;
-            state.pending = Some(PendingMic {
-                reply: Reply::Gui(Request {
-                    request_id: 1,
-                    connection_id: [4; 16],
-                    message: gui::gui_frame::Msg::SetPtt(gui::SetPtt {
-                        pressed: true,
-                        expected_revision: 7,
-                    }),
-                    out,
+            let mut state = State {
+                held: Some(Held {
+                    connection: [4; 16],
+                    out: out.clone(),
+                    press: [5; 16],
+                    parent,
+                    next: 100,
                 }),
-                worker_generation: [7; 16],
-                request: 1,
-                deadline: 1000,
-                muted: None,
-                previous: true,
-                endpoint_generation: 1,
-            });
+                native_parent: Some(parent),
+                native_press: Some([6; 16]),
+                native_expires: 250_000_000,
+                pending: Some(PendingMic {
+                    reply: Reply::Gui(Box::new(Request {
+                        request_id: 1,
+                        connection_id: [4; 16],
+                        message: gui::gui_frame::Msg::SetPtt(gui::SetPtt {
+                            pressed: true,
+                            expected_revision: 7,
+                        }),
+                        out,
+                    })),
+                    worker_generation: [7; 16],
+                    request: 1,
+                    deadline: 1000,
+                    muted: None,
+                    previous: true,
+                    endpoint_generation: 1,
+                }),
+                ..Default::default()
+            };
             assert_eq!(
                 state.gui_activation(Op::SetMute(false), if stale { 6 } else { 7 }, 7),
                 Err(if stale {
@@ -2956,17 +3278,19 @@ mod tests {
             generation: [3; 16],
         };
         let (out, _receive) = mpsc::channel(1);
-        let mut state = State::default();
-        state.held = Some(Held {
-            connection: [4; 16],
-            out,
-            press: [5; 16],
-            parent,
-            next: 100,
-        });
-        state.native_parent = Some(parent);
-        state.native_press = Some([6; 16]);
-        state.native_expires = 250_000_000;
+        let mut state = State {
+            held: Some(Held {
+                connection: [4; 16],
+                out,
+                press: [5; 16],
+                parent,
+                next: 100,
+            }),
+            native_parent: Some(parent),
+            native_press: Some([6; 16]),
+            native_expires: 250_000_000,
+            ..Default::default()
+        };
         assert_eq!(
             state.take_holds(),
             [Some((parent, [5; 16])), Some((parent, [6; 16]))]
@@ -3338,18 +3662,20 @@ mod tests {
             expires_ns,
         };
         authority.decide(50_000_000, parent, true, true, press);
-        let mut source = State::default();
-        source.remote = Some(Remote {
-            parent,
-            state: net::MicState {
-                revision: authority.revision,
-                challenge,
-                expires_ns,
-                supported: true,
-                ptt_enabled: true,
-                ..Default::default()
-            },
-        });
+        let mut source = State {
+            remote: Some(Remote {
+                parent,
+                state: net::MicState {
+                    revision: authority.revision,
+                    challenge,
+                    expires_ns,
+                    supported: true,
+                    ptt_enabled: true,
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
         let (out, _receive) = mpsc::channel(1);
         source.held = Some(Held {
             connection: [4; 16],

@@ -2480,7 +2480,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 545] = [
+    pub const EVERY: [Key; 554] = [
         Key::AudioHide,
         Key::AudioPlayer,
         Key::AudioSettings,

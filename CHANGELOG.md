@@ -10,9 +10,14 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Live audio health updates no longer invalidate settings, start or gain actions. Stale configuration/consent changes, future snapshots and A→B→A edits remain rejected without automatic retries.
 - Latch microphone mute/PTT release before bounded GUI admission, so continued polling cannot keep an old hold alive after queue saturation. Rejected stale/busy unmute requests leave legitimate holds untouched.
+- Correlate emergency PTT release completion by worker/request identity without treating a command acknowledgement as native rearming proof.
+- Never reopen an endpoint as failed-unmute rollback; persist queue-saturated safety mutes and retain muted runtime recovery intent when saving fails.
+- Retry only unconfirmed Source safety mutes on the same live consented link; stale activation and unmute are never retried.
 - Keep an observed safety mute and its runtime recovery intent even when configuration persistence fails; report the write error without reopening the microphone.
 - Preserve absent/automatic/manual group-policy states through TOML, IPC and GUI edits; legacy Source pins survive restart instead of silently becoming automatic.
 - Treat zero native media token/revision as stale/unavailable, never an implicit current session; preserve a typed operation failure without executing a child command.
+- Refuse unauthorized media commands before validating native target identity; authorized commands still require a real nonzero session token and revision.
+- Explicit command-line pairing rejection or EOF cancellation exits unsuccessfully with the rejection reason, rather than reporting success.
 - Starting a newer pairing ceremony cancels the previous pending SAS exchange on both computers. Old prompts, confirmations and delayed dial results cannot approve or replace the newest attempt; existing window/handshake budgets remain in force. Pairing outcome IPC now carries the ceremony identity and cancellation code for correlated clients.
 - GUI pairing results are matched to the visible ceremony, including after its answer acknowledgement. Superseded confirmations cannot close a newer prompt; cancellation is explained in English and Russian instead of exposing a raw error code.
 - Superseded pairing attempts show a neutral informational notice without a failure prefix. The audio-settings headphones and popup-player speaker now have distinct sidebar glyphs, tooltips and accessible button names.
@@ -148,9 +153,14 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Обновления аудиометрик больше не мешают настройкам, запуску и громкости. Устаревшие изменения конфигурации/разрешений, будущие снимки и возврат A→B→A по-прежнему отклоняются без автоматических повторов.
 - Фиксировать выключение микрофона и отпускание PTT до ограниченной очереди GUI: опрос состояния не продлевает старое удержание при переполнении. Отклонённое устаревшее или занятое включение не отменяет действующее удержание.
+- Сопоставлять подтверждение аварийного отпускания PTT с процессом и запросом, не принимая ответ на команду за доказательство готовности горячей клавиши.
+- Не включать микрофон при откате неудачного сохранения unmute; сохранять аварийное mute при переполнении очереди и безопасное состояние восстановления при ошибке записи.
+- Повторять только неподтверждённое аварийное mute Source в том же живом соединении с действующим разрешением; устаревшие включения и unmute не повторяются.
 - Сохранять подтверждённое выключение микрофона и безопасное состояние восстановления при ошибке записи конфигурации; сообщать об ошибке, не включая микрофон обратно.
 - Сохранять отсутствие, автоматический и ручной режим группы при записи TOML, обмене IPC и изменениях GUI; старые ручные группы Source переживают перезапуск.
 - Нулевые идентификатор или ревизия медиасессии означают недоступную/устаревшую цель, а не выбор текущей: команда дочернему процессу не выполняется, GUI получает служебный код отказа.
+- Отклонять медиакоманды без разрешения до проверки нативной цели; разрешённые команды по-прежнему требуют реальные ненулевые идентификатор и ревизию сессии.
+- Явный отказ от сопряжения в командной строке или отмена через EOF завершаются ошибкой с причиной, а не успешным кодом выхода.
 - Новая попытка сопряжения отменяет предыдущую незавершённую сверку SAS на обоих компьютерах. Старые запросы, подтверждения и запоздавшие результаты подключения не могут подтвердить или подменить новую попытку; ограничения окна и числа подключений сохранены. IPC результата сопряжения дополнен идентификатором церемонии и кодом отмены для клиентов с проверкой соответствия.
 - GUI сопоставляет результаты сопряжения с текущей церемонией, в том числе после подтверждения отправки ответа. Запоздавшие подтверждения не закрывают новый код; отмена объясняется по-русски и по-английски вместо показа служебного кода ошибки.
 - Отменённая предыдущая попытка сопряжения показывается нейтральным уведомлением без префикса ошибки. Настройки звука отмечены наушниками, мини-плеер — динамиком; у кнопок боковой панели разные подсказки и доступные имена.

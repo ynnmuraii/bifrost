@@ -162,3 +162,132 @@ fn disabled_request_policy_survives_restart_and_refuses_without_prompt() {
     wait_line(&two.b, "pair-request-status", "disabled");
     assert_eq!(two.a.ctl("pair-request-prompt").unwrap(), "OK none");
 }
+
+#[cfg(target_os = "linux")]
+mod cli {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct PairCli {
+        root: PathBuf,
+        child: Child,
+    }
+
+    impl PairCli {
+        fn start(args: &[&str]) -> Self {
+            let root = super::common::unique_dir("pair-cli-rejection");
+            let output = std::fs::File::create(root.join("cli.log")).unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+                .arg("--root")
+                .arg(&root)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(output.try_clone().unwrap()))
+                .stderr(Stdio::from(output))
+                .spawn()
+                .expect("pair CLI starts without a core or agent");
+            Self { root, child }
+        }
+
+        fn output(&self) -> String {
+            std::fs::read_to_string(self.root.join("cli.log")).unwrap()
+        }
+
+        fn until(&mut self, expected: &str) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !self.output().contains(expected) {
+                assert!(
+                    self.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                    "waiting for {expected:?}: {}",
+                    self.output()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn answer(&mut self, answer: &[u8]) {
+            // Keep stdin open so explicit rejection cannot be confused with EOF.
+            self.child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(answer)
+                .unwrap();
+        }
+
+        fn finish(&mut self) -> ExitStatus {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pairing must terminate promptly: {}",
+                    self.output()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for PairCli {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn rejection_and_eof_exit_nonzero_without_trust_on_either_side() {
+        for reject_opener in [false, true] {
+            for eof in [false, true] {
+                let [port] = super::common::distinct_ports();
+                let address = format!("127.0.0.1:{port}");
+                let mut opener = PairCli::start(&["pair", "--open", "--listen", &address]);
+                opener.until("waiting for a peer to dial");
+                let mut dialer = PairCli::start(&["pair", "--dial", &address]);
+                opener.until("codes match? [y/N]");
+                dialer.until("codes match? [y/N]");
+                let (rejecting, approving) = if reject_opener {
+                    (&mut opener, &mut dialer)
+                } else {
+                    (&mut dialer, &mut opener)
+                };
+                approving.answer(b"y\n");
+                if eof {
+                    drop(rejecting.child.stdin.take());
+                } else {
+                    rejecting.answer(b"n\n");
+                }
+                assert_eq!(rejecting.finish().code(), Some(1), "{}", rejecting.output());
+                assert!(
+                    rejecting
+                        .output()
+                        .contains("pairing rejected: UserRejected"),
+                    "{}",
+                    rejecting.output()
+                );
+                assert_eq!(approving.finish().code(), Some(1), "{}", approving.output());
+                assert!(
+                    approving
+                        .output()
+                        .contains("pairing rejected: PeerRejected"),
+                    "{}",
+                    approving.output()
+                );
+                for cli in [&opener, &dialer] {
+                    assert!(
+                        !cli.root.join("config/trust.toml").exists(),
+                        "rejection must not write trust: {}",
+                        cli.output()
+                    );
+                    assert!(!cli.output().contains("paired with"), "{}", cli.output());
+                }
+            }
+        }
+    }
+}

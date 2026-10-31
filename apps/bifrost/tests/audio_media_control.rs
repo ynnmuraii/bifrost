@@ -151,6 +151,16 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
         listener.request(command(&source_id, &session_id, &initial, requested)),
         ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
     );
+    // Permission denial takes precedence over absent native targeting facts.
+    for (token, revision) in [(0, initial.revision), (initial.session_token, 0), (0, 0)] {
+        let mut unavailable = initial.clone();
+        unavailable.session_token = token;
+        unavailable.revision = revision;
+        denied(
+            listener.request(command(&source_id, &session_id, &unavailable, requested)),
+            ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
+        );
+    }
     let after_denial = media(&mut listener, &session_id);
     assert_eq!(after_denial.session_token, initial.session_token);
     assert_eq!(after_denial.revision, initial.revision);
@@ -294,6 +304,19 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
         listener.request(command(&source_id, &session_id, &current, requested)),
         ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
     );
+    denied(
+        listener.request(command(&source_id, &session_id, &stale, requested)),
+        ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
+    );
+    for (token, revision) in [(0, current.revision), (current.session_token, 0), (0, 0)] {
+        let mut unavailable = current.clone();
+        unavailable.session_token = token;
+        unavailable.revision = revision;
+        denied(
+            listener.request(command(&source_id, &session_id, &unavailable, requested)),
+            ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
+        );
+    }
     let after_withdrawal = media(&mut listener, &session_id);
     assert_eq!(after_withdrawal.revision, current.revision);
     assert_eq!(after_withdrawal.playback, current.playback);

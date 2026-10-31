@@ -3198,8 +3198,10 @@ fn gui_connection_live(
     !closed
         && !locked
         && last_seen.is_some_and(|at| {
-            now.checked_duration_since(at)
-                .is_some_and(|age| age <= GUI_SILENCE)
+            at <= now
+                && now
+                    .checked_duration_since(at)
+                    .is_some_and(|age| age <= GUI_SILENCE)
         })
 }
 
@@ -3508,7 +3510,7 @@ mod observation_tests {
         let boundary = Some(now - GUI_SILENCE);
         assert!(gui_connection_live(boundary, now, false, false));
         assert!(!gui_connection_live(
-            Some(now - GUI_SILENCE - Duration::from_nanos(1)),
+            Some(now - GUI_SILENCE - Duration::from_millis(1)),
             now,
             false,
             false
@@ -3516,12 +3518,15 @@ mod observation_tests {
         assert!(!gui_connection_live(Some(now), now, true, false));
         assert!(!gui_connection_live(Some(now), now, false, true));
         assert!(!gui_connection_live(None, now, false, false));
-        assert!(!gui_connection_live(
-            Some(now + Duration::from_nanos(1)),
-            now,
-            false,
-            false
-        ));
+        // One supplied time boundary, not a race against a second clock read.
+        // Some platforms round a tiny positive duration to zero; ordering must
+        // still reject a future observation before computing its age.
+        for nanos in [1, 10, 100, 1_000_000] {
+            let future = now + Duration::from_nanos(nanos);
+            if future > now {
+                assert!(!gui_connection_live(Some(future), now, false, false));
+            }
+        }
     }
 
     #[test]

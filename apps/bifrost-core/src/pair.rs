@@ -309,13 +309,8 @@ async fn confirm(
     let result = tokio::select! {
         biased;
         approved = input => {
-            let approved = approved?;
-            let result = ceremony.await;
-            if !approved {
-                println!("rejected; nothing was written");
-                return Ok(());
-            }
-            result
+            approved?;
+            ceremony.await
         }
         result = &mut ceremony => result,
     };
