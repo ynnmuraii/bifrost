@@ -25,6 +25,7 @@
 //! started as `bifrost agent …`), and it is the only role that listens on the network.
 
 mod agent;
+mod audio;
 mod clipboard;
 mod clipboard_history;
 mod clipboard_routing;
