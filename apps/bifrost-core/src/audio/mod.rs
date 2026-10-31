@@ -5,5 +5,6 @@
 mod supervisor;
 
 pub use supervisor::{
-    AudioHandle, AudioSupervisor, AudioSupervisorConfig, AudioSupervisorError, AudioSupervisorEvent,
+    AudioHandle, AudioPrivacyOperation, AudioRestartReason, AudioSupervisor, AudioSupervisorConfig,
+    AudioSupervisorError, AudioSupervisorEvent,
 };

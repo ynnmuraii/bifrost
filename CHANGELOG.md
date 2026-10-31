@@ -95,6 +95,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add Wayland GlobalShortcuts portal observation with both edges and 100 ms renewals of 250 ms leases; no binding occurs during availability probes. Missing portals and X11 remain honestly unsupported; X11 release observation is a later agent integration.
 - Add Pulse source mute with explicitly best-effort ownership: one matching change echo within 200 ms is attributable, while differing/late/ambiguous changes relinquish restoration. Owned-null-sink live tests cover set/restore/drop without touching defaults or audible endpoints.
 
+**Audio privacy admission and child lifetime**
+
+- Revoke metadata admission before bounded queueing, and give microphone mute/revoke/release a separate guard-owned priority path. Privacy reductions fence older queued openings; mailbox saturation fails closed and is surfaced as a typed fatal supervisor event.
+- Keep lifetime session/key tombstones intact, but retire the child at a soft 240-start budget before its 256-entry backstop. A typed restart-required outcome triggers bounded recycling; existing sessions fail and require fresh negotiation, never historical key replay.
+
 ### Русский
 
 **Исправления**
@@ -185,6 +190,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Добавлено наблюдение обеих границ Wayland GlobalShortcuts с продлением каждые 100 мс срока 250 мс; проверка доступности не создаёт привязку. Отсутствующий портал и X11 явно не поддерживаются; X11 release требует дальнейшей интеграции агента.
 - Заглушение источника Pulse использует явно best-effort владение: допускается одно совпадающее эхо за 200 мс, а отличающееся, позднее или неоднозначное изменение отменяет восстановление. Натурные тесты set/restore/drop используют только собственный null-sink, не трогая defaults и слышимые устройства.
+
+**Приватность аудио и срок жизни процесса**
+
+- Метаданные отзываются до ограниченной очереди, а mute/revoke/release микрофона идут отдельным приоритетным путём guard. Старые запросы открытия блокируются; переполнение закрывает разрешения и передаётся как типизированная фатальная ошибка надзора.
+- История ID/ключей не удаляется; после 240 запусков процесс переинициализируется до жёсткого предела 256. Типизированный запрос перезапуска ограничен бюджетом надзора; сеансы требуют нового согласования без повтора старых ключей.
 
 ## 0.4.0 — 2026-10-30
 

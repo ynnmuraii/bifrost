@@ -949,3 +949,18 @@ fn latency_health_bounds_each_observed_stage_and_preserves_unknown_native_depth(
         assert!(!valid(latency), "unbounded stage {index}");
     }
 }
+
+#[test]
+fn restart_required_is_an_append_only_bounded_private_error() {
+    for code in [-1, 0, 1, 8, 9, 10, i32::MAX] {
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::Error(w::Error {
+                code,
+                session_id: vec![1; 16],
+            })))
+            .is_ok(),
+            (1..=9).contains(&code),
+        );
+    }
+    assert_eq!(w::ErrorCode::RestartRequired as i32, 9);
+}

@@ -6,12 +6,13 @@ pub(super) enum Script {
     Event(ScriptEvent),
     CompleteMedia,
     Stall(Duration),
+    Block(sync_mpsc::Sender<()>, sync_mpsc::Receiver<()>),
 }
 struct ScriptedBackend {
     dry: DryBackend,
     script: sync_mpsc::Receiver<Script>,
 }
-static FACTORIES: LazyLock<[Mutex<Option<ScriptedBackend>>; 2]> =
+static FACTORIES: LazyLock<[Mutex<Option<ScriptedBackend>>; 3]> =
     LazyLock::new(|| std::array::from_fn(|_| Mutex::new(None)));
 fn factory<const INDEX: usize>() -> Result<ScriptedBackend, BackendError> {
     lock(&FACTORIES[INDEX]).take().ok_or(BackendError::Stopped)
@@ -76,6 +77,10 @@ impl Backend for ScriptedBackend {
                 Ok(Script::Event(event)) => self.dry.apply(event).expect("valid Dry script"),
                 Ok(Script::CompleteMedia) => self.dry.pump_control(),
                 Ok(Script::Stall(duration)) => thread::sleep(duration),
+                Ok(Script::Block(entered, resume)) => {
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                }
                 Err(_) => break,
             }
         }
@@ -155,8 +160,10 @@ pub(super) async fn child(index: usize) -> (Fixture, sync_mpsc::Sender<Script>) 
         });
         let factory = if index == 0 {
             factory::<0>
-        } else {
+        } else if index == 1 {
             factory::<1>
+        } else {
+            factory::<2>
         };
         serve(link, 2, factory, Some(pump), None).await
     });
