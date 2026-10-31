@@ -3321,6 +3321,7 @@ dependencies = [
  "futures-timer",
  "pulseaudio",
  "rtrb",
+ "zbus",
  "zeroize",
 ]
 

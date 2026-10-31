@@ -19,7 +19,7 @@ use audio_model::{
 use std::{
     net::{SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -59,9 +59,11 @@ struct Relay {
     socket: UdpSocket,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    stateful_dropped: Arc<AtomicU64>,
+    listener_first: Arc<AtomicBool>,
 }
 impl Relay {
-    fn start(source: SocketAddr, listener: SocketAddr, loss: bool) -> Self {
+    fn start(source: SocketAddr, listener: SocketAddr, loss: bool, stateful: bool) -> Self {
         let socket = socket();
         socket
             .set_read_timeout(Some(Duration::from_millis(2)))
@@ -69,22 +71,39 @@ impl Relay {
         let worker_socket = socket.try_clone().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let running = stop.clone();
+        let stateful_dropped = Arc::new(AtomicU64::new(0));
+        let dropped = stateful_dropped.clone();
+        let listener_first = Arc::new(AtomicBool::new(false));
+        let first_is_listener = listener_first.clone();
         let worker = thread::spawn(move || {
             let mut packet = [0; MAX_DATAGRAM_LEN + 1];
             let mut rng = 17u64;
             let mut sequence = 0;
             let mut held = None::<Vec<u8>>;
+            let mut first = true;
+            let (mut source_outbound, mut listener_outbound) = (false, false);
             while !running.load(Ordering::Acquire) {
                 let Ok((n, peer)) = worker_socket.recv_from(&mut packet) else {
                     continue;
                 };
-                let target = if peer == source {
-                    listener
+                let (target, outbound_state) = if peer == source {
+                    source_outbound = true;
+                    (listener, listener_outbound)
                 } else if peer == listener {
-                    source
+                    listener_outbound = true;
+                    (source, source_outbound)
                 } else {
                     continue;
                 };
+                if first {
+                    first_is_listener.store(peer == listener, Ordering::Release);
+                    first = false;
+                }
+                // Each endpoint accepts this relay tuple only after its own outbound UDP.
+                if stateful && !outbound_state {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let is_media =
                     peer == source && n >= HEADER_LEN && packet[5] == PacketKind::Opus as u8;
                 if is_media && loss {
@@ -110,6 +129,8 @@ impl Relay {
             socket,
             stop,
             thread: Some(worker),
+            stateful_dropped,
+            listener_first,
         }
     }
     fn address(&self) -> SocketAddr {
@@ -156,35 +177,21 @@ fn dry_udp_engines_resample_mix_control_ignore_injection_and_stop() {
         (44_100, 44_100, Profile::Ethernet, false),
         (48_000, 48_000, Profile::Wifi, true),
     ] {
-        exercise(capture_rate, render_rate, profile, loss);
+        exercise(capture_rate, render_rate, profile, loss, false);
     }
 }
-fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool) {
+fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, stateful: bool) {
     let (mut source_backend, source_id) = backend(capture_rate);
     let (mut listener_backend, listener_id) = backend(render_rate);
     let source_socket = socket();
     let listener_socket = socket();
     let listener_address = listener_socket.local_addr().unwrap();
-    let relay = Relay::start(source_socket.local_addr().unwrap(), listener_address, loss);
-    let mut source = start_source(
-        &mut source_backend,
-        CaptureSpec::Monitor {
-            sink: DeviceSelection::Explicit(source_id),
-            format: AudioFormat {
-                sample_rate: 48_000,
-                channels: 2,
-            },
-        },
-        SessionConfig {
-            authorized: Arc::new(AtomicBool::new(true)),
-            socket: source_socket,
-            peer: relay.address(),
-            session_id: [9; 16],
-            profile,
-        },
-        material(),
-    )
-    .unwrap();
+    let relay = Relay::start(
+        source_socket.local_addr().unwrap(),
+        listener_address,
+        loss,
+        stateful,
+    );
     let mut listener = start_listener(
         &mut listener_backend,
         RenderRequest {
@@ -197,6 +204,25 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool) {
         SessionConfig {
             authorized: Arc::new(AtomicBool::new(true)),
             socket: listener_socket,
+            peer: relay.address(),
+            session_id: [9; 16],
+            profile,
+        },
+        material(),
+    )
+    .unwrap();
+    let mut source = start_source(
+        &mut source_backend,
+        CaptureSpec::Monitor {
+            sink: DeviceSelection::Explicit(source_id),
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        },
+        SessionConfig {
+            authorized: Arc::new(AtomicBool::new(true)),
+            socket: source_socket,
             peer: relay.address(),
             session_id: [9; 16],
             profile,
@@ -325,6 +351,10 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool) {
     let listener_health = listener.snapshot();
     println!("{capture_rate}->{render_rate} {profile:?} loss={loss} RMS loud={:.3} quiet={:.3} muted={:.6} resumed={:.3}; health={:?}",loud.rms(),quiet.rms(),muted.rms(),resumed.rms(),listener_health.health);
     assert!(source_started && listener_started);
+    if stateful {
+        assert!(relay.listener_first.load(Ordering::Acquire));
+        assert!(relay.stateful_dropped.load(Ordering::Relaxed) > 0);
+    }
     assert!(listener_health.health.received_packets > 50);
     assert!(source_health.health.received_packets > 30);
     assert!(listener_health.rejected_datagrams >= 16);
@@ -504,4 +534,128 @@ fn authorization_gate_rejects_start_and_revokes_existing_render() {
         thread::sleep(Duration::from_millis(2));
     }
     session.stop().unwrap();
+}
+
+#[test]
+fn bidirectional_probes_open_stateful_udp_firewalls() {
+    exercise(48_000, 48_000, Profile::Ethernet, false, true);
+}
+
+#[test]
+fn listener_returns_only_after_attempting_authenticated_initial_probe() {
+    use audio_media::keys::{Endpoint, SessionKeys};
+    let (mut backend, id) = backend(48_000);
+    let peer = socket();
+    peer.set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let mut listener = start_listener(
+        &mut backend,
+        RenderRequest {
+            device: DeviceSelection::Explicit(id),
+            requested: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        },
+        SessionConfig {
+            socket: socket(),
+            peer: peer.local_addr().unwrap(),
+            session_id: [27; 16],
+            profile: Profile::Ethernet,
+            authorized: Arc::new(AtomicBool::new(true)),
+        },
+        material(),
+    )
+    .unwrap();
+    let mut packet = [0; MAX_DATAGRAM_LEN + 1];
+    let n = peer.recv(&mut packet).unwrap();
+    let material = material();
+    let mut keys = SessionKeys::new(
+        Endpoint::MediaSender,
+        [27; 16],
+        0,
+        material.forward,
+        material.reverse,
+    )
+    .unwrap();
+    let (header, token) = keys.receive.open(&mut packet[..n], |_| true).unwrap();
+    assert_eq!(header.kind, PacketKind::PathChallenge);
+    assert_eq!(token.len(), 16);
+    listener.stop().unwrap();
+}
+
+#[test]
+fn listener_first_probe_tolerates_source_port_not_bound_yet() {
+    let (mut source_backend, source_id) = backend(48_000);
+    let (mut listener_backend, listener_id) = backend(48_000);
+    let source_socket = socket();
+    let source_address = source_socket.local_addr().unwrap();
+    drop(source_socket);
+    let listener_socket = socket();
+    let listener_address = listener_socket.local_addr().unwrap();
+    let config = |socket, peer| SessionConfig {
+        socket,
+        peer,
+        session_id: [29; 16],
+        profile: Profile::Ethernet,
+        authorized: Arc::new(AtomicBool::new(true)),
+    };
+    let format = AudioFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    };
+    let mut listener = start_listener(
+        &mut listener_backend,
+        RenderRequest {
+            device: DeviceSelection::Explicit(listener_id),
+            requested: format,
+        },
+        config(listener_socket, source_address),
+        material(),
+    )
+    .unwrap();
+    // The first outgoing challenge targets an unbound port; no peer response exists yet.
+    thread::sleep(Duration::from_millis(30));
+    let mut source = start_source(
+        &mut source_backend,
+        CaptureSpec::Monitor {
+            sink: DeviceSelection::Explicit(source_id),
+            format,
+        },
+        config(UdpSocket::bind(source_address).unwrap(), listener_address),
+        material(),
+    )
+    .unwrap();
+    let start = Instant::now();
+    let mut energy = Energy::default();
+    let (mut source_started, mut listener_started) = (false, false);
+    while start.elapsed() < Duration::from_millis(1200) {
+        source.stream_mut().unwrap().pump(480).unwrap();
+        let stream = listener.stream_mut().unwrap();
+        stream.pump(480).unwrap();
+        let samples = stream.rendered_samples().collect::<Vec<_>>();
+        energy.add(
+            samples[samples.len().saturating_sub(960)..].iter().copied(),
+            375.0,
+            48_000,
+        );
+        for (session, started) in [
+            (&mut source, &mut source_started),
+            (&mut listener, &mut listener_started),
+        ] {
+            while let Some(event) = session.poll_event() {
+                match event {
+                    MediaEvent::Started => *started = true,
+                    MediaEvent::Stopped { reason } => panic!("startup stopped: {reason:?}"),
+                    _ => {}
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(source_started && listener_started);
+    assert!(energy.rms() > 0.05);
+    assert!(listener.snapshot().health.received_packets > 20);
+    source.stop().unwrap();
+    listener.stop().unwrap();
 }

@@ -2,6 +2,7 @@
 #![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
 mod backend;
+mod mpris;
 mod raw;
 mod stream;
 #[cfg(any(test, feature = "testing"))]

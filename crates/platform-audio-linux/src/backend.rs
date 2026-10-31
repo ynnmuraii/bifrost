@@ -21,13 +21,11 @@ use std::{
 pub enum Limitation {
     ProcessExclusionUnavailable,
     EndpointMuteOwnershipUnavailable,
-    MediaSessionsDeferredM6,
     GlobalPttDeferredM5,
 }
-const LIMITS: [Limitation; 4] = [
+const LIMITS: [Limitation; 3] = [
     Limitation::ProcessExclusionUnavailable,
     Limitation::EndpointMuteOwnershipUnavailable,
-    Limitation::MediaSessionsDeferredM6,
     Limitation::GlobalPttDeferredM5,
 ];
 #[derive(Clone)]
@@ -222,6 +220,7 @@ pub struct LinuxBackend {
     pub(crate) state: Arc<State>,
     watch_socket: UnixStream,
     watcher: Option<JoinHandle<()>>,
+    media: crate::mpris::Mpris,
 }
 impl LinuxBackend {
     pub fn connect() -> Result<Self, BackendError> {
@@ -262,6 +261,7 @@ impl LinuxBackend {
             state,
             watch_socket,
             watcher: Some(handle),
+            media: crate::mpris::Mpris::start(),
         })
     }
     pub fn limitations(&self) -> &'static [Limitation] {
@@ -306,6 +306,7 @@ impl LinuxBackend {
 }
 impl Drop for LinuxBackend {
     fn drop(&mut self) {
+        self.media.shutdown();
         self.state.invalidate_all();
         let _ = self.watch_socket.shutdown(Shutdown::Both);
         self.connection.close();
@@ -396,6 +397,7 @@ impl Backend for LinuxBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             system_capture: true,
+            media: self.media.availability() == Availability::Available,
             ..Capabilities::default()
         }
     }
@@ -404,7 +406,7 @@ impl Backend for LinuxBackend {
             os_build: None,
             process_exclude: Availability::Unavailable(BackendError::Unsupported),
             endpoint_mute: Availability::Unavailable(BackendError::Unsupported),
-            media: Availability::Unavailable(BackendError::Unsupported),
+            media: self.media.availability(),
             ptt: Availability::Unavailable(BackendError::Unsupported),
             ptt_release: None,
         }
@@ -490,15 +492,16 @@ impl Backend for LinuxBackend {
         Err(BackendError::Unsupported)
     }
     fn media_sessions(&self) -> Result<Vec<MediaInfo>, BackendError> {
-        Err(BackendError::Unsupported)
+        self.media.sessions()
     }
     fn current_media_session(&self) -> Result<Option<MediaSessionToken>, BackendError> {
-        Err(BackendError::Unsupported)
+        self.media.current()
     }
-    fn media_command(&mut self, _: MediaCommandRequest) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported)
+    fn media_command(&mut self, request: MediaCommandRequest) -> Result<(), BackendError> {
+        self.media.command(request)
     }
-    fn cancel_media_commands(&mut self) { /* Unsupported commands are never admitted. */
+    fn cancel_media_commands(&mut self) {
+        self.media.cancel();
     }
     fn configure_ptt(
         &mut self,
@@ -512,12 +515,18 @@ impl Backend for LinuxBackend {
         }
     }
     fn poll_event(&mut self) -> Option<Event> {
+        if let Some(event) = self.media.poll_completion() {
+            return Some(event);
+        }
         let mut catalog = lock(&self.state.catalog);
         if catalog.overflow {
             catalog.overflow = false;
             Some(Event::ResyncRequired)
         } else {
-            catalog.events.pop_front()
+            catalog
+                .events
+                .pop_front()
+                .or_else(|| self.media.poll_changed())
         }
     }
 }

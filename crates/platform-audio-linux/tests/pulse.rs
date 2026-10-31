@@ -147,8 +147,8 @@ mod live {
             Availability::Unavailable(BackendError::Unsupported)
         );
         assert_eq!(
-            backend.media_sessions().err(),
-            Some(BackendError::Unsupported)
+            backend.media_sessions().is_ok(),
+            backend.capabilities().media
         );
         let source = explicit(&a.monitor().unwrap());
         let before = backend.capture_mute(&source).unwrap();
