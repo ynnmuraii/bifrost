@@ -54,7 +54,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Linux audio backend internals**
 
-- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
+- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion remains unsupported. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
 
 **Linux MPRIS internals**
 
@@ -85,6 +85,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Execute owned microphone mute and shortcut observation, and keep persistent toggles separate from independently timed remote talk grants. Grant expiry remutes on a guard-owning thread even while other backend work stalls; native snapshots remain authoritative, pre-muted endpoints refuse grants, and Ping does not renew them.
 - Forward bounded media metadata only during an explicitly enabled authorized Source watch, recheck the current player before commands, and correlate completion/cancellation. The explicit Dry harness has documented deterministic revisioned media; native backends never synthesize it.
 
+**Linux M5 native controls**
+
+- Add Wayland GlobalShortcuts portal observation with both edges and 100 ms renewals of 250 ms leases; no binding occurs during availability probes. Missing portals and X11 remain honestly unsupported; X11 release observation is a later agent integration.
+- Add Pulse source mute with explicitly best-effort ownership: one matching change echo within 200 ms is attributable, while differing/late/ambiguous changes relinquish restoration. Owned-null-sink live tests cover set/restore/drop without touching defaults or audible endpoints.
 
 ### Русский
 
@@ -136,7 +140,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Внутренний аудиобэкенд Linux**
 
-- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса, безопасное владение заглушением и глобальный PTT явно недоступны. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
+- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса остаётся неподдерживаемым. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
 
 **Внутренний MPRIS Linux**
 
@@ -167,6 +171,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Реализованы владение заглушением микрофона и наблюдение PTT; постоянное переключение отделено от удалённых разрешений говорить. Независимый поток guard заглушает по истечении даже при задержке другой работы бэкенда; фактическое состояние подтверждают снимки, изначально заглушённый микрофон отклоняет разрешение, Ping его не продлевает.
 - Ограниченные медиаданные передаются только при явно включённом наблюдении разрешённого Source; перед командой повторно проверяется текущий плеер, результаты и отмены связаны с запросами. Только явный Dry-режим предоставляет документированный детерминированный медиасеанс с ревизиями.
 
+**Нативное управление Linux M5**
+
+- Добавлено наблюдение обеих границ Wayland GlobalShortcuts с продлением каждые 100 мс срока 250 мс; проверка доступности не создаёт привязку. Отсутствующий портал и X11 явно не поддерживаются; X11 release требует дальнейшей интеграции агента.
+- Заглушение источника Pulse использует явно best-effort владение: допускается одно совпадающее эхо за 200 мс, а отличающееся, позднее или неоднозначное изменение отменяет восстановление. Натурные тесты set/restore/drop используют только собственный null-sink, не трогая defaults и слышимые устройства.
 
 ## 0.4.0 — 2026-10-30
 

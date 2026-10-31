@@ -141,7 +141,7 @@ mod live {
         assert_eq!(backend.monitor_availability(), Availability::Available);
         assert!(backend
             .limitations()
-            .contains(&Limitation::EndpointMuteOwnershipUnavailable));
+            .contains(&Limitation::EndpointMuteBestEffortOwnership));
         assert_eq!(
             backend.probe_capabilities().process_exclude,
             Availability::Unavailable(BackendError::Unsupported)
@@ -152,12 +152,42 @@ mod live {
         );
         let source = explicit(&a.monitor().unwrap());
         let before = backend.capture_mute(&source).unwrap();
+        assert!(backend.capabilities().endpoint_mute);
+        assert_eq!(
+            backend.probe_capabilities().endpoint_mute,
+            Availability::Available
+        );
+        let mut mute = backend.acquire_mute(&source).unwrap();
+        assert_eq!(mute.original_muted(), before.muted);
         assert_eq!(
             backend.acquire_mute(&source).err(),
-            Some(BackendError::Unsupported)
+            Some(BackendError::Busy)
         );
+        mute.set_capture_mute(before.generation, !before.muted)
+            .unwrap();
+        wait_until(|| backend.capture_mute(&source).unwrap().muted != before.muted);
+        // Let the dedicated subscription/query thread consume this write's echo.
+        thread::sleep(Duration::from_millis(250));
+        assert!(std::iter::from_fn(|| backend.poll_event()).any(|event| {
+            matches!(event, Event::MuteChanged(snapshot)
+                if snapshot.endpoint == before.endpoint && snapshot.muted != before.muted)
+        }));
+        mute.restore().unwrap();
         assert_eq!(backend.capture_mute(&source).unwrap(), before);
-        eprintln!("mute guard round-trip skipped: EndpointMuteOwnershipUnavailable (accepted contract limitation); observed mute unchanged");
+        assert_eq!(
+            mute.set_capture_mute(before.generation, true),
+            Err(BackendError::Stopped)
+        );
+        mute.restore().unwrap();
+        drop(mute);
+        // Drop performs the same one-shot restoration, on this owned monitor only.
+        thread::sleep(Duration::from_millis(250));
+        let mut mute = backend.acquire_mute(&source).unwrap();
+        mute.set_capture_mute(before.generation, !before.muted)
+            .unwrap();
+        thread::sleep(Duration::from_millis(250));
+        drop(mute);
+        assert_eq!(backend.capture_mute(&source).unwrap(), before);
         let mut phase = 0u64;
         let rendered = Arc::new(AtomicU64::new(0));
         let callback_rendered = rendered.clone();

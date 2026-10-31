@@ -20,6 +20,10 @@ futures = "0.3"
 futures-timer = "3"
 zeroize = "1"
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+tokio = { version = "1", features = ["rt", "time", "net"] }
+rustix = { version = "1", features = ["time"] }
+toml = "1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 audio-media = { path = "../audio-media" }
