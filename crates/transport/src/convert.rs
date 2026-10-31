@@ -48,6 +48,7 @@ pub(crate) const IMPLEMENTED_CAPABILITIES: &[i32] = &[
     wire::Capability::ClipboardImage as i32,
     wire::Capability::AudioControlV1 as i32,
     wire::Capability::SystemAudioSource as i32,
+    wire::Capability::AudioFocusReportV1 as i32,
     wire::Capability::AudioListener as i32,
 ];
 
@@ -1105,6 +1106,8 @@ pub struct PeerInfo {
     pub audio_control: bool,
     /// Whether the peer advertises system-audio capture (capability 17).
     pub system_audio_source: bool,
+    /// Whether the peer supports committed focus metadata, independently of audio (19).
+    pub audio_focus_report: bool,
     /// Whether the peer advertises audio rendering (capability 20).
     pub audio_listener: bool,
 }
@@ -1178,6 +1181,9 @@ impl PeerInfo {
             system_audio_source: hello
                 .capabilities
                 .contains(&(wire::Capability::SystemAudioSource as i32)),
+            audio_focus_report: hello
+                .capabilities
+                .contains(&(wire::Capability::AudioFocusReportV1 as i32)),
             audio_listener: hello
                 .capabilities
                 .contains(&(wire::Capability::AudioListener as i32)),
@@ -1220,6 +1226,7 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::UnpairNotice
             | WireCapability::AudioControlV1
             | WireCapability::SystemAudioSource
+            | WireCapability::AudioFocusReportV1
             | WireCapability::AudioListener
             | WireCapability::ClipboardSession => {}
         }

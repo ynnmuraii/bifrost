@@ -86,7 +86,8 @@ enum Capability {
   CAPABILITY_CLIPBOARD_IMAGE = 15;
   CAPABILITY_AUDIO_CONTROL_V1 = 16;
   CAPABILITY_SYSTEM_AUDIO_SOURCE = 17;
-  // Future: 18 mic-control, 19 focus-report.
+  // Future: 18 mic-control.
+  CAPABILITY_AUDIO_FOCUS_REPORT_V1 = 19;
   CAPABILITY_AUDIO_LISTENER = 20;
   // Future: 21 mic-stream, 22 virtual-mic, 23 media-control.
 }
@@ -188,12 +189,24 @@ message AudioControl {
     AudioStop stop = 14;
     AudioKeepalive keepalive = 15;
     AudioReport report = 16;
-    // Future: 17 focus, 18 mic-state, 19 mic-ack.
+    AudioFocusSnapshot focus = 17;
+    // Future: 18 mic-state, 19 mic-ack.
     AudioConsentChanged consent = 20;
-    // Future: 21 focus-request.
+    AudioFocusRequest focus_request = 21;
     AudioStartRequest start_request = 25; // Source asks Listener to create a normal Offer
     AudioStartRefusal start_refusal = 26; // request correlation, never a session stop
   }
+}
+message AudioFocusSnapshot {
+  bytes owner_node_id = 1; //32, authenticated current owner
+  uint64 owner_serial = 2; //positive; revision namespace
+  uint64 focus_revision = 3; //positive, monotonic within owner namespace
+  bytes active_node_id = 4; //empty when unknown, otherwise32
+  bytes lease_id = 5; //16 for committed remote; empty for idle owner/unknown
+  bool committed = 6; //false requires empty active and lease
+}
+message AudioFocusRequest {
+  bytes group_id = 1; //16
 }
 enum AudioNodeRole {
   AUDIO_NODE_ROLE_UNSPECIFIED = 0;

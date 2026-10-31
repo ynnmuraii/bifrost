@@ -1148,7 +1148,7 @@ async fn audio_reenable_is_committed_after_write_before_reserved_stop() {
     )
     .await
     .unwrap();
-    assert!(queue.audio_allowed());
+    assert!(queue.audio_allowed(&wire::AudioControl::default()));
     queue.push(stop()).unwrap();
     write_intent(
         &mut writer,
@@ -1193,5 +1193,5 @@ async fn failed_capability_announcement_does_not_reenable_audio() {
     )
     .await
     .is_err());
-    assert!(!queue.audio_allowed());
+    assert!(!queue.audio_allowed(&wire::AudioControl::default()));
 }

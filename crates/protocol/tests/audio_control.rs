@@ -76,8 +76,9 @@ fn stable_tags_enums_and_roundtrips() {
     assert_eq!(limits::PROTOCOL_MINOR, 0);
     assert_eq!(wire::Capability::AudioControlV1 as i32, 16);
     assert_eq!(wire::Capability::SystemAudioSource as i32, 17);
+    assert_eq!(wire::Capability::AudioFocusReportV1 as i32, 19);
     assert_eq!(wire::Capability::AudioListener as i32, 20);
-    for value in [18, 19, 21, 22, 23] {
+    for value in [18, 21, 22, 23] {
         assert!(wire::Capability::try_from(value).is_err());
     }
     assert_eq!(wire::AudioNodeRole::Source as i32, 1);
@@ -150,6 +151,13 @@ fn stable_tags_enums_and_roundtrips() {
                 underruns: u32::MAX,
                 suggested_loss_pct: 100,
                 device_state: wire::AudioDeviceState::Ready as i32,
+            }),
+        ),
+        (17, Body::Focus(focus_snapshot())),
+        (
+            21,
+            Body::FocusRequest(wire::AudioFocusRequest {
+                group_id: vec![4; 16],
             }),
         ),
         (
@@ -443,7 +451,7 @@ fn setup_requires_ids_contributory_nonces_format_epoch_ttl_and_typed_refusal() {
 
 #[test]
 fn complete_encoded_ceiling_precedes_scans_and_unknown_body_is_audio_only() {
-    let unknown = wire::AudioControl::decode(&[8, 1, 0xaa, 1, 0][..]).unwrap(); // unknown body21
+    let unknown = wire::AudioControl::decode(&[8, 1, 0xb2, 1, 0][..]).unwrap(); // unknown body22
     assert_eq!(audio_control(&unknown), Err(AudioViolation::MissingBody));
     assert_eq!(
         audio_control(&wire::AudioControl {
@@ -628,4 +636,68 @@ fn request_ids_reasons_and_profiles_are_bounded() {
         }))),
         Err(AudioViolation::Identifier)
     );
+}
+
+fn focus_snapshot() -> wire::AudioFocusSnapshot {
+    wire::AudioFocusSnapshot {
+        owner_node_id: vec![1; 32],
+        owner_serial: 1,
+        focus_revision: 1,
+        active_node_id: vec![2; 32],
+        lease_id: vec![3; 16],
+        committed: true,
+    }
+}
+
+#[test]
+fn focus_requires_positive_namespace_and_exact_committed_shapes() {
+    let valid = focus_snapshot();
+    let check = |snapshot| audio_control(&control(Body::Focus(snapshot)));
+    assert_eq!(check(valid.clone()), Ok(()));
+    let mut idle = valid.clone();
+    idle.active_node_id = idle.owner_node_id.clone();
+    idle.lease_id.clear();
+    assert_eq!(check(idle.clone()), Ok(()));
+    let mut unknown = idle.clone();
+    unknown.committed = false;
+    unknown.active_node_id.clear();
+    assert_eq!(check(unknown.clone()), Ok(()));
+    for size in [0, 31, 33] {
+        let mut bad = valid.clone();
+        bad.owner_node_id.resize(size, 0);
+        assert_eq!(check(bad), Err(AudioViolation::Identifier));
+        let mut bad = valid.clone();
+        bad.active_node_id.resize(size, 0);
+        assert_eq!(check(bad), Err(AudioViolation::Identifier));
+    }
+    for size in [0, 15, 17] {
+        let mut bad = valid.clone();
+        bad.lease_id.resize(size, 0);
+        assert_eq!(check(bad), Err(AudioViolation::Identifier));
+        assert_eq!(
+            audio_control(&control(Body::FocusRequest(wire::AudioFocusRequest {
+                group_id: vec![4; size],
+            }))),
+            Err(AudioViolation::Identifier)
+        );
+    }
+    for bad in [
+        wire::AudioFocusSnapshot {
+            owner_serial: 0,
+            ..valid.clone()
+        },
+        wire::AudioFocusSnapshot {
+            focus_revision: 0,
+            ..valid.clone()
+        },
+    ] {
+        assert_eq!(check(bad), Err(AudioViolation::Epoch));
+    }
+    idle.lease_id = vec![3; 16];
+    assert_eq!(check(idle), Err(AudioViolation::Lease));
+    unknown.lease_id = vec![3; 16];
+    assert_eq!(check(unknown), Err(AudioViolation::Lease));
+    let mut bad = valid;
+    bad.committed = false;
+    assert_eq!(check(bad), Err(AudioViolation::Lease));
 }

@@ -219,6 +219,15 @@ pub(crate) enum Intent {
 }
 
 const AUXILIARY_INPUT_BURST: u8 = 8;
+pub(crate) fn is_focus(message: &protocol::wire::AudioControl) -> bool {
+    matches!(
+        message.body,
+        Some(
+            protocol::wire::audio_control::Body::Focus(_)
+                | protocol::wire::audio_control::Body::FocusRequest(_)
+        )
+    )
+}
 
 #[derive(Debug)]
 struct QueueState {
@@ -244,15 +253,40 @@ struct QueueState {
     audio_stops: VecDeque<Intent>,
     local_audio: bool,
     remote_audio: bool,
+    local_focus: bool,
+    remote_focus: bool,
     urgent_run: u8,
     input_run: u8,
 }
 
 impl QueueState {
+    fn audio_allowed(&self, message: &protocol::wire::AudioControl) -> bool {
+        self.ready
+            && !self.closed
+            && !self.refusing
+            && if is_focus(message) {
+                self.local_focus && self.remote_focus
+            } else {
+                self.local_audio && self.remote_audio
+            }
+    }
+
     fn purge_audio(&mut self) {
-        self.auxiliary
-            .retain(|(_, intent)| !matches!(intent, Intent::Outbound(Outbound::AudioControl(_))));
-        self.audio_stops.clear();
+        let audio = self.local_audio && self.remote_audio;
+        let focus = self.local_focus && self.remote_focus;
+        self.auxiliary.retain(|(_, intent)| match intent {
+            Intent::Outbound(Outbound::AudioControl(message)) => {
+                if is_focus(message) {
+                    focus
+                } else {
+                    audio
+                }
+            }
+            _ => true,
+        });
+        if !audio {
+            self.audio_stops.clear();
+        }
     }
 
     fn next_admission(&mut self) -> Result<u64, crate::TransportError> {
@@ -299,6 +333,8 @@ impl InputQueue {
                 audio_stops: VecDeque::new(),
                 local_audio: false,
                 remote_audio: false,
+                local_focus: false,
+                remote_focus: false,
                 urgent_run: 0,
                 input_run: 0,
             }),
@@ -311,24 +347,31 @@ impl InputQueue {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.local_audio =
             capabilities.contains(&(protocol::wire::Capability::AudioControlV1 as i32));
-        if !state.local_audio {
-            state.purge_audio();
-        }
+        state.local_focus =
+            capabilities.contains(&(protocol::wire::Capability::AudioFocusReportV1 as i32));
+        state.purge_audio();
     }
 
     /// Re-enabling is visible only after its announcement reached the wire.
     pub fn local_capabilities_written(&self, capabilities: &[i32]) {
-        let cap = protocol::wire::Capability::AudioControlV1 as i32;
-        if !capabilities.contains(&cap) {
-            return;
-        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // A withdrawal admitted while this write was in flight wins immediately.
-        if !state.auxiliary.iter().any(|(_, intent)| {
-            matches!(intent, Intent::Outbound(Outbound::CapabilitiesChanged(caps))
-                if !caps.contains(&cap))
-        }) {
-            state.local_audio = true;
+        for cap in [
+            protocol::wire::Capability::AudioControlV1 as i32,
+            protocol::wire::Capability::AudioFocusReportV1 as i32,
+        ] {
+            // A withdrawal admitted while this write was in flight wins immediately.
+            if capabilities.contains(&cap)
+                && !state.auxiliary.iter().any(|(_, intent)| {
+                    matches!(intent, Intent::Outbound(Outbound::CapabilitiesChanged(caps))
+                        if !caps.contains(&cap))
+                })
+            {
+                if cap == protocol::wire::Capability::AudioControlV1 as i32 {
+                    state.local_audio = true;
+                } else {
+                    state.local_focus = true;
+                }
+            }
         }
     }
 
@@ -336,14 +379,14 @@ impl InputQueue {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.remote_audio =
             capabilities.contains(&(protocol::wire::Capability::AudioControlV1 as i32));
-        if !state.remote_audio {
-            state.purge_audio();
-        }
+        state.remote_focus =
+            capabilities.contains(&(protocol::wire::Capability::AudioFocusReportV1 as i32));
+        state.purge_audio();
     }
 
-    pub fn audio_allowed(&self) -> bool {
+    pub fn audio_allowed(&self, message: &protocol::wire::AudioControl) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.ready && state.local_audio && state.remote_audio && !state.closed && !state.refusing
+        state.audio_allowed(message)
     }
 
     pub fn begin_close(&self) -> Instant {
@@ -575,7 +618,7 @@ impl InputQueue {
         }
         if let Outbound::AudioControl(message) = &item {
             use protocol::validate::AudioViolation;
-            if !state.ready || !state.local_audio || !state.remote_audio {
+            if !state.audio_allowed(message) {
                 return Err(crate::TransportError::Audio(AudioViolation::Capability));
             }
             let stop = matches!(
@@ -701,8 +744,12 @@ impl InputQueue {
             if let Outbound::CapabilitiesChanged(capabilities) = &item {
                 if !capabilities.contains(&(protocol::wire::Capability::AudioControlV1 as i32)) {
                     state.local_audio = false;
-                    state.purge_audio();
                 }
+                if !capabilities.contains(&(protocol::wire::Capability::AudioFocusReportV1 as i32))
+                {
+                    state.local_focus = false;
+                }
+                state.purge_audio();
             }
             state
                 .auxiliary
@@ -919,7 +966,7 @@ mod tests {
         queue.ready(false);
         queue.push(audio_stop()).unwrap();
         queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
-        assert!(!queue.audio_allowed());
+        assert!(!queue.audio_allowed(&wire::AudioControl::default()));
         assert!(matches!(
             queue.pop(),
             Some(Intent::Outbound(Outbound::CapabilitiesChanged(_)))
@@ -935,20 +982,98 @@ mod tests {
         assert!(queue.push(audio_stop()).is_err());
         queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
         queue.local_capabilities_written(&caps);
-        assert!(!queue.audio_allowed());
+        assert!(!queue.audio_allowed(&wire::AudioControl::default()));
         queue.pop().unwrap();
         queue
             .push(Outbound::CapabilitiesChanged(caps.clone()))
             .unwrap();
         queue.pop().unwrap();
         queue.local_capabilities_written(&caps);
-        assert!(queue.audio_allowed());
+        assert!(queue.audio_allowed(&wire::AudioControl::default()));
         queue.push(audio_stop()).unwrap();
         assert!(matches!(
             queue.pop(),
             Some(Intent::Outbound(Outbound::AudioControl(_)))
         ));
         assert!(queue.pop().is_none());
+    }
+
+    fn focus_request() -> wire::AudioControl {
+        wire::AudioControl {
+            control_version: 1,
+            body: Some(wire::audio_control::Body::FocusRequest(
+                wire::AudioFocusRequest {
+                    group_id: vec![4; 16],
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn audio_and_focus_withdrawals_purge_only_their_own_metadata() {
+        let audio = wire::Capability::AudioControlV1 as i32;
+        let focus = wire::Capability::AudioFocusReportV1 as i32;
+        for local in [false, true] {
+            for withdrawn in [audio, focus] {
+                let queue = InputQueue::new(16);
+                queue.set_local_audio(&[audio, focus]);
+                queue.set_remote_audio(&[audio, focus]);
+                queue.ready(false);
+                queue.push(audio_stop()).unwrap();
+                queue.push(Outbound::AudioControl(focus_request())).unwrap();
+                let remaining = if withdrawn == audio { focus } else { audio };
+                if local {
+                    queue
+                        .push(Outbound::CapabilitiesChanged(vec![remaining]))
+                        .unwrap();
+                } else {
+                    queue.set_remote_audio(&[remaining]);
+                }
+                assert_eq!(queue.audio_allowed(&focus_request()), withdrawn == audio);
+                assert_eq!(
+                    queue.audio_allowed(&wire::AudioControl::default()),
+                    withdrawn == focus
+                );
+                let mut received = 0;
+                while let Some(intent) = queue.pop() {
+                    if let Intent::Outbound(Outbound::AudioControl(message)) = intent {
+                        assert_eq!(is_focus(&message), withdrawn == audio);
+                        received += 1;
+                    }
+                }
+                assert_eq!(received, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn focus_reenable_waits_for_write_and_inflight_enable_cannot_undo_withdrawal() {
+        let queue = InputQueue::new(16);
+        let caps = vec![wire::Capability::AudioFocusReportV1 as i32];
+        queue.set_local_audio(&caps);
+        queue.set_remote_audio(&caps);
+        queue.ready(false);
+        queue.push(Outbound::AudioControl(focus_request())).unwrap();
+        queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
+        assert!(!queue.audio_allowed(&focus_request()));
+        queue.pop().unwrap();
+        assert!(queue.pop().is_none());
+        queue
+            .push(Outbound::CapabilitiesChanged(caps.clone()))
+            .unwrap();
+        assert!(!queue.audio_allowed(&focus_request()));
+        queue.pop().unwrap();
+        queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
+        queue.local_capabilities_written(&caps);
+        assert!(!queue.audio_allowed(&focus_request()));
+        queue.pop().unwrap();
+        queue
+            .push(Outbound::CapabilitiesChanged(caps.clone()))
+            .unwrap();
+        queue.pop().unwrap();
+        queue.local_capabilities_written(&caps);
+        assert!(queue.audio_allowed(&focus_request()));
+        assert!(!queue.audio_allowed(&wire::AudioControl::default()));
     }
 
     fn motion() -> InputSample {

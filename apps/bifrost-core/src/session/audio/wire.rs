@@ -27,6 +27,70 @@ impl From<ipc::audio::AudioError> for Error {
 fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     bytes.try_into().map_err(|_| Error::InvalidModel)
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusControl {
+    Snapshot(audio_model::focus::Snapshot),
+    Request([u8; 16]),
+}
+pub fn is_focus(message: &net::AudioControl) -> bool {
+    matches!(
+        message.body,
+        Some(net::audio_control::Body::Focus(_) | net::audio_control::Body::FocusRequest(_))
+    )
+}
+pub fn decode_focus(message: &net::AudioControl) -> Result<FocusControl> {
+    protocol::validate::audio_control(message)?;
+    match message.body.as_ref().ok_or(Error::InvalidModel)? {
+        net::audio_control::Body::Focus(value) => {
+            Ok(FocusControl::Snapshot(audio_model::focus::Snapshot {
+                owner: audio_model::focus::Owner {
+                    node: fixed(&value.owner_node_id)?,
+                    serial: value.owner_serial,
+                },
+                revision: value.focus_revision,
+                active: if value.active_node_id.is_empty() {
+                    None
+                } else {
+                    Some(fixed(&value.active_node_id)?)
+                },
+                lease: if value.lease_id.is_empty() {
+                    None
+                } else {
+                    Some(fixed(&value.lease_id)?)
+                },
+                committed: value.committed,
+            }))
+        }
+        net::audio_control::Body::FocusRequest(value) => {
+            Ok(FocusControl::Request(fixed(&value.group_id)?))
+        }
+        _ => Err(Error::InvalidModel),
+    }
+}
+pub fn encode_focus(snapshot: audio_model::focus::Snapshot) -> net::AudioControl {
+    net::AudioControl {
+        control_version: protocol::limits::AUDIO_CONTROL_VERSION,
+        body: Some(net::audio_control::Body::Focus(net::AudioFocusSnapshot {
+            owner_node_id: snapshot.owner.node.to_vec(),
+            owner_serial: snapshot.owner.serial,
+            focus_revision: snapshot.revision,
+            active_node_id: snapshot.active.map_or_else(Vec::new, |id| id.to_vec()),
+            lease_id: snapshot.lease.map_or_else(Vec::new, |id| id.to_vec()),
+            committed: snapshot.committed,
+        })),
+    }
+}
+pub fn encode_focus_request(group: [u8; 16]) -> net::AudioControl {
+    net::AudioControl {
+        control_version: protocol::limits::AUDIO_CONTROL_VERSION,
+        body: Some(net::audio_control::Body::FocusRequest(
+            net::AudioFocusRequest {
+                group_id: group.to_vec(),
+            },
+        )),
+    }
+}
 pub fn format_sha256(format: keys::Format) -> [u8; 32] {
     let digest = ring::digest::digest(&ring::digest::SHA256, &format.canonical_bytes());
     let mut result = [0; 32];
@@ -254,6 +318,7 @@ pub fn decode_control(
             request_id: fixed(&r.request_id)?,
             reason: decode_stop_reason(r.reason)?,
         },
+        Body::Focus(_) | Body::FocusRequest(_) => return Err(Error::Unsupported),
     };
     Ok(DecodedControl::Control { message, extras })
 }
@@ -1538,4 +1603,75 @@ fn full_config_preserves_explicit_denied_peer_preferences() {
     assert!(!decoded.enabled);
     assert!(decoded.allow_system_audio_from.is_empty());
     assert!(decoded.allow_send_to.is_empty());
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use audio_model::focus::{Owner, Snapshot};
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            owner: Owner {
+                node: [1; 32],
+                serial: 2,
+            },
+            revision: 3,
+            active: Some([2; 32]),
+            lease: Some([4; 16]),
+            committed: true,
+        }
+    }
+
+    #[test]
+    fn focus_roundtrip_is_separate_from_session_admission() {
+        let value = snapshot();
+        let message = encode_focus(value);
+        assert!(is_focus(&message));
+        assert_eq!(decode_focus(&message), Ok(FocusControl::Snapshot(value)));
+        assert_eq!(
+            decode_control(&message, model::AudioRole::Source, [9; 16]),
+            Err(Error::Unsupported)
+        );
+        let request = encode_focus_request([5; 16]);
+        assert_eq!(decode_focus(&request), Ok(FocusControl::Request([5; 16])));
+    }
+
+    #[test]
+    fn focus_rejects_malformed_commit_and_identifiers() {
+        let mut value = snapshot();
+        value.lease = None;
+        assert!(decode_focus(&encode_focus(value)).is_err());
+        value = snapshot();
+        value.committed = false;
+        assert!(decode_focus(&encode_focus(value)).is_err());
+        value = snapshot();
+        value.owner.serial = 0;
+        assert!(decode_focus(&encode_focus(value)).is_err());
+        value = snapshot();
+        value.revision = 0;
+        assert!(decode_focus(&encode_focus(value)).is_err());
+        let mut request = encode_focus_request([5; 16]);
+        if let Some(net::audio_control::Body::FocusRequest(value)) = request.body.as_mut() {
+            value.group_id.pop();
+        }
+        assert!(decode_focus(&request).is_err());
+    }
+
+    #[test]
+    fn idle_owner_and_unknown_roundtrip() {
+        let mut value = snapshot();
+        value.active = Some(value.owner.node);
+        value.lease = None;
+        assert_eq!(
+            decode_focus(&encode_focus(value)),
+            Ok(FocusControl::Snapshot(value))
+        );
+        value.active = None;
+        value.committed = false;
+        assert_eq!(
+            decode_focus(&encode_focus(value)),
+            Ok(FocusControl::Snapshot(value))
+        );
+    }
 }

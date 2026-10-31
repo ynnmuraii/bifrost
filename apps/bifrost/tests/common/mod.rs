@@ -713,6 +713,9 @@ impl Node {
         if audio::dry_launch(&self.root) {
             command.arg("--test-audio-dry");
         }
+        if self.dry_control_dir().is_dir() {
+            command.env("BIFROST_LOG", "debug");
+        }
         self.child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(file))

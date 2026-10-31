@@ -472,3 +472,244 @@ fn fixture_input_and_clipboard_endpoints_are_distinct_and_reservations_are_relea
             .expect("fixture reservation is released for the service")
     });
 }
+
+fn has_focus_gains(
+    status: &wire::AudioStatus,
+    primary: &[u8],
+    background: &[u8],
+    primary_gain: u32,
+) -> bool {
+    status.sessions.iter().any(|session| {
+        session.peer == primary
+            && session.state == wire::AudioSessionState::Running as i32
+            && session.focus_primary
+            && session.gain_percent == primary_gain
+    }) && status.sessions.iter().any(|session| {
+        session.peer == background
+            && session.state == wire::AudioSessionState::Running as i32
+            && !session.focus_primary
+            && session.gain_percent == 0
+    })
+}
+
+fn reset_focus_pair(cluster: &Cluster, proxy: &common::Proxy) {
+    let marker = format!("link up peer={}", cluster.node(1).id);
+    let previous = cluster.node(0).marked(&marker).len();
+    // This proxy discards TLS bytes, not packets: forwarding cannot repair that stream.
+    proxy.reset();
+    cluster
+        .node(0)
+        .wait_for("fresh input TLS generation", TIMEOUT, |status| {
+            status.members == 2 && cluster.node(0).marked(&marker).len() > previous
+        })
+        .expect("reset pair reconnects before the next input transition");
+}
+
+#[test]
+fn third_pc_listener_follows_committed_owner_focus_and_requests_after_reconnect() {
+    use std::time::{Duration, Instant};
+
+    let _guard = common::serial();
+    let (mut cluster, proxy) = Cluster::start_with("audio-follow-focus", |roots, ports, ids| {
+        for root in roots {
+            audio::mark_dry(root);
+            std::fs::create_dir_all(root.join("run/control-dry")).expect("dry input controls");
+        }
+        let proxy = common::Proxy::start(ports[0], ports[1]).expect("owner/receiver proxy");
+        common::retarget_trust_peer(&roots[0], &ids[1], &proxy.toward_b);
+        common::retarget_trust_peer(&roots[1], &ids[0], &proxy.toward_a);
+        proxy
+    });
+    cluster.wait_mesh(TIMEOUT);
+    // C is neither the input owner A nor its receiver B.
+    audio::start_group(&[cluster.node(2), cluster.node(0), cluster.node(1)]);
+    let a = audio::node_id(&cluster.node(0).id);
+    let b = audio::node_id(&cluster.node(1).id);
+    let c = audio::node_id(&cluster.node(2).id);
+    let mut listener = Window::open(cluster.node(2));
+    let mut source_a = Window::open(cluster.node(0));
+    let mut source_b = Window::open(cluster.node(1));
+    let mut config = listener.status().config.expect("Listener configuration");
+    config.mode = wire::AudioMode::FollowFocus as i32;
+    config.focus_debounce_ms = 250;
+    config.focus_ramp_ms = 150;
+    config.background_mute = true;
+    config
+        .peers
+        .iter_mut()
+        .find(|peer| peer.node_id == b)
+        .expect("Source B preference")
+        .volume_percent = 80;
+    listener.configure(config);
+    let baseline = listener.wait("idle owner A becomes primary", |status| {
+        has_focus_gains(status, &a, &b, 100)
+    });
+    let microphone = baseline.microphone;
+
+    // A's pending EnterPrepare cannot announce B as committed to the third PC.
+    proxy.blackhole();
+    cluster
+        .node(0)
+        .switch_to(&cluster.node(1).id)
+        .expect("prepare B");
+    cluster.node(0).wait_dry_capture("Temporary");
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        let status = listener.status();
+        assert!(
+            has_focus_gains(&status, &a, &b, 100),
+            "preparation changed primary: {status:?}"
+        );
+        assert_eq!(
+            status.microphone, microphone,
+            "focus never changes microphone state"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(cluster
+        .node(0)
+        .focus_events()
+        .iter()
+        .any(|(_, state)| state == "Preparing"));
+    assert!(!cluster
+        .node(0)
+        .focus_events()
+        .iter()
+        .any(|(_, state)| state == "Remote"));
+    cluster
+        .node(0)
+        .wait_for("prepare abort restores Local", TIMEOUT, |status| {
+            status.is_idle()
+        })
+        .expect("failed prepare returns local");
+    reset_focus_pair(&cluster, &proxy);
+
+    cluster
+        .node(0)
+        .switch_to(&cluster.node(1).id)
+        .expect("commit receiver B");
+    cluster
+        .node(0)
+        .wait_for("receiver B committed", TIMEOUT, |status| {
+            status.focus == "Remote" && status.peer == cluster.node(1).id
+        })
+        .expect("real input commit");
+    listener.wait("B primary with Listener-local user gain", |status| {
+        has_focus_gains(status, &b, &a, 80)
+    });
+
+    // Lost LeaveAck holds Releasing; it is not a committed return to owner A.
+    proxy.blackhole();
+    cluster.node(0).switch_to_local().expect("begin release");
+    let until = Instant::now() + Duration::from_secs(2);
+    let mut saw_releasing = false;
+    loop {
+        let input = cluster.node(0).status().expect("input status");
+        if input.focus != "Releasing" {
+            break;
+        }
+        saw_releasing = true;
+        let status = listener.status();
+        assert!(
+            has_focus_gains(&status, &b, &a, 80),
+            "release selected uncommitted owner: {status:?}"
+        );
+        assert_eq!(status.microphone, microphone);
+        assert!(Instant::now() < until, "input release guard did not finish");
+    }
+    assert!(
+        saw_releasing,
+        "the proxy must exercise a real Releasing interval"
+    );
+    reset_focus_pair(&cluster, &proxy);
+    listener.wait("committed Local returns primary to A", |status| {
+        has_focus_gains(status, &a, &b, 100)
+    });
+
+    cluster.claim(1).expect("handoff input ownership to B");
+    cluster.wait_owner(1, TIMEOUT);
+    listener.wait("new owner B replaces the old focus namespace", |status| {
+        has_focus_gains(status, &b, &a, 80)
+    });
+    cluster
+        .node(1)
+        .switch_to(&cluster.node(0).id)
+        .expect("new owner commits A");
+    listener.wait("new owner's receiver A is primary", |status| {
+        has_focus_gains(status, &a, &b, 100)
+    });
+
+    let requests = cluster
+        .node(2)
+        .marked("audio focus snapshot requested")
+        .len();
+    assert!(requests > 0, "Listener requests owner-authenticated focus");
+    drop(listener);
+    cluster.nodes[2].stop();
+    source_a.closed();
+    source_b.closed();
+    cluster.nodes[2].restart_without_input();
+    cluster.wait_owner(1, TIMEOUT);
+    let mut listener = Window::open(cluster.node(2));
+    listener.start(&a);
+    listener.start(&b);
+    audio::healthy(&mut listener, &mut source_a, &c, &a);
+    audio::healthy(&mut listener, &mut source_b, &c, &b);
+    let status = listener.wait(
+        "reconnected third PC obtains committed receiver A",
+        |status| has_focus_gains(status, &a, &b, 100),
+    );
+    assert_eq!(status.microphone, microphone);
+    assert!(
+        cluster
+            .node(2)
+            .marked("audio focus snapshot requested")
+            .len()
+            > requests,
+        "a fresh parent must request the current owner's snapshot"
+    );
+    listener.stop_all();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn audio_disabled_owner_reports_focus_without_probing_or_spawning_a_child() {
+    let _guard = common::serial();
+    let (harness, ()) = Harness::start_with(false, false, |a, b| {
+        for root in [a, b] {
+            audio::mark_dry(root);
+            std::fs::create_dir_all(root.join("run/control-dry")).expect("dry debug controls");
+        }
+    });
+    harness.wait_linked();
+    let mut owner = Window::open(&harness.a);
+    let disabled = owner.status();
+    assert!(!disabled.enabled);
+    let owner_port =
+        u16::try_from(disabled.config.expect("owner config").udp_port).expect("owner media port");
+    let mut listener = Window::open(&harness.b);
+    let mut config = audio::config(
+        wire::AudioRole::Listener,
+        audio::ports(1)[0],
+        &[],
+        &[],
+        false,
+    );
+    config.mode = wire::AudioMode::FollowFocus as i32;
+    listener.configure(config);
+    let until = std::time::Instant::now() + TIMEOUT;
+    while harness
+        .a
+        .marked("audio focus snapshot request received")
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "disabled owner did not accept cap19 request"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    audio::assert_no_audio_resources(&harness.a, owner_port);
+    assert!(!owner.status().enabled);
+    audio::disable(&harness.b, &mut listener);
+}

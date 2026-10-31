@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod drift;
+pub mod focus;
 pub mod jitter;
 pub mod keys;
 pub mod packet;

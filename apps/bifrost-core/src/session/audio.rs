@@ -8,7 +8,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use audio_model::{jitter::Profile, keys, session as fsm, status as model};
+use audio_model::{
+    focus::{FocusPolicy, Owner, Snapshot},
+    jitter::Profile,
+    keys, session as fsm, status as model,
+};
 use geometry::NodeId;
 use protocol::{audio_worker as worker, ipc as gui, wire as net};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -21,7 +25,7 @@ use crate::audio::{
 use crate::gui::{Outgoing, Request};
 
 const COMMANDS: usize = 32;
-const TICK: Duration = Duration::from_millis(100);
+const TICK: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT_MS: u64 = 10_000;
 type Code = &'static str;
 
@@ -41,6 +45,14 @@ pub(super) fn is_request(message: &gui::gui_frame::Msg) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct CommittedFocus {
+    pub owner: Option<(NodeId, u64)>,
+    pub active: Option<NodeId>,
+    pub lease: Option<[u8; 16]>,
+    pub committed: bool,
+}
+
 #[derive(Clone)]
 struct Peer {
     parent: fsm::Parent,
@@ -49,6 +61,11 @@ struct Peer {
     support: fsm::Support,
     trusted: bool,
     hello: Option<fsm::Hello>,
+    focus_support: bool,
+    focus_sent_revision: u64,
+    focus_request_at: Option<u64>,
+    focus_reply_at: Option<u64>,
+    focus_reply: bool,
 }
 #[derive(Clone, Default)]
 struct Links {
@@ -65,6 +82,7 @@ pub(super) struct Coordinator {
     commands: mpsc::Sender<Command>,
     gui_commands: mpsc::Sender<Request>,
     links: watch::Sender<Links>,
+    focus: watch::Sender<CommittedFocus>,
     caps: watch::Receiver<Vec<i32>>,
     stopping: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -82,8 +100,14 @@ impl Coordinator {
         let (commands, rx) = mpsc::channel(COMMANDS);
         let (gui_commands, gui_rx) = mpsc::channel(16);
         let (links, link_rx) = watch::channel(Links::default());
+        let (focus_tx, focus_rx) = watch::channel(CommittedFocus::default());
         let (caps_tx, caps) = watch::channel(Vec::new());
         let (stopping, stop_rx) = watch::channel(false);
+        let focus_policy = FocusPolicy::new(
+            u64::from(config.focus_debounce_ms),
+            u64::from(config.focus_ramp_ms),
+            background_percent(&config),
+        );
         let actor = Actor {
             config,
             local,
@@ -96,6 +120,12 @@ impl Coordinator {
             gui_commands: gui_rx,
             links: link_rx,
             stopping: stop_rx,
+            focus_rx,
+            focus_view: CommittedFocus::default(),
+            focus_policy,
+            focus_revision: 0,
+            focus_snapshot: None,
+            focus_received: false,
             caps: caps_tx,
             model: fsm::ControlPlane::new(*local.as_bytes()),
             peers: BTreeMap::new(),
@@ -124,10 +154,21 @@ impl Coordinator {
             commands,
             gui_commands,
             links,
+            focus: focus_tx,
             caps,
             stopping,
             task: Some(task),
         }
+    }
+    pub(super) fn focus(&self, view: CommittedFocus) {
+        self.focus.send_if_modified(|current| {
+            if *current == view {
+                false
+            } else {
+                *current = view;
+                true
+            }
+        });
     }
     pub(super) fn trusted(&self, store: &identity::TrustStore) {
         let trusted: BTreeSet<_> = store
@@ -177,6 +218,11 @@ impl Coordinator {
                         listener: hello.audio_listener,
                     },
                     hello: None,
+                    focus_support: hello.audio_focus_report,
+                    focus_sent_revision: 0,
+                    focus_request_at: None,
+                    focus_reply_at: None,
+                    focus_reply: false,
                 },
             );
         });
@@ -196,6 +242,8 @@ impl Coordinator {
         self.links.send_modify(|links| {
             if let Some(peer) = links.peers.get_mut(&peer) {
                 peer.support = support(capabilities);
+                peer.focus_support =
+                    capabilities.contains(&(net::Capability::AudioFocusReportV1 as i32));
             }
         });
     }
@@ -309,6 +357,7 @@ struct Record {
     health_state: model::StreamHealth,
     capture_active: Option<bool>,
     sending: Option<bool>,
+    applied_gain: Option<(u32, bool)>,
 }
 struct Pending {
     request: Request,
@@ -326,6 +375,12 @@ struct Actor {
     gui_commands: mpsc::Receiver<Request>,
     links: watch::Receiver<Links>,
     stopping: watch::Receiver<bool>,
+    focus_rx: watch::Receiver<CommittedFocus>,
+    focus_view: CommittedFocus,
+    focus_policy: FocusPolicy,
+    focus_revision: u64,
+    focus_snapshot: Option<Snapshot>,
+    focus_received: bool,
     caps: watch::Sender<Vec<i32>>,
     model: fsm::ControlPlane,
     peers: BTreeMap<NodeId, Peer>,
@@ -395,6 +450,12 @@ impl Actor {
         }
     }
     fn configure(&mut self) -> Result<(), Code> {
+        self.focus_policy.configure(
+            self.now(),
+            u64::from(self.config.focus_debounce_ms),
+            u64::from(self.config.focus_ramp_ms),
+            background_percent(&self.config),
+        );
         let role = match self.config.role {
             config::AudioRole::Off => None,
             config::AudioRole::Source => Some(model::AudioRole::Source),
@@ -422,8 +483,9 @@ impl Actor {
         Ok(())
     }
     fn publish_caps(&self) {
-        let mut bits = [0; 3];
-        let mut len = 0;
+        let mut bits = [0; 4];
+        bits[0] = net::Capability::AudioFocusReportV1 as i32;
+        let mut len = 1;
         if self.config.enabled {
             bits[len] = net::Capability::AudioControlV1 as i32;
             len += 1;
@@ -466,16 +528,20 @@ impl Actor {
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let enabled = self.config.enabled;
             let attached = self.worker_events.is_some();
+            let ticking = self.config.enabled || self.pending_focus();
             tokio::select! {
                 _ = self.stopping.changed() => break,
+                changed = self.focus_rx.changed() => {
+                    if changed.is_err() { break; }
+                    self.sync_focus();
+                }
                 changed = self.links.changed() => {
                     if changed.is_err() { break; }
                     self.dirty = true;
                     self.sync_links();
                 }
-                _ = tick.tick(), if enabled => self.tick().await,
+                _ = tick.tick(), if ticking => self.tick().await,
                 event = async { match self.worker_events.as_mut() { Some(events) => events.recv().await, None => std::future::pending().await } }, if attached => {
                     self.dirty = true;
                     if let Some(event) = event { self.on_worker(event).await; }
@@ -510,6 +576,8 @@ impl Actor {
                 }
             }
             self.drain().await;
+            self.service_focus().await;
+            self.apply_gains().await;
             self.publish_caps();
             self.publish();
             self.service_deferred().await;
@@ -537,6 +605,20 @@ impl Actor {
             .collect();
         for (id, parent) in removed {
             let _ = self.feed(fsm::Input::PeerDown(parent));
+            if self.focus_view.owner.is_some_and(|(owner, _)| owner == id) {
+                self.focus_received = false;
+                let now = self.now();
+                // A restarted owner may retain its ownership serial, but not its revision.
+                // Old-parent messages are rejected before reaching this fresh namespace.
+                self.focus_policy.set_owner(now, None);
+                self.focus_policy.set_owner(
+                    now,
+                    self.focus_view.owner.map(|(node, serial)| Owner {
+                        node: *node.as_bytes(),
+                        serial,
+                    }),
+                );
+            }
             if let Some(record) = self.records.get_mut(&id) {
                 record.view.phase = fsm::Phase::Failed;
                 record.view.reason = Some(fsm::Reason::ParentLost);
@@ -558,6 +640,10 @@ impl Actor {
                 .is_none_or(|previous| previous.trusted != peer.trusted);
             if let Some(previous) = self.peers.get(&id).filter(|p| p.parent == peer.parent) {
                 peer.hello = previous.hello;
+                peer.focus_sent_revision = previous.focus_sent_revision;
+                peer.focus_request_at = previous.focus_request_at;
+                peer.focus_reply_at = previous.focus_reply_at;
+                peer.focus_reply = previous.focus_reply;
             }
             if self.admitted.contains(&id) {
                 if !peer.trusted && trust_changed {
@@ -591,6 +677,17 @@ impl Actor {
                 }
             }
             self.peers.insert(id, peer);
+        }
+        if let Some((owner, _)) = self.focus_view.owner {
+            if owner != self.local
+                && !self
+                    .peers
+                    .get(&owner)
+                    .is_some_and(|p| p.trusted && p.focus_support)
+            {
+                self.focus_received = false;
+                self.focus_policy.unknown(self.now());
+            }
         }
     }
     async fn save(&self, config: config::AudioConfig) -> Result<(), Code> {
@@ -734,6 +831,7 @@ impl Actor {
                                 health_state: model::StreamHealth::Buffering,
                                 capture_active: None,
                                 sending: None,
+                                applied_gain: None,
                             },
                         );
                         let mut transcript_sha256 = [0; 32];
@@ -957,6 +1055,7 @@ impl Actor {
         if let Ok(request_id) = &result {
             if let Some(record) = self.records.get_mut(&peer_id) {
                 record.start_request_id = Some(*request_id);
+                record.applied_gain = None;
             }
         }
         if result.is_err() {
@@ -1209,23 +1308,49 @@ impl Actor {
                                     record.agreement.source_port
                                 })
                         });
-                        if port_matches
+                        let valid = port_matches
                             && view.phase == fsm::Phase::Committed
                             && self
                                 .worker
                                 .as_ref()
                                 .is_some_and(|w| w.alive && w.model_ready && w.generation == gen)
-                            && self.current(view.parent)
-                            && self.feed(fsm::Input::ChildStarted(view)).is_ok()
+                            && self.current(view.parent);
+                        if !valid {
+                            if let Some(worker) = &self.worker {
+                                let _ = worker.handle.stop_session(id).await;
+                            }
+                            return;
+                        }
+                        if self
+                            .records
+                            .get(&peer)
+                            .is_some_and(|record| record.role == model::AudioRole::Listener)
                         {
                             let (gain, muted) = self.gain(peer);
-                            if self.role() == model::AudioRole::Listener {
-                                if let Some(worker) = &self.worker {
-                                    let _ = worker.handle.set_gain(id, gain, muted).await;
+                            let applied = match &self.worker {
+                                Some(worker) => {
+                                    worker.handle.set_gain(id, gain, muted).await.is_ok()
                                 }
+                                None => false,
+                            };
+                            if !applied {
+                                let _ = self.feed(fsm::Input::ChildFailed {
+                                    view,
+                                    reason: fsm::Reason::WorkerLost,
+                                });
+                                return;
                             }
-                        } else if let Some(worker) = &self.worker {
-                            let _ = worker.handle.stop_session(id).await;
+                            if let Some(record) = self.records.get_mut(&peer) {
+                                record.applied_gain = Some((gain, muted));
+                            }
+                        }
+                        // Establish Listener gain before Commit can start the Source.
+                        if !self.current(view.parent)
+                            || self.feed(fsm::Input::ChildStarted(view)).is_err()
+                        {
+                            if let Some(worker) = &self.worker {
+                                let _ = worker.handle.stop_session(id).await;
+                            }
                         }
                     }
                     Ok(worker::EventKind::Stopped) => {
@@ -1386,6 +1511,9 @@ impl Actor {
     }
     async fn tick(&mut self) {
         self.sync_links();
+        if !self.config.enabled {
+            return;
+        }
         if let Some(worker) = &self.worker {
             if worker.alive && worker.model_ready {
                 // The supervisor validates child Pongs and owns its liveness timeout. This
@@ -1416,7 +1544,251 @@ impl Actor {
             }
         }
     }
+    fn follow_focus(&self) -> bool {
+        self.config.enabled
+            && self.config.role == config::AudioRole::Listener
+            && self.config.mode == config::AudioMode::FollowFocus
+    }
+    fn focus_members(&self) -> Option<([[u8; 32]; 4], usize)> {
+        let mut members = [[0; 32]; 4];
+        members[0] = *self.local.as_bytes();
+        let mut len = 1;
+        for (id, _) in self.peers.iter().filter(|(_, peer)| peer.trusted) {
+            *members.get_mut(len)? = *id.as_bytes();
+            len += 1;
+        }
+        Some((members, len))
+    }
+    fn refresh_local_focus(&mut self) {
+        self.focus_snapshot = None;
+        let Some((node, serial)) = self.focus_view.owner.filter(|(id, _)| *id == self.local) else {
+            return;
+        };
+        let now = self.now();
+        let Some(revision) = self.focus_revision.checked_add(1) else {
+            self.focus_policy.unknown(now);
+            return;
+        };
+        self.focus_revision = revision;
+        let snapshot = Snapshot {
+            owner: Owner {
+                node: *node.as_bytes(),
+                serial,
+            },
+            revision,
+            active: self.focus_view.active.map(|id| *id.as_bytes()),
+            lease: self.focus_view.lease,
+            committed: self.focus_view.committed,
+        };
+        if let Some((members, len)) = self.focus_members() {
+            if self
+                .focus_policy
+                .accept(now, snapshot.owner.node, snapshot, &members[..len])
+            {
+                self.focus_snapshot = Some(snapshot);
+                self.focus_received = true;
+                return;
+            }
+        }
+        self.focus_policy.unknown(now);
+    }
+    fn sync_focus(&mut self) {
+        let view = *self.focus_rx.borrow_and_update();
+        if view == self.focus_view {
+            return;
+        }
+        let now = self.now();
+        if view.owner != self.focus_view.owner {
+            self.focus_received = false;
+            self.focus_snapshot = None;
+        }
+        self.focus_view = view;
+        let owner = view.owner.map(|(node, serial)| Owner {
+            node: *node.as_bytes(),
+            serial,
+        });
+        self.focus_policy.set_owner(now, owner);
+        if owner.is_some_and(|o| o.node == *self.local.as_bytes()) {
+            self.refresh_local_focus();
+        } else if owner.is_none() {
+            self.focus_policy.unknown(now);
+        }
+        self.dirty = true;
+    }
+    fn on_focus_network(&mut self, parent: fsm::Parent, message: &net::AudioControl) {
+        self.sync_focus();
+        if !self
+            .peers
+            .get(&NodeId::new(parent.peer))
+            .is_some_and(|p| p.trusted && p.focus_support && p.parent == parent)
+            || !self
+                .links
+                .borrow()
+                .peers
+                .get(&NodeId::new(parent.peer))
+                .is_some_and(|p| p.trusted && p.focus_support && p.parent == parent)
+        {
+            return;
+        }
+        match wire::decode_focus(message) {
+            Ok(wire::FocusControl::Snapshot(snapshot)) => {
+                if self.config.enabled
+                    && self.config.role == config::AudioRole::Listener
+                    && self
+                        .focus_view
+                        .owner
+                        .is_some_and(|(owner, _)| *owner.as_bytes() == parent.peer)
+                {
+                    if let Some((members, len)) = self.focus_members() {
+                        if self.focus_policy.accept(
+                            self.now(),
+                            parent.peer,
+                            snapshot,
+                            &members[..len],
+                        ) {
+                            self.focus_received = true;
+                            self.dirty = true;
+                        }
+                    }
+                }
+            }
+            Ok(wire::FocusControl::Request(_)) => {
+                if self
+                    .focus_view
+                    .owner
+                    .is_some_and(|(owner, _)| owner == self.local)
+                {
+                    let now = self.now();
+                    if let Some(peer) = self.peers.get_mut(&NodeId::new(parent.peer)) {
+                        if elapsed_second(peer.focus_reply_at, now) {
+                            peer.focus_reply = true;
+                            peer.focus_reply_at = Some(now);
+                            tracing::debug!(peer = %NodeId::new(parent.peer), "audio focus snapshot request received");
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    fn pending_focus(&self) -> bool {
+        self.focus_view
+            .owner
+            .is_some_and(|(owner, _)| owner == self.local)
+            && self.focus_snapshot.is_some_and(|snapshot| {
+                self.peers.values().any(|peer| {
+                    peer.trusted
+                        && peer.focus_support
+                        && (peer.focus_reply || peer.focus_sent_revision != snapshot.revision)
+                })
+            })
+    }
+
+    async fn service_focus(&mut self) {
+        self.sync_focus();
+        let now = self.now();
+        let previous_primary = self.focus_policy.primary();
+        self.focus_policy.tick(now);
+        self.dirty |= previous_primary != self.focus_policy.primary();
+        let local_owner = self
+            .focus_view
+            .owner
+            .is_some_and(|(owner, _)| owner == self.local);
+        let owner = self.focus_view.owner.map(|(id, _)| id);
+        let group = self.config.group_id.map(|id| id.0);
+        let request =
+            self.config.enabled && self.config.role == config::AudioRole::Listener && !local_owner;
+        if local_owner
+            && self.peers.values().any(|peer| {
+                peer.trusted
+                    && peer.focus_support
+                    && (peer.focus_reply || peer.focus_sent_revision == 0)
+            })
+        {
+            self.refresh_local_focus();
+        }
+        for (id, peer) in &mut self.peers {
+            if !peer.trusted || !peer.focus_support {
+                continue;
+            }
+            if local_owner {
+                if let Some(snapshot) = self.focus_snapshot {
+                    if (peer.focus_reply || peer.focus_sent_revision != snapshot.revision)
+                        && self
+                            .manager
+                            .send_audio_control(id, wire::encode_focus(snapshot))
+                            .await
+                            .is_ok()
+                    {
+                        peer.focus_sent_revision = snapshot.revision;
+                        peer.focus_reply = false;
+                    }
+                }
+            } else if request
+                && owner == Some(*id)
+                && (!self.focus_received || peer.focus_request_at.is_none())
+                && elapsed_second(peer.focus_request_at, now)
+            {
+                if let Some(group) = group {
+                    peer.focus_request_at = Some(now);
+                    if self
+                        .manager
+                        .send_audio_control(id, wire::encode_focus_request(group))
+                        .await
+                        .is_ok()
+                    {
+                        tracing::debug!(peer = %id, "audio focus snapshot requested");
+                    }
+                }
+            }
+        }
+    }
+    async fn apply_gains(&mut self) {
+        if !self.config.enabled || self.config.role != config::AudioRole::Listener {
+            return;
+        }
+        let Some(worker) = self.worker.as_ref().filter(|w| w.alive && w.model_ready) else {
+            return;
+        };
+        for (peer, record) in &mut self.records {
+            if record.role != model::AudioRole::Listener
+                || !matches!(
+                    record.view.phase,
+                    fsm::Phase::Active | fsm::Phase::Rebuffering
+                )
+            {
+                continue;
+            }
+            let (gain, muted) = self
+                .config
+                .peers
+                .iter()
+                .find(|p| p.node_id.0 == *peer.as_bytes())
+                .map_or((100, false), |p| (p.gain_percent, p.muted));
+            let factor = if self.config.mode == config::AudioMode::FollowFocus {
+                self.focus_policy.gain_percent(*peer.as_bytes())
+            } else {
+                100
+            };
+            let target = (effective_gain(gain, factor), muted);
+            if record.applied_gain != Some(target)
+                && worker
+                    .handle
+                    .set_gain(record.view.session, target.0, target.1)
+                    .await
+                    .is_ok()
+            {
+                record.applied_gain = Some(target);
+                self.dirty = true;
+            }
+        }
+    }
+
     fn on_network(&mut self, parent: fsm::Parent, message: net::AudioControl) {
+        if wire::is_focus(&message) {
+            self.on_focus_network(parent, &message);
+            return;
+        }
         if !self.config.enabled || self.configuration_error.is_some() || !self.current(parent) {
             return;
         }
@@ -1628,9 +2000,6 @@ impl Actor {
             wire::Error::Unsupported => ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND,
             _ => ipc::audio::codes::AUDIO_ROLE_CONFLICT,
         })?;
-        if next.enabled && next.mode == config::AudioMode::FollowFocus {
-            return Err(ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND);
-        }
         if next.enabled && (self.listen.ip().is_unspecified() || self.listen.ip().is_multicast()) {
             return Err(ipc::audio::codes::AUDIO_DEVICE_UNAVAILABLE);
         }
@@ -1716,10 +2085,6 @@ impl Actor {
         }
         if !self.config.enabled {
             reply(&request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await;
-            return;
-        }
-        if self.config.mode == config::AudioMode::FollowFocus {
-            reply(&request, Err(ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND)).await;
             return;
         }
         if start.expected_revision != self.revision {
@@ -1866,11 +2231,18 @@ impl Actor {
         }
     }
     fn gain(&self, peer: NodeId) -> (u32, bool) {
-        self.config
+        let (gain, muted) = self
+            .config
             .peers
             .iter()
             .find(|p| p.node_id.0 == *peer.as_bytes())
-            .map_or((100, false), |p| (p.gain_percent, p.muted))
+            .map_or((100, false), |p| (p.gain_percent, p.muted));
+        let factor = if self.follow_focus() {
+            self.focus_policy.gain_percent(*peer.as_bytes())
+        } else {
+            100
+        };
+        (effective_gain(gain, factor), muted)
     }
     async fn set_gain(&mut self, set: &gui::SetAudioPeerGain) -> Result<(), Code> {
         if set.expected_revision != self.revision {
@@ -1902,15 +2274,7 @@ impl Actor {
         }
         self.save(next.clone()).await?;
         self.config = next;
-        if let Some(record) = self.records.get(&peer) {
-            if let Some(worker) = &self.worker {
-                worker
-                    .handle
-                    .set_gain(record.view.session, set.gain_percent, set.muted)
-                    .await
-                    .map_err(|_| ipc::audio::codes::AUDIO_DEVICE_UNAVAILABLE)?;
-            }
-        }
+        self.apply_gains().await;
         Ok(())
     }
     fn snapshot(&self) -> Option<gui::AudioStatus> {
@@ -1971,7 +2335,8 @@ impl Actor {
                 muted,
                 consent,
                 media_info: None,
-                focus_primary: false,
+                focus_primary: self.follow_focus()
+                    && self.focus_policy.primary() == Some(*peer.as_bytes()),
             });
             observations.push(wire::SessionObservation {
                 session: record.view.session,
@@ -2185,6 +2550,22 @@ fn backend(ready: Option<&worker::Ready>) -> Vec<model::CapabilityAvailability> 
     .collect()
 }
 
+fn elapsed_second(previous: Option<u64>, now: u64) -> bool {
+    previous.is_none_or(|at| now.saturating_sub(at) >= 1000)
+}
+fn effective_gain(user: u32, focus: u32) -> u32 {
+    user.min(100) * focus.min(100) / 100
+}
+fn background_percent(config: &config::AudioConfig) -> u32 {
+    if config.background_mute {
+        0
+    } else {
+        (100.0 * 10.0_f32.powf(config.background_gain_db / 20.0))
+            .round()
+            .clamp(0.0, 100.0) as u32
+    }
+}
+
 fn permitted(config: &config::AudioConfig, peer: NodeId) -> bool {
     let id = config::audio::HexId(*peer.as_bytes());
     config.enabled
@@ -2244,6 +2625,26 @@ fn control_session(message: &fsm::Control) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_multiplier_preserves_user_gain_and_bounds() {
+        assert_eq!(effective_gain(80, 100), 80);
+        assert_eq!(effective_gain(80, 13), 10);
+        assert_eq!(effective_gain(80, 0), 0);
+        assert_eq!(effective_gain(100, 100), 100);
+        let mut config = config::AudioConfig::default();
+        assert_eq!(background_percent(&config), 13);
+        config.background_mute = true;
+        assert_eq!(background_percent(&config), 0);
+    }
+
+    #[test]
+    fn focus_requests_are_bounded_per_parent() {
+        assert!(elapsed_second(None, 0));
+        assert!(!elapsed_second(Some(100), 1099));
+        assert!(elapsed_second(Some(100), 1100));
+        assert!(!elapsed_second(Some(100), 99));
+    }
 
     fn parent(value: u8) -> fsm::Parent {
         fsm::Parent {

@@ -923,6 +923,7 @@ impl Session {
             ));
             if let Some(audio) = &self.audio {
                 audio.trusted(&self.trust);
+                audio.focus(committed_audio_focus(&self.router, self.node_id));
             }
         }
         #[cfg(not(feature = "audio"))]
@@ -1594,6 +1595,10 @@ impl Session {
         }
         // Boxed: `apply` reaches `feed` again through the agent-loss path.
         Box::pin(self.apply(outputs)).await;
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            audio.focus(committed_audio_focus(&self.router, self.node_id));
+        }
     }
 
     fn transition_disabled_reason(&self) -> String {
@@ -5146,11 +5151,141 @@ fn refusal_detail(code: protocol::wire::ErrorCode, layout_revision: u64) -> Stri
     )
 }
 
+/// Read only settled router state: a third member's Local is not global focus.
+#[cfg(feature = "audio")]
+fn committed_audio_focus<I: fr::Identifiers>(
+    router: &fr::FocusRouter<I>,
+    local: NodeId,
+) -> audio::CommittedFocus {
+    let owner = matches!(
+        router.ownership().state(),
+        fr::OwnershipState::Owner | fr::OwnershipState::Follower
+    )
+    .then(|| router.owner().copied())
+    .flatten()
+    .filter(|_| router.serial() > 0)
+    .map(|owner| (owner, router.serial()));
+    let target = committed_audio_target(local, owner.map(|p| p.0), router.focus(), router.lease());
+    audio::CommittedFocus {
+        owner,
+        active: target.map(|p| p.0),
+        lease: target.and_then(|p| p.1),
+        committed: target.is_some(),
+    }
+}
+
+#[cfg(feature = "audio")]
+fn committed_audio_target(
+    local: NodeId,
+    owner: Option<NodeId>,
+    focus: fr::FocusState,
+    lease: &fr::LeaseSlot,
+) -> Option<(NodeId, Option<fr::LeaseId>)> {
+    match (focus, lease) {
+        (fr::FocusState::Local, fr::LeaseSlot::Idle) if owner == Some(local) => Some((local, None)),
+        (fr::FocusState::Remote, fr::LeaseSlot::Source(lease))
+            if owner == Some(local) && lease.state == fr::SourceState::Remote =>
+        {
+            Some((lease.peer, Some(lease.lease_id)))
+        }
+        (fr::FocusState::Remote, fr::LeaseSlot::Receiver(lease))
+            if owner == Some(lease.source) && lease.state == fr::ReceiverState::Active =>
+        {
+            Some((local, Some(lease.lease_id)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "audio"))]
+mod audio_focus_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn idle_owner_is_primary_but_third_member_local_is_not() {
+        let local = NodeId::new([1; 32]);
+        let other = NodeId::new([2; 32]);
+        for owner in [local, other] {
+            let router = fr::FocusRouter::new(
+                local,
+                fr::Timing::default(),
+                fr::SequentialIds::default(),
+                fr::Capabilities::default(),
+            )
+            .with_persisted_ownership(3, Some((3, owner)));
+            let focus = committed_audio_focus(&router, local);
+            assert_eq!(focus.owner, Some((owner, 3)));
+            assert_eq!(focus.active, (owner == local).then_some(local));
+            assert_eq!(focus.committed, owner == local);
+            assert_eq!(focus.lease, None);
+        }
+    }
+
+    #[test]
+    fn only_committed_remote_source_state_selects_the_receiver() {
+        let local = NodeId::new([1; 32]);
+        let peer = NodeId::new([2; 32]);
+        let mut source = fr::SourceLease::new(
+            [7; 16],
+            peer,
+            1,
+            geometry::Position::new("d".to_owned(), 0.0, 0.0),
+            0,
+        );
+        for state in [
+            fr::SourceState::Preparing,
+            fr::SourceState::Remote,
+            fr::SourceState::Releasing,
+            fr::SourceState::Done,
+        ] {
+            source.state = state;
+            let lease = fr::LeaseSlot::Source(Box::new(source.clone()));
+            let target = committed_audio_target(local, Some(local), lease.focus(), &lease);
+            assert_eq!(
+                target,
+                (state == fr::SourceState::Remote).then_some((peer, Some([7; 16])))
+            );
+            assert_eq!(
+                committed_audio_target(local, Some(local), fr::FocusState::Blocked, &lease),
+                None
+            );
+            assert_eq!(
+                committed_audio_target(local, Some(peer), lease.focus(), &lease),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn receiver_observation_requires_active_and_the_accepted_owner() {
+        let local = NodeId::new([1; 32]);
+        let owner = NodeId::new([2; 32]);
+        let mut receiver = fr::ReceiverLease::new([8; 16], owner, 1, 0);
+        for state in [
+            fr::ReceiverState::Prepared,
+            fr::ReceiverState::Active,
+            fr::ReceiverState::Releasing,
+            fr::ReceiverState::Expired,
+        ] {
+            receiver.state = state;
+            let lease = fr::LeaseSlot::Receiver(Box::new(receiver.clone()));
+            assert_eq!(
+                committed_audio_target(local, Some(owner), lease.focus(), &lease),
+                (state == fr::ReceiverState::Active).then_some((local, Some([8; 16])))
+            );
+            assert_eq!(
+                committed_audio_target(local, Some(local), lease.focus(), &lease),
+                None
+            );
+        }
+    }
+}
+
 #[cfg(any(feature = "audio", test))]
 fn merge_audio_capabilities(current: &mut Vec<i32>, audio: &[i32]) {
-    current.retain(|bit| !matches!(bit, 16 | 17 | 20));
+    current.retain(|bit| !matches!(bit, 16 | 17 | 19 | 20));
     for &bit in audio {
-        if matches!(bit, 16 | 17 | 20) && !current.contains(&bit) {
+        if matches!(bit, 16 | 17 | 19 | 20) && !current.contains(&bit) {
             current.push(bit);
         }
     }
@@ -5162,9 +5297,9 @@ mod audio_capability_tests {
 
     #[test]
     fn audio_publication_preserves_other_capabilities() {
-        let mut current = vec![1, 7, 16, 17, 18, 20, 21];
-        merge_audio_capabilities(&mut current, &[16, 20, 20, 99]);
-        assert_eq!(current, vec![1, 7, 18, 21, 16, 20]);
+        let mut current = vec![1, 7, 16, 17, 18, 19, 20, 21];
+        merge_audio_capabilities(&mut current, &[16, 19, 20, 20, 99]);
+        assert_eq!(current, vec![1, 7, 18, 21, 16, 19, 20]);
         merge_audio_capabilities(&mut current, &[]);
         assert_eq!(current, vec![1, 7, 18, 21]);
     }

@@ -15,6 +15,7 @@ use transport::{
 };
 
 const CAP: i32 = wire::Capability::AudioControlV1 as i32;
+const FOCUS_CAP: i32 = wire::Capability::AudioFocusReportV1 as i32;
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct Root(std::path::PathBuf);
@@ -495,11 +496,18 @@ async fn generic_audio_envelope_and_prehello_violations_remain_fatal() {
 }
 
 async fn raw_audio_link() -> (Root, Stream, Link, mpsc::Receiver<LinkReport>, [u8; 16]) {
+    raw_link(vec![CAP], vec![CAP]).await
+}
+
+async fn raw_link(
+    local_caps: Vec<i32>,
+    remote_caps: Vec<i32>,
+) -> (Root, Stream, Link, mpsc::Receiver<LinkReport>, [u8; 16]) {
     let root = Root::new();
     let client = root.identity("client");
     let server = root.identity("server");
     let (mut raw, b) = streams(&client, &server).await;
-    let (link, mut rx) = spawn(b, server.node_id(), client.node_id(), false, vec![CAP]);
+    let (link, mut rx) = spawn(b, server.node_id(), client.node_id(), false, local_caps);
     let connection = [8; 16];
     transport::write_frame(
         &mut raw,
@@ -508,7 +516,7 @@ async fn raw_audio_link() -> (Root, Stream, Link, mpsc::Receiver<LinkReport>, [u
             1,
             wire::envelope::Payload::Hello(wire::Hello {
                 node_id: client.node_id().as_bytes().to_vec(),
-                capabilities: vec![CAP],
+                capabilities: remote_caps,
                 ..Default::default()
             }),
         ),
@@ -618,6 +626,231 @@ async fn raw_audio_padding_limit_is_audio_only_and_envelope_padding_is_not_audio
     ));
     let frame =
         transport::convert::to_envelope(&focus(), 5, &connection, Some(&[4; 16]), "").unwrap();
+    transport::write_frame(&mut raw, &frame).await.unwrap();
+    assert_eq!(message(report(&mut rx).await), Inbound::Focus(focus()));
+    link.handle.close();
+    link.task.abort();
+}
+
+fn focus_bodies() -> [wire::AudioControl; 2] {
+    [
+        wire::AudioControl {
+            control_version: 1,
+            body: Some(wire::audio_control::Body::Focus(wire::AudioFocusSnapshot {
+                owner_node_id: vec![1; 32],
+                owner_serial: 1,
+                focus_revision: 1,
+                active_node_id: vec![2; 32],
+                lease_id: vec![3; 16],
+                committed: true,
+            })),
+        },
+        wire::AudioControl {
+            control_version: 1,
+            body: Some(wire::audio_control::Body::FocusRequest(
+                wire::AudioFocusRequest {
+                    group_id: vec![4; 16],
+                },
+            )),
+        },
+    ]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn focus_only_capability_delivers_both_directions_and_survives_audio_withdrawal() {
+    let root = Root::new();
+    let client = root.identity("client");
+    let server = root.identity("server");
+    let (a, b) = streams(&client, &server).await;
+    let (left, mut left_rx) = spawn(a, client.node_id(), server.node_id(), true, vec![FOCUS_CAP]);
+    let (right, mut right_rx) = spawn(
+        b,
+        server.node_id(),
+        client.node_id(),
+        false,
+        vec![CAP, FOCUS_CAP],
+    );
+    let connection = up(report(&mut left_rx).await);
+    assert_eq!(up(report(&mut right_rx).await), connection);
+    right
+        .handle
+        .send_capabilities(vec![FOCUS_CAP])
+        .await
+        .unwrap();
+    assert!(matches!(
+        message(report(&mut left_rx).await),
+        Inbound::CapabilitiesChanged(caps) if caps == vec![FOCUS_CAP]
+    ));
+    for audio in focus_bodies() {
+        for handle in [&left.handle, &right.handle] {
+            handle.send_audio_control(audio.clone()).await.unwrap();
+            assert!(matches!(
+                handle.send_audio_control(stop()).await,
+                Err(TransportError::Audio(AudioViolation::Capability))
+            ));
+        }
+        for received in [
+            message(report(&mut left_rx).await),
+            message(report(&mut right_rx).await),
+        ] {
+            assert_eq!(
+                received,
+                Inbound::Audio {
+                    message: audio.clone(),
+                    connection_id: connection
+                }
+            );
+        }
+    }
+    right.handle.send_capabilities(vec![CAP]).await.unwrap();
+    assert!(matches!(
+        message(report(&mut left_rx).await),
+        Inbound::CapabilitiesChanged(_)
+    ));
+    for handle in [&left.handle, &right.handle] {
+        for audio in focus_bodies() {
+            assert!(matches!(
+                handle.send_audio_control(audio).await,
+                Err(TransportError::Audio(AudioViolation::Capability))
+            ));
+        }
+    }
+    left.handle.close();
+    right.handle.close();
+    left.task.abort();
+    right.task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_focus_capability_refuses_send_and_raw_receive_without_harming_input() {
+    for (local_caps, remote_caps) in [
+        (vec![CAP], vec![CAP, FOCUS_CAP]),
+        (vec![CAP, FOCUS_CAP], vec![CAP]),
+        (vec![CAP], vec![CAP]),
+    ] {
+        let (_root, mut raw, link, mut rx, connection) = raw_link(local_caps, remote_caps).await;
+        for (index, audio) in focus_bodies().into_iter().enumerate() {
+            assert!(matches!(
+                link.handle.send_audio_control(audio.clone()).await,
+                Err(TransportError::Audio(AudioViolation::Capability))
+            ));
+            transport::write_frame(
+                &mut raw,
+                &envelope(
+                    connection,
+                    index as u64 + 2,
+                    wire::envelope::Payload::AudioControl(audio),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                message(report(&mut rx).await),
+                Inbound::AudioRejected {
+                    violation: AudioViolation::Capability,
+                    connection_id: connection,
+                }
+            );
+        }
+        transport::write_frame(
+            &mut raw,
+            &envelope(connection, 4, wire::envelope::Payload::AudioControl(stop())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            message(report(&mut rx).await),
+            Inbound::Audio {
+                message: stop(),
+                connection_id: connection
+            }
+        );
+        let frame =
+            transport::convert::to_envelope(&focus(), 5, &connection, Some(&[4; 16]), "").unwrap();
+        transport::write_frame(&mut raw, &frame).await.unwrap();
+        assert_eq!(message(report(&mut rx).await), Inbound::Focus(focus()));
+        link.handle.close();
+        link.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_and_unknown_focus_metadata_are_bounded_audio_only_failures() {
+    use prost::{
+        encoding::{encode_key, encode_varint, WireType},
+        Message,
+    };
+    use tokio::io::AsyncWriteExt;
+    let (_root, mut raw, link, mut rx, connection) =
+        raw_link(vec![FOCUS_CAP], vec![FOCUS_CAP]).await;
+    let mut malformed = focus_bodies()[0].clone();
+    if let Some(wire::audio_control::Body::Focus(snapshot)) = &mut malformed.body {
+        snapshot.focus_revision = 0;
+    }
+    let cases = [
+        (malformed.encode_to_vec(), Some(AudioViolation::Epoch)),
+        (vec![8, 1, 0xb2, 1, 0], Some(AudioViolation::MissingBody)),
+    ];
+    let mut seq = 2;
+    for (audio, violation) in cases
+        .into_iter()
+        .chain([2048usize, 2049].into_iter().map(|size| {
+            let mut audio = focus_bodies()[0].encode_to_vec();
+            let padding = size - audio.len() - 4;
+            encode_key(100, WireType::LengthDelimited, &mut audio);
+            encode_varint(padding as u64, &mut audio);
+            audio.resize(size, 0);
+            (audio, (size > 2048).then_some(AudioViolation::TooLarge))
+        }))
+    {
+        let mut bytes = envelope(
+            connection,
+            seq,
+            wire::envelope::Payload::Ping(wire::Ping { nonce: 0 }),
+        );
+        bytes.payload = None;
+        let mut bytes = bytes.encode_to_vec();
+        encode_key(59, WireType::LengthDelimited, &mut bytes);
+        encode_varint(audio.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&audio);
+        raw.write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        raw.write_all(&bytes).await.unwrap();
+        raw.flush().await.unwrap();
+        let expected = match violation {
+            Some(violation) => Inbound::AudioRejected {
+                violation,
+                connection_id: connection,
+            },
+            None => Inbound::Audio {
+                message: focus_bodies()[0].clone(),
+                connection_id: connection,
+            },
+        };
+        assert_eq!(message(report(&mut rx).await), expected);
+        seq += 1;
+    }
+    transport::write_frame(
+        &mut raw,
+        &envelope(
+            connection,
+            seq,
+            wire::envelope::Payload::Ping(wire::Ping { nonce: 991 }),
+        ),
+    )
+    .await
+    .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), transport::read_frame(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        pong.payload,
+        Some(wire::envelope::Payload::Pong(wire::Pong { nonce: 991 }))
+    ));
+    let frame = transport::convert::to_envelope(&focus(), seq + 1, &connection, Some(&[4; 16]), "")
+        .unwrap();
     transport::write_frame(&mut raw, &frame).await.unwrap();
     assert_eq!(message(report(&mut rx).await), Inbound::Focus(focus()));
     link.handle.close();

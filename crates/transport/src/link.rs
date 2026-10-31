@@ -829,7 +829,7 @@ impl LinkHandle {
         message: wire::AudioControl,
     ) -> Result<(), TransportError> {
         validate::audio_control(&message).map_err(TransportError::Audio)?;
-        if !self.queue.audio_allowed() {
+        if !self.queue.audio_allowed(&message) {
             return Err(TransportError::Audio(validate::AudioViolation::Capability));
         }
         if let Some(wire::audio_control::Body::Offer(offer)) = &message.body {
@@ -1784,7 +1784,8 @@ impl LinkState {
                 return Ok(());
             }
         };
-        let message = if matches!(message, convert::Inbound::Audio { .. }) && !queue.audio_allowed()
+        let message = if matches!(&message, convert::Inbound::Audio { message, .. }
+            if !queue.audio_allowed(message))
         {
             convert::Inbound::AudioRejected {
                 violation: validate::AudioViolation::Capability,
@@ -2081,7 +2082,7 @@ async fn write_intent<W: AsyncWrite + Unpin>(
             Outbound::AudioControl(message) => {
                 // Withdrawal purges queued metadata; recheck items already selected by
                 // the writer too. Never consume an envelope sequence for a dropped item.
-                if !queue.audio_allowed() {
+                if !queue.audio_allowed(&message) {
                     return Ok(());
                 }
                 state.envelope(wire::envelope::Payload::AudioControl(message))
@@ -2338,7 +2339,7 @@ mod audio_admission_tests {
         ));
         assert!(handle.terminal.borrow().is_none());
         handle.queue.set_remote_audio(&[]);
-        assert!(!handle.queue.audio_allowed());
+        assert!(!handle.queue.audio_allowed(&wire::AudioControl::default()));
         for _ in 0..16 {
             assert!(matches!(
                 handle.queue.pop(),

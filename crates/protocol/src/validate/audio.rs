@@ -245,6 +245,25 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
                 return Err(AudioViolation::Health);
             }
         }
+        Body::Focus(focus) => {
+            id(&focus.owner_node_id, 32)?;
+            if focus.owner_serial == 0 || focus.focus_revision == 0 {
+                return Err(AudioViolation::Epoch);
+            }
+            if focus.committed {
+                id(&focus.active_node_id, 32)?;
+                if focus.active_node_id == focus.owner_node_id {
+                    if !focus.lease_id.is_empty() {
+                        return Err(AudioViolation::Lease);
+                    }
+                } else {
+                    id(&focus.lease_id, 16)?;
+                }
+            } else if !focus.active_node_id.is_empty() || !focus.lease_id.is_empty() {
+                return Err(AudioViolation::Lease);
+            }
+        }
+        Body::FocusRequest(request) => id(&request.group_id, 16)?,
         Body::Consent(consent) => {
             id(&consent.group_id, 16)?;
             directions(consent.allowed_directions)?;
