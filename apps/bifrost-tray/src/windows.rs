@@ -96,11 +96,7 @@ unsafe extern "system" fn procedure(
                 }
                 UPDATE => {
                     let latest = window.state.borrow();
-                    let text = latest
-                        .items()
-                        .get(1)
-                        .map(|i| i.label.clone())
-                        .unwrap_or_else(|| "Bifrost".into());
+                    let text = latest.tooltip();
                     // The icon is borrowed only for these statements, never across a
                     // nested message loop (`TrackPopupMenu` below re-enters this function).
                     let mut icon = window.icon.borrow_mut();

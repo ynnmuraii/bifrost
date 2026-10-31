@@ -19,6 +19,7 @@
 
 mod appearance;
 pub mod audio_player;
+pub mod audio_settings;
 mod bridge;
 mod dock;
 mod field;
@@ -36,7 +37,7 @@ use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, UiBu
 
 pub use bridge::Bridge as AsciiBridge;
 pub use field::{Field, Frame as FieldFrame};
-pub use theme::{install_fonts, Palette};
+pub use theme::{apply as apply_theme, install_fonts, Palette};
 
 use crate::gui_settings::Theme;
 use crate::map::Pt;
@@ -419,10 +420,10 @@ fn rail_draw(
         Icon::Clip,
         Icon::Diag,
         Icon::Settings,
+        Icon::Audio,
     ];
     let mut tip: Option<(Rect, &'static str)> = None;
-    // The six slots of the rail, in one column from the top and in one style: the five sections
-    // and, after them, appearance.
+    // Service sections, appearance, and the independent popup entry share the rail.
     for (i, modal) in Modal::ALL.iter().enumerate() {
         let btn = rail_slot(rect, i);
         let on = vm.modal == Some(*modal);
@@ -458,7 +459,7 @@ fn rail_draw(
         pal,
         audio,
         Icon::Audio,
-        "07",
+        "08",
         vm.audio_player.open,
         &mut tip,
         text(lang, Key::AudioPlayer),

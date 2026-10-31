@@ -187,6 +187,7 @@ pub fn draw(
                 Modal::Diag => diag_body(ui, pal, vm, actions),
                 Modal::Settings => settings_body(ui, pal, vm, actions),
                 Modal::Appearance => super::appearance::body(ui, pal, vm, actions),
+                Modal::Audio => super::audio_settings::body(ui, pal, vm, actions),
             }
         });
     if foot_h > 0.0 {
@@ -222,7 +223,7 @@ pub fn draw(
                     || Action::OpenConfigFile,
                 );
             }
-            Modal::Clip | Modal::Diag | Modal::Settings | Modal::Appearance => {}
+            Modal::Clip | Modal::Diag | Modal::Settings | Modal::Appearance | Modal::Audio => {}
         });
     }
     let measured = header_h + used.content_size.y + foot_h;

@@ -16,6 +16,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Optional features can derive per-input-link keys without a new wire capability. The TLS exporter root stays inside transport, is erased on parent closure/replacement, and is accessible only through a redacted, revocable derivation view after validated Hello; consumers gate on their own feature capabilities.
 - Add internal audio backend/Dry and pure packet/replay/status contracts, with dependency-direction checks; no audio devices, network sessions or user-visible audio behavior are enabled by this change.
+- Add bounded revisioned local audio IPC, an authoritative remote-audio popup, bilingual audio settings/device selection and tray privacy/mute/stop controls. Audio controls report unavailable until a core implements the audio handlers; this change does not activate audio capture or transport. Media metadata is transient and redacted from debug output.
 
 ### Русский
 
@@ -29,6 +30,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Необязательные функции могут выводить ключи входного соединения без новой сетевой возможности. Корневой секрет TLS остаётся внутри транспорта, стирается при закрытии или замене родителя и после проверки Hello доступен только через скрывающий секрет, отзываемый интерфейс вывода ключей; потребители проверяют возможности своих функций.
 - Добавлены внутренние контракты аудиобэкенда/Dry, чистых пакетов, защиты от повторов и статуса с проверкой направлений зависимостей; изменение не включает аудиоустройства, сетевые аудиосеансы или пользовательские функции звука.
+- Добавлены ограниченный локальный аудио-IPC с ревизиями, плеер удалённых потоков по подтверждённому состоянию, двуязычные аудионастройки/выбор устройств и индикаторы приватности/отключение звука/остановка в трее. До реализации обработчиков в службе управление честно показывает недоступность; изменение не запускает захват или передачу аудио. Метаданные медиасеансов не сохраняются и скрыты в отладочном выводе.
 
 ## 0.4.0 — 2026-10-30
 

@@ -21,7 +21,7 @@ pub enum StreamState {
 }
 
 /// One active Source stream, populated only from authoritative status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AudioPlayerCard {
     pub stream_id: String,
     pub source_name: String,
@@ -44,6 +44,17 @@ pub struct AudioPlayerCard {
     pub background: bool,
 }
 
+impl std::fmt::Debug for AudioPlayerCard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioPlayerCard")
+            .field("stream_id", &self.stream_id)
+            .field("metadata", &"[REDACTED]")
+            .field("state", &self.state)
+            .field("muted", &self.muted)
+            .finish()
+    }
+}
+
 /// Intent, not optimistic playback state. The IPC adapter must recheck permissions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioPlayerAction {
@@ -63,7 +74,6 @@ pub enum AudioPlayerAction {
 pub struct AudioPlayer {
     pub cards: Vec<AudioPlayerCard>,
     pub open: bool,
-    pub settings_open: bool,
     had_streams: bool,
 }
 

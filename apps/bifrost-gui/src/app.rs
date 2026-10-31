@@ -83,6 +83,7 @@ impl GuiApp {
             view.look = gui_settings::load(file);
         }
         let saved_look = view.look.clone();
+        crate::audio::consume_navigation(&mut view, true);
         view.settings.autostart = crate::autostart::enabled();
         let start_core = should_start_core(view.config.config_was_missing, updated, login);
         let mut bridge = Bridge::new(view, client);
@@ -122,9 +123,18 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Instant::now();
         let arrived = self.bridge.pump();
+        if crate::audio::NAVIGATION_WAKE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            crate::audio::consume_navigation(self.bridge.view_mut(), false);
+        }
         self.bridge.view_mut().tick(now);
         self.updater.tick(&mut self.bridge, ui.ctx());
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+        if close_requested && self.bridge.view().audio.gui_ptt_held {
+            self.bridge.dispatch(
+                view_model::Action::Audio(crate::audio::AudioAction::SetPtt(false)),
+                now,
+            );
+        }
         if close_requested
             && !crate::updater_runtime::RESTART.load(std::sync::atomic::Ordering::Acquire)
         {
@@ -158,6 +168,16 @@ impl eframe::App for GuiApp {
             (viewport.focused, viewport.minimized)
         });
         let minimized = minimized == Some(true);
+        if self.bridge.view().audio.gui_ptt_held
+            && (focused != Some(true)
+                || minimized
+                || self.bridge.view().modal != Some(view_model::Modal::Audio))
+        {
+            self.bridge.dispatch(
+                view_model::Action::Audio(crate::audio::AudioAction::SetPtt(false)),
+                now,
+            );
+        }
         if self.reported_minimized != Some(minimized) {
             self.reported_minimized = Some(minimized);
             // Above, the close handler says when *this program* minimised the window. A
@@ -179,43 +199,24 @@ impl eframe::App for GuiApp {
             theme,
             lang,
         );
+        let audio_acted = !audio_actions.is_empty();
         for action in audio_actions {
-            match action {
-                crate::audio_player::AudioPlayerAction::HidePlayer => {
-                    self.bridge.view_mut().audio_player.open = false;
-                }
-                crate::audio_player::AudioPlayerAction::OpenSettings => {
-                    self.bridge.view_mut().audio_player.settings_open = true;
-                    ui.ctx().send_viewport_cmd_to(
-                        egui::ViewportId::ROOT,
-                        egui::ViewportCommand::Minimized(false),
-                    );
-                    ui.ctx()
-                        .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
-                }
-                // Do not optimistically mutate a stream or pretend the missing audio IPC sent it.
-                _ => {
-                    self.bridge.view_mut().outcome = Some(view_model::Outcome::failed(
-                        ui_text::text(lang, ui_text::Key::AudioUnavailable),
-                    ));
-                }
+            if matches!(action, crate::audio_player::AudioPlayerAction::OpenSettings) {
+                ui.ctx().send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(false),
+                );
+                ui.ctx()
+                    .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
             }
+            self.bridge.dispatch(
+                view_model::Action::Audio(crate::audio::AudioAction::Player(action)),
+                now,
+            );
         }
-        let player = &mut self.bridge.view_mut().audio_player;
-        egui::Window::new(ui_text::text(lang, ui_text::Key::AudioSettings))
-            .open(&mut player.settings_open)
-            .show(ui.ctx(), |ui| {
-                ui.label(ui_text::text(lang, ui_text::Key::AudioUnavailable));
-                if ui
-                    .button(ui_text::text(lang, ui_text::Key::AudioPlayer))
-                    .clicked()
-                {
-                    player.open = true;
-                }
-            });
         let output = ui::draw(ui, self.bridge.view(), &mut self.ui, env);
 
-        let acted = !output.actions.is_empty();
+        let acted = audio_acted || !output.actions.is_empty();
         for action in output.actions {
             if let view_model::Action::Update(update) = action {
                 self.updater.action(update, &mut self.bridge, ui.ctx());

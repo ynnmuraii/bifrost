@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+audio-model = { path = "../../crates/audio-model" }
 config = { path = "../../crates/config" }
 bifrost-desktop = { path = "../bifrost-desktop" }
 # `default-features = false` + `glow`: the smallest dependency set that still draws a window.

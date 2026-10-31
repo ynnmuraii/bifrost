@@ -35,7 +35,9 @@ pub use protocol::app_version;
 pub use ui_text;
 
 pub mod app;
+pub mod audio;
 pub mod audio_player;
+pub mod audio_wire;
 pub mod autostart;
 mod core_exit;
 pub mod gui_settings;
@@ -105,6 +107,7 @@ pub fn run_gui(mut args: Vec<String>) -> std::process::ExitCode {
         Box::new(|cc| {
             let ctx = cc.egui_ctx.clone();
             instance.set_show_handler(move || {
+                audio::NAVIGATION_WAKE.store(true, std::sync::atomic::Ordering::Release);
                 tracing::info!(
                     origin = "show signal (tray «Открыть Bifrost», or a second launch)",
                     "showing the window"
