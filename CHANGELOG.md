@@ -14,6 +14,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Keep input links usable when optional auxiliary export is unavailable; bind revocable key access to the current manager generation, erase roots on membership refusal, and return zeroizing keys through a closed purpose registry with bounded contexts.
 - Disable TLS session resumption so every runtime and pairing connection re-runs certificate pin verification.
 - Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
+- Fix boxed auxiliary exporter storage with the locked zeroize version while retaining a stable heap allocation and erasure before deallocation.
 
 **New**
 
@@ -32,6 +33,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Недоступность необязательного экспорта ключей не прерывает входное соединение; доступ к ключам привязан к текущему поколению менеджера, корни стираются при отказе членства, а вывод возвращает стираемые ключи через закрытый реестр назначений с ограниченным контекстом.
 - Возобновление TLS отключено: каждое рабочее и сопрягающее соединение заново проверяет закреплённый сертификат.
 - Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
+- Исправлено хранение корневого секрета экспорта с закреплённой версией zeroize: сохраняются стабильное размещение в куче и стирание до освобождения памяти.
 
 **Новое**
 
