@@ -117,49 +117,74 @@ from = { node = "peer:9c1e…", display = "eDP-1", edge = "right", start = 0, en
 to   = { node = "peer:4f70…", display = "eDP-1", edge = "left", start = 0, end = 1080 }
 bidirectional = true
 
-# Optional audio: pairing alone grants no audio permission. No devices/sockets
-# are activated by this disabled, unresolved Source selection.
-# Downgrade: older binaries reject [audio]. Restore config.toml.pre-audio or
-# remove all audio tables before downgrade; .bak rotates and is not that backup.
+# Необязательный общий звук: сопряжение не выдаёт аудиоразрешений.
+# Секцию можно опустить: её значения по умолчанию не записываются.
+# Здесь показан выключенный Source с примером ID, без согласий и открытых устройств.
+# Откат: протокол остаётся 1/0, config_version — 2, но старые программы
+# не понимают [audio]. До включения сохраните совместимую резервную копию.
+# При первом сохранении непустого audio в существующий файл без audio
+# однократно создаётся отсутствующий config.toml.pre-audio.
+# Для вручную добавленного [audio] этой копии может не быть; .bak вращается
+# и не заменяет её. Перед откатом остановите Bifrost и восстановите совместимый файл.
 [audio]
 enabled = false
-role = "source"                     # off (default) | source | listener
-# Select a trusted computer by name in GUI; this example ID is not permission.
+role = "source"                     # off (по умолчанию) | source | listener
+# Выберите доверенный приёмник в GUI; ID — 64 hex, не имя/IP и не разрешение.
 listener_node_id = "1111111111111111111111111111111111111111111111111111111111111111"
-# group_id intentionally absent: authenticated Listener setup resolves it.
-# Manual 32-hex group IDs require group_id_override = true (Source Advanced only).
-group_id_override = false           # resolved stored groups follow the selected Listener
-media_port = 47903                  # UDP, 1..65535 except discovery 47902
-profile = "auto"                    # auto | ethernet | wifi
+# group_id отсутствует: группа задаётся выбранным приёмником по доверенной связи.
+# Сохранённый авторазрешённый group_id не фиксирует группу: приёмник может её обновить.
+# group_id_override = false          # по умолчанию false: следовать выбранному Listener
+# Ручная фиксация — только Source Advanced: измените group_id_override выше на true
+# и задайте group_id (32 hex), например:
+# group_id = "00112233445566778899aabbccddeeff"
+# Один сохранённый group_id без явного override не означает ручную фиксацию.
+media_port = 47903                  # UDP 1..65535, кроме discovery 47902; 0 запрещён
+# В stateful LAN обычно достаточно исходящих проб после закреплённого TCP-соединения.
+# Это не обход брандмауэра/AP/VPN. При неудачной проверке пути разрешите этот UDP-порт
+# на приёмнике только от LAN-адреса источника; TCP 47901 нужен хотя бы в одну сторону.
+profile = "auto"                    # auto | ethernet | wifi; Wi-Fi буфер больше
 mode = "mix_all"                    # mix_all | follow_focus
-allow_send_to = []                  # explicit Source -> selected Listener consent
-allow_system_audio_from = []        # explicit Listener <- Source consent, max 3
-peers = []                          # no per-peer media control consent
+allow_send_to = []                  # согласие Source -> единственный выбранный Listener
+allow_system_audio_from = []        # согласие Listener <- Source, максимум 3 источника
+# peers по умолчанию пуст. Пример [[audio.peers]] ниже; не задавайте одновременно
+# peers = [] и [[audio.peers]]: это два определения одного TOML-ключа.
 output_device = { kind = "follow_default", role = "multimedia" }
-# Stable selection: { kind = "stable_id", id = "<opaque native endpoint ID>" }
-output_fallback_to_default = false  # disappearance does not permit rerouting
-capture_device = { kind = "default_monitor" }
+# Альтернатива: { kind = "follow_default", role = "communications" }
+# Закрепление устройства: { kind = "stable_id", id = "<ID из списка устройств>" }
+# Выбор выхода не меняет системное устройство по умолчанию.
+output_fallback_to_default = false
+capture_device = { kind = "default_monitor" } # системный monitor, не микрофон
+# Закрепление monitor: { kind = "stable_id", id = "<ID из списка устройств>" }
 resume_system_audio = false
-focus_debounce_ms = 250             # load clamps 100..2000 with a warning
-focus_ramp_ms = 150                 # load clamps 20..1000 with a warning
-background_gain_db = -18            # load clamps -60..0 with a warning
+focus_debounce_ms = 250             # при загрузке ограничивается 100..2000 с предупреждением
+focus_ramp_ms = 150                 # при загрузке ограничивается 20..1000 с предупреждением
+background_gain_db = -18.0          # конечное число -60..0; при загрузке ограничивается
 background_mute = false
 
 [audio.microphone]
-control_enabled = false
-streaming_enabled = false          # true rejected while streaming is deferred
+control_enabled = false             # отдельное согласие на mute/PTT, не передачу звука
+streaming_enabled = false           # true отклоняется: передача микрофона отложена
 experimental_acknowledged = false
-capture_device = { kind = "follow_default", role = "communications" }
+capture_device = { kind = "follow_default", role = "multimedia" }
+# Для коммуникационного default явно задайте role = "communications".
+# Только Listener управляет своим физическим микрофоном; Source пересылает команды.
+# Для удалённого управления нужны control_enabled и разрешение Source на Listener.
 allow_default_mic_changes = false
-virtual_device = ""
-muted = true
+virtual_device = ""                 # виртуальная маршрутизация отложена; оставьте пустым
+muted = true                        # предпочтение, не снимок состояния ОС
 ptt_enabled = false
-ptt_hotkey = ""
-# pinned_target_node_id is absent; selecting a target never grants consent.
+ptt_hotkey = ""                      # при ptt_enabled=true: пусто — GUI PTT, hotkey — глобальная
+# pinned_target_node_id отсутствует: зависимый выбор микрофонной цели/UX отложен.
+# Не задавайте его для виртуальной маршрутизации.
 
-# Listener-local gain/mute (0..100); Source media control permission is separate.
+# Пример записи — раскомментировать только после выбора роли и доверенного пира.
+# Источник может дать media-control только своему единственному Listener; по умолчанию false.
+# Listener разрешает Source управлять своим микрофоном через allow_mic_control.
+# Медиа- и микрофонные разрешения независимы и по умолчанию выключены.
+# gain_percent/muted — местные настройки Listener; для Source оставьте 100/false.
 # [[audio.peers]]
-# node_id = "<trusted 64-hex ID>"
+# node_id = "1111111111111111111111111111111111111111111111111111111111111111"
 # allow_media_control = false
-# gain_percent = 100
+# allow_mic_control = false          # только Listener, для доверенного Source
+# gain_percent = 100                 # целое 0..100
 # muted = false
