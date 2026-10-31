@@ -158,6 +158,9 @@ separates the listener's remaining output from the helper's direct tone; reporte
 includes that delay, and the delay-subtracted value is only an estimate. Muted or
 loopback-suppressed endpoints can fail the signal assertions; do not change real endpoint
 settings just to obtain a pass.
+The example reports the Listener's worker Health drift-controller ratio, fill error and
+coarse corrections beside its independent delivered-sample/QPC capture estimate. These
+measure different quantities; Source has no receiver drift controller.
 
 ## License
 

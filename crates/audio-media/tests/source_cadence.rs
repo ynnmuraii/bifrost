@@ -25,6 +25,15 @@ fn material() -> SessionMaterial {
 
 #[test]
 fn source_keeps_100_fps_when_control_peer_is_silent() {
+    exercise(Duration::ZERO);
+}
+
+#[test]
+fn source_recovers_after_capture_overflow_before_path_validation() {
+    exercise(Duration::from_millis(500));
+}
+
+fn exercise(reply_after: Duration) {
     let mut backend = DryBackend::new(Capabilities {
         system_capture: true,
         ..Capabilities::default()
@@ -83,7 +92,7 @@ fn source_keeps_100_fps_when_control_peer_is_silent() {
         while let Ok((n, sender)) = peer.recv_from(&mut packet) {
             assert_eq!(sender, source_address);
             let (header, payload) = opener.open(&mut packet[..n], |_| true).unwrap();
-            if header.kind == PacketKind::PathChallenge && !replied {
+            if header.kind == PacketKind::PathChallenge && !replied && elapsed >= reply_after {
                 let n = sealer
                     .seal(
                         elapsed.as_millis() as u64,
@@ -137,7 +146,14 @@ fn source_keeps_100_fps_when_control_peer_is_silent() {
         (99.0..=101.0).contains(&fps),
         "control starvation changed media cadence: {fps} fps"
     );
-    assert_eq!(health.capture_dropped_frames, 0);
+    if reply_after.is_zero() {
+        assert_eq!(health.capture_dropped_frames, 0);
+    } else {
+        assert!(
+            health.capture_dropped_frames > 0,
+            "fixture must overflow before validation"
+        );
+    }
     assert_eq!(
         timestamp_last.wrapping_sub(timestamp_first.unwrap()),
         (measured - 1) as u32 * 480,
