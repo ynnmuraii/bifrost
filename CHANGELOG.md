@@ -8,6 +8,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Fixes**
 
+- Compile the audio test RMS accessor only for its Unix-only consumers, keeping Windows all-target Clippy checks warning-free.
 - Enforce both peers' Hello requirements against stable implementation support and advertised offers, independent of transient agent readiness. Deliver compatibility refusals before graceful closure, select slow reconnects, and forbid bounded capability changes from withdrawing handshake requirements.
 - Bound Hello advertised capability lists to 64 entries and required capability lists to 32 before membership or duplicate scans.
 - Clipboard channels inherit their parent input link's negotiated protocol version for both outgoing frames and incoming validation, preserving clipboard compatibility across future mixed-minor peers.
@@ -71,6 +72,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Исправления**
 
+- Вспомогательное чтение RMS в аудиотестах компилируется только для использующих его Unix-тестов, чтобы проверка Clippy всех целей Windows проходила без предупреждений.
 - Требования Hello обеих сторон проверяются по реализованным возможностям и объявленным предложениям независимо от готовности агента. Отказ совместимости доставляется перед плавным закрытием, повторное подключение откладывается, а ограниченные обновления возможностей не могут отзывать обязательные возможности Hello.
 - Списки возможностей Hello ограничены 64 объявленными и 32 обязательными элементами до проверки включения и повторов.
 - Каналы буфера обмена используют согласованную версию родительского входного соединения при отправке и проверке кадров, сохраняя совместимость при будущих различиях младшей версии протокола.
