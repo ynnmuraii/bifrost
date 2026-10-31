@@ -164,7 +164,8 @@ reasons!(
     RateLimited,
     Revoked,
     UserStop,
-    ProtocolViolation
+    ProtocolViolation,
+    GroupMismatch
 );
 fn direction(role: model::AudioRole) -> u32 {
     match role {
@@ -518,6 +519,7 @@ pub fn encode_config(
             .map(|id| id.0.to_vec())
             .unwrap_or_default(),
         group_id: config.group_id.map(|id| id.0.to_vec()).unwrap_or_default(),
+        group_id_override: Some(config.role == cfg::AudioRole::Source && config.group_id_override),
         mode: match config.mode {
             cfg::AudioMode::MixAll => wire::AudioMode::MixAll as i32,
             cfg::AudioMode::FollowFocus => wire::AudioMode::FollowFocus as i32,
@@ -553,22 +555,18 @@ pub fn encode_config(
         }),
         peers: ids
             .into_iter()
-            .map(|id| wire::AudioPeerConfig {
-                node_id: id.0.to_vec(),
-                allow_system_send: config.allow_send_to.contains(&id),
-                allow_system_receive: config.allow_system_audio_from.contains(&id),
-                allow_mic_send: false,
-                allow_mic_receive: false,
-                allow_mic_control: false,
-                allow_media_control: config
-                    .peers
-                    .iter()
-                    .any(|p| p.node_id == id && p.allow_media_control),
-                volume_percent: config
-                    .peers
-                    .iter()
-                    .find(|p| p.node_id == id)
-                    .map_or(100, |p| p.gain_percent),
+            .map(|id| {
+                let preference = config.peers.iter().find(|peer| peer.node_id == id);
+                wire::AudioPeerConfig {
+                    node_id: id.0.to_vec(),
+                    allow_system_send: config.allow_send_to.contains(&id),
+                    allow_system_receive: config.allow_system_audio_from.contains(&id),
+                    allow_mic_send: false,
+                    allow_mic_receive: false,
+                    allow_mic_control: preference.is_some_and(|peer| peer.allow_mic_control),
+                    allow_media_control: preference.is_some_and(|peer| peer.allow_media_control),
+                    volume_percent: preference.map_or(100, |peer| peer.gain_percent),
+                }
             })
             .collect(),
     };
@@ -585,16 +583,14 @@ pub fn decode_config(
     auto_profile: model::AudioProfile,
 ) -> Result<cfg::AudioConfig> {
     let mic = value.microphone.as_ref().ok_or(Error::InvalidConfig)?;
-    if mic.control_enabled
-        || mic.streaming_enabled
-        || mic.ptt_enabled
+    if mic.streaming_enabled
         || !mic.pinned_target_node_id.is_empty()
         || !mic.virtual_device.is_empty()
         || mic.allow_default_mic_changes
         || value
             .peers
             .iter()
-            .any(|p| p.allow_mic_send || p.allow_mic_receive || p.allow_mic_control)
+            .any(|p| p.allow_mic_send || p.allow_mic_receive)
     {
         return Err(Error::Unsupported);
     }
@@ -627,10 +623,15 @@ pub fn decode_config(
             _ => return Err(Error::InvalidConfig),
         },
         group_id: if value.group_id.is_empty() {
-            None
+            if wire_role == wire::AudioRole::Listener && previous.role == cfg::AudioRole::Listener {
+                previous.group_id
+            } else {
+                None
+            }
         } else {
             Some(cfg::HexId(fixed(&value.group_id)?))
         },
+        group_id_override: false,
         listener_node_id: if value.listener_node_id.is_empty() {
             None
         } else {
@@ -682,6 +683,16 @@ pub fn decode_config(
             pinned_target_node_id: None,
         },
     };
+    if result.role == cfg::AudioRole::Source {
+        let same_listener = previous.role == cfg::AudioRole::Source
+            && result.listener_node_id == previous.listener_node_id;
+        if value.group_id.is_empty() && same_listener {
+            result.group_id = previous.group_id;
+        }
+        result.group_id_override = value.group_id_override.unwrap_or_else(|| {
+            !value.group_id.is_empty() || (same_listener && previous.group_id_override)
+        });
+    }
     for peer in &value.peers {
         let id = cfg::HexId(fixed(&peer.node_id)?);
         if peer.allow_system_send {
@@ -694,6 +705,7 @@ pub fn decode_config(
         result.peers.push(cfg::AudioPeerConfig {
             node_id: id,
             allow_media_control: peer.allow_media_control,
+            allow_mic_control: peer.allow_mic_control,
             gain_percent: peer.volume_percent,
             muted: result.role == cfg::AudioRole::Listener && prior.is_some_and(|p| p.muted),
         });
@@ -747,6 +759,18 @@ status_enum!(
     AudioStreamHealth,
     StreamHealth,
     [Ready, Buffering, Degraded]
+);
+status_enum!(
+    encode_path_diagnostic,
+    AudioPathDiagnostic,
+    PathDiagnostic,
+    [
+        None,
+        NoAuthenticatedPeerPackets,
+        PeerProbesMissing,
+        ProbeResponsesMissing,
+        AuthenticationFailures
+    ]
 );
 status_enum!(
     encode_capability,
@@ -859,6 +883,27 @@ pub fn encode_status(
                 }),
                 health_state: encode_health(s.health_state),
                 latency_estimate_ms: s.latency_estimate_ms,
+                latency_stages: s
+                    .latency_stages
+                    .map(|stages| wire::AudioLatencyDiagnostics {
+                        packetization_us: stages.packetization_us,
+                        capture_queue_us: stages.capture_queue_us,
+                        codec_lookahead_us: stages.codec_lookahead_us,
+                        jitter_target_us: stages.jitter_target_us,
+                        jitter_buffer_us: stages.jitter_buffer_us,
+                        decoded_queue_us: stages.decoded_queue_us,
+                        render_queue_us: stages.render_queue_us,
+                        resampler_delay_us: stages.resampler_delay_us,
+                        native_render_buffer_us: stages.native_render_buffer_us,
+                    }),
+                path_diagnostic: encode_path_diagnostic(s.path_diagnostic),
+                local_udp_port: u32::from(s.local_udp_port),
+                peer_udp_port: u32::from(s.peer_udp_port),
+                remote_quality: s.remote_quality.map(|quality| wire::AudioRemoteQuality {
+                    received_packets: quality.received_packets,
+                    lost_frames: quality.lost_frames,
+                    late_frames: quality.late_frames,
+                }),
                 gain_percent: u32::from(s.gain_percent),
                 muted: s.muted,
                 consent: Some(wire::AudioSessionConsent {
@@ -1145,6 +1190,7 @@ mod tests {
             peers: vec![cfg::AudioPeerConfig {
                 node_id: peer,
                 allow_media_control: false,
+                allow_mic_control: false,
                 gain_percent: 37,
                 muted: true,
             }],
@@ -1191,6 +1237,7 @@ mod tests {
         let default = cfg::AudioConfig::default();
         let off = encode_config(&default, model::AudioProfile::Ethernet).unwrap();
         assert!(off.peers.is_empty());
+        assert_eq!(off.group_id_override, Some(false));
         assert_eq!(
             decode_config(
                 &off,
@@ -1202,30 +1249,19 @@ mod tests {
             .unwrap(),
             default
         );
-        let mut unsupported = encoded.clone();
-        unsupported.peers[0].allow_mic_control = true;
-        assert_eq!(
-            decode_config(
-                &unsupported,
-                &config,
-                [1; 32],
-                &trusted,
-                model::AudioProfile::Ethernet
-            ),
-            Err(Error::Unsupported)
-        );
-        unsupported = encoded;
-        unsupported.microphone.as_mut().unwrap().control_enabled = true;
-        assert_eq!(
-            decode_config(
-                &unsupported,
-                &config,
-                [1; 32],
-                &trusted,
-                model::AudioProfile::Ethernet
-            ),
-            Err(Error::Unsupported)
-        );
+        let mut controls = encoded;
+        controls.peers[0].allow_mic_control = true;
+        controls.microphone.as_mut().unwrap().control_enabled = true;
+        let decoded = decode_config(
+            &controls,
+            &config,
+            [1; 32],
+            &trusted,
+            model::AudioProfile::Ethernet,
+        )
+        .unwrap();
+        assert!(decoded.microphone.control_enabled);
+        assert!(decoded.peers[0].allow_mic_control);
     }
     #[test]
     fn pending_group_intents_preserve_enabled_without_fabricating_group() {
@@ -1269,6 +1305,126 @@ mod tests {
         assert!(status.enabled && status.sessions.is_empty());
     }
     #[test]
+    fn source_group_policy_distinguishes_modern_clones_from_legacy_pins() {
+        let group = cfg::HexId([3; 16]);
+        let source = cfg::AudioConfig {
+            enabled: true,
+            role: cfg::AudioRole::Source,
+            listener_node_id: Some(cfg::HexId([2; 32])),
+            group_id: Some(group),
+            ..Default::default()
+        };
+        let decode = |request: &wire::AudioConfig, previous: &cfg::AudioConfig| {
+            decode_config(
+                request,
+                previous,
+                [1; 32],
+                &BTreeSet::from([cfg::HexId([2; 32]), cfg::HexId([4; 32])]),
+                model::AudioProfile::Ethernet,
+            )
+            .unwrap()
+        };
+        let mut request = encode_config(&source, model::AudioProfile::Ethernet).unwrap();
+        assert_eq!(request.group_id_override, Some(false));
+        request.background_gain_db = -12;
+        request.microphone.as_mut().unwrap().control_enabled = true;
+        let automatic = decode(&request, &source);
+        assert_eq!(automatic.group_id, Some(group));
+        assert!(!automatic.group_id_override);
+
+        request.group_id_override = None;
+        let legacy_pin = decode(&request, &source);
+        assert_eq!(legacy_pin.group_id, Some(group));
+        assert!(legacy_pin.group_id_override);
+        request.group_id.clear();
+        assert!(decode(&request, &legacy_pin).group_id_override);
+        assert!(!decode(&request, &source).group_id_override);
+
+        request.group_id = group.0.to_vec();
+        request.group_id_override = Some(true);
+        let pinned = decode(&request, &source);
+        assert_eq!(pinned.group_id, Some(group));
+        assert!(pinned.group_id_override);
+        request = encode_config(&pinned, model::AudioProfile::Ethernet).unwrap();
+        assert_eq!(request.group_id_override, Some(true));
+        request.background_gain_db = -18;
+        assert!(decode(&request, &pinned).group_id_override);
+
+        request.group_id_override = Some(false);
+        let unpinned = decode(&request, &pinned);
+        assert_eq!(unpinned.group_id, Some(group));
+        assert!(!unpinned.group_id_override);
+        request.group_id.clear();
+        let empty_unpinned = decode(&request, &pinned);
+        assert_eq!(empty_unpinned.group_id, Some(group));
+        assert!(!empty_unpinned.group_id_override);
+        assert_eq!(empty_unpinned.listener_node_id, source.listener_node_id);
+
+        request.listener_node_id = vec![4; 32];
+        let changed_listener = decode(&request, &pinned);
+        assert!(changed_listener.group_id.is_none());
+        assert!(!changed_listener.group_id_override);
+        request.group_id = vec![5; 16];
+        let changed_group = decode(&request, &source);
+        assert_eq!(changed_group.group_id, Some(cfg::HexId([5; 16])));
+        assert!(!changed_group.group_id_override);
+    }
+
+    #[test]
+    fn listener_group_identity_survives_empty_updates_but_not_role_changes() {
+        let group = cfg::HexId([3; 16]);
+        let listener = cfg::AudioConfig {
+            enabled: true,
+            role: cfg::AudioRole::Listener,
+            group_id: Some(group),
+            ..Default::default()
+        };
+        let decode = |request: &wire::AudioConfig, previous: &cfg::AudioConfig| {
+            decode_config(
+                request,
+                previous,
+                [1; 32],
+                &BTreeSet::from([cfg::HexId([2; 32])]),
+                model::AudioProfile::Ethernet,
+            )
+            .unwrap()
+        };
+        let mut request = encode_config(&listener, model::AudioProfile::Ethernet).unwrap();
+        assert_eq!(request.group_id_override, Some(false));
+        request.group_id.clear();
+        let republished = decode(&request, &listener);
+        assert_eq!(republished.group_id, Some(group));
+        assert!(!republished.group_id_override);
+        let pending = decode(&request, &cfg::AudioConfig::default());
+        assert!(pending.group_id.is_none());
+        assert!(!pending.group_id_override);
+
+        let source = cfg::AudioConfig {
+            role: cfg::AudioRole::Source,
+            listener_node_id: Some(cfg::HexId([2; 32])),
+            group_id: Some(group),
+            group_id_override: true,
+            ..Default::default()
+        };
+        let changed_to_listener = decode(&request, &source);
+        assert!(changed_to_listener.group_id.is_none());
+        assert!(!changed_to_listener.group_id_override);
+        request.role = wire::AudioRole::Source as i32;
+        request.listener_node_id = vec![2; 32];
+        let changed_to_source = decode(&request, &listener);
+        assert!(changed_to_source.group_id.is_none());
+        assert!(!changed_to_source.group_id_override);
+    }
+
+    #[test]
+    fn group_mismatch_stop_reason_roundtrips() {
+        assert_eq!(encode_stop_reason(session_model::Reason::GroupMismatch), 14);
+        assert_eq!(
+            decode_stop_reason(14).unwrap(),
+            session_model::Reason::GroupMismatch
+        );
+    }
+    #[test]
     fn authoritative_status_preserves_metadata_counters_and_optional_worker_facts() {
         let config = cfg::AudioConfig {
             enabled: true,
@@ -1303,6 +1459,11 @@ mod tests {
                 },
                 health_state: model::StreamHealth::Degraded,
                 latency_estimate_ms: Some(0),
+                latency_stages: Some(model::LatencyDiagnostics::default()),
+                path_diagnostic: model::PathDiagnostic::None,
+                local_udp_port: 47903,
+                peer_udp_port: 47904,
+                remote_quality: None,
                 gain_percent: 37,
                 muted: true,
                 consent: model::SessionConsent {
@@ -1354,6 +1515,8 @@ mod tests {
         assert_eq!(s.health.as_ref().unwrap().received_packets, u64::MAX);
         assert_eq!(s.health.as_ref().unwrap().limiter_frames, 7);
         assert_eq!(s.latency_estimate_ms, Some(0));
+        assert_eq!(s.path_diagnostic, wire::AudioPathDiagnostic::None as i32);
+        assert_eq!((s.local_udp_port, s.peer_udp_port), (47903, 47904));
         assert_eq!(s.gain_percent, 37);
         assert!(s.muted && s.focus_primary);
         let media = s.media_info.as_ref().unwrap();
@@ -1445,6 +1608,7 @@ mod media_consent_tests {
             peers: vec![cfg::AudioPeerConfig {
                 node_id: peer,
                 allow_media_control: true,
+                allow_mic_control: false,
                 gain_percent: 100,
                 muted: false,
             }],
@@ -1592,6 +1756,7 @@ fn full_config_preserves_explicit_denied_peer_preferences() {
         peers: vec![cfg::AudioPeerConfig {
             node_id: peer,
             allow_media_control: false,
+            allow_mic_control: false,
             gain_percent: 100,
             muted: false,
         }],

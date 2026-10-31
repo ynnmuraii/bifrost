@@ -62,6 +62,11 @@ fn snapshot(revision: u64) -> ipc::AudioStatus {
                 revision: 3,
             }),
             focus_primary: false,
+            path_diagnostic: model::PathDiagnostic::None,
+            local_udp_port: 0,
+            peer_udp_port: 0,
+            remote_quality: None,
+            latency_stages: None,
         }],
     };
     bifrost_gui::audio_wire::encode_status(
@@ -218,6 +223,74 @@ fn popup_source_names_follow_trusted_membership_in_either_ipc_order() {
 }
 
 #[test]
+fn normal_permission_and_gain_edits_preserve_group_policy_through_apply_and_status() {
+    for group_id_override in [None, Some(false), Some(true)] {
+        let mut vm = view();
+        let mut status = snapshot(5);
+        status.role = ipc::AudioRole::Source as i32;
+        status.sessions.clear();
+        let config = status.config.as_mut().unwrap();
+        config.role = ipc::AudioRole::Source as i32;
+        config.listener_node_id = vec![2; 32];
+        config.group_id_override = group_id_override;
+        vm.apply(event(Msg::AudioStatus(status.clone())));
+        let now = Instant::now();
+        let mut draft = vm.audio.draft.clone();
+        draft.background_gain_db = -24;
+        draft.peers.push(ipc::AudioPeerConfig {
+            node_id: vec![2; 32],
+            allow_system_send: true,
+            volume_percent: 70,
+            ..Default::default()
+        });
+        vm.audio_action(&AudioAction::EditConfig(Box::new(draft.clone())), now);
+        assert_eq!(vm.audio.draft.group_id_override, group_id_override);
+        vm.audio_action(&AudioAction::ApplyConfig, now);
+        let (_, message) = vm.take_outgoing().pop().unwrap();
+        let Msg::SetAudio(request) = message else {
+            panic!("expected SetAudio");
+        };
+        assert_eq!(request.config, Some(draft.clone()));
+        status.revision += 1;
+        status.config = request.config;
+        vm.apply(event(Msg::AudioStatus(status)));
+        assert_eq!(vm.audio.draft, draft);
+        assert!(!vm.audio.dirty);
+        assert!(!vm.audio.pending);
+    }
+}
+
+#[test]
+fn manual_source_group_draft_survives_a_different_automatic_listener_group_status() {
+    let mut vm = view();
+    let mut status = snapshot(5);
+    status.role = ipc::AudioRole::Source as i32;
+    status.sessions.clear();
+    let config = status.config.as_mut().unwrap();
+    config.role = ipc::AudioRole::Source as i32;
+    config.listener_node_id = vec![2; 32];
+    vm.apply(event(Msg::AudioStatus(status.clone())));
+    let now = Instant::now();
+    let mut draft = vm.audio.draft.clone();
+    draft.group_id = vec![7; 16];
+    draft.group_id_override = Some(true);
+    draft.background_gain_db = -24;
+    vm.audio_action(&AudioAction::EditConfig(Box::new(draft.clone())), now);
+    status.revision += 1;
+    status.config.as_mut().unwrap().group_id = vec![8; 16];
+    vm.apply(event(Msg::AudioStatus(status)));
+    assert_eq!(vm.audio.draft, draft);
+    assert!(vm.audio.dirty);
+    vm.audio_action(&AudioAction::ApplyConfig, now);
+    let (_, message) = vm.take_outgoing().pop().unwrap();
+    let Msg::SetAudio(request) = message else {
+        panic!("expected SetAudio");
+    };
+    assert_eq!(request.config, Some(draft));
+    assert_eq!(request.expected_revision, 6);
+}
+
+#[test]
 fn unsupported_and_timeout_rollback_pending_without_claiming_success() {
     let mut vm = view();
     vm.apply(event(Msg::AudioStatus(snapshot(5))));
@@ -261,6 +334,7 @@ fn explicit_group_creation_edits_only_the_listener_draft() {
     vm.apply(event(Msg::AudioStatus(snapshot(5))));
     vm.audio_action(&AudioAction::UseThisListener, Instant::now());
     assert_eq!(vm.audio.draft.group_id.len(), 16);
+    assert_eq!(vm.audio.draft.group_id_override, Some(false));
     assert!(vm.audio.dirty);
     assert_eq!(
         vm.audio

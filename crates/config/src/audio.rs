@@ -130,6 +130,8 @@ pub struct AudioConfig {
     pub role: AudioRole,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<AudioGroupId>,
+    /// Only explicit Source Advanced overrides pin a group; resolved groups follow the Listener.
+    pub group_id_override: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listener_node_id: Option<AudioNodeId>,
     pub media_port: u16,
@@ -158,6 +160,7 @@ impl Default for AudioConfig {
             enabled: false,
             role: AudioRole::Off,
             group_id: None,
+            group_id_override: false,
             listener_node_id: None,
             media_port: 47903,
             profile: AudioProfile::Auto,
@@ -183,6 +186,8 @@ impl Default for AudioConfig {
 #[serde(deny_unknown_fields)]
 pub struct AudioPeerConfig {
     pub node_id: AudioNodeId,
+    #[serde(default)]
+    pub allow_mic_control: bool,
     #[serde(default)]
     pub allow_media_control: bool,
     #[serde(default = "full_gain")]
@@ -260,6 +265,12 @@ impl AudioConfig {
     /// Listener group ownership, runtime device availability and bilateral consent
     /// at activation. Pairing never populates either explicit consent list.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.group_id_override && (self.role != AudioRole::Source || self.group_id.is_none()) {
+            return Err(invalid(
+                "audio.group_id_override",
+                "Source role with a nonempty group_id",
+            ));
+        }
         if self.media_port == 0 || self.media_port == 47902 {
             return Err(invalid(
                 "audio.media_port",
@@ -294,6 +305,12 @@ impl AudioConfig {
                 return Err(invalid(
                     "audio.peers.allow_media_control",
                     "Source permission for selected Listener only",
+                ));
+            }
+            if peer.allow_mic_control && self.role != AudioRole::Listener {
+                return Err(invalid(
+                    "audio.peers.allow_mic_control",
+                    "Listener permission for a configured Source only",
                 ));
             }
             if self.role != AudioRole::Listener && (peer.gain_percent != 100 || peer.muted) {
@@ -375,10 +392,10 @@ impl AudioConfig {
                 "false: microphone streaming is deferred",
             ));
         }
-        if mic.ptt_enabled && (!mic.control_enabled || mic.ptt_hotkey.is_empty()) {
+        if mic.ptt_enabled && !mic.control_enabled {
             return Err(invalid(
                 "audio.microphone.ptt_enabled",
-                "control enabled and explicit valid hotkey",
+                "microphone control enabled (empty hotkey permits focused GUI PTT)",
             ));
         }
         if !mic.ptt_hotkey.is_empty() && crate::Hotkey::parse(&mic.ptt_hotkey).is_err() {
@@ -406,7 +423,6 @@ impl AudioConfig {
             .copied()
             .chain(self.allow_system_audio_from.iter().copied())
             .chain(self.peers.iter().map(|peer| peer.node_id))
-            .chain(self.microphone.pinned_target_node_id)
             .chain(
                 self.listener_node_id
                     .filter(|_| self.role != AudioRole::Listener),
@@ -418,6 +434,16 @@ impl AudioConfig {
                     "other node IDs must be currently trusted and not self",
                 ));
             }
+        }
+        if self
+            .microphone
+            .pinned_target_node_id
+            .is_some_and(|id| id != local)
+        {
+            return Err(invalid(
+                "audio.microphone.pinned_target_node_id",
+                "only the Listener's own physical microphone is controlled",
+            ));
         }
         if self.role == AudioRole::Listener && self.listener_node_id.is_some_and(|id| id != local) {
             return Err(invalid(

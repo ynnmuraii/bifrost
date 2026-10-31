@@ -170,14 +170,29 @@ impl Window {
         }));
     }
 
+    /// Local configuration ACKs are not a barrier for the peer's authenticated
+    /// consent Hello. Wait on the actual Start result, without production retries
+    /// or changing consent policy; all other failures remain immediate.
     pub fn start(&mut self, peer: &[u8]) {
-        let revision = self.status().revision;
-        self.op(gui_frame::Msg::StartAudio(wire::StartAudio {
-            peer_node_id: peer.to_vec(),
-            kind: wire::AudioKind::System as i32,
-            profile: wire::AudioProfile::Ethernet as i32,
-            expected_revision: revision,
-        }));
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let revision = self.status().revision;
+            let result = self.request(gui_frame::Msg::StartAudio(wire::StartAudio {
+                peer_node_id: peer.to_vec(),
+                kind: wire::AudioKind::System as i32,
+                profile: wire::AudioProfile::Ethernet as i32,
+                expected_revision: revision,
+            }));
+            if matches!(&result, gui_frame::Msg::OpResult(result)
+                if !result.ok && result.error_code == "AUDIO_CONSENT_REQUIRED")
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            assert_ok(result);
+            return;
+        }
     }
 
     pub fn stop(&mut self, peer: &[u8], session_id: &[u8]) {
@@ -303,6 +318,7 @@ pub fn config(
         role: role as i32,
         listener_node_id: listener.to_vec(),
         group_id: Vec::new(),
+        group_id_override: Some(false),
         mode: wire::AudioMode::MixAll as i32,
         udp_port: u32::from(port),
         profile: wire::AudioProfile::Ethernet as i32,
@@ -376,8 +392,10 @@ pub fn healthy(
     );
     let id = receiving.session_id;
     let initial = receiving.health.expect("worker health").received_packets;
-    listener.wait("authenticated media receive counters advance", |status| {
-        status.sessions.iter().any(|session| {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = listener.status();
+        if status.sessions.iter().any(|session| {
             session.session_id == id
                 && session.state == wire::AudioSessionState::Running as i32
                 && session.health_state == wire::AudioStreamHealth::Ready as i32
@@ -385,8 +403,36 @@ pub fn healthy(
                     .health
                     .as_ref()
                     .is_some_and(|health| health.received_packets > initial)
-        })
-    });
+        }) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let observed: Vec<_> = status.sessions.iter().map(|session| {
+                format!(
+                    "session_id={:?}, same_session={}, state={:?}, health_state={:?}, \
+                     received={:?}, lost={:?}, late={:?}, path_diagnostic={:?}, \
+                     local_udp_port={}, peer_udp_port={}, latency_estimate_ms={:?}, latency_stages={:?}",
+                    session.session_id,
+                    session.session_id == id,
+                    wire::AudioSessionState::try_from(session.state),
+                    wire::AudioStreamHealth::try_from(session.health_state),
+                    session.health.as_ref().map(|health| health.received_packets),
+                    session.health.as_ref().map(|health| health.lost_frames),
+                    session.health.as_ref().map(|health| health.late_frames),
+                    wire::AudioPathDiagnostic::try_from(session.path_diagnostic),
+                    session.local_udp_port,
+                    session.peer_udp_port,
+                    session.latency_estimate_ms,
+                    session.latency_stages,
+                )
+            }).collect();
+            panic!(
+                "authenticated media receive counters advance: expected_session={id:?}, \
+                 initial_received={initial}, observed={observed:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
     source.wait("worker observes actual capture and send", |status| {
         status.sessions.iter().any(|session| {
             session.session_id == id

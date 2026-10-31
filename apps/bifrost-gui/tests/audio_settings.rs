@@ -419,7 +419,8 @@ fn enabled_checkbox_emits_only_draft_and_unavailable_checkbox_emits_nothing() {
         if available {
             assert_eq!(actions.len(), 1);
             assert!(
-                matches!(&actions[0], Action::Audio(AudioAction::EditConfig(config)) if config.enabled)
+                matches!(&actions[0], Action::Audio(AudioAction::EditConfig(config))
+                    if config.enabled && config.group_id_override == Some(false))
             );
             assert!(!vm.audio.draft.enabled);
         } else {
@@ -893,6 +894,7 @@ fn apply_emits_only_the_typed_intent_without_optimistic_activation() {
     vm.audio.dirty = true;
     let before = vm.audio.draft.clone();
     let ctx = egui::Context::default();
+    assert_eq!(before.group_id_override, Some(false));
     ui::install_fonts(&ctx);
     let size = egui::vec2(760.0, 6000.0);
     frame(&ctx, &vm, size, Vec::new());

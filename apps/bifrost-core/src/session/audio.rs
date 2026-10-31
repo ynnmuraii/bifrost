@@ -1,10 +1,14 @@
 //! Optional audio control actor. The input Session only updates bounded channels/watch state.
 //! Native IPC and config writes never run on the KVM dispatch path. Every media lease is
 //! renewed by this actor, not by the supervisor's independent IPC heartbeat.
+mod admission;
+mod media;
+mod microphone;
 mod wire;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +31,20 @@ use crate::gui::{Outgoing, Request};
 const COMMANDS: usize = 32;
 const TICK: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT_MS: u64 = 10_000;
+const GUI_SILENCE: Duration = Duration::from_secs(12);
+const MAX_GUI_CONNECTIONS: usize = 16;
 type Code = &'static str;
+
+fn count_optional_drop(counter: &AtomicU64) {
+    let mut count = counter.load(Ordering::Relaxed);
+    while count != u64::MAX {
+        match counter.compare_exchange_weak(count, count + 1, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return,
+            Err(current) => count = current,
+        }
+    }
+}
 
 pub(super) fn is_request(message: &gui::gui_frame::Msg) -> bool {
     use gui::gui_frame::Msg;
@@ -62,6 +79,8 @@ struct Peer {
     trusted: bool,
     hello: Option<fsm::Hello>,
     focus_support: bool,
+    mic_support: bool,
+    media_support: bool,
     focus_sent_revision: u64,
     focus_request_at: Option<u64>,
     focus_reply_at: Option<u64>,
@@ -73,6 +92,13 @@ struct Links {
     trusted: BTreeSet<NodeId>,
     overflow: u64,
 }
+#[derive(Clone, Default)]
+struct ControlContext {
+    hotkeys: config::HotkeyBindings,
+    locked: bool,
+    gui_seen: BTreeMap<[u8; 16], Instant>,
+}
+
 struct Command {
     parent: fsm::Parent,
     message: Result<net::AudioControl, protocol::validate::AudioViolation>,
@@ -83,7 +109,9 @@ pub(super) struct Coordinator {
     gui_commands: mpsc::Sender<Request>,
     links: watch::Sender<Links>,
     focus: watch::Sender<CommittedFocus>,
+    control: watch::Sender<ControlContext>,
     caps: watch::Receiver<Vec<i32>>,
+    optional_drops: Arc<AtomicU64>,
     stopping: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -101,6 +129,7 @@ impl Coordinator {
         let (gui_commands, gui_rx) = mpsc::channel(16);
         let (links, link_rx) = watch::channel(Links::default());
         let (focus_tx, focus_rx) = watch::channel(CommittedFocus::default());
+        let (control, control_rx) = watch::channel(ControlContext::default());
         let (caps_tx, caps) = watch::channel(Vec::new());
         let (stopping, stop_rx) = watch::channel(false);
         let focus_policy = FocusPolicy::new(
@@ -108,6 +137,7 @@ impl Coordinator {
             u64::from(config.focus_ramp_ms),
             background_percent(&config),
         );
+        let optional_drops = Arc::new(AtomicU64::new(0));
         let actor = Actor {
             config,
             local,
@@ -121,6 +151,11 @@ impl Coordinator {
             links: link_rx,
             stopping: stop_rx,
             focus_rx,
+            control_rx,
+            hotkeys: config::HotkeyBindings::default(),
+            session_locked: false,
+            mic: microphone::State::default(),
+            media: media::State::default(),
             focus_view: CommittedFocus::default(),
             focus_policy,
             focus_revision: 0,
@@ -131,6 +166,7 @@ impl Coordinator {
             peers: BTreeMap::new(),
             admitted: BTreeSet::new(),
             records: BTreeMap::new(),
+            start_budgets: admission::Starts::default(),
             effects: VecDeque::new(),
             scratch_effects: Vec::new(),
             retry: VecDeque::new(),
@@ -142,10 +178,12 @@ impl Coordinator {
             consent_revision: 1,
             epoch: Instant::now(),
             overflow: 0,
+            optional_drops: Arc::clone(&optional_drops),
             last_status: None,
             dirty: true,
             configuration_error: None,
             worker_failed: false,
+            privacy_restart: false,
             pending_starts: BTreeMap::new(),
             deferred_starts: BTreeMap::new(),
         };
@@ -155,10 +193,47 @@ impl Coordinator {
             gui_commands,
             links,
             focus: focus_tx,
+            control,
             caps,
             stopping,
+            optional_drops,
             task: Some(task),
         }
+    }
+    pub(super) fn hotkeys(&self, hotkeys: &config::HotkeyBindings) {
+        self.control.send_if_modified(|context| {
+            if context.hotkeys == *hotkeys {
+                return false;
+            }
+            context.hotkeys = hotkeys.clone();
+            true
+        });
+    }
+    pub(super) fn locked(&self, locked: bool) {
+        self.control.send_if_modified(|context| {
+            if context.locked == locked {
+                return false;
+            }
+            context.locked = locked;
+            true
+        });
+    }
+    pub(super) fn gui_activity(&self, connection_id: [u8; 16]) {
+        self.control.send_modify(|context| {
+            if !context.gui_seen.contains_key(&connection_id)
+                && context.gui_seen.len() >= MAX_GUI_CONNECTIONS
+            {
+                if let Some(oldest) = context
+                    .gui_seen
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(id, _)| *id)
+                {
+                    context.gui_seen.remove(&oldest);
+                }
+            }
+            context.gui_seen.insert(connection_id, Instant::now());
+        });
     }
     pub(super) fn focus(&self, view: CommittedFocus) {
         self.focus.send_if_modified(|current| {
@@ -219,6 +294,8 @@ impl Coordinator {
                     },
                     hello: None,
                     focus_support: hello.audio_focus_report,
+                    mic_support: hello.mic_control,
+                    media_support: hello.media_control,
                     focus_sent_revision: 0,
                     focus_request_at: None,
                     focus_reply_at: None,
@@ -244,6 +321,9 @@ impl Coordinator {
                 peer.support = support(capabilities);
                 peer.focus_support =
                     capabilities.contains(&(net::Capability::AudioFocusReportV1 as i32));
+                peer.mic_support = capabilities.contains(&(net::Capability::MicControlV1 as i32));
+                peer.media_support =
+                    capabilities.contains(&(net::Capability::MediaControlV1 as i32));
             }
         });
     }
@@ -286,6 +366,12 @@ impl Coordinator {
         violation: protocol::validate::AudioViolation,
     ) {
         if let Some(parent) = self.parent(peer, connection) {
+            // A valid optional family without its negotiated bit must not enter
+            // the lifecycle queue or tear down an unrelated P1 stream.
+            if violation == protocol::validate::AudioViolation::Capability {
+                count_optional_drop(&self.optional_drops);
+                return;
+            }
             self.enqueue(Command {
                 parent,
                 message: Err(violation),
@@ -355,6 +441,10 @@ struct Record {
     start_request_id: Option<u64>,
     health: model::AudioHealth,
     health_state: model::StreamHealth,
+    latency_estimate_ms: Option<u32>,
+    latency_stages: Option<model::LatencyDiagnostics>,
+    path_diagnostic: model::PathDiagnostic,
+    remote_quality: Option<model::RemoteQuality>,
     capture_active: Option<bool>,
     sending: Option<bool>,
     applied_gain: Option<(u32, bool)>,
@@ -376,6 +466,11 @@ struct Actor {
     links: watch::Receiver<Links>,
     stopping: watch::Receiver<bool>,
     focus_rx: watch::Receiver<CommittedFocus>,
+    control_rx: watch::Receiver<ControlContext>,
+    hotkeys: config::HotkeyBindings,
+    session_locked: bool,
+    mic: microphone::State,
+    media: media::State,
     focus_view: CommittedFocus,
     focus_policy: FocusPolicy,
     focus_revision: u64,
@@ -386,6 +481,7 @@ struct Actor {
     peers: BTreeMap<NodeId, Peer>,
     admitted: BTreeSet<NodeId>,
     records: BTreeMap<NodeId, Record>,
+    start_budgets: admission::Starts,
     worker_epoch: u64,
     effects: VecDeque<fsm::Effect>,
     scratch_effects: Vec<fsm::Effect>,
@@ -397,16 +493,41 @@ struct Actor {
     consent_revision: u32,
     epoch: Instant,
     overflow: u64,
+    optional_drops: Arc<AtomicU64>,
     last_status: Option<gui::AudioStatus>,
     dirty: bool,
     configuration_error: Option<Code>,
     worker_failed: bool,
+    privacy_restart: bool,
     pending_starts: BTreeMap<[u8; 16], Pending>,
     deferred_starts: BTreeMap<NodeId, Pending>,
 }
 impl Actor {
     fn now(&self) -> u64 {
         self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+    fn sync_control(&mut self) {
+        let (hotkeys, locked) = {
+            let context = self.control_rx.borrow_and_update();
+            (
+                (context.hotkeys != self.hotkeys).then(|| context.hotkeys.clone()),
+                context.locked,
+            )
+        };
+        if let Some(hotkeys) = hotkeys {
+            self.mic_set_hotkeys(&hotkeys);
+            self.hotkeys = hotkeys;
+        }
+        self.session_locked = locked;
+    }
+    fn gui_live(&self, connection_id: [u8; 16], out: &mpsc::Sender<Outgoing>) -> bool {
+        let context = self.control_rx.borrow();
+        gui_connection_live(
+            context.gui_seen.get(&connection_id).copied(),
+            Instant::now(),
+            out.is_closed(),
+            context.locked,
+        )
     }
     fn current(&self, parent: fsm::Parent) -> bool {
         self.links
@@ -443,6 +564,20 @@ impl Actor {
         for (peer, record) in &mut self.records {
             if let Some(view) = self.model.session(*peer.as_bytes()) {
                 if view.session == record.view.session && view.parent == record.view.parent {
+                    if record.view.phase != view.phase
+                        && matches!(
+                            view.phase,
+                            fsm::Phase::Stopping | fsm::Phase::Stopped | fsm::Phase::Failed
+                        )
+                    {
+                        tracing::info!(
+                            %peer,
+                            session = ?view.session,
+                            phase = ?view.phase,
+                            reason = ?view.reason,
+                            "audio session ended"
+                        );
+                    }
                     self.dirty |= record.view != view;
                     record.view = view;
                 }
@@ -465,6 +600,7 @@ impl Actor {
             enabled: self.config.enabled,
             role,
             group: self.config.group_id.map(|id| id.0),
+            group_override: self.config.group_id_override,
             listener: self.config.listener_node_id.map(|id| id.0),
             port: self.config.media_port,
         }))?;
@@ -483,7 +619,7 @@ impl Actor {
         Ok(())
     }
     fn publish_caps(&self) {
-        let mut bits = [0; 4];
+        let mut bits = [0; 6];
         bits[0] = net::Capability::AudioFocusReportV1 as i32;
         let mut len = 1;
         if self.config.enabled {
@@ -504,6 +640,16 @@ impl Actor {
                 }
             }
         }
+        if self.config.enabled {
+            if self.mic_capable() {
+                bits[len] = net::Capability::MicControlV1 as i32;
+                len += 1;
+            }
+            if self.media_capable() {
+                bits[len] = net::Capability::MediaControlV1 as i32;
+                len += 1;
+            }
+        }
         let bits = &bits[..len];
         self.caps.send_if_modified(|old| {
             if old.as_slice() == bits {
@@ -516,6 +662,10 @@ impl Actor {
         });
     }
     async fn run(mut self) {
+        let hotkeys = self.control_rx.borrow_and_update().hotkeys.clone();
+        self.mic_set_hotkeys(&hotkeys);
+        self.hotkeys = hotkeys;
+        self.sync_control();
         let _ = self.configure();
         self.publish_caps();
         self.publish();
@@ -535,6 +685,11 @@ impl Actor {
                 changed = self.focus_rx.changed() => {
                     if changed.is_err() { break; }
                     self.sync_focus();
+                }
+                changed = self.control_rx.changed() => {
+                    if changed.is_err() { break; }
+                    self.sync_control();
+                    self.dirty = true;
                 }
                 changed = self.links.changed() => {
                     if changed.is_err() { break; }
@@ -556,8 +711,23 @@ impl Actor {
                     let Some(Command { parent, message }) = command else { break; };
                     self.dirty = true;
                     match message {
-                        Ok(message) => self.on_network(parent,message),
+                        Ok(message) => match message.body.as_ref() {
+                            Some(net::audio_control::Body::MicControl(_)
+                                | net::audio_control::Body::MicState(_)
+                                | net::audio_control::Body::MicAck(_)) =>
+                                    self.mic_on_network(parent, &message).await,
+                            Some(net::audio_control::Body::MediaInfo(_)
+                                | net::audio_control::Body::MediaCommand(_)
+                                | net::audio_control::Body::MediaAck(_)) =>
+                                    self.media_on_network(parent, &message).await,
+                            _ => self.on_network(parent, message),
+                        },
                         Err(violation) if self.current(parent) => {
+                            tracing::warn!(
+                                peer = %NodeId::new(parent.peer),
+                                code = ?violation.stop_code(),
+                                "invalid audio control"
+                            );
                             let reason = match violation.stop_code() {
                                 net::AudioStopCode::UnsupportedFormat => fsm::Reason::UnsupportedFormat,
                                 net::AudioStopCode::Disabled => fsm::Reason::Disabled,
@@ -578,6 +748,9 @@ impl Actor {
             self.drain().await;
             self.service_focus().await;
             self.apply_gains().await;
+            self.mic_tick().await;
+            self.media_tick().await;
+            self.service_privacy_failure().await;
             self.publish_caps();
             self.publish();
             self.service_deferred().await;
@@ -588,6 +761,8 @@ impl Actor {
     }
     fn sync_links(&mut self) {
         let snapshot = self.links.borrow_and_update().clone();
+        self.start_budgets
+            .retain(|peer| snapshot.trusted.contains(peer));
         if snapshot.overflow != self.overflow {
             self.overflow = snapshot.overflow;
             self.stop_all(fsm::Reason::RateLimited);
@@ -689,6 +864,7 @@ impl Actor {
                 self.focus_policy.unknown(self.now());
             }
         }
+        self.mic_on_parents_changed();
     }
     async fn save(&self, config: config::AudioConfig) -> Result<(), Code> {
         let path = self.paths.config_file();
@@ -713,14 +889,14 @@ impl Actor {
                     {
                         let mut next = self.config.clone();
                         next.group_id = settings.group.map(config::audio::HexId);
+                        next.group_id_override = settings.group_override;
                         if self.save(next.clone()).await.is_ok() {
                             self.config = next;
                             let _ = self.configure();
                         } else {
                             self.configuration_error = Some(ipc::audio::codes::AUDIO_CONFIG_WRITE);
                             let _ = self.feed(fsm::Input::Configure(fsm::Settings::default()));
-                            self.fail_pending(ipc::audio::codes::AUDIO_CONFIG_WRITE)
-                                .await;
+                            self.fail_pending(ipc::audio::codes::AUDIO_CONFIG_WRITE);
                         }
                     }
                 }
@@ -740,14 +916,21 @@ impl Actor {
                         } else {
                             self.configuration_error = Some(ipc::audio::codes::AUDIO_CONFIG_WRITE);
                             let _ = self.feed(fsm::Input::Configure(fsm::Settings::default()));
-                            self.fail_pending(ipc::audio::codes::AUDIO_CONFIG_WRITE)
-                                .await;
+                            self.fail_pending(ipc::audio::codes::AUDIO_CONFIG_WRITE);
                         }
                     }
                 }
                 fsm::Effect::Send { parent, message } => self.send_control(parent, message).await,
                 fsm::Effect::GenerateSourceNonce { parent, session } => {
                     if self.current(parent) {
+                        let now = self.now();
+                        if !self.start_budgets.admit(NodeId::new(parent.peer), now) {
+                            let _ = self.feed(fsm::Input::Stop {
+                                peer: parent.peer,
+                                reason: fsm::Reason::RateLimited,
+                            });
+                            continue;
+                        }
                         if let Some(nonce) = nonce() {
                             let _ = self.feed(fsm::Input::SourceNonce {
                                 parent,
@@ -759,6 +942,17 @@ impl Actor {
                 }
                 fsm::Effect::GenerateListenerOffer { parent, request } => {
                     if self.current(parent) {
+                        let now = self.now();
+                        if !self.start_budgets.admit(NodeId::new(parent.peer), now) {
+                            self.effects.push_back(fsm::Effect::Send {
+                                parent,
+                                message: fsm::Control::StartRefusal {
+                                    request_id: request.request_id,
+                                    reason: fsm::Reason::RateLimited,
+                                },
+                            });
+                            continue;
+                        }
                         if let (Ok(session), Some(listener_nonce)) = (identity::random16(), nonce())
                         {
                             let format = format(request.profile);
@@ -829,6 +1023,10 @@ impl Actor {
                                 start_request_id: None,
                                 health: Default::default(),
                                 health_state: model::StreamHealth::Buffering,
+                                path_diagnostic: model::PathDiagnostic::None,
+                                remote_quality: None,
+                                latency_estimate_ms: None,
+                                latency_stages: None,
                                 capture_active: None,
                                 sending: None,
                                 applied_gain: None,
@@ -883,7 +1081,9 @@ impl Actor {
                         w.alive
                             && generation(w.generation, self.worker_epoch) == view.worker_generation
                     }) {
-                        let _ = worker.handle.stop_session(view.session).await;
+                        if let Err(error) = worker.handle.stop_session(view.session).await {
+                            self.native_privacy_failure(&error);
+                        }
                     }
                 }
                 fsm::Effect::RenewChild {
@@ -1058,6 +1258,16 @@ impl Actor {
                 record.applied_gain = None;
             }
         }
+        if matches!(
+            &result,
+            Err(AudioSupervisorError::RestartRequired(
+                crate::audio::AudioRestartReason::SessionBudget
+            ))
+        ) {
+            self.worker_lost();
+            self.fail_pending(ipc::audio::codes::AUDIO_WORKER_RESTARTING);
+            return;
+        }
         if result.is_err() {
             let _ = self.feed(fsm::Input::ChildFailed {
                 view,
@@ -1065,7 +1275,9 @@ impl Actor {
             });
         } else if !self.current(view.parent) {
             if let Some(worker) = &self.worker {
-                let _ = worker.handle.stop_session(view.session).await;
+                if let Err(error) = worker.handle.stop_session(view.session).await {
+                    self.native_privacy_failure(&error);
+                }
             }
         }
         // Native SessionEvent::Started, never this write ACK, calls ChildStarted.
@@ -1170,14 +1382,39 @@ impl Actor {
             });
         }
         self.ready = None;
+        self.mic_reset();
+        self.media_reset();
         self.publish_caps();
         for record in self.records.values_mut() {
             record.material = None;
             record.capture_active = None;
             record.sending = None;
+            record.latency_estimate_ms = None;
+            record.latency_stages = None;
+        }
+    }
+    fn native_privacy_failure(&mut self, error: &AudioSupervisorError) -> bool {
+        if !matches!(error, AudioSupervisorError::PrivacyControlRejected) {
+            return false;
+        }
+        self.privacy_restart = true;
+        self.worker_lost();
+        true
+    }
+    async fn service_privacy_failure(&mut self) {
+        if !std::mem::take(&mut self.privacy_restart) {
+            return;
+        }
+        self.fail_pending(ipc::audio::codes::AUDIO_WORKER_RESTARTING);
+        let _ = self.stop_worker().await;
+        self.privacy_restart = false;
+        self.worker_failed = false;
+        if self.config.enabled {
+            let _ = self.ensure_worker().await;
         }
     }
     async fn stop_worker(&mut self) -> Result<(), Code> {
+        self.mic_stop().await;
         self.worker_lost();
         let Some(worker) = self.worker.take() else {
             self.worker_events = None;
@@ -1198,6 +1435,10 @@ impl Actor {
         Ok(())
     }
     async fn on_worker(&mut self, event: AudioSupervisorEvent) {
+        if matches!(&event, AudioSupervisorEvent::CommandRejected { .. }) {
+            self.mic_on_worker(&event).await;
+            self.media_on_worker(&event).await;
+        }
         match event {
             AudioSupervisorEvent::Ready {
                 generation: gen,
@@ -1293,7 +1534,9 @@ impl Actor {
                             .as_ref()
                             .filter(|w| w.alive && w.generation == gen)
                         {
-                            let _ = worker.handle.stop_session(id).await;
+                            if let Err(error) = worker.handle.stop_session(id).await {
+                                self.native_privacy_failure(&error);
+                            }
                         }
                     }
                     return;
@@ -1317,7 +1560,9 @@ impl Actor {
                             && self.current(view.parent);
                         if !valid {
                             if let Some(worker) = &self.worker {
-                                let _ = worker.handle.stop_session(id).await;
+                                if let Err(error) = worker.handle.stop_session(id).await {
+                                    self.native_privacy_failure(&error);
+                                }
                             }
                             return;
                         }
@@ -1349,11 +1594,16 @@ impl Actor {
                             || self.feed(fsm::Input::ChildStarted(view)).is_err()
                         {
                             if let Some(worker) = &self.worker {
-                                let _ = worker.handle.stop_session(id).await;
+                                if let Err(error) = worker.handle.stop_session(id).await {
+                                    self.native_privacy_failure(&error);
+                                }
                             }
                         }
                     }
                     Ok(worker::EventKind::Stopped) => {
+                        if let Some(record) = self.records.get_mut(&peer) {
+                            record.path_diagnostic = native_path_diagnostic(event.path_diagnostic);
+                        }
                         if view.phase == fsm::Phase::Stopping {
                             let _ = self.feed(fsm::Input::ChildStopped(view));
                         } else if !matches!(
@@ -1387,7 +1637,12 @@ impl Actor {
                         });
                     }
                     Ok(worker::EventKind::Degraded) => {
-                        let _ = self.feed(fsm::Input::Buffering(view));
+                        if let Some(record) = self.records.get_mut(&peer) {
+                            record.health_state = model::StreamHealth::Degraded;
+                        }
+                        if view.phase == fsm::Phase::Rebuffering {
+                            let _ = self.feed(fsm::Input::PathReady(view));
+                        }
                     }
                     _ => {}
                 }
@@ -1421,7 +1676,7 @@ impl Actor {
                     let Some(record) = self.records.get_mut(&peer) else {
                         continue;
                     };
-                    if let Some(c) = health.counters {
+                    if let Some(c) = &health.counters {
                         record.health = model::AudioHealth {
                             received_packets: c.received_packets,
                             lost_frames: c.lost_frames,
@@ -1439,15 +1694,33 @@ impl Actor {
                     };
                     record.capture_active = health.capture_active;
                     record.sending = health.sending;
+                    record.latency_estimate_ms =
+                        latency_estimate_ms(health.latency.as_ref(), record.role);
+                    record.latency_stages = health.latency.as_ref().map(native_latency_stages);
+                    record.remote_quality = native_remote_quality(&health, record.role);
+                    if let Some(path) = &health.path {
+                        let diagnostic = native_path_diagnostic(path.diagnostic);
+                        if diagnostic != model::PathDiagnostic::None
+                            || !matches!(
+                                record.view.phase,
+                                fsm::Phase::Stopped | fsm::Phase::Failed
+                            )
+                        {
+                            record.path_diagnostic = diagnostic;
+                        }
+                    }
                     let view = record.view;
-                    if record.health_state == model::StreamHealth::Ready
-                        && view.phase == fsm::Phase::Rebuffering
-                    {
-                        let _ = self.feed(fsm::Input::PathReady(view));
-                    } else if record.health_state != model::StreamHealth::Ready
-                        && view.phase == fsm::Phase::Active
-                    {
-                        let _ = self.feed(fsm::Input::Buffering(view));
+                    match (
+                        view.phase,
+                        local_health_phase(view.phase, record.health_state),
+                    ) {
+                        (fsm::Phase::Rebuffering, fsm::Phase::Active) => {
+                            let _ = self.feed(fsm::Input::PathReady(view));
+                        }
+                        (fsm::Phase::Active, fsm::Phase::Rebuffering) => {
+                            let _ = self.feed(fsm::Input::Buffering(view));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1484,42 +1757,55 @@ impl Actor {
                 }
             }
             AudioSupervisorEvent::PrivacyControlRejected {
-                generation: gen, ..
-            }
-            | AudioSupervisorEvent::RestartRequired {
-                generation: gen, ..
+                generation: gen,
+                request_id,
+                operation,
+                error,
             } => {
                 if self
                     .worker
                     .as_ref()
-                    .is_some_and(|worker| worker.generation == gen)
+                    .is_some_and(|worker| worker.alive && worker.generation == gen)
                 {
-                    self.fail_pending(ipc::audio::codes::AUDIO_UNAVAILABLE)
-                        .await;
+                    let operation = match operation {
+                        crate::audio::AudioPrivacyOperation::DisableMediaWatch => {
+                            "disable_media_watch"
+                        }
+                        crate::audio::AudioPrivacyOperation::MuteMicrophone => "mute_microphone",
+                        crate::audio::AudioPrivacyOperation::RevokePtt => "revoke_ptt",
+                        crate::audio::AudioPrivacyOperation::ReleaseMicMute => "release_mic_mute",
+                        crate::audio::AudioPrivacyOperation::StopSession => "stop_session",
+                    };
+                    tracing::warn!(
+                        generation = gen,
+                        request_id,
+                        operation,
+                        code = error.code,
+                        "audio child rejected a privacy reduction; replacing it"
+                    );
+                    self.native_privacy_failure(&AudioSupervisorError::PrivacyControlRejected);
+                }
+            }
+            AudioSupervisorEvent::RestartRequired {
+                generation: gen,
+                reason: crate::audio::AudioRestartReason::SessionBudget,
+            } => {
+                if self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.alive && worker.generation == gen)
+                {
                     self.worker_lost();
+                    self.fail_pending(ipc::audio::codes::AUDIO_WORKER_RESTARTING);
                 }
             }
-            AudioSupervisorEvent::MuteSnapshot {
-                generation: gen, ..
+            event @ (AudioSupervisorEvent::MuteSnapshot { .. }
+            | AudioSupervisorEvent::PttEvent { .. }) => {
+                self.mic_on_worker(&event).await;
             }
-            | AudioSupervisorEvent::PttEvent {
-                generation: gen, ..
-            }
-            | AudioSupervisorEvent::MediaSessions {
-                generation: gen, ..
-            }
-            | AudioSupervisorEvent::MediaCommandResult {
-                generation: gen, ..
-            } => {
-                // Unrequested optional controls cannot acquire authority from a child push.
-                if self
-                    .worker
-                    .as_ref()
-                    .is_some_and(|worker| worker.generation == gen)
-                {
-                    let _ = self.stop_worker().await;
-                    self.worker_failed = true;
-                }
+            event @ (AudioSupervisorEvent::MediaSessions { .. }
+            | AudioSupervisorEvent::MediaCommandResult { .. }) => {
+                self.media_on_worker(&event).await;
             }
             AudioSupervisorEvent::CommandRejected {
                 generation: gen,
@@ -1831,6 +2117,23 @@ impl Actor {
             return;
         }
         let peer = NodeId::new(parent.peer);
+        if let Some(net::audio_control::Body::StartRequest(request)) = &message.body {
+            let now = self.now();
+            if !self.start_budgets.available(peer, now) {
+                if let Ok(request_id) = <[u8; 16]>::try_from(request.request_id.as_slice()) {
+                    if self.start_budgets.refuse(peer, request_id, now) {
+                        self.effects.push_back(fsm::Effect::Send {
+                            parent,
+                            message: fsm::Control::StartRefusal {
+                                request_id,
+                                reason: fsm::Reason::RateLimited,
+                            },
+                        });
+                    }
+                }
+                return;
+            }
+        }
         let remote_role = self
             .peers
             .get(&peer)
@@ -1888,6 +2191,7 @@ impl Actor {
                 let _ = self.feed(fsm::Input::Receive { parent, message });
             }
             Ok(wire::DecodedControl::Report(_)) => {}
+            Err(wire::Error::Unsupported) => count_optional_drop(&self.optional_drops),
             Err(_) => {
                 let _ = self.feed(fsm::Input::Stop {
                     peer: parent.peer,
@@ -1906,16 +2210,25 @@ impl Actor {
         }
         self.retry.clear();
     }
-    async fn fail_pending(&mut self, code: Code) {
-        for (_, p) in std::mem::take(&mut self.pending_starts) {
-            reply(&p.request, Err(code)).await;
-        }
-        for (_, p) in std::mem::take(&mut self.deferred_starts) {
-            reply(&p.request, Err(code)).await;
+    fn fail_pending(&mut self, code: Code) {
+        // A stalled GUI cannot hold native revocation/recovery behind reply backpressure.
+        for pending in std::mem::take(&mut self.pending_starts)
+            .into_values()
+            .chain(std::mem::take(&mut self.deferred_starts).into_values())
+        {
+            let request = pending.request;
+            let _ = request.out.try_send((
+                request.request_id,
+                gui::gui_frame::Msg::OpResult(gui::OpResult {
+                    ok: false,
+                    error_code: code.to_owned(),
+                }),
+            ));
         }
     }
     async fn on_gui(&mut self, request: Request) {
         use gui::gui_frame::Msg;
+        self.sync_control();
         match &request.message {
             Msg::GetAudioStatus(_) => {
                 if let Some(status) = self.snapshot() {
@@ -2008,9 +2321,8 @@ impl Actor {
                     }
                 }
             }
-            Msg::SetMicrophoneMute(_) | Msg::SetPtt(_) | Msg::SendMediaCommand(_) => {
-                reply(&request, Err(ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND)).await
-            }
+            Msg::SetMicrophoneMute(_) | Msg::SetPtt(_) => self.mic_on_gui(request).await,
+            Msg::SendMediaCommand(_) => self.media_on_gui(request).await,
             _ => reply(&request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await,
         }
     }
@@ -2038,6 +2350,7 @@ impl Actor {
             wire::Error::Unsupported => ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND,
             _ => ipc::audio::codes::AUDIO_ROLE_CONFLICT,
         })?;
+        self.mic_validate_config(&next)?;
         if next.enabled && (self.listen.ip().is_unspecified() || self.listen.ip().is_multicast()) {
             return Err(ipc::audio::codes::AUDIO_DEVICE_UNAVAILABLE);
         }
@@ -2077,8 +2390,12 @@ impl Actor {
             let _ = self.feed(fsm::Input::Configure(fsm::Settings::default()));
             self.drain().await;
             let _ = self.stop_worker().await;
-            self.fail_pending(code).await;
+            self.fail_pending(code);
             return Err(code);
+        }
+        if scope_changed || next.microphone != previous.microphone {
+            self.mic_stop().await;
+            self.mic_reset();
         }
         self.config = next;
         self.configuration_error = None;
@@ -2095,7 +2412,7 @@ impl Actor {
                 let _ = self.feed(fsm::Input::Configure(fsm::Settings::default()));
                 self.drain().await;
                 let _ = self.stop_worker().await;
-                self.fail_pending(code).await;
+                self.fail_pending(code);
                 return Err(code);
             }
             let _ = self.configure();
@@ -2104,8 +2421,7 @@ impl Actor {
         }
         self.drain().await;
         if !self.config.enabled {
-            self.fail_pending(ipc::audio::codes::AUDIO_UNAVAILABLE)
-                .await;
+            self.fail_pending(ipc::audio::codes::AUDIO_UNAVAILABLE);
             self.stop_worker().await?;
             self.records.clear();
         } else {
@@ -2142,6 +2458,15 @@ impl Actor {
             reply(&request, Err(ipc::audio::codes::AUDIO_ROLE_CONFLICT)).await;
             return;
         }
+        if let Some(code) = self.start_refusal(peer) {
+            reply(&request, Err(code)).await;
+            return;
+        }
+        let now = self.now();
+        if !self.start_budgets.available(peer, now) {
+            reply(&request, Err(ipc::audio::codes::AUDIO_START_RATE_LIMITED)).await;
+            return;
+        }
         if self.deferred_starts.contains_key(&peer)
             || self.pending_starts.values().any(|p| {
                 matches!(&p.request.message, gui::gui_frame::Msg::StartAudio(start)
@@ -2168,6 +2493,22 @@ impl Actor {
         }
         self.start_now(request, self.now() + REQUEST_TIMEOUT_MS)
             .await;
+    }
+    fn start_refusal(&self, peer: NodeId) -> Option<Code> {
+        let peer = self.peers.get(&peer)?;
+        if !peer.support.control {
+            return Some(ipc::audio::codes::AUDIO_CONSENT_REQUIRED);
+        }
+        let hello = peer.hello?;
+        if hello.role == self.role()
+            || (self.role() == model::AudioRole::Listener
+                && hello.listener != *self.local.as_bytes())
+        {
+            return Some(ipc::audio::codes::AUDIO_ROLE_CONFLICT);
+        }
+        let local = self.config.group_id?;
+        let remote = hello.group?;
+        (local.0 != remote).then_some(ipc::audio::codes::AUDIO_GROUP_MISMATCH)
     }
     fn start_ready(&self, peer: NodeId) -> bool {
         self.config.enabled
@@ -2213,16 +2554,25 @@ impl Actor {
             Profile::Ethernet
         };
         let result = if self.role() == model::AudioRole::Listener {
+            let now = self.now();
+            if !self.start_budgets.available(peer, now) {
+                reply(&request, Err(ipc::audio::codes::AUDIO_START_RATE_LIMITED)).await;
+                return;
+            }
             match (identity::random16(), nonce()) {
                 (Ok(session), Some(listener_nonce)) => {
                     let format = format(profile);
-                    self.feed(fsm::Input::Start {
+                    let result = self.feed(fsm::Input::Start {
                         parent,
                         session,
                         listener_nonce,
                         format,
                         format_sha256: wire::format_sha256(format),
-                    })
+                    });
+                    if result.is_ok() {
+                        self.start_budgets.admit(peer, now);
+                    }
+                    result
                 }
                 _ => Err(ipc::audio::codes::AUDIO_UNAVAILABLE),
             }
@@ -2255,12 +2605,18 @@ impl Actor {
         let ready: Vec<_> = self
             .deferred_starts
             .iter()
-            .filter(|(peer, p)| self.now() >= p.deadline || self.start_ready(**peer))
+            .filter(|(peer, p)| {
+                self.start_refusal(**peer).is_some()
+                    || self.now() >= p.deadline
+                    || self.start_ready(**peer)
+            })
             .map(|(p, _)| *p)
             .collect();
         for peer in ready {
             if let Some(pending) = self.deferred_starts.remove(&peer) {
-                if self.now() >= pending.deadline {
+                if let Some(code) = self.start_refusal(peer) {
+                    reply(&pending.request, Err(code)).await;
+                } else if self.now() >= pending.deadline {
                     reply(&pending.request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await;
                 } else {
                     self.start_now(pending.request, pending.deadline).await;
@@ -2306,6 +2662,7 @@ impl Actor {
             next.peers.push(config::AudioPeerConfig {
                 node_id: config::audio::HexId(id),
                 allow_media_control: false,
+                allow_mic_control: false,
                 gain_percent: set.gain_percent,
                 muted: set.muted,
             });
@@ -2342,25 +2699,40 @@ impl Actor {
             let local = self.allowed(*peer) && self.current(record.view.parent);
             let (gain_percent, muted) = self.gain(*peer);
             let mut consent = model::SessionConsent::default();
-            match role {
+            match record.role {
                 model::AudioRole::Source => {
                     consent.local.allow_system_send = local;
                     consent.remote.allow_system_receive = remote;
+                    consent.local.allow_media_control =
+                        self.config.peers.iter().any(|pref| {
+                            pref.node_id.0 == *peer.as_bytes() && pref.allow_media_control
+                        });
                 }
                 model::AudioRole::Listener => {
                     consent.local.allow_system_receive = local;
                     consent.remote.allow_system_send = remote;
+                    consent.remote.allow_media_control = self.media_allowed(*peer);
                 }
             }
             let name = self
                 .peers
                 .get(peer)
                 .map_or_else(|| peer.to_string(), |p| p.name.clone());
+            let (local_udp_port, peer_udp_port) = match record.role {
+                model::AudioRole::Listener => (
+                    record.agreement.offer.listener_port,
+                    record.agreement.source_port,
+                ),
+                model::AudioRole::Source => (
+                    record.agreement.source_port,
+                    record.agreement.offer.listener_port,
+                ),
+            };
             status.sessions.push(model::SessionStatus {
                 session_id: record.view.session,
                 peer: *peer.as_bytes(),
                 source_name: name,
-                local_role: role,
+                local_role: record.role,
                 state: phase(record.view.phase),
                 profile: match record.agreement.offer.format.profile {
                     Profile::Ethernet => model::AudioProfile::Ethernet,
@@ -2368,11 +2740,16 @@ impl Actor {
                 },
                 health: record.health,
                 health_state: record.health_state,
-                latency_estimate_ms: None,
+                latency_estimate_ms: record.latency_estimate_ms,
+                latency_stages: record.latency_stages,
+                path_diagnostic: record.path_diagnostic,
+                local_udp_port,
+                peer_udp_port,
+                remote_quality: record.remote_quality,
                 gain_percent: u8::try_from(gain_percent).ok()?,
                 muted,
                 consent,
-                media_info: None,
+                media_info: self.media_info(*peer),
                 focus_primary: self.follow_focus()
                     && self.focus_policy.primary() == Some(*peer.as_bytes()),
             });
@@ -2384,13 +2761,8 @@ impl Actor {
             });
         }
         let config = wire::encode_config(&self.config, model::AudioProfile::Ethernet).ok()?;
-        let mut result = wire::encode_status(
-            &status,
-            config,
-            gui::AudioMicrophoneState::default(),
-            &observations,
-        )
-        .ok()?;
+        let mut result =
+            wire::encode_status(&status, config, self.microphone_status(), &observations).ok()?;
         result.revision = self.revision;
         Some(result)
     }
@@ -2495,10 +2867,12 @@ fn reason_code(reason: fsm::Reason) -> Code {
     match reason {
         fsm::Reason::ConsentRequired | fsm::Reason::Revoked => c::AUDIO_CONSENT_REQUIRED,
         fsm::Reason::RoleConflict => c::AUDIO_ROLE_CONFLICT,
+        fsm::Reason::GroupMismatch => c::AUDIO_GROUP_MISMATCH,
         fsm::Reason::UnsupportedFormat => c::AUDIO_UNSUPPORTED_BACKEND,
         fsm::Reason::DeviceUnavailable => c::AUDIO_DEVICE_UNAVAILABLE,
         fsm::Reason::VirtualMicMissing => c::AUDIO_VIRTUAL_MIC_MISSING,
         fsm::Reason::Timeout => c::AUDIO_NO_UDP_PATH,
+        fsm::Reason::RateLimited => c::AUDIO_START_RATE_LIMITED,
         _ => c::AUDIO_UNAVAILABLE,
     }
 }
@@ -2591,6 +2965,103 @@ fn backend(ready: Option<&worker::Ready>) -> Vec<model::CapabilityAvailability> 
 fn elapsed_second(previous: Option<u64>, now: u64) -> bool {
     previous.is_none_or(|at| now.saturating_sub(at) >= 1000)
 }
+fn native_path_diagnostic(raw: i32) -> model::PathDiagnostic {
+    match worker::PathDiagnostic::try_from(raw) {
+        Ok(worker::PathDiagnostic::NoAuthenticatedPeerPackets) => {
+            model::PathDiagnostic::NoAuthenticatedPeerPackets
+        }
+        Ok(worker::PathDiagnostic::PeerProbesMissing) => model::PathDiagnostic::PeerProbesMissing,
+        Ok(worker::PathDiagnostic::ProbeResponsesMissing) => {
+            model::PathDiagnostic::ProbeResponsesMissing
+        }
+        Ok(worker::PathDiagnostic::AuthenticationFailures) => {
+            model::PathDiagnostic::AuthenticationFailures
+        }
+        _ => model::PathDiagnostic::None,
+    }
+}
+fn native_remote_quality(
+    health: &worker::SessionHealth,
+    role: model::AudioRole,
+) -> Option<model::RemoteQuality> {
+    if role != model::AudioRole::Source {
+        return None;
+    }
+    health
+        .remote_receiver_quality
+        .as_ref()
+        .map(|quality| model::RemoteQuality {
+            received_packets: quality.received_packets,
+            lost_frames: quality.lost_frames,
+            late_frames: quality.late_frames,
+        })
+}
+/// Quality loss is not a pause: only the native jitter pause state rebuffers.
+/// Health cannot manufacture initial path validation or revive a terminal session.
+fn local_health_phase(current: fsm::Phase, local: model::StreamHealth) -> fsm::Phase {
+    match (current, local) {
+        (fsm::Phase::Active, model::StreamHealth::Buffering) => fsm::Phase::Rebuffering,
+        (fsm::Phase::Rebuffering, model::StreamHealth::Ready | model::StreamHealth::Degraded) => {
+            fsm::Phase::Active
+        }
+        _ => current,
+    }
+}
+/// Local stage estimate, not synchronized one-way network latency. Jitter storage
+/// overlaps its scheduling target; native Listener depth must be observed, not zero-filled.
+fn latency_estimate_ms(
+    stages: Option<&worker::LatencyDiagnostics>,
+    role: model::AudioRole,
+) -> Option<u32> {
+    let stages = stages?;
+    let native = match (role, stages.native_render_buffer_us) {
+        (model::AudioRole::Listener, None) => return None,
+        (_, native) => native.unwrap_or(0),
+    };
+    let total: u64 = [
+        stages.packetization_us,
+        stages.capture_queue_us,
+        stages.codec_lookahead_us,
+        stages.jitter_target_us,
+        stages.decoded_queue_us,
+        stages.render_queue_us,
+        stages.resampler_delay_us,
+        native,
+    ]
+    .into_iter()
+    .map(u64::from)
+    .sum();
+    u32::try_from(total.div_ceil(1_000)).ok()
+}
+
+fn native_latency_stages(stages: &worker::LatencyDiagnostics) -> model::LatencyDiagnostics {
+    model::LatencyDiagnostics {
+        packetization_us: stages.packetization_us,
+        capture_queue_us: stages.capture_queue_us,
+        codec_lookahead_us: stages.codec_lookahead_us,
+        jitter_target_us: stages.jitter_target_us,
+        jitter_buffer_us: stages.jitter_buffer_us,
+        decoded_queue_us: stages.decoded_queue_us,
+        render_queue_us: stages.render_queue_us,
+        resampler_delay_us: stages.resampler_delay_us,
+        native_render_buffer_us: stages.native_render_buffer_us,
+    }
+}
+
+fn gui_connection_live(
+    last_seen: Option<Instant>,
+    now: Instant,
+    closed: bool,
+    locked: bool,
+) -> bool {
+    !closed
+        && !locked
+        && last_seen.is_some_and(|at| {
+            now.checked_duration_since(at)
+                .is_some_and(|age| age <= GUI_SILENCE)
+        })
+}
+
 fn effective_gain(user: u32, focus: u32) -> u32 {
     user.min(100) * focus.min(100) / 100
 }
@@ -2786,4 +3257,205 @@ fn source_hello_does_not_require_the_listener_only_available_flag() {
     assert!(!peer_setup_ready(model::AudioRole::Source, hello));
     hello.available = true;
     assert!(peer_setup_ready(model::AudioRole::Source, hello));
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn local_playout_quality_does_not_invent_rebuffering_or_initial_validation() {
+        use fsm::Phase::*;
+        use model::StreamHealth::*;
+        assert_eq!(local_health_phase(Active, Degraded), Active);
+        assert_eq!(local_health_phase(Rebuffering, Degraded), Active);
+        assert_eq!(local_health_phase(Rebuffering, Ready), Active);
+        assert_eq!(local_health_phase(Active, Buffering), Rebuffering);
+        assert_eq!(local_health_phase(Committed, Ready), Committed);
+        assert_eq!(local_health_phase(Committed, Degraded), Committed);
+        assert_eq!(local_health_phase(Failed, Ready), Failed);
+        assert_eq!(local_health_phase(Stopped, Ready), Stopped);
+    }
+
+    #[test]
+    fn peer_receiver_reports_remain_separate_from_source_local_phase_and_counters() {
+        let health = worker::SessionHealth {
+            counters: Some(worker::AudioHealth::default()),
+            state: worker::StreamHealth::Ready as i32,
+            remote_receiver_quality: Some(worker::RemoteReceiverQuality {
+                received_packets: 966,
+                lost_frames: 34,
+                late_frames: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            native_remote_quality(&health, model::AudioRole::Source),
+            Some(model::RemoteQuality {
+                received_packets: 966,
+                lost_frames: 34,
+                late_frames: 0
+            })
+        );
+        assert_eq!(
+            native_remote_quality(&health, model::AudioRole::Listener),
+            None
+        );
+        assert_eq!(health.counters.as_ref().unwrap().lost_frames, 0);
+        assert_eq!(
+            local_health_phase(fsm::Phase::Active, model::StreamHealth::Ready),
+            fsm::Phase::Active
+        );
+    }
+
+    #[test]
+    fn native_path_diagnostics_preserve_each_bounded_observation() {
+        for (raw, expected) in [
+            (0, model::PathDiagnostic::None),
+            (1, model::PathDiagnostic::NoAuthenticatedPeerPackets),
+            (2, model::PathDiagnostic::PeerProbesMissing),
+            (3, model::PathDiagnostic::ProbeResponsesMissing),
+            (4, model::PathDiagnostic::AuthenticationFailures),
+        ] {
+            assert_eq!(native_path_diagnostic(raw), expected);
+        }
+    }
+
+    #[test]
+    fn latency_sums_disjoint_observed_stages_not_jitter_occupancy_or_maxima() {
+        let mut stages = worker::LatencyDiagnostics {
+            packetization_us: 10_000,
+            capture_queue_us: 2_000,
+            codec_lookahead_us: 6_500,
+            jitter_target_us: 20_000,
+            jitter_buffer_us: 1_900_000,
+            decoded_queue_us: 3_000,
+            render_queue_us: 4_000,
+            resampler_delay_us: 1_000,
+            native_render_buffer_us: Some(5_000),
+        };
+        let observed = native_latency_stages(&stages);
+        assert_eq!(observed.packetization_us, stages.packetization_us);
+        assert_eq!(observed.capture_queue_us, stages.capture_queue_us);
+        assert_eq!(observed.codec_lookahead_us, stages.codec_lookahead_us);
+        assert_eq!(observed.jitter_target_us, stages.jitter_target_us);
+        assert_eq!(observed.jitter_buffer_us, stages.jitter_buffer_us);
+        assert_eq!(observed.decoded_queue_us, stages.decoded_queue_us);
+        assert_eq!(observed.render_queue_us, stages.render_queue_us);
+        assert_eq!(observed.resampler_delay_us, stages.resampler_delay_us);
+        assert_eq!(observed.native_render_buffer_us, Some(5_000));
+        assert_eq!(
+            latency_estimate_ms(Some(&stages), model::AudioRole::Listener),
+            Some(52)
+        );
+        stages.native_render_buffer_us = None;
+        assert_eq!(native_latency_stages(&stages).native_render_buffer_us, None);
+        assert_eq!(
+            latency_estimate_ms(Some(&stages), model::AudioRole::Listener),
+            None
+        );
+        assert_eq!(
+            latency_estimate_ms(Some(&stages), model::AudioRole::Source),
+            Some(47)
+        );
+        assert_eq!(latency_estimate_ms(None, model::AudioRole::Source), None);
+    }
+
+    #[test]
+    fn gui_holds_require_current_connection_activity_and_an_unlocked_session() {
+        let now = Instant::now();
+        let boundary = Some(now - GUI_SILENCE);
+        assert!(gui_connection_live(boundary, now, false, false));
+        assert!(!gui_connection_live(
+            Some(now - GUI_SILENCE - Duration::from_nanos(1)),
+            now,
+            false,
+            false
+        ));
+        assert!(!gui_connection_live(Some(now), now, true, false));
+        assert!(!gui_connection_live(Some(now), now, false, true));
+        assert!(!gui_connection_live(None, now, false, false));
+        assert!(!gui_connection_live(
+            Some(now + Duration::from_nanos(1)),
+            now,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn unnegotiated_optional_bodies_never_enter_the_p1_lifecycle_queue() {
+        let peer = NodeId::new([2; 32]);
+        let connection = [3; 16];
+        let parent = fsm::Parent {
+            peer: *peer.as_bytes(),
+            connection_id: connection,
+            generation: [4; 16],
+        };
+        let (commands, mut incoming) = mpsc::channel(COMMANDS);
+        let (gui_commands, _gui) = mpsc::channel(1);
+        let (links, _links) = watch::channel(Links {
+            peers: BTreeMap::from([(
+                peer,
+                Peer {
+                    parent,
+                    name: String::new(),
+                    remote: SocketAddr::from(([127, 0, 0, 1], 1)),
+                    trusted: true,
+                    support: fsm::Support {
+                        control: true,
+                        system_source: true,
+                        listener: false,
+                    },
+                    hello: None,
+                    focus_support: false,
+                    mic_support: false,
+                    media_support: false,
+                    focus_sent_revision: 0,
+                    focus_request_at: None,
+                    focus_reply_at: None,
+                    focus_reply: false,
+                },
+            )]),
+            trusted: BTreeSet::from([peer]),
+            overflow: 0,
+        });
+        let (focus, _focus) = watch::channel(CommittedFocus::default());
+        let (control, _control) = watch::channel(ControlContext::default());
+        let (_caps, caps) = watch::channel(Vec::new());
+        let (stopping, _stopping) = watch::channel(false);
+        let coordinator = Coordinator {
+            commands,
+            gui_commands,
+            links,
+            focus,
+            control,
+            caps,
+            optional_drops: Arc::new(AtomicU64::new(u64::MAX - 1)),
+            stopping,
+            task: None,
+        };
+        for _ in 0..COMMANDS * 2 {
+            coordinator.rejected(
+                peer,
+                connection,
+                protocol::validate::AudioViolation::Capability,
+            );
+        }
+        assert!(matches!(
+            incoming.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(coordinator.links.borrow().overflow, 0);
+        assert_eq!(coordinator.optional_drops.load(Ordering::Relaxed), u64::MAX);
+        coordinator.rejected(
+            peer,
+            connection,
+            protocol::validate::AudioViolation::Identifier,
+        );
+        assert!(matches!(
+            incoming.try_recv().unwrap().message,
+            Err(protocol::validate::AudioViolation::Identifier)
+        ));
+    }
 }

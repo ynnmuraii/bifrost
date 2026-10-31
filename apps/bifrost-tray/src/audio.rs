@@ -312,6 +312,7 @@ mod tests {
             mode: wire::AudioMode::MixAll as i32,
             config: Some(wire::AudioConfig {
                 role: wire::AudioRole::Listener as i32,
+                group_id_override: Some(false),
                 mode: wire::AudioMode::MixAll as i32,
                 profile: wire::AudioProfile::Ethernet as i32,
                 udp_port: 47903,
@@ -335,6 +336,35 @@ mod tests {
         let mut audio = Audio::default();
         audio.receive(0, &Msg::AudioStatus(snapshot()));
         audio
+    }
+
+    #[test]
+    fn tray_snapshots_preserve_group_policy_presence_without_configuration_writes() {
+        for policy in [None, Some(false), Some(true)] {
+            let mut value = snapshot();
+            value.role = wire::AudioRole::Source as i32;
+            let config = value.config.as_mut().unwrap();
+            config.role = wire::AudioRole::Source as i32;
+            config.listener_node_id = vec![2; 32];
+            config.group_id = vec![3; 16];
+            config.group_id_override = policy;
+            let mut audio = Audio::default();
+            audio.receive(0, &Msg::AudioStatus(value));
+            for action in [Action::StopAllAudio, Action::MicMute, Action::MicPttRelease] {
+                assert!(!matches!(audio.request(&action), Some(Msg::SetAudio(_))));
+                assert_eq!(
+                    audio
+                        .snapshot
+                        .as_ref()
+                        .unwrap()
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .group_id_override,
+                    policy
+                );
+            }
+        }
     }
 
     fn session() -> wire::AudioSessionStatus {

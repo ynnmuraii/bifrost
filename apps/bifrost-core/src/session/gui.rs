@@ -624,6 +624,10 @@ impl Session {
     /// One `GuiFrame` request, answered on the connection it came from.
     pub(crate) async fn on_gui_request(&mut self, request: crate::gui::Request) {
         #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            audio.gui_activity(request.connection_id);
+        }
+        #[cfg(feature = "audio")]
         let audio_request = super::audio::is_request(&request.message);
         #[cfg(not(feature = "audio"))]
         let audio_request = matches!(

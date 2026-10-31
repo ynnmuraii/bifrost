@@ -65,6 +65,17 @@ required_enum!(
     [Ready, Buffering, Degraded]
 );
 required_enum!(
+    decode_path_diagnostic,
+    AudioPathDiagnostic,
+    [
+        None,
+        NoAuthenticatedPeerPackets,
+        PeerProbesMissing,
+        ProbeResponsesMissing,
+        AuthenticationFailures
+    ]
+);
+required_enum!(
     decode_capability,
     AudioBackendCapability,
     [
@@ -120,6 +131,11 @@ pub fn validate_config(config: &wire::AudioConfig) -> Result<()> {
     id(&config.listener_node_id, 32, true)?;
     id(&config.group_id, 16, true)?;
     require(
+        config.group_id_override != Some(true)
+            || (role == wire::AudioRole::Source && config.group_id.len() == 16),
+        "manual audio group requires source and group",
+    )?;
+    require(
         !config.enabled || role != wire::AudioRole::Source || config.listener_node_id.len() == 32,
         "enabled source requires listener",
     )?;
@@ -148,7 +164,9 @@ pub fn validate_config(config: &wire::AudioConfig) -> Result<()> {
         !mic.ptt_enabled || mic.control_enabled,
         "PTT requires microphone control",
     )?;
-    if mic.ptt_enabled || !mic.ptt_hotkey.is_empty() {
+    // GUI-only PTT needs no global shortcut; validate an optional native chord
+    // only when one was configured.
+    if !mic.ptt_hotkey.is_empty() {
         config::hotkey::Hotkey::parse(&mic.ptt_hotkey)
             .map_err(|_| AudioError("invalid audio PTT hotkey"))?;
     }
@@ -254,6 +272,33 @@ pub fn validate_status(status: &wire::AudioStatus) -> Result<()> {
         decode_profile(session.profile)?;
         decode_health(session.health_state)?;
         require(session.health.is_some(), "missing audio health")?;
+        let diagnostic = decode_path_diagnostic(session.path_diagnostic)?;
+        for port in [session.local_udp_port, session.peer_udp_port] {
+            require(
+                port <= u16::MAX as u32
+                    && port != 47902
+                    && (port != 0 || diagnostic == wire::AudioPathDiagnostic::None),
+                "invalid audio path UDP port",
+            )?;
+        }
+        if let Some(latency) = &session.latency_stages {
+            require(
+                [
+                    latency.packetization_us,
+                    latency.capture_queue_us,
+                    latency.codec_lookahead_us,
+                    latency.jitter_target_us,
+                    latency.jitter_buffer_us,
+                    latency.decoded_queue_us,
+                    latency.render_queue_us,
+                    latency.resampler_delay_us,
+                    latency.native_render_buffer_us.unwrap_or(0),
+                ]
+                .into_iter()
+                .all(|delay| delay <= 2_000_000),
+                "audio latency stage out of range",
+            )?;
+        }
         let consent = session
             .consent
             .as_ref()
@@ -365,6 +410,7 @@ pub fn validate_frame(frame: &wire::GuiFrame) -> Result<()> {
 pub mod codes {
     pub const AUDIO_CONSENT_REQUIRED: &str = "AUDIO_CONSENT_REQUIRED";
     pub const AUDIO_ROLE_CONFLICT: &str = "AUDIO_ROLE_CONFLICT";
+    pub const AUDIO_GROUP_MISMATCH: &str = "AUDIO_GROUP_MISMATCH";
     pub const AUDIO_UNSUPPORTED_BACKEND: &str = "AUDIO_UNSUPPORTED_BACKEND";
     pub const AUDIO_NO_UDP_PATH: &str = "AUDIO_NO_UDP_PATH";
     pub const AUDIO_DEVICE_UNAVAILABLE: &str = "AUDIO_DEVICE_UNAVAILABLE";
@@ -374,4 +420,6 @@ pub mod codes {
     pub const AUDIO_STALE_MEDIA: &str = "AUDIO_STALE_MEDIA";
     pub const AUDIO_UNSUPPORTED_COMMAND: &str = "AUDIO_UNSUPPORTED_COMMAND";
     pub const AUDIO_UNAVAILABLE: &str = "AUDIO_UNAVAILABLE";
+    pub const AUDIO_START_RATE_LIMITED: &str = "AUDIO_START_RATE_LIMITED";
+    pub const AUDIO_WORKER_RESTARTING: &str = "AUDIO_WORKER_RESTARTING";
 }

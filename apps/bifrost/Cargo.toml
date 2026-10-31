@@ -46,7 +46,9 @@ clipboard = { path = "../../crates/clipboard" }
 identity = { path = "../../crates/identity" }
 ipc = { path = "../../crates/ipc" }
 protocol = { path = "../../crates/protocol" }
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "net", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+transport = { path = "../../crates/transport" }
 # The fault-injection harness forces an RST (`SO_LINGER 0`) to simulate an abrupt link
 # loss. `std`'s `TcpStream::set_linger` is still unstable, and `socket2` is already in
 # the tree through tokio (`Cargo.lock`), so this adds no new crate to the graph.

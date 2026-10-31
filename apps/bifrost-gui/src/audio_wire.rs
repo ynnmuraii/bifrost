@@ -100,6 +100,19 @@ enums!(
     PlaybackState,
     [Unknown, Playing, Paused, Stopped]
 );
+enums!(
+    decode_path_diagnostic,
+    encode_path_diagnostic,
+    AudioPathDiagnostic,
+    PathDiagnostic,
+    [
+        None,
+        NoAuthenticatedPeerPackets,
+        PeerProbesMissing,
+        ProbeResponsesMissing,
+        AuthenticationFailures
+    ]
+);
 
 fn decode_flags(flags: &wire::AudioConsentFlags) -> model::ConsentFlags {
     model::ConsentFlags {
@@ -223,6 +236,30 @@ pub fn decode_status(status: &wire::AudioStatus) -> Result<model::AudioStatus> {
                 },
                 media_info,
                 focus_primary: s.focus_primary,
+                path_diagnostic: decode_path_diagnostic(s.path_diagnostic)?,
+                local_udp_port: u16::try_from(s.local_udp_port)
+                    .map_err(|_| AudioError("invalid audio path UDP port"))?,
+                peer_udp_port: u16::try_from(s.peer_udp_port)
+                    .map_err(|_| AudioError("invalid audio path UDP port"))?,
+                remote_quality: s.remote_quality.as_ref().map(|q| model::RemoteQuality {
+                    received_packets: q.received_packets,
+                    lost_frames: q.lost_frames,
+                    late_frames: q.late_frames,
+                }),
+                latency_stages: s
+                    .latency_stages
+                    .as_ref()
+                    .map(|l| model::LatencyDiagnostics {
+                        packetization_us: l.packetization_us,
+                        capture_queue_us: l.capture_queue_us,
+                        codec_lookahead_us: l.codec_lookahead_us,
+                        jitter_target_us: l.jitter_target_us,
+                        jitter_buffer_us: l.jitter_buffer_us,
+                        decoded_queue_us: l.decoded_queue_us,
+                        render_queue_us: l.render_queue_us,
+                        resampler_delay_us: l.resampler_delay_us,
+                        native_render_buffer_us: l.native_render_buffer_us,
+                    }),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -310,6 +347,25 @@ pub fn encode_status(
                 revision: m.revision,
             }),
             focus_primary: s.focus_primary,
+            path_diagnostic: encode_path_diagnostic(s.path_diagnostic),
+            local_udp_port: u32::from(s.local_udp_port),
+            peer_udp_port: u32::from(s.peer_udp_port),
+            remote_quality: s.remote_quality.map(|q| wire::AudioRemoteQuality {
+                received_packets: q.received_packets,
+                lost_frames: q.lost_frames,
+                late_frames: q.late_frames,
+            }),
+            latency_stages: s.latency_stages.map(|l| wire::AudioLatencyDiagnostics {
+                packetization_us: l.packetization_us,
+                capture_queue_us: l.capture_queue_us,
+                codec_lookahead_us: l.codec_lookahead_us,
+                jitter_target_us: l.jitter_target_us,
+                jitter_buffer_us: l.jitter_buffer_us,
+                decoded_queue_us: l.decoded_queue_us,
+                render_queue_us: l.render_queue_us,
+                resampler_delay_us: l.resampler_delay_us,
+                native_render_buffer_us: l.native_render_buffer_us,
+            }),
             kind: wire::AudioKind::System as i32,
             capture_active: None,
             sending: None,
@@ -335,6 +391,7 @@ mod tests {
     fn config() -> wire::AudioConfig {
         wire::AudioConfig {
             role: wire::AudioRole::Listener as i32,
+            group_id_override: Some(false),
             mode: wire::AudioMode::MixAll as i32,
             profile: wire::AudioProfile::Ethernet as i32,
             udp_port: 47903,
@@ -351,6 +408,35 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn config_adapter_round_trip_preserves_group_override_presence() {
+        let status = model::AudioStatus {
+            revision: 1,
+            enabled: false,
+            role: model::AudioRole::Source,
+            mode: model::AudioMode::MixAll,
+            backend: Vec::new(),
+            sessions: Vec::new(),
+        };
+        for group_id_override in [None, Some(false), Some(true)] {
+            let mut config = config();
+            config.role = wire::AudioRole::Source as i32;
+            config.listener_node_id = vec![2; 32];
+            config.group_id = vec![7; 16];
+            config.group_id_override = group_id_override;
+            let wire = encode_status(
+                &status,
+                config.clone(),
+                wire::AudioMicrophoneState::default(),
+            )
+            .unwrap();
+            let model = decode_status(&wire).unwrap();
+            let round_trip =
+                encode_status(&model, wire.config.unwrap(), wire.microphone.unwrap()).unwrap();
+            assert_eq!(round_trip.config, Some(config));
+        }
+    }
+
     #[test]
     fn round_trip_preserves_model_health_and_optional_media_numbers() {
         let mut c = config();
@@ -413,6 +499,11 @@ mod tests {
                     },
                 }),
                 focus_primary: true,
+                path_diagnostic: model::PathDiagnostic::None,
+                local_udp_port: 0,
+                peer_udp_port: 0,
+                remote_quality: None,
+                latency_stages: None,
             }],
         };
         let wire = encode_status(&model, c, wire::AudioMicrophoneState::default()).unwrap();
@@ -447,5 +538,110 @@ mod tests {
         invalid.sessions[0].media_info.as_mut().unwrap().title = "\u{00e9}".repeat(129);
         let error = validate_status(&invalid).unwrap_err();
         assert!(!format!("{error:?}").contains('\u{00e9}'));
+    }
+
+    #[test]
+    fn round_trip_preserves_path_ports_and_remote_quality_without_changing_source_state() {
+        let mut c = config();
+        c.enabled = true;
+        c.role = wire::AudioRole::Source as i32;
+        c.listener_node_id = vec![4; 32];
+        let status = model::AudioStatus {
+            revision: 7,
+            enabled: true,
+            role: model::AudioRole::Source,
+            mode: model::AudioMode::MixAll,
+            backend: Vec::new(),
+            sessions: vec![model::SessionStatus {
+                session_id: [3; 16],
+                peer: [4; 32],
+                source_name: "SOURCE".into(),
+                local_role: model::AudioRole::Source,
+                state: model::SessionState::PathValidation,
+                profile: model::AudioProfile::Ethernet,
+                health: model::AudioHealth {
+                    received_packets: 11,
+                    ..Default::default()
+                },
+                health_state: model::StreamHealth::Buffering,
+                latency_estimate_ms: None,
+                gain_percent: 0,
+                muted: false,
+                consent: model::SessionConsent {
+                    local: model::ConsentFlags {
+                        allow_system_send: true,
+                        ..Default::default()
+                    },
+                    remote: model::ConsentFlags::default(),
+                },
+                media_info: None,
+                focus_primary: false,
+                path_diagnostic: model::PathDiagnostic::NoAuthenticatedPeerPackets,
+                local_udp_port: 47903,
+                peer_udp_port: 61000,
+                remote_quality: Some(model::RemoteQuality {
+                    received_packets: 12,
+                    lost_frames: 3,
+                    late_frames: 2,
+                }),
+                latency_stages: Some(model::LatencyDiagnostics {
+                    packetization_us: 1,
+                    capture_queue_us: 2,
+                    codec_lookahead_us: 3,
+                    jitter_target_us: 4,
+                    jitter_buffer_us: 5,
+                    decoded_queue_us: 6,
+                    render_queue_us: 7,
+                    resampler_delay_us: 8,
+                    native_render_buffer_us: None,
+                }),
+            }],
+        };
+        let encoded = encode_status(&status, c, wire::AudioMicrophoneState::default()).unwrap();
+        assert_eq!(
+            encoded.sessions[0].path_diagnostic,
+            wire::AudioPathDiagnostic::NoAuthenticatedPeerPackets as i32
+        );
+        assert_eq!(encoded.sessions[0].local_udp_port, 47903);
+        assert_eq!(encoded.sessions[0].peer_udp_port, 61000);
+        assert_eq!(
+            encoded.sessions[0].remote_quality,
+            Some(wire::AudioRemoteQuality {
+                received_packets: 12,
+                lost_frames: 3,
+                late_frames: 2,
+            })
+        );
+        let decoded = decode_status(&encoded).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(
+            decoded.sessions[0].state,
+            model::SessionState::PathValidation
+        );
+        let mut invalid = encoded.clone();
+        invalid.sessions[0].path_diagnostic = 5;
+        assert!(decode_status(&invalid).is_err());
+        invalid = encoded;
+        invalid.sessions[0].local_udp_port = 65536;
+        assert!(decode_status(&invalid).is_err());
+        let mut stages = status.clone();
+        stages.sessions[0]
+            .latency_stages
+            .as_mut()
+            .unwrap()
+            .native_render_buffer_us = Some(0);
+        let mut encoded = encode_status(
+            &stages,
+            invalid.config.clone().unwrap(),
+            wire::AudioMicrophoneState::default(),
+        )
+        .unwrap();
+        assert_eq!(decode_status(&encoded).unwrap(), stages);
+        encoded.sessions[0]
+            .latency_stages
+            .as_mut()
+            .unwrap()
+            .native_render_buffer_us = Some(2_000_001);
+        assert!(decode_status(&encoded).is_err());
     }
 }

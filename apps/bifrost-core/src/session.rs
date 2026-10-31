@@ -923,6 +923,7 @@ impl Session {
             ));
             if let Some(audio) = &self.audio {
                 audio.trusted(&self.trust);
+                audio.hotkeys(&self.hotkeys);
                 audio.focus(committed_audio_focus(&self.router, self.node_id));
             }
         }
@@ -1547,6 +1548,14 @@ impl Session {
 
     /// Feeds the FSM and performs what it decided.
     async fn feed(&mut self, input: fr::Input) {
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            match &input {
+                fr::Input::Local(fr::LocalInput::SuspendOrLock) => audio.locked(true),
+                fr::Input::Local(fr::LocalInput::Resume) => audio.locked(false),
+                _ => {}
+            }
+        }
         let now = self.now_ms();
         let previous_source = self.remote_input_lease();
         let preparing_peer =
@@ -5284,9 +5293,9 @@ mod audio_focus_extraction_tests {
 
 #[cfg(any(feature = "audio", test))]
 fn merge_audio_capabilities(current: &mut Vec<i32>, audio: &[i32]) {
-    current.retain(|bit| !matches!(bit, 16 | 17 | 19 | 20));
+    current.retain(|bit| !matches!(bit, 16 | 17 | 18 | 19 | 20 | 23));
     for &bit in audio {
-        if matches!(bit, 16 | 17 | 19 | 20) && !current.contains(&bit) {
+        if matches!(bit, 16 | 17 | 18 | 19 | 20 | 23) && !current.contains(&bit) {
             current.push(bit);
         }
     }
@@ -5298,11 +5307,11 @@ mod audio_capability_tests {
 
     #[test]
     fn audio_publication_preserves_other_capabilities() {
-        let mut current = vec![1, 7, 16, 17, 18, 19, 20, 21];
-        merge_audio_capabilities(&mut current, &[16, 19, 20, 20, 99]);
-        assert_eq!(current, vec![1, 7, 18, 21, 16, 19, 20]);
+        let mut current = vec![1, 7, 16, 17, 18, 19, 20, 21, 23];
+        merge_audio_capabilities(&mut current, &[16, 18, 19, 20, 23, 20, 99]);
+        assert_eq!(current, vec![1, 7, 21, 16, 18, 19, 20, 23]);
         merge_audio_capabilities(&mut current, &[]);
-        assert_eq!(current, vec![1, 7, 18, 21]);
+        assert_eq!(current, vec![1, 7, 21]);
     }
 }
 

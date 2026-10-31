@@ -47,6 +47,10 @@ impl Session {
     pub fn set_hotkeys_source(&mut self, hotkeys: config::HotkeyBindings) {
         self.hotkey_status = bindings(&hotkeys);
         self.hotkeys = hotkeys.clone();
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            audio.hotkeys(&self.hotkeys);
+        }
         self.agent.set_hotkeys(hotkeys);
     }
 
@@ -154,6 +158,10 @@ impl Session {
             .await;
             if matches!(saved, Ok(Ok(()))) {
                 self.hotkeys = pending.wanted;
+                #[cfg(feature = "audio")]
+                if let Some(audio) = &self.audio {
+                    audio.hotkeys(&self.hotkeys);
+                }
                 self.emergency_hotkey = self.hotkeys.emergency_release.clone();
                 self.agent.set_hotkeys(self.hotkeys.clone());
                 self.hotkey_status = result.bindings;

@@ -127,7 +127,8 @@ role = "source"                     # off (default) | source | listener
 # Select a trusted computer by name in GUI; this example ID is not permission.
 listener_node_id = "1111111111111111111111111111111111111111111111111111111111111111"
 # group_id intentionally absent: authenticated Listener setup resolves it.
-# Manual 32-hex group IDs belong only in an Advanced override.
+# Manual 32-hex group IDs require group_id_override = true (Source Advanced only).
+group_id_override = false           # resolved stored groups follow the selected Listener
 media_port = 47903                  # UDP, 1..65535 except discovery 47902
 profile = "auto"                    # auto | ethernet | wifi
 mode = "mix_all"                    # mix_all | follow_focus

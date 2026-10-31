@@ -70,6 +70,33 @@ fn unresolved_source_preserves_enabled_intent_without_inventing_group() {
 }
 
 #[test]
+fn group_override_defaults_auto_and_requires_a_source_group() {
+    let source = format!(
+        "role = 'source'\nlistener_node_id = '{}'\ngroup_id = '{}'",
+        "11".repeat(32),
+        "22".repeat(16)
+    );
+    let legacy = parse(&source).unwrap();
+    assert!(!legacy.audio.group_id_override);
+    let pinned = parse(&format!("{source}\ngroup_id_override = true")).unwrap();
+    pinned.validate().unwrap();
+    assert_eq!(
+        Config::from_str(&pinned.to_toml().unwrap()).unwrap(),
+        pinned
+    );
+    for role in [AudioRole::Off, AudioRole::Listener, AudioRole::Source] {
+        let mut config = AudioConfig {
+            role,
+            group_id_override: true,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config.group_id = Some(HexId([2; 16]));
+        assert_eq!(config.validate().is_ok(), role == AudioRole::Source);
+    }
+}
+
+#[test]
 fn rejects_malformed_ids_enums_ports_and_nested_unknowns() {
     for text in [
         "group_id = ''",
@@ -345,6 +372,7 @@ fn programmatic_peer_gains_reject_out_of_range_values() {
         role: AudioRole::Listener,
         peers: vec![AudioPeerConfig {
             node_id: HexId([1; 32]),
+            allow_mic_control: false,
             allow_media_control: false,
             gain_percent: 101,
             muted: false,
@@ -377,4 +405,38 @@ fn cosmetic_clamps_emit_warnings() {
         parse("focus_debounce_ms = 0\nfocus_ramp_ms = 0\nbackground_gain_db = 1").unwrap();
     });
     assert_eq!(count.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn microphone_consent_defaults_closed_and_gui_ptt_needs_no_global_hotkey() {
+    let id = "11".repeat(32);
+    let listener = parse(&format!(
+        "role = 'listener'\n[[audio.peers]]\nnode_id = '{id}'"
+    ))
+    .unwrap();
+    assert!(!listener.audio.peers[0].allow_mic_control);
+    assert!(valid(&format!(
+        "role = 'listener'\n[[audio.peers]]\nnode_id = '{id}'\nallow_mic_control = true"
+    )));
+    assert!(!valid(&format!("role = 'source'\nlistener_node_id = '{id}'\n[[audio.peers]]\nnode_id = '{id}'\nallow_mic_control = true")));
+    assert!(valid("role = 'listener'\n[audio.microphone]\ncontrol_enabled = true\nptt_enabled = true\nptt_hotkey = ''"));
+    assert!(!valid(
+        "role = 'listener'\n[audio.microphone]\nptt_enabled = true"
+    ));
+}
+
+#[test]
+fn physical_microphone_target_is_listener_local_only() {
+    let local = HexId([1; 32]);
+    let remote = HexId([2; 32]);
+    let mut audio = AudioConfig {
+        role: AudioRole::Listener,
+        ..AudioConfig::default()
+    };
+    audio.microphone.pinned_target_node_id = Some(local);
+    assert!(audio.validate_identity(local, &BTreeSet::new()).is_ok());
+    audio.microphone.pinned_target_node_id = Some(remote);
+    assert!(audio
+        .validate_identity(local, &BTreeSet::from([remote]))
+        .is_err());
 }

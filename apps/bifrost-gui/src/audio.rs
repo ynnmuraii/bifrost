@@ -68,6 +68,7 @@ pub fn default_config() -> ipc::AudioConfig {
     ipc::AudioConfig {
         enabled: false,
         role: ipc::AudioRole::Source as i32,
+        group_id_override: Some(false),
         mode: ipc::AudioMode::MixAll as i32,
         profile: ipc::AudioProfile::Ethernet as i32,
         udp_port: 47903,
@@ -293,6 +294,7 @@ impl ViewModel {
                     self.audio.draft.group_id = id;
                 }
                 self.audio.draft.role = ipc::AudioRole::Listener as i32;
+                self.audio.draft.group_id_override = Some(false);
                 self.audio.draft.listener_node_id.clear();
                 if !was_listener {
                     self.audio.draft.enabled = false;

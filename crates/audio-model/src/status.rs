@@ -165,6 +165,25 @@ pub enum StreamHealth {
     Degraded,
 }
 
+/// Observed path failure, without attributing it to a firewall or network policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PathDiagnostic {
+    #[default]
+    None,
+    NoAuthenticatedPeerPackets,
+    PeerProbesMissing,
+    ProbeResponsesMissing,
+    AuthenticationFailures,
+}
+
+/// Receiver-reported quality, separate from the Source's local pipeline state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteQuality {
+    pub received_packets: u64,
+    pub lost_frames: u64,
+    pub late_frames: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaybackState {
     #[default]
@@ -254,6 +273,12 @@ pub struct SessionStatus {
     pub consent: SessionConsent,
     pub media_info: Option<MediaInfo>,
     pub focus_primary: bool,
+    pub path_diagnostic: PathDiagnostic,
+    /// Zero means unknown, and is allowed only without a path diagnostic.
+    pub local_udp_port: u16,
+    pub peer_udp_port: u16,
+    pub remote_quality: Option<RemoteQuality>,
+    pub latency_stages: Option<LatencyDiagnostics>,
 }
 
 /// Authoritative, revisioned GUI snapshot. Omitted capabilities mean unavailable,
@@ -279,6 +304,8 @@ pub enum StatusError {
     TitleTooLong,
     SubtitleTooLong,
     SourceNameTooLong,
+    InvalidUdpPort,
+    LatencyOutOfRange,
 }
 
 impl AudioStatus {
@@ -303,6 +330,31 @@ impl AudioStatus {
             }
             if session.source_name.len() > MAX_SOURCE_NAME_BYTES {
                 return Err(StatusError::SourceNameTooLong);
+            }
+            if [session.local_udp_port, session.peer_udp_port]
+                .into_iter()
+                .any(|port| {
+                    port == 47902 || (port == 0 && session.path_diagnostic != PathDiagnostic::None)
+                })
+            {
+                return Err(StatusError::InvalidUdpPort);
+            }
+            if session.latency_stages.is_some_and(|latency| {
+                [
+                    latency.packetization_us,
+                    latency.capture_queue_us,
+                    latency.codec_lookahead_us,
+                    latency.jitter_target_us,
+                    latency.jitter_buffer_us,
+                    latency.decoded_queue_us,
+                    latency.render_queue_us,
+                    latency.resampler_delay_us,
+                    latency.native_render_buffer_us.unwrap_or(0),
+                ]
+                .into_iter()
+                .any(|delay| delay > 2_000_000)
+            }) {
+                return Err(StatusError::LatencyOutOfRange);
             }
             if self.sessions[..index]
                 .iter()
@@ -338,6 +390,11 @@ mod tests {
             consent: SessionConsent::default(),
             media_info: None,
             focus_primary: false,
+            path_diagnostic: PathDiagnostic::None,
+            local_udp_port: 0,
+            peer_udp_port: 0,
+            remote_quality: None,
+            latency_stages: None,
         }
     }
 
@@ -376,6 +433,61 @@ mod tests {
     }
 
     #[test]
+    fn path_diagnostics_require_usable_ports() {
+        let mut status = AudioStatus {
+            sessions: vec![session(0)],
+            ..Default::default()
+        };
+        for diagnostic in [
+            PathDiagnostic::None,
+            PathDiagnostic::NoAuthenticatedPeerPackets,
+            PathDiagnostic::PeerProbesMissing,
+            PathDiagnostic::ProbeResponsesMissing,
+            PathDiagnostic::AuthenticationFailures,
+        ] {
+            status.sessions[0].path_diagnostic = diagnostic;
+            for (local, peer) in [(0, 0), (0, 47903), (47903, 0)] {
+                status.sessions[0].local_udp_port = local;
+                status.sessions[0].peer_udp_port = peer;
+                assert_eq!(
+                    status.validate(),
+                    if diagnostic == PathDiagnostic::None {
+                        Ok(())
+                    } else {
+                        Err(StatusError::InvalidUdpPort)
+                    }
+                );
+            }
+            for (local, peer) in [(1, u16::MAX), (47901, 47903)] {
+                status.sessions[0].local_udp_port = local;
+                status.sessions[0].peer_udp_port = peer;
+                assert_eq!(status.validate(), Ok(()));
+            }
+            for (local, peer) in [(47902, 47903), (47903, 47902)] {
+                status.sessions[0].local_udp_port = local;
+                status.sessions[0].peer_udp_port = peer;
+                assert_eq!(status.validate(), Err(StatusError::InvalidUdpPort));
+            }
+        }
+    }
+
+    #[test]
+    fn receiver_quality_is_independent_of_local_health() {
+        let mut status = AudioStatus {
+            sessions: vec![session(0)],
+            ..Default::default()
+        };
+        status.sessions[0].remote_quality = Some(RemoteQuality {
+            received_packets: 1,
+            lost_frames: u64::MAX,
+            late_frames: 3,
+        });
+        assert_eq!(status.validate(), Ok(()));
+        assert_eq!(status.sessions[0].health_state, StreamHealth::Ready);
+        assert_eq!(status.sessions[0].health, AudioHealth::default());
+    }
+
+    #[test]
     fn metadata_is_byte_bounded_and_never_debugged() {
         let mut info = MediaInfo {
             app_id: "a".repeat(128),
@@ -402,5 +514,40 @@ mod tests {
         };
         status.sessions[0].media_info = Some(info);
         assert_eq!(status.validate(), Err(StatusError::SubtitleTooLong));
+    }
+
+    #[test]
+    fn latency_stages_bound_each_observed_delay() {
+        let mut status = AudioStatus {
+            sessions: vec![session(0)],
+            ..Default::default()
+        };
+        for stage in 0..9 {
+            for delay in [0, 2_000_000, 2_000_001, u32::MAX] {
+                let mut delays = [0; 9];
+                delays[stage] = delay;
+                status.sessions[0].latency_stages = Some(LatencyDiagnostics {
+                    packetization_us: delays[0],
+                    capture_queue_us: delays[1],
+                    codec_lookahead_us: delays[2],
+                    jitter_target_us: delays[3],
+                    jitter_buffer_us: delays[4],
+                    decoded_queue_us: delays[5],
+                    render_queue_us: delays[6],
+                    resampler_delay_us: delays[7],
+                    native_render_buffer_us: Some(delays[8]),
+                });
+                assert_eq!(
+                    status.validate(),
+                    if delay <= 2_000_000 {
+                        Ok(())
+                    } else {
+                        Err(StatusError::LatencyOutOfRange)
+                    }
+                );
+            }
+        }
+        status.sessions[0].latency_stages = Some(LatencyDiagnostics::default());
+        assert_eq!(status.validate(), Ok(()));
     }
 }

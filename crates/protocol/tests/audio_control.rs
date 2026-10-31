@@ -99,6 +99,7 @@ fn stable_tags_enums_and_roundtrips() {
         wire::AudioStopCode::Revoked,
         wire::AudioStopCode::UserStop,
         wire::AudioStopCode::ProtocolViolation,
+        wire::AudioStopCode::GroupMismatch,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         assert_eq!(reason as usize, index + 1);

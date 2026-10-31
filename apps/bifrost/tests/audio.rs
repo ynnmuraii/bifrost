@@ -125,6 +125,16 @@ fn real_pairing_resolves_groupless_source_requires_consent_and_streams_until_sto
     source.configure(consent);
     listener.start(&source_id);
     let session_id = audio::healthy(&mut listener, &mut source, &listener_id, &source_id);
+    for window in [&mut listener, &mut source] {
+        window.wait(
+            "native health supplies an observed latency estimate",
+            |status| {
+                status.sessions.iter().any(|session| {
+                    session.session_id == session_id && session.latency_estimate_ms.is_some()
+                })
+            },
+        );
+    }
 
     // Exact identity stop, not a broadcast or a stale GUI card targeting a new stream.
     listener.op(gui_frame::Msg::StopAudio(wire::StopAudio {
@@ -369,7 +379,7 @@ fn disabled_audio_owns_neither_child_nor_media_udp_before_or_after_use() {
 }
 
 #[test]
-fn gui_controls_use_authoritative_media_state_and_deferred_features_never_succeed() {
+fn gui_controls_use_authoritative_state_and_require_explicit_control_consent() {
     let _guard = common::serial();
     let harness = Harness::start_audio(false);
     let mut listener = Window::open(&harness.a);
@@ -410,13 +420,10 @@ fn gui_controls_use_authoritative_media_state_and_deferred_features_never_succee
         expected_revision: revision,
     }));
     match result {
-        gui_frame::Msg::OpResult(result) => assert!(
-            result.ok
-                || matches!(
-                    result.error_code.as_str(),
-                    "AUDIO_UNAVAILABLE" | "AUDIO_UNSUPPORTED_COMMAND"
-                )
-        ),
+        gui_frame::Msg::OpResult(result) => {
+            assert!(!result.ok);
+            assert_eq!(result.error_code, "AUDIO_UNAVAILABLE");
+        }
         other => panic!("SetMicrophoneMute answered {other:?}"),
     }
     let revision = source.status().revision;
@@ -425,17 +432,14 @@ fn gui_controls_use_authoritative_media_state_and_deferred_features_never_succee
         expected_revision: revision,
     }));
     match result {
-        gui_frame::Msg::OpResult(result) => assert!(
-            result.ok
-                || matches!(
-                    result.error_code.as_str(),
-                    "AUDIO_UNAVAILABLE" | "AUDIO_UNSUPPORTED_COMMAND"
-                )
-        ),
+        gui_frame::Msg::OpResult(result) => {
+            assert!(!result.ok);
+            assert_eq!(result.error_code, "AUDIO_UNAVAILABLE");
+        }
         other => panic!("SetPtt release answered {other:?}"),
     }
-    // M5/M6 are deferred, so lack of a native media session must be an explicit typed
-    // rejection, never a successful ACK for work that nobody executes.
+    // System-audio consent does not implicitly authorize media commands, even
+    // when the Source has a real native media session.
     match listener.request(gui_frame::Msg::SendMediaCommand(wire::SendMediaCommand {
         peer_node_id: source_id,
         session_id,
@@ -445,10 +449,7 @@ fn gui_controls_use_authoritative_media_state_and_deferred_features_never_succee
     })) {
         gui_frame::Msg::OpResult(result) => {
             assert!(!result.ok);
-            assert!(matches!(
-                result.error_code.as_str(),
-                "AUDIO_UNAVAILABLE" | "AUDIO_UNSUPPORTED_COMMAND" | "AUDIO_STALE_MEDIA"
-            ));
+            assert_eq!(result.error_code, "AUDIO_CONSENT_REQUIRED");
         }
         other => panic!("SendMediaCommand answered {other:?}"),
     }

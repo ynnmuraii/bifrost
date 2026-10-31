@@ -42,6 +42,7 @@ pub enum Reason {
     Revoked,
     UserStop,
     ProtocolViolation,
+    GroupMismatch,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -69,6 +70,8 @@ pub struct Settings {
     pub role: Option<AudioRole>,
     /// Explicit Advanced override or a previously resolved/minted group, never a guess.
     pub group: Option<[u8; 16]>,
+    /// Pin an explicit Source Advanced group instead of following the selected Listener.
+    pub group_override: bool,
     pub listener: Option<NodeId>,
     pub port: u16,
 }
@@ -78,6 +81,7 @@ impl Default for Settings {
             enabled: false,
             role: None,
             group: None,
+            group_override: false,
             listener: None,
             port: 47903,
         }
@@ -563,6 +567,7 @@ impl ControlPlane {
                         role: Some(AudioRole::Source),
                         listener: Some(listener),
                         group: None,
+                        group_override: false,
                         ..self.settings
                     },
                     out,
@@ -1102,11 +1107,13 @@ impl ControlPlane {
             last_renewal: now,
         }
     }
-    fn configure(&mut self, mut settings: Settings, out: &mut Vec<Effect>) -> Result<(), Error> {
+    fn configure(&mut self, settings: Settings, out: &mut Vec<Effect>) -> Result<(), Error> {
         let now = self.now;
         if settings.port == 0
             || settings.port == 47902
             || (settings.enabled && settings.role.is_none())
+            || (settings.group_override
+                && (settings.role != Some(AudioRole::Source) || settings.group.is_none()))
             || (settings.role == Some(AudioRole::Source) && settings.listener == Some(self.local))
             || (settings.role == Some(AudioRole::Listener)
                 && settings
@@ -1115,12 +1122,12 @@ impl ControlPlane {
         {
             return Err(Error::InvalidSettings);
         }
-        if settings.role == Some(AudioRole::Source)
-            && (settings.group.is_none() || settings.listener.is_none())
+        // Discovery pinning does not change the current authenticated transport.
+        if (Settings {
+            group_override: self.settings.group_override,
+            ..settings
+        }) != self.settings
         {
-            settings.enabled = false;
-        }
-        if settings != self.settings {
             let changed_scope = settings.role != self.settings.role
                 || settings.group != self.settings.group
                 || settings.listener != self.settings.listener;
@@ -1204,7 +1211,10 @@ impl ControlPlane {
         );
     }
     fn resolve_listener_group(&mut self) -> bool {
-        let GroupResolution::WaitingForListener { listener } = self.group else {
+        if self.settings.role != Some(AudioRole::Source) || self.settings.group_override {
+            return false;
+        }
+        let Some(listener) = self.settings.listener else {
             return false;
         };
         let group = self
@@ -1217,8 +1227,10 @@ impl ControlPlane {
         let Some(group) = group else {
             return false;
         };
+        if self.settings.group == Some(group) {
+            return false;
+        }
         self.settings.group = Some(group);
-        self.settings.enabled = false;
         self.group = GroupResolution::Resolved { group, listener };
         true
     }
@@ -1242,6 +1254,9 @@ impl ControlPlane {
                 || previous.group != hello.group
                 || previous.listener != hello.listener
         });
+        if hello.consent_revision < peer.remote_revision {
+            return Ok(());
+        }
         if !hello.allowed
             || peer.hello.is_none()
             || changed
@@ -1259,7 +1274,7 @@ impl ControlPlane {
         {
             peer.finish_request(
                 Err(if changed {
-                    Reason::RoleConflict
+                    Reason::GroupMismatch
                 } else {
                     Reason::ConsentRequired
                 }),
@@ -1268,7 +1283,7 @@ impl ControlPlane {
             if let Some(session) = &mut peer.session {
                 session.terminate(
                     if changed {
-                        Reason::RoleConflict
+                        Reason::GroupMismatch
                     } else {
                         Reason::ConsentRequired
                     },
@@ -1281,6 +1296,7 @@ impl ControlPlane {
         }
         if self.resolve_listener_group() {
             self.publish_configuration(out);
+            self.announce(out);
         }
         if self.settings.role == Some(AudioRole::Listener) && hello.role == AudioRole::Source {
             self.announce_peer(index, out);
@@ -1299,11 +1315,14 @@ impl ControlPlane {
         if !peer.trusted {
             return Err(Reason::Revoked);
         }
+        let hello = peer.hello.ok_or(Reason::RoleConflict)?;
+        let group = settings.group.ok_or(Reason::RoleConflict)?;
+        if hello.group.is_some() && hello.group != Some(group) {
+            return Err(Reason::GroupMismatch);
+        }
         if !peer.local_allowed || !peer.remote_allowed {
             return Err(Reason::ConsentRequired);
         }
-        let hello = peer.hello.ok_or(Reason::RoleConflict)?;
-        let group = settings.group.ok_or(Reason::RoleConflict)?;
         match role {
             AudioRole::Listener
                 if peer.support.system_source
@@ -1368,9 +1387,9 @@ impl ControlPlane {
                     .and_then(|()| {
                         if request.kind != keys::StreamKind::System {
                             Err(Reason::UnsupportedFormat)
-                        } else if request.source != peer.parent.peer
-                            || Some(request.group) != settings.group
-                        {
+                        } else if Some(request.group) != settings.group {
+                            Err(Reason::GroupMismatch)
+                        } else if request.source != peer.parent.peer {
                             Err(Reason::RoleConflict)
                         } else if request.consent_revision != peer.remote_revision {
                             Err(Reason::ConsentRequired)
@@ -1454,9 +1473,10 @@ impl ControlPlane {
                         if offer.parent_connection_id != peer.parent.connection_id
                             || offer.listener != peer.parent.peer
                             || offer.source != local
-                            || Some(offer.group) != settings.group
                         {
                             Err(Reason::ProtocolViolation)
+                        } else if Some(offer.group) != settings.group {
+                            Err(Reason::GroupMismatch)
                         } else if offer.consent_revision != peer.remote_revision {
                             Err(Reason::ConsentRequired)
                         } else {
@@ -1627,7 +1647,7 @@ impl ControlPlane {
                 allowed,
             } => {
                 if Some(group) != settings.group {
-                    return Err(Error::Refused(Reason::RoleConflict));
+                    return Err(Error::Refused(Reason::GroupMismatch));
                 }
                 if allowed && revision <= peer.remote_revision {
                     return Ok(());

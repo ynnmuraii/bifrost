@@ -558,6 +558,194 @@ fn listener_mints_and_source_resolves_without_manual_ids_or_automatic_enable() {
     assert_eq!(source.configuration().group, Some([98; 16]));
     assert!(!source.enabled());
 }
+
+#[test]
+fn automatic_source_follows_fresh_selected_listener_but_override_stays_pinned() {
+    for pinned in [false, true] {
+        let mut pair = Pair::new(true, true);
+        if pinned {
+            let settings = Settings {
+                group_override: true,
+                ..pair.source.configuration()
+            };
+            run(&mut pair.source, 0, Input::Configure(settings));
+        }
+        let hello = |group, revision| {
+            Control::Hello(Hello {
+                role: AudioRole::Listener,
+                group: Some(group),
+                listener: LISTENER,
+                available: true,
+                allowed: true,
+                consent_revision: revision,
+            })
+        };
+        let next = [44; 16];
+        let effects = run(
+            &mut pair.source,
+            1,
+            Input::Receive {
+                parent: pair.sp,
+                message: hello(next, 2),
+            },
+        );
+        let expected = if pinned { GROUP } else { next };
+        assert_eq!(pair.source.configuration().group, Some(expected));
+        assert_eq!(
+            effects.iter().any(|effect| matches!(
+                effect, Effect::PublishConfiguration(settings) if settings.group == Some(next)
+            )),
+            !pinned
+        );
+        for (parent, revision) in [(pair.sp, 1), (parent(LISTENER, 99), 3)] {
+            run(
+                &mut pair.source,
+                2,
+                Input::Receive {
+                    parent,
+                    message: hello(GROUP, revision),
+                },
+            );
+            assert_eq!(pair.source.configuration().group, Some(expected));
+        }
+    }
+}
+
+#[test]
+fn pinning_or_unpinning_current_group_preserves_active_transport() {
+    let mut pair = Pair::new(true, true);
+    pair.active();
+    let before = pair.source.session(LISTENER).unwrap();
+    let listener_before = pair.listener.session(SOURCE).unwrap();
+    for (now, pinned) in [(20, true), (21, false), (22, true)] {
+        let settings = Settings {
+            group_override: pinned,
+            ..pair.source.configuration()
+        };
+        let effects = run(&mut pair.source, now, Input::Configure(settings));
+        assert_eq!(pair.source.configuration().group_override, pinned);
+        assert_eq!(pair.source.session(LISTENER), Some(before));
+        assert_eq!(pair.listener.session(SOURCE), Some(listener_before));
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            Effect::InvalidateSession { .. }
+                | Effect::StopChild { .. }
+                | Effect::DeriveKeys { .. }
+                | Effect::Send {
+                    message: Control::Stop { .. },
+                    ..
+                }
+        )));
+    }
+    // Pinning still governs future discovery; it does not follow a new group.
+    run(
+        &mut pair.source,
+        23,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::Hello(Hello {
+                role: AudioRole::Listener,
+                group: Some([44; 16]),
+                listener: LISTENER,
+                available: true,
+                allowed: true,
+                consent_revision: 2,
+            }),
+        },
+    );
+    assert_eq!(pair.source.configuration().group, Some(GROUP));
+    let settings = Settings {
+        group_override: false,
+        ..pair.source.configuration()
+    };
+    run(&mut pair.source, 24, Input::Configure(settings));
+    assert_eq!(pair.source.configuration().group, Some([44; 16]));
+}
+
+#[test]
+fn source_enable_waits_for_group_without_losing_intent_and_rejects_empty_override() {
+    let mut source = ControlPlane::new(SOURCE);
+    let settings = Settings {
+        enabled: true,
+        role: Some(AudioRole::Source),
+        listener: Some(LISTENER),
+        ..Default::default()
+    };
+    assert_eq!(
+        source.handle(
+            0,
+            Input::Configure(Settings {
+                group_override: true,
+                ..settings
+            }),
+            &mut Vec::new()
+        ),
+        Err(Error::InvalidSettings)
+    );
+    run(&mut source, 0, Input::Configure(settings));
+    assert!(!source.enabled());
+    let sp = parent(LISTENER, 11);
+    run(
+        &mut source,
+        0,
+        Input::PeerUp {
+            parent: sp,
+            support: Support {
+                control: true,
+                listener: true,
+                system_source: false,
+            },
+            trusted: true,
+            local_allowed: true,
+            consent_revision: 1,
+        },
+    );
+    run(
+        &mut source,
+        1,
+        Input::Receive {
+            parent: sp,
+            message: Control::Hello(Hello {
+                role: AudioRole::Listener,
+                group: Some(GROUP),
+                listener: LISTENER,
+                available: true,
+                allowed: true,
+                consent_revision: 1,
+            }),
+        },
+    );
+    assert!(source.enabled());
+    assert!(source.configuration().enabled);
+}
+
+#[test]
+fn fresh_group_change_stops_the_previous_group_session() {
+    let mut pair = Pair::new(true, true);
+    pair.active();
+    let effects = run(
+        &mut pair.source,
+        20,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::Hello(Hello {
+                role: AudioRole::Listener,
+                group: Some([44; 16]),
+                listener: LISTENER,
+                available: true,
+                allowed: true,
+                consent_revision: 2,
+            }),
+        },
+    );
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::StopChild { .. })));
+    assert_eq!(pair.source.configuration().group, Some([44; 16]));
+    assert!(effects.iter().any(|effect| matches!(
+        effect, Effect::PublishConfiguration(settings) if settings.group == Some([44; 16])
+    )));
+}
 #[test]
 fn replayed_offer_never_produces_another_answer_or_derivation() {
     let mut pair = Pair::new(true, true);
@@ -1488,14 +1676,14 @@ fn listener_request_refusals_are_typed_and_do_not_stop_sessions() {
     for reason in [
         Reason::ConsentRequired,
         Reason::RateLimited,
-        Reason::RoleConflict,
+        Reason::GroupMismatch,
     ] {
         let mut pair = Pair::new(reason != Reason::ConsentRequired, true);
         let mut requested = request(43);
         if reason == Reason::RateLimited {
             pair.offer();
         }
-        if reason == Reason::RoleConflict {
+        if reason == Reason::GroupMismatch {
             requested.group = [99; 16];
         }
         let before = pair.listener.session(SOURCE);

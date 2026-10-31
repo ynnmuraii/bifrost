@@ -59,6 +59,7 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
                 config.enabled = false;
                 config.listener_node_id.clear();
                 config.group_id.clear();
+                config.group_id_override = Some(false);
             }
             widgets::hint(ui, pal, text(lang, Key::AudioRoleWarning));
         });
@@ -250,6 +251,7 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
 }
 
 fn inherit_listener_group(config: &mut ipc::AudioConfig, saved: Option<&ipc::AudioConfig>) {
+    config.group_id_override = Some(false);
     config.group_id = saved
         .filter(|saved| {
             saved.role == AudioRole::Source as i32
@@ -317,6 +319,11 @@ fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, limit: usize) 
     });
 }
 
+fn edit_group(config: &mut ipc::AudioConfig, bytes: Vec<u8>) {
+    config.group_id_override = Some(config.role == AudioRole::Source as i32 && !bytes.is_empty());
+    config.group_id = bytes;
+}
+
 fn advanced(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -336,7 +343,7 @@ fn advanced(
         valid_group = parsed.is_some() && (!config.enabled || !group.is_empty());
         if group != previous {
             if let Some(bytes) = parsed {
-                config.group_id = bytes;
+                edit_group(config, bytes);
             }
             ui.data_mut(|data| data.insert_temp(id, group));
         }
@@ -776,22 +783,41 @@ fn permissions(
 
 #[cfg(test)]
 mod tests {
-    use super::{hex, inherit_listener_group, parse_hex};
+    use super::{edit_group, hex, inherit_listener_group, parse_hex};
+
+    #[test]
+    fn advanced_group_edits_pin_only_valid_source_groups_and_clear_explicitly() {
+        let mut config = crate::audio::default_config();
+        config.group_id = vec![7; 16];
+        assert_eq!(config.group_id_override, Some(false));
+        edit_group(&mut config, vec![8; 16]);
+        assert_eq!(config.group_id, vec![8; 16]);
+        assert_eq!(config.group_id_override, Some(true));
+        edit_group(&mut config, Vec::new());
+        assert!(config.group_id.is_empty());
+        assert_eq!(config.group_id_override, Some(false));
+        config.role = protocol::ipc::AudioRole::Listener as i32;
+        edit_group(&mut config, vec![9; 16]);
+        assert_eq!(config.group_id_override, Some(false));
+    }
 
     #[test]
     fn source_listener_selection_never_reuses_another_listeners_group() {
         let mut saved = crate::audio::default_config();
         saved.listener_node_id = vec![1; 32];
         saved.group_id = vec![7; 16];
+        saved.group_id_override = Some(true);
         let mut draft = saved.clone();
         draft.listener_node_id = vec![2; 32];
         draft.enabled = true;
         inherit_listener_group(&mut draft, Some(&saved));
         assert!(draft.group_id.is_empty());
+        assert_eq!(draft.group_id_override, Some(false));
         assert!(!draft.enabled);
         draft.listener_node_id = saved.listener_node_id.clone();
         inherit_listener_group(&mut draft, Some(&saved));
         assert_eq!(draft.group_id, saved.group_id);
+        assert_eq!(draft.group_id_override, Some(false));
         assert!(!draft.enabled);
     }
 
