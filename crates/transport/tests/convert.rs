@@ -1069,6 +1069,32 @@ fn image_clipboard_capability_is_independent_and_unknown_bits_are_ignored() {
 }
 
 #[test]
+fn audio_capabilities_are_independent_optional_flags_and_unknown_bits_are_ignored() {
+    let mut hello = wire::Hello {
+        node_id: some_owner().as_bytes().to_vec(),
+        ..Default::default()
+    };
+    for mask in 0u8..8 {
+        hello.capabilities = vec![999_999];
+        for (bit, capability) in [(1, 16), (2, 17), (4, 20)] {
+            if mask & bit != 0 {
+                hello.capabilities.push(capability);
+            }
+        }
+        assert!(protocol::validate::hello(&hello).is_ok());
+        let info = PeerInfo::from_hello(&hello).unwrap();
+        assert_eq!(info.audio_control, mask & 1 != 0);
+        assert_eq!(info.system_audio_source, mask & 2 != 0);
+        assert_eq!(info.audio_listener, mask & 4 != 0);
+        assert_eq!(info.capabilities, fr::Capabilities::default());
+        assert!(!info.text_clipboard && !info.image_clipboard);
+    }
+    hello.capabilities.clear();
+    let legacy = PeerInfo::from_hello(&hello).unwrap();
+    assert!(!legacy.audio_control && !legacy.system_audio_source && !legacy.audio_listener);
+}
+
+#[test]
 fn clipboard_session_epoch_is_capability_gated_and_exactly_sixteen_bytes() {
     let mut hello = wire::Hello {
         node_id: some_owner().as_bytes().to_vec(),

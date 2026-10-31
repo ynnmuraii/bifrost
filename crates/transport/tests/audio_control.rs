@@ -166,6 +166,7 @@ fn all_bodies(connection: [u8; 16]) -> Vec<wire::AudioControl> {
             udp_port: 47903,
             key_epoch: 1,
             control_ttl_ms: 3000,
+            request_id: Vec::new(),
             ..Default::default()
         }),
         Body::Answer(wire::AudioAnswer {
@@ -197,6 +198,18 @@ fn all_bodies(connection: [u8; 16]) -> Vec<wire::AudioControl> {
             group_id: vec![1; 16],
             allowed_directions: 0,
             consent_revision: 1,
+        }),
+        Body::StartRequest(wire::AudioStartRequest {
+            request_id: vec![7; 16],
+            group_id: vec![1; 16],
+            source_node_id: vec![5; 32],
+            consent_revision: 1,
+            kind: wire::AudioStreamKind::System as i32,
+            profile: wire::AudioLatencyProfile::Wifi as i32,
+        }),
+        Body::StartRefusal(wire::AudioStartRefusal {
+            request_id: vec![7; 16],
+            reason: wire::AudioStopCode::ConsentRequired as i32,
         }),
     ]
     .into_iter()

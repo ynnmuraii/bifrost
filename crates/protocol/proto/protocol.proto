@@ -191,6 +191,8 @@ message AudioControl {
     // Future: 17 focus, 18 mic-state, 19 mic-ack.
     AudioConsentChanged consent = 20;
     // Future: 21 focus-request.
+    AudioStartRequest start_request = 25; // Source asks Listener to create a normal Offer
+    AudioStartRefusal start_refusal = 26; // request correlation, never a session stop
   }
 }
 enum AudioNodeRole {
@@ -273,6 +275,19 @@ message AudioOffer {
   uint32 consent_revision = 10;
   uint32 key_epoch = 11; //1
   uint32 control_ttl_ms = 12; //3000
+  bytes request_id = 13; // empty for Listener start, otherwise16; not key context
+}
+message AudioStartRequest {
+  bytes request_id = 1; //16, unique for this authenticated parent generation
+  bytes group_id = 2; //16
+  bytes source_node_id = 3; //32, authenticated sender
+  uint32 consent_revision = 4;
+  AudioStreamKind kind = 5; //System
+  AudioLatencyProfile profile = 6;
+}
+message AudioStartRefusal {
+  bytes request_id = 1; //16; never interpreted as session_id
+  AudioStopCode reason = 2; //known nonzero
 }
 message AudioAnswer {
   bytes session_id = 1;

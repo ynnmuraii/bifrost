@@ -166,6 +166,9 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
         }
         Body::Offer(offer) => {
             id(&offer.session_id, 16)?;
+            if !offer.request_id.is_empty() {
+                id(&offer.request_id, 16)?;
+            }
             nonce(&offer.session_nonce)?;
             id(&offer.parent_connection_id, 16)?;
             id(&offer.group_id, 16)?;
@@ -245,6 +248,23 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
         Body::Consent(consent) => {
             id(&consent.group_id, 16)?;
             directions(consent.allowed_directions)?;
+        }
+        Body::StartRequest(request) => {
+            id(&request.request_id, 16)?;
+            id(&request.group_id, 16)?;
+            id(&request.source_node_id, 32)?;
+            if request.kind != wire::AudioStreamKind::System as i32
+                || !matches!(
+                    wire::AudioLatencyProfile::try_from(request.profile),
+                    Ok(wire::AudioLatencyProfile::Ethernet | wire::AudioLatencyProfile::Wifi)
+                )
+            {
+                return Err(AudioViolation::UnsupportedFormat);
+            }
+        }
+        Body::StartRefusal(refusal) => {
+            id(&refusal.request_id, 16)?;
+            reason(refusal.reason)?;
         }
     }
     Ok(())

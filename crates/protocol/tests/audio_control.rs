@@ -44,6 +44,7 @@ fn hello() -> wire::AudioHello {
 }
 fn offer() -> wire::AudioOffer {
     wire::AudioOffer {
+        request_id: Vec::new(),
         session_id: vec![1; 16],
         session_nonce: vec![2; 32],
         parent_connection_id: vec![3; 16],
@@ -56,6 +57,17 @@ fn offer() -> wire::AudioOffer {
         consent_revision: 0,
         key_epoch: 1,
         control_ttl_ms: 3000,
+    }
+}
+
+fn start_request() -> wire::AudioStartRequest {
+    wire::AudioStartRequest {
+        request_id: vec![7; 16],
+        group_id: vec![4; 16],
+        source_node_id: vec![6; 32],
+        consent_revision: 2,
+        kind: wire::AudioStreamKind::System as i32,
+        profile: wire::AudioLatencyProfile::Ethernet as i32,
     }
 }
 
@@ -146,6 +158,14 @@ fn stable_tags_enums_and_roundtrips() {
                 group_id: vec![1; 16],
                 consent_revision: u32::MAX,
                 allowed_directions: 3,
+            }),
+        ),
+        (25, Body::StartRequest(start_request())),
+        (
+            26,
+            Body::StartRefusal(wire::AudioStartRefusal {
+                request_id: vec![7; 16],
+                reason: wire::AudioStopCode::ConsentRequired as i32,
             }),
         ),
     ];
@@ -539,4 +559,73 @@ fn received_audio_size_counts_only_complete_field59_bodies_including_duplicates(
     assert!(audio_control_wire_size(&bytes).is_err());
     assert!(audio_control_wire_size(&[0]).is_err());
     assert!(audio_control_wire_size(&[0x80]).is_err());
+}
+
+#[test]
+fn request_ids_reasons_and_profiles_are_bounded() {
+    for len in [0, 15, 17, 2048] {
+        let request = wire::AudioStartRequest {
+            request_id: vec![1; len],
+            ..start_request()
+        };
+        assert!(audio_control(&control(Body::StartRequest(request))).is_err());
+    }
+    for len in [1, 15, 17] {
+        assert_eq!(
+            audio_control(&control(Body::Offer(wire::AudioOffer {
+                request_id: vec![1; len],
+                ..offer()
+            }))),
+            Err(AudioViolation::Identifier)
+        );
+    }
+    assert!(audio_control(&control(Body::Offer(wire::AudioOffer {
+        request_id: vec![1; 16],
+        ..offer()
+    })))
+    .is_ok());
+    for request in [
+        wire::AudioStartRequest {
+            group_id: vec![],
+            ..start_request()
+        },
+        wire::AudioStartRequest {
+            source_node_id: vec![1; 31],
+            ..start_request()
+        },
+        wire::AudioStartRequest {
+            kind: 0,
+            ..start_request()
+        },
+        wire::AudioStartRequest {
+            kind: 2,
+            ..start_request()
+        },
+        wire::AudioStartRequest {
+            profile: 0,
+            ..start_request()
+        },
+        wire::AudioStartRequest {
+            profile: 99,
+            ..start_request()
+        },
+    ] {
+        assert!(audio_control(&control(Body::StartRequest(request))).is_err());
+    }
+    for reason in [0, 99] {
+        assert_eq!(
+            audio_control(&control(Body::StartRefusal(wire::AudioStartRefusal {
+                request_id: vec![1; 16],
+                reason,
+            }))),
+            Err(AudioViolation::Reason)
+        );
+    }
+    assert_eq!(
+        audio_control(&control(Body::StartRefusal(wire::AudioStartRefusal {
+            request_id: vec![1; 15],
+            reason: 2,
+        }))),
+        Err(AudioViolation::Identifier)
+    );
 }

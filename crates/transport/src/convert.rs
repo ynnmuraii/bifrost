@@ -1101,6 +1101,12 @@ pub struct PeerInfo {
     pub text_clipboard: bool,
     /// Whether the running peer adapter supports PNG clipboard content.
     pub image_clipboard: bool,
+    /// Whether the peer supports V1 audio control messages (capability 16).
+    pub audio_control: bool,
+    /// Whether the peer advertises system-audio capture (capability 17).
+    pub system_audio_source: bool,
+    /// Whether the peer advertises audio rendering (capability 20).
+    pub audio_listener: bool,
 }
 
 impl PeerInfo {
@@ -1166,6 +1172,15 @@ impl PeerInfo {
             image_clipboard: hello
                 .capabilities
                 .contains(&(wire::Capability::ClipboardImage as i32)),
+            audio_control: hello
+                .capabilities
+                .contains(&(wire::Capability::AudioControlV1 as i32)),
+            system_audio_source: hello
+                .capabilities
+                .contains(&(wire::Capability::SystemAudioSource as i32)),
+            audio_listener: hello
+                .capabilities
+                .contains(&(wire::Capability::AudioListener as i32)),
         })
     }
 }

@@ -26,6 +26,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Define bounded P1 audio control messages and capability-gated, parent-bound transport delivery with isolated audio refusal and reserved Stop capacity. No core audio coordinator or native capture is enabled.
 - Add opt-in typed `[audio]` preferences, explicit directional consent, stable device selection and locked updates. Config version stays 2, but 0.5.0 configs containing `[audio]` are not downgrade-safe: restore the one-time `.pre-audio` copy made before adding audio to an audio-free config, or remove the audio tables. Hand-edited audio configs need their own earlier backup. No audio is started.
 - Add a pure consent/session control model with contributory nonce/context binding, per-parent replay reservations, worker/generation revocation, deadline-driven failure and automatic Listener-group discovery. Listener child startup must succeed before Commit can start the Source; no coordinator or automatic session activation is wired yet.
+- Add bounded Source-to-Listener StartRequest/StartRefusal negotiation with explicit request correlation, per-parent deduplication/rate limits and typed consent/capacity refusals; Listener still contributes the first nonce and starts before Commit. Track four peer control links separately from the three-session audio limit.
 
 **Audio media internals**
 
@@ -84,6 +85,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Определены ограниченные сообщения управления звуком P1 и доставка с проверкой возможностей и родительского соединения, изолированными отказами аудио и отдельным резервом для Stop. Координатор core и нативный захват не включаются.
 - Добавлены отключённые по умолчанию типизированные настройки `[audio]`, явные разрешения по направлениям, стабильный выбор устройств и запись под блокировкой. Версия конфига остаётся 2, но конфиги 0.5.0 с `[audio]` несовместимы со старыми бинарниками: восстановите однократную копию `.pre-audio`, созданную перед добавлением аудионастроек, либо удалите аудиотаблицы. Для вручную отредактированных аудиоконфигов нужна своя предыдущая копия. Аудио не запускается.
 - Добавлена чистая модель разрешений и аудиосеансов: вклады обеих сторон в nonce/контекст, защита от повтора в рамках родителя, отзыв по поколениям связи и воркера, тайм-ауты и поиск группы Listener. До Commit и запуска Source требуется подтверждение запуска дочернего сеанса Listener; координатор и автоматическое включение сеансов пока не подключены.
+- Добавлены ограниченные StartRequest/StartRefusal от Source к Listener с явной корреляцией запросов, защитой от повторов/ограничением частоты на родительском соединении и типизированными отказами разрешений/ёмкости. Первый nonce по-прежнему создаёт Listener, который запускается до Commit; четыре управляющих соединения учитываются отдельно от трёх аудиосеансов.
 
 **Внутренний аудиотракт**
 

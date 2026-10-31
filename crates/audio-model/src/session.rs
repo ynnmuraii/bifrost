@@ -6,9 +6,10 @@ use crate::{jitter::Profile, keys, status::AudioRole};
 
 pub type NodeId = [u8; 32];
 pub type SessionId = [u8; 16];
-pub const MAX_PEERS: usize = 3;
+pub const MAX_PEERS: usize = 4;
 /// Never evict entries on a live parent: saturation refuses audio until parent replacement.
 pub const USED_SESSION_LIMIT: usize = 256;
+pub const USED_REQUEST_LIMIT: usize = 256;
 pub const SETUP_TIMEOUT_MS: u64 = 10_000;
 pub const PEER_TTL_MS: u32 = 3_000;
 pub const CHILD_TTL_MS: u32 = 1_000;
@@ -93,6 +94,8 @@ pub struct Hello {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Offer {
+    /// GUI correlation only; excluded from the canonical key context and transcript.
+    pub request_id: Option<[u8; 16]>,
     pub session: SessionId,
     pub listener_nonce: [u8; 32],
     pub parent_connection_id: [u8; 16],
@@ -116,8 +119,22 @@ pub struct Answer {
     pub consent_revision: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartRequest {
+    pub request_id: [u8; 16],
+    pub group: [u8; 16],
+    pub source: NodeId,
+    pub consent_revision: u32,
+    pub kind: keys::StreamKind,
+    pub profile: Profile,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     Hello(Hello),
+    StartRequest(StartRequest),
+    StartRefusal {
+        request_id: [u8; 16],
+        reason: Reason,
+    },
     Offer(Offer),
     Answer(Answer),
     Commit {
@@ -200,6 +217,18 @@ pub enum Effect {
         parent: Parent,
         message: Control,
     },
+    /// Respond synchronously with fresh caller-generated IDs/nonces via Input::Start.
+    /// The reserved per-parent slot counts toward the same three-session cap.
+    GenerateListenerOffer {
+        parent: Parent,
+        request: StartRequest,
+    },
+    /// An accepted request has entered ordinary Offer setup, not yet activated media.
+    StartRequestResult {
+        parent: Parent,
+        request_id: [u8; 16],
+        result: Result<SessionId, Reason>,
+    },
     GenerateSourceNonce {
         parent: Parent,
         session: SessionId,
@@ -260,11 +289,22 @@ pub enum Input {
         capture: bool,
         render: bool,
     },
+    WorkerCapabilities {
+        generation: [u8; 16],
+        capture: bool,
+        render: bool,
+    },
     WorkerHeartbeat {
         generation: [u8; 16],
     },
     WorkerLost {
         generation: [u8; 16],
+    },
+    RequestStart {
+        parent: Parent,
+        request_id: [u8; 16],
+        kind: keys::StreamKind,
+        profile: Profile,
     },
     Start {
         parent: Parent,
@@ -369,6 +409,11 @@ impl Session {
         out.push(Effect::PublishStatus);
     }
 }
+struct PendingRequest {
+    request: StartRequest,
+    outgoing: bool,
+    deadline: u64,
+}
 struct Peer {
     parent: Parent,
     support: Support,
@@ -380,6 +425,9 @@ struct Peer {
     hello: Option<Hello>,
     used: Vec<SessionId>,
     last_offer: Option<u64>,
+    used_requests: Vec<[u8; 16]>,
+    last_request: Option<u64>,
+    pending_request: Option<PendingRequest>,
     session: Option<Session>,
 }
 impl Peer {
@@ -390,6 +438,39 @@ impl Peer {
                 message,
             });
         }
+    }
+    fn finish_request(&mut self, result: Result<SessionId, Reason>, out: &mut Vec<Effect>) {
+        if let Some(pending) = self.pending_request.take() {
+            if pending.outgoing {
+                out.push(Effect::StartRequestResult {
+                    parent: self.parent,
+                    request_id: pending.request.request_id,
+                    result,
+                });
+            } else if let Err(reason) = result {
+                self.send(
+                    Control::StartRefusal {
+                        request_id: pending.request.request_id,
+                        reason,
+                    },
+                    out,
+                );
+            }
+        }
+    }
+    fn reserve_request(&mut self, request_id: [u8; 16], now: u64) -> bool {
+        if self.used_requests.contains(&request_id)
+            || self.used_requests.len() == USED_REQUEST_LIMIT
+            || self
+                .last_request
+                .is_some_and(|last| now.saturating_sub(last) < 1000)
+            || self.pending_request.is_some()
+        {
+            return false;
+        }
+        self.used_requests.push(request_id);
+        self.last_request = Some(now);
+        true
     }
     fn reserve(&mut self, session: SessionId, now: u64) -> Result<(), Reason> {
         if self.used.contains(&session) {
@@ -458,6 +539,16 @@ impl ControlPlane {
             .map(|session| session.view)
     }
     pub fn handle(&mut self, now: u64, input: Input, out: &mut Vec<Effect>) -> Result<(), Error> {
+        // Stale network callbacks cannot mutate a replacement link; local callers need an error.
+        match input {
+            Input::Receive { parent, .. } if self.peer_index(parent).is_err() => {
+                return Ok(());
+            }
+            Input::RequestStart { parent, .. } | Input::Start { parent, .. } => {
+                self.peer_index(parent)?;
+            }
+            _ => {}
+        }
         if now < self.now {
             return Err(Error::TimeReversed);
         }
@@ -514,6 +605,7 @@ impl ControlPlane {
                             Err(Error::Refused(Reason::Revoked))
                         };
                     }
+                    self.peers[index].finish_request(Err(Reason::ParentLost), out);
                     if let Some(session) = &mut self.peers[index].session {
                         session.terminate(Reason::ParentLost, true, false, now, out);
                     }
@@ -533,12 +625,16 @@ impl ControlPlane {
                     hello: None,
                     used: Vec::with_capacity(USED_SESSION_LIMIT),
                     last_offer: None,
+                    used_requests: Vec::with_capacity(USED_REQUEST_LIMIT),
+                    last_request: None,
+                    pending_request: None,
                     session: None,
                 });
                 self.announce(out);
             }
             Input::PeerDown(parent) => {
                 if let Some(index) = self.peers.iter().position(|peer| peer.parent == parent) {
+                    self.peers[index].finish_request(Err(Reason::ParentLost), out);
                     if let Some(session) = &mut self.peers[index].session {
                         session.terminate(Reason::ParentLost, true, false, now, out);
                     }
@@ -554,6 +650,7 @@ impl ControlPlane {
                     || role == Some(AudioRole::Source) && !support.listener
                     || role == Some(AudioRole::Listener) && !support.system_source
                 {
+                    peer.finish_request(Err(Reason::Revoked), out);
                     if let Some(session) = &mut peer.session {
                         session.terminate(Reason::Revoked, true, false, now, out);
                     }
@@ -566,6 +663,7 @@ impl ControlPlane {
                     peer.trusted = false;
                     peer.local_allowed = false;
                     peer.remote_allowed = false;
+                    peer.finish_request(Err(Reason::Revoked), out);
                     if let Some(session) = &mut peer.session {
                         session.terminate(Reason::Revoked, true, false, now, out);
                     }
@@ -591,6 +689,7 @@ impl ControlPlane {
                 peer.local_revision = peer.local_revision.max(revision);
                 peer.local_allowed = allowed;
                 if !allowed {
+                    peer.finish_request(Err(Reason::ConsentRequired), out);
                     if let Some(session) = &mut peer.session {
                         session.terminate(
                             Reason::ConsentRequired,
@@ -630,6 +729,44 @@ impl ControlPlane {
                 });
                 self.announce(out);
             }
+            Input::WorkerCapabilities {
+                generation,
+                capture,
+                render,
+            } => {
+                let worker = self
+                    .worker
+                    .as_mut()
+                    .filter(|worker| worker.generation == generation)
+                    .ok_or(Error::StaleWorker)?;
+                if worker.capture == capture && worker.render == render {
+                    return Ok(());
+                }
+                worker.capture = capture;
+                worker.render = render;
+                let unavailable = match self.settings.role {
+                    Some(AudioRole::Source) => !capture,
+                    Some(AudioRole::Listener) => !render,
+                    None => false,
+                };
+                if unavailable {
+                    for peer in &mut self.peers {
+                        if let Some(session) = &mut peer.session {
+                            if session.live() {
+                                session.terminate(
+                                    Reason::DeviceUnavailable,
+                                    false,
+                                    peer.support.control,
+                                    now,
+                                    out,
+                                );
+                                session.view.phase = Phase::DevicePaused;
+                            }
+                        }
+                    }
+                }
+                self.announce(out);
+            }
             Input::WorkerHeartbeat { generation } => {
                 let worker = self
                     .worker
@@ -652,15 +789,41 @@ impl ControlPlane {
             } => self.hello(parent, hello, out)?,
             Input::Receive { parent, message } => {
                 let index = self.peer_index(parent)?;
-                Self::receive(
-                    self.local,
-                    &self.settings,
-                    self.worker,
-                    &mut self.peers[index],
-                    message,
-                    now,
-                    out,
-                )?;
+                self.receive(index, message, now, out)?;
+            }
+            Input::RequestStart {
+                parent,
+                request_id,
+                kind,
+                profile,
+            } => {
+                let index = self.peer_index(parent)?;
+                let peer = &mut self.peers[index];
+                Self::authorized(self.local, &self.settings, peer, AudioRole::Source)
+                    .map_err(Error::Refused)?;
+                if kind != keys::StreamKind::System {
+                    return Err(Error::Refused(Reason::UnsupportedFormat));
+                }
+                if peer.session.as_ref().is_some_and(Session::live) {
+                    return Err(Error::Refused(Reason::RateLimited));
+                }
+                if !peer.reserve_request(request_id, now) {
+                    return Err(Error::Refused(Reason::RateLimited));
+                }
+                let request = StartRequest {
+                    request_id,
+                    group: self.settings.group.ok_or(Error::InvalidSettings)?,
+                    source: self.local,
+                    consent_revision: peer.local_revision,
+                    kind,
+                    profile,
+                };
+                peer.pending_request = Some(PendingRequest {
+                    request,
+                    outgoing: true,
+                    deadline: now.saturating_add(SETUP_TIMEOUT_MS),
+                });
+                peer.send(Control::StartRequest(request), out);
             }
             Input::Start {
                 parent,
@@ -670,21 +833,44 @@ impl ControlPlane {
                 format_sha256,
             } => {
                 let index = self.peer_index(parent)?;
+                let listener_full = self.listener_slots() >= crate::status::MAX_AUDIO_SESSIONS;
                 let peer = &mut self.peers[index];
-                Self::authorized(self.local, &self.settings, peer, AudioRole::Listener)
-                    .map_err(Error::Refused)?;
-                if !valid_format(format) {
-                    return Err(Error::Refused(Reason::UnsupportedFormat));
+                let pending = peer
+                    .pending_request
+                    .as_ref()
+                    .filter(|pending| !pending.outgoing);
+                let request_id = pending.map(|pending| pending.request.request_id);
+                let allowed =
+                    Self::authorized(self.local, &self.settings, peer, AudioRole::Listener)
+                        .and_then(|()| {
+                            if !valid_format(format)
+                                || pending.is_some_and(|pending| {
+                                    pending.request.profile != format.profile
+                                })
+                            {
+                                Err(Reason::UnsupportedFormat)
+                            } else if pending.is_some_and(|pending| {
+                                pending.request.consent_revision != peer.remote_revision
+                            }) {
+                                Err(Reason::ConsentRequired)
+                            } else if !self.worker.is_some_and(|worker| worker.render) {
+                                Err(Reason::DeviceUnavailable)
+                            } else if peer.session.as_ref().is_some_and(Session::live)
+                                || listener_full && pending.is_none()
+                            {
+                                Err(Reason::RateLimited)
+                            } else {
+                                Ok(())
+                            }
+                        })
+                        .and_then(|()| peer.reserve(session, now));
+                if let Err(reason) = allowed {
+                    peer.finish_request(Err(reason), out);
+                    return Err(Error::Refused(reason));
                 }
-                let worker = self
-                    .worker
-                    .filter(|worker| worker.render)
-                    .ok_or(Error::Refused(Reason::DeviceUnavailable))?;
-                if peer.session.as_ref().is_some_and(Session::live) {
-                    return Err(Error::Refused(Reason::RateLimited));
-                }
-                peer.reserve(session, now).map_err(Error::Refused)?;
+                let worker = self.worker.ok_or(Error::StaleWorker)?;
                 let offer = Offer {
+                    request_id,
                     session,
                     listener_nonce,
                     parent_connection_id: parent.connection_id,
@@ -697,6 +883,7 @@ impl ControlPlane {
                     consent_revision: peer.local_revision,
                 };
                 peer.session = Some(Self::new_session(parent, worker.generation, offer, now));
+                peer.finish_request(Ok(session), out);
                 peer.send(Control::Offer(offer), out);
                 out.push(Effect::PublishStatus);
             }
@@ -868,6 +1055,7 @@ impl ControlPlane {
                     .iter_mut()
                     .find(|entry| entry.parent.peer == peer)
                 {
+                    peer.finish_request(Err(reason), out);
                     if let Some(session) = &mut peer.session {
                         session.terminate(reason, false, peer.support.control, now, out);
                     }
@@ -937,6 +1125,7 @@ impl ControlPlane {
                 || settings.group != self.settings.group
                 || settings.listener != self.settings.listener;
             for peer in &mut self.peers {
+                peer.finish_request(Err(Reason::Disabled), out);
                 if let Some(session) = &mut peer.session {
                     session.terminate(Reason::Disabled, false, peer.support.control, now, out);
                 }
@@ -1068,6 +1257,14 @@ impl ControlPlane {
         peer.hello = Some(hello);
         if changed || !peer.remote_allowed || !hello.available && hello.role == AudioRole::Listener
         {
+            peer.finish_request(
+                Err(if changed {
+                    Reason::RoleConflict
+                } else {
+                    Reason::ConsentRequired
+                }),
+                out,
+            );
             if let Some(session) = &mut peer.session {
                 session.terminate(
                     if changed {
@@ -1129,15 +1326,30 @@ impl ControlPlane {
             _ => Err(Reason::RoleConflict),
         }
     }
+    fn listener_slots(&self) -> usize {
+        self.peers
+            .iter()
+            .filter(|peer| {
+                peer.session.as_ref().is_some_and(Session::live)
+                    || peer
+                        .pending_request
+                        .as_ref()
+                        .is_some_and(|pending| !pending.outgoing)
+            })
+            .count()
+    }
     fn receive(
-        local: NodeId,
-        settings: &Settings,
-        worker: Option<Worker>,
-        peer: &mut Peer,
+        &mut self,
+        index: usize,
         message: Control,
         now: u64,
         out: &mut Vec<Effect>,
     ) -> Result<(), Error> {
+        let listener_full = self.listener_slots() >= crate::status::MAX_AUDIO_SESSIONS;
+        let local = self.local;
+        let settings = &self.settings;
+        let worker = self.worker;
+        let peer = &mut self.peers[index];
         if !peer.trusted {
             return Err(Error::Refused(Reason::Revoked));
         }
@@ -1145,7 +1357,76 @@ impl ControlPlane {
             return Err(Error::Refused(Reason::Disabled));
         }
         match message {
+            Control::StartRequest(request) => {
+                if settings.role != Some(AudioRole::Listener) {
+                    return Ok(());
+                }
+                if !peer.reserve_request(request.request_id, now) {
+                    return Ok(());
+                }
+                let allowed = Self::authorized(local, settings, peer, AudioRole::Listener)
+                    .and_then(|()| {
+                        if request.kind != keys::StreamKind::System {
+                            Err(Reason::UnsupportedFormat)
+                        } else if request.source != peer.parent.peer
+                            || Some(request.group) != settings.group
+                        {
+                            Err(Reason::RoleConflict)
+                        } else if request.consent_revision != peer.remote_revision {
+                            Err(Reason::ConsentRequired)
+                        } else if listener_full || peer.session.as_ref().is_some_and(Session::live)
+                        {
+                            Err(Reason::RateLimited)
+                        } else if !worker.is_some_and(|worker| worker.render) {
+                            Err(Reason::DeviceUnavailable)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                if let Err(reason) = allowed {
+                    peer.send(
+                        Control::StartRefusal {
+                            request_id: request.request_id,
+                            reason,
+                        },
+                        out,
+                    );
+                    return Ok(());
+                }
+                peer.pending_request = Some(PendingRequest {
+                    request,
+                    outgoing: false,
+                    deadline: now.saturating_add(SETUP_TIMEOUT_MS),
+                });
+                out.push(Effect::GenerateListenerOffer {
+                    parent: peer.parent,
+                    request,
+                });
+            }
+            Control::StartRefusal { request_id, reason } => {
+                if peer.pending_request.as_ref().is_some_and(|pending| {
+                    pending.outgoing && pending.request.request_id == request_id
+                }) {
+                    peer.finish_request(Err(reason), out);
+                }
+            }
             Control::Offer(offer) => {
+                if let Some(request_id) = offer.request_id {
+                    if !peer.pending_request.as_ref().is_some_and(|pending| {
+                        pending.outgoing
+                            && pending.request.request_id == request_id
+                            && pending.request.profile == offer.format.profile
+                            && pending.request.group == offer.group
+                    }) {
+                        return Ok(());
+                    }
+                } else if peer
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|pending| pending.outgoing)
+                {
+                    return Ok(());
+                }
                 if let Err(reason) = peer.reserve(offer.session, now) {
                     if reason == Reason::ProtocolViolation {
                         if let Some(session) = &mut peer.session {
@@ -1162,6 +1443,9 @@ impl ControlPlane {
                         );
                     } else {
                         reject_offer(peer, offer.session, reason, out);
+                    }
+                    if offer.request_id.is_some() {
+                        peer.finish_request(Err(reason), out);
                     }
                     return Err(Error::Refused(reason));
                 }
@@ -1199,6 +1483,9 @@ impl ControlPlane {
                     allowed.and_then(|()| worker.map(|_| ()).ok_or(Reason::DeviceUnavailable))
                 {
                     reject_offer(peer, offer.session, reason, out);
+                    if offer.request_id.is_some() {
+                        peer.finish_request(Err(reason), out);
+                    }
                     return Err(Error::Refused(reason));
                 }
                 peer.session = Some(Self::new_session(
@@ -1207,6 +1494,9 @@ impl ControlPlane {
                     offer,
                     now,
                 ));
+                if offer.request_id.is_some() {
+                    peer.finish_request(Ok(offer.session), out);
+                }
                 out.push(Effect::GenerateSourceNonce {
                     parent: peer.parent,
                     session: offer.session,
@@ -1340,6 +1630,7 @@ impl ControlPlane {
                 peer.remote_revision = peer.remote_revision.max(revision);
                 peer.remote_allowed = allowed;
                 if !allowed {
+                    peer.finish_request(Err(Reason::ConsentRequired), out);
                     if let Some(entry) = &mut peer.session {
                         entry.terminate(Reason::ConsentRequired, false, true, now, out);
                     }
@@ -1355,6 +1646,7 @@ impl ControlPlane {
         let now = self.now;
         if self.worker.take().is_some() {
             for peer in &mut self.peers {
+                peer.finish_request(Err(Reason::WorkerLost), out);
                 if let Some(session) = &mut peer.session {
                     session.terminate(Reason::WorkerLost, true, peer.support.control, now, out);
                 }
@@ -1371,6 +1663,13 @@ impl ControlPlane {
             self.lose_worker(out);
         }
         for peer in &mut self.peers {
+            if peer
+                .pending_request
+                .as_ref()
+                .is_some_and(|pending| now >= pending.deadline)
+            {
+                peer.finish_request(Err(Reason::Timeout), out);
+            }
             if let Some(session) = &mut peer.session {
                 if session.live() && self.now >= session.deadline {
                     if session.view.phase == Phase::Stopping {

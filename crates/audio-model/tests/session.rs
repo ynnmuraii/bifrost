@@ -188,6 +188,9 @@ impl Pair {
     }
     fn prepared(&mut self) -> (SessionView, SessionView, Agreement) {
         let offer = self.offer();
+        self.prepared_offer(offer)
+    }
+    fn prepared_offer(&mut self, offer: Offer) -> (SessionView, SessionView, Agreement) {
         let requested = run(
             &mut self.source,
             2,
@@ -196,6 +199,13 @@ impl Pair {
                 message: Control::Offer(offer),
             },
         );
+        if let Some(request_id) = offer.request_id {
+            assert!(requested.contains(&Effect::StartRequestResult {
+                parent: self.sp,
+                request_id,
+                result: Ok(offer.session),
+            }));
+        }
         assert_eq!(derives(&requested), 0);
         assert!(requested
             .iter()
@@ -524,6 +534,7 @@ fn parent_replacement_purges_sessions_and_rejects_stale_callbacks_and_down() {
         },
     );
     let offer = Offer {
+        request_id: None,
         session: SESSION,
         listener_nonce: [12; 32],
         parent_connection_id: newer.connection_id,
@@ -1142,6 +1153,7 @@ fn a_new_consent_grant_requires_a_new_revision_and_never_starts_implicitly() {
         },
     );
     let offer = Offer {
+        request_id: None,
         session: SESSION,
         listener_nonce: [12; 32],
         parent_connection_id: CONNECTION,
@@ -1276,4 +1288,889 @@ fn listener_availability_tracks_worker_readiness_not_only_configuration() {
         })
     ));
     assert_eq!(derives(&effects) + starts(&effects), 0);
+}
+
+fn request(id: u8) -> StartRequest {
+    StartRequest {
+        request_id: [id; 16],
+        group: GROUP,
+        source: SOURCE,
+        consent_revision: 2,
+        kind: audio_model::keys::StreamKind::System,
+        profile: Profile::Ethernet,
+    }
+}
+
+#[test]
+fn source_request_enters_ordinary_contributory_handshake() {
+    let mut pair = Pair::new(true, true);
+    let request = sent(&run(
+        &mut pair.source,
+        0,
+        Input::RequestStart {
+            parent: pair.sp,
+            request_id: [42; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    ));
+    let effects = run(
+        &mut pair.listener,
+        0,
+        Input::Receive {
+            parent: pair.lp,
+            message: request,
+        },
+    );
+    assert!(
+        matches!(effects.as_slice(), [Effect::GenerateListenerOffer { parent, request }]
+        if *parent == pair.lp && request.request_id == [42; 16])
+    );
+    let offer = pair.offer();
+    assert_eq!(offer.request_id, Some([42; 16]));
+    let (lv, sv, agreement) = pair.prepared_offer(offer);
+    // Correlation never changes key derivation or the semantic agreement.
+    let mut ordinary = agreement;
+    ordinary.offer.request_id = None;
+    assert_eq!(agreement.context().encode(), ordinary.context().encode());
+    assert_eq!(agreement.transcript_bytes(), ordinary.transcript_bytes());
+    let local = run(&mut pair.listener, 8, Input::ChildPrepared(lv));
+    assert_eq!(starts(&local), 1);
+    assert!(!local.iter().any(|effect| matches!(
+        effect,
+        Effect::Send {
+            message: Control::Commit { .. },
+            ..
+        }
+    )));
+    let commit = sent(&run(&mut pair.listener, 9, Input::ChildStarted(lv)));
+    assert_eq!(
+        starts(&run(
+            &mut pair.source,
+            10,
+            Input::Receive {
+                parent: pair.sp,
+                message: commit,
+            }
+        )),
+        1
+    );
+    run(&mut pair.source, 11, Input::ChildStarted(sv));
+}
+
+#[test]
+fn listener_request_refusals_are_typed_and_do_not_stop_sessions() {
+    for reason in [
+        Reason::ConsentRequired,
+        Reason::RateLimited,
+        Reason::RoleConflict,
+    ] {
+        let mut pair = Pair::new(reason != Reason::ConsentRequired, true);
+        let mut requested = request(43);
+        if reason == Reason::RateLimited {
+            pair.offer();
+        }
+        if reason == Reason::RoleConflict {
+            requested.group = [99; 16];
+        }
+        let before = pair.listener.session(SOURCE);
+        let effects = run(
+            &mut pair.listener,
+            2,
+            Input::Receive {
+                parent: pair.lp,
+                message: Control::StartRequest(requested),
+            },
+        );
+        assert_eq!(
+            sent(&effects),
+            Control::StartRefusal {
+                request_id: [43; 16],
+                reason
+            }
+        );
+        assert_eq!(pair.listener.session(SOURCE), before);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StopChild { .. })));
+    }
+}
+
+#[test]
+fn requests_are_rate_limited_deduplicated_and_queue_one() {
+    let mut pair = Pair::new(true, true);
+    let first = run(
+        &mut pair.listener,
+        1,
+        Input::Receive {
+            parent: pair.lp,
+            message: Control::StartRequest(request(44)),
+        },
+    );
+    assert!(matches!(
+        first.as_slice(),
+        [Effect::GenerateListenerOffer { .. }]
+    ));
+    for id in [44, 45] {
+        assert!(run(
+            &mut pair.listener,
+            2,
+            Input::Receive {
+                parent: pair.lp,
+                message: Control::StartRequest(request(id)),
+            }
+        )
+        .is_empty());
+    }
+    run(
+        &mut pair.listener,
+        3,
+        Input::Stop {
+            peer: SOURCE,
+            reason: Reason::UserStop,
+        },
+    );
+    assert!(run(
+        &mut pair.listener,
+        4,
+        Input::Receive {
+            parent: pair.lp,
+            message: Control::StartRequest(request(46)),
+        }
+    )
+    .is_empty());
+    for at in [250, 500, 750, 1000] {
+        run(
+            &mut pair.listener,
+            at,
+            Input::WorkerHeartbeat {
+                generation: [8; 16],
+            },
+        );
+    }
+    assert!(run(
+        &mut pair.listener,
+        1001,
+        Input::Receive {
+            parent: pair.lp,
+            message: Control::StartRequest(request(44)),
+        }
+    )
+    .is_empty());
+    assert!(matches!(
+        run(
+            &mut pair.listener,
+            1002,
+            Input::Receive {
+                parent: pair.lp,
+                message: Control::StartRequest(request(47)),
+            }
+        )
+        .as_slice(),
+        [Effect::GenerateListenerOffer { .. }]
+    ));
+}
+
+#[test]
+fn refusal_correlates_only_pending_request_not_a_session() {
+    let mut pair = Pair::new(true, true);
+    pair.active();
+    let before = pair.source.session(LISTENER);
+    assert!(run(
+        &mut pair.source,
+        13,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::StartRefusal {
+                request_id: SESSION,
+                reason: Reason::UserStop
+            },
+        }
+    )
+    .is_empty());
+    assert_eq!(pair.source.session(LISTENER), before);
+    let mut pair = Pair::new(true, true);
+    run(
+        &mut pair.source,
+        1,
+        Input::RequestStart {
+            parent: pair.sp,
+            request_id: [48; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    );
+    let effects = run(
+        &mut pair.source,
+        2,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::StartRefusal {
+                request_id: [48; 16],
+                reason: Reason::ConsentRequired,
+            },
+        },
+    );
+    assert_eq!(
+        effects,
+        vec![Effect::StartRequestResult {
+            parent: pair.sp,
+            request_id: [48; 16],
+            result: Err(Reason::ConsentRequired),
+        }]
+    );
+}
+
+#[test]
+fn replaced_parent_cannot_correlate_or_expire_new_request() {
+    let mut pair = Pair::new(true, true);
+    run(
+        &mut pair.source,
+        1,
+        Input::RequestStart {
+            parent: pair.sp,
+            request_id: [49; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    );
+    let newer = parent(LISTENER, 55);
+    let replacement = run(
+        &mut pair.source,
+        2,
+        Input::PeerUp {
+            parent: newer,
+            support: Support {
+                control: true,
+                listener: true,
+                system_source: false,
+            },
+            trusted: true,
+            local_allowed: true,
+            consent_revision: 2,
+        },
+    );
+    assert!(replacement.contains(&Effect::StartRequestResult {
+        parent: pair.sp,
+        request_id: [49; 16],
+        result: Err(Reason::ParentLost),
+    }));
+    run(
+        &mut pair.source,
+        3,
+        Input::Receive {
+            parent: newer,
+            message: Control::Hello(Hello {
+                role: AudioRole::Listener,
+                group: Some(GROUP),
+                listener: LISTENER,
+                available: true,
+                allowed: true,
+                consent_revision: 1,
+            }),
+        },
+    );
+    run(
+        &mut pair.source,
+        4,
+        Input::RequestStart {
+            parent: newer,
+            request_id: [49; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    );
+    assert!(run(
+        &mut pair.source,
+        100_000,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::StartRefusal {
+                request_id: [49; 16],
+                reason: Reason::Disabled
+            },
+        }
+    )
+    .is_empty());
+    let result = run(
+        &mut pair.source,
+        5,
+        Input::Receive {
+            parent: newer,
+            message: Control::StartRefusal {
+                request_id: [49; 16],
+                reason: Reason::ConsentRequired,
+            },
+        },
+    );
+    assert_eq!(
+        result,
+        vec![Effect::StartRequestResult {
+            parent: newer,
+            request_id: [49; 16],
+            result: Err(Reason::ConsentRequired),
+        }]
+    );
+}
+
+#[test]
+fn correlated_offer_cannot_match_a_different_pending_request() {
+    let mut pair = Pair::new(true, true);
+    let mut offer = pair.offer();
+    offer.request_id = Some([50; 16]);
+    run(
+        &mut pair.source,
+        1,
+        Input::RequestStart {
+            parent: pair.sp,
+            request_id: [51; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    );
+    assert!(run(
+        &mut pair.source,
+        2,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::Offer(offer),
+        }
+    )
+    .is_empty());
+    assert!(pair.source.session(LISTENER).is_none());
+    let refusal = run(
+        &mut pair.source,
+        3,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::StartRefusal {
+                request_id: [51; 16],
+                reason: Reason::Disabled,
+            },
+        },
+    );
+    assert_eq!(
+        refusal,
+        vec![Effect::StartRequestResult {
+            parent: pair.sp,
+            request_id: [51; 16],
+            result: Err(Reason::Disabled),
+        }]
+    );
+}
+
+#[test]
+fn request_replay_storage_saturates_without_eviction() {
+    let mut pair = Pair::new(false, true);
+    for index in 0..USED_REQUEST_LIMIT {
+        let mut value = request(0);
+        value.request_id[..2].copy_from_slice(&(index as u16).to_be_bytes());
+        let effects = run(
+            &mut pair.listener,
+            index as u64 * 1000,
+            Input::Receive {
+                parent: pair.lp,
+                message: Control::StartRequest(value),
+            },
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Send {
+                message: Control::StartRefusal {
+                    reason: Reason::ConsentRequired,
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+    let at = USED_REQUEST_LIMIT as u64 * 1000;
+    for value in [request(0), request(99)] {
+        assert!(run(
+            &mut pair.listener,
+            at,
+            Input::Receive {
+                parent: pair.lp,
+                message: Control::StartRequest(value),
+            }
+        )
+        .is_empty());
+    }
+}
+
+#[test]
+fn pending_source_request_times_out_without_stopping_any_session() {
+    let mut pair = Pair::new(true, true);
+    run(
+        &mut pair.source,
+        1,
+        Input::RequestStart {
+            parent: pair.sp,
+            request_id: [52; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    );
+    for at in (250..=10000).step_by(250) {
+        run(
+            &mut pair.source,
+            at,
+            Input::WorkerHeartbeat {
+                generation: [9; 16],
+            },
+        );
+    }
+    let expired = run(&mut pair.source, 10001, Input::Tick);
+    assert_eq!(
+        expired,
+        vec![Effect::StartRequestResult {
+            parent: pair.sp,
+            request_id: [52; 16],
+            result: Err(Reason::Timeout),
+        }]
+    );
+    assert!(pair.source.session(LISTENER).is_none());
+}
+
+#[test]
+fn four_parents_receive_typed_full_refusals_for_three_listener_slots() {
+    let mut pair = Pair::new(true, true);
+    for (index, source) in [SOURCE, [61; 32], [62; 32], [63; 32]]
+        .into_iter()
+        .enumerate()
+    {
+        let link = if source == SOURCE {
+            pair.lp
+        } else {
+            parent(source, 60 + index as u8)
+        };
+        run(
+            &mut pair.listener,
+            0,
+            Input::PeerUp {
+                parent: link,
+                support: Support {
+                    control: true,
+                    system_source: true,
+                    listener: false,
+                },
+                trusted: true,
+                local_allowed: true,
+                consent_revision: 1,
+            },
+        );
+        run(
+            &mut pair.listener,
+            0,
+            Input::Receive {
+                parent: link,
+                message: Control::Hello(Hello {
+                    role: AudioRole::Source,
+                    group: Some(GROUP),
+                    listener: LISTENER,
+                    available: false,
+                    allowed: true,
+                    consent_revision: 2,
+                }),
+            },
+        );
+        let mut requested = request(60 + index as u8);
+        requested.source = source;
+        let effects = run(
+            &mut pair.listener,
+            0,
+            Input::Receive {
+                parent: link,
+                message: Control::StartRequest(requested),
+            },
+        );
+        if index < 3 {
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::GenerateListenerOffer { .. }]
+            ));
+            assert!(
+                pair.listener.session(source).is_none(),
+                "reservation precedes randomness"
+            );
+        } else {
+            assert_eq!(
+                sent(&effects),
+                Control::StartRefusal {
+                    request_id: requested.request_id,
+                    reason: Reason::RateLimited,
+                }
+            );
+        }
+    }
+    assert_eq!(
+        pair.listener.handle(
+            0,
+            Input::PeerUp {
+                parent: parent([64; 32], 64),
+                support: Support {
+                    control: true,
+                    system_source: true,
+                    listener: false
+                },
+                trusted: true,
+                local_allowed: true,
+                consent_revision: 1,
+            },
+            &mut Vec::new()
+        ),
+        Err(Error::Capacity)
+    );
+    // Converting an existing reservation must not count the same slot twice.
+    pair.offer();
+    let mut effects = Vec::new();
+    assert_eq!(
+        pair.listener.handle(
+            1,
+            Input::Start {
+                parent: parent([63; 32], 63),
+                session: [65; 16],
+                listener_nonce: [66; 32],
+                format: format(),
+                format_sha256: DIGEST,
+            },
+            &mut effects
+        ),
+        Err(Error::Refused(Reason::RateLimited))
+    );
+    assert!(effects.is_empty());
+    // A live session and two pending requests still fill the same global cap.
+    let mut requested = request(67);
+    requested.source = [63; 32];
+    for now in [250, 500, 750] {
+        run(
+            &mut pair.listener,
+            now,
+            Input::WorkerHeartbeat {
+                generation: [8; 16],
+            },
+        );
+    }
+    let effects = run(
+        &mut pair.listener,
+        1000,
+        Input::Receive {
+            parent: parent([63; 32], 63),
+            message: Control::StartRequest(requested),
+        },
+    );
+    assert_eq!(
+        sent(&effects),
+        Control::StartRefusal {
+            request_id: requested.request_id,
+            reason: Reason::RateLimited,
+        }
+    );
+}
+
+#[test]
+fn worker_readiness_changes_are_generation_fenced_and_never_resume_old_keys() {
+    let mut pair = Pair::new(true, true);
+    let (view, _) = pair.active();
+    let mut effects = Vec::new();
+    assert_eq!(
+        pair.listener.handle(
+            13,
+            Input::WorkerCapabilities {
+                generation: [99; 16],
+                capture: false,
+                render: false
+            },
+            &mut effects
+        ),
+        Err(Error::StaleWorker)
+    );
+    assert!(effects.is_empty());
+    assert_eq!(pair.listener.session(SOURCE).unwrap().phase, Phase::Active);
+    let effects = run(
+        &mut pair.listener,
+        14,
+        Input::WorkerCapabilities {
+            generation: view.worker_generation,
+            capture: false,
+            render: false,
+        },
+    );
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::InvalidateSession { .. })));
+    assert_eq!(
+        pair.listener.session(SOURCE).unwrap().phase,
+        Phase::DevicePaused
+    );
+    let effects = run(
+        &mut pair.listener,
+        14,
+        Input::WorkerCapabilities {
+            generation: view.worker_generation,
+            capture: false,
+            render: false,
+        },
+    );
+    assert!(
+        effects.is_empty(),
+        "unchanged readiness must not invalidate or announce again"
+    );
+    let mut effects = Vec::new();
+    assert_eq!(
+        pair.listener.handle(
+            14,
+            Input::WorkerCapabilities {
+                generation: [99; 16],
+                capture: false,
+                render: false
+            },
+            &mut effects
+        ),
+        Err(Error::StaleWorker)
+    );
+    assert!(effects.is_empty());
+    let effects = run(
+        &mut pair.listener,
+        15,
+        Input::WorkerCapabilities {
+            generation: view.worker_generation,
+            capture: false,
+            render: true,
+        },
+    );
+    assert_eq!(derives(&effects) + starts(&effects), 0);
+    assert_eq!(
+        pair.listener.session(SOURCE).unwrap().phase,
+        Phase::DevicePaused
+    );
+    let effects = run(
+        &mut pair.listener,
+        15,
+        Input::WorkerCapabilities {
+            generation: view.worker_generation,
+            capture: false,
+            render: true,
+        },
+    );
+    assert!(
+        effects.is_empty(),
+        "unchanged ready state must not spam Hello"
+    );
+}
+
+#[test]
+fn stale_gui_starts_fail_without_advancing_time_or_expiring_requests() {
+    let mut pair = Pair::new(true, true);
+    run(
+        &mut pair.source,
+        0,
+        Input::RequestStart {
+            parent: pair.sp,
+            request_id: [70; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    );
+    let stale = parent(LISTENER, 99);
+    for input in [
+        Input::RequestStart {
+            parent: stale,
+            request_id: [71; 16],
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+        Input::Start {
+            parent: stale,
+            session: [72; 16],
+            listener_nonce: [73; 32],
+            format: format(),
+            format_sha256: DIGEST,
+        },
+    ] {
+        let mut effects = Vec::new();
+        assert_eq!(
+            pair.source.handle(20_000, input, &mut effects),
+            Err(Error::StaleParent)
+        );
+        assert!(effects.is_empty());
+    }
+    let effects = run(
+        &mut pair.source,
+        1,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::StartRefusal {
+                request_id: [70; 16],
+                reason: Reason::Disabled,
+            },
+        },
+    );
+    assert_eq!(
+        effects,
+        vec![Effect::StartRequestResult {
+            parent: pair.sp,
+            request_id: [70; 16],
+            result: Err(Reason::Disabled),
+        }]
+    );
+}
+
+#[test]
+fn outgoing_request_limits_return_immediate_typed_errors() {
+    let mut pair = Pair::new(true, true);
+    let sp = pair.sp;
+    let start = |id| Input::RequestStart {
+        parent: sp,
+        request_id: [id; 16],
+        kind: audio_model::keys::StreamKind::System,
+        profile: Profile::Ethernet,
+    };
+    run(&mut pair.source, 0, start(74));
+    let mut effects = Vec::new();
+    assert_eq!(
+        pair.source.handle(0, start(75), &mut effects),
+        Err(Error::Refused(Reason::RateLimited))
+    );
+    assert!(
+        effects.is_empty(),
+        "a pending request must not hide a GUI result"
+    );
+    run(
+        &mut pair.source,
+        1,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::StartRefusal {
+                request_id: [74; 16],
+                reason: Reason::Disabled,
+            },
+        },
+    );
+    assert_eq!(
+        pair.source.handle(2, start(75), &mut effects),
+        Err(Error::Refused(Reason::RateLimited))
+    );
+    assert!(effects.is_empty(), "a fast retry must fail synchronously");
+    for now in [250, 500, 750] {
+        run(
+            &mut pair.source,
+            now,
+            Input::WorkerHeartbeat {
+                generation: [9; 16],
+            },
+        );
+    }
+    assert_eq!(
+        pair.source.handle(1000, start(74), &mut effects),
+        Err(Error::Refused(Reason::RateLimited))
+    );
+    assert!(
+        effects.is_empty(),
+        "a replayed request ID must fail synchronously"
+    );
+    assert!(matches!(
+        sent(&run(&mut pair.source, 1000, start(75))),
+        Control::StartRequest(_)
+    ));
+}
+
+#[test]
+fn rejected_correlated_offer_finishes_request_for_both_reservation_errors() {
+    for reason in [Reason::ProtocolViolation, Reason::RateLimited] {
+        let mut pair = Pair::new(true, true);
+        let mut offer = pair.offer();
+        let port = offer.listener_port;
+        offer.listener_port = 0;
+        let mut effects = Vec::new();
+        assert_eq!(
+            pair.source.handle(
+                2,
+                Input::Receive {
+                    parent: pair.sp,
+                    message: Control::Offer(offer),
+                },
+                &mut effects
+            ),
+            Err(Error::Refused(Reason::UnsupportedFormat))
+        );
+        assert!(pair.source.session(LISTENER).is_none());
+        run(
+            &mut pair.source,
+            3,
+            Input::RequestStart {
+                parent: pair.sp,
+                request_id: [76; 16],
+                kind: audio_model::keys::StreamKind::System,
+                profile: Profile::Ethernet,
+            },
+        );
+        offer.listener_port = port;
+        offer.request_id = Some([76; 16]);
+        if reason == Reason::RateLimited {
+            offer.session = [77; 16];
+        }
+        effects.clear();
+        assert_eq!(
+            pair.source.handle(
+                4,
+                Input::Receive {
+                    parent: pair.sp,
+                    message: Control::Offer(offer),
+                },
+                &mut effects
+            ),
+            Err(Error::Refused(reason))
+        );
+        assert!(effects.contains(&Effect::StartRequestResult {
+            parent: pair.sp,
+            request_id: [76; 16],
+            result: Err(reason),
+        }));
+        assert_eq!(derives(&effects) + starts(&effects), 0);
+        assert!(
+            run(
+                &mut pair.source,
+                5,
+                Input::Receive {
+                    parent: pair.sp,
+                    message: Control::StartRefusal {
+                        request_id: [76; 16],
+                        reason: Reason::Timeout
+                    },
+                }
+            )
+            .is_empty(),
+            "failed reservation must clear the pending request"
+        );
+    }
+}
+
+#[test]
+fn incoming_requests_to_source_do_not_poison_outgoing_request_budget() {
+    let mut pair = Pair::new(true, true);
+    for index in 0..USED_REQUEST_LIMIT {
+        let mut incoming = request(0);
+        incoming.request_id[..2].copy_from_slice(&(index as u16).to_be_bytes());
+        assert!(run(
+            &mut pair.source,
+            0,
+            Input::Receive {
+                parent: pair.sp,
+                message: Control::StartRequest(incoming),
+            }
+        )
+        .is_empty());
+    }
+    let effects = run(
+        &mut pair.source,
+        0,
+        Input::RequestStart {
+            parent: pair.sp,
+            request_id: request(0).request_id,
+            kind: audio_model::keys::StreamKind::System,
+            profile: Profile::Ethernet,
+        },
+    );
+    assert!(matches!(sent(&effects), Control::StartRequest(_)));
 }
