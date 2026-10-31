@@ -83,6 +83,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Audio M5/M6 child execution**
 
 - Execute owned microphone mute and shortcut observation, and keep persistent toggles separate from independently timed remote talk grants. Grant expiry remutes on a guard-owning thread even while other backend work stalls; native snapshots remain authoritative, pre-muted endpoints refuse grants, and Ping does not renew them.
+- Report failed timed remute writes separately from lease expiry; never present an expired permission as evidence that the physical endpoint is muted.
 - Forward bounded media metadata only during an explicitly enabled authorized Source watch, recheck the current player before commands, and correlate completion/cancellation. The explicit Dry harness has documented deterministic revisioned media; native backends never synthesize it.
 
 **Linux M5 native controls**
@@ -169,6 +170,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Исполнение M5/M6 в аудиопроцессе**
 
 - Реализованы владение заглушением микрофона и наблюдение PTT; постоянное переключение отделено от удалённых разрешений говорить. Независимый поток guard заглушает по истечении даже при задержке другой работы бэкенда; фактическое состояние подтверждают снимки, изначально заглушённый микрофон отклоняет разрешение, Ping его не продлевает.
+- Ошибка заглушения по таймеру сообщается отдельно от истечения разрешения: истёкший срок не выдаётся за подтверждение фактического mute устройства.
 - Ограниченные медиаданные передаются только при явно включённом наблюдении разрешённого Source; перед командой повторно проверяется текущий плеер, результаты и отмены связаны с запросами. Только явный Dry-режим предоставляет документированный детерминированный медиасеанс с ревизиями.
 
 **Нативное управление Linux M5**

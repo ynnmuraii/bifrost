@@ -44,7 +44,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                     // Check before receiving too: queued commands never starve the deadline.
                     if active.is_some_and(|(_, deadline)| Instant::now() >= deadline) {
                         if let Some((id, _)) = active.take() {
-                            let _ = remute(&mut guard);
+                            remute(&mut guard, &sink);
                             sink(0, Msg::PttEvent(event(id, 3, 1)));
                             publish(&guard, &sink);
                         }
@@ -76,7 +76,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                                 }
                                 persistent = !muted;
                             } else if let Some((id, _)) = active.take() {
-                                let _ = remute(&mut guard);
+                                remute(&mut guard, &sink);
                                 sink(0, Msg::PttEvent(event(id, 3, 2)));
                             }
                             publish(&guard, &sink);
@@ -110,7 +110,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                                     Ok(timing)
                                 }) {
                                     Ok(_) if Instant::now() >= deadline => {
-                                        let _ = remute(&mut guard);
+                                        remute(&mut guard, &sink);
                                         if let Some((old, _)) = active.take() {
                                             if old != id {
                                                 sink(0, Msg::PttEvent(event(old, 3, 3)));
@@ -137,7 +137,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                             };
                             if !publish(&guard, &sink) {
                                 if let Some((old, _)) = active.take() {
-                                    let _ = remute(&mut guard);
+                                    remute(&mut guard, &sink);
                                     sink(0, Msg::PttEvent(event(old, 3, 2)));
                                 }
                                 if matches!(result.kind, 1 | 2) {
@@ -149,7 +149,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                         Command::Revoke(id, reply) => {
                             let result = if active.is_some_and(|(old, _)| old == id) {
                                 active = None;
-                                let _ = remute(&mut guard);
+                                remute(&mut guard, &sink);
                                 event(id, 3, 2)
                             } else {
                                 event(id, 5, 2)
@@ -159,7 +159,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                         }
                         Command::Restore(reply) => {
                             if let Some((id, _)) = active.take() {
-                                let _ = remute(&mut guard);
+                                remute(&mut guard, &sink);
                                 sink(0, Msg::PttEvent(event(id, 3, 2)));
                             }
                             let _ = reply.send(guard.restore());
@@ -168,7 +168,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
                     }
                 }
                 if let Some((id, _)) = active.take() {
-                    let _ = remute(&mut guard);
+                    remute(&mut guard, &sink);
                     sink(0, Msg::PttEvent(event(id, 3, 2)));
                 }
                 let _ = guard.restore();
@@ -241,9 +241,20 @@ impl<M: MuteGuard> Drop for Guard<M> {
         }
     }
 }
-fn remute(guard: &mut impl MuteGuard) -> Result<(), BackendError> {
-    let snapshot = guard.snapshot()?;
-    guard.set_capture_mute(snapshot.generation, true)
+fn remute(guard: &mut impl MuteGuard, sink: &EventSink) {
+    if let Err(error) = guard
+        .snapshot()
+        .and_then(|snapshot| guard.set_capture_mute(snapshot.generation, true))
+    {
+        // Expired authorization is not proof that a native mute write succeeded.
+        sink(
+            0,
+            Msg::Error(w::Error {
+                code: super::super::control_code(error),
+                session_id: Vec::new(),
+            }),
+        );
+    }
 }
 
 fn publish(guard: &impl MuteGuard, sink: &EventSink) -> bool {

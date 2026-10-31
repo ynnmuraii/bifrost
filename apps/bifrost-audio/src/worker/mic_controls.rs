@@ -693,7 +693,7 @@ mod tests {
         let Msg::ConfigurePtt(mut request) = configure(true) else {
             unreachable!()
         };
-        request.reserved.push(request.binding.clone().unwrap());
+        request.reserved.push(request.binding.unwrap());
         assert_eq!(
             run(
                 &mut controls,
@@ -1034,5 +1034,39 @@ mod tests {
         let (id, snapshot) = receive.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(id, 0);
         assert!(snapshot.guard_active && snapshot.muted);
+    }
+
+    #[test]
+    fn expiry_reports_native_mute_failure_without_fabricating_muted_state() {
+        let (mut backend, _, mut output) = fixture();
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut controls = Controls::new_with_events(move |_, message| {
+            let _ = send.send(message);
+        });
+        run(&mut controls, &mut backend, &mut output, acquire()).unwrap();
+        run(&mut controls, &mut backend, &mut output, grant(31, 100)).unwrap();
+        while receive.try_recv().is_ok() {}
+        backend
+            .apply(ScriptEvent::SetMute {
+                device: DeviceId::new("mic").unwrap(),
+                muted: false,
+            })
+            .unwrap();
+        let (mut failed, mut released, mut observed) = (false, false, false);
+        while !released || !observed {
+            match receive.recv_timeout(Duration::from_secs(1)).unwrap() {
+                Msg::Error(_) => failed = true,
+                Msg::PttEvent(event) => {
+                    assert_eq!((event.grant_id, event.kind, event.reason), (31, 3, 1));
+                    released = true;
+                }
+                Msg::MuteSnapshot(snapshot) => {
+                    assert!(!snapshot.muted, "an external owner must not be overwritten");
+                    observed = true;
+                }
+                _ => panic!("unexpected mute timer response"),
+            }
+        }
+        assert!(failed);
     }
 }

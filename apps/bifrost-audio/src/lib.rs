@@ -465,7 +465,9 @@ where
                                 snapshot.sessions.clear();snapshot.current_token=None;
                             }
                             let Some(revision)=media_revision.checked_add(1) else{failure=Some(RoleError::WorkerFailed);break;};
-                            media_revision=revision;snapshot.revision=revision;media_present=!snapshot.sessions.is_empty();
+                            media_revision = revision;
+                            snapshot.revision = revision;
+                            media_present = !snapshot.sessions.is_empty();
                             Msg::MediaSessions(snapshot)
                         },
                         message=>message,
