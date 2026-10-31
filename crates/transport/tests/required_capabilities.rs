@@ -173,7 +173,17 @@ impl Session {
     }
 
     async fn refused(&mut self, code: wire::ErrorCode, related_seq: u64) {
-        let envelope = self.frame().await;
+        let envelope = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let envelope = transport::read_frame(&mut self.peer).await.unwrap();
+                // Whole frames already in flight cannot be preempted by the urgent refusal.
+                if !matches!(envelope.payload, Some(wire::envelope::Payload::Ping(_))) {
+                    break envelope;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(envelope.connection_id, self.connection_id);
         let Some(wire::envelope::Payload::Error(error)) = envelope.payload else {
             panic!("expected wire refusal, got {envelope:?}");
