@@ -21,7 +21,7 @@ mod live {
     use std::{
         net::UdpSocket,
         sync::{
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
         },
         thread,
@@ -207,6 +207,7 @@ mod live {
                 format: format(),
             },
             SessionConfig {
+                authorized: Arc::new(AtomicBool::new(true)),
                 socket: source_socket,
                 peer: listener_address,
                 session_id: [7; 16],
@@ -222,6 +223,7 @@ mod live {
                 requested: format(),
             },
             SessionConfig {
+                authorized: Arc::new(AtomicBool::new(true)),
                 socket: listener_socket,
                 peer: source_address,
                 session_id: [7; 16],

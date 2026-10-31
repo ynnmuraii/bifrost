@@ -31,6 +31,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Audio child IPC**
 
 - Add a separate private audio-worker protobuf/AudioLink contract with bounded commands, version/generation/sequence checks, explicit backend probing, one-use secret extraction and recursive Debug redaction. Reuse existing same-user IPC endpoints; no samples or secrets enter GUI messages.
+- Add the internal audio child role behind the default-enabled binary `audio` feature. It lazily owns native/Dry backends and at most three authorized UDP sessions, revokes media on core silence/disconnect, rejects reused session/key material, and pushes bounded actual capture/send observations. No native device is opened before an explicit command; core supervision remains a separate integration step.
 
 ### Русский
 
@@ -59,6 +60,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **IPC дочернего аудиопроцесса**
 
 - Добавлен отдельный закрытый контракт protobuf/AudioLink аудиопроцесса с ограниченными командами, проверкой версии/поколения/последовательности, явным запросом проверки бэкенда, одноразовым извлечением секретов и скрытием их в Debug. Используются существующие локальные IPC-каналы того же пользователя; сэмплы и секреты не попадают в GUI.
+- Добавлена внутренняя роль дочернего аудиопроцесса под включённой по умолчанию функцией сборки `audio`. Бэкенды native/Dry создаются только по запросу; не более трёх разрешённых UDP-сеансов останавливаются при потере core, повторное использование сеансов/ключей отклоняется, фактические захват/отправка передаются в ограниченных сводках. До явной команды устройства не открываются; надзор core интегрируется отдельно.
 
 ## 0.4.0 — 2026-10-30
 

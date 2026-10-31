@@ -176,6 +176,7 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool) {
             },
         },
         SessionConfig {
+            authorized: Arc::new(AtomicBool::new(true)),
             socket: source_socket,
             peer: relay.address(),
             session_id: [9; 16],
@@ -194,6 +195,7 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool) {
             },
         },
         SessionConfig {
+            authorized: Arc::new(AtomicBool::new(true)),
             socket: listener_socket,
             peer: relay.address(),
             session_id: [9; 16],
@@ -371,6 +373,7 @@ fn native_snapshot_invalidation_stops_without_a_forwarded_backend_event() {
             },
         },
         SessionConfig {
+            authorized: Arc::new(AtomicBool::new(true)),
             socket: socket(),
             peer: peer.local_addr().unwrap(),
             session_id: [9; 16],
@@ -406,6 +409,7 @@ fn unvalidated_path_times_out_without_transmitting_captured_audio() {
             },
         },
         SessionConfig {
+            authorized: Arc::new(AtomicBool::new(true)),
             socket: socket(),
             peer: peer.local_addr().unwrap(),
             session_id: [9; 16],
@@ -446,4 +450,58 @@ fn unvalidated_path_times_out_without_transmitting_captured_audio() {
         challenges += 1;
     }
     assert_eq!(challenges, 3);
+}
+
+#[test]
+fn authorization_gate_rejects_start_and_revokes_existing_render() {
+    let (mut backend, id) = backend(48_000);
+    let peer = socket();
+    let config = |authorized| SessionConfig {
+        socket: socket(),
+        peer: peer.local_addr().unwrap(),
+        session_id: [33; 16],
+        profile: Profile::Ethernet,
+        authorized,
+    };
+    let request = || RenderRequest {
+        device: DeviceSelection::Explicit(id.clone()),
+        requested: AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+    };
+    assert!(matches!(
+        start_listener(
+            &mut backend,
+            request(),
+            config(Arc::new(AtomicBool::new(false))),
+            material()
+        ),
+        Err(audio_media::runtime::EngineError::Unauthorized)
+    ));
+    let authorized = Arc::new(AtomicBool::new(true));
+    let mut session = start_listener(
+        &mut backend,
+        request(),
+        config(authorized.clone()),
+        material(),
+    )
+    .unwrap();
+    authorized.store(false, Ordering::Release);
+    session.stream_mut().unwrap().pump(480).unwrap();
+    assert!(session
+        .stream_mut()
+        .unwrap()
+        .rendered_samples()
+        .all(|sample| sample == 0.0));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(MediaEvent::Stopped { reason }) = session.poll_event() {
+            assert_eq!(reason, StopReason::AuthorizationLost);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    session.stop().unwrap();
 }

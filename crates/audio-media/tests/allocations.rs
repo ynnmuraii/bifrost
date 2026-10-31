@@ -7,6 +7,7 @@ use audio_model::jitter::Profile;
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
+    sync::{atomic::AtomicBool, Arc},
 };
 use zeroize::Zeroizing;
 struct Counting;
@@ -116,6 +117,7 @@ fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow()
             },
         },
         SessionConfig {
+            authorized: Arc::new(AtomicBool::new(true)),
             socket: a,
             peer: ba,
             session_id: [3; 16],
@@ -134,6 +136,7 @@ fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow()
             },
         },
         SessionConfig {
+            authorized: Arc::new(AtomicBool::new(true)),
             socket: b,
             peer: aa,
             session_id: [3; 16],

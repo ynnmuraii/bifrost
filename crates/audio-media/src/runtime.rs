@@ -46,6 +46,8 @@ pub struct SessionConfig {
     pub peer: SocketAddr,
     pub session_id: [u8; 16],
     pub profile: Profile,
+    /// Revocation is immediate on callbacks and UDP workers, even while native control blocks.
+    pub authorized: Arc<AtomicBool>,
 }
 pub struct SessionMaterial {
     pub forward: DirectionMaterial,
@@ -60,6 +62,7 @@ pub enum StopReason {
     WorkerFailed = 4,
     PathTimeout = 5,
     RotationRequired = 6,
+    AuthorizationLost = 7,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaEvent {
@@ -74,6 +77,9 @@ pub struct HealthSnapshot {
     pub health: AudioHealth,
     pub state: StreamHealth,
     pub sent_datagrams: u64,
+    pub sent_media_packets: u64,
+    pub capture_active: bool,
+    pub sending: bool,
     pub rejected_datagrams: u64,
     pub capture_dropped_frames: u64,
     pub native: StreamSnapshot,
@@ -84,6 +90,7 @@ pub enum EngineError {
     Io(io::Error),
     Media(MediaError),
     InvalidFormat,
+    Unauthorized,
     InvalidGain,
     StopTimeout,
     WorkerPanicked,
@@ -133,6 +140,12 @@ struct Shared {
     capture_dropped: AtomicU64,
     capture_discontinuities: AtomicU64,
     last_media_ms: AtomicU64,
+    authorized: Arc<AtomicBool>,
+    clock: Instant,
+    capture_frames: AtomicU64,
+    last_capture_ms: AtomicU64,
+    sent_media_packets: AtomicU64,
+    last_send_ms: AtomicU64,
     stats: Mutex<Stats>,
 }
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -141,7 +154,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 impl Shared {
-    fn new() -> Self {
+    fn new(authorized: Arc<AtomicBool>) -> Self {
         Self {
             stopped: AtomicBool::new(false),
             reason: AtomicU8::new(0),
@@ -159,6 +172,12 @@ impl Shared {
             capture_dropped: AtomicU64::new(0),
             capture_discontinuities: AtomicU64::new(0),
             last_media_ms: AtomicU64::new(0),
+            authorized,
+            clock: Instant::now(),
+            capture_frames: AtomicU64::new(0),
+            last_capture_ms: AtomicU64::new(0),
+            sent_media_packets: AtomicU64::new(0),
+            last_send_ms: AtomicU64::new(0),
             stats: Mutex::new(Stats {
                 health: AudioHealth::default(),
                 state: StreamHealth::Buffering,
@@ -166,6 +185,12 @@ impl Shared {
                 rejected: 0,
             }),
         }
+    }
+    fn is_stopped(&self) -> bool {
+        if !self.authorized.load(Ordering::Acquire) {
+            self.request_stop(StopReason::AuthorizationLost);
+        }
+        self.stopped.load(Ordering::Acquire)
     }
     fn request_stop(&self, reason: StopReason) {
         let _ = self
@@ -180,6 +205,7 @@ impl Shared {
             4 => StopReason::WorkerFailed,
             5 => StopReason::PathTimeout,
             6 => StopReason::RotationRequired,
+            7 => StopReason::AuthorizationLost,
             _ => StopReason::User,
         }
     }
@@ -286,10 +312,21 @@ impl<S: Stream + 'static> MediaSession<S> {
         health.discontinuities = health
             .discontinuities
             .saturating_add(self.shared.capture_discontinuities.load(Ordering::Acquire));
+        let now = self.shared.clock.elapsed().as_millis() as u64;
+        let stopped = self.shared.is_stopped();
+        let media = self.shared.sent_media_packets.load(Ordering::Acquire);
         HealthSnapshot {
             health,
             state: stats.state,
             sent_datagrams: stats.sent,
+            sent_media_packets: media,
+            capture_active: self.source
+                && self.last_native.status == StreamStatus::Running
+                && self.shared.capture_frames.load(Ordering::Acquire) > 0
+                && now.saturating_sub(self.shared.last_capture_ms.load(Ordering::Acquire)) < 100,
+            sending: !stopped
+                && media > 0
+                && now.saturating_sub(self.shared.last_send_ms.load(Ordering::Acquire)) < 100,
             rejected_datagrams: stats.rejected,
             capture_dropped_frames: self
                 .shared
@@ -403,16 +440,28 @@ pub fn start_source<B: Backend>(
 where
     B::Stream: 'static,
 {
+    if !config.authorized.load(Ordering::Acquire) {
+        return Err(EngineError::Unauthorized);
+    }
     socket_setup(&config.socket)?;
     let start = Instant::now();
-    let shared = Arc::new(Shared::new());
+    let shared = Arc::new(Shared::new(config.authorized.clone()));
     let (events_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
     let (mut producer, consumer) = RingBuffer::<f32>::new(PCM_RING_SAMPLES);
     let callback_shared = shared.clone();
     let mut stream = backend.start_capture(
         spec,
         Box::new(move |block| {
-            if callback_shared.stopped.load(Ordering::Acquire) {
+            if block.frames > 0 {
+                callback_shared
+                    .capture_frames
+                    .fetch_add(block.frames as u64, Ordering::Relaxed);
+                callback_shared.last_capture_ms.store(
+                    callback_shared.clock.elapsed().as_millis() as u64,
+                    Ordering::Release,
+                );
+            }
+            if callback_shared.is_stopped() {
                 return;
             }
             let expected = callback_shared.native_rate.load(Ordering::Acquire);
@@ -445,6 +494,10 @@ where
         }),
     )?;
     let format = stream.format();
+    if !config.authorized.load(Ordering::Acquire) {
+        stream.stop()?;
+        return Err(EngineError::Unauthorized);
+    }
     if !valid_format(format) {
         stream.stop()?;
         return Err(EngineError::InvalidFormat);
@@ -508,16 +561,19 @@ pub fn start_listener<B: Backend>(
 where
     B::Stream: 'static,
 {
+    if !config.authorized.load(Ordering::Acquire) {
+        return Err(EngineError::Unauthorized);
+    }
     socket_setup(&config.socket)?;
     let start = Instant::now();
-    let shared = Arc::new(Shared::new());
+    let shared = Arc::new(Shared::new(config.authorized.clone()));
     let (events_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
     let (producer, mut consumer) = RingBuffer::<f32>::new(PCM_RING_SAMPLES);
     let callback_shared = shared.clone();
     let mut stream = backend.start_render(
         request,
         Box::new(move |output| {
-            if callback_shared.stopped.load(Ordering::Acquire) {
+            if callback_shared.is_stopped() {
                 output.fill(0.0);
                 return;
             }
@@ -559,6 +615,10 @@ where
         }),
     )?;
     let format = stream.format();
+    if !config.authorized.load(Ordering::Acquire) {
+        stream.stop()?;
+        return Err(EngineError::Unauthorized);
+    }
     if !valid_format(format) {
         stream.stop()?;
         return Err(EngineError::InvalidFormat);
@@ -639,9 +699,21 @@ impl Context {
         self.start.elapsed().as_millis() as u64
     }
     fn send(&self, packet: &[u8]) -> Result<(), StopReason> {
+        if self.shared.is_stopped() {
+            return Err(self.shared.reason());
+        }
         match self.socket.send_to(packet, self.peer) {
             Ok(n) if n == packet.len() => {
                 lock(&self.shared.stats).sent += 1;
+                if packet.get(5) == Some(&(PacketKind::Opus as u8)) {
+                    self.shared
+                        .sent_media_packets
+                        .fetch_add(1, Ordering::AcqRel);
+                    self.shared.last_send_ms.store(
+                        self.shared.clock.elapsed().as_millis() as u64,
+                        Ordering::Release,
+                    );
+                }
                 Ok(())
             }
             Err(error)
@@ -793,7 +865,7 @@ impl SourceWorker {
         let mut next_keepalive = Instant::now();
         let mut dropped = 0;
         let mut discontinuities = 0;
-        while !self.context.shared.stopped.load(Ordering::Acquire) {
+        while !self.context.shared.is_stopped() {
             if self.context.shared.callback_invalid.load(Ordering::Acquire) {
                 self.context.shared.invalidate(&self.context.events);
                 return Err(StopReason::DeviceInvalidated);
@@ -942,7 +1014,7 @@ impl ReceiveWorker {
         let mut packet = [0; MAX_DATAGRAM_LEN + 1];
         let mut outgoing = [0; MAX_DATAGRAM_LEN];
         let mut next_report = Instant::now();
-        while !self.context.shared.stopped.load(Ordering::Acquire) {
+        while !self.context.shared.is_stopped() {
             if let Some(token) = self.path.probe()? {
                 let n = self
                     .sealer
@@ -1054,7 +1126,7 @@ impl PlayoutWorker {
             .map_or(0, NativeRate::max_output_frames)
             * 2;
         let mut converted = vec![0.0; converted_capacity];
-        while !self.shared.stopped.load(Ordering::Acquire) {
+        while !self.shared.is_stopped() {
             if self.shared.callback_invalid.load(Ordering::Acquire) {
                 self.shared.invalidate(&self.events);
                 return Err(StopReason::DeviceInvalidated);

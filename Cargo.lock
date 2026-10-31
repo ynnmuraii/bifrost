@@ -567,6 +567,7 @@ name = "bifrost"
 version = "0.4.0"
 dependencies = [
  "bifrost-agent",
+ "bifrost-audio",
  "bifrost-core",
  "bifrost-gui",
  "bifrost-tray",
@@ -604,6 +605,23 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "x11rb 0.14.0",
+]
+
+[[package]]
+name = "bifrost-audio"
+version = "0.4.0"
+dependencies = [
+ "audio-backend",
+ "audio-media",
+ "audio-model",
+ "ipc",
+ "platform-audio-linux",
+ "platform-audio-win",
+ "protocol",
+ "ring",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
