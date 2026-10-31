@@ -84,6 +84,7 @@ pub struct Authority {
     pub revision: u64,
     pub muted: bool,
     pub desired_muted: bool,
+    pub desired_muted_by: Option<Parent>,
     pub ptt_enabled: bool,
     pub grant: Option<Grant>,
     pub recovery_mode: Option<RecoveryMode>,
@@ -98,6 +99,7 @@ impl Default for Authority {
             revision: 1,
             muted: true,
             desired_muted: true,
+            desired_muted_by: None,
             ptt_enabled: false,
             grant: None,
             recovery_mode: None,
@@ -110,6 +112,9 @@ impl Default for Authority {
 }
 impl Authority {
     pub fn recovery_muted(&self) -> bool {
+        if self.desired_muted_by.is_some() {
+            return true;
+        }
         self.recovery_mode
             .unwrap_or(if self.ptt_enabled {
                 RecoveryMode::Ptt
@@ -117,6 +122,12 @@ impl Authority {
                 RecoveryMode::Persistent(self.desired_muted)
             })
             .idle_muted()
+    }
+    /// Only GUI/config intent may become the replacement child's persistent base.
+    pub fn set_local_muted(&mut self, muted: bool) {
+        self.desired_muted = muted;
+        self.desired_muted_by = None;
+        self.recovery_mode = Some(RecoveryMode::Persistent(muted));
     }
     pub fn complete(&mut self, parent: Parent, request: [u8; 16], result: ResultCode) {
         if let Some((_, history)) = self.history.iter_mut().find(|(p, _)| *p == parent) {
@@ -176,11 +187,25 @@ impl Authority {
     pub fn reset(&mut self) {
         self.revoke();
         self.challenges.clear();
-        self.muted = true;
+        if self.desired_muted_by.take().is_some() {
+            self.desired_muted = true;
+            self.recovery_mode = Some(RecoveryMode::Persistent(true));
+        }
         self.changed();
     }
+    /// Prune only departed parents; consent changes must not erase replay fences.
+    pub fn prune_history(&mut self, mut current: impl FnMut(Parent) -> bool) {
+        self.history.retain(|(p, _)| current(*p));
+    }
     pub fn retain(&mut self, mut allowed: impl FnMut(Parent) -> bool) -> Effect {
-        self.history.retain(|(p, _)| allowed(*p));
+        if self.desired_muted_by.is_some_and(|p| !allowed(p)) {
+            self.desired_muted_by = None;
+            self.desired_muted = true;
+            self.recovery_mode = Some(RecoveryMode::Persistent(true));
+            self.revoke();
+            self.changed();
+            return Effect::SetMute(true);
+        }
         if self.grant.is_some_and(|g| !allowed(g.parent)) {
             self.revoke()
         } else {
@@ -259,6 +284,7 @@ impl Authority {
         }
         if let Op::SetMute(muted) = c.op {
             self.desired_muted = muted;
+            self.desired_muted_by = Some(parent);
             self.changed();
             return Decision {
                 result: ResultCode::Ok,
@@ -541,6 +567,91 @@ mod tests {
                 authority.decide(1, parent(1), true, true, control).effect,
                 Effect::None
             );
+        }
+    }
+    #[test]
+    fn remote_unmute_is_remuted_when_parent_or_consent_is_lost() {
+        for keep_parent in [false, true] {
+            let mut a = Authority::default();
+            let c = Control {
+                op: Op::SetMute(false),
+                ..press(&mut a, 0, 1)
+            };
+            assert_eq!(
+                a.decide(0, parent(1), true, true, c).effect,
+                Effect::SetMute(false)
+            );
+            a.observe(false);
+            a.prune_history(|_| keep_parent);
+            assert_eq!(a.retain(|_| false), Effect::SetMute(true));
+            assert!(a.desired_muted);
+            assert_eq!(a.desired_muted_by, None);
+            assert!(!a.muted, "native state changes only on observation");
+            assert_eq!(a.retain(|_| false), Effect::None);
+            if keep_parent {
+                assert_eq!(
+                    a.decide(1, parent(1), true, false, c).result,
+                    ResultCode::ConsentRequired
+                );
+                assert_eq!(a.decide(1, parent(1), true, true, c).effect, Effect::None);
+            }
+        }
+    }
+    #[test]
+    fn remote_unmute_never_recovers_even_over_local_unmuted_base() {
+        let mut a = Authority::default();
+        a.set_local_muted(false);
+        let c = Control {
+            op: Op::SetMute(false),
+            ..press(&mut a, 0, 1)
+        };
+        a.decide(0, parent(1), true, true, c);
+        assert_eq!(a.desired_muted_by, Some(parent(1)));
+        assert!(a.recovery_muted());
+        a.observe(false);
+        a.reset();
+        assert!(a.desired_muted);
+        assert!(a.recovery_muted());
+        assert_eq!(a.desired_muted_by, None);
+        assert!(!a.muted, "reset is not a native mute observation");
+    }
+    #[test]
+    fn local_persistent_unmute_survives_reset_and_remote_consent_loss() {
+        let mut a = Authority::default();
+        a.set_local_muted(false);
+        assert_eq!(a.retain(|_| false), Effect::None);
+        a.reset();
+        assert!(!a.desired_muted);
+        assert!(!a.recovery_muted());
+    }
+    #[test]
+    fn reconnect_pruning_keeps_live_parent_replay_fences() {
+        let mut a = Authority::default();
+        for n in 1..=10 {
+            let current = parent(n);
+            a.prune_history(|p| p == current);
+            a.retain(|p| p == current);
+            let c = Control {
+                op: Op::SetMute(false),
+                ..press(&mut a, 0, 2)
+            };
+            assert_eq!(a.decide(0, current, true, true, c).result, ResultCode::Ok);
+            let stale = Control {
+                request: [1; 16],
+                revision: a.revision,
+                ..c
+            };
+            assert_eq!(
+                a.decide(1, current, true, true, stale).result,
+                ResultCode::Expired
+            );
+            assert_eq!(a.decide(1, current, true, true, c).effect, Effect::None);
+            if n > 1 {
+                assert_eq!(
+                    a.decide(1, parent(n - 1), true, false, c).result,
+                    ResultCode::ConsentRequired
+                );
+            }
         }
     }
 }

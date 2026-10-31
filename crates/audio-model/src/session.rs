@@ -1457,6 +1457,8 @@ impl ControlPlane {
                             || Some(offer.group) != settings.group
                         {
                             Err(Reason::ProtocolViolation)
+                        } else if offer.consent_revision != peer.remote_revision {
+                            Err(Reason::ConsentRequired)
                         } else {
                             Ok(())
                         }
@@ -1537,6 +1539,9 @@ impl ControlPlane {
                         || answer.source_port == 47902
                     {
                         return Err(Error::Refused(Reason::UnsupportedFormat));
+                    }
+                    if answer.consent_revision != peer.remote_revision {
+                        return Err(Error::Refused(Reason::ConsentRequired));
                     }
                     let agreement = Agreement {
                         offer: entry.offer,

@@ -311,6 +311,131 @@ fn contributory_setup_waits_for_listener_start_before_source_start() {
     let mut pair = Pair::new(true, true);
     pair.active();
 }
+
+#[test]
+fn offers_require_the_current_remote_consent_revision_before_nonce_or_key_work() {
+    for revision in [0, 1, 2] {
+        let mut pair = Pair::new(true, true);
+        let mut offer = pair.offer();
+        offer.consent_revision = revision;
+        let mut effects = Vec::new();
+        let result = pair.source.handle(
+            2,
+            Input::Receive {
+                parent: pair.sp,
+                message: Control::Offer(offer),
+            },
+            &mut effects,
+        );
+        assert_eq!(derives(&effects), 0);
+        assert_eq!(starts(&effects), 0);
+        if revision == 1 {
+            assert_eq!(result, Ok(()));
+            assert!(effects.contains(&Effect::GenerateSourceNonce {
+                parent: pair.sp,
+                session: offer.session,
+            }));
+            let effects = run(
+                &mut pair.source,
+                3,
+                Input::SourceNonce {
+                    parent: pair.sp,
+                    session: offer.session,
+                    nonce: [14; 32],
+                },
+            );
+            assert_eq!(derives(&effects), 1);
+            assert_eq!(agreement(&effects).offer.consent_revision, revision);
+        } else {
+            assert_eq!(result, Err(Error::Refused(Reason::ConsentRequired)));
+            assert_eq!(
+                sent(&effects),
+                Control::Answer(Answer {
+                    session: offer.session,
+                    accepted: false,
+                    reason: Some(Reason::ConsentRequired),
+                    format: None,
+                    source_nonce: None,
+                    source_port: 0,
+                    consent_revision: 2,
+                })
+            );
+            assert!(!effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::GenerateSourceNonce { .. })));
+            assert!(pair.source.session(LISTENER).is_none());
+        }
+    }
+}
+
+#[test]
+fn accepted_answers_require_the_current_remote_consent_revision_before_deriving() {
+    for revision in [1, 2, 3] {
+        let mut pair = Pair::new(true, true);
+        let offer = pair.offer();
+        let before = pair.listener.session(SOURCE);
+        let mut effects = Vec::new();
+        let result = pair.listener.handle(
+            2,
+            Input::Receive {
+                parent: pair.lp,
+                message: Control::Answer(Answer {
+                    session: offer.session,
+                    accepted: true,
+                    reason: None,
+                    format: Some(offer.format),
+                    source_nonce: Some([14; 32]),
+                    source_port: 47903,
+                    consent_revision: revision,
+                }),
+            },
+            &mut effects,
+        );
+        assert_eq!(starts(&effects), 0);
+        if revision == 2 {
+            assert_eq!(result, Ok(()));
+            assert_eq!(derives(&effects), 1);
+            assert_eq!(agreement(&effects).source_consent_revision, revision);
+            assert_eq!(
+                pair.listener.session(SOURCE).unwrap().phase,
+                Phase::Answered
+            );
+        } else {
+            assert_eq!(result, Err(Error::Refused(Reason::ConsentRequired)));
+            assert_eq!(derives(&effects), 0);
+            assert!(effects.is_empty());
+            assert_eq!(pair.listener.session(SOURCE), before);
+        }
+    }
+}
+
+#[test]
+fn refused_answers_do_not_require_the_current_remote_consent_revision() {
+    let mut pair = Pair::new(true, true);
+    let offer = pair.offer();
+    let effects = run(
+        &mut pair.listener,
+        2,
+        Input::Receive {
+            parent: pair.lp,
+            message: Control::Answer(Answer {
+                session: offer.session,
+                accepted: false,
+                reason: Some(Reason::ConsentRequired),
+                format: None,
+                source_nonce: None,
+                source_port: 0,
+                consent_revision: 1,
+            }),
+        },
+    );
+    assert_eq!(derives(&effects), 0);
+    assert_eq!(starts(&effects), 0);
+    assert_eq!(
+        pair.listener.session(SOURCE).unwrap().reason,
+        Some(Reason::ConsentRequired)
+    );
+}
 #[test]
 fn capability_or_pairing_never_grants_either_end_consent() {
     for (local_allowed, remote_allowed) in [(false, true), (true, false), (false, false)] {
