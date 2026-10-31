@@ -586,6 +586,11 @@ fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
     // Dry pumps complete blocks; readout is quantized to one output callback.
     // Actual host-scheduler overshoot is measured separately, never assumed zero.
     const CALLBACK_QUANTUM_US: u32 = QUANTUM_FRAMES as u32 * 1_000_000 / RATE;
+    // Portable measurement floor: Windows' high-resolution wait is still budgeted
+    // at 1ms, Linux at 0.1ms; other hosts use the conservative Windows floor.
+    const HOST_TIMER_FLOOR_US: u64 = if cfg!(target_os = "linux") { 100 } else { 1000 };
+    // The amplitude onset search is quantized to one 48kHz sample.
+    const ONSET_EPSILON_US: u64 = 1_000_000_u64.div_ceil(RATE as u64);
     let mut output_backend = ToneBackend::new(0.0, 48_000);
     let mut group = ListenerGroup::new(&mut output_backend, request()).unwrap();
     let listener_socket = socket();
@@ -702,9 +707,12 @@ fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
         callback_lateness <= Duration::from_micros(u64::from(CALLBACK_QUANTUM_US)),
         "Dry callback scheduler missed more than one quantum: {callback_lateness:?}"
     );
-    let scheduling_us = u64::from(CALLBACK_QUANTUM_US) + callback_lateness.as_micros() as u64;
+    let measured_overshoot_us = callback_lateness.as_nanos().div_ceil(1000) as u64;
+    let scheduling_us = u64::from(CALLBACK_QUANTUM_US)
+        + measured_overshoot_us.max(HOST_TIMER_FLOOR_US)
+        + ONSET_EPSILON_US;
     let upper_ms = (u64::from(stage_sum_us) + scheduling_us) as f64 / 1000.0;
-    println!("actual Dry/socket/shared-mixer onset={latency_ms:.4}ms; fixed stages={stage_sum_ms:.4}ms including modeled capture10ms/native20ms; callback quantum={}ms, measured host overshoot={callback_lateness:?}; stages={:?}", CALLBACK_QUANTUM_US / 1000, stages.last());
+    println!("actual Dry/socket/shared-mixer onset={latency_ms:.4}ms; fixed stages={stage_sum_ms:.4}ms including modeled capture10ms/native20ms; callback quantum={}ms, measured host overshoot={callback_lateness:?}, OS floor={HOST_TIMER_FLOOR_US}us, sample epsilon={ONSET_EPSILON_US}us, test bound={upper_ms:.4}ms; stages={:?}", CALLBACK_QUANTUM_US / 1000, stages.last());
     assert!(
         (55.0..=upper_ms).contains(&latency_ms),
         "wired runtime {latency_ms}ms exceeds stages {stage_sum_ms}ms + callback scheduling {}ms",
