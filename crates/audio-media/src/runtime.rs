@@ -583,6 +583,14 @@ where
                 block.frames,
                 block.format.sample_rate,
             );
+            // Time advances even when PCM is dropped; path validation must not
+            // anchor its capture epoch to the last block that fit in the ring.
+            callback_shared
+                .capture_clock_ns
+                .store(clock_ns, Ordering::Release);
+            callback_shared
+                .clock_source
+                .store(source as u8, Ordering::Release);
             if block.discontinuity {
                 callback_shared
                     .capture_discontinuities
@@ -600,12 +608,6 @@ where
             for &sample in block.samples {
                 let _ = producer.push(sample);
             }
-            callback_shared
-                .capture_clock_ns
-                .store(clock_ns, Ordering::Release);
-            callback_shared
-                .clock_source
-                .store(source as u8, Ordering::Release);
             callback_shared.notification.notify();
         }),
     )?;
