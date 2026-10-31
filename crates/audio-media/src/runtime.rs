@@ -966,6 +966,7 @@ impl SourceWorker {
         let mut dropped = 0;
         let mut capture_epoch = None;
         let mut discontinuities = 0;
+        let mut activated = false;
         while !self.context.shared.is_stopped() {
             self.context
                 .shared
@@ -1038,11 +1039,27 @@ impl SourceWorker {
                 break;
             }
             if !self.path.validated {
+                // Discard only the current snapshot so a hot callback cannot starve control.
+                for _ in 0..self.input.slots() {
+                    let _ = self.input.pop();
+                }
                 if drained < 64 {
                     self.context
                         .wait_until(self.path.deadline().expect("unvalidated path deadline"));
                 }
                 continue;
+            }
+            if !activated {
+                // Authentication activates the live edge, never the preactivation ring tail.
+                for _ in 0..self.input.slots() {
+                    let _ = self.input.pop();
+                }
+                if let Some(converter) = self.converter.as_mut() {
+                    converter.reset();
+                }
+                dropped = self.context.shared.capture_dropped.load(Ordering::Acquire);
+                next_frame = Instant::now();
+                activated = true;
             }
             self.context.shared.started(&self.context.events);
             if Instant::now() >= next_keepalive {

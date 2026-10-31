@@ -114,6 +114,19 @@ impl JitterBuffer {
     pub fn buffered_frames(&self) -> usize {
         self.occupied.count_ones() as usize
     }
+    /// Timestamp span still held in encoded storage, including holes awaiting FEC/PLC.
+    pub fn buffered_samples(&self) -> u32 {
+        let Some(expected) = self.expected else {
+            return 0;
+        };
+        (0..self.profile.capacity())
+            .filter(|&i| self.occupied & (1 << i) != 0)
+            .map(|i| self.slots[i].timestamp.wrapping_sub(expected))
+            .max()
+            .map_or(0, |span| {
+                span.saturating_add(u32::from(self.profile.frame_samples()))
+            })
+    }
     pub fn health(&self) -> AudioHealth {
         self.health
     }
@@ -292,6 +305,35 @@ impl JitterBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_media_anchors_after_idle_at_arbitrary_timestamp() {
+        for profile in [Profile::Ethernet, Profile::Wifi] {
+            for first in [1, 98_765_431, u32::MAX - 123] {
+                let mut jitter = JitterBuffer::new(profile);
+                let mut out = [0; MAX_PAYLOAD_LEN];
+                for now in (0..24_000).step_by(48) {
+                    assert_eq!(jitter.pop(now, false, &mut out), Playout::Underrun);
+                }
+                let frame = u64::from(profile.frame_samples());
+                for n in 0..100u64 {
+                    let now = 24_000 + n * frame;
+                    let timestamp = first.wrapping_add((n * frame) as u32);
+                    jitter.insert(now, 500 + n * 3, timestamp, &[1]).unwrap();
+                    assert!(jitter.buffered_samples() <= profile.initial_delay() + frame as u32);
+                    while matches!(
+                        jitter.pop(now, profile == Profile::Wifi, &mut out),
+                        Playout::Frame { .. }
+                    ) {}
+                }
+                assert_eq!(jitter.target_samples(), profile.initial_delay());
+                assert_eq!(jitter.health().lost_frames, 0);
+                assert_eq!(jitter.health().late_frames, 0);
+                assert_eq!(jitter.health().concealed_frames, 0);
+                assert_eq!(jitter.health().discontinuities, 0);
+                assert_eq!(jitter.health().underruns, 0);
+            }
+        }
+    }
     #[test]
     fn reorder_wrap_duplicate_and_fec() {
         let mut jitter = JitterBuffer::new(Profile::Ethernet);

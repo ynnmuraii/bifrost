@@ -34,6 +34,7 @@ struct Fixture {
     opener: Opener,
     sealer: Sealer,
     token: Vec<u8>,
+    previous_media_timestamp: Option<u32>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -81,6 +82,7 @@ impl Fixture {
             opener: Opener::new(material().forward, [17; 16]).unwrap(),
             sealer: Sealer::new(material().reverse, [17; 16], 0).unwrap(),
             token: Vec::new(),
+            previous_media_timestamp: None,
         }
     }
     fn capture(&mut self) {
@@ -97,7 +99,18 @@ impl Fixture {
                     self.token.clear();
                     self.token.extend_from_slice(payload);
                 }
-                PacketKind::Opus => media += 1,
+                PacketKind::Opus => {
+                    if let Some(previous) = self.previous_media_timestamp {
+                        assert_eq!(header.media_timestamp.wrapping_sub(previous), 480);
+                    } else {
+                        assert_eq!(
+                            header.media_timestamp, 0,
+                            "preactivation data skipped media time"
+                        );
+                    }
+                    self.previous_media_timestamp = Some(header.media_timestamp);
+                    media += 1;
+                }
                 _ => {}
             }
         }
@@ -115,7 +128,7 @@ impl Fixture {
 }
 
 #[test]
-fn overflowed_capture_recovers_immediately_after_delayed_validation() {
+fn delayed_validation_discards_preactivation_capture_and_starts_immediately() {
     let mut f = Fixture::new();
     let start = Instant::now();
     let mut capture_due = Duration::ZERO;
@@ -127,9 +140,10 @@ fn overflowed_capture_recovers_immediately_after_delayed_validation() {
         assert_eq!(f.drain(), 0, "media before authentication");
         thread::sleep(Duration::from_micros(250));
     }
-    assert!(
-        f.source.snapshot().capture_dropped_frames > 0,
-        "fixture did not overflow"
+    assert_eq!(
+        f.source.snapshot().capture_dropped_frames,
+        0,
+        "preactivation ring was not drained"
     );
     let validated = Instant::now();
     f.validate();
@@ -215,3 +229,4 @@ fn hostile_input_does_not_starve_source_pacing_or_stop() {
         "flood starved Source pacing: {packets} packets"
     );
 }
+
