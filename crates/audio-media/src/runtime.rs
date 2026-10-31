@@ -134,6 +134,16 @@ struct Stats {
     drift: Option<DriftDiagnostics>,
     latency: LatencyDiagnostics,
 }
+impl Stats {
+    fn receive_source_report(&mut self, payload: &[u8]) {
+        if let Some(report) = ReceiverReport::decode(payload) {
+            // Source-side receive/loss/late values are remote snapshots, not local counters.
+            self.health.received_packets = report.received;
+            self.health.lost_frames = report.lost;
+            self.health.late_frames = report.late;
+        }
+    }
+}
 struct Shared {
     stopped: AtomicBool,
     reason: AtomicU8,
@@ -1105,15 +1115,7 @@ impl SourceWorker {
                             self.context.send(&outgoing[..n])?;
                         }
                         if self.path.validated && header.kind == PacketKind::ReceiverReport {
-                            if let Some(report) = ReceiverReport::decode(payload) {
-                                let mut stats = lock(&self.context.shared.stats);
-                                stats.health.received_packets =
-                                    stats.health.received_packets.max(report.received);
-                                stats.health.lost_frames =
-                                    stats.health.lost_frames.max(report.lost);
-                                stats.health.late_frames =
-                                    stats.health.late_frames.max(report.late);
-                            }
+                            lock(&self.context.shared.stats).receive_source_report(payload);
                         }
                     }
                     Err(_) => lock(&self.context.shared.stats).rejected += 1,
@@ -1369,6 +1371,63 @@ impl ReceiveWorker {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+    #[test]
+    fn source_receiver_report_recovers_after_extreme_snapshot_without_resetting_local_stats() {
+        let shared = Shared::new(Arc::new(AtomicBool::new(true)));
+        let mut stats = lock(&shared.stats);
+        let local_health = AudioHealth {
+            concealed_frames: 7,
+            underruns: 8,
+            discontinuities: 9,
+            limiter_frames: 10,
+            ..Default::default()
+        };
+        stats.health = local_health;
+        stats.sent = 11;
+        stats.rejected = 12;
+        stats.state = StreamHealth::Degraded;
+        stats.latency.packetization_us = 10_000;
+        let extreme = ReceiverReport {
+            received: u64::MAX,
+            lost: u64::MAX,
+            late: u64::MAX,
+            jitter_samples: u32::MAX,
+            buffer_samples: u32::MAX,
+        };
+        stats.receive_source_report(&extreme.encode());
+        assert_eq!(
+            stats.health,
+            AudioHealth {
+                received_packets: u64::MAX,
+                lost_frames: u64::MAX,
+                late_frames: u64::MAX,
+                ..local_health
+            },
+        );
+        let normal = ReceiverReport {
+            received: 100,
+            lost: 2,
+            late: 3,
+            jitter_samples: 4,
+            buffer_samples: 5,
+        };
+        stats.receive_source_report(&normal.encode());
+        let expected = AudioHealth {
+            received_packets: 100,
+            lost_frames: 2,
+            late_frames: 3,
+            ..local_health
+        };
+        assert_eq!(stats.health, expected);
+        // A malformed report cannot erase the last valid snapshot.
+        stats.receive_source_report(&[0; ReceiverReport::LEN - 1]);
+        assert_eq!(stats.health, expected);
+        assert_eq!(stats.sent, 11);
+        assert_eq!(stats.rejected, 12);
+        assert_eq!(stats.state, StreamHealth::Degraded);
+        assert_eq!(stats.latency.packetization_us, 10_000);
+    }
+
     #[test]
     fn render_playback_clock_tracks_hardware_behind_submitted_callbacks() {
         let now = Instant::now();

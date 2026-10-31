@@ -99,6 +99,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Revoke metadata admission before bounded queueing, and give microphone mute/revoke/release a separate guard-owned priority path. Privacy reductions fence older queued openings; mailbox saturation fails closed and is surfaced as a typed fatal supervisor event.
 - Keep lifetime session/key tombstones intact, but retire the child at a soft 240-start budget before its 256-entry backstop. A typed restart-required outcome triggers bounded recycling; existing sessions fail and require fresh negotiation, never historical key replay.
+- Match pinned IPv6 peers by IP/port, ignoring flow labels and irrelevant global scopes while retaining link-local scope checks. Keep wrong-address/family and cross-session rejection.
+- Replace Source-side peer report snapshots instead of permanently pinning diagnostics to the largest authenticated value; locally measured counters remain independent.
 
 ### Русский
 
@@ -195,6 +197,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Метаданные отзываются до ограниченной очереди, а mute/revoke/release микрофона идут отдельным приоритетным путём guard. Старые запросы открытия блокируются; переполнение закрывает разрешения и передаётся как типизированная фатальная ошибка надзора.
 - История ID/ключей не удаляется; после 240 запусков процесс переинициализируется до жёсткого предела 256. Типизированный запрос перезапуска ограничен бюджетом надзора; сеансы требуют нового согласования без повтора старых ключей.
+- IPv6-пиры сравниваются по IP/порту без flow label и лишнего scope глобальных адресов; scope link-local и запрет чужих адресов/семейств/сеансов сохраняются.
+- Сводки удалённого получателя заменяют предыдущие значения Source, а не навсегда закрепляют максимальные счётчики; местные измерения остаются независимыми.
 
 ## 0.4.0 — 2026-10-30
 
