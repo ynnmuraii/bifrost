@@ -4,6 +4,12 @@ use ui_text::{fill, text, Key, Lang};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Open,
+    OpenAudioPlayer,
+    OpenAudioSettings,
+    StopAllAudio,
+    AudioReceiveMute(Vec<u8>),
+    MicMute,
+    MicPttRelease,
     /// Directional target: an empty string means Local, otherwise a peer node id.
     ///
     /// The tray used to send the active peer on the way home and let the core toggle on the

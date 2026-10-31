@@ -1218,6 +1218,7 @@ fn modal_name(modal: Modal) -> &'static str {
         Modal::Diag => "diag",
         Modal::Settings => "settings",
         Modal::Appearance => "appearance",
+        Modal::Audio => "audio",
     }
 }
 

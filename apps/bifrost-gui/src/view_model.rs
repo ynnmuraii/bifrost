@@ -93,16 +93,19 @@ pub enum Modal {
     Settings,
     /// «Внешний вид», rendered from the appearance rail's open flag.
     Appearance,
+    /// Audio configuration and privacy, independent of input ownership.
+    Audio,
 }
 
 impl Modal {
-    /// The five service sections, in rail order; Appearance uses its dedicated open flag.
-    pub const ALL: [Modal; 5] = [
+    /// Service sections in rail order; Appearance uses its dedicated open flag.
+    pub const ALL: [Modal; 6] = [
         Modal::Pairs,
         Modal::Keys,
         Modal::Clip,
         Modal::Diag,
         Modal::Settings,
+        Modal::Audio,
     ];
 
     /// The two-digit number of the section.
@@ -114,6 +117,7 @@ impl Modal {
             Modal::Diag => "04",
             Modal::Settings => "05",
             Modal::Appearance => "06",
+            Modal::Audio => "07",
         }
     }
 
@@ -126,6 +130,7 @@ impl Modal {
             Modal::Diag => text(lang, Key::Diagnostics),
             Modal::Settings => text(lang, Key::Settings),
             Modal::Appearance => text(lang, Key::Appearance2),
+            Modal::Audio => text(lang, Key::AudioSettings),
         }
     }
 
@@ -138,6 +143,7 @@ impl Modal {
             Modal::Diag => "bifrost diag",
             Modal::Settings => "bifrost config",
             Modal::Appearance => "bifrost theme",
+            Modal::Audio => "bifrost audio",
         }
     }
 
@@ -150,6 +156,7 @@ impl Modal {
             Modal::Diag => text(lang, Key::AReportForTroubleshooting),
             Modal::Settings => text(lang, Key::AddressAndService),
             Modal::Appearance => text(lang, Key::ThemeAndBackground),
+            Modal::Audio => text(lang, Key::AudioSettings),
         }
     }
 }
@@ -253,6 +260,7 @@ impl Connection {
 /// a sentence about pairing rather than a sentence about layouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Request {
+    Audio(crate::audio::AudioRequest),
     /// `GetStatus`.
     GetStatus,
     /// `GetTopology`.
@@ -314,6 +322,7 @@ impl Request {
     /// The request's name in a log line.
     pub fn label(self, lang: Lang) -> &'static str {
         match self {
+            Request::Audio(_) => text(lang, Key::AudioSettings),
             Request::GetStatus => text(lang, Key::State),
             Request::GetTopology => text(lang, Key::Layout),
             Request::Claim => text(lang, Key::TakeControl),
@@ -891,6 +900,7 @@ impl ServiceStart {
 pub struct ViewModel {
     /// Provisional audio presentation state; populated by the audio IPC adapter when available.
     pub audio_player: crate::audio_player::AudioPlayer,
+    pub audio: crate::audio::AudioView,
     /// The endpoint the core serves, or the reason there is none.
     pub endpoint: CoreEndpoint,
     /// The state of the local channel.
@@ -943,7 +953,7 @@ pub struct ViewModel {
     outcome_hold_since: Option<Instant>,
     /// Requests the view model itself made (the automatic save, a status re-read): already
     /// recorded as in flight, to be put on the wire by [`Bridge`].
-    outgoing: Vec<(u64, Msg)>,
+    pub(crate) outgoing: Vec<(u64, Msg)>,
     /// The last [`LOG_LINES`] lines of what happened.
     pub log: VecDeque<String>,
     /// The requests waiting for an answer.
@@ -992,6 +1002,7 @@ impl ViewModel {
         let lang = Lang::from_system();
         let mut view = ViewModel {
             audio_player: crate::audio_player::AudioPlayer::default(),
+            audio: crate::audio::AudioView::default(),
             endpoint,
             connection: Connection::Disconnected {
                 why: text(lang, Key::TheServiceHasNotAnsweredYet).to_owned(),
@@ -1045,6 +1056,7 @@ impl ViewModel {
         // A sentence from a previous core does not describe this connection.
         self.outcome = None;
         self.push_log(format!("Служба работает ({endpoint})"));
+        self.audio = crate::audio::AudioView::default();
     }
 
     /// The service writes first-run config before opening this connection; read it now so
@@ -1077,6 +1089,8 @@ impl ViewModel {
             status.active_layout.clear();
         }
         self.inflight.clear();
+        self.audio = crate::audio::AudioView::default();
+        self.audio_player.replace_cards(Vec::new());
         // History belongs to the lost core session, not to the last known status.
         self.clipboard_history.clear();
         self.silent = false;
@@ -1188,6 +1202,17 @@ impl ViewModel {
         }
         let lang = self.look.language;
         let request = self.take_inflight(id);
+        if let Some(Request::Audio(kind)) = request {
+            self.audio_result(
+                id,
+                kind,
+                ipc::OpResult {
+                    ok: false,
+                    error_code: "AUDIO_UNAVAILABLE".into(),
+                },
+            );
+            return;
+        }
         if matches!(request, Some(Request::PairWith | Request::PairingAnswer)) {
             self.finish_pairing(false);
         }
@@ -1263,6 +1288,9 @@ impl ViewModel {
         for inflight in &self.inflight {
             consider(inflight.deadline);
         }
+        if let Some(deadline) = self.audio.deadline() {
+            consider(deadline);
+        }
         if let Some(since) = self.settings.service.stopping {
             consider(since + SERVICE_STOP_TIMEOUT);
         }
@@ -1299,6 +1327,7 @@ impl ViewModel {
 
     /// Ages the deadlines; called once per frame.
     pub fn tick(&mut self, now: Instant) {
+        self.tick_audio(now);
         self.silent = self
             .inflight
             .iter()
@@ -1428,10 +1457,12 @@ impl ViewModel {
         // `TopologyDoc`) and still carries the `request_id` it answers, so
         // those requests are retired here; the write half answers with an `OpResult`, which
         // is the one message that has to name its request to be understood.
-        if !matches!(&msg, Msg::OpResult(_)) {
+        if !matches!(&msg, Msg::OpResult(_)) && !matches!(&msg, Msg::AudioDevices(_)) {
             self.take_inflight(frame.request_id);
         }
         match msg {
+            Msg::AudioStatus(status) => self.apply_audio_status(status),
+            Msg::AudioDevices(devices) => self.apply_audio_devices(frame.request_id, devices),
             Msg::Status(status) => self.apply_status(status),
             Msg::TopologyDoc(doc) => self.apply_topology(doc),
             Msg::PairingWindow(window) => self.apply_pairing_window(window),
@@ -1806,6 +1837,10 @@ impl ViewModel {
             ));
             return;
         };
+        if let Request::Audio(kind) = request {
+            self.audio_result(request_id, kind, result);
+            return;
+        }
         if request == Request::SendClipboardHistory {
             let target = clipboard_target.as_deref().unwrap_or("");
             let line = fill_named(
@@ -2481,6 +2516,7 @@ impl ViewModel {
     /// typing, where they dragged a rectangle.
     pub fn local(&mut self, action: &Action) {
         match action {
+            Action::Audio(action) => self.audio_action(action, Instant::now()),
             Action::OpenAudioPlayer => self.audio_player.open = true,
             Action::ToggleModal(Modal::Appearance) => self.local(&Action::ToggleAppearance),
             Action::ToggleModal(modal) => {
@@ -2493,6 +2529,9 @@ impl ViewModel {
                     let id = self.begin_request(Request::GetClipboardHistory, Instant::now());
                     self.outgoing
                         .push((id, Msg::GetClipboardHistory(ipc::GetClipboardHistory {})));
+                }
+                if self.modal == Some(Modal::Audio) {
+                    self.request_audio_status(Instant::now());
                 }
                 self.appearance_open = false;
                 self.settings.revoke = None;
@@ -2706,6 +2745,7 @@ impl ViewModel {
 /// is applied to the view model by the app. [`Action::wire`] is the boundary between them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    Audio(crate::audio::AudioAction),
     /// Open the Listener mini-player without changing a remote stream.
     OpenAudioPlayer,
     /// A GUI-only updater operation; intercepted by the app, never sent to the agent.
@@ -3351,6 +3391,7 @@ impl Bridge {
                     self.peer_pid = pid;
                     self.core_unit = unit;
                     self.view.on_connected(&endpoint);
+                    self.view.request_audio_status(Instant::now());
                     // §4 of the build spec: a fresh link asks for the status and the document.
                     self.dispatch(Action::Refresh, Instant::now());
                 }
@@ -4146,6 +4187,17 @@ pub fn spaced_code(code: &str) -> String {
 /// The name of a message a GUI should never receive, for a log line.
 fn message_name(msg: &Msg) -> &'static str {
     match msg {
+        Msg::GetAudioStatus(_) => "GetAudioStatus",
+        Msg::SetAudio(_) => "SetAudio",
+        Msg::StartAudio(_) => "StartAudio",
+        Msg::StopAudio(_) => "StopAudio",
+        Msg::SetMicrophoneMute(_) => "SetMicrophoneMute",
+        Msg::SetPtt(_) => "SetPtt",
+        Msg::AudioStatus(_) => "AudioStatus",
+        Msg::ListAudioDevices(_) => "ListAudioDevices",
+        Msg::AudioDevices(_) => "AudioDevices",
+        Msg::SetAudioPeerGain(_) => "SetAudioPeerGain",
+        Msg::SendMediaCommand(_) => "SendMediaCommand",
         Msg::GetStatus(_) => "GetStatus",
         Msg::GetTopology(_) => "GetTopology",
         Msg::StartPairing(_) => "StartPairing",
@@ -4264,6 +4316,7 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::ExportDiagnostics => text(lang, Key::TheDiagnosticsAreSaved).to_owned(),
         Request::StartPairing => text(lang, Key::ThePairingWindowIsOpen).to_owned(),
         Request::GetStatus | Request::GetTopology => text(lang, Key::TheCoreAnswered).to_owned(),
+        Request::Audio(_) => text(lang, Key::AudioSettings).to_owned(),
     }
 }
 

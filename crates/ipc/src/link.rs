@@ -338,6 +338,8 @@ impl<S> GuiLink<S> {
             request_id,
             msg: Some(message),
         };
+        crate::audio::validate_frame(&frame)
+            .map_err(|error| IpcError::protocol(error.to_string()))?;
         self.framed.send(&frame).await?;
         self.outbound_next = self.outbound_next.checked_add(1).ok_or_else(|| {
             IpcError::protocol("outgoing seq would exceed u64; open a new channel")
@@ -351,6 +353,8 @@ impl<S> GuiLink<S> {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let frame: GuiFrame = self.framed.recv().await?;
+        crate::audio::validate_frame(&frame)
+            .map_err(|error| IpcError::protocol(error.to_string()))?;
         self.inbound.accept(frame.seq)?;
         Ok(frame)
     }

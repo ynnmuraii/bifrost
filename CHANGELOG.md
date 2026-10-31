@@ -22,6 +22,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add internal audio backend/Dry and pure packet/replay/status contracts, with dependency-direction checks; no audio devices, network sessions or user-visible audio behavior are enabled by this change.
 - Extend the internal audio backend contract with native clock/status snapshots, valid capture timestamps, reserved-hotkey collision checks and expiring, renewable PTT press leases; no native audio or hotkeys are activated.
 - Preserve unknown native playback states and expose the OS-selected current media-session token in the shared backend contract and Windows adapter.
+- Add bounded revisioned local audio IPC, an authoritative remote-audio popup, bilingual audio settings/device selection and tray privacy/mute/stop controls. Audio controls report unavailable until a core implements the audio handlers; this change does not activate audio capture or transport. Media metadata is transient and redacted from debug output.
 
 ### Русский
 
@@ -41,6 +42,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлены внутренние контракты аудиобэкенда/Dry, чистых пакетов, защиты от повторов и статуса с проверкой направлений зависимостей; изменение не включает аудиоустройства, сетевые аудиосеансы или пользовательские функции звука.
 - Внутренний контракт аудиобэкенда дополнен снимками часов и состояния потока, достоверностью временных меток, проверкой конфликтов горячих клавиш и возобновляемыми ограниченными по времени нажатиями PTT; нативный звук и горячие клавиши не включаются.
 - Общий контракт бэкенда и адаптер Windows сохраняют неизвестные состояния воспроизведения и предоставляют выбранный ОС текущий медиасеанс.
+- Добавлены ограниченный локальный аудио-IPC с ревизиями, плеер удалённых потоков по подтверждённому состоянию, двуязычные аудионастройки/выбор устройств и индикаторы приватности/отключение звука/остановка в трее. До реализации обработчиков в службе управление честно показывает недоступность; изменение не запускает захват или передачу аудио. Метаданные медиасеансов не сохраняются и скрыты в отладочном выводе.
 
 ## 0.4.0 — 2026-10-30
 

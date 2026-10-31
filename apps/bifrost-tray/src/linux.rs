@@ -17,17 +17,7 @@ impl ksni::Tray for Tray {
         "bifrost".into()
     }
     fn title(&self) -> String {
-        self.state
-            .status
-            .as_ref()
-            .filter(|status| !status.game_guard_reason.is_empty())
-            .map(|status| {
-                ui_text::game_guard_state(
-                    super::language_of(self.state.look_file.as_deref()),
-                    &status.game_guard_reason,
-                )
-            })
-            .unwrap_or_else(|| "Bifrost".into())
+        self.state.tooltip()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {

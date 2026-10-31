@@ -332,6 +332,17 @@ message GuiFrame {
     OutgoingPairingRequest outgoing_pairing_request = 57;
     MutePairingRequester mute_pairing_requester = 58;
     PairingResult pairing_result = 59; // explicit ceremony outcome; OpResult only acknowledges a request
+    GetAudioStatus get_audio_status = 61;
+    SetAudio set_audio = 62;
+    StartAudio start_audio = 63;
+    StopAudio stop_audio = 64;
+    SetMicrophoneMute set_microphone_mute = 65;
+    SetPtt set_ptt = 66;
+    AudioStatus audio_status = 67;
+    ListAudioDevices list_audio_devices = 68;
+    AudioDevices audio_devices = 69;
+    SetAudioPeerGain set_audio_peer_gain = 70;
+    SendMediaCommand send_media_command = 71;
   }
 }
 // Also replays the current open PairingWindow and unanswered PairingPrompt as events
@@ -619,3 +630,87 @@ message ClipboardHistoryItem {
   uint32 chunk_index = 3; // zero-based; UTF-8 boundaries are preserved
   uint32 chunk_count = 4;
 }
+
+// Audio is local control-plane data only. Required enum selections reject zero.
+enum AudioRole { AUDIO_ROLE_UNSPECIFIED = 0; AUDIO_ROLE_SOURCE = 1; AUDIO_ROLE_LISTENER = 2; }
+enum AudioMode { AUDIO_MODE_UNSPECIFIED = 0; AUDIO_MODE_MIX_ALL = 1; AUDIO_MODE_FOLLOW_FOCUS = 2; }
+enum AudioProfile { AUDIO_PROFILE_UNSPECIFIED = 0; AUDIO_PROFILE_ETHERNET = 1; AUDIO_PROFILE_WIFI = 2; }
+enum AudioKind { AUDIO_KIND_UNSPECIFIED = 0; AUDIO_KIND_SYSTEM = 1; }
+enum AudioSessionState {
+  AUDIO_SESSION_STATE_UNSPECIFIED = 0; AUDIO_SESSION_STATE_IDLE = 1;
+  AUDIO_SESSION_STATE_AWAIT_CONSENT = 2; AUDIO_SESSION_STATE_PREPARING = 3;
+  AUDIO_SESSION_STATE_AWAIT_COMMIT = 4; AUDIO_SESSION_STATE_PATH_VALIDATION = 5;
+  AUDIO_SESSION_STATE_RUNNING = 6; AUDIO_SESSION_STATE_REBUFFERING = 7;
+  AUDIO_SESSION_STATE_DEVICE_PAUSED = 8; AUDIO_SESSION_STATE_STOPPING = 9;
+  AUDIO_SESSION_STATE_FAILED = 10;
+}
+enum AudioStreamHealth { AUDIO_STREAM_HEALTH_UNSPECIFIED = 0; AUDIO_STREAM_HEALTH_READY = 1; AUDIO_STREAM_HEALTH_BUFFERING = 2; AUDIO_STREAM_HEALTH_DEGRADED = 3; }
+enum AudioBackendCapability { AUDIO_BACKEND_CAPABILITY_UNSPECIFIED = 0; AUDIO_BACKEND_CAPABILITY_SYSTEM_CAPTURE = 1; AUDIO_BACKEND_CAPABILITY_RENDER = 2; AUDIO_BACKEND_CAPABILITY_ENDPOINT_MUTE = 3; AUDIO_BACKEND_CAPABILITY_GLOBAL_PTT = 4; AUDIO_BACKEND_CAPABILITY_MEDIA_SESSIONS = 5; }
+enum AudioAvailability { AUDIO_AVAILABILITY_UNSPECIFIED = 0; AUDIO_AVAILABILITY_AVAILABLE = 1; AUDIO_AVAILABILITY_UNSUPPORTED = 2; AUDIO_AVAILABILITY_UNAVAILABLE = 3; }
+enum AudioUnavailableReason {
+  AUDIO_UNAVAILABLE_REASON_UNSPECIFIED = 0; AUDIO_UNAVAILABLE_REASON_FEATURE_NOT_BUILT = 1;
+  AUDIO_UNAVAILABLE_REASON_NOT_SUPPORTED_BY_PLATFORM = 2; AUDIO_UNAVAILABLE_REASON_OS_BUILD_TOO_OLD = 3;
+  AUDIO_UNAVAILABLE_REASON_PROCESS_EXCLUSION_UNAVAILABLE = 4; AUDIO_UNAVAILABLE_REASON_RELEASE_OBSERVATION_UNAVAILABLE = 5;
+  AUDIO_UNAVAILABLE_REASON_SERVER_UNAVAILABLE = 6; AUDIO_UNAVAILABLE_REASON_PERMISSION_DENIED = 7;
+  AUDIO_UNAVAILABLE_REASON_DEVICE_GONE = 8; AUDIO_UNAVAILABLE_REASON_DEVICE_NOT_SELECTED = 9;
+  AUDIO_UNAVAILABLE_REASON_WORKER_UNAVAILABLE = 10;
+}
+enum AudioPlaybackState { AUDIO_PLAYBACK_STATE_UNSPECIFIED = 0; AUDIO_PLAYBACK_STATE_UNKNOWN = 1; AUDIO_PLAYBACK_STATE_PLAYING = 2; AUDIO_PLAYBACK_STATE_PAUSED = 3; AUDIO_PLAYBACK_STATE_STOPPED = 4; }
+enum AudioMediaCommand { AUDIO_MEDIA_COMMAND_UNSPECIFIED = 0; AUDIO_MEDIA_COMMAND_PLAY = 1; AUDIO_MEDIA_COMMAND_PAUSE = 2; AUDIO_MEDIA_COMMAND_TOGGLE = 3; AUDIO_MEDIA_COMMAND_NEXT = 4; AUDIO_MEDIA_COMMAND_PREVIOUS = 5; }
+enum AudioDeviceKind { AUDIO_DEVICE_KIND_UNSPECIFIED = 0; AUDIO_DEVICE_KIND_OUTPUT = 1; AUDIO_DEVICE_KIND_CAPTURE = 2; AUDIO_DEVICE_KIND_MICROPHONE = 3; }
+message GetAudioStatus {}
+message SetAudio { AudioConfig config = 1; uint64 expected_revision = 2; }
+message StartAudio { bytes peer_node_id = 1; AudioKind kind = 2; AudioProfile profile = 3; uint64 expected_revision = 4; }
+message StopAudio { bytes peer_node_id = 1; bytes session_id = 2; bool stop_all = 3; }
+message SetMicrophoneMute { bool muted = 1; uint64 expected_revision = 2; }
+message SetPtt { bool pressed = 1; uint64 expected_revision = 2; }
+message SetAudioPeerGain { bytes peer_node_id = 1; uint32 gain_percent = 2; bool muted = 3; uint64 expected_revision = 4; }
+message SendMediaCommand { bytes peer_node_id = 1; bytes session_id = 2; uint64 session_token = 3; uint64 media_revision = 4; AudioMediaCommand command = 5; }
+message AudioConfig {
+  bool enabled = 1; AudioRole role = 2; bytes listener_node_id = 3; bytes group_id = 4;
+  AudioMode mode = 5; uint32 udp_port = 6; AudioProfile profile = 7;
+  string output_device = 8; bool output_fallback_to_default = 9; string capture_device = 10;
+  bool resume_system_audio = 11; uint32 focus_debounce_ms = 12; uint32 focus_ramp_ms = 13;
+  sint32 background_gain_db = 14; bool background_mute = 15;
+  AudioMicrophoneConfig microphone = 16; repeated AudioPeerConfig peers = 17;
+}
+message AudioMicrophoneConfig {
+  bool control_enabled = 1; bool streaming_enabled = 2; bool experimental_acknowledged = 3;
+  string capture_device = 4; bool allow_default_mic_changes = 5; string virtual_device = 6;
+  bool muted = 7; bool ptt_enabled = 8; string ptt_hotkey = 9; bytes pinned_target_node_id = 10;
+}
+message AudioPeerConfig {
+  bytes node_id = 1; bool allow_system_send = 2; bool allow_system_receive = 3;
+  bool allow_mic_send = 4; bool allow_mic_receive = 5; bool allow_mic_control = 6;
+  bool allow_media_control = 7; uint32 volume_percent = 8;
+}
+message AudioMicrophoneState { bool muted = 1; bool ptt_pressed = 2; bool capture_active = 3; bytes target_node_id = 4; bool control_active = 5; }
+message AudioStatus {
+  uint64 revision = 1; bool enabled = 2; AudioRole role = 3; AudioMode mode = 4;
+  repeated AudioCapabilityAvailability backend = 5; repeated AudioSessionStatus sessions = 6;
+  AudioConfig config = 7; AudioMicrophoneState microphone = 8;
+}
+message AudioCapabilityAvailability { AudioBackendCapability capability = 1; AudioAvailability availability = 2; AudioUnavailableReason reason = 3; }
+message AudioConsentFlags { bool allow_system_send = 1; bool allow_system_receive = 2; bool allow_mic_control = 3; bool allow_media_control = 4; }
+message AudioSessionConsent { AudioConsentFlags local = 1; AudioConsentFlags remote = 2; }
+message AudioHealth { uint64 received_packets = 1; uint64 lost_frames = 2; uint64 late_frames = 3; uint64 concealed_frames = 4; uint64 underruns = 5; uint64 discontinuities = 6; uint64 limiter_frames = 7; }
+message AudioSessionStatus {
+  bytes session_id = 1; bytes peer = 2; string source_name = 3; AudioRole local_role = 4;
+  AudioSessionState state = 5; AudioProfile profile = 6; AudioHealth health = 7;
+  AudioStreamHealth health_state = 8; optional uint32 latency_estimate_ms = 9;
+  uint32 gain_percent = 10; bool muted = 11; AudioSessionConsent consent = 12;
+  MediaInfo media_info = 13; bool focus_primary = 14; AudioKind kind = 15;
+  // Actual Source observations; absent means unknown, never inferred from lifecycle.
+  optional bool capture_active = 16;
+  optional bool sending = 17;
+}
+message AudioMediaCommands { bool play = 1; bool pause = 2; bool toggle = 3; bool next = 4; bool previous = 5; }
+// Private, transient user metadata. Debug output must remain redacted.
+message MediaInfo {
+  string app_id = 1; string title = 2; string subtitle = 3;
+  optional uint64 position_ms = 4; uint64 session_token = 5; optional uint64 duration_ms = 6;
+  AudioPlaybackState playback = 7; AudioMediaCommands commands = 8; uint64 revision = 9;
+}
+message ListAudioDevices { AudioDeviceKind kind = 1; }
+message AudioDevice { string id = 1; string name = 2; bool is_default = 3; bool available = 4; }
+message AudioDevices { AudioDeviceKind kind = 1; uint64 revision = 2; repeated AudioDevice devices = 3; bool complete = 4; }

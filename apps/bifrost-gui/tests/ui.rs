@@ -1042,10 +1042,29 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
         frame.output.actions
     );
 
-    // Appearance is the sixth slot of that same column, right under the five sections.
-    let at = egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + 5.0 * 50.0 + 22.0);
+    // Appearance follows the service sections, including Audio.
+    let at = egui::pos2(
+        SIZE.x - 32.0,
+        60.0 + 12.0 + Modal::ALL.len() as f32 * 50.0 + 22.0,
+    );
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(frame.output.actions.contains(&Action::ToggleAppearance));
+    let audio_slot = Modal::ALL
+        .iter()
+        .position(|modal| *modal == Modal::Audio)
+        .unwrap();
+    let at = egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + audio_slot as f32 * 50.0 + 22.0);
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(frame
+        .output
+        .actions
+        .contains(&Action::ToggleModal(Modal::Audio)));
+    let at = egui::pos2(
+        SIZE.x - 32.0,
+        60.0 + 12.0 + (Modal::ALL.len() + 1) as f32 * 50.0 + 22.0,
+    );
+    let frame = harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(frame.output.actions.contains(&Action::OpenAudioPlayer));
     // Nothing sits at the bottom of the rail any more.
     let frame = harness.frame(
         &vm,
