@@ -18,6 +18,12 @@
 //! wait is event-driven (`status` polling with generous timeouts) so the harness never
 //! depends on a sleep being long enough; latencies are read back from the cores' own
 //! logs, whose `tracing` timestamps are UTC to the microsecond.
+//!
+//! `BIFROST_TEST_AUDIO=1` opts Harness/Cluster fixtures into live Dry audio alongside
+//! their existing dry input. Only this test harness reads it: every isolated-root
+//! launch explicitly passes `--test-audio-dry`; production never selects it from env.
+
+pub mod audio;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -697,10 +703,17 @@ impl Node {
             .open(&self.log)
             .expect("restart log");
         let err = file.try_clone().expect("restart stderr");
-        self.child = Command::new(core_exe())
-            .arg("--root")
-            .arg(&self.root)
-            .args(["run", "--dry-inject", "--dry-input-events", "0"])
+        let mut command = Command::new(core_exe());
+        command.arg("--root").arg(&self.root).args([
+            "run",
+            "--dry-inject",
+            "--dry-input-events",
+            "0",
+        ]);
+        if audio::dry_launch(&self.root) {
+            command.arg("--test-audio-dry");
+        }
+        self.child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(file))
             .stderr(Stdio::from(err))
@@ -928,6 +941,20 @@ impl Harness {
     pub fn start(proxied: bool, dry_motion: bool) -> Harness {
         Harness::start_with(proxied, dry_motion, |_, _| ()).0
     }
+
+    /// Runs the ordinary paired fixture with isolated Dry media, never native devices.
+    pub fn start_audio(proxied: bool) -> Harness {
+        let harness = Self::start_with(proxied, false, |a, b| {
+            for root in [a, b] {
+                audio::mark_dry(root);
+            }
+        })
+        .0;
+        if !audio::enabled() {
+            audio::start_group(&[&harness.a, &harness.b]);
+        }
+        harness
+    }
     /// Starts two dry agents with synthetic displays for topology-sharing tests.
     pub fn start_with_displays() -> Harness {
         Harness::start_with_options(false, false, true, |_, _| ()).0
@@ -1018,7 +1045,11 @@ impl Harness {
 
         let a = spawn_node(a_root, a_id, dry_motion, dry_displays, "a");
         let b = spawn_node(b_root, b_id, dry_motion, dry_displays, "b");
-        (Harness { dir, a, b, proxy }, attached)
+        let harness = Harness { dir, a, b, proxy };
+        if audio::enabled() {
+            audio::start_group(&[&harness.a, &harness.b]);
+        }
+        (harness, attached)
     }
 
     /// Waits until both nodes see each other, both agents are ready, and the source owns
@@ -1521,6 +1552,9 @@ fn spawn_node(
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err));
+    if audio::dry_launch(&root) {
+        command.arg("--test-audio-dry");
+    }
     let dry_control_dir = root.join("run/control-dry");
     if dry_motion && label == "a" && !dry_control_dir.is_dir() {
         command.arg("--dry-motion");
@@ -1579,6 +1613,20 @@ impl Cluster {
         Cluster::start_with(label, |_, _, _| ()).0
     }
 
+    /// Runs the ordinary three-node paired mesh with isolated Dry media on every node.
+    pub fn start_audio(label: &str) -> Cluster {
+        let cluster = Self::start_with(label, |roots, _, _| {
+            for root in roots {
+                audio::mark_dry(root);
+            }
+        })
+        .0;
+        if !audio::enabled() {
+            audio::start_group(&cluster.nodes.iter().collect::<Vec<_>>());
+        }
+        cluster
+    }
+
     /// Starts the three nodes, calling `before_run` once the roots are *paired* and the
     /// topology is written, but before anything dials.
     ///
@@ -1602,7 +1650,11 @@ impl Cluster {
                 )
             })
             .collect();
-        (Cluster { dir, nodes, ports }, attached)
+        let cluster = Cluster { dir, nodes, ports };
+        if audio::enabled() {
+            audio::start_group(&cluster.nodes.iter().collect::<Vec<_>>());
+        }
+        (cluster, attached)
     }
 
     /// Pairs three fresh roots and writes their topology: `w` claims on startup
@@ -1776,11 +1828,23 @@ pub struct Unpaired {
 impl Unpaired {
     /// Starts the two cores, each with its own `--root`.
     pub fn start(label: &str) -> Unpaired {
+        Self::start_with_audio(label, false)
+    }
+
+    /// An unpaired GUI fixture with the explicit isolated-root Dry-audio launch flag.
+    pub fn start_audio(label: &str) -> Unpaired {
+        Self::start_with_audio(label, true)
+    }
+
+    fn start_with_audio(label: &str, dry_audio: bool) -> Unpaired {
         let dir = unique_dir(label);
         let a_root = dir.join("a");
         let b_root = dir.join("b");
         for root in [&a_root, &b_root] {
             std::fs::create_dir_all(root.join("config")).expect("config directory");
+            if dry_audio {
+                audio::mark_dry(root);
+            }
         }
         // Paired with nobody, so the identity has to be created before the id can be read:
         // `peers` loads-or-creates it, which is what the harness does for the paired cases too.
@@ -1810,6 +1874,21 @@ impl Unpaired {
                 status.agent == "ready"
             })
             .expect("the core must answer `status`");
+        }
+    }
+}
+
+impl Drop for Unpaired {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", diagnose("unpaired test failed", &[&self.a, &self.b]));
+        }
+        self.a.stop();
+        self.b.stop();
+        if std::env::var_os("BIFROST_KEEP_ROOTS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        } else {
+            println!("roots kept at {}", self.dir.display());
         }
     }
 }
