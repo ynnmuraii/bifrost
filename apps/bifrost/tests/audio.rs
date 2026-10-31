@@ -668,10 +668,42 @@ fn third_pc_listener_follows_committed_owner_focus_and_requests_after_reconnect(
     cluster.nodes[2].restart_without_input();
     cluster.wait_owner(1, TIMEOUT);
     let mut listener = Window::open(cluster.node(2));
-    listener.start(&a);
-    listener.start(&b);
-    audio::healthy(&mut listener, &mut source_a, &c, &a);
-    audio::healthy(&mut listener, &mut source_b, &c, &b);
+    let render_ready = |status: &wire::AudioStatus| {
+        status.backend.iter().any(|capability| {
+            capability.capability == wire::AudioBackendCapability::Render as i32
+                && capability.availability == wire::AudioAvailability::Available as i32
+        })
+    };
+    let initial = listener.status();
+    let ready = if render_ready(&initial) {
+        initial
+    } else {
+        // Input ownership is not the audio child's probe barrier. Ingest the
+        // actual readiness push before the first deliberate Start, like the GUI.
+        let ready = listener.event(|event| match event {
+            gui_frame::Msg::AudioStatus(status) if render_ready(status) => Some(status.clone()),
+            _ => None,
+        });
+        assert!(
+            ready.revision > initial.revision,
+            "the startup probe must publish its semantic readiness change"
+        );
+        ready
+    };
+    assert!(
+        render_ready(&ready),
+        "Listener render backend is not pending"
+    );
+    for (peer, source) in [(&a, &mut source_a), (&b, &mut source_b)] {
+        let revision = listener.status().revision;
+        listener.op(gui_frame::Msg::StartAudio(wire::StartAudio {
+            peer_node_id: peer.clone(),
+            kind: wire::AudioKind::System as i32,
+            profile: wire::AudioProfile::Ethernet as i32,
+            expected_revision: revision,
+        }));
+        audio::healthy(&mut listener, source, &c, peer);
+    }
     let status = listener.wait(
         "reconnected third PC obtains committed receiver A",
         |status| has_focus_gains(status, &a, &b, 100),
