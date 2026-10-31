@@ -664,3 +664,45 @@ fn retarget_preserves_inactive_media_permission_and_revokes_old_system_scope() {
         .iter()
         .any(|p| p.allow_media_control));
 }
+
+#[test]
+fn source_can_receive_without_clearing_independent_media_preferences() {
+    let _guard = common::serial();
+    let mut pair = Pair::new("sharing-source-to-receive");
+    let mut preferences = pair.source.status().config.expect("Source preferences");
+    preferences.listener_node_id = pair.listener_id.clone();
+    preferences.profile = wire::AudioProfile::Wifi as i32;
+    preferences.microphone.as_mut().unwrap().muted = true;
+    preferences.peers.push(wire::AudioPeerConfig {
+        node_id: pair.listener_id.clone(),
+        allow_system_send: true,
+        system_send_override: Some(true),
+        allow_media_control: true,
+        volume_percent: 100,
+        ..Default::default()
+    });
+    pair.source.configure(preferences);
+    let before = saved(&pair.nodes.b);
+    sharing(&mut pair.source, true, wire::AudioRole::Listener, &[]);
+    let received = pair.source.status();
+    assert_eq!(received.role, wire::AudioRole::Listener as i32);
+    assert_eq!(received.system_sharing_requested, Some(true));
+    assert!(received
+        .sessions
+        .iter()
+        .all(|session| session.capture_active != Some(true)));
+    let after = saved(&pair.nodes.b);
+    assert_eq!(after.role, config::AudioRole::Listener);
+    assert_eq!(after.system_sharing, Some(true));
+    assert!(after.allow_send_to.is_empty());
+    assert_eq!(after.peers[0].system_send_override, None);
+    assert!(
+        after.peers[0].allow_media_control,
+        "dormant USER opt-in retained"
+    );
+    assert_eq!(after.microphone, before.microphone);
+    assert_eq!(after.profile, before.profile);
+    assert_eq!(after.output_device, before.output_device);
+    assert_eq!(after.capture_device, before.capture_device);
+    assert_eq!(after.resume_system_audio, before.resume_system_audio);
+}

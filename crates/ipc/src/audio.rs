@@ -206,7 +206,7 @@ pub fn validate_config(config: &wire::AudioConfig) -> Result<()> {
                     !peer.allow_system_send
                         && peer.system_send_override != Some(true)
                         && !peer.allow_mic_receive
-                        && !peer.allow_media_control
+                        && (!peer.allow_media_control || config.system_sharing.is_some())
                 }
                 wire::AudioRole::Unspecified => false,
             },

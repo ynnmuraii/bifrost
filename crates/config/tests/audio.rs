@@ -253,12 +253,13 @@ fn modern_source_retains_inactive_media_grants_without_changing_legacy_validatio
         !valid(&source),
         "legacy policy remains selected-peer strict"
     );
+    let listener = format!(
+        "role = 'listener'\n[[audio.peers]]\nnode_id = '{previous}'\nallow_media_control = true"
+    );
+    assert!(!valid(&listener), "legacy Listener policy stays strict");
     for sharing in [false, true] {
         assert!(valid(&format!("system_sharing = {sharing}\n{source}")));
-        assert!(!valid(&format!(
-            "system_sharing = {sharing}\nrole = 'listener'\n\
-             [[audio.peers]]\nnode_id = '{previous}'\nallow_media_control = true"
-        )));
+        assert!(valid(&format!("system_sharing = {sharing}\n{listener}")));
     }
 }
 

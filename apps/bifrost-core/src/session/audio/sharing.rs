@@ -179,6 +179,21 @@ impl Actor {
         next.enabled = true;
         next.system_sharing = Some(true);
         next.role = role;
+        if self.config.role == config::AudioRole::Source
+            && (role != self.config.role || self.config.listener_node_id != listener)
+        {
+            // A deliberate SYSTEM scope change revokes only obsolete positive
+            // send grants. Independent preferences and known denials survive.
+            next.allow_send_to
+                .retain(|peer| role == config::AudioRole::Source && Some(*peer) == listener);
+            for peer in &mut next.peers {
+                if peer.system_send_override == Some(true)
+                    && (role != config::AudioRole::Source || Some(peer.node_id) != listener)
+                {
+                    peer.system_send_override = None;
+                }
+            }
+        }
         if role == config::AudioRole::Source {
             if !pinned {
                 next.group_id_override = Some(false);
@@ -186,22 +201,12 @@ impl Actor {
             if !pinned && (self.config.role != role || next.listener_node_id != listener) {
                 next.group_id = None;
             }
-            if self.config.role == role && next.listener_node_id != listener {
-                // Selecting B explicitly revokes only obsolete SYSTEM grants to
-                // A. Independent media preferences and known denials survive.
-                next.allow_send_to.retain(|peer| Some(*peer) == listener);
-                for peer in &mut next.peers {
-                    if Some(peer.node_id) != listener && peer.system_send_override == Some(true) {
-                        peer.system_send_override = None;
-                    }
-                }
-            }
-            next.listener_node_id = listener;
         } else if self.config.role != role || next.group_id.is_none() {
             next.group_id = Some(config::audio::HexId(
                 identity::random16().map_err(|_| ipc::audio::codes::AUDIO_UNAVAILABLE)?,
             ));
         }
+        next.listener_node_id = listener;
         next.validate()
             .map_err(|_| ipc::audio::codes::AUDIO_ROLE_CONFLICT)?;
         if self.listen.ip().is_unspecified() || self.listen.ip().is_multicast() {

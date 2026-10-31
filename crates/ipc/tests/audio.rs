@@ -61,6 +61,37 @@ fn frame(message: wire::gui_frame::Msg) -> wire::GuiFrame {
 }
 
 #[test]
+fn modern_listener_retains_dormant_media_preferences_without_relaxing_other_roles() {
+    let mut value = config();
+    value.peers.push(wire::AudioPeerConfig {
+        node_id: vec![1; 32],
+        allow_media_control: true,
+        volume_percent: 100,
+        ..Default::default()
+    });
+    assert!(
+        validate_config(&value).is_err(),
+        "legacy Listener stays strict"
+    );
+    for policy in [false, true] {
+        value.system_sharing = Some(policy);
+        validate_config(&value).unwrap();
+        value.peers[0].allow_mic_receive = true;
+        assert!(
+            validate_config(&value).is_err(),
+            "mic role checks unchanged"
+        );
+        value.peers[0].allow_mic_receive = false;
+        value.peers[0].system_send_override = Some(true);
+        assert!(
+            validate_config(&value).is_err(),
+            "Listener cannot send SYSTEM"
+        );
+        value.peers[0].system_send_override = None;
+    }
+}
+
+#[test]
 fn native_ptt_arming_preserves_optional_observations_and_rejects_unknown_states() {
     for state in [
         None,

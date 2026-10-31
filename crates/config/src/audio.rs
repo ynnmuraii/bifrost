@@ -366,13 +366,14 @@ impl AudioConfig {
                     "Listener permission for a configured Source only",
                 ));
             }
-            // Modern SYSTEM target changes retain independent, inactive media
-            // preferences. Execution still requires the selected live session.
+            // Modern SYSTEM role/target changes retain inactive media preferences.
+            // Execution still requires the Source role and selected live session.
             // Legacy manual configurations keep their selected-peer restriction.
             if peer.allow_media_control
-                && (self.role != AudioRole::Source
+                && (self.role == AudioRole::Off
                     || (self.system_sharing.is_none()
-                        && Some(peer.node_id) != self.listener_node_id))
+                        && (self.role != AudioRole::Source
+                            || Some(peer.node_id) != self.listener_node_id)))
             {
                 return Err(invalid(
                     "audio.peers.allow_media_control",
