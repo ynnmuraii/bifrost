@@ -32,6 +32,7 @@ impl Observed {
             );
         }
     }
+    #[cfg(unix)]
     fn rms(&self) -> f64 {
         f64::from_bits(self.rms.load(Ordering::Relaxed))
     }
