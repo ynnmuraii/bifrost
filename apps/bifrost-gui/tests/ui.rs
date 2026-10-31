@@ -1962,3 +1962,74 @@ fn clipboard_send_result_stays_above_scrolling_history_in_both_languages_and_the
         }
     }
 }
+
+fn cancelled_pairing(lang: ui_text::Lang, theme: Theme) -> ViewModel {
+    let mut vm = connected();
+    vm.look.language = lang;
+    vm.look.theme = theme;
+    vm.look.dock_open = true;
+    vm.apply(event(Msg::PairingPrompt(pairing_prompt())));
+    vm.apply(event(Msg::PairingResult(ipc::PairingResult {
+        outcome: ipc::PairingOutcome::Rejected as i32,
+        ceremony_id: vec![0x42; 16],
+        error_code: "PAIRING_CANCELLED".into(),
+        ..Default::default()
+    })));
+    vm
+}
+
+#[test]
+fn cancelled_pairing_shows_localized_status_without_the_old_code() {
+    for lang in [ui_text::Lang::En, ui_text::Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            let vm = cancelled_pairing(lang, theme);
+            let mut harness = Harness::new();
+            let frame = harness.settle(&vm, false);
+            expect(
+                &frame,
+                &[ui_text::text(lang, ui_text::Key::PairingCancelled)],
+            );
+            assert!(!shows(&frame, "482 913"));
+            assert!(!shows(
+                &frame,
+                ui_text::text(lang, ui_text::Key::YesTheyMatch)
+            ));
+        }
+    }
+}
+
+#[test]
+fn optional_cancelled_pairing_pngs() {
+    let Some(dir) = std::env::var_os("BIFROST_PAIRING_SHOTS") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (lang, language) in [(ui_text::Lang::En, "en"), (ui_text::Lang::Ru, "ru")] {
+        for (theme, theme_name) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
+            let vm = cancelled_pairing(lang, theme);
+            let now = Instant::now();
+            let mut state = UiState::new(now);
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(SIZE)
+                .wgpu()
+                .build_ui(move |ui| {
+                    ui::draw(
+                        ui,
+                        &vm,
+                        &mut state,
+                        Env {
+                            now,
+                            animate: false,
+                        },
+                    );
+                });
+            harness.run_steps(3);
+            harness
+                .render()
+                .unwrap()
+                .save(dir.join(format!("pairing-cancelled-{language}-{theme_name}.png")))
+                .unwrap();
+        }
+    }
+}

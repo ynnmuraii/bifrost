@@ -701,6 +701,8 @@ pub struct Pairing {
     pub window: Option<ipc::PairingWindow>,
     /// The six-digit confirmation of ADR-010, waiting for an answer.
     pub prompt: Option<ipc::PairingPrompt>,
+    /// Visible SAS identity, retained after its answer ACK removes the prompt.
+    pub ceremony_id: Option<[u8; 16]>,
     /// The address field of «Подключиться по адресу».
     pub address: String,
     /// `true` once «Подробнее» was opened (ADR-010: the full fingerprints live there).
@@ -1108,6 +1110,7 @@ impl ViewModel {
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
         self.pairing.prompt = None;
+        self.pairing.ceremony_id = None;
         self.pairing.window_deadline = None;
         self.pairing.dialing = false;
         self.pairing.paired = None;
@@ -1453,6 +1456,15 @@ impl ViewModel {
             self.connection = Connection::Connected;
         }
         self.silent = false;
+        // A terminal event for an older ceremony cannot retire a newer request or prompt.
+        if let Msg::PairingResult(result) = &msg {
+            if !result.ceremony_id.is_empty()
+                && self.pairing.ceremony_id.as_ref().map(|id| id.as_slice())
+                    != Some(result.ceremony_id.as_slice())
+            {
+                return;
+            }
+        }
         // The read half of the contract answers with the state itself (`Status`,
         // `TopologyDoc`) and still carries the `request_id` it answers, so
         // those requests are retired here; the write half answers with an `OpResult`, which
@@ -1480,6 +1492,8 @@ impl ViewModel {
                         .unwrap_or_else(|| text(lang, Key::ComputerTitle));
                     let line = fill_named(lang, Key::NameIsPaired, &[("name", &name)]);
                     self.set_outcome(Outcome::done(line));
+                } else if !result.error_code.is_empty() {
+                    self.set_outcome(Outcome::failed(code_label(lang, &result.error_code)));
                 }
             }
             Msg::IncomingPairingRequest(prompt) => {
@@ -1494,6 +1508,11 @@ impl ViewModel {
                 self.outgoing_pair_request = Some(request);
             }
             Msg::PairingPrompt(prompt) => {
+                let ceremony_id = prompt.attempt_id.as_slice().try_into().ok();
+                if self.pairing.ceremony_id.is_some() && self.pairing.ceremony_id != ceremony_id {
+                    self.reset_pairing_flow();
+                }
+                self.pairing.ceremony_id = ceremony_id;
                 self.push_log(fill(
                     lang,
                     Key::PairingOffersACodeToCompare,
@@ -1797,6 +1816,19 @@ impl ViewModel {
             self.pairing.window_deadline = None;
             self.pairing.prompt = None;
         }
+    }
+
+    /// Starting a new dial/request supersedes pending answers belonging to its predecessor.
+    fn reset_pairing_flow(&mut self) {
+        self.finish_pairing(false);
+        self.pairing.ceremony_id = None;
+        self.pairing.details = false;
+        self.inflight.retain(|request| {
+            !matches!(
+                request.request,
+                Request::PairWith | Request::PairingAnswer | Request::PairingRequest
+            )
+        });
     }
 
     /// A ceremony ended: the code and the dialling state are over, and a success stays on
@@ -2618,14 +2650,22 @@ impl ViewModel {
             Action::ShowDiscovered(node_id) => {
                 self.look.hidden_discovered.remove(node_id);
             }
-            Action::DonePairing => self.pairing.paired = None,
+            Action::DonePairing => {
+                self.pairing.paired = None;
+                self.pairing.ceremony_id = None;
+            }
             Action::RequestPairing(_) => {
+                self.reset_pairing_flow();
                 self.modal = None;
                 self.appearance_open = false;
                 self.look.dock_open = true;
                 self.pairing.paired = None;
             }
+            Action::AnswerPairingRequest { accept: true, .. } => {
+                self.reset_pairing_flow();
+            }
             Action::PairWith(address) => {
+                self.reset_pairing_flow();
                 self.modal = None;
                 self.appearance_open = false;
                 self.look.dock_open = true;
@@ -4272,6 +4312,7 @@ fn code_label(lang: Lang, code: &str) -> String {
         "CLIPBOARD_DISABLED" => text(lang, Key::TheClipboardDidNotTurnOn).to_owned(),
         "EXPORT_FAILED" => text(lang, Key::CouldNotWriteTheDiagnosticsFile).to_owned(),
         "PAIRING_FAILED" => text(lang, Key::ThePairingCouldNotBeAgreed).to_owned(),
+        "PAIRING_CANCELLED" => text(lang, Key::PairingCancelled).to_owned(),
         "PAIRING_GONE" => text(lang, Key::ThePairingWindowIsAlreadyClosed).to_owned(),
         "PAIRING_WINDOW_OPEN" => text(lang, Key::ThePairingWindowIsAlreadyOpen).to_owned(),
         "NO_WINDOW" => text(lang, Key::ThePairingWindowIsNotOpen).to_owned(),
