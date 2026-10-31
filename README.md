@@ -162,6 +162,12 @@ The example reports the Listener's worker Health drift-controller ratio, fill er
 coarse corrections beside its independent delivered-sample/QPC capture estimate. These
 measure different quantities; Source has no receiver drift controller.
 
+For a Windows timing-only diagnostic, run
+`cargo run -p platform-audio-win --example hw_probe -- --timing`.
+It initializes—but never starts—capture/render clients and prints actual buffer capacities,
+engine periods and available native latency queries. It plays no tone and changes no
+endpoint settings; process-loopback period/latency queries may report unsupported.
+
 ## License
 
 [MIT](LICENSE). Distributed third-party components are listed in [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).
