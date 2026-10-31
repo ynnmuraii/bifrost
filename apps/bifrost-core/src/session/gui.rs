@@ -623,6 +623,50 @@ impl Session {
 
     /// One `GuiFrame` request, answered on the connection it came from.
     pub(crate) async fn on_gui_request(&mut self, request: crate::gui::Request) {
+        #[cfg(feature = "audio")]
+        let audio_request = super::audio::is_request(&request.message);
+        #[cfg(not(feature = "audio"))]
+        let audio_request = matches!(
+            &request.message,
+            Msg::GetAudioStatus(_)
+                | Msg::SetAudio(_)
+                | Msg::StartAudio(_)
+                | Msg::StopAudio(_)
+                | Msg::SetMicrophoneMute(_)
+                | Msg::SetPtt(_)
+                | Msg::ListAudioDevices(_)
+                | Msg::SetAudioPeerGain(_)
+                | Msg::SendMediaCommand(_)
+        );
+        if audio_request {
+            #[cfg(feature = "audio")]
+            let (request_id, out) = if let Some(audio) = &self.audio {
+                if matches!(
+                    &request.message,
+                    Msg::SetAudio(_) | Msg::SetAudioPeerGain(_)
+                ) {
+                    audio.trusted(&self.trust);
+                }
+                match audio.submit(request) {
+                    Ok(()) => return,
+                    Err(request) => request,
+                }
+            } else {
+                (request.request_id, request.out)
+            };
+            #[cfg(not(feature = "audio"))]
+            let (request_id, out) = (request.request_id, request.out);
+            answer(
+                &out,
+                request_id,
+                Msg::OpResult(ipc::OpResult {
+                    ok: false,
+                    error_code: "AUDIO_UNAVAILABLE".to_owned(),
+                }),
+            )
+            .await;
+            return;
+        }
         if matches!(request.message, Msg::SetHotkey(_)) {
             self.queue_hotkey(request).await;
             return;
@@ -1543,6 +1587,10 @@ impl Session {
         if node == self.node_id {
             return bad_request();
         }
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            audio.revoke(node);
+        }
         if self.trust.is_trusted(&node) {
             let state = self.paths.state_dir().join("pending-unpairs.toml");
             if let Err(error) = self.manager.queue_unpair(node, &state).await {
@@ -1579,6 +1627,10 @@ impl Session {
 
     /// Both removal paths share the same trust and stale-layout tombstones.
     async fn forget_peer(&mut self, node: NodeId) -> ipc::OpResult {
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            audio.revoke(node);
+        }
         let mut trust = self.trust.clone();
         let removed_trust = trust.revoke(&node, identity::trust::now_unix_ms());
         if !removed_trust && !crate::topology::layout_has_node(&self.layout, &node) {

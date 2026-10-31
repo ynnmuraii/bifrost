@@ -6,8 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+audio = []
+
 [dependencies]
 anyhow = "1"
+audio-model = { path = "../../crates/audio-model" }
 clipboard = { path = "../../crates/clipboard" }
 config = { path = "../../crates/config" }
 edgefx = { path = "../../crates/edgefx" }
@@ -20,6 +24,7 @@ ipc = { path = "../../crates/ipc" }
 bifrost-desktop = { path = "../bifrost-desktop" }
 platform-probe = { path = "../../crates/platform-probe" }
 protocol = { path = "../../crates/protocol" }
+ring = "0.17"
 # `portal-restore.toml` is a small TOML document owned by core (serde + toml are
 # already in the tree through `config`, so this adds no new crates).
 serde = { version = "1", features = ["derive"] }

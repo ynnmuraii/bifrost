@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [features]
 default = ["audio"]
-audio = ["dep:bifrost-audio"]
+audio = ["dep:bifrost-audio", "bifrost-core/audio"]
 
 [dependencies]
 bifrost-agent = { path = "../bifrost-agent" }

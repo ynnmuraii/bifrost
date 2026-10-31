@@ -34,6 +34,8 @@ use crate::ownership_store::OwnershipStore;
 use crate::routing::{self, AgentSignal, Effect};
 use ipc::clock::{Clock, SuspendDetector, SystemClock};
 
+#[cfg(feature = "audio")]
+mod audio;
 mod clipboard_follow;
 mod discovery;
 /// The GUI's half of the session: `GuiFrame` requests and the events pushed to the window.
@@ -540,6 +542,8 @@ type ClipboardLink = (
 pub struct Session {
     router: crate::ids::Router,
     manager: Arc<LinkManager>,
+    #[cfg(feature = "audio")]
+    audio: Option<audio::Coordinator>,
     link_events: mpsc::Receiver<LinkEvent>,
     agent: Supervisor,
     ctl: ctl::Server,
@@ -798,6 +802,8 @@ impl Session {
         let mut session = Session {
             router,
             manager,
+            #[cfg(feature = "audio")]
+            audio: None,
             link_events,
             agent,
             ctl,
@@ -900,6 +906,27 @@ impl Session {
         };
         session.rebuild_topology();
         session
+    }
+
+    /// Installs the independent audio actor without adding native work to the input loop.
+    pub fn set_audio_source(&mut self, config: config::AudioConfig, test_dry: bool) {
+        #[cfg(feature = "audio")]
+        {
+            self.audio = Some(audio::Coordinator::spawn(
+                config,
+                self.node_id,
+                Arc::clone(&self.manager),
+                self.paths.clone(),
+                self.listen,
+                test_dry,
+                self.gui_events.clone(),
+            ));
+            if let Some(audio) = &self.audio {
+                audio.trusted(&self.trust);
+            }
+        }
+        #[cfg(not(feature = "audio"))]
+        let _ = (config, test_dry);
     }
 
     /// What the coordinator runs on every edit before applying it: the document must parse and
@@ -1221,6 +1248,22 @@ impl Session {
 
     /// Runs until `quit`, a signal, or a fatal link error.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let result = self.run_inner().await;
+        #[cfg(feature = "audio")]
+        if let Some(mut audio) = self.audio.take() {
+            audio.shutdown().await;
+        }
+        result
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            merge_audio_capabilities(&mut self.local_hello.capabilities, &audio.capabilities());
+            self.manager
+                .update_local_hello(self.local_hello.clone())
+                .await;
+        }
         let outputs = self.router.on_start(self.now_ms());
         self.apply(outputs).await;
         tracing::info!(
@@ -1249,12 +1292,25 @@ impl Session {
             // The clipboard runtime owns the sender of `clipboard_events`; with the clipboard
             // off there is no runtime, and the arm must not fire on a closed channel.
             let clipboard_enabled = self.clipboard.is_some();
+            #[cfg(feature = "audio")]
+            let audio_enabled = self.audio.is_some();
+            #[cfg(not(feature = "audio"))]
+            let audio_enabled = false;
+            #[cfg(feature = "audio")]
+            let audio = &mut self.audio;
             let mut gui_request = None;
             let step = {
                 tokio::select! {
                     event = self.link_events.recv() => Step::Link(event),
                     frame = self.agent.recv(), if attached => Step::Agent(frame),
                     event = self.clipboard_events.recv(), if clipboard_enabled => Step::Clipboard(event),
+                    changed = async {
+                        #[cfg(feature = "audio")]
+                        if let Some(audio) = audio {
+                            return audio.changed().await.is_ok();
+                        }
+                        std::future::pending::<bool>().await
+                    }, if audio_enabled => Step::Audio(changed),
                     client = self.ctl.accept() => Step::Control(client),
                     client = self.gui.accept() => Step::GuiClient(client),
                     request = self.gui_requests.recv() => {
@@ -1315,6 +1371,27 @@ impl Session {
                     // clipboard feature would silently stop, so say so.
                     tracing::warn!("the clipboard channel stopped");
                 }
+                Step::Audio(changed) => {
+                    #[cfg(feature = "audio")]
+                    {
+                        let capabilities = if changed {
+                            self.audio
+                                .as_ref()
+                                .map_or_else(Vec::new, |audio| audio.capabilities())
+                        } else {
+                            Vec::new()
+                        };
+                        merge_audio_capabilities(&mut self.local_hello.capabilities, &capabilities);
+                        self.manager
+                            .update_local_hello(self.local_hello.clone())
+                            .await;
+                        if !changed {
+                            self.audio = None;
+                        }
+                    }
+                    #[cfg(not(feature = "audio"))]
+                    let _ = changed;
+                }
                 Step::Tick => {
                     self.arm_observation().await;
                     self.clipboard_on_focus().await;
@@ -1366,6 +1443,10 @@ impl Session {
     /// session teardown after this await. Restarters must wait for process/listener exit.
     pub(crate) async fn shutdown_agent(&mut self) {
         self.stopping = true;
+        #[cfg(feature = "audio")]
+        if let Some(mut audio) = self.audio.take() {
+            audio.shutdown().await;
+        }
         self.agent.shutdown().await;
         self.stop_update_worker();
     }
@@ -2714,6 +2795,17 @@ impl Session {
                 version,
                 remote,
             } => {
+                #[cfg(feature = "audio")]
+                if let Some(audio) = &self.audio {
+                    audio.link_up(
+                        peer,
+                        generation,
+                        connection_id,
+                        &hello,
+                        remote,
+                        self.trust.is_trusted(&peer),
+                    );
+                }
                 if !self.trust.is_trusted(&peer) {
                     return;
                 }
@@ -2855,10 +2947,28 @@ impl Session {
                     return;
                 }
                 match message {
-                    // No audio coordinator is active: this core does not advertise
-                    // AUDIO_CONTROL_V1 and never authorizes remote activation.
-                    transport::convert::Inbound::Audio { .. }
-                    | transport::convert::Inbound::AudioRejected { .. } => {}
+                    transport::convert::Inbound::Audio {
+                        message,
+                        connection_id,
+                    } => {
+                        #[cfg(feature = "audio")]
+                        if let Some(audio) = &self.audio {
+                            audio.receive(peer, connection_id, message);
+                        }
+                        #[cfg(not(feature = "audio"))]
+                        let _ = (message, connection_id);
+                    }
+                    transport::convert::Inbound::AudioRejected {
+                        violation,
+                        connection_id,
+                    } => {
+                        #[cfg(feature = "audio")]
+                        if let Some(audio) = &self.audio {
+                            audio.rejected(peer, connection_id, violation);
+                        }
+                        #[cfg(not(feature = "audio"))]
+                        let _ = (violation, connection_id);
+                    }
                     transport::convert::Inbound::Unpaired(notice) => {
                         self.receive_unpaired(peer, notice).await;
                     }
@@ -2911,6 +3021,10 @@ impl Session {
                         self.on_layout(peer, message).await;
                     }
                     transport::convert::Inbound::CapabilitiesChanged(capabilities) => {
+                        #[cfg(feature = "audio")]
+                        if let Some(audio) = &self.audio {
+                            audio.capabilities_changed(peer, &capabilities);
+                        }
                         self.router.set_peer_capabilities(
                             peer,
                             transport::convert::capabilities_from_wire(&capabilities),
@@ -3017,6 +3131,10 @@ impl Session {
                 {
                     return;
                 }
+                #[cfg(feature = "audio")]
+                if let Some(audio) = &self.audio {
+                    audio.link_down(peer, generation);
+                }
                 self.link_generations.remove(&peer);
                 self.layout_connections.remove(&peer);
                 self.clipboard_links.remove(&peer);
@@ -3081,6 +3199,10 @@ impl Session {
         self.local_hello
             .capabilities
             .push(protocol::wire::Capability::RemoteUpdate as i32);
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            merge_audio_capabilities(&mut self.local_hello.capabilities, &audio.capabilities());
+        }
         self.manager
             .update_local_hello(self.local_hello.clone())
             .await;
@@ -5024,6 +5146,30 @@ fn refusal_detail(code: protocol::wire::ErrorCode, layout_revision: u64) -> Stri
     )
 }
 
+#[cfg(any(feature = "audio", test))]
+fn merge_audio_capabilities(current: &mut Vec<i32>, audio: &[i32]) {
+    current.retain(|bit| !matches!(bit, 16 | 17 | 20));
+    for &bit in audio {
+        if matches!(bit, 16 | 17 | 20) && !current.contains(&bit) {
+            current.push(bit);
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_capability_tests {
+    use super::merge_audio_capabilities;
+
+    #[test]
+    fn audio_publication_preserves_other_capabilities() {
+        let mut current = vec![1, 7, 16, 17, 18, 20, 21];
+        merge_audio_capabilities(&mut current, &[16, 20, 20, 99]);
+        assert_eq!(current, vec![1, 7, 18, 21, 16, 20]);
+        merge_audio_capabilities(&mut current, &[]);
+        assert_eq!(current, vec![1, 7, 18, 21]);
+    }
+}
+
 /// What one turn of the loop produced.
 enum Step {
     Link(Option<LinkEvent>),
@@ -5037,6 +5183,7 @@ enum Step {
     Pairing(Option<pairing::Event>),
     /// One event from the clipboard runtime: a bound channel, a message, or a lost channel.
     Clipboard(Option<crate::clipboard::Inbound>),
+    Audio(bool),
     Tick,
 }
 

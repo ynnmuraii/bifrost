@@ -25,6 +25,7 @@
 //! started as `bifrost agent …`), and it is the only role that listens on the network.
 
 mod agent;
+#[cfg(feature = "audio")]
 mod audio;
 mod clipboard;
 mod clipboard_history;
@@ -155,6 +156,7 @@ COMMANDS:
 /// The parsed global options and the command line behind them.
 struct Args {
     paths: Paths,
+    explicit_root: bool,
     command: String,
     rest: Vec<String>,
 }
@@ -164,9 +166,11 @@ fn dispatch(argv: &[String]) -> Result<(), Failure> {
         print!("{USAGE}");
         return Ok(());
     };
+    let explicit_root = invocation.flags.root.is_some();
     let paths = invocation.flags.resolve().map_err(Failure::Run)?;
     let args = Args {
         paths,
+        explicit_root,
         command: invocation.command,
         rest: invocation.rest,
     };
@@ -389,7 +393,7 @@ fn init_logging(paths: &Paths) {
 /// `run`: the daemon.
 fn run(args: &Args) -> Result<(), Failure> {
     init_logging(&args.paths);
-    let options = RunOptions::parse(&args.rest)?;
+    let options = RunOptions::parse(&args.rest, args.explicit_root)?;
     if options.dev_capture_injected {
         tracing::warn!("dev: capturing externally injected input");
     }
@@ -686,6 +690,7 @@ async fn run_async(
         options.dev_capture_injected,
         pairing_gate,
     );
+    session.set_audio_source(config.audio, options.test_audio_dry);
     session.set_appearance_source(paths.config_file(), config.appearance);
     session.set_game_guard_source(config.game_guard);
     session.set_discovery_source(config.discovery, config.network.clone());
@@ -767,6 +772,9 @@ mod network_tests {
 struct RunOptions {
     dev_capture_injected: bool,
     dry_inject: bool,
+    /// Debug-only synthetic audio requires dry input and an explicit isolated global root;
+    /// it must never activate a native audio backend or use the production user profile.
+    test_audio_dry: bool,
     dry_input_events: usize,
     /// With `--dry-inject`: also walk the synthetic pointer over the right edge, so the
     /// edge-triggered transition can be exercised without a human at the keyboard.
@@ -778,9 +786,10 @@ struct RunOptions {
 }
 
 impl RunOptions {
-    fn parse(rest: &[String]) -> Result<Self, Failure> {
+    fn parse(rest: &[String], explicit_root: bool) -> Result<Self, Failure> {
         let mut dev_capture_injected = false;
         let mut dry_inject = false;
+        let mut test_audio_dry = false;
         let mut dry_input_events = 0usize;
         let mut dry_motion = false;
         let mut dry_displays = false;
@@ -795,6 +804,10 @@ impl RunOptions {
                 }
                 "--dry-inject" => {
                     dry_inject = true;
+                    index += 1;
+                }
+                "--test-audio-dry" => {
+                    test_audio_dry = true;
                     index += 1;
                 }
                 "--dry-motion" => {
@@ -830,10 +843,17 @@ impl RunOptions {
                 "--dry-displays requires --dry-inject".to_owned(),
             ));
         }
+        validate_test_audio_dry(
+            test_audio_dry,
+            dry_inject,
+            explicit_root,
+            cfg!(debug_assertions),
+        )?;
         let agent = agent::agent_program().map_err(Failure::Run)?;
         Ok(RunOptions {
             dev_capture_injected,
             dry_inject,
+            test_audio_dry,
             dry_input_events,
             dry_motion,
             dry_displays,
@@ -841,6 +861,25 @@ impl RunOptions {
             listen,
         })
     }
+}
+
+fn validate_test_audio_dry(
+    enabled: bool,
+    dry_inject: bool,
+    explicit_root: bool,
+    debug: bool,
+) -> Result<(), Failure> {
+    if enabled {
+        if !debug {
+            return Err(Failure::Usage("--test-audio-dry is debug-only".to_owned()));
+        }
+        if !dry_inject || !explicit_root {
+            return Err(Failure::Usage(
+                "--test-audio-dry requires --dry-inject and an explicit global --root".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The private directory the launch token lives in.
@@ -1229,7 +1268,7 @@ fn control(paths: &Paths, line: &str) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod run_options_tests {
-    use super::RunOptions;
+    use super::{validate_test_audio_dry, RunOptions};
 
     #[test]
     fn dev_capture_injected_is_explicit_and_off_by_default() {
@@ -1238,9 +1277,27 @@ mod run_options_tests {
                 .iter()
                 .map(|argument| (*argument).to_owned())
                 .collect::<Vec<_>>();
-            RunOptions::parse(&arguments).unwrap_or_else(|_| panic!("valid run options"))
+            RunOptions::parse(&arguments, false).unwrap_or_else(|_| panic!("valid run options"))
         };
         assert!(!parse(&[]).dev_capture_injected);
         assert!(parse(&["--dev-capture-injected"]).dev_capture_injected);
+        assert!(!parse(&[]).test_audio_dry);
+    }
+
+    #[test]
+    fn test_audio_dry_requires_debug_dry_input_and_explicit_root() {
+        assert!(validate_test_audio_dry(false, false, false, false).is_ok());
+        assert!(validate_test_audio_dry(true, true, true, true).is_ok());
+        assert!(validate_test_audio_dry(true, false, true, true).is_err());
+        assert!(validate_test_audio_dry(true, true, false, true).is_err());
+        assert!(validate_test_audio_dry(true, true, true, false).is_err());
+        let arguments = vec!["--test-audio-dry".to_owned()];
+        assert!(RunOptions::parse(&arguments, true).is_err());
+        let arguments = vec!["--test-audio-dry".to_owned(), "--dry-inject".to_owned()];
+        assert!(RunOptions::parse(&arguments, false).is_err());
+        assert_eq!(
+            RunOptions::parse(&arguments, true).is_ok(),
+            cfg!(debug_assertions),
+        );
     }
 }
