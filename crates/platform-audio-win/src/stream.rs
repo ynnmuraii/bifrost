@@ -39,6 +39,8 @@ enum RenderSource {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CapturedFrame {
     pub samples: StereoFrame,
+    /// Raw packet-local diagnostic; process loopback can reset it on every packet.
+    /// Not a monotonic device clock, even when the QPC timestamp is valid.
     pub device_position: u64,
     pub qpc_100ns: u64,
     pub timestamp_valid: bool,
@@ -62,10 +64,12 @@ pub struct StreamSnapshot {
     pub transferred_frames: u64,
     pub dropped_capture_frames: u64,
     pub underrun_frames: u64,
-    /// Render clock units and frequency (not necessarily audio sample frames).
+    /// Raw capture packet position, or render clock units (not necessarily sample frames).
     pub device_position: u64,
+    /// Zero for process capture: packet positions do not define a device clock.
     pub clock_frequency: u64,
     pub qpc_100ns: u64,
+    /// Whether QPC is valid; device position also requires a nonzero clock frequency.
     pub clock_valid: bool,
 }
 #[derive(Default)]
@@ -282,9 +286,7 @@ fn start_process_capture(
                 return;
             }
         };
-        state
-            .frequency
-            .store(u64::from(SAMPLE_RATE), Ordering::SeqCst);
+        // Process-loopback positions reset at packet boundaries; leave frequency at zero.
         let _priority = ProAudio::enter();
         if let Err(e) = unsafe { raw.Start() } {
             let _ = ready.send(Err(e.into()));
@@ -305,6 +307,28 @@ unsafe fn read_frame(pointer: *const u8, silent: bool, index: usize) -> StereoFr
             let p = pointer.cast::<f32>().add(index * 2);
             [p.read_unaligned(), p.add(1).read_unaligned()]
         }
+    }
+}
+fn process_capture_block(
+    samples: &[f32],
+    qpc: u64,
+    flags: u32,
+    offset: usize,
+) -> audio_backend::CaptureBlock<'_> {
+    audio_backend::CaptureBlock {
+        samples,
+        frames: samples.len() / 2,
+        format: audio_backend::AudioFormat {
+            sample_rate: SAMPLE_RATE,
+            channels: 2,
+        },
+        timestamp_ns: (qpc + offset as u64 * 10_000_000 / u64::from(SAMPLE_RATE))
+            .saturating_mul(100),
+        timestamp_valid: flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0,
+        // Native process-loopback positions can reset every packet (479 -> 0);
+        // they are not a monotonic device clock. The correlated QPC remains usable.
+        device_position: None,
+        discontinuity: offset == 0 && flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
     }
 }
 struct CapturePacket<'a> {
@@ -407,25 +431,7 @@ fn capture_loop(
                                     )
                                 }
                             };
-                            callback(audio_backend::CaptureBlock {
-                                samples,
-                                frames,
-                                format: audio_backend::AudioFormat {
-                                    sample_rate: SAMPLE_RATE,
-                                    channels: 2,
-                                },
-                                timestamp_ns: (qpc
-                                    + offset as u64 * 10_000_000 / u64::from(SAMPLE_RATE))
-                                .saturating_mul(100),
-                                timestamp_valid: flags
-                                    & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32
-                                    == 0,
-                                device_position: (flags
-                                    & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32
-                                    == 0)
-                                    .then_some(position + offset as u64),
-                                discontinuity: offset == 0 && discontinuity,
-                            });
+                            callback(process_capture_block(samples, qpc, flags, offset));
                             delivered += frames as u64;
                         }
                     }
@@ -624,6 +630,32 @@ fn render_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn process_capture_blocks_keep_qpc_without_device_positions() {
+        let samples = [0.0; 2];
+        // Last sample of one 480-frame packet, then the first sample after its reset.
+        let last = process_capture_block(&samples, 1_000_000, 0, 479);
+        let next = process_capture_block(&samples, 1_100_000, 0, 0);
+        for block in [last, next] {
+            assert_eq!(block.device_position, None);
+            assert!(block.timestamp_valid);
+            assert_eq!(block.frames, 1);
+            assert_eq!(block.format.sample_rate, SAMPLE_RATE);
+        }
+        assert_eq!(last.timestamp_ns, 100_000_000 + 9_979_100);
+        assert_eq!(next.timestamp_ns, 110_000_000);
+        assert!(next.timestamp_ns > last.timestamp_ns);
+
+        let split = process_capture_block(&samples, 1_100_000, 0, 960);
+        assert_eq!(split.device_position, None);
+        assert_eq!(split.timestamp_ns, 130_000_000);
+        assert!(split.timestamp_valid);
+        let invalid =
+            process_capture_block(&samples, 0, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32, 0);
+        assert_eq!(invalid.device_position, None);
+        assert!(!invalid.timestamp_valid);
+    }
+
     #[test]
     fn explicit_format_and_ring_handoff() {
         let f = format();
