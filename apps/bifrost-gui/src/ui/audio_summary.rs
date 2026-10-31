@@ -65,6 +65,34 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                     super::theme::fam::sans(),
                     pal.ink,
                 );
+                if let Some(path) = crate::audio_path::AudioPathObservation::from_wire(session) {
+                    let peer = peer_name(vm, &session.peer);
+                    widgets::wrapped(
+                        ui,
+                        &path.reason(lang, &peer),
+                        12.0,
+                        super::theme::fam::sans(),
+                        pal.accent_ink,
+                    );
+                    widgets::hint(ui, pal, &path.ports(lang, &peer));
+                    let local = vm
+                        .status
+                        .as_ref()
+                        .and_then(|status| {
+                            status.members.iter().find(|member| {
+                                member.node_id.eq_ignore_ascii_case(&status.local_node_id)
+                            })
+                        })
+                        .map(|member| member.display_name.trim())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| text(lang, Key::ThisComputerTitle));
+                    if let Some(guidance) = ipc::AudioRole::try_from(session.local_role)
+                        .ok()
+                        .and_then(|role| path.guidance(lang, role, local, &peer))
+                    {
+                        widgets::hint(ui, pal, &guidance);
+                    }
+                }
                 if session.local_role == AudioRole::Source as i32 {
                     let capture = match session.capture_active {
                         Some(true) => text(lang, Key::AudioSystemCaptureActive).to_owned(),

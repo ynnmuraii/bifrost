@@ -36,6 +36,7 @@ pub use ui_text;
 
 pub mod app;
 pub mod audio;
+pub mod audio_path;
 pub mod audio_player;
 pub mod audio_wire;
 pub mod autostart;

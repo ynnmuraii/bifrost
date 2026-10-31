@@ -8,6 +8,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Fixes**
 
+- Show per-session UDP path observations and both endpoint ports directly in Audio settings, with conditional Listener-only firewall guidance scoped to the Source computer. Diagnosed failed Listener streams remain visible in the popup with a compact path warning and an observational tooltip; unknown legacy observations never blame a firewall.
 - Live audio health updates no longer invalidate settings, start or gain actions. Stale configuration/consent changes, future snapshots and A→B→A edits remain rejected without automatic retries.
 - Latch microphone mute/PTT release before bounded GUI admission, so continued polling cannot keep an old hold alive after queue saturation. Rejected stale/busy unmute requests leave legitimate holds untouched.
 - Correlate emergency PTT release completion by worker/request identity without treating a command acknowledgement as native rearming proof.
@@ -151,6 +152,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Исправления**
 
+- В настройках звука видны наблюдения UDP-пути каждого сеанса и порты обоих концов; условная подсказка брандмауэра относится только к порту Listener и компьютеру Source. Сеансы Listener с подтверждённой диагностикой сбоя остаются в мини-плеере с краткой пометкой и подсказкой наблюдений; отсутствие диагностики в старом статусе не выдаётся за вину брандмауэра.
 - Обновления аудиометрик больше не мешают настройкам, запуску и громкости. Устаревшие изменения конфигурации/разрешений, будущие снимки и возврат A→B→A по-прежнему отклоняются без автоматических повторов.
 - Фиксировать выключение микрофона и отпускание PTT до ограниченной очереди GUI: опрос состояния не продлевает старое удержание при переполнении. Отклонённое устаревшее или занятое включение не отменяет действующее удержание.
 - Сопоставлять подтверждение аварийного отпускания PTT с процессом и запросом, не принимая ответ на команду за доказательство готовности горячей клавиши.
