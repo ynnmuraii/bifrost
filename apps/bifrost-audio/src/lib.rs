@@ -1,5 +1,18 @@
 //! Isolated audio child. No identity/transport/core dependency, no implicit native probing.
+//!
+//! Explicit `BackendKind::Dry` is a deterministic harness, never a native fallback:
+//! its current media token is 1, initial revision 1, title "Dry media", state Paused,
+//! and Play/Pause/Toggle/Next/Previous are available. Commands execute on its control
+//! pump, change playback state as appropriate and increment that token's revision.
+//! Metadata is still exposed only under an explicitly enabled, authorized Source watch.
+//!
+//! Mic toggles persist without a TTL. Remote PTT grants alone are timed; shortcut
+//! observation needs no mic guard and GUI-only talk grants need no native hotkey.
+//! Clean release/shutdown restores via the backend guard contract (best-effort on
+//! Linux); a fresh child never reacquires or unmutes an endpoint automatically.
 #![forbid(unsafe_code)]
+mod clock;
+mod ptt_lease;
 mod worker;
 use audio_backend::{
     dry::{DryBackend, DryStream, ScriptEvent},
@@ -54,12 +67,14 @@ impl From<ipc::IpcError> for RoleError {
 }
 struct Permit {
     id: [u8; 16],
+    role: i32,
     authorized: Arc<AtomicBool>,
     deadline: Instant,
     stop_reason: i32,
 }
 struct Shared {
     stopping: AtomicBool,
+    media_enabled: AtomicBool,
     permits: Mutex<Vec<Permit>>,
 }
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -71,8 +86,14 @@ impl Shared {
     fn new() -> Self {
         Self {
             stopping: AtomicBool::new(false),
+            media_enabled: AtomicBool::new(false),
             permits: Mutex::new(Vec::with_capacity(contract::MAX_SESSIONS)),
         }
+    }
+    fn has_source(&self, now: Instant) -> bool {
+        lock(&self.permits).iter().any(|permit| {
+            permit.role == 1 && now < permit.deadline && permit.authorized.load(Ordering::Acquire)
+        })
     }
     fn stop_all(&self) {
         self.stopping.store(true, Ordering::Release);
@@ -137,6 +158,7 @@ impl Drop for AuthorityGuard {
 }
 struct Command {
     request_id: u64,
+    admitted_at: Instant,
     message: Msg,
     secrets: Option<contract::SessionSecrets>,
     permit: Option<Arc<AtomicBool>>,
@@ -162,7 +184,9 @@ fn dry_backend() -> Result<DryBackend, BackendError> {
     let mut backend = DryBackend::new(Capabilities {
         system_capture: true,
         exclude_own_process_tree: true,
-        ..Capabilities::default()
+        endpoint_mute: true,
+        global_ptt: true,
+        media: true,
     });
     let output = DeviceId::new("DRY_OUTPUT")?;
     let capture = DeviceId::new("DRY_CAPTURE")?;
@@ -188,6 +212,28 @@ fn dry_backend() -> Result<DryBackend, BackendError> {
         multimedia: defaults.clone(),
         communications: defaults,
     }))?;
+    let token = audio_backend::MediaSessionToken(1);
+    backend.apply(ScriptEvent::SetMedia {
+        session: token,
+        info: Some(audio_backend::MediaInfo::new(
+            "bifrost-dry".into(),
+            "Dry media".into(),
+            "Harness only".into(),
+            token,
+            1,
+            audio_backend::PlaybackState::Paused,
+            audio_backend::MediaCommands {
+                play: true,
+                pause: true,
+                toggle: true,
+                next: true,
+                previous: true,
+            },
+        )?),
+    })?;
+    backend.apply(ScriptEvent::SetCurrentMediaSession {
+        session: Some(token),
+    })?;
     while backend.poll_event().is_some() {}
     Ok(backend)
 }
@@ -256,7 +302,14 @@ where
             let factory = _options.dry_factory.unwrap_or(dry_backend);
             #[cfg(not(test))]
             let factory = dry_backend;
-            serve(link, kind, factory, Some(pump)).await
+            serve(
+                link,
+                kind,
+                factory,
+                Some(pump),
+                Some(DryBackend::pump_control),
+            )
+            .await
         }
         1 => {
             #[cfg(target_os = "linux")]
@@ -266,12 +319,20 @@ where
                     kind,
                     platform_audio_linux::LinuxBackend::connect,
                     None,
+                    None,
                 )
                 .await
             }
             #[cfg(windows)]
             {
-                serve(link, kind, platform_audio_win::WindowsBackend::new, None).await
+                serve(
+                    link,
+                    kind,
+                    platform_audio_win::WindowsBackend::new,
+                    None,
+                    None,
+                )
+                .await
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
@@ -286,11 +347,13 @@ async fn serve<S, B>(
     kind: i32,
     factory: fn() -> Result<B, BackendError>,
     pump: Option<worker::Pump<B::Stream>>,
+    control_pump: Option<fn(&mut B)>,
 ) -> Result<ExitReason, RoleError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     B: Backend + 'static,
     B::Stream: 'static,
+    B::Mute: 'static,
 {
     let shared = Arc::new(Shared::new());
     let _authority = AuthorityGuard(shared.clone());
@@ -309,6 +372,7 @@ where
                 kind,
                 factory,
                 pump,
+                control_pump,
             )
         })
         .map_err(|_| RoleError::WorkerFailed)?;
@@ -337,10 +401,27 @@ where
     let mut check = tokio::time::interval(Duration::from_millis(10));
     let mut reason = ExitReason::CoreLost;
     let mut failure = None;
+    let mut ptt_forwarder = ptt_lease::Forwarder::default();
+    let mut media_revision = 0u64;
+    let mut media_present = false;
     loop {
         tokio::select! {
             biased;
-            _=check.tick()=>{if shared.stopping.load(Ordering::Acquire){break;}},
+            _=check.tick()=>{
+                if shared.stopping.load(Ordering::Acquire){break;}
+                let now=Instant::now();
+                if let Some(event)=ptt_forwarder.expire(now) {
+                    if send(&mut link,0,Msg::PttEvent(event)).await.is_err(){break;}
+                }
+                if !shared.has_source(now) {shared.media_enabled.store(false,Ordering::Release);}
+                if media_present && !shared.media_enabled.load(Ordering::Acquire) {
+                    let Some(revision)=media_revision.checked_add(1) else{failure=Some(RoleError::WorkerFailed);break;};
+                    media_revision=revision;media_present=false;
+                    if send(&mut link,0,Msg::MediaSessions(w::MediaSessions {
+                        sessions:Vec::new(),current_token:None,revision,
+                    })).await.is_err(){break;}
+                }
+            },
             received=link.recv()=>{
                 let mut received=match received {Ok(received)=>received,Err(_)=>break};
                 last.store(clock.elapsed().as_millis() as u64,Ordering::Release);
@@ -358,18 +439,41 @@ where
                         if let Msg::StartSession(start)=&message {
                             let id:[u8;16]=start.session_id.as_slice().try_into().expect("AudioLink validated session id");
                             let deadline=Instant::now()+Duration::from_millis(u64::from(start.initial_authorization_ms));
-                            let admitted={let mut permits=lock(&shared.permits);if permits.len()>=contract::MAX_SESSIONS||permits.iter().any(|permit|permit.id==id){false}else{let authorized=Arc::new(AtomicBool::new(true));permits.push(Permit {id,authorized:authorized.clone(),deadline,stop_reason:1});permit=Some(authorized);true}};
+                            let admitted={let mut permits=lock(&shared.permits);if permits.len()>=contract::MAX_SESSIONS||permits.iter().any(|permit|permit.id==id){false}else{let authorized=Arc::new(AtomicBool::new(true));permits.push(Permit {id,role:start.role,authorized:authorized.clone(),deadline,stop_reason:1});permit=Some(authorized);true}};
                             if !admitted {if send(&mut link,request_id,Msg::Error(w::Error {code:3,session_id:id.to_vec()})).await.is_err(){break;}continue;}
                         }
                         let id=if let Msg::StartSession(start)=&message{Some(start.session_id.clone())}else{None};
-                        if command_tx.try_send(Command {request_id,message,secrets:received.secrets.take(),permit}).is_err(){
+                        let media_watch=if let Msg::SetMediaWatch(watch)=&message {Some(watch.enabled)} else{None};
+                        if command_tx.try_send(Command {request_id,admitted_at:Instant::now(),message,secrets:received.secrets.take(),permit}).is_err(){
                             if let Some(id)=id {shared.revoke(&id);shared.remove(&id);}
                             if send(&mut link,request_id,Msg::Error(w::Error {code:3,session_id:Vec::new()})).await.is_err(){break;}
+                        } else if let Some(enabled)=media_watch {
+                            shared.media_enabled.store(enabled,Ordering::Release);
                         }
                     }
                 }
             },
-            response=response_rx.recv()=>{match response {Some(response)=>{if send(&mut link,response.request_id,response.message).await.is_err(){break;}},None=>{if !shared.stopping.load(Ordering::Acquire){reason=ExitReason::WorkerFailed;}break;}}},
+            response=response_rx.recv()=>{match response {
+                Some(response)=>{
+                    let message=match response.message {
+                        Msg::PttEvent(event)=>{
+                            let Some(event)=ptt_forwarder.accept(event,clock::now_ns(),Instant::now()) else{continue;};
+                            Msg::PttEvent(event)
+                        },
+                        Msg::MediaSessions(mut snapshot)=>{
+                            if !shared.media_enabled.load(Ordering::Acquire) || !shared.has_source(Instant::now()) {
+                                snapshot.sessions.clear();snapshot.current_token=None;
+                            }
+                            let Some(revision)=media_revision.checked_add(1) else{failure=Some(RoleError::WorkerFailed);break;};
+                            media_revision=revision;snapshot.revision=revision;media_present=!snapshot.sessions.is_empty();
+                            Msg::MediaSessions(snapshot)
+                        },
+                        message=>message,
+                    };
+                    if send(&mut link,response.request_id,message).await.is_err(){break;}
+                },
+                None=>{if !shared.stopping.load(Ordering::Acquire){reason=ExitReason::WorkerFailed;}break;}
+            }},
             _=status_tick.tick()=>{let health=health_rx.borrow().clone();if send(&mut link,0,Msg::Health(health)).await.is_err(){break;}},
         }
     }

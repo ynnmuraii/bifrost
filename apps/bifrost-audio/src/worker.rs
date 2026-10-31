@@ -1,3 +1,5 @@
+mod media_controls;
+mod mic_controls;
 use super::*;
 use audio_media::{
     crypto::DirectionMaterial,
@@ -28,10 +30,12 @@ struct Inventory {
 struct Worker<B: Backend + 'static>
 where
     B::Stream: 'static,
+    B::Mute: 'static,
 {
     backend: Option<B>,
     factory: fn() -> Result<B, BackendError>,
     pump: Option<Pump<B::Stream>>,
+    control_pump: Option<fn(&mut B)>,
     kind: i32,
     shared: Arc<Shared>,
     responses: mpsc::Sender<Response>,
@@ -43,7 +47,10 @@ where
     used_keys: Vec<[u8; 32]>,
     inventory: Option<Inventory>,
     revision: u64,
+    media_controls: media_controls::Controls,
+    mic_controls: mic_controls::Controls<B::Mute>,
 }
+#[allow(clippy::too_many_arguments)] // Explicit harness hooks never apply to native backends.
 pub(crate) fn run<B: Backend + 'static>(
     shared: Arc<Shared>,
     commands: Receiver<Command>,
@@ -52,13 +59,21 @@ pub(crate) fn run<B: Backend + 'static>(
     kind: i32,
     factory: fn() -> Result<B, BackendError>,
     pump: Option<Pump<B::Stream>>,
+    control_pump: Option<fn(&mut B)>,
 ) where
     B::Stream: 'static,
+    B::Mute: 'static,
 {
+    let timer_responses = responses.clone();
+    let timer_shared = shared.clone();
+    let mic_controls = mic_controls::Controls::new_with_events(move |id, message| {
+        emit_response(&timer_responses, &timer_shared, id, message);
+    });
     let mut worker = Worker {
         backend: None,
         factory,
         pump,
+        control_pump,
         kind,
         shared,
         responses,
@@ -70,6 +85,8 @@ pub(crate) fn run<B: Backend + 'static>(
         used_keys: Vec::with_capacity(MAX_STARTS * 2),
         inventory: None,
         revision: 0,
+        media_controls: media_controls::Controls::new(),
+        mic_controls,
     };
     let (mut next_pump, mut next_health) = (Instant::now(), Instant::now());
     while !worker.shared.stopping.load(Ordering::Acquire) {
@@ -111,6 +128,13 @@ pub(crate) fn run<B: Backend + 'static>(
             next_health = Instant::now() + Duration::from_millis(200);
         }
     }
+    if let Some(backend) = worker.backend.as_mut() {
+        let responses = &worker.responses;
+        let shared = &worker.shared;
+        let mut emit = |id, message| emit_response(responses, shared, id, message);
+        worker.media_controls.shutdown(backend, &mut emit);
+        worker.mic_controls.shutdown(backend, &mut emit);
+    }
     worker.shared.stop_all();
     for mut session in worker.sessions.drain(..) {
         let _ = session.media.stop();
@@ -123,6 +147,7 @@ pub(crate) fn run<B: Backend + 'static>(
 impl<B: Backend + 'static> Worker<B>
 where
     B::Stream: 'static,
+    B::Mute: 'static,
 {
     fn backend(&mut self) -> Result<&mut B, BackendError> {
         if self.backend.is_none() {
@@ -131,20 +156,12 @@ where
         Ok(self.backend.as_mut().expect("initialized above"))
     }
     fn response(&self, request_id: u64, message: Msg) {
-        if self
-            .responses
-            .try_send(Response {
-                request_id,
-                message,
-            })
-            .is_err()
-        {
-            self.shared.stop_all();
-        }
+        emit_response(&self.responses, &self.shared, request_id, message);
     }
     fn command(&mut self, command: Command) {
         let Command {
             request_id,
+            admitted_at,
             message,
             secrets,
             permit,
@@ -180,6 +197,13 @@ where
                     Err(6)
                 }
             }
+            message
+                if media_controls::Controls::handles(&message)
+                    || mic_controls::Controls::<B::Mute>::handles(&message) =>
+            {
+                self.control_command(request_id, message, admitted_at)
+                    .map_err(control_code)
+            }
             _ => Err(6),
         };
         if let Err(code) = result {
@@ -210,6 +234,65 @@ where
                     session_id: start_id.unwrap_or_default(),
                 }),
             );
+        }
+    }
+    fn active_source(&mut self) -> bool {
+        self.sessions.iter_mut().any(|session| {
+            session.role == 1
+                && session.authorized.load(Ordering::Acquire)
+                && session.media.snapshot().sending
+        })
+    }
+    fn control_command(
+        &mut self,
+        id: u64,
+        message: Msg,
+        admitted_at: Instant,
+    ) -> Result<(), BackendError> {
+        let active = self.active_source();
+        if matches!(&message, Msg::MediaCommand(_))
+            && !self.shared.media_enabled.load(Ordering::Acquire)
+        {
+            self.response(
+                id,
+                Msg::MediaCommandResult(w::MediaCommandResult { result: 5 }),
+            );
+            return Ok(());
+        }
+        if self.backend.is_none() {
+            match &message {
+                Msg::SetMediaWatch(w::SetMediaWatch { enabled: false }) => return Ok(()),
+                Msg::SetMediaWatch(_) => return Err(BackendError::Stopped),
+                Msg::ReleaseMicMute(_)
+                | Msg::SetMicMute(_)
+                | Msg::PttGrant(_)
+                | Msg::PttRevoke(_) => return Err(BackendError::Stopped),
+                Msg::ConfigurePtt(config) if config.binding.is_none() => {
+                    self.response(
+                        id,
+                        Msg::PttEvent(w::PttEvent {
+                            kind: 3,
+                            observed_at_ns: 0,
+                            expires_at_ns: 0,
+                            ..Default::default()
+                        }),
+                    );
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        self.backend()?;
+        let backend = self.backend.as_mut().expect("initialized above");
+        let responses = &self.responses;
+        let shared = &self.shared;
+        let mut emit = |id, message| emit_response(responses, shared, id, message);
+        if media_controls::Controls::handles(&message) {
+            self.media_controls
+                .command(backend, id, message, active, &mut emit)
+        } else {
+            self.mic_controls
+                .command_at(backend, id, message, admitted_at, &mut emit)
         }
     }
     fn probe(&mut self, request_id: u64) {
@@ -248,9 +331,23 @@ where
                     Availability::Unavailable(error) => (3, reason(error)),
                 };
                 capabilities.push(add(3, availability, why));
-                capabilities.push(add(4, 2, if kind == 3 { 7 } else { 8 }));
-                capabilities.push(add(5, 2, 8));
-                capabilities.push(add(6, 2, 9));
+                let ptt = match probe.ptt_release {
+                    Some(ReleaseObservation::Native)
+                    | Some(ReleaseObservation::Polling {
+                        interval_ms: 1..=125,
+                    }) => probe.ptt,
+                    _ => Availability::Unavailable(BackendError::Unsupported),
+                };
+                for (capability, observation) in
+                    [(4, probe.endpoint_mute), (5, ptt), (6, probe.media)]
+                {
+                    let (availability, why) = match observation {
+                        Availability::Available => (1, 0),
+                        Availability::Unavailable(BackendError::Unsupported) => (2, 2),
+                        Availability::Unavailable(error) => (3, reason(error)),
+                    };
+                    capabilities.push(add(capability, availability, why));
+                }
                 w::Ready {
                     backend: kind,
                     probed: true,
@@ -487,6 +584,9 @@ where
         );
     }
     fn events(&mut self) {
+        if let (Some(pump), Some(backend)) = (self.control_pump, self.backend.as_mut()) {
+            pump(backend);
+        }
         for _ in 0..8 {
             let event = self.backend.as_mut().and_then(Backend::poll_event);
             let Some(event) = event else {
@@ -497,6 +597,21 @@ where
             }
             if let Some(group) = self.listener.as_mut() {
                 group.on_backend_event(&event);
+            }
+            let active = self.active_source();
+            if let Some(backend) = self.backend.as_mut() {
+                let responses = &self.responses;
+                let shared = &self.shared;
+                let mut emit = |id, message| emit_response(responses, shared, id, message);
+                self.media_controls
+                    .event(backend, &event, active, &mut emit);
+                self.mic_controls.event(
+                    backend,
+                    &event,
+                    crate::clock::now_ns(),
+                    Instant::now(),
+                    &mut emit,
+                );
             }
             let event = match event {
                 Event::Device(event) => Some(match event {
@@ -555,6 +670,15 @@ where
             } else {
                 index += 1;
             }
+        }
+        let active = self.active_source();
+        if let Some(backend) = self.backend.as_mut() {
+            let responses = &self.responses;
+            let shared = &self.shared;
+            let mut emit = |id, message| emit_response(responses, shared, id, message);
+            self.media_controls.tick(backend, active, &mut emit);
+            self.mic_controls
+                .tick(backend, crate::clock::now_ns(), Instant::now(), &mut emit);
         }
     }
     fn push_health(&mut self) {
@@ -673,5 +797,28 @@ fn stop_reason(reason: media::StopReason) -> i32 {
         media::StopReason::PathTimeout => 5,
         media::StopReason::RotationRequired => 6,
         media::StopReason::AuthorizationLost => 9,
+    }
+}
+fn emit_response(
+    responses: &mpsc::Sender<Response>,
+    shared: &Shared,
+    request_id: u64,
+    message: Msg,
+) {
+    if responses
+        .try_send(Response {
+            request_id,
+            message,
+        })
+        .is_err()
+    {
+        shared.stop_all();
+    }
+}
+fn control_code(error: BackendError) -> i32 {
+    match error {
+        BackendError::Busy => 3,
+        BackendError::Stopped | BackendError::InvalidArgument | BackendError::StaleRevision => 6,
+        error => code(error),
     }
 }

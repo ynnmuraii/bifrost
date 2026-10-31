@@ -590,9 +590,9 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             } else {
                 match event.kind {
                     1 | 2 => event.reason == 0,
-                    3 => matches!(event.reason, 1..=4),
-                    4 => event.reason == 5,
-                    5 => event.reason == 6,
+                    3 => matches!(event.reason, 1..=4 | 6),
+                    4 => matches!(event.reason, 5 | 7),
+                    5 => matches!(event.reason, 2 | 6),
                     _ => false,
                 }
             };

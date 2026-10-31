@@ -129,10 +129,12 @@ enum Reply {
 struct Command {
     generation: u64,
     message: Msg,
+    admitted_at: Instant,
     reply: oneshot::Sender<Result<Reply>>,
 }
 impl AudioHandle {
     async fn command(&self, message: Msg) -> Result<Reply> {
+        let admitted_at = Instant::now();
         let generation = self.generation.load(Ordering::Acquire);
         if generation == 0 {
             return Err(AudioSupervisorError::Unavailable);
@@ -152,6 +154,7 @@ impl AudioHandle {
             .try_send(Command {
                 generation,
                 message,
+                admitted_at,
                 reply,
             })
             .map_err(|error| match error {
@@ -659,7 +662,10 @@ async fn serve(
                     }
                     let next_request = request.checked_add(1).ok_or(AudioSupervisorError::InvalidFrame)?;
                     // Handle validation bounds the queue; AudioLink validates the actual wire frame.
-                    let message = command.message;
+                    let mut message = command.message;
+                    if let Err(error) = bound_grant_queue(&mut message, command.admitted_at, Instant::now()) {
+                        let _ = command.reply.send(Err(error)); continue;
+                    }
                     let shutdown = matches!(message, Msg::Shutdown(_));
                     let inventory = match &message { Msg::ListDevices(query) => Some(Inventory { direction: query.direction, page: 0, revision: 0, devices: Vec::new() }), _ => None };
                     let response = matches!(message, Msg::ProbeBackend(_) | Msg::ListDevices(_));
@@ -694,6 +700,22 @@ async fn serve(
         let _ = response.reply.send(Err(AudioSupervisorError::ChildLost));
     }
     result
+}
+
+// Whole milliseconds round down: time in the supervisor queue never extends a grant.
+fn bound_grant_queue(message: &mut Msg, admitted_at: Instant, now: Instant) -> Result<()> {
+    if let Msg::PttGrant(grant) = message {
+        let deadline = admitted_at + Duration::from_millis(u64::from(grant.ttl_ms));
+        let remaining = deadline
+            .checked_duration_since(now)
+            .ok_or(AudioSupervisorError::Timeout)?
+            .as_millis();
+        if remaining == 0 {
+            return Err(AudioSupervisorError::Timeout);
+        }
+        grant.ttl_ms = u32::try_from(remaining).map_err(|_| AudioSupervisorError::InvalidFrame)?;
+    }
+    Ok(())
 }
 
 async fn run(
@@ -1149,6 +1171,7 @@ mod tests {
             tx.send(Command {
                 generation: 1,
                 message,
+                admitted_at: Instant::now(),
                 reply,
             })
             .await
@@ -1400,6 +1423,7 @@ mod tests {
             .try_send(Command {
                 generation: 1,
                 message: Msg::ProbeBackend(w::ProbeBackend {}),
+                admitted_at: Instant::now(),
                 reply,
             })
             .unwrap_or_else(|_| panic!("fixture queue"));
@@ -1455,5 +1479,145 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+    #[test]
+    fn queued_grants_keep_only_the_original_remaining_lifetime() {
+        let now = Instant::now();
+        let mut grant = Msg::PttGrant(w::PttGrant {
+            grant_id: 7,
+            ttl_ms: 250,
+        });
+        bound_grant_queue(&mut grant, now, now + Duration::from_millis(100)).unwrap();
+        assert!(matches!(
+            grant,
+            Msg::PttGrant(w::PttGrant { ttl_ms: 150, .. })
+        ));
+        assert_eq!(
+            bound_grant_queue(&mut grant, now, now + Duration::from_millis(251)),
+            Err(AudioSupervisorError::Timeout)
+        );
+        let mut toggle = Msg::SetMicMute(w::SetMicMute {
+            expected_generation: 1,
+            muted: false,
+        });
+        assert!(bound_grant_queue(&mut toggle, now, now + Duration::from_secs(60)).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_child_mic_grant_expiry_and_restart_drop_native_ownership() {
+        async fn mute(
+            events: &mut mpsc::Receiver<AudioSupervisorEvent>,
+            id: u64,
+        ) -> w::MuteSnapshot {
+            loop {
+                match next(events).await {
+                    AudioSupervisorEvent::MuteSnapshot {
+                        request_id,
+                        snapshot,
+                        ..
+                    } if request_id == id => return snapshot,
+                    AudioSupervisorEvent::Failed { reason, .. } => {
+                        panic!("native control failed: {reason}")
+                    }
+                    AudioSupervisorEvent::CommandRejected { error, .. } => {
+                        panic!("native control rejected: {error:?}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let root = Root::new();
+        let (handle, mut events) = AudioSupervisor::start(root.config("m5")).await.unwrap();
+        let (generation, pid) = ready(&mut events).await;
+        assert!(handle.probe().await.unwrap().probed);
+        let id = handle
+            .acquire_mic_mute(w::DeviceSelection {
+                selector: Some(w::device_selection::Selector::FollowDefault(2)),
+            })
+            .await
+            .unwrap();
+        let original = mute(&mut events, id).await;
+        assert!(original.guard_active && !original.muted);
+        let id = handle
+            .set_mic_mute(original.generation, true)
+            .await
+            .unwrap();
+        assert!(mute(&mut events, id).await.muted);
+        let grant = handle.ptt_grant(73, 200).await.unwrap();
+        let (mut opened, mut admitted, mut expired, mut remuted) = (false, false, false, false);
+        timeout(Duration::from_secs(3), async {
+            while !expired || !remuted {
+                match next(&mut events).await {
+                    AudioSupervisorEvent::MuteSnapshot { snapshot, .. } => {
+                        assert!(snapshot.guard_active);
+                        if !snapshot.muted {
+                            opened = true;
+                        }
+                        if expired && snapshot.muted {
+                            remuted = true;
+                        }
+                    }
+                    AudioSupervisorEvent::PttEvent {
+                        generation: observed_generation,
+                        request_id,
+                        event,
+                    } => {
+                        assert_eq!(observed_generation, generation);
+                        if request_id == grant {
+                            assert_eq!(event.kind, 1);
+                            admitted = true;
+                        }
+                        if event.grant_id == 73 && event.kind == 3 && event.reason == 1 {
+                            assert_eq!(request_id, 0);
+                            expired = true;
+                        }
+                    }
+                    AudioSupervisorEvent::Failed { reason, .. } => panic!("grant failed: {reason}"),
+                    AudioSupervisorEvent::CommandRejected { error, .. } => {
+                        panic!("grant rejected: {error:?}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("independent talk grant expiry");
+        assert!(opened && admitted);
+        #[cfg(unix)]
+        assert!(std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        #[cfg(windows)]
+        assert!(std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let (next_generation, next_pid) = ready(&mut events).await;
+        assert!(next_generation > generation);
+        let release = handle.release_mic_mute().await.unwrap();
+        loop {
+            if let AudioSupervisorEvent::CommandRejected {
+                generation,
+                request_id,
+                error,
+            } = next(&mut events).await
+            {
+                if request_id == release {
+                    assert_eq!(generation, next_generation);
+                    assert_eq!(error.code, 6);
+                    break;
+                }
+            }
+        }
+        handle.shutdown().await.unwrap();
+        #[cfg(target_os = "linux")]
+        for pid in [pid, next_pid] {
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = next_pid;
     }
 }

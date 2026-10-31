@@ -1,4 +1,45 @@
 use super::*;
+
+#[test]
+fn explicit_dry_media_fixture_is_revisioned_and_commandable() {
+    let mut backend = dry_backend().unwrap();
+    let token = MediaSessionToken(1);
+    assert_eq!(backend.current_media_session().unwrap(), Some(token));
+    let initial = backend.media_sessions().unwrap().remove(0);
+    assert_eq!(initial.session, token);
+    assert_eq!(initial.revision, 1);
+    assert!(!initial.title().is_empty());
+    assert_eq!(initial.state, PlaybackState::Paused);
+    for command in [
+        MediaCommand::Play,
+        MediaCommand::Pause,
+        MediaCommand::Toggle,
+        MediaCommand::Next,
+        MediaCommand::Previous,
+    ] {
+        assert!(initial.commands.contains(command));
+    }
+    for (id, command, expected) in [
+        (1, MediaCommand::Play, PlaybackState::Playing),
+        (2, MediaCommand::Pause, PlaybackState::Paused),
+        (3, MediaCommand::Toggle, PlaybackState::Playing),
+    ] {
+        backend
+            .media_command(MediaCommandRequest {
+                request_id: id,
+                session: token,
+                expected_revision: id,
+                command,
+            })
+            .unwrap();
+        backend.pump_control();
+        let current = backend.media_sessions().unwrap().remove(0);
+        assert_eq!(current.session, token);
+        assert_eq!(current.revision, id + 1);
+        assert_eq!(current.state, expected);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Observed {
     samples: AtomicU64,
@@ -45,6 +86,9 @@ fn arguments_reject_secrets_and_implicit_backend_switches() {
 }
 #[cfg(unix)]
 mod local {
+    mod m5;
+    mod m6;
+    mod scripted;
     use super::*;
     use ipc::{
         peer::SameUser,
@@ -193,12 +237,17 @@ mod local {
                         serial += 1;
                     }
                     frame = core.recv() => {
-                        match frame.unwrap().frame.msg.unwrap() {
+                        let received = frame.unwrap().frame;
+                        match received.msg.unwrap() {
                             Msg::SessionEvent(event) => {
                                 assert_eq!(event.session_id, vec![13; 16]);
                                 assert_eq!(event.kind, kind);
                                 assert_eq!(event.local_udp_port, port);
                                 return event;
+                            }
+                            Msg::Error(error) if kind == 5 && received.request_id == 100
+                                && error.code == 6 && error.session_id == vec![13; 16] => {
+                                // An automatic renewal can race terminal path failure.
                             }
                             Msg::Error(error) => panic!("session error: {}", error.code),
                             _ => {}
