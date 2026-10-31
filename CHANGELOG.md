@@ -30,6 +30,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Preserve explicit enabled audio intent while a Listener group is being minted or a Source's selected trusted Listener is unresolved. Config and GUI validation accept these pending states without granting consent or claiming active media.
 - Wire optional system-audio control into core and GUI/tray requests: explicit bilateral consent, authenticated Listener-group discovery, parent-bound key derivation, isolated audio-child supervision, device listing and Listener-local gain/mute. Native startup precedes Commit, Active requires authenticated path validation, and per-session one-second leases fail closed independently of IPC heartbeat. Explicit disable removes the child and media sockets; microphone/PTT/media-command operations remain explicitly unsupported.
 - Exercise isolated multi-core audio with deterministic Dry children, real pairing/consent/group discovery, Source-side starts, shared Listener rendering, lifecycle failures and audio-enabled KVM suites. Unpaired fixtures own process and root cleanup, including pairing-request tests. The hidden Dry-audio switch requires a debug build, dry input and an explicit test root; production does not read the harness-only audio environment flag.
+- Choose each multi-core fixture's input and clipboard endpoints as one simultaneously bound batch, preventing duplicate ephemeral-port numbers before services start.
 
 **Audio media internals**
 
@@ -92,6 +93,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Сохраняется явное включение звука, пока создаётся группа Listener или разрешается выбранный доверенный Listener для Source. Валидаторы конфига и GUI принимают такие ожидающие состояния, не выдавая разрешений и не заявляя об активной передаче.
 - Управление системным звуком подключено к core и запросам GUI/трея: явные двусторонние разрешения, проверенный поиск группы Listener, ключи родительского соединения, отдельный аудиопроцесс, список устройств и локальная громкость/заглушение Listener. Нативный запуск предшествует Commit, Active требует проверки UDP-пути, а отдельные секундные разрешения сеансов истекают независимо от IPC heartbeat. Явное выключение убирает дочерний процесс и медиасокеты; микрофон/PTT/медиакоманды честно отвечают «не поддерживается».
 - Добавлены проверки звука между изолированными core с детерминированными Dry-процессами: настоящее сопряжение, разрешения и поиск группы, запуск со стороны Source, общий рендер Listener, отказы жизненного цикла и KVM со включённым звуком. Несопряжённый стенд сам завершает процессы и удаляет корни, в том числе в тестах запросов сопряжения. Скрытый Dry-переключатель требует отладочной сборки, dry-ввода и явно заданного тестового корня; рабочий бинарник не читает аудиофлаг окружения тестового стенда.
+- Входные и буферные порты многопроцессного стенда выбираются одним одновременно связанным набором, чтобы ОС не выдала один временный порт двум службам до их запуска.
 
 **Внутренний аудиотракт**
 

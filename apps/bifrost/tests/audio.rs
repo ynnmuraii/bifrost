@@ -460,3 +460,15 @@ fn gui_controls_use_authoritative_media_state_and_deferred_features_never_succee
     listener.closed();
     source.closed();
 }
+
+#[test]
+fn fixture_input_and_clipboard_endpoints_are_distinct_and_reservations_are_released() {
+    let _guard = common::serial();
+    let ports: [u16; 6] = common::distinct_ports();
+    let unique: std::collections::BTreeSet<_> = ports.into_iter().collect();
+    assert_eq!(unique.len(), ports.len());
+    let _listeners = ports.map(|port| {
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("fixture reservation is released for the service")
+    });
+}

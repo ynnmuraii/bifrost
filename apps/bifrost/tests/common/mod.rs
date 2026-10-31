@@ -998,10 +998,7 @@ impl Harness {
         let dir = unique_dir("fault-injection");
         let a_root = dir.join("a");
         let b_root = dir.join("b");
-        let a_port = free_port();
-        let b_port = free_port();
-        let a_clipboard_port = free_port();
-        let b_clipboard_port = free_port();
+        let [a_port, b_port, a_clipboard_port, b_clipboard_port] = distinct_ports();
         for root in [&a_root, &b_root] {
             std::fs::create_dir_all(root.join("config")).expect("config directory");
         }
@@ -1222,6 +1219,23 @@ pub fn free_port() -> u16 {
         .local_addr()
         .expect("local address")
         .port()
+}
+
+/// Chooses fixture endpoints together while every reservation remains bound.
+///
+/// Separate `free_port` calls can immediately reuse an earlier result, assigning
+/// input and clipboard the same port before either service starts. This batch
+/// prevents that alias without retries; child processes still bind the released
+/// ports themselves, so it is not an inherited-listener handoff.
+pub fn distinct_ports<const N: usize>() -> [u16; N] {
+    let reservations: [TcpListener; N] =
+        std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").expect("reserve fixture port"));
+    reservations.each_ref().map(|listener| {
+        listener
+            .local_addr()
+            .expect("reserved fixture address")
+            .port()
+    })
 }
 
 /// The base configuration, with the topology section left out.
@@ -1664,11 +1678,12 @@ impl Cluster {
         let names = ["w", "a", "b"];
         let mut roots = Vec::new();
         let mut ports = Vec::new();
+        let endpoints: [u16; 6] = distinct_ports();
         for (index, name) in names.iter().enumerate() {
             let root = dir.join(name);
             std::fs::create_dir_all(root.join("config")).expect("config directory");
-            let port = free_port();
-            let clipboard_port = free_port();
+            let port = endpoints[index * 2];
+            let clipboard_port = endpoints[index * 2 + 1];
             // `AC-21`: «владение можно заявить с любого узла» — every node in the cluster
             // may own; only `w` claims on startup, the other two follow until asked.
             write_config_sides(
@@ -1848,10 +1863,9 @@ impl Unpaired {
         }
         // Paired with nobody, so the identity has to be created before the id can be read:
         // `peers` loads-or-creates it, which is what the harness does for the paired cases too.
-        let a_port = free_port();
-        let b_port = free_port();
-        write_config(&a_root, a_port, free_port(), "left", true, false);
-        write_config(&b_root, b_port, free_port(), "right", true, false);
+        let [a_port, b_port, a_clipboard_port, b_clipboard_port] = distinct_ports();
+        write_config(&a_root, a_port, a_clipboard_port, "left", true, false);
+        write_config(&b_root, b_port, b_clipboard_port, "right", true, false);
         let a_id = peers(&a_root);
         let b_id = peers(&b_root);
         let a = spawn_node(a_root, a_id.clone(), false, false, "a");
