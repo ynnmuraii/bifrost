@@ -252,6 +252,7 @@ fn is_core(message: &w::audio_frame::Msg) -> bool {
             | w::audio_frame::Msg::ListDevices(_)
             | w::audio_frame::Msg::StartSession(_)
             | w::audio_frame::Msg::StopSession(_)
+            | w::audio_frame::Msg::RenewSession(_)
             | w::audio_frame::Msg::SetGain(_)
             | w::audio_frame::Msg::Ping(_)
             | w::audio_frame::Msg::Shutdown(_)
@@ -278,6 +279,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             | Msg::ListDevices(_)
             | Msg::StartSession(_)
             | Msg::StopSession(_)
+            | Msg::RenewSession(_)
             | Msg::SetGain(_)
             | Msg::ProbeBackend(_)
             | Msg::Shutdown(_)
@@ -335,7 +337,9 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
         }
         Msg::StartSession(start) => {
             session_id(&start.session_id)?;
-            if !matches!(start.profile, 1 | 2) {
+            if !matches!(start.profile, 1 | 2)
+                || !(1..=1000).contains(&start.initial_authorization_ms)
+            {
                 return Err(invalid());
             }
             let local = address(&start.local_bind_ip, start.local_scope_id)?;
@@ -374,6 +378,12 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             }
         }
         Msg::StopSession(stop) => session_id(&stop.session_id)?,
+        Msg::RenewSession(renew) => {
+            session_id(&renew.session_id)?;
+            if !(1..=1000).contains(&renew.ttl_ms) {
+                return Err(invalid());
+            }
+        }
         Msg::SetGain(gain) => {
             session_id(&gain.session_id)?;
             if gain.gain_percent > 100 {
@@ -415,8 +425,8 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
         }
         Msg::SessionEvent(event) => {
             session_id(&event.session_id)?;
-            if !matches!(event.kind, 1..=5)
-                || (event.kind == 5 && !matches!(event.reason, 1..=8))
+            if !matches!(event.kind, 1..=6)
+                || (event.kind == 5 && !matches!(event.reason, 1..=9))
                 || (event.kind != 5 && event.reason != 0)
                 || (event.kind == 1 && !port(event.local_udp_port, false))
                 || (event.kind != 1 && event.local_udp_port != 0)

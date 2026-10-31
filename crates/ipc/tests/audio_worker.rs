@@ -2,6 +2,7 @@ use ipc::{
     audio_worker::{self as contract, AudioLink},
     Framed,
 };
+use prost::Message;
 use protocol::audio_worker::{self as w, audio_frame::Msg};
 fn attach() -> Msg {
     Msg::Attach(w::Attach {
@@ -47,6 +48,7 @@ fn start() -> w::StartSession {
         }),
         local_scope_id: 0,
         peer_scope_id: 0,
+        initial_authorization_ms: 1000,
     }
 }
 fn frame(message: Msg) -> w::AudioFrame {
@@ -88,6 +90,130 @@ fn start_validation_rejects_keys_addresses_roles_and_reserved_mic() {
             "mutation {mutation}"
         );
     }
+}
+#[test]
+fn authorization_ttls_and_renew_session_ids_are_bounded() {
+    for ttl_ms in [0, 1, 1000, 1001] {
+        let valid = (1..=1000).contains(&ttl_ms);
+        let mut request = start();
+        request.initial_authorization_ms = ttl_ms;
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::StartSession(request))).is_ok(),
+            valid
+        );
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::RenewSession(w::RenewSession {
+                session_id: vec![3; 16],
+                ttl_ms,
+            })))
+            .is_ok(),
+            valid
+        );
+    }
+    for length in [0, 15, 17] {
+        assert!(
+            contract::validate_frame(&frame(Msg::RenewSession(w::RenewSession {
+                session_id: vec![3; length],
+                ttl_ms: 1000,
+            })))
+            .is_err()
+        );
+    }
+    let mut renew = frame(Msg::RenewSession(w::RenewSession {
+        session_id: vec![3; 16],
+        ttl_ms: 1000,
+    }));
+    renew.request_id = 0;
+    assert!(contract::validate_frame(&renew).is_err());
+}
+
+#[test]
+fn started_ack_requires_native_port_without_implying_path_validation() {
+    let mut event = frame(Msg::SessionEvent(w::SessionEvent {
+        session_id: vec![3; 16],
+        kind: w::EventKind::Started as i32,
+        reason: 0,
+        local_udp_port: 40000,
+    }));
+    event.request_id = 0;
+    // Native initialization is acknowledged independently of peer/path readiness.
+    assert!(contract::validate_frame(&event).is_ok());
+    let Some(Msg::SessionEvent(payload)) = event.msg.as_mut() else {
+        unreachable!();
+    };
+    payload.kind = w::EventKind::PathValidated as i32;
+    payload.local_udp_port = 0;
+    assert!(contract::validate_frame(&event).is_ok());
+}
+
+#[test]
+fn session_event_kinds_reasons_and_ports_preserve_wire_contract() {
+    assert_eq!(w::EventKind::Started as i32, 1);
+    assert_eq!(w::EventKind::Degraded as i32, 2);
+    assert_eq!(w::EventKind::DeviceInvalidated as i32, 3);
+    assert_eq!(w::EventKind::RotationRequired as i32, 4);
+    assert_eq!(w::EventKind::Stopped as i32, 5);
+    assert_eq!(w::EventKind::PathValidated as i32, 6);
+    assert_eq!(w::StopReason::AuthorizationLost as i32, 9);
+    for kind in [-1, 0, 1, 2, 3, 4, 5, 6, 7, i32::MAX] {
+        for reason in -1..=10 {
+            for local_udp_port in [0, 40000, 47902, 65536] {
+                let mut event = frame(Msg::SessionEvent(w::SessionEvent {
+                    session_id: vec![3; 16],
+                    kind,
+                    reason,
+                    local_udp_port,
+                }));
+                event.request_id = 0;
+                let valid = (1..=6).contains(&kind)
+                    && if kind == 5 {
+                        (1..=9).contains(&reason)
+                    } else {
+                        reason == 0
+                    }
+                    && if kind == 1 {
+                        local_udp_port == 40000
+                    } else {
+                        local_udp_port == 0
+                    };
+                assert_eq!(
+                    contract::validate_frame(&event).is_ok(),
+                    valid,
+                    "kind={kind}, reason={reason}, port={local_udp_port}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stopped_authorization_lost_is_valid_but_unknown_reasons_are_not() {
+    for reason in 0..=10 {
+        let mut stopped = frame(Msg::SessionEvent(w::SessionEvent {
+            session_id: vec![3; 16],
+            kind: 5,
+            reason,
+            local_udp_port: 0,
+        }));
+        stopped.request_id = 0;
+        assert_eq!(
+            contract::validate_frame(&stopped).is_ok(),
+            (1..=9).contains(&reason)
+        );
+    }
+}
+
+#[test]
+fn renewal_uses_unreserved_tag_70() {
+    let renew = w::RenewSession {
+        session_id: vec![3; 16],
+        ttl_ms: 1000,
+    };
+    let body = renew.encode_to_vec();
+    let mut tagged = vec![0xb2, 0x04, body.len() as u8];
+    tagged.extend(body);
+    let encoded = frame(Msg::RenewSession(renew)).encode_to_vec();
+    assert!(encoded.ends_with(&tagged));
 }
 #[test]
 fn pages_health_and_generation_are_bounded() {
@@ -151,6 +277,31 @@ async fn link_roundtrip_extracts_single_use_secrets_and_binds_generation() {
     assert_eq!(child.generation(), Some(7));
     assert!(child
         .send(0, Msg::Ping(w::Ping { serial: 1 }))
+        .await
+        .is_err());
+    core.send(
+        3,
+        Msg::RenewSession(w::RenewSession {
+            session_id: vec![3; 16],
+            ttl_ms: 1000,
+        }),
+    )
+    .await
+    .unwrap();
+    let received = child.recv().await.unwrap();
+    assert!(received.secrets.is_none() && received.token.is_none());
+    assert!(format!("{received:?}").contains("REDACTED"));
+    assert!(
+        matches!(received.frame.msg, Some(Msg::RenewSession(renew)) if renew.session_id == vec![3; 16] && renew.ttl_ms == 1000)
+    );
+    assert!(child
+        .send(
+            4,
+            Msg::RenewSession(w::RenewSession {
+                session_id: vec![3; 16],
+                ttl_ms: 1000,
+            }),
+        )
         .await
         .is_err());
 }

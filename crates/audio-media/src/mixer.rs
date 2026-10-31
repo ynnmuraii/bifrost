@@ -7,6 +7,18 @@ struct Gain {
     step: f32,
     remaining: usize,
 }
+impl Gain {
+    fn next(&mut self) -> f32 {
+        if self.remaining > 0 {
+            self.current += self.step;
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                self.current = self.target;
+            }
+        }
+        self.current
+    }
+}
 const UNITY: Gain = Gain {
     current: 1.0,
     target: 1.0,
@@ -34,6 +46,9 @@ impl Mixer {
     pub fn limited_frames(&self) -> u64 {
         self.limited_frames
     }
+    pub(crate) fn reset_input(&mut self, input: usize) {
+        self.gains[input] = UNITY;
+    }
     /// Listener-local gain only. No writes to any source/native master volume.
     pub fn set_gain(&mut self, input: usize, gain: f32) -> Result<(), MixError> {
         if input >= MAX_INPUTS || !gain.is_finite() || !(0.0..=2.0).contains(&gain) {
@@ -59,18 +74,11 @@ impl Mixer {
         for frame in 0..output.len() / 2 {
             let mut mixed = [0.0; 2];
             for (index, input) in inputs.iter().enumerate() {
-                let gain = &mut self.gains[index];
-                if gain.remaining > 0 {
-                    gain.current += gain.step;
-                    gain.remaining -= 1;
-                    if gain.remaining == 0 {
-                        gain.current = gain.target;
-                    }
-                }
+                let gain = self.gains[index].next();
                 for ch in 0..2 {
                     let sample = input[frame * 2 + ch];
                     if sample.is_finite() {
-                        mixed[ch] += sample * gain.current * headroom;
+                        mixed[ch] += sample * gain * headroom;
                     }
                 }
             }
@@ -79,6 +87,48 @@ impl Mixer {
             }
             for ch in 0..2 {
                 output[frame * 2 + ch] = soft_limit(mixed[ch]);
+            }
+        }
+        Ok(())
+    }
+    /// Precompute every authorized subset off RT. The callback selects, never sums.
+    /// Fixed lanes keep headroom and other inputs' ramps unchanged on joins/leaves.
+    pub(crate) fn process_subsets(
+        &mut self,
+        inputs: &[&[f32]; MAX_INPUTS],
+        output: &mut [[[f32; 2]; 1 << MAX_INPUTS]],
+    ) -> Result<(), MixError> {
+        if inputs.iter().any(|input| input.len() != output.len() * 2) {
+            return Err(MixError::InvalidInput);
+        }
+        let headroom = 1.0 / (MAX_INPUTS as f32).sqrt();
+        for (frame, variants) in output.iter_mut().enumerate() {
+            let weighted: [[f32; 2]; MAX_INPUTS] = std::array::from_fn(|input| {
+                let gain = self.gains[input].next() * headroom;
+                std::array::from_fn(|channel| {
+                    let sample = inputs[input][frame * 2 + channel];
+                    if sample.is_finite() {
+                        sample * gain
+                    } else {
+                        0.0
+                    }
+                })
+            });
+            let mut sums = [[0.0; 2]; 1 << MAX_INPUTS];
+            for mask in 1usize..1 << MAX_INPUTS {
+                let input = mask.trailing_zeros() as usize;
+                let previous = mask & !(1 << input);
+                if previous == 0 {
+                    sums[mask] = weighted[input];
+                } else {
+                    sums[mask] = std::array::from_fn(|channel| {
+                        sums[previous][channel] + weighted[input][channel]
+                    });
+                }
+            }
+            variants[0] = [0.0; 2];
+            for (variant, sum) in variants[1..].iter_mut().zip(sums.into_iter().skip(1)) {
+                *variant = sum.map(soft_limit);
             }
         }
         Ok(())
@@ -96,6 +146,28 @@ fn soft_limit(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subset_mix_limits_aggregate_and_advances_each_gain_once() {
+        let mut mixer = Mixer::new(4);
+        let mut variants = [[[0.0; 2]; 1 << MAX_INPUTS]; 4];
+        let input = [0.7; 8];
+        mixer
+            .process_subsets(&[&input; MAX_INPUTS], &mut variants)
+            .unwrap();
+        assert_eq!(mixer.limited_frames(), 0); // Precomputation is not audible limiter activity.
+        assert_eq!(variants[0][0], [0.0; 2]);
+        assert!((variants[0][1][0] - 0.7 / 3.0f32.sqrt()).abs() < 1e-6);
+        assert!(variants[0][7][0] > 0.8 && variants[0][7][0] < 1.0);
+        mixer.set_gain(0, 0.0).unwrap();
+        mixer
+            .process_subsets(&[&input; MAX_INPUTS], &mut variants)
+            .unwrap();
+        assert_eq!(variants[3][1], [0.0; 2]);
+        for frame in variants {
+            assert!((frame[2][0] - 0.7 / 3.0f32.sqrt()).abs() < 1e-6);
+            assert!((frame[6][0] - soft_limit(1.4 / 3.0f32.sqrt())).abs() < 1e-6);
+        }
+    }
     #[test]
     fn sum_headroom_limiter_and_ramp() {
         let mut mixer = Mixer::new(4);

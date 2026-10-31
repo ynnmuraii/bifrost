@@ -55,6 +55,8 @@ impl From<ipc::IpcError> for RoleError {
 struct Permit {
     id: [u8; 16],
     authorized: Arc<AtomicBool>,
+    deadline: Instant,
+    stop_reason: i32,
 }
 struct Shared {
     stopping: AtomicBool,
@@ -79,9 +81,48 @@ impl Shared {
         }
     }
     fn revoke(&self, id: &[u8]) {
-        for permit in lock(&self.permits).iter().filter(|permit| permit.id == id) {
+        let now = Instant::now();
+        for permit in lock(&self.permits)
+            .iter_mut()
+            .filter(|permit| permit.id == id)
+        {
+            if permit.authorized.load(Ordering::Acquire) && now >= permit.deadline {
+                permit.stop_reason = 9;
+            }
             permit.authorized.store(false, Ordering::Release);
         }
+    }
+    fn expire(&self, now: Instant) {
+        for permit in lock(&self.permits).iter_mut() {
+            if now >= permit.deadline && permit.authorized.load(Ordering::Acquire) {
+                permit.stop_reason = 9;
+                permit.authorized.store(false, Ordering::Release);
+            }
+        }
+    }
+    fn renew(&self, id: &[u8], ttl_ms: u32, now: Instant) -> bool {
+        let mut permits = lock(&self.permits);
+        let Some(permit) = permits.iter_mut().find(|permit| permit.id == id) else {
+            return false;
+        };
+        if now >= permit.deadline {
+            if permit.authorized.load(Ordering::Acquire) {
+                permit.stop_reason = 9;
+                permit.authorized.store(false, Ordering::Release);
+            }
+            return false;
+        }
+        if !(1..=1000).contains(&ttl_ms) || !permit.authorized.load(Ordering::Acquire) {
+            return false;
+        }
+        permit.deadline = now + Duration::from_millis(u64::from(ttl_ms));
+        true
+    }
+    fn stop_reason(&self, id: &[u8]) -> i32 {
+        lock(&self.permits)
+            .iter()
+            .find(|permit| permit.id == id)
+            .map_or(1, |permit| permit.stop_reason)
     }
     fn remove(&self, id: &[u8]) {
         lock(&self.permits).retain(|permit| permit.id != id);
@@ -163,6 +204,8 @@ where
 struct Options {
     #[cfg(test)]
     observed: Option<Arc<tests::Observed>>,
+    #[cfg(test)]
+    dry_factory: Option<fn() -> Result<DryBackend, BackendError>>,
 }
 async fn run_connection_options<S>(
     io: S,
@@ -209,7 +252,11 @@ where
                 }
                 Ok(())
             });
-            serve(link, kind, dry_backend, Some(pump)).await
+            #[cfg(test)]
+            let factory = _options.dry_factory.unwrap_or(dry_backend);
+            #[cfg(not(test))]
+            let factory = dry_backend;
+            serve(link, kind, factory, Some(pump)).await
         }
         1 => {
             #[cfg(target_os = "linux")]
@@ -276,6 +323,7 @@ where
             if watch_shared.stopping.load(Ordering::Acquire) {
                 return;
             }
+            watch_shared.expire(Instant::now());
             if clock.elapsed().as_millis() as u64
                 >= watch_last.load(Ordering::Acquire) + u64::from(contract::CORE_SILENCE_MS)
             {
@@ -300,12 +348,17 @@ where
                 match message {
                     Msg::Ping(ping)=>{if send(&mut link,0,Msg::Pong(w::Pong {serial:ping.serial})).await.is_err(){break;}},
                     Msg::Shutdown(_)=>{reason=ExitReason::Shutdown;break;},
+                    Msg::RenewSession(renew)=>{
+                        if !shared.renew(&renew.session_id,renew.ttl_ms,Instant::now())
+                            && send(&mut link,request_id,Msg::Error(w::Error {code:6,session_id:renew.session_id})).await.is_err(){break;}
+                    },
                     message=>{
                         let mut permit=None;
                         if let Msg::StopSession(stop)=&message {shared.revoke(&stop.session_id);}
                         if let Msg::StartSession(start)=&message {
                             let id:[u8;16]=start.session_id.as_slice().try_into().expect("AudioLink validated session id");
-                            let admitted={let mut permits=lock(&shared.permits);if permits.len()>=contract::MAX_SESSIONS||permits.iter().any(|permit|permit.id==id){false}else{let authorized=Arc::new(AtomicBool::new(true));permits.push(Permit {id,authorized:authorized.clone()});permit=Some(authorized);true}};
+                            let deadline=Instant::now()+Duration::from_millis(u64::from(start.initial_authorization_ms));
+                            let admitted={let mut permits=lock(&shared.permits);if permits.len()>=contract::MAX_SESSIONS||permits.iter().any(|permit|permit.id==id){false}else{let authorized=Arc::new(AtomicBool::new(true));permits.push(Permit {id,authorized:authorized.clone(),deadline,stop_reason:1});permit=Some(authorized);true}};
                             if !admitted {if send(&mut link,request_id,Msg::Error(w::Error {code:3,session_id:id.to_vec()})).await.is_err(){break;}continue;}
                         }
                         let id=if let Msg::StartSession(start)=&message{Some(start.session_id.clone())}else{None};
