@@ -117,6 +117,10 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 - The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
 - Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
 
+## Windows command line
+
+Run CLI commands from cmd/PowerShell (also inside Windows Terminal), or use `cmd /c` in hosts that launch the windowed executable directly; without a console or redirected output, Bifrost exits with code 69 and records the launch hint in the configured core log.
+
 ## Build from source
 
 Use [Rust via rustup](https://rustup.rs/) with the repository's toolchain (Rust 1.99 or newer). Windows needs the MSVC C++ build tools and Windows SDK.

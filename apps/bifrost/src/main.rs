@@ -29,7 +29,9 @@ fn main() -> ExitCode {
     adopt_default_directories(&mut args);
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => {
-            console::attach_parent();
+            if let Err(exit) = console::attach_cli(&args) {
+                return exit;
+            }
             println!("Bifrost {}", bifrost_gui::app_version());
             ExitCode::SUCCESS
         }
@@ -39,7 +41,9 @@ fn main() -> ExitCode {
             bifrost_gui::run_gui(args)
         }
         Some("update") => {
-            console::attach_parent();
+            if let Err(exit) = console::attach_cli(&args) {
+                return exit;
+            }
             args.remove(0);
             bifrost_gui::headless_update::run(args)
         }
@@ -65,7 +69,9 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Some(_) => {
-            console::attach_parent();
+            if let Err(exit) = console::attach_cli(&args) {
+                return exit;
+            }
             bifrost_core::run_core(args)
         }
     }

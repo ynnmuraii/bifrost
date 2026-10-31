@@ -33,7 +33,7 @@ config = { path = "../../crates/config" }
 [target.'cfg(windows)'.dependencies]
 # `AttachConsole` / `SetStdHandle`: the binary is a Windows-subsystem program (no console for
 # the window), and the command-line roles bind the parent terminal back (`src/console.rs`).
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
@@ -55,7 +55,7 @@ transport = { path = "../../crates/transport" }
 socket2 = "0.6"
 
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [lints]
 workspace = true
