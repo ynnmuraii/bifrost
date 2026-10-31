@@ -4,13 +4,13 @@ use super::*;
 use audio_media::{
     crypto::DirectionMaterial,
     runtime::{self as media, MediaSession},
-    socket::MediaSocket,
+    socket::{MediaSocket, Notification},
 };
 use audio_model::{jitter::Profile, status::StreamHealth};
 use ring::digest::{digest, SHA256};
 use std::{
     net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket},
-    sync::mpsc::{Receiver, RecvTimeoutError},
+    sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError},
 };
 
 pub(crate) type Pump<S> = Box<dyn FnMut(&mut S) -> Result<(), BackendError> + Send>;
@@ -89,8 +89,21 @@ pub(crate) fn run<B: Backend + 'static>(
         mic_controls,
     };
     let (mut next_pump, mut next_health) = (Instant::now(), Instant::now());
+    let pump_wait = Notification::new();
     while !worker.shared.stopping.load(Ordering::Acquire) {
-        match commands.recv_timeout(Duration::from_millis(5)) {
+        // Dry's callback clock must not be paced by coarse Windows channel timeouts.
+        // Native streams own their hardware event loops and retain blocking control reception.
+        let has_pump = worker.pump.is_some();
+        let command = if has_pump {
+            commands.try_recv().map_err(|error| match error {
+                TryRecvError::Empty => RecvTimeoutError::Timeout,
+                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            })
+        } else {
+            commands.recv_timeout(Duration::from_millis(5))
+        };
+        let idle = matches!(command, Err(RecvTimeoutError::Timeout));
+        match command {
             Ok(command) => worker.command(command),
             Err(RecvTimeoutError::Disconnected) => {
                 worker.shared.stop_all();
@@ -126,6 +139,14 @@ pub(crate) fn run<B: Backend + 'static>(
             // The IPC task still sends at 1 Hz; a fresher watch slot avoids a second
             // of phase lag and stale session membership when its timer fires first.
             next_health = Instant::now() + Duration::from_millis(200);
+        }
+        if has_pump && idle {
+            let deadline = next_pump.min(next_health);
+            pump_wait.wait_timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            );
         }
     }
     if let Some(backend) = worker.backend.as_mut() {
