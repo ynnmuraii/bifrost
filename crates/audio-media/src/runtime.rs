@@ -531,7 +531,7 @@ fn make_session<S: Stream + 'static>(
         event_tx,
         workers: Vec::with_capacity(2),
         native_stop: None,
-        render_timeline: RenderClock::new(snapshot),
+        render_timeline: RenderClock::default(),
         last_native: snapshot,
         source,
         group_native: None,
@@ -543,7 +543,6 @@ fn make_session<S: Stream + 'static>(
 /// Playback progress is not callback submission: hardware can trail by its prebuffer.
 #[derive(Default)]
 struct RenderClock {
-    origin: Option<u64>,
     previous_native: Option<u64>,
     previous_host: Option<u64>,
     changed_at: Option<Instant>,
@@ -553,12 +552,6 @@ struct RenderClock {
     published: u64,
 }
 impl RenderClock {
-    fn new(snapshot: StreamSnapshot) -> Self {
-        Self {
-            origin: snapshot.device_position,
-            ..Self::default()
-        }
-    }
     fn observe(
         &mut self,
         snapshot: StreamSnapshot,
@@ -583,9 +576,8 @@ impl RenderClock {
                 let fresh = self
                     .changed_at
                     .is_none_or(|last| now.duration_since(last) < Duration::from_millis(100));
-                let origin = *self.origin.get_or_insert(position);
-                (monotonic && fresh && position >= origin).then(|| {
-                    (u128::from(position - origin) * 48_000 / u128::from(frequency))
+                (monotonic && fresh).then(|| {
+                    (u128::from(position) * 48_000 / u128::from(frequency))
                         .min(u128::from(u64::MAX)) as u64
                 })
             }
@@ -597,6 +589,7 @@ impl RenderClock {
                 .get_or_insert((native, self.played.max(self.published)));
             self.played = played.saturating_add(native.saturating_sub(anchor));
             self.callback_anchor = None;
+            // Both counters start at stream zero, not at the first control-plane snapshot.
             let pending = (submitted.saturating_sub(native).saturating_mul(1_000_000) / 48_000)
                 .min(2_000_000) as u32;
             (
@@ -1387,25 +1380,25 @@ mod path_tests {
             underrun_frames: 0,
             dropped_capture_frames: 0,
         };
-        let mut clock = RenderClock::new(snapshot);
+        let mut clock = RenderClock::default();
         assert_eq!(
-            clock.observe(snapshot, 1920, now),
+            clock.observe(snapshot, 10920, now),
             (0, ClockSource::RenderDevicePosition, Some(40_000))
         );
         snapshot.device_position = Some(9480);
         snapshot.host_time_100ns = Some(101000);
         assert_eq!(
-            clock.observe(snapshot, 2880, now + Duration::from_millis(10)),
+            clock.observe(snapshot, 11880, now + Duration::from_millis(10)),
             (480, ClockSource::RenderDevicePosition, Some(50_000))
         );
         // Stale hardware cannot pin playout forever; fallback changes no clock epoch.
         assert_eq!(
-            clock.observe(snapshot, 3360, now + Duration::from_millis(120)),
+            clock.observe(snapshot, 12360, now + Duration::from_millis(120)),
             (480, ClockSource::RenderCallbackFrames, None)
         );
         assert_eq!(
             clock
-                .observe(snapshot, 3840, now + Duration::from_millis(130))
+                .observe(snapshot, 12840, now + Duration::from_millis(130))
                 .0,
             960
         );
@@ -1413,7 +1406,7 @@ mod path_tests {
         snapshot.host_time_100ns = Some(201000);
         assert_eq!(
             clock
-                .observe(snapshot, 4320, now + Duration::from_millis(140))
+                .observe(snapshot, 13320, now + Duration::from_millis(140))
                 .0,
             960
         );
@@ -1421,14 +1414,14 @@ mod path_tests {
         snapshot.host_time_100ns = Some(301000);
         assert_eq!(
             clock
-                .observe(snapshot, 4800, now + Duration::from_millis(150))
+                .observe(snapshot, 13800, now + Duration::from_millis(150))
                 .0,
             1440
         );
         snapshot.host_time_100ns = None;
         assert_eq!(
             clock
-                .observe(snapshot, 5280, now + Duration::from_millis(160))
+                .observe(snapshot, 14280, now + Duration::from_millis(160))
                 .1,
             ClockSource::RenderCallbackFrames
         );
@@ -1437,7 +1430,7 @@ mod path_tests {
         snapshot.device_position = Some(10920);
         assert_eq!(
             clock
-                .observe(snapshot, 5760, now + Duration::from_millis(170))
+                .observe(snapshot, 14760, now + Duration::from_millis(170))
                 .0,
             2400,
             "native recovery must align to extrapolated callback fallback, not rewind"
@@ -1445,10 +1438,86 @@ mod path_tests {
         snapshot.clock_frequency = Some(0);
         assert_eq!(
             clock
-                .observe(snapshot, 6240, now + Duration::from_millis(180))
+                .observe(snapshot, 15240, now + Duration::from_millis(180))
                 .1,
             ClockSource::RenderCallbackFrames
         );
+    }
+
+    #[test]
+    fn render_depth_uses_stream_origin_even_when_first_snapshot_is_delayed() {
+        let now = Instant::now();
+        for frequency in [48_000, 480_000] {
+            let mut snapshot = StreamSnapshot {
+                status: StreamStatus::Running,
+                device_position: Some(frequency / 50),
+                clock_frequency: Some(frequency),
+                host_time_100ns: Some(200_000),
+                underrun_frames: 0,
+                dropped_capture_frames: 0,
+            };
+            let mut clock = RenderClock::default();
+            // Startup already played 960 frames; 1056 remain in the native FIFO.
+            assert_eq!(
+                clock.observe(snapshot, 2016, now),
+                (0, ClockSource::RenderDevicePosition, Some(22_000))
+            );
+            snapshot.device_position = Some(frequency * 3 / 100);
+            snapshot.host_time_100ns = Some(300_000);
+            assert_eq!(
+                clock.observe(snapshot, 2496, now + Duration::from_millis(10)),
+                (480, ClockSource::RenderDevicePosition, Some(22_000))
+            );
+        }
+    }
+
+    #[test]
+    fn dry_render_clock_has_no_phantom_padding_and_resets_with_new_stream() {
+        use audio_backend::dry::{DryBackend, ScriptEvent};
+        use audio_backend::{Capabilities, Device, DeviceId, DeviceSelection, Direction};
+
+        let mut backend = DryBackend::new(Capabilities::default());
+        let id = DeviceId::new("DRY_RENDER_CLOCK").unwrap();
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        backend
+            .apply(ScriptEvent::UpsertDevice(Device {
+                id: id.clone(),
+                label: "Dry render clock".into(),
+                direction: Direction::Render,
+                format,
+            }))
+            .unwrap();
+        for startup_frames in [960, 480] {
+            let mut stream = backend
+                .start_render(
+                    RenderRequest {
+                        device: DeviceSelection::Explicit(id.clone()),
+                        requested: format,
+                    },
+                    Box::new(|output| output.fill(0.0)),
+                )
+                .unwrap();
+            stream.pump(startup_frames).unwrap();
+            let mut clock = RenderClock::default();
+            let now = Instant::now();
+            assert_eq!(
+                clock.observe(stream.snapshot(), stream.processed_frames(), now),
+                (0, ClockSource::RenderDevicePosition, Some(0))
+            );
+            stream.pump(480).unwrap();
+            assert_eq!(
+                clock.observe(
+                    stream.snapshot(),
+                    stream.processed_frames(),
+                    now + Duration::from_millis(10),
+                ),
+                (480, ClockSource::RenderDevicePosition, Some(0))
+            );
+            stream.stop().unwrap();
+        }
     }
 
     #[test]

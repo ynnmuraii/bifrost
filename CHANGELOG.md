@@ -46,6 +46,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Keep an uninterrupted transmitted sample grid through capture silence without DTX. Fill uncovered host-time gaps with bounded silence (at most 200 ms), reanchor larger gaps, and report native discontinuity flags separately from actual capture repairs.
 - Expose bounded per-stage latency observations, use 5 ms aggregate mix blocks with a native-callback quantum floor, and bound decoded lane queues. A deterministic wired chirp fixture with a modeled 20 ms native FIFO improves from 86.688 to 81.688 ms without changing jitter profile targets; native hardware timing requires platform verification.
 - Wake the mixer from render consumption and refill a complete native quantum before parking. When safe before the next callback, honor an imminent jitter deadline rather than queueing an extra silent output period.
+- Compare native played/submitted frames from the same stream-zero origin, eliminating phantom startup FIFO depth; recreate that clock on render restart. Dry onset checks retain the wired planning budget and explicitly account for a complete callback quantum plus measured host-scheduler overshoot.
 
 **Shared Listener media**
 
@@ -133,6 +134,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - При тишине захвата сохраняется непрерывная временная сетка отправленных кадров без DTX. Непокрытые разрывы времени host заполняются тишиной до 200 мс; большие разрывы переустанавливают опорную точку. Нативные флаги discontinuity учитываются отдельно от реальных исправлений захвата.
 - Добавлены ограниченные наблюдения задержки по стадиям, блоки общего микшера 5 мс с запасом не меньше нативного callback и ограниченные очереди декодированных входов. Детерминированный тест с моделью нативного FIFO 20 мс улучшился с 86,688 до 81,688 мс без изменения профилей джиттера; нативные задержки проверяются на соответствующей платформе.
 - Микшер пробуждается при потреблении выхода и перед ожиданием заполняет весь нативный квант. Если запас до следующего callback позволяет, он ждёт близкий срок джиттера вместо постановки лишнего периода тишины в очередь.
+- Нативные воспроизведённые и переданные кадры сравниваются от общего нуля потока, без фиктивной стартовой глубины FIFO; при перезапуске часы создаются заново. Проверка Dry сохраняет проводной бюджет стадий и явно учитывает квант callback плюс измеренное опоздание планировщика.
 
 **Общий аудиовыход Listener**
 
