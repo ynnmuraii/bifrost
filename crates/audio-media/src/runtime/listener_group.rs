@@ -86,6 +86,7 @@ impl<S: Stream + 'static> ListenerGroup<S> {
         let (producer, mut consumer) = RingBuffer::<MixedFrame>::new(PCM_RING_SAMPLES / 2);
         let callback_shared = shared.clone();
         let callback_gates = gates.clone();
+        let mut submitted_native_frames = 0u64;
         let mut stream = backend.start_render(
             request.clone(),
             Box::new(move |output| {
@@ -113,18 +114,38 @@ impl<S: Stream + 'static> ListenerGroup<S> {
                         .callback_underruns
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                let total = callback_shared
-                    .render_frames
-                    .fetch_add((output.len() / 2) as u64, Ordering::AcqRel)
-                    + (output.len() / 2) as u64;
                 let rate = callback_shared.native_rate.load(Ordering::Acquire);
                 if rate > 0 {
-                    let clock = total.saturating_mul(48_000) / u64::from(rate);
-                    if callback_shared
-                        .render_clock
-                        .fetch_max(clock, Ordering::AcqRel)
-                        < clock
-                    {
+                    submitted_native_frames =
+                        submitted_native_frames.saturating_add((output.len() / 2) as u64);
+                    let total = submitted_native_frames.saturating_mul(48_000) / u64::from(rate);
+                    let frames = total.saturating_sub(
+                        callback_shared.render_frames.swap(total, Ordering::AcqRel),
+                    );
+                    let observed = callback_shared
+                        .render_native_observed_ns
+                        .load(Ordering::Acquire);
+                    let elapsed = (callback_shared
+                        .clock
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64)
+                        .saturating_sub(observed);
+                    if observed > 0 && elapsed <= 100_000_000 {
+                        let clock = callback_shared
+                            .render_native_clock
+                            .load(Ordering::Acquire)
+                            .saturating_add(elapsed.saturating_mul(48_000) / 1_000_000_000);
+                        callback_shared
+                            .render_clock
+                            .fetch_max(clock, Ordering::AcqRel);
+                        callback_shared
+                            .clock_source
+                            .store(ClockSource::RenderDevicePosition as u8, Ordering::Release);
+                    } else {
+                        callback_shared
+                            .render_clock
+                            .fetch_add(frames, Ordering::AcqRel);
                         callback_shared
                             .clock_source
                             .store(ClockSource::RenderCallbackFrames as u8, Ordering::Release);
@@ -314,7 +335,7 @@ impl<S: Stream + 'static> ListenerGroup<S> {
             event_tx: tx,
             workers: Vec::with_capacity(1),
             native_stop: None,
-            initial_position: None,
+            render_timeline: RenderClock::default(),
             last_native: *lock(&self.native),
             source: false,
             group_native: Some(self.native.clone()),

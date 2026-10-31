@@ -41,6 +41,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Expose bounded drift ratio ppm, filtered fill error, applied coarse-correction count and actual clock authority through private worker Health. Source reports no drift controller; Listener observations survive PI resets.
 - Bound Source inbound work to 64 packets before revisiting shutdown and media/control deadlines, so pinned-peer invalid-tag floods cannot starve pacing or shutdown.
 - Print receiver drift diagnostics and clock authority in the Windows audible E2E example alongside independent capture-clock estimates.
+- Drive Listener drift timing from a valid native playback position/frequency/host snapshot, not callback submission. Preserve a monotonic timeline across fallback and report native queued depth without assuming unknown depth is zero.
 
 **Shared Listener media**
 
@@ -111,6 +112,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Закрытые сводки Health передают ограниченные ppm ресэмплинга, фильтрованную ошибку наполнения, число применённых грубых коррекций и фактический источник часов. У Source нет ПИ-регулятора дрейфа; счётчик Listener сохраняется при сбросах ПИ.
 - Входящая обработка Source ограничена 64 пакетами перед повторной проверкой остановки и сроков медиа/управления: поток пакетов с неверным тегом от закреплённого адреса не блокирует темп передачи и завершение.
 - Звуковой E2E-пример Windows выводит диагностику дрейфа приёмника и источник часов рядом с независимой оценкой часов захвата.
+- Часы дрейфа Listener используют достоверные нативные позицию воспроизведения, частоту и время host, а не число переданных callback кадров. Переходы на резервные часы сохраняют монотонность; неизвестная глубина нативного буфера не подменяется нулём.
 
 **Общий аудиовыход Listener**
 

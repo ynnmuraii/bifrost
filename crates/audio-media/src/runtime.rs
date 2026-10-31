@@ -16,7 +16,7 @@ use audio_backend::{
 use audio_model::{
     jitter::Profile,
     packet::{HEADER_LEN, MAX_DATAGRAM_LEN},
-    status::{AudioHealth, ClockSource, DriftDiagnostics, StreamHealth},
+    status::{AudioHealth, ClockSource, DriftDiagnostics, LatencyDiagnostics, StreamHealth},
     Header, PacketKind,
 };
 use ring::rand::{SecureRandom, SystemRandom};
@@ -86,6 +86,7 @@ pub struct HealthSnapshot {
     pub capture_dropped_frames: u64,
     pub drift: Option<DriftDiagnostics>,
     pub clock_source: ClockSource,
+    pub latency: LatencyDiagnostics,
     /// Worker loop entries, including notifications and deadline wakes; not native callbacks.
     pub worker_wakeups: u64,
     pub native: StreamSnapshot,
@@ -130,6 +131,7 @@ struct Stats {
     sent: u64,
     rejected: u64,
     drift: Option<DriftDiagnostics>,
+    latency: LatencyDiagnostics,
 }
 struct Shared {
     stopped: AtomicBool,
@@ -144,6 +146,8 @@ struct Shared {
     callback_invalid: AtomicBool,
     render_frames: AtomicU64,
     render_clock: AtomicU64,
+    render_native_clock: AtomicU64,
+    render_native_observed_ns: AtomicU64,
     callback_underruns: AtomicU64,
     callback_limiter: AtomicU64,
     capture_dropped: AtomicU64,
@@ -182,6 +186,8 @@ impl Shared {
             callback_invalid: AtomicBool::new(false),
             render_frames: AtomicU64::new(0),
             render_clock: AtomicU64::new(0),
+            render_native_clock: AtomicU64::new(0),
+            render_native_observed_ns: AtomicU64::new(0),
             callback_underruns: AtomicU64::new(0),
             callback_limiter: AtomicU64::new(0),
             capture_dropped: AtomicU64::new(0),
@@ -204,6 +210,7 @@ impl Shared {
                 sent: 0,
                 rejected: 0,
                 drift: None,
+                latency: LatencyDiagnostics::default(),
             }),
         }
     }
@@ -273,7 +280,7 @@ pub struct MediaSession<S: Stream + 'static> {
     event_tx: SyncSender<MediaEvent>,
     workers: Vec<JoinHandle<()>>,
     native_stop: Option<JoinHandle<Result<(), BackendError>>>,
-    initial_position: Option<u64>,
+    render_timeline: RenderClock,
     last_native: StreamSnapshot,
     source: bool,
     group_native: Option<Arc<Mutex<StreamSnapshot>>>,
@@ -322,23 +329,37 @@ impl<S: Stream + 'static> MediaSession<S> {
                 _ => {}
             }
             if !self.source {
-                if let (Some(position), Some(base), Some(frequency)) = (
-                    snapshot.device_position,
-                    self.initial_position,
-                    snapshot.clock_frequency,
-                ) {
-                    if frequency > 0 {
-                        let count = (u128::from(position.saturating_sub(base)) * 48_000
-                            / u128::from(frequency))
-                        .min(u128::from(u64::MAX)) as u64;
-                        let previous = self.shared.render_clock.fetch_max(count, Ordering::AcqRel);
-                        if count > previous {
-                            self.shared
-                                .clock_source
-                                .store(ClockSource::RenderDevicePosition as u8, Ordering::Release);
-                        }
-                    }
+                let submitted = self.shared.render_frames.load(Ordering::Acquire);
+                let changed = self.render_timeline.previous_native != snapshot.device_position
+                    || self.render_timeline.previous_host != snapshot.host_time_100ns;
+                self.render_timeline.published = self.shared.render_clock.load(Ordering::Acquire);
+                let (clock, source, pending) =
+                    self.render_timeline
+                        .observe(snapshot, submitted, Instant::now());
+                self.shared.render_clock.fetch_max(clock, Ordering::AcqRel);
+                if source == ClockSource::RenderDevicePosition && changed {
+                    self.shared
+                        .render_native_clock
+                        .store(clock, Ordering::Release);
+                    self.shared.render_native_observed_ns.store(
+                        (self
+                            .shared
+                            .clock
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64)
+                            .max(1),
+                        Ordering::Release,
+                    );
+                } else if source != ClockSource::RenderDevicePosition {
+                    self.shared
+                        .render_native_observed_ns
+                        .store(0, Ordering::Release);
                 }
+                self.shared
+                    .clock_source
+                    .store(source as u8, Ordering::Release);
+                lock(&self.shared.stats).latency.native_render_buffer_us = pending;
             }
         }
     }
@@ -380,6 +401,7 @@ impl<S: Stream + 'static> MediaSession<S> {
                 .saturating_add(self.last_native.dropped_capture_frames),
             drift: stats.drift,
             clock_source: ClockSource::from_code(self.shared.clock_source.load(Ordering::Acquire)),
+            latency: stats.latency,
             worker_wakeups: self.shared.worker_wakeups.load(Ordering::Relaxed),
             native: self.last_native,
         }
@@ -474,16 +496,87 @@ fn make_session<S: Stream + 'static>(
         event_tx,
         workers: Vec::with_capacity(2),
         native_stop: None,
-        initial_position: if source {
-            None
-        } else {
-            snapshot.device_position
-        },
+        render_timeline: RenderClock::new(snapshot),
         last_native: snapshot,
         source,
         group_native: None,
         group_owner: None,
         stop_attempted: false,
+    }
+}
+
+/// Playback progress is not callback submission: hardware can trail by its prebuffer.
+#[derive(Default)]
+struct RenderClock {
+    origin: Option<u64>,
+    previous_native: Option<u64>,
+    previous_host: Option<u64>,
+    changed_at: Option<Instant>,
+    native_anchor: Option<(u64, u64)>,
+    callback_anchor: Option<(u64, u64)>,
+    played: u64,
+    published: u64,
+}
+impl RenderClock {
+    fn new(snapshot: StreamSnapshot) -> Self {
+        Self {
+            origin: snapshot.device_position,
+            ..Self::default()
+        }
+    }
+    fn observe(
+        &mut self,
+        snapshot: StreamSnapshot,
+        submitted: u64,
+        now: Instant,
+    ) -> (u64, ClockSource, Option<u32>) {
+        let native = match (
+            snapshot.device_position,
+            snapshot.clock_frequency,
+            snapshot.host_time_100ns,
+        ) {
+            (Some(position), Some(frequency), Some(host)) if frequency > 0 => {
+                let monotonic = self.previous_native.is_none_or(|last| position >= last)
+                    && self.previous_host.is_none_or(|last| host >= last);
+                if monotonic {
+                    if self.previous_host != Some(host) || self.previous_native != Some(position) {
+                        self.changed_at = Some(now);
+                    }
+                    self.previous_host = Some(host);
+                    self.previous_native = Some(position);
+                }
+                let fresh = self
+                    .changed_at
+                    .is_none_or(|last| now.duration_since(last) < Duration::from_millis(100));
+                let origin = *self.origin.get_or_insert(position);
+                (monotonic && fresh && position >= origin).then(|| {
+                    (u128::from(position - origin) * 48_000 / u128::from(frequency))
+                        .min(u128::from(u64::MAX)) as u64
+                })
+            }
+            _ => None,
+        };
+        if let Some(native) = native {
+            let (anchor, played) = *self
+                .native_anchor
+                .get_or_insert((native, self.played.max(self.published)));
+            self.played = played.saturating_add(native.saturating_sub(anchor));
+            self.callback_anchor = None;
+            let pending = (submitted.saturating_sub(native).saturating_mul(1_000_000) / 48_000)
+                .min(2_000_000) as u32;
+            (
+                self.played,
+                ClockSource::RenderDevicePosition,
+                Some(pending),
+            )
+        } else {
+            let (anchor, played) = *self
+                .callback_anchor
+                .get_or_insert((submitted, self.played.max(self.published)));
+            self.played = played.saturating_add(submitted.saturating_sub(anchor));
+            self.native_anchor = None;
+            (self.played, ClockSource::RenderCallbackFrames, None)
+        }
     }
 }
 
@@ -1170,6 +1263,81 @@ impl ReceiveWorker {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+    #[test]
+    fn render_playback_clock_tracks_hardware_behind_submitted_callbacks() {
+        let now = Instant::now();
+        let mut snapshot = StreamSnapshot {
+            status: StreamStatus::Running,
+            device_position: Some(9000),
+            clock_frequency: Some(48_000),
+            host_time_100ns: Some(1000),
+            underrun_frames: 0,
+            dropped_capture_frames: 0,
+        };
+        let mut clock = RenderClock::new(snapshot);
+        assert_eq!(
+            clock.observe(snapshot, 1920, now),
+            (0, ClockSource::RenderDevicePosition, Some(40_000))
+        );
+        snapshot.device_position = Some(9480);
+        snapshot.host_time_100ns = Some(101000);
+        assert_eq!(
+            clock.observe(snapshot, 2880, now + Duration::from_millis(10)),
+            (480, ClockSource::RenderDevicePosition, Some(50_000))
+        );
+        // Stale hardware cannot pin playout forever; fallback changes no clock epoch.
+        assert_eq!(
+            clock.observe(snapshot, 3360, now + Duration::from_millis(120)),
+            (480, ClockSource::RenderCallbackFrames, None)
+        );
+        assert_eq!(
+            clock
+                .observe(snapshot, 3840, now + Duration::from_millis(130))
+                .0,
+            960
+        );
+        snapshot.device_position = Some(9960);
+        snapshot.host_time_100ns = Some(201000);
+        assert_eq!(
+            clock
+                .observe(snapshot, 4320, now + Duration::from_millis(140))
+                .0,
+            960
+        );
+        snapshot.device_position = Some(10440);
+        snapshot.host_time_100ns = Some(301000);
+        assert_eq!(
+            clock
+                .observe(snapshot, 4800, now + Duration::from_millis(150))
+                .0,
+            1440
+        );
+        snapshot.host_time_100ns = None;
+        assert_eq!(
+            clock
+                .observe(snapshot, 5280, now + Duration::from_millis(160))
+                .1,
+            ClockSource::RenderCallbackFrames
+        );
+        clock.published = 2400;
+        snapshot.host_time_100ns = Some(401000);
+        snapshot.device_position = Some(10920);
+        assert_eq!(
+            clock
+                .observe(snapshot, 5760, now + Duration::from_millis(170))
+                .0,
+            2400,
+            "native recovery must align to extrapolated callback fallback, not rewind"
+        );
+        snapshot.clock_frequency = Some(0);
+        assert_eq!(
+            clock
+                .observe(snapshot, 6240, now + Duration::from_millis(180))
+                .1,
+            ClockSource::RenderCallbackFrames
+        );
+    }
+
     #[test]
     fn exhausted_path_attempts_wait_for_timeout_not_expired_probe() {
         let start = Instant::now();
