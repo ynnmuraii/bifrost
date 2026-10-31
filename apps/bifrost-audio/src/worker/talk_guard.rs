@@ -36,6 +36,7 @@ pub(super) struct Guard<M: MuteGuard> {
 
 pub(super) fn event(grant_id: u64, kind: i32, reason: i32) -> w::PttEvent {
     w::PttEvent {
+        safety_epoch: 0,
         grant_id,
         kind,
         reason,
@@ -52,6 +53,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
     ) -> Result<Self, BackendError> {
         let (commands, receive) = mpsc::sync_channel(4);
         let timer_privacy = privacy.clone();
+        let mut release_seen = privacy.release_epoch.load(Ordering::Acquire);
         privacy.active.store(true, Ordering::Release);
         let thread = thread::Builder::new()
             .name("audio-mic-grant".into())
@@ -60,7 +62,6 @@ impl<M: MuteGuard + 'static> Guard<M> {
                 let mut active: Option<(u64, Instant)> = None;
                 let mut persistent = false;
                 let mut saturated = false;
-                let mut release_seen = 0;
                 loop {
                     if reductions(
                         &mut guard,
@@ -315,6 +316,7 @@ impl<M: MuteGuard + 'static> Guard<M> {
         receive.recv().unwrap_or_else(|_| event(id, 4, 7))
     }
     pub(super) fn revoke(&self, id: u64) -> w::PttEvent {
+        self.privacy.revoke_scoped(id);
         let (send, receive) = mpsc::sync_channel(1);
         if self.commands.send(Command::Revoke(id, send)).is_err() {
             return event(id, 5, 2);
@@ -659,5 +661,84 @@ mod correlation_tests {
             assert_eq!(baseline, persistent);
             assert_eq!(privacy.revoked_through.load(Ordering::Acquire), 7);
         }
+    }
+
+    fn unmuted_fixture() -> ReleaseGuard {
+        ReleaseGuard {
+            restored: false,
+            restore_error: false,
+            snapshot_unavailable_after_restore: false,
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn safety_audit_old_release_all_does_not_replay_into_new_guard() {
+        let privacy = crate::privacy::Privacy::new();
+        assert_eq!(
+            privacy.admit(1, &Msg::PttReleaseAll(w::PttReleaseAll {})),
+            Some(Ok(false))
+        );
+        let sink: EventSink = Arc::new(|_, _| {});
+        let guard = Guard::new(unmuted_fixture(), sink, privacy.clone()).unwrap();
+        assert!(
+            !guard.snapshot().unwrap().muted,
+            "a pre-ownership fence cannot remute a newly acquired endpoint"
+        );
+        assert_eq!(
+            privacy.admit(2, &Msg::PttReleaseAll(w::PttReleaseAll {})),
+            Some(Ok(true))
+        );
+        assert!(
+            guard.snapshot().unwrap().muted,
+            "a new post-admission reduction must still apply"
+        );
+    }
+
+    #[test]
+    fn safety_audit_scoped_revoke_preserves_newer_queued_grant_and_fences_matching_renewal() {
+        let privacy = crate::privacy::Privacy::new();
+        let (send, receive) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |id, msg| {
+            let _ = send.send((id, msg));
+        });
+        let guard = Guard::new(unmuted_fixture(), sink, privacy.clone()).unwrap();
+        // Original normal-queue admission happens before the prioritized stale revoke.
+        let fence = (
+            privacy.epoch.load(Ordering::Acquire),
+            privacy.talk_epoch.load(Ordering::Acquire),
+        );
+        privacy.admit(
+            1,
+            &Msg::PttGrant(w::PttGrant {
+                grant_id: 6,
+                ttl_ms: 250,
+            }),
+        );
+        assert_eq!(
+            privacy.admit(2, &Msg::PttRevoke(w::PttRevoke { grant_id: 5 })),
+            Some(Ok(true))
+        );
+        let result = guard.grant(6, 250, Instant::now(), fence);
+        assert_eq!((result.grant_id, result.kind, result.reason), (6, 1, 0));
+        assert_eq!(
+            privacy.admit(3, &Msg::PttRevoke(w::PttRevoke { grant_id: 6 })),
+            Some(Ok(true))
+        );
+        loop {
+            let (id, _) = receive.recv_timeout(Duration::from_secs(1)).unwrap();
+            if id == 3 {
+                break;
+            }
+        }
+        assert!(guard.snapshot().unwrap().muted);
+        let result = guard.grant(6, 250, Instant::now(), fence);
+        assert_eq!((result.grant_id, result.kind, result.reason), (6, 4, 2));
+        assert_eq!(
+            privacy.admit(4, &Msg::PttRevoke(w::PttRevoke { grant_id: 999 })),
+            Some(Ok(true))
+        );
+        let result = guard.grant(7, 250, Instant::now(), fence);
+        assert_eq!((result.grant_id, result.kind, result.reason), (7, 1, 0));
     }
 }

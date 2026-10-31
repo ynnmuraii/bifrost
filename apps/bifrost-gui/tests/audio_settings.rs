@@ -118,6 +118,8 @@ fn fixture(lang: Lang, theme: Theme, scene: &str) -> ViewModel {
             ptt_pressed: true,
             capture_active: false,
             target_node_id: [0xbb, 0x22].repeat(16),
+            native_ptt_arming: None,
+            native_ptt_unavailable_reason: None,
         });
     }
     if scene == "source-no-mic" {
@@ -387,7 +389,7 @@ fn microphone_summary_uses_committed_control_config_and_preserves_release() {
                     .iter()
                     .any(|action| matches!(action, Action::Audio(AudioAction::SetPtt(false)))));
                 if !enabled {
-                    assert!(actions
+                    assert!(!actions
                         .iter()
                         .any(|action| matches!(action, Action::Audio(AudioAction::SetPtt(false)))));
                 }
@@ -912,4 +914,152 @@ fn apply_emits_only_the_typed_intent_without_optimistic_activation() {
     ));
     assert_eq!(vm.audio.draft, before);
     assert!(!vm.audio.status.as_ref().unwrap().enabled);
+}
+
+#[test]
+fn passive_status_loss_and_reconnect_do_not_emit_global_release_or_a_fresh_press() {
+    let mut vm = fixture(Lang::En, Theme::Dark, "active");
+    vm.audio
+        .status
+        .as_mut()
+        .unwrap()
+        .microphone
+        .as_mut()
+        .unwrap()
+        .ptt_pressed = false;
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    let size = egui::vec2(760.0, 900.0);
+    frame(&ctx, &vm, size, Vec::new());
+    let (output, _) = frame(&ctx, &vm, size, Vec::new());
+    let at = labels(&output)
+        .iter()
+        .find(|(label, _)| label == text(Lang::En, Key::AudioPttPress))
+        .unwrap()
+        .1
+        .center();
+    let (_, actions) = frame(
+        &ctx,
+        &vm,
+        size,
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ],
+    );
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Audio(AudioAction::SetPtt(true))]
+    ));
+    // A reconnect clears desired GUI ownership, not the physical mouse-down state.
+    let status = vm.audio.status.take().unwrap();
+    vm.audio.gui_ptt_held = false;
+    vm.audio.available = false;
+    let (_, actions) = frame(&ctx, &vm, size, Vec::new());
+    assert!(!actions
+        .iter()
+        .any(|action| matches!(action, Action::Audio(AudioAction::SetPtt(_)))));
+    vm.audio.status = Some(status);
+    vm.audio.available = true;
+    let (_, actions) = frame(&ctx, &vm, size, Vec::new());
+    assert!(!actions
+        .iter()
+        .any(|action| matches!(action, Action::Audio(AudioAction::SetPtt(_)))));
+}
+
+#[test]
+fn native_ptt_arming_is_localized_and_never_disables_gui_hold() {
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for (state, reason, key) in [
+                (None, None, Key::AudioNativePttUnknown),
+                (
+                    Some(ipc::AudioPttArmingState::Armed),
+                    None,
+                    Key::AudioNativePttArmed,
+                ),
+                (
+                    Some(ipc::AudioPttArmingState::NeedsPhysicalRelease),
+                    None,
+                    Key::AudioNativePttNeedsRelease,
+                ),
+                (
+                    Some(ipc::AudioPttArmingState::Unavailable),
+                    None,
+                    Key::AudioNativePttUnavailable,
+                ),
+                (
+                    Some(ipc::AudioPttArmingState::Unavailable),
+                    Some(ipc::AudioPttUnavailableReason::HostClockUnavailable),
+                    Key::AudioNativePttHostClockUnavailable,
+                ),
+                (
+                    Some(ipc::AudioPttArmingState::Unavailable),
+                    Some(ipc::AudioPttUnavailableReason::PortalFreshnessUnverifiable),
+                    Key::AudioNativePttPortalFreshnessUnverifiable,
+                ),
+                (
+                    Some(ipc::AudioPttArmingState::Unavailable),
+                    Some(ipc::AudioPttUnavailableReason::RegistrationUnavailable),
+                    Key::AudioNativePttRegistrationUnavailable,
+                ),
+            ] {
+                let mut vm = fixture(lang, theme, "active");
+                let mic = vm
+                    .audio
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .microphone
+                    .as_mut()
+                    .unwrap();
+                mic.ptt_pressed = false;
+                mic.native_ptt_arming = state.map(|state| state as i32);
+                mic.native_ptt_unavailable_reason = reason.map(|reason| reason as i32);
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                let size = egui::vec2(760.0, 1200.0);
+                frame(&ctx, &vm, size, Vec::new());
+                let (output, actions) = frame(&ctx, &vm, size, Vec::new());
+                assert!(actions.is_empty());
+                let labels = labels(&output);
+                assert!(labels.iter().any(|(label, _)| label == text(lang, key)));
+                assert_eq!(
+                    labels
+                        .iter()
+                        .any(|(label, _)| label == text(lang, Key::AudioNativePttArmHint)),
+                    state == Some(ipc::AudioPttArmingState::NeedsPhysicalRelease)
+                );
+                let at = labels
+                    .iter()
+                    .find(|(label, _)| label == text(lang, Key::AudioPttPress))
+                    .unwrap()
+                    .1
+                    .center();
+                let (_, actions) = frame(
+                    &ctx,
+                    &vm,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                assert!(matches!(
+                    actions.as_slice(),
+                    [Action::Audio(AudioAction::SetPtt(true))]
+                ));
+            }
+        }
+    }
 }

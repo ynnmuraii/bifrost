@@ -741,6 +741,7 @@ fn release_all_and_physical_release_have_distinct_provenance() {
         assert_eq!(contract::validate_frame(&request).is_ok(), request_id != 0);
         for reason in [-1, 0, 2, 7, 8, 9, i32::MAX] {
             let mut event = frame(Msg::PttEvent(w::PttEvent {
+                safety_epoch: 1,
                 kind: 3,
                 reason,
                 ..Default::default()
@@ -748,9 +749,48 @@ fn release_all_and_physical_release_have_distinct_provenance() {
             event.request_id = request_id;
             assert_eq!(
                 contract::validate_frame(&event).is_ok(),
-                reason == 2 || matches!(reason, 7 | 8) && request_id == 0,
+                reason == 2 || matches!(reason, 7..=9) && request_id == 0,
             );
         }
+    }
+}
+
+#[test]
+fn native_status_is_bounded_uncorrelated_and_never_substitutes_for_a_proof() {
+    for state in [-1, 0, 1, 2, 3, 4] {
+        for registered in [false, true] {
+            for reason in [-1, 0, 1, 2, 3, 4] {
+                let mut status = frame(Msg::PttStatus(w::PttStatus {
+                    state,
+                    registered,
+                    reason,
+                    safety_epoch: 7,
+                }));
+                status.request_id = 0;
+                let valid = matches!(state, 1..=3)
+                    && (state == 3 || registered)
+                    && if state == 3 {
+                        matches!(reason, 1..=3)
+                    } else {
+                        reason == 0
+                    };
+                assert_eq!(contract::validate_frame(&status).is_ok(), valid);
+                status.request_id = 1;
+                assert!(contract::validate_frame(&status).is_err());
+            }
+        }
+    }
+    for reason in [8, 9] {
+        let mut event = frame(Msg::PttEvent(w::PttEvent {
+            kind: 3,
+            reason,
+            ..Default::default()
+        }));
+        event.request_id = 0;
+        assert!(
+            contract::validate_frame(&event).is_err(),
+            "epochless release is not current proof"
+        );
     }
 }
 

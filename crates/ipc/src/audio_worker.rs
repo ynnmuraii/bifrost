@@ -326,6 +326,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             | Msg::Health(_)
             | Msg::BackendEvent(_)
             | Msg::MediaSessions(_)
+            | Msg::PttStatus(_)
     );
     if correlated && frame.request_id == 0 || pushed && frame.request_id != 0 {
         return Err(invalid());
@@ -584,6 +585,16 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 return Err(invalid());
             }
         }
+        Msg::PttStatus(status) => {
+            if !matches!(status.state, 1..=3) || status.state != 3 && !status.registered {
+                return Err(invalid());
+            }
+            if status.state == 3 && !matches!(status.reason, 1..=3)
+                || status.state != 3 && status.reason != 0
+            {
+                return Err(invalid());
+            }
+        }
         Msg::PttEvent(event) => {
             let valid = match event.kind {
                 1 => {
@@ -599,7 +610,8 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                     1 | 2 => event.reason == 0,
                     3 => {
                         if frame.request_id == 0 {
-                            matches!(event.reason, 1..=4 | 6..=8)
+                            matches!(event.reason, 1..=4 | 6..=9)
+                                && (!matches!(event.reason, 8 | 9) || event.safety_epoch != 0)
                         } else {
                             event.reason == w::PttReleaseReason::Revoked as i32
                         }
@@ -615,7 +627,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                     _ => false,
                 }
             };
-            if !valid || !scope_valid {
+            if !valid || !scope_valid || event.grant_id != 0 && event.safety_epoch != 0 {
                 return Err(invalid());
             }
         }

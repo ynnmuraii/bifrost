@@ -519,7 +519,7 @@ pub fn encode_config(
             .map(|id| id.0.to_vec())
             .unwrap_or_default(),
         group_id: config.group_id.map(|id| id.0.to_vec()).unwrap_or_default(),
-        group_id_override: Some(config.role == cfg::AudioRole::Source && config.group_id_override),
+        group_id_override: config.group_id_override,
         mode: match config.mode {
             cfg::AudioMode::MixAll => wire::AudioMode::MixAll as i32,
             cfg::AudioMode::FollowFocus => wire::AudioMode::FollowFocus as i32,
@@ -631,7 +631,7 @@ pub fn decode_config(
         } else {
             Some(cfg::HexId(fixed(&value.group_id)?))
         },
-        group_id_override: false,
+        group_id_override: value.group_id_override,
         listener_node_id: if value.listener_node_id.is_empty() {
             None
         } else {
@@ -689,9 +689,6 @@ pub fn decode_config(
         if value.group_id.is_empty() && same_listener {
             result.group_id = previous.group_id;
         }
-        result.group_id_override = value.group_id_override.unwrap_or_else(|| {
-            !value.group_id.is_empty() || (same_listener && previous.group_id_override)
-        });
     }
     for peer in &value.peers {
         let id = cfg::HexId(fixed(&peer.node_id)?);
@@ -983,6 +980,44 @@ pub fn encode_decoded_control(
     };
     protocol::validate::audio_control(&result)?;
     Ok(result)
+}
+
+/// System configuration/start/gain CAS shares a conservative control domain:
+/// preferences (including consent/device policy), availability, microphone authority,
+/// and session identity/lifecycle/consent. Telemetry, media metadata and focus-derived
+/// gain are observations, not new user intent. Media and microphone commands retain
+/// their separate token/revision guards.
+pub fn same_control_state(old: &wire::AudioStatus, new: &wire::AudioStatus) -> bool {
+    fn lifecycle(state: i32) -> i32 {
+        if state == wire::AudioSessionState::Rebuffering as i32 {
+            wire::AudioSessionState::Running as i32
+        } else {
+            state
+        }
+    }
+    old.enabled == new.enabled
+        && old.role == new.role
+        && old.mode == new.mode
+        && old.config == new.config
+        && old.backend == new.backend
+        && old.microphone == new.microphone
+        && old.sessions.len() == new.sessions.len()
+        && old.sessions.iter().zip(&new.sessions).all(|(old, new)| {
+            old.session_id == new.session_id
+                && old.peer == new.peer
+                && old.local_role == new.local_role
+                && old.profile == new.profile
+                && old.kind == new.kind
+                && lifecycle(old.state) == lifecycle(new.state)
+                && old.consent == new.consent
+                && old.muted == new.muted
+        })
+}
+
+/// A published snapshot remains a valid CAS base only within its unchanged control
+/// interval. The monotonic barrier also rejects ABA; payload equality cannot revive it.
+pub fn control_revision_matches(expected: u64, current: u64, changed: u64) -> bool {
+    expected != 0 && current != u64::MAX && changed <= expected && expected <= current
 }
 
 #[cfg(test)]
@@ -1324,50 +1359,77 @@ mod tests {
             )
             .unwrap()
         };
+        for policy in [None, Some(false), Some(true)] {
+            let mut original = source.clone();
+            original.group_id_override = policy;
+            let encoded = encode_config(&original, model::AudioProfile::Ethernet).unwrap();
+            assert_eq!(encoded.group_id_override, policy);
+            let restored = decode(&encoded, &original);
+            assert_eq!(restored, original);
+            assert_eq!(restored.group_id_override, policy);
+            assert_eq!(restored.effective_group_override(), policy != Some(false));
+        }
         let mut request = encode_config(&source, model::AudioProfile::Ethernet).unwrap();
         assert_eq!(request.group_id_override, Some(false));
         request.background_gain_db = -12;
         request.microphone.as_mut().unwrap().control_enabled = true;
         let automatic = decode(&request, &source);
         assert_eq!(automatic.group_id, Some(group));
-        assert!(!automatic.group_id_override);
+        assert_eq!(automatic.group_id_override, Some(false));
+        assert!(!automatic.effective_group_override());
 
         request.group_id_override = None;
         let legacy_pin = decode(&request, &source);
         assert_eq!(legacy_pin.group_id, Some(group));
-        assert!(legacy_pin.group_id_override);
+        assert_eq!(legacy_pin.group_id_override, None);
+        assert!(legacy_pin.effective_group_override());
         request.group_id.clear();
-        assert!(decode(&request, &legacy_pin).group_id_override);
-        assert!(!decode(&request, &source).group_id_override);
+        for previous in [&legacy_pin, &source] {
+            let reused = decode(&request, previous);
+            assert_eq!(reused.group_id, Some(group));
+            assert_eq!(reused.group_id_override, None);
+            assert!(reused.effective_group_override());
+        }
+        request.listener_node_id = vec![4; 32];
+        let unresolved_legacy = decode(&request, &legacy_pin);
+        assert!(unresolved_legacy.group_id.is_none());
+        assert_eq!(unresolved_legacy.group_id_override, None);
+        assert!(!unresolved_legacy.effective_group_override());
+        request.listener_node_id = vec![2; 32];
 
         request.group_id = group.0.to_vec();
         request.group_id_override = Some(true);
         let pinned = decode(&request, &source);
         assert_eq!(pinned.group_id, Some(group));
-        assert!(pinned.group_id_override);
+        assert_eq!(pinned.group_id_override, Some(true));
+        assert!(pinned.effective_group_override());
         request = encode_config(&pinned, model::AudioProfile::Ethernet).unwrap();
         assert_eq!(request.group_id_override, Some(true));
         request.background_gain_db = -18;
-        assert!(decode(&request, &pinned).group_id_override);
+        assert_eq!(decode(&request, &pinned).group_id_override, Some(true));
 
         request.group_id_override = Some(false);
         let unpinned = decode(&request, &pinned);
         assert_eq!(unpinned.group_id, Some(group));
-        assert!(!unpinned.group_id_override);
+        assert_eq!(unpinned.group_id_override, Some(false));
+        assert!(!unpinned.effective_group_override());
         request.group_id.clear();
         let empty_unpinned = decode(&request, &pinned);
         assert_eq!(empty_unpinned.group_id, Some(group));
-        assert!(!empty_unpinned.group_id_override);
+        assert_eq!(empty_unpinned.group_id_override, Some(false));
+        assert!(!empty_unpinned.effective_group_override());
         assert_eq!(empty_unpinned.listener_node_id, source.listener_node_id);
 
         request.listener_node_id = vec![4; 32];
         let changed_listener = decode(&request, &pinned);
         assert!(changed_listener.group_id.is_none());
-        assert!(!changed_listener.group_id_override);
+        assert_eq!(changed_listener.group_id_override, Some(false));
+        assert!(!changed_listener.effective_group_override());
         request.group_id = vec![5; 16];
         let changed_group = decode(&request, &source);
         assert_eq!(changed_group.group_id, Some(cfg::HexId([5; 16])));
-        assert!(!changed_group.group_id_override);
+        assert_eq!(changed_group.group_id_override, Some(false));
+        assert!(!changed_group.effective_group_override());
     }
 
     #[test]
@@ -1389,31 +1451,43 @@ mod tests {
             )
             .unwrap()
         };
+        for policy in [None, Some(false)] {
+            let mut original = listener.clone();
+            original.group_id_override = policy;
+            let mut encoded = encode_config(&original, model::AudioProfile::Ethernet).unwrap();
+            assert_eq!(encoded.group_id_override, policy);
+            assert_eq!(decode(&encoded, &original), original);
+            encoded.group_id.clear();
+            let reused = decode(&encoded, &original);
+            assert_eq!(reused.group_id, Some(group));
+            assert_eq!(reused.group_id_override, policy);
+            assert!(!reused.effective_group_override());
+        }
         let mut request = encode_config(&listener, model::AudioProfile::Ethernet).unwrap();
         assert_eq!(request.group_id_override, Some(false));
         request.group_id.clear();
         let republished = decode(&request, &listener);
         assert_eq!(republished.group_id, Some(group));
-        assert!(!republished.group_id_override);
+        assert_eq!(republished.group_id_override, Some(false));
         let pending = decode(&request, &cfg::AudioConfig::default());
         assert!(pending.group_id.is_none());
-        assert!(!pending.group_id_override);
+        assert_eq!(pending.group_id_override, Some(false));
 
         let source = cfg::AudioConfig {
             role: cfg::AudioRole::Source,
             listener_node_id: Some(cfg::HexId([2; 32])),
             group_id: Some(group),
-            group_id_override: true,
+            group_id_override: Some(true),
             ..Default::default()
         };
         let changed_to_listener = decode(&request, &source);
         assert!(changed_to_listener.group_id.is_none());
-        assert!(!changed_to_listener.group_id_override);
+        assert_eq!(changed_to_listener.group_id_override, Some(false));
         request.role = wire::AudioRole::Source as i32;
         request.listener_node_id = vec![2; 32];
         let changed_to_source = decode(&request, &listener);
         assert!(changed_to_source.group_id.is_none());
-        assert!(!changed_to_source.group_id_override);
+        assert_eq!(changed_to_source.group_id_override, Some(false));
     }
 
     #[test]
@@ -1845,5 +1919,125 @@ mod focus_tests {
             decode_focus(&encode_focus(value)),
             Ok(FocusControl::Snapshot(value))
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    fn status() -> wire::AudioStatus {
+        wire::AudioStatus {
+            revision: 10,
+            enabled: true,
+            role: wire::AudioRole::Source as i32,
+            mode: wire::AudioMode::MixAll as i32,
+            config: Some(wire::AudioConfig {
+                enabled: true,
+                role: wire::AudioRole::Source as i32,
+                group_id: vec![3; 16],
+                listener_node_id: vec![2; 32],
+                output_device: "default".into(),
+                group_id_override: Some(false),
+                ..Default::default()
+            }),
+            sessions: vec![wire::AudioSessionStatus {
+                session_id: vec![1; 16],
+                peer: vec![2; 32],
+                local_role: wire::AudioRole::Source as i32,
+                state: wire::AudioSessionState::Running as i32,
+                profile: wire::AudioProfile::Ethernet as i32,
+                kind: wire::AudioKind::System as i32,
+                consent: Some(wire::AudioSessionConsent {
+                    local: Some(wire::AudioConsentFlags {
+                        allow_system_send: true,
+                        ..Default::default()
+                    }),
+                    remote: Some(wire::AudioConsentFlags {
+                        allow_system_receive: true,
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn telemetry_and_playout_observations_do_not_change_the_control_domain() {
+        let old = status();
+        let mut new = old.clone();
+        new.revision += 1;
+        let session = &mut new.sessions[0];
+        session.health = Some(wire::AudioHealth {
+            received_packets: 100,
+            ..Default::default()
+        });
+        session.remote_quality = Some(wire::AudioRemoteQuality {
+            received_packets: 100,
+            ..Default::default()
+        });
+        session.latency_estimate_ms = Some(20);
+        session.state = wire::AudioSessionState::Rebuffering as i32;
+        session.focus_primary = true;
+        session.gain_percent = 25;
+        session.media_info = Some(wire::MediaInfo {
+            session_token: 1,
+            revision: 1,
+            ..Default::default()
+        });
+        assert!(same_control_state(&old, &new));
+        assert!(control_revision_matches(
+            old.revision,
+            new.revision,
+            old.revision
+        ));
+    }
+
+    #[test]
+    fn preferences_consent_identity_and_lifecycle_close_the_control_interval() {
+        let old = status();
+        for change in 0..6 {
+            let mut new = old.clone();
+            match change {
+                0 => new.config.as_mut().unwrap().group_id[0] ^= 1,
+                1 => new.config.as_mut().unwrap().output_device = "another-device".into(),
+                2 => {
+                    new.sessions[0]
+                        .consent
+                        .as_mut()
+                        .unwrap()
+                        .local
+                        .as_mut()
+                        .unwrap()
+                        .allow_system_send = false
+                }
+                3 => new.sessions[0].session_id[0] ^= 1,
+                4 => new.sessions[0].state = wire::AudioSessionState::Failed as i32,
+                5 => new.sessions[0].muted = true,
+                _ => unreachable!(),
+            }
+            assert!(!same_control_state(&old, &new));
+        }
+    }
+
+    #[test]
+    fn future_stale_and_aba_snapshots_cannot_cross_the_control_barrier() {
+        for expected in [0, 9, 21, u64::MAX] {
+            assert!(!control_revision_matches(expected, 20, 10));
+        }
+        for expected in [10, 15, 20] {
+            assert!(control_revision_matches(expected, 20, 10));
+        }
+        assert!(!control_revision_matches(u64::MAX, u64::MAX, u64::MAX));
+        let a = status();
+        let mut b = a.clone();
+        b.config.as_mut().unwrap().group_id[0] ^= 1;
+        assert!(!same_control_state(&a, &b));
+        let returned_to_a = a.clone();
+        assert!(!same_control_state(&b, &returned_to_a));
+        assert!(same_control_state(&a, &returned_to_a));
+        assert!(!control_revision_matches(a.revision, 12, 12));
     }
 }

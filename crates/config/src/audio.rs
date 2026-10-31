@@ -130,8 +130,9 @@ pub struct AudioConfig {
     pub role: AudioRole,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<AudioGroupId>,
-    /// Only explicit Source Advanced overrides pin a group; resolved groups follow the Listener.
-    pub group_id_override: bool,
+    /// Absent legacy Source groups pin; explicit false follows the Listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id_override: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listener_node_id: Option<AudioNodeId>,
     pub media_port: u16,
@@ -160,7 +161,7 @@ impl Default for AudioConfig {
             enabled: false,
             role: AudioRole::Off,
             group_id: None,
-            group_id_override: false,
+            group_id_override: Some(false),
             listener_node_id: None,
             media_port: 47903,
             profile: AudioProfile::Auto,
@@ -261,11 +262,17 @@ impl AudioConfig {
         self == &Self::default()
     }
 
+    pub fn effective_group_override(&self) -> bool {
+        self.role == AudioRole::Source && self.group_id_override.unwrap_or(self.group_id.is_some())
+    }
+
     /// Structural policy only. The caller MUST recheck current trust, self identity,
     /// Listener group ownership, runtime device availability and bilateral consent
     /// at activation. Pairing never populates either explicit consent list.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.group_id_override && (self.role != AudioRole::Source || self.group_id.is_none()) {
+        if self.group_id_override == Some(true)
+            && (self.role != AudioRole::Source || self.group_id.is_none())
+        {
             return Err(invalid(
                 "audio.group_id_override",
                 "Source role with a nonempty group_id",

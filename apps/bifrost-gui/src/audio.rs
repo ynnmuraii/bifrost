@@ -428,7 +428,10 @@ fn eligible(session: &model::SessionStatus) -> bool {
 }
 fn media_allowed(session: &model::SessionStatus) -> bool {
     eligible(session)
-        && session.media_info.is_some()
+        && session
+            .media_info
+            .as_ref()
+            .is_some_and(|info| info.session_token != 0 && info.revision != 0)
         && session.consent.local.allow_system_receive
         && session.consent.remote.allow_system_send
         && session.consent.remote.allow_media_control

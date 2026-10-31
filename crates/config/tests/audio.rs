@@ -70,29 +70,92 @@ fn unresolved_source_preserves_enabled_intent_without_inventing_group() {
 }
 
 #[test]
-fn group_override_defaults_auto_and_requires_a_source_group() {
+fn group_override_preserves_all_presence_states_through_toml() {
+    assert_eq!(AudioConfig::default().group_id_override, Some(false));
     let source = format!(
         "role = 'source'\nlistener_node_id = '{}'\ngroup_id = '{}'",
         "11".repeat(32),
         "22".repeat(16)
     );
-    let legacy = parse(&source).unwrap();
-    assert!(!legacy.audio.group_id_override);
-    let pinned = parse(&format!("{source}\ngroup_id_override = true")).unwrap();
-    pinned.validate().unwrap();
-    assert_eq!(
-        Config::from_str(&pinned.to_toml().unwrap()).unwrap(),
-        pinned
-    );
+    for policy in [None, Some(false), Some(true)] {
+        let field = policy
+            .map(|value| format!("\ngroup_id_override = {value}"))
+            .unwrap_or_default();
+        let config = parse(&format!("{source}{field}")).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.audio.group_id_override, policy);
+        assert_eq!(
+            config.audio.effective_group_override(),
+            policy != Some(false)
+        );
+        let saved = config.to_toml().unwrap();
+        assert_eq!(saved.contains("group_id_override"), policy.is_some());
+        let restored = Config::from_str(&saved).unwrap();
+        assert_eq!(restored, config);
+        assert_eq!(restored.audio.group_id_override, policy);
+    }
+}
+
+#[test]
+fn group_override_requires_a_source_group() {
     for role in [AudioRole::Off, AudioRole::Listener, AudioRole::Source] {
         let mut config = AudioConfig {
             role,
-            group_id_override: true,
+            group_id_override: Some(true),
             ..Default::default()
         };
         assert!(config.validate().is_err());
         config.group_id = Some(HexId([2; 16]));
         assert_eq!(config.validate().is_ok(), role == AudioRole::Source);
+    }
+}
+
+#[test]
+fn legacy_group_pin_survives_restart_and_unrelated_locked_save() {
+    let directory = directory();
+    let path = directory.join("config.toml");
+    let legacy = parse(&format!(
+        "role = 'source'\nlistener_node_id = '{}'\ngroup_id = '{}'",
+        "11".repeat(32),
+        "22".repeat(16)
+    ))
+    .unwrap();
+    assert_eq!(legacy.audio.group_id_override, None);
+    assert!(legacy.audio.effective_group_override());
+    legacy.save(&path).unwrap();
+    let mut restored = Config::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(restored.audio.group_id_override, None);
+    assert!(restored.audio.effective_group_override());
+    restored.audio.background_gain_db = -24.0;
+    save_audio_locked(&path, restored.audio.clone()).unwrap();
+    let restarted = Config::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(restarted.audio, restored.audio);
+    assert_eq!(restarted.audio.group_id_override, None);
+    assert!(restarted.audio.effective_group_override());
+    restored.audio.group_id_override = Some(false);
+    save_audio_locked(&path, restored.audio).unwrap();
+    let unpinned = Config::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(unpinned.audio.group_id, legacy.audio.group_id);
+    assert_eq!(unpinned.audio.group_id_override, Some(false));
+    assert!(!unpinned.audio.effective_group_override());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn legacy_group_policy_only_pins_sources_with_a_group() {
+    for role in [AudioRole::Off, AudioRole::Listener, AudioRole::Source] {
+        for group_id in [None, Some(HexId([2; 16]))] {
+            let config = AudioConfig {
+                role,
+                group_id,
+                group_id_override: None,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.effective_group_override(),
+                role == AudioRole::Source && group_id.is_some()
+            );
+        }
     }
 }
 

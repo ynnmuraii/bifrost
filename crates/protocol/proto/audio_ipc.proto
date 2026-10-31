@@ -39,6 +39,7 @@ message AudioFrame {
     Error error = 46;
     MuteSnapshot mute_snapshot = 47;
     PttEvent ptt_event = 48;
+    PttStatus ptt_status = 72;
     MediaSessions media_sessions = 60;
     MediaCommandResult media_command_result = 61;
   }
@@ -170,12 +171,18 @@ message PttGrant { uint64 grant_id = 1; uint32 ttl_ms = 2; } // Nonzero, strictl
 message PttRevoke { uint64 grant_id = 1; } // Stale IDs never revoke a newer grant.
 message PttReleaseAll {} // Clears transient talk without changing explicit persistent unmute.
 enum PttEventKind { PTT_EVENT_KIND_UNSPECIFIED = 0; PTT_EVENT_KIND_PRESSED = 1; PTT_EVENT_KIND_RENEWED = 2; PTT_EVENT_KIND_RELEASED = 3; PTT_EVENT_KIND_REFUSED = 4; PTT_EVENT_KIND_NOOP = 5; }
-enum PttReleaseReason { PTT_RELEASE_REASON_UNSPECIFIED = 0; PTT_RELEASE_REASON_EXPIRED = 1; PTT_RELEASE_REASON_REVOKED = 2; PTT_RELEASE_REASON_REPLACED = 3; PTT_RELEASE_REASON_EXPLICIT_MUTE = 4; PTT_RELEASE_REASON_PRE_MUTED = 5; PTT_RELEASE_REASON_PERSISTENT_UNMUTE = 6; PTT_RELEASE_REASON_BACKEND_FAILED = 7; PTT_RELEASE_REASON_PHYSICAL_RELEASE = 8; }
-// Native physical release alone uses grant_id=0/reason=PhysicalRelease.
+enum PttReleaseReason { PTT_RELEASE_REASON_UNSPECIFIED = 0; PTT_RELEASE_REASON_EXPIRED = 1; PTT_RELEASE_REASON_REVOKED = 2; PTT_RELEASE_REASON_REPLACED = 3; PTT_RELEASE_REASON_EXPLICIT_MUTE = 4; PTT_RELEASE_REASON_PRE_MUTED = 5; PTT_RELEASE_REASON_PERSISTENT_UNMUTE = 6; PTT_RELEASE_REASON_BACKEND_FAILED = 7; PTT_RELEASE_REASON_PHYSICAL_RELEASE = 8; PTT_RELEASE_REASON_PORTAL_RELEASE = 9; }
+// PhysicalRelease proves configured non-modifier key-up; PortalRelease proves a
+// current-session trusted compositor logical release, never a raw key assertion.
 // ReleaseAll replies use grant_id=0/Released/Revoked, never a physical observation.
 // Pressed: expires>observed, delta<=250ms. Renewed: observed=0, expires>0.
 // Released/Refused/Noop: timestamps zero. A positive outer ID correlates admission/result.
-message PttEvent { PttEventKind kind = 1; uint64 observed_at_ns = 2; uint64 expires_at_ns = 3; uint64 grant_id = 4; PttReleaseReason reason = 5; }
+message PttEvent { PttEventKind kind = 1; uint64 observed_at_ns = 2; uint64 expires_at_ns = 3; uint64 grant_id = 4; PttReleaseReason reason = 5; uint64 safety_epoch = 6; }
+// Readiness is not a physical edge and never authorizes talk. Epoch orders queued
+// status observations against child safety fences within a worker generation.
+enum PttArmingState { PTT_ARMING_STATE_UNSPECIFIED = 0; PTT_ARMING_STATE_ARMED = 1; PTT_ARMING_STATE_NEEDS_PHYSICAL_RELEASE = 2; PTT_ARMING_STATE_UNAVAILABLE = 3; }
+enum PttUnavailableReason { PTT_UNAVAILABLE_REASON_UNSPECIFIED = 0; PTT_UNAVAILABLE_REASON_HOST_CLOCK_UNAVAILABLE = 1; PTT_UNAVAILABLE_REASON_PORTAL_FRESHNESS_UNVERIFIABLE = 2; PTT_UNAVAILABLE_REASON_REGISTRATION_UNAVAILABLE = 3; }
+message PttStatus { PttArmingState state = 1; uint64 safety_epoch = 2; bool registered = 3; PttUnavailableReason reason = 4; }
 message SetMediaWatch { bool enabled = 1; } // Success is an asynchronous MediaSessions snapshot.
 enum MediaCommandKind { MEDIA_COMMAND_KIND_UNSPECIFIED = 0; MEDIA_COMMAND_KIND_PLAY = 1; MEDIA_COMMAND_KIND_PAUSE = 2; MEDIA_COMMAND_KIND_TOGGLE = 3; MEDIA_COMMAND_KIND_NEXT = 4; MEDIA_COMMAND_KIND_PREVIOUS = 5; }
 message MediaCommand { uint64 token = 1; uint64 expected_revision = 2; MediaCommandKind command = 3; }

@@ -18,6 +18,10 @@ pub(super) struct Controls<M: MuteGuard> {
     last_press: Option<u64>,
     native_epoch: u64,
     native_blocked: bool,
+    native_status: Option<(u64, i32, bool, i32)>,
+    discard_native_proof: bool,
+    portal_observation: bool,
+    native_unavailable_reason: i32,
     privacy: Arc<crate::privacy::Privacy>,
     pub(super) fence: Option<(u64, u64)>,
 }
@@ -46,6 +50,10 @@ impl<M: MuteGuard + 'static> Controls<M> {
             last_press: None,
             native_epoch: 0,
             native_blocked: false,
+            native_status: None,
+            discard_native_proof: false,
+            portal_observation: false,
+            native_unavailable_reason: 3,
             privacy,
             fence: None,
         }
@@ -59,7 +67,54 @@ impl<M: MuteGuard + 'static> Controls<M> {
         if epoch != self.native_epoch {
             self.native_epoch = epoch;
             self.native_blocked = true;
+            self.discard_native_proof = true;
             self.press = None;
+        }
+    }
+
+    pub(super) fn begin_native_events(&mut self) {
+        self.sync_native_fence();
+    }
+    pub(super) fn native_queue_drained(&mut self) {
+        self.sync_native_fence();
+        // Pending proofs predate an unobservable queue boundary; only later
+        // native key-up observations may rearm the current safety epoch.
+        self.discard_native_proof = false;
+    }
+
+    fn publish_native_status(&mut self, now_ns: Option<u64>, emit: &mut impl FnMut(u64, Msg)) {
+        let state = if !self.configured || now_ns.is_none() {
+            3
+        } else if self.native_blocked {
+            2
+        } else {
+            1
+        };
+        let reason = if now_ns.is_none() {
+            1
+        } else if !self.configured {
+            self.native_unavailable_reason
+        } else {
+            0
+        };
+        self.privacy
+            .native_failure_reason
+            .store(reason as u64, std::sync::atomic::Ordering::Release);
+        self.privacy
+            .native_registered
+            .store(self.configured, std::sync::atomic::Ordering::Release);
+        let status = (self.native_epoch, state, self.configured, reason);
+        if self.native_status != Some(status) {
+            self.native_status = Some(status);
+            emit(
+                0,
+                Msg::PttStatus(w::PttStatus {
+                    state,
+                    safety_epoch: self.native_epoch,
+                    registered: self.configured,
+                    reason,
+                }),
+            );
         }
     }
 
@@ -237,10 +292,25 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 for (slot, key) in reserved.iter_mut().zip(&request.reserved) {
                     *slot = hotkey(key);
                 }
-                backend.configure_ptt(binding, &reserved[..request.reserved.len()])?;
+                self.native_unavailable_reason = 3;
+                self.portal_observation = false;
+                if let Err(error) =
+                    backend.configure_ptt(binding, &reserved[..request.reserved.len()])
+                {
+                    self.publish_native_status(crate::clock::now_ns(), emit);
+                    return Err(error);
+                }
                 self.configured = binding.is_some();
+                let cutoff = self
+                    .privacy
+                    .native_fence_ns
+                    .load(std::sync::atomic::Ordering::Acquire);
+                self.privacy.fence_native((cutoff != 0).then_some(cutoff));
+                self.sync_native_fence();
+                self.native_blocked = true;
+                self.publish_native_status(crate::clock::now_ns(), emit);
                 // Admission acknowledgment, not evidence that an OS permission prompt was granted.
-                emit(request_id, released(2));
+                emit(request_id, released(2, self.native_epoch));
                 Ok(())
             }
             _ => Err(BackendError::InvalidArgument),
@@ -305,12 +375,20 @@ impl<M: MuteGuard + 'static> Controls<M> {
         emit: &mut impl FnMut(u64, Msg),
     ) {
         let held = self.press.take().is_some();
+        let observed = self.configured || self.native_status.is_some();
         if self.configured || held {
             let _ = backend.configure_ptt(None, &[]);
         }
         self.configured = false;
+        self.native_blocked = true;
+        self.privacy
+            .native_registered
+            .store(false, std::sync::atomic::Ordering::Release);
         if held {
-            emit(0, released(reason));
+            emit(0, released(reason, self.native_epoch));
+        }
+        if observed {
+            self.publish_native_status(crate::clock::now_ns(), emit);
         }
     }
 
@@ -346,18 +424,21 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 let Some(clock) = now_ns else {
                     return;
                 };
-                if self
+                let cutoff = self
                     .privacy
-                    .native_epoch
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != 0
-                    && *observed_at_ns
-                        <= self
-                            .privacy
-                            .native_fence_ns
-                            .load(std::sync::atomic::Ordering::Acquire)
-                {
+                    .native_fence_ns
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if cutoff != 0 && *observed_at_ns <= cutoff {
                     self.native_blocked = true;
+                    self.publish_native_status(now_ns, emit);
+                    return;
+                }
+                if self.portal_observation && clock.saturating_sub(*observed_at_ns) > PTT_LEASE_NS {
+                    self.native_unavailable_reason = 2;
+                    self.configured = false;
+                    self.privacy.fence_native(now_ns);
+                    self.sync_native_fence();
+                    self.publish_native_status(now_ns, emit);
                     return;
                 }
                 if !self.configured
@@ -366,7 +447,9 @@ impl<M: MuteGuard + 'static> Controls<M> {
                     || self.last_press.is_some_and(|last| *observed_at_ns <= last)
                     || *observed_at_ns > clock
                     || *expires_at_ns <= clock
-                    || expires_at_ns.saturating_sub(*observed_at_ns) > PTT_LEASE_NS
+                    || (!self.portal_observation
+                        && expires_at_ns.saturating_sub(*observed_at_ns) > PTT_LEASE_NS)
+                    || expires_at_ns.saturating_sub(clock) > PTT_LEASE_NS
                     || *expires_at_ns <= *observed_at_ns
                 {
                     return;
@@ -388,8 +471,13 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 emit(
                     0,
                     Msg::PttEvent(w::PttEvent {
+                        safety_epoch: self.native_epoch,
                         kind: 1,
-                        observed_at_ns: *observed_at_ns,
+                        observed_at_ns: if self.portal_observation {
+                            clock
+                        } else {
+                            *observed_at_ns
+                        },
                         expires_at_ns: *expires_at_ns,
                         grant_id: 0,
                         reason: 0,
@@ -413,6 +501,7 @@ impl<M: MuteGuard + 'static> Controls<M> {
                 emit(
                     0,
                     Msg::PttEvent(w::PttEvent {
+                        safety_epoch: self.native_epoch,
                         kind: 2,
                         observed_at_ns: 0,
                         expires_at_ns: *expires_at_ns,
@@ -424,16 +513,74 @@ impl<M: MuteGuard + 'static> Controls<M> {
             Event::PttReleased { reason } => {
                 let held = self.press.take().is_some();
                 match reason {
-                    audio_backend::PttReleaseReason::PhysicalKeyUp => {
+                    audio_backend::PttReleaseReason::PortalFreshnessUnavailable => {
+                        self.native_unavailable_reason = 2;
+                        self.configured = false;
+                        self.privacy.fence_native(now_ns);
+                        self.sync_native_fence();
+                    }
+                    audio_backend::PttReleaseReason::PortalDeactivated { observed_at_ns } => {
+                        let cutoff = self
+                            .privacy
+                            .native_fence_ns
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        if let Some(clock) = now_ns {
+                            if *observed_at_ns > clock
+                                || clock.saturating_sub(*observed_at_ns) > PTT_LEASE_NS
+                            {
+                                self.native_unavailable_reason = 2;
+                                self.configured = false;
+                                self.privacy.fence_native(now_ns);
+                                self.sync_native_fence();
+                            } else if self.configured
+                                && !self.discard_native_proof
+                                && *observed_at_ns > cutoff
+                            {
+                                self.portal_observation = true;
+                                self.native_blocked = false;
+                                emit(0, released(9, self.native_epoch));
+                            } else {
+                                self.native_blocked = true;
+                            }
+                        } else {
+                            self.native_blocked = true;
+                        }
+                    }
+                    audio_backend::PttReleaseReason::PhysicalKeyUp
+                        if now_ns.is_some() && self.configured && !self.discard_native_proof =>
+                    {
                         self.native_blocked = false;
-                        emit(0, released(8));
+                        emit(0, released(8, self.native_epoch));
+                        self.portal_observation = false;
                     }
-                    audio_backend::PttReleaseReason::LeaseExpired if held => emit(0, released(1)),
-                    audio_backend::PttReleaseReason::UnavailableOrReset if held => {
-                        emit(0, released(7))
+                    audio_backend::PttReleaseReason::LeaseExpired => {
+                        if !self.native_blocked {
+                            self.privacy.fence_native(now_ns);
+                            self.sync_native_fence();
+                        }
+                        self.native_blocked = true;
+                        if held {
+                            emit(0, released(1, self.native_epoch));
+                        }
                     }
-                    _ => {}
+                    audio_backend::PttReleaseReason::UnavailableOrReset => {
+                        if !self.native_blocked {
+                            self.privacy.fence_native(now_ns);
+                            self.sync_native_fence();
+                        }
+                        self.native_blocked = true;
+                        if held {
+                            emit(0, released(7, self.native_epoch));
+                        }
+                    }
+                    audio_backend::PttReleaseReason::PhysicalKeyUp => {
+                        self.native_blocked = true;
+                        if now_ns.is_none() {
+                            emit(0, released(7, self.native_epoch));
+                        }
+                    }
                 }
+                self.publish_native_status(now_ns, emit);
             }
             Event::ResyncRequired => {
                 self.revoke(backend, 7, emit);
@@ -452,18 +599,33 @@ impl<M: MuteGuard + 'static> Controls<M> {
 
     pub(super) fn tick<B: Backend<Mute = M>>(
         &mut self,
-        backend: &mut B,
+        _backend: &mut B,
         now_ns: Option<u64>,
         now: Instant,
         emit: &mut impl FnMut(u64, Msg),
     ) {
         self.sync_native_fence();
-        if now_ns.is_none()
-            || self.press.is_some_and(|(expiry, deadline)| {
-                now_ns.is_some_and(|clock| clock >= expiry) || now >= deadline
-            })
+        let expired = self.press.is_some_and(|(expiry, deadline)| {
+            now_ns.is_some_and(|clock| clock >= expiry) || now >= deadline
+        });
+        if expired
+            || now_ns.is_none()
+                && self.configured
+                && self.native_status.is_none_or(|(_, state, _, _)| state != 3)
         {
-            self.revoke(backend, if now_ns.is_none() { 7 } else { 1 }, emit);
+            let held = self.press.take().is_some();
+            self.privacy.fence_native(now_ns);
+            self.sync_native_fence();
+            self.native_blocked = true;
+            if held {
+                emit(
+                    0,
+                    released(if now_ns.is_none() { 7 } else { 1 }, self.native_epoch),
+                );
+            }
+        }
+        if self.configured || self.native_epoch != 0 || self.native_status.is_some() {
+            self.publish_native_status(now_ns, emit);
         }
     }
 
@@ -488,8 +650,9 @@ fn hotkey(key: &w::PttHotkey) -> PttHotkey {
         meta: key.meta,
     }
 }
-fn released(reason: i32) -> Msg {
+fn released(reason: i32, safety_epoch: u64) -> Msg {
     Msg::PttEvent(w::PttEvent {
+        safety_epoch,
         kind: 3,
         observed_at_ns: 0,
         expires_at_ns: 0,
@@ -552,7 +715,22 @@ mod tests {
         output: &mut Vec<(u64, Msg)>,
         message: Msg,
     ) -> Result<(), BackendError> {
-        controls.command(backend, 7, message, &mut |id, msg| output.push((id, msg)))
+        let initial_registration = controls.native_status.is_none()
+            && controls
+                .privacy
+                .talk_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            && matches!(&message,Msg::ConfigurePtt(request) if request.binding.is_some());
+        let result = controls.command(backend, 7, message, &mut |id, msg| output.push((id, msg)));
+        controls.native_queue_drained();
+        if initial_registration && result.is_ok() {
+            // Unit fixtures perform a real scripted key cycle, never a free up.
+            backend.apply(ScriptEvent::PttPress).unwrap();
+            backend.apply(ScriptEvent::PttRelease).unwrap();
+            pump(controls, backend, &mut Vec::new(), 1, Instant::now());
+        }
+        result
     }
     fn pump(
         controls: &mut Controls<DryMuteGuard>,
@@ -561,11 +739,13 @@ mod tests {
         clock: u64,
         now: Instant,
     ) {
+        controls.begin_native_events();
         while let Some(event) = backend.poll_event() {
             controls.event(backend, &event, Some(clock), now, &mut |id, msg| {
                 output.push((id, msg))
             });
         }
+        controls.native_queue_drained();
     }
     fn kinds(output: &[(u64, Msg)]) -> Vec<i32> {
         output
@@ -793,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn timer_expiry_releases_even_when_native_unregister_fails() {
+    fn timer_expiry_closes_talk_without_relying_on_native_unregister() {
         let (mut backend, mut controls, mut output) = fixture();
         run(&mut controls, &mut backend, &mut output, configure(true)).unwrap();
         let now = Instant::now();
@@ -811,7 +991,11 @@ mod tests {
             &mut |id, msg| output.push((id, msg)),
         );
         assert_eq!(kinds(&output), vec![3, 1, 3]);
-        assert!(!controls.configured);
+        assert!(
+            controls.configured,
+            "registration stays live to observe real key-up"
+        );
+        assert!(controls.native_blocked);
         assert!(controls.press.is_none());
     }
 
@@ -850,7 +1034,8 @@ mod tests {
         assert!(!controls.configured);
         run(&mut controls, &mut backend, &mut output, configure(true)).unwrap();
         controls.tick(&mut backend, None, Instant::now(), &mut |_, _| {});
-        assert!(!controls.configured);
+        assert!(controls.configured);
+        assert!(controls.native_blocked);
     }
 
     #[test]
@@ -1262,7 +1447,10 @@ mod tests {
             now,
             &mut |id, msg| output.push((id, msg)),
         );
-        assert!(matches!(output.last(), Some((0,Msg::PttEvent(event))) if event.reason == 8));
+        assert!(output
+            .iter()
+            .rev()
+            .any(|(_, msg)| matches!(msg,Msg::PttEvent(event) if event.reason==8)));
         controls.event(&mut backend, &press(100), Some(500), now, &mut |id, msg| {
             output.push((id, msg))
         });
@@ -1330,5 +1518,151 @@ mod tests {
         result(&output, 12, 5, 6);
         std::thread::sleep(Duration::from_millis(10));
         assert!(!controls.guard.as_ref().unwrap().snapshot().unwrap().muted);
+    }
+
+    #[test]
+    fn native_registration_is_observably_unarmed_and_clock_recovery_requires_real_up() {
+        let (mut backend, mut controls, mut output) = fixture();
+        controls
+            .command(&mut backend, 7, configure(true), &mut |id, msg| {
+                output.push((id, msg))
+            })
+            .unwrap();
+        assert!(output.iter().any(
+            |(_, msg)| matches!(msg,Msg::PttStatus(status) if status.registered && status.state==2)
+        ));
+        assert!(controls.native_blocked);
+        controls.native_queue_drained();
+        assert_eq!(
+            controls
+                .privacy
+                .admit_at(8, &Msg::PttReleaseAll(w::PttReleaseAll {}), None),
+            Some(Ok(false))
+        );
+        controls.tick(&mut backend, None, Instant::now(), &mut |id, msg| {
+            output.push((id, msg))
+        });
+        assert!(output.iter().any(
+            |(_, msg)| matches!(msg,Msg::PttStatus(status) if status.state==3 && status.reason==1)
+        ));
+        assert_eq!(
+            controls
+                .privacy
+                .native_fence_ns
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        controls.native_queue_drained();
+        backend.apply(ScriptEvent::PttPress).unwrap();
+        backend.apply(ScriptEvent::PttRelease).unwrap();
+        pump(
+            &mut controls,
+            &mut backend,
+            &mut output,
+            1000,
+            Instant::now(),
+        );
+        assert!(!controls.native_blocked);
+        backend
+            .apply(ScriptEvent::AdvanceTime { now_ns: 2000 })
+            .unwrap();
+        backend.apply(ScriptEvent::PttPress).unwrap();
+        pump(
+            &mut controls,
+            &mut backend,
+            &mut output,
+            2000,
+            Instant::now(),
+        );
+        assert_eq!(kinds(&output).last(), Some(&1));
+    }
+
+    #[test]
+    fn portal_logical_proof_keeps_original_freshness_and_separate_bounded_lease() {
+        let (mut backend, mut controls, mut output) = fixture();
+        controls
+            .command(&mut backend, 7, configure(true), &mut |id, msg| {
+                output.push((id, msg))
+            })
+            .unwrap();
+        controls.native_queue_drained();
+        let now = Instant::now();
+        controls.event(
+            &mut backend,
+            &Event::PttReleased {
+                reason: audio_backend::PttReleaseReason::PortalDeactivated {
+                    observed_at_ns: 100,
+                },
+            },
+            Some(200),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        assert!(output.iter().any(|(_,msg)| matches!(msg,Msg::PttEvent(event) if event.reason==9 && event.safety_epoch==controls.native_epoch)));
+        controls.event(
+            &mut backend,
+            &Event::PttPressed {
+                observed_at_ns: 101,
+                expires_at_ns: 200 + PTT_LEASE_NS,
+            },
+            Some(200),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        assert!(
+            matches!(output.last(),Some((0,Msg::PttEvent(event))) if event.kind==1 && event.observed_at_ns==200 && event.expires_at_ns-event.observed_at_ns==PTT_LEASE_NS)
+        );
+        assert_eq!(controls.last_press, Some(101));
+        controls
+            .privacy
+            .admit_at(8, &Msg::PttReleaseAll(w::PttReleaseAll {}), Some(300));
+        controls.begin_native_events();
+        controls.event(
+            &mut backend,
+            &Event::PttReleased {
+                reason: audio_backend::PttReleaseReason::PortalDeactivated {
+                    observed_at_ns: 299,
+                },
+            },
+            Some(350),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        assert!(
+            controls.native_blocked,
+            "queued pre-fence logical up is not proof"
+        );
+        controls.native_queue_drained();
+        controls.event(
+            &mut backend,
+            &Event::PttReleased {
+                reason: audio_backend::PttReleaseReason::PortalDeactivated {
+                    observed_at_ns: 301,
+                },
+            },
+            Some(350),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        assert!(!controls.native_blocked);
+        controls.event(
+            &mut backend,
+            &Event::PttReleased {
+                reason: audio_backend::PttReleaseReason::PortalFreshnessUnavailable,
+            },
+            Some(400),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        controls.event(
+            &mut backend,
+            &Event::ResyncRequired,
+            Some(400),
+            now,
+            &mut |id, msg| output.push((id, msg)),
+        );
+        assert!(
+            matches!(output.last(),Some((0,Msg::PttStatus(status))) if status.state==3 && status.reason==2 && !status.registered)
+        );
     }
 }

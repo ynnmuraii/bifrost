@@ -28,6 +28,7 @@ pub enum Op {
     Press,
     Renew,
     Release,
+    ReleaseAll,
 }
 
 /// A replacement child has no guard history. Re-establish this base state before
@@ -66,6 +67,7 @@ pub struct Grant {
 pub enum Effect {
     None,
     SetMute(bool),
+    ReleaseAll,
     Grant(Grant),
     Revoke(u64),
 }
@@ -82,6 +84,7 @@ struct History {
 }
 pub struct Authority {
     pub revision: u64,
+    pub talk_generation: u64,
     pub muted: bool,
     pub desired_muted: bool,
     pub desired_muted_by: Option<Parent>,
@@ -97,6 +100,7 @@ impl Default for Authority {
     fn default() -> Self {
         Self {
             revision: 1,
+            talk_generation: 0,
             muted: true,
             desired_muted: true,
             desired_muted_by: None,
@@ -177,6 +181,13 @@ impl Authority {
             None => Effect::None,
         }
     }
+    pub fn release_all(&mut self) -> Effect {
+        self.grant = None;
+        self.challenges.clear();
+        self.talk_generation = self.talk_generation.saturating_add(1);
+        self.changed();
+        Effect::ReleaseAll
+    }
     pub fn expire(&mut self, now: u64) -> Effect {
         if self.grant.is_some_and(|g| g.expires_ns <= now) {
             self.revoke()
@@ -242,7 +253,7 @@ impl Authority {
                     effect: Effect::None,
                 };
             }
-            if sequence <= h.request_high && c.op != Op::Release {
+            if sequence <= h.request_high && !matches!(c.op, Op::Release | Op::ReleaseAll) {
                 return reject(ResultCode::Expired);
             }
         }
@@ -263,6 +274,12 @@ impl Authority {
             result,
             effect: Effect::None,
         };
+        if c.op == Op::ReleaseAll {
+            return Decision {
+                result: ResultCode::Ok,
+                effect: self.release_all(),
+            };
+        }
         // Release is revision-independent, but can only close this exact parent's press.
         if c.op == Op::Release {
             let sequence = u64::from_be_bytes(c.press[8..].try_into().unwrap());
@@ -283,6 +300,9 @@ impl Authority {
             return reject(ResultCode::StaleRevision);
         }
         if let Op::SetMute(muted) = c.op {
+            if muted {
+                self.release_all();
+            }
             self.desired_muted = muted;
             self.desired_muted_by = Some(parent);
             self.changed();
@@ -325,13 +345,16 @@ impl Authority {
         if c.op == Op::Renew {
             return reject(ResultCode::Expired);
         }
+        let Some(next_grant) = self.next_grant.checked_add(1) else {
+            return reject(ResultCode::Busy);
+        };
         let h = self.history(parent);
         let sequence = u64::from_be_bytes(c.press[8..].try_into().unwrap());
         if sequence == 0 || sequence <= h.press_high {
             return reject(ResultCode::Expired);
         }
         h.press_high = sequence;
-        self.next_grant = self.next_grant.saturating_add(1).max(1);
+        self.next_grant = next_grant;
         let g = Grant {
             parent,
             press: c.press,
@@ -350,6 +373,55 @@ impl Authority {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn talk_generation_tracks_safety_events_not_status_reads_or_duplicate_requests() {
+        let mut authority = Authority::default();
+        assert_eq!(authority.talk_generation, 0);
+        authority.challenge(0);
+        authority.observe(true);
+        assert_eq!(authority.talk_generation, 0);
+        let mut control = Control {
+            request: [1; 16],
+            revision: 0,
+            op: Op::ReleaseAll,
+            press: [0; 16],
+            challenge: 0,
+            expires_ns: 0,
+        };
+        authority.decide(0, parent(1), true, true, control);
+        assert_eq!(authority.talk_generation, 1);
+        authority.decide(0, parent(1), true, true, control);
+        assert_eq!(authority.talk_generation, 1);
+        control.request = [2; 16];
+        control.op = Op::SetMute(true);
+        authority.decide(0, parent(1), true, true, control);
+        assert_eq!(authority.talk_generation, 2);
+        authority.decide(0, parent(1), true, true, control);
+        assert_eq!(authority.talk_generation, 2);
+        authority.reset();
+        assert_eq!(authority.talk_generation, 2);
+    }
+    #[test]
+    fn exhausted_native_grant_counter_never_reuses_a_grant_id() {
+        let mut authority = Authority {
+            ptt_enabled: true,
+            next_grant: u64::MAX - 1,
+            ..Authority::default()
+        };
+        let last = press(&mut authority, 0, 1);
+        assert!(matches!(
+            authority.decide(0, parent(1), true, true, last).effect,
+            Effect::Grant(Grant { id: u64::MAX, .. })
+        ));
+        authority.reset();
+        let exhausted = press(&mut authority, 1, 2);
+        assert_eq!(
+            authority.decide(1, parent(1), true, true, exhausted).result,
+            ResultCode::Busy
+        );
+        assert!(authority.grant.is_none());
+        assert_eq!(authority.next_grant, u64::MAX);
+    }
     fn parent(n: u8) -> Parent {
         Parent {
             peer: [n; 32],
@@ -367,6 +439,118 @@ mod tests {
             challenge,
             expires_ns,
         }
+    }
+    #[test]
+    fn global_release_fences_every_parent_without_changing_persistent_intent() {
+        for muted in [false, true] {
+            let mut authority = Authority {
+                ptt_enabled: true,
+                ..Authority::default()
+            };
+            authority.set_local_muted(muted);
+            let old = press(&mut authority, 0, 1);
+            assert!(matches!(
+                authority.decide(0, parent(1), true, true, old).effect,
+                Effect::Grant(_)
+            ));
+            let release = Control {
+                request: [2; 16],
+                revision: 0,
+                op: Op::ReleaseAll,
+                press: [0; 16],
+                challenge: 0,
+                expires_ns: 0,
+            };
+            assert_eq!(
+                authority.decide(1, parent(2), true, false, release).result,
+                ResultCode::ConsentRequired
+            );
+            assert!(authority.grant.is_some());
+            assert_eq!(
+                authority.decide(1, parent(2), true, true, release).effect,
+                Effect::ReleaseAll
+            );
+            assert!(authority.grant.is_none());
+            assert_eq!(authority.desired_muted, muted);
+            assert_eq!(
+                authority.recovery_mode,
+                Some(RecoveryMode::Persistent(muted))
+            );
+            assert_eq!(authority.recovery_muted(), muted);
+            let stale = Control {
+                request: [3; 16],
+                revision: authority.revision,
+                op: Op::Renew,
+                ..old
+            };
+            assert_eq!(
+                authority.decide(2, parent(1), true, true, stale).result,
+                ResultCode::Expired
+            );
+            assert_eq!(
+                authority
+                    .decide(
+                        2,
+                        parent(3),
+                        true,
+                        true,
+                        Control {
+                            op: Op::Press,
+                            ..stale
+                        }
+                    )
+                    .result,
+                ResultCode::Expired
+            );
+            let fresh = press(&mut authority, 2, 4);
+            assert_ne!(fresh.challenge, old.challenge);
+            assert!(matches!(
+                authority.decide(2, parent(1), true, true, fresh).effect,
+                Effect::Grant(_)
+            ));
+            let grant = authority.grant;
+            assert_eq!(
+                authority.decide(3, parent(2), true, true, release).effect,
+                Effect::None
+            );
+            assert_eq!(authority.grant, grant);
+        }
+    }
+    #[test]
+    fn safety_mute_invalidates_old_challenges_and_grants() {
+        let mut authority = Authority {
+            ptt_enabled: true,
+            ..Authority::default()
+        };
+        let old = press(&mut authority, 0, 1);
+        authority.decide(0, parent(1), true, true, old);
+        let mute = Control {
+            request: [2; 16],
+            revision: 0,
+            op: Op::SetMute(true),
+            press: [0; 16],
+            challenge: 0,
+            expires_ns: 0,
+        };
+        assert_eq!(
+            authority.decide(1, parent(2), true, true, mute).effect,
+            Effect::SetMute(true)
+        );
+        assert!(authority.grant.is_none());
+        let replay = Control {
+            request: [3; 16],
+            revision: authority.revision,
+            ..old
+        };
+        assert_eq!(
+            authority.decide(2, parent(3), true, true, replay).result,
+            ResultCode::Expired
+        );
+        let fresh = press(&mut authority, 2, 4);
+        assert!(matches!(
+            authority.decide(2, parent(1), true, true, fresh).effect,
+            Effect::Grant(_)
+        ));
     }
     #[test]
     fn delayed_press_and_expired_renew_do_not_get_fresh_ttl() {

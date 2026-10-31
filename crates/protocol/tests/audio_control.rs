@@ -414,7 +414,7 @@ fn setup_requires_ids_contributory_nonces_format_epoch_ttl_and_typed_refusal() {
         audio_control(&control(Body::Answer(answer.clone()))),
         Ok(())
     );
-    for reason in [0, 14, 999] {
+    for reason in [0, -1, i32::MAX] {
         answer.reason = reason;
         assert_eq!(
             audio_control(&control(Body::Answer(answer.clone()))),
@@ -526,7 +526,7 @@ fn health_keepalive_stop_and_consent_are_bounded() {
             Err(AudioViolation::Ttl)
         );
     }
-    for reason in [0, 14, 999] {
+    for reason in [0, -1, i32::MAX] {
         assert_eq!(
             audio_control(&control(Body::Stop(wire::AudioStop {
                 session_id: vec![1; 16],
@@ -857,6 +857,47 @@ fn microphone_shapes_and_unknown_control_enums_are_rejected() {
 }
 
 #[test]
+fn emergency_talk_release_is_append_only_and_has_no_press_or_lease_payload() {
+    assert_eq!(wire::MicControlOp::ReleaseAll as i32, 5);
+    let release = wire::MicControl {
+        group_id: vec![1; 16],
+        request_id: vec![2; 16],
+        expected_revision: 1,
+        op: wire::MicControlOp::ReleaseAll as i32,
+        ..Default::default()
+    };
+    let message = control(Body::MicControl(release.clone()));
+    assert_eq!(audio_control(&message), Ok(()));
+    assert_eq!(
+        wire::AudioControl::decode(message.encode_to_vec().as_slice()).unwrap(),
+        message
+    );
+    for bad in [
+        wire::MicControl {
+            muted: true,
+            ..release.clone()
+        },
+        wire::MicControl {
+            press_id: vec![3; 16],
+            ..release.clone()
+        },
+        wire::MicControl {
+            challenge: 1,
+            ..release.clone()
+        },
+        wire::MicControl {
+            expires_ns: 1,
+            ..release
+        },
+    ] {
+        assert_eq!(
+            audio_control(&control(Body::MicControl(bad))),
+            Err(AudioViolation::Shape)
+        );
+    }
+}
+
+#[test]
 fn media_metadata_bounds_clear_shape_and_nested_debug_are_private() {
     let info = wire::MediaInfo {
         session_id: vec![3; 16],
@@ -1088,4 +1129,24 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
             Ok(())
         );
     }
+}
+
+#[test]
+fn group_mismatch_is_a_typed_refusal_and_stop() {
+    let reason = wire::AudioStopCode::GroupMismatch as i32;
+    assert_eq!(
+        audio_control(&control(Body::Answer(wire::AudioAnswer {
+            session_id: vec![1; 16],
+            reason,
+            ..Default::default()
+        }))),
+        Ok(())
+    );
+    assert_eq!(
+        audio_control(&control(Body::Stop(wire::AudioStop {
+            session_id: vec![1; 16],
+            reason,
+        }))),
+        Ok(())
+    );
 }

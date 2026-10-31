@@ -44,6 +44,20 @@ required_enum!(decode_role, AudioRole, [Source, Listener]);
 required_enum!(decode_mode, AudioMode, [MixAll, FollowFocus]);
 required_enum!(decode_profile, AudioProfile, [Ethernet, Wifi]);
 required_enum!(
+    decode_ptt_arming,
+    AudioPttArmingState,
+    [Armed, NeedsPhysicalRelease, Unavailable]
+);
+required_enum!(
+    decode_ptt_unavailable_reason,
+    AudioPttUnavailableReason,
+    [
+        HostClockUnavailable,
+        PortalFreshnessUnverifiable,
+        RegistrationUnavailable
+    ]
+);
+required_enum!(
     decode_session_state,
     AudioSessionState,
     [
@@ -220,6 +234,16 @@ pub fn validate_status(status: &wire::AudioStatus) -> Result<()> {
         .ok_or(AudioError("missing microphone state"))?;
     id(&mic.target_node_id, 32, true)?;
     require(!mic.capture_active, "microphone streaming deferred")?;
+    if let Some(state) = mic.native_ptt_arming {
+        decode_ptt_arming(state)?;
+    }
+    if let Some(reason) = mic.native_ptt_unavailable_reason {
+        decode_ptt_unavailable_reason(reason)?;
+        require(
+            mic.native_ptt_arming == Some(wire::AudioPttArmingState::Unavailable as i32),
+            "native PTT reason requires unavailable state",
+        )?;
+    }
     require(
         !mic.ptt_pressed || mic.control_active,
         "PTT requires active control",
@@ -395,6 +419,8 @@ pub fn validate_frame(frame: &wire::GuiFrame) -> Result<()> {
             require(request.gain_percent <= 100, "audio gain out of range")?;
         }
         Msg::SendMediaCommand(request) => {
+            // Zero remains structurally valid for a typed AUDIO_STALE_MEDIA reply.
+            // Core never resolves it to another native session or sends it to the child.
             id(&request.peer_node_id, 32, false)?;
             id(&request.session_id, 16, false)?;
             decode_command(request.command)?;

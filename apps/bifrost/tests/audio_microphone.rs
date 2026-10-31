@@ -475,3 +475,233 @@ fn dropping_held_source_gui_remutes_actual_listener_before_parent_timeout() {
     audio::disable(&two.b, &mut source);
     audio::disable(&two.a, &mut listener);
 }
+
+#[test]
+fn stale_unmute_does_not_cancel_an_existing_gui_ptt_hold() {
+    let _guard = common::serial();
+    let (two, mut listener, mut source) = pair("audio-mic-stale-unmute");
+    mute(&mut source, true);
+    agree(&mut listener, &mut source, true, false);
+    ptt(&mut source, true);
+    agree(&mut listener, &mut source, false, true);
+    assert!(source.status().revision > 0);
+    match source.request(gui_frame::Msg::SetMicrophoneMute(wire::SetMicrophoneMute {
+        muted: false,
+        expected_revision: 0,
+    })) {
+        gui_frame::Msg::OpResult(result) => {
+            assert!(!result.ok);
+            assert_eq!(
+                result.error_code,
+                ipc::audio::codes::AUDIO_REVISION_CONFLICT
+            );
+        }
+        other => panic!("stale unmute answered {other:?}"),
+    }
+    // Polling stays live beyond several native leases; rejection cannot cancel renewal.
+    hold(&mut listener, &mut source, false, true);
+    ptt(&mut source, false);
+    agree(&mut listener, &mut source, true, false);
+    audio::disable(&two.b, &mut source);
+    audio::disable(&two.a, &mut listener);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_local_mute_persistence_keeps_the_native_endpoint_and_replacement_child_muted() {
+    let _guard = common::serial();
+    let (two, mut listener, mut source) = pair("audio-mic-failed-mute-save");
+    let owner = std::cmp::max(two.a_id.as_str(), two.b_id.as_str());
+    for node in [&two.a, &two.b] {
+        node.wait_for(
+            "settled ownership before holding config lock",
+            audio::TIMEOUT,
+            |status| status.serial > 0 && status.owner == owner,
+        )
+        .expect("ownership has settled");
+    }
+    mute(&mut listener, false);
+    agree(&mut listener, &mut source, false, false);
+    let path = two.a.root.join("config/config.toml");
+    assert!(!config::Config::load(&path).unwrap().audio.microphone.muted);
+    let lock = config::lock::FileLock::acquire(&path).expect("hold only this fixture's config");
+    match listener.request(gui_frame::Msg::SetMicrophoneMute(wire::SetMicrophoneMute {
+        muted: true,
+        expected_revision: 0,
+    })) {
+        gui_frame::Msg::OpResult(result) => {
+            assert!(!result.ok);
+            assert_eq!(result.error_code, ipc::audio::codes::AUDIO_CONFIG_WRITE);
+        }
+        other => panic!("locked mute save answered {other:?}"),
+    }
+    agree(&mut listener, &mut source, true, false);
+    assert!(listener.status().config.unwrap().microphone.unwrap().muted);
+    assert!(!config::Config::load(&path).unwrap().audio.microphone.muted);
+    drop(lock);
+    restart_listener_child(&two, &mut listener);
+    agree(&mut listener, &mut source, true, false);
+    hold(&mut listener, &mut source, true, false);
+    audio::disable(&two.b, &mut source);
+    audio::disable(&two.a, &mut listener);
+}
+
+#[cfg(target_os = "linux")]
+struct PausedAudioChild(u32);
+
+#[cfg(target_os = "linux")]
+impl PausedAudioChild {
+    fn source(two: &Unpaired) -> Self {
+        assert!(audio::dry_launch(&two.b.root));
+        let children = audio::audio_children(&two.b);
+        assert_eq!(children.len(), 1);
+        let pid = children[0];
+        assert_ne!(pid, two.a.pid());
+        assert_ne!(pid, two.b.pid());
+        assert!(std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .expect("pause only the owned Dry audio child")
+            .success());
+        Self(pid)
+    }
+
+    fn resume(&mut self) {
+        assert!(std::process::Command::new("kill")
+            .args(["-CONT", &self.0.to_string()])
+            .status()
+            .expect("resume the owned Dry audio child")
+            .success());
+        self.0 = 0;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PausedAudioChild {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-CONT", &self.0.to_string()])
+                .status();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn saturated_audio_gui_queue_latches_release_and_mute_despite_continued_polling() {
+    let _guard = common::serial();
+    let (two, mut listener, mut source) = pair("audio-mic-safety-admission");
+    for mute_requested in [false, true] {
+        if mute_requested {
+            mute(&mut source, false);
+            agree(&mut listener, &mut source, false, false);
+        } else {
+            mute(&mut source, true);
+            agree(&mut listener, &mut source, true, false);
+            ptt(&mut source, true);
+            agree(&mut listener, &mut source, false, true);
+        }
+        let mut flood = Window::open(&two.b);
+        let mut paused = PausedAudioChild::source(&two);
+        // A real pending native enumeration holds the audio actor, not the KVM
+        // session or GUI ingress. No injected queue-size/test-only production seam.
+        for _ in 0..64 {
+            flood.send(gui_frame::Msg::ListAudioDevices(wire::ListAudioDevices {
+                kind: wire::AudioDeviceKind::Output as i32,
+            }));
+        }
+        let barrier = flood.send(gui_frame::Msg::GetStatus(wire::GetStatus {}));
+        let replies = flood.answers_through(barrier);
+        assert!(
+            replies.iter().any(|(_, message)| matches!(
+                message,
+                gui_frame::Msg::OpResult(result)
+                    if !result.ok && result.error_code == ipc::audio::codes::AUDIO_UNAVAILABLE
+            )),
+            "normal audio queue must actually be saturated"
+        );
+        let safety = if mute_requested {
+            gui_frame::Msg::SetMicrophoneMute(wire::SetMicrophoneMute {
+                muted: true,
+                expected_revision: 0,
+            })
+        } else {
+            gui_frame::Msg::SetPtt(wire::SetPtt {
+                pressed: false,
+                expected_revision: 0,
+            })
+        };
+        let submitted = Instant::now();
+        match source.request(safety) {
+            gui_frame::Msg::OpResult(result) => {
+                assert!(!result.ok);
+                assert_eq!(result.error_code, ipc::audio::codes::AUDIO_UNAVAILABLE);
+            }
+            other => panic!("full-queue safety request answered {other:?}"),
+        }
+        paused.resume();
+        drop(flood);
+        let bound = Duration::from_millis(450);
+        loop {
+            let _ = source.request(gui_frame::Msg::GetStatus(wire::GetStatus {}));
+            let actual = listener.status();
+            if microphone(&actual, true, false) {
+                assert!(submitted.elapsed() <= bound);
+                break;
+            }
+            assert!(
+                submitted.elapsed() < bound,
+                "latched safety did not disarm: {actual:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The original pressing GUI remains connected and active. Its old hold
+        // must not restart renewal after the queue drains.
+        while submitted.elapsed() < Duration::from_millis(650) {
+            let _ = source.request(gui_frame::Msg::GetStatus(wire::GetStatus {}));
+            let actual = listener.status();
+            assert!(
+                microphone(&actual, true, false),
+                "old hold reopened: {actual:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        agree(&mut listener, &mut source, true, false);
+    }
+    audio::disable(&two.b, &mut source);
+    audio::disable(&two.a, &mut listener);
+}
+
+#[test]
+fn another_gui_emergency_release_is_group_wide_idempotent_and_requires_a_fresh_press() {
+    let _guard = common::serial();
+    let (two, mut listener, mut source) = pair("audio-mic-release-all");
+    mute(&mut source, true);
+    agree(&mut listener, &mut source, true, false);
+    ptt(&mut source, true);
+    agree(&mut listener, &mut source, false, true);
+    let mut listener_tray = Window::open(&two.a);
+    // This connection never pressed; the explicit action still releases the authority.
+    ptt(&mut listener_tray, false);
+    agree(&mut listener, &mut source, true, false);
+    hold(&mut listener, &mut source, true, false);
+    ptt(&mut listener_tray, false);
+    agree(&mut listener, &mut source, true, false);
+    ptt(&mut source, true);
+    agree(&mut listener, &mut source, false, true);
+    let mut source_tray = Window::open(&two.b);
+    ptt(&mut source_tray, false);
+    agree(&mut listener, &mut source, true, false);
+    hold(&mut listener, &mut source, true, false);
+    ptt(&mut source_tray, false);
+    agree(&mut listener, &mut source, true, false);
+    // Releasing talk grants is not an implicit persistent microphone mute.
+    mute(&mut listener, false);
+    agree(&mut listener, &mut source, false, false);
+    ptt(&mut source_tray, false);
+    agree(&mut listener, &mut source, false, false);
+    hold(&mut listener, &mut source, false, false);
+    audio::disable(&two.b, &mut source);
+    audio::disable(&two.a, &mut listener);
+}

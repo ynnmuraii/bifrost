@@ -4,6 +4,7 @@
 mod admission;
 mod media;
 mod microphone;
+mod safety;
 mod wire;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -106,7 +107,8 @@ struct Command {
 
 pub(super) struct Coordinator {
     commands: mpsc::Sender<Command>,
-    gui_commands: mpsc::Sender<Request>,
+    gui_commands: mpsc::Sender<safety::Command>,
+    gui_safety: watch::Sender<safety::Latch>,
     links: watch::Sender<Links>,
     focus: watch::Sender<CommittedFocus>,
     control: watch::Sender<ControlContext>,
@@ -127,6 +129,9 @@ impl Coordinator {
     ) -> Self {
         let (commands, rx) = mpsc::channel(COMMANDS);
         let (gui_commands, gui_rx) = mpsc::channel(16);
+        let (gui_safety, safety_rx) = watch::channel(safety::Latch::default());
+        let (gui_safety_target, target_rx) = watch::channel(None);
+        let independent_safety_rx = safety_rx.clone();
         let (links, link_rx) = watch::channel(Links::default());
         let (focus_tx, focus_rx) = watch::channel(CommittedFocus::default());
         let (control, control_rx) = watch::channel(ControlContext::default());
@@ -148,6 +153,9 @@ impl Coordinator {
             events,
             commands: rx,
             gui_commands: gui_rx,
+            gui_safety: safety_rx,
+            applied_gui_safety: 0,
+            gui_safety_target,
             links: link_rx,
             stopping: stop_rx,
             focus_rx,
@@ -175,6 +183,7 @@ impl Coordinator {
             worker_events: None,
             ready: None,
             revision: 1,
+            control_revision: 1,
             consent_revision: 1,
             epoch: Instant::now(),
             overflow: 0,
@@ -187,10 +196,21 @@ impl Coordinator {
             pending_starts: BTreeMap::new(),
             deferred_starts: BTreeMap::new(),
         };
-        let task = tokio::spawn(actor.run());
+        let independent_stop_rx = actor.stopping.clone();
+        let task = tokio::spawn(async move {
+            let safety_task = tokio::spawn(safety::watch_safety(
+                independent_safety_rx,
+                target_rx,
+                independent_stop_rx,
+            ));
+            Box::pin(actor.run()).await;
+            safety_task.abort();
+            let _ = safety_task.await;
+        });
         Self {
             commands,
             gui_commands,
+            gui_safety,
             links,
             focus: focus_tx,
             control,
@@ -379,10 +399,7 @@ impl Coordinator {
         }
     }
     pub(super) fn submit(&self, request: Request) -> Result<(), (u64, mpsc::Sender<Outgoing>)> {
-        self.gui_commands.try_send(request).map_err(|error| {
-            let request = error.into_inner();
-            (request.request_id, request.out)
-        })
+        safety::submit(&self.gui_commands, &self.gui_safety, request)
     }
     pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.caps.changed().await
@@ -462,7 +479,10 @@ struct Actor {
     test_dry: bool,
     events: broadcast::Sender<Outgoing>,
     commands: mpsc::Receiver<Command>,
-    gui_commands: mpsc::Receiver<Request>,
+    gui_commands: mpsc::Receiver<safety::Command>,
+    gui_safety: watch::Receiver<safety::Latch>,
+    applied_gui_safety: u64,
+    gui_safety_target: watch::Sender<Option<safety::Target>>,
     links: watch::Receiver<Links>,
     stopping: watch::Receiver<bool>,
     focus_rx: watch::Receiver<CommittedFocus>,
@@ -490,6 +510,7 @@ struct Actor {
     worker_events: Option<mpsc::Receiver<AudioSupervisorEvent>>,
     ready: Option<worker::Ready>,
     revision: u64,
+    control_revision: u64,
     consent_revision: u32,
     epoch: Instant,
     overflow: u64,
@@ -503,6 +524,26 @@ struct Actor {
     deferred_starts: BTreeMap<NodeId, Pending>,
 }
 impl Actor {
+    pub(super) fn publish_gui_safety_target(&self) {
+        let owned = self.mic_safety_endpoint().and_then(|endpoint| {
+            self.worker
+                .as_ref()
+                .filter(|worker| worker.alive)
+                .map(|worker| (worker.generation, endpoint, &worker.handle))
+        });
+        safety::publish_target(&self.gui_safety_target, &self.gui_safety, owned);
+    }
+    pub(super) fn clear_gui_safety_target(&self) {
+        self.gui_safety_target.send_replace(None);
+    }
+    async fn sync_gui_safety(&mut self) {
+        let latch = *self.gui_safety.borrow_and_update();
+        if let Some(mute) = latch.pending(self.applied_gui_safety) {
+            self.applied_gui_safety = latch.generation;
+            self.mic_gui_safety(mute).await;
+            self.dirty = true;
+        }
+    }
     fn now(&self) -> u64 {
         self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
@@ -600,7 +641,7 @@ impl Actor {
             enabled: self.config.enabled,
             role,
             group: self.config.group_id.map(|id| id.0),
-            group_override: self.config.group_id_override,
+            group_override: self.config.effective_group_override(),
             listener: self.config.listener_node_id.map(|id| id.0),
             port: self.config.media_port,
         }))?;
@@ -668,7 +709,7 @@ impl Actor {
         self.sync_control();
         let _ = self.configure();
         self.publish_caps();
-        self.publish();
+        self.publish("initial");
         self.sync_links();
         self.drain().await;
         if self.config.enabled {
@@ -680,24 +721,41 @@ impl Actor {
         loop {
             let attached = self.worker_events.is_some();
             let ticking = self.config.enabled || self.pending_focus();
+            let cause;
             tokio::select! {
                 _ = self.stopping.changed() => break,
+                changed = self.gui_safety.changed() => {
+                    cause = "gui_safety";
+                    if changed.is_err() { break; }
+                    self.sync_gui_safety().await;
+                }
                 changed = self.focus_rx.changed() => {
+                    cause = "focus";
                     if changed.is_err() { break; }
                     self.sync_focus();
                 }
                 changed = self.control_rx.changed() => {
+                    cause = "control";
                     if changed.is_err() { break; }
                     self.sync_control();
                     self.dirty = true;
                 }
                 changed = self.links.changed() => {
+                    cause = "parent_links";
                     if changed.is_err() { break; }
                     self.dirty = true;
                     self.sync_links();
                 }
-                _ = tick.tick(), if ticking => self.tick().await,
+                _ = tick.tick(), if ticking => {
+                    cause = "timer";
+                    self.tick().await;
+                },
                 event = async { match self.worker_events.as_mut() { Some(events) => events.recv().await, None => std::future::pending().await } }, if attached => {
+                    cause = if matches!(&event, Some(AudioSupervisorEvent::Health { .. })) {
+                        "worker_health"
+                    } else {
+                        "worker_state"
+                    };
                     self.dirty = true;
                     if let Some(event) = event { self.on_worker(event).await; }
                     else {
@@ -708,6 +766,7 @@ impl Actor {
                     }
                 }
                 command = self.commands.recv() => {
+                    cause = "peer_control";
                     let Some(Command { parent, message }) = command else { break; };
                     self.dirty = true;
                     match message {
@@ -740,19 +799,33 @@ impl Actor {
                     }
                 }
                 request = self.gui_commands.recv() => {
-                    let Some(request) = request else { break; };
+                    let Some(command) = request else { break; };
+                    cause = match &command.request.message {
+                        gui::gui_frame::Msg::GetAudioStatus(_) => "get_status",
+                        gui::gui_frame::Msg::SetAudio(_) => "set_audio",
+                        gui::gui_frame::Msg::StartAudio(_) => "start_audio",
+                        gui::gui_frame::Msg::SetAudioPeerGain(_) => "set_gain",
+                        _ => "gui_control",
+                    };
+                    self.sync_gui_safety().await;
                     self.dirty = true;
-                    self.on_gui(request).await;
+                    let superseded = command.superseded(*self.gui_safety.borrow());
+                    if superseded {
+                        reply(&command.request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await;
+                    } else {
+                        self.on_gui(command.request).await;
+                    }
                 }
             }
             self.drain().await;
             self.service_focus().await;
             self.apply_gains().await;
+            self.sync_gui_safety().await;
             self.mic_tick().await;
             self.media_tick().await;
             self.service_privacy_failure().await;
             self.publish_caps();
-            self.publish();
+            self.publish(cause);
             self.service_deferred().await;
         }
         self.stop_all(fsm::Reason::UserStop);
@@ -877,7 +950,7 @@ impl Actor {
     async fn drain(&mut self) {
         while let Some(effect) = self.effects.pop_front() {
             match effect {
-                fsm::Effect::PublishStatus => self.publish(),
+                fsm::Effect::PublishStatus => self.publish("model"),
                 fsm::Effect::PublishConfiguration(settings) => {
                     if self.configuration_error.is_some() {
                         continue;
@@ -889,7 +962,6 @@ impl Actor {
                     {
                         let mut next = self.config.clone();
                         next.group_id = settings.group.map(config::audio::HexId);
-                        next.group_id_override = settings.group_override;
                         if self.save(next.clone()).await.is_ok() {
                             self.config = next;
                             let _ = self.configure();
@@ -1436,6 +1508,12 @@ impl Actor {
         Ok(())
     }
     async fn on_worker(&mut self, event: AudioSupervisorEvent) {
+        if matches!(&event, AudioSupervisorEvent::Health { .. }) {
+            tracing::debug!(
+                current_revision = self.revision,
+                "audio worker health observed"
+            );
+        }
         if matches!(&event, AudioSupervisorEvent::CommandRejected { .. }) {
             self.mic_on_worker(&event).await;
             self.media_on_worker(&event).await;
@@ -1802,6 +1880,7 @@ impl Actor {
                 }
             }
             event @ (AudioSupervisorEvent::MuteSnapshot { .. }
+            | AudioSupervisorEvent::PttStatus { .. }
             | AudioSupervisorEvent::PttEvent { .. }) => {
                 self.mic_on_worker(&event).await;
             }
@@ -2243,7 +2322,7 @@ impl Actor {
                 let result = self.set_config(set).await;
                 self.drain().await;
                 self.publish_caps();
-                self.publish();
+                self.publish("set_audio");
                 reply(&request, result).await;
             }
             Msg::StartAudio(_) => self.start_request(request).await,
@@ -2271,12 +2350,12 @@ impl Actor {
                     Err(ipc::audio::codes::AUDIO_UNAVAILABLE)
                 };
                 self.drain().await;
-                self.publish();
+                self.publish("stop_audio");
                 reply(&request, result).await;
             }
             Msg::SetAudioPeerGain(set) => {
                 let result = self.set_gain(set).await;
-                self.publish();
+                self.publish("set_gain");
                 reply(&request, result).await;
             }
             Msg::ListAudioDevices(list) => {
@@ -2329,7 +2408,17 @@ impl Actor {
         }
     }
     async fn set_config(&mut self, set: &gui::SetAudio) -> Result<(), Code> {
-        if set.expected_revision != self.revision {
+        if !wire::control_revision_matches(
+            set.expected_revision,
+            self.revision,
+            self.control_revision,
+        ) {
+            tracing::debug!(
+                operation = "set_audio",
+                expected_revision = set.expected_revision,
+                current_revision = self.revision,
+                "audio snapshot CAS refused"
+            );
             return Err(ipc::audio::codes::AUDIO_REVISION_CONFLICT);
         }
         let trusted: BTreeSet<_> = self
@@ -2400,6 +2489,7 @@ impl Actor {
             self.mic_reset();
         }
         self.config = next;
+        self.publish_gui_safety_target();
         self.configuration_error = None;
         self.worker_failed = false;
         self.publish_caps();
@@ -2409,6 +2499,7 @@ impl Actor {
         }
         if let Err(error) = self.configure() {
             self.config = previous;
+            self.publish_gui_safety_target();
             if let Err(code) = self.save(self.config.clone()).await {
                 self.configuration_error = Some(code);
                 let _ = self.feed(fsm::Input::Configure(fsm::Settings::default()));
@@ -2443,7 +2534,17 @@ impl Actor {
             reply(&request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await;
             return;
         }
-        if start.expected_revision != self.revision {
+        if !wire::control_revision_matches(
+            start.expected_revision,
+            self.revision,
+            self.control_revision,
+        ) {
+            tracing::debug!(
+                operation = "start_audio",
+                expected_revision = start.expected_revision,
+                current_revision = self.revision,
+                "audio snapshot CAS refused"
+            );
             reply(&request, Err(ipc::audio::codes::AUDIO_REVISION_CONFLICT)).await;
             return;
         }
@@ -2600,7 +2701,7 @@ impl Actor {
             return;
         };
         self.drain().await;
-        self.publish();
+        self.publish("start_audio");
         reply(&request, result).await;
     }
     async fn service_deferred(&mut self) {
@@ -2641,7 +2742,17 @@ impl Actor {
         (effective_gain(gain, factor), muted)
     }
     async fn set_gain(&mut self, set: &gui::SetAudioPeerGain) -> Result<(), Code> {
-        if set.expected_revision != self.revision {
+        if !wire::control_revision_matches(
+            set.expected_revision,
+            self.revision,
+            self.control_revision,
+        ) {
+            tracing::debug!(
+                operation = "set_gain",
+                expected_revision = set.expected_revision,
+                current_revision = self.revision,
+                "audio snapshot CAS refused"
+            );
             return Err(ipc::audio::codes::AUDIO_REVISION_CONFLICT);
         }
         if self.role() != model::AudioRole::Listener {
@@ -2768,7 +2879,7 @@ impl Actor {
         result.revision = self.revision;
         Some(result)
     }
-    fn publish(&mut self) {
+    fn publish(&mut self, cause: &'static str) {
         if !self.dirty {
             return;
         }
@@ -2780,8 +2891,36 @@ impl Actor {
         if self.last_status.as_ref() == Some(&status) {
             return;
         }
+        let control_changed = self
+            .last_status
+            .as_ref()
+            .is_none_or(|old| !wire::same_control_state(old, &status));
+        let previous_revision = self.revision;
         self.revision = self.revision.saturating_add(1);
+        if control_changed {
+            self.control_revision = self.revision;
+        }
         status.revision = self.revision;
+        tracing::debug!(
+            cause,
+            previous_revision,
+            control_changed,
+            control_revision = self.control_revision,
+            current_revision = self.revision,
+            configuration_changed = self
+                .last_status
+                .as_ref()
+                .is_none_or(|old| old.config != status.config),
+            session_control_changed = self.last_status.as_ref().is_none_or(|old| {
+                old.sessions.len() != status.sessions.len()
+                    || old.sessions.iter().zip(&status.sessions).any(|(old, new)| {
+                        old.peer != new.peer
+                            || old.session_id != new.session_id
+                            || old.state != new.state
+                    })
+            }),
+            "audio snapshot revision advanced"
+        );
         self.last_status = Some(status.clone());
         let _ = self
             .events
@@ -3429,6 +3568,7 @@ mod observation_tests {
         let coordinator = Coordinator {
             commands,
             gui_commands,
+            gui_safety: watch::channel(safety::Latch::default()).0,
             links,
             focus,
             control,

@@ -59,6 +59,78 @@ fn frame(message: wire::gui_frame::Msg) -> wire::GuiFrame {
         msg: Some(message),
     }
 }
+
+#[test]
+fn native_ptt_arming_preserves_optional_observations_and_rejects_unknown_states() {
+    for state in [
+        None,
+        Some(wire::AudioPttArmingState::Armed as i32),
+        Some(wire::AudioPttArmingState::NeedsPhysicalRelease as i32),
+        Some(wire::AudioPttArmingState::Unavailable as i32),
+    ] {
+        let mut value = status();
+        let mic = value.microphone.as_mut().unwrap();
+        mic.native_ptt_arming = state;
+        // GUI-held PTT is independent of native hotkey readiness.
+        mic.control_active = true;
+        mic.ptt_pressed = true;
+        assert!(validate_status(&value).is_ok());
+        let encoded = frame(wire::gui_frame::Msg::AudioStatus(value.clone()));
+        let decoded = wire::GuiFrame::decode(encoded.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, encoded);
+        assert!(validate_frame(&decoded).is_ok());
+        let wire::gui_frame::Msg::AudioStatus(restored) = decoded.msg.unwrap() else {
+            panic!("expected audio status");
+        };
+        assert_eq!(restored.microphone.unwrap().native_ptt_arming, state);
+    }
+    for state in [0, -1, 4, i32::MAX] {
+        let mut value = status();
+        value.microphone.as_mut().unwrap().native_ptt_arming = Some(state);
+        assert!(validate_status(&value).is_err());
+        assert!(validate_frame(&frame(wire::gui_frame::Msg::AudioStatus(value))).is_err());
+    }
+}
+
+#[test]
+fn native_ptt_unavailability_details_are_optional_bounded_and_state_specific() {
+    for reason in [
+        None,
+        Some(wire::AudioPttUnavailableReason::HostClockUnavailable as i32),
+        Some(wire::AudioPttUnavailableReason::PortalFreshnessUnverifiable as i32),
+        Some(wire::AudioPttUnavailableReason::RegistrationUnavailable as i32),
+    ] {
+        for state in [
+            None,
+            Some(wire::AudioPttArmingState::Armed as i32),
+            Some(wire::AudioPttArmingState::NeedsPhysicalRelease as i32),
+            Some(wire::AudioPttArmingState::Unavailable as i32),
+        ] {
+            let mut value = status();
+            let mic = value.microphone.as_mut().unwrap();
+            mic.native_ptt_arming = state;
+            mic.native_ptt_unavailable_reason = reason;
+            mic.control_active = true;
+            mic.ptt_pressed = true;
+            let valid =
+                reason.is_none() || state == Some(wire::AudioPttArmingState::Unavailable as i32);
+            assert_eq!(validate_status(&value).is_ok(), valid);
+            let encoded = frame(wire::gui_frame::Msg::AudioStatus(value));
+            let decoded = wire::GuiFrame::decode(encoded.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, encoded);
+            assert_eq!(validate_frame(&decoded).is_ok(), valid);
+        }
+    }
+    for reason in [0, -1, 4, i32::MAX] {
+        let mut value = status();
+        let mic = value.microphone.as_mut().unwrap();
+        mic.native_ptt_arming = Some(wire::AudioPttArmingState::Unavailable as i32);
+        mic.native_ptt_unavailable_reason = Some(reason);
+        assert!(validate_status(&value).is_err());
+        assert!(validate_frame(&frame(wire::gui_frame::Msg::AudioStatus(value))).is_err());
+    }
+}
+
 #[test]
 fn validates_config_ranges_and_security_structure() {
     assert!(validate_config(&config()).is_ok());
@@ -236,7 +308,12 @@ fn devices_and_commands_are_bounded() {
         media_revision: 0,
         command: wire::AudioMediaCommand::Toggle as i32,
     };
-    assert!(validate_frame(&frame(Msg::SendMediaCommand(command.clone()))).is_ok());
+    // Semantic unavailability returns AUDIO_STALE_MEDIA without closing the GUI link.
+    for (token, revision) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        command.session_token = token;
+        command.media_revision = revision;
+        assert!(validate_frame(&frame(Msg::SendMediaCommand(command.clone()))).is_ok());
+    }
     command.command = 0;
     assert!(validate_frame(&frame(Msg::SendMediaCommand(command))).is_err());
 }
@@ -281,6 +358,8 @@ fn required_enums_and_numeric_boundaries_are_strict() {
         assert!(ipc::audio::decode_reason(value).is_err());
         assert!(ipc::audio::decode_playback(value).is_err());
         assert!(ipc::audio::decode_command(value).is_err());
+        assert!(ipc::audio::decode_ptt_arming(value).is_err());
+        assert!(ipc::audio::decode_ptt_unavailable_reason(value).is_err());
     }
     for port in [1, 47901, 65535] {
         let mut c = config();

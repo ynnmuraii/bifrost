@@ -688,7 +688,7 @@ message AudioConfig {
   AudioMicrophoneConfig microphone = 16; repeated AudioPeerConfig peers = 17;
   // Absent preserves legacy nonempty Source group = Advanced override.
   // Explicit false follows the authenticated selected Listener, even with a resolved group.
-  // Explicit true pins a valid nonempty Source group; core snapshots always set this field.
+  // Explicit true pins a valid nonempty Source group; snapshots preserve persisted absence.
   optional bool group_id_override = 18;
 }
 message AudioMicrophoneConfig {
@@ -701,7 +701,27 @@ message AudioPeerConfig {
   bool allow_mic_send = 4; bool allow_mic_receive = 5; bool allow_mic_control = 6;
   bool allow_media_control = 7; uint32 volume_percent = 8;
 }
-message AudioMicrophoneState { bool muted = 1; bool ptt_pressed = 2; bool capture_active = 3; bytes target_node_id = 4; bool control_active = 5; }
+enum AudioPttArmingState {
+  AUDIO_PTT_ARMING_STATE_UNSPECIFIED = 0;
+  AUDIO_PTT_ARMING_STATE_ARMED = 1;
+  AUDIO_PTT_ARMING_STATE_NEEDS_PHYSICAL_RELEASE = 2;
+  AUDIO_PTT_ARMING_STATE_UNAVAILABLE = 3;
+}
+enum AudioPttUnavailableReason {
+  AUDIO_PTT_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  AUDIO_PTT_UNAVAILABLE_REASON_HOST_CLOCK_UNAVAILABLE = 1;
+  AUDIO_PTT_UNAVAILABLE_REASON_PORTAL_FRESHNESS_UNVERIFIABLE = 2;
+  AUDIO_PTT_UNAVAILABLE_REASON_REGISTRATION_UNAVAILABLE = 3;
+}
+message AudioMicrophoneState {
+  bool muted = 1; bool ptt_pressed = 2; bool capture_active = 3;
+  bytes target_node_id = 4; bool control_active = 5;
+  // Native hotkey observation only; absent is unknown, not ready to talk.
+  // Registration starts unarmed; an accepted configured-key release arms the next press.
+  optional AudioPttArmingState native_ptt_arming = 6;
+  // Optional detail only while native_ptt_arming is UNAVAILABLE.
+  optional AudioPttUnavailableReason native_ptt_unavailable_reason = 7;
+}
 message AudioStatus {
   uint64 revision = 1; bool enabled = 2; AudioRole role = 3; AudioMode mode = 4;
   repeated AudioCapabilityAvailability backend = 5; repeated AudioSessionStatus sessions = 6;

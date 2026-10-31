@@ -316,6 +316,11 @@ impl Actor {
         let gui::gui_frame::Msg::SendMediaCommand(command) = &request.message else {
             return;
         };
+        // Zero is an unavailable/stale native identity, never "choose current".
+        if command.session_token == 0 || command.media_revision == 0 {
+            reply(&request, Err(ipc::audio::codes::AUDIO_STALE_MEDIA)).await;
+            return;
+        }
         let Ok(raw_peer) = <[u8; 32]>::try_from(command.peer_node_id.as_slice()) else {
             reply(&request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await;
             return;

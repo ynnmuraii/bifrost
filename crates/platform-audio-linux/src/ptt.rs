@@ -1,4 +1,15 @@
 //! Audio-owned GlobalShortcuts PTT. No input-agent dependency or synthetic key events.
+//!
+//! Supported portals must supply nonzero, stable elapsed-millisecond timestamps
+//! for the live session. The portal specification leaves their base undefined;
+//! ashpd's epoch wording is not a shared-clock guarantee. We anchor the first
+//! timestamp before CreateSession, never at receipt, and retain that conservative
+//! lag for the entire session. Zero timestamps (including current KDE), clock
+//! regressions and unmappable jumps fail closed; not every portal supports PTT.
+//! Both edges must have a conservative mapped age no greater than the 250 ms
+//! PTT lease at admission. Consent/initial-signal lag beyond that closes the
+//! session as freshness-unverifiable; there is no receipt-time recalibration or
+//! later catch-up. Use the focused GUI PTT control when global PTT is unavailable.
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -24,16 +35,95 @@ fn monotonic_ns() -> u64 {
         .saturating_add(time.tv_nsec as u64)
 }
 
+/// The compositor is trusted for stable elapsed milliseconds, not a shared epoch.
+/// See https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html
+struct PortalTimeline {
+    session_started_ns: u64,
+    first_ms: Option<u64>,
+    last_ms: u64,
+}
+
+impl PortalTimeline {
+    fn new(session_started_ns: u64) -> Self {
+        Self {
+            session_started_ns,
+            first_ms: None,
+            last_ms: 0,
+        }
+    }
+
+    fn observe(&mut self, timestamp: Duration, now: u64) -> Option<u64> {
+        const MILLIS_NS: u64 = 1_000_000;
+        let milliseconds = u64::try_from(timestamp.as_millis()).ok()?;
+        if milliseconds == 0 || milliseconds <= self.last_ms || now == 0 {
+            return None;
+        }
+        let first_ms = *self.first_ms.get_or_insert(milliseconds);
+        let elapsed_ns = milliseconds.checked_sub(first_ms)?.checked_mul(MILLIS_NS)?;
+        // Subtract one tick: the first signal can occur at either end of its
+        // quantized millisecond. Session creation is its only trusted lower bound.
+        let observed_at_ns = self
+            .session_started_ns
+            .checked_sub(MILLIS_NS)?
+            .checked_add(elapsed_ns)?;
+        if observed_at_ns == 0 || observed_at_ns > now || now - observed_at_ns > PTT_LEASE_NS {
+            return None;
+        }
+        self.last_ms = milliseconds;
+        Some(observed_at_ns)
+    }
+}
+
 #[derive(Default)]
 struct State {
     generation: u64,
+    live_generation: Option<u64>,
+    last_edge_ns: Option<u64>,
     held_until: Option<u64>,
+    logical_down: bool,
+    pending_deactivated: Option<u64>,
     renewed_at: u64,
     events: VecDeque<Event>,
 }
 
 impl State {
+    fn registered(&mut self, generation: u64) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.live_generation = Some(generation);
+        self.last_edge_ns = None;
+        self.logical_down = false;
+        true
+    }
+
+    fn portal_edge(
+        &mut self,
+        generation: u64,
+        activated: bool,
+        timestamp: Duration,
+        now: u64,
+        timeline: &mut PortalTimeline,
+    ) -> bool {
+        if self.live_generation != Some(generation) || self.generation != generation {
+            return false;
+        }
+        let Some(observed_at_ns) = timeline.observe(timestamp, now) else {
+            self.release(PttReleaseReason::PortalFreshnessUnavailable);
+            self.push(Event::ResyncRequired);
+            return false;
+        };
+        self.edge(generation, activated, observed_at_ns, now);
+        true
+    }
+
     fn release(&mut self, reason: PttReleaseReason) {
+        if matches!(
+            reason,
+            PttReleaseReason::UnavailableOrReset | PttReleaseReason::PortalFreshnessUnavailable
+        ) {
+            self.live_generation = None;
+        }
         self.held_until = None;
         self.events
             .retain(|event| !matches!(event, Event::PttPressed { .. } | Event::PttRenewed { .. }));
@@ -49,6 +139,17 @@ impl State {
         }
         if self.events.len() >= QUEUE_CAPACITY {
             self.held_until = None;
+            // Retain the newest genuine proof with its original timestamp, never
+            // convert overflow/reset into a logical deactivation.
+            for queued in self.events.iter().chain(std::iter::once(&event)) {
+                if let Event::PttReleased {
+                    reason: PttReleaseReason::PortalDeactivated { observed_at_ns },
+                } = queued
+                {
+                    self.pending_deactivated =
+                        Some(self.pending_deactivated.unwrap_or(0).max(*observed_at_ns));
+                }
+            }
             self.events.clear();
             self.events.push_back(Event::PttReleased {
                 reason: PttReleaseReason::UnavailableOrReset,
@@ -59,15 +160,46 @@ impl State {
         self.events.push_back(event);
     }
 
-    fn press(&mut self, now: u64) {
-        if self.held_until.is_some() || now == 0 {
+    fn edge(&mut self, generation: u64, activated: bool, observed_at_ns: u64, now: u64) {
+        if self.live_generation != Some(generation) || self.generation != generation {
             return;
         }
+        if observed_at_ns == 0 || now == 0 || observed_at_ns > now {
+            self.release(PttReleaseReason::UnavailableOrReset);
+            self.push(Event::ResyncRequired);
+            return;
+        }
+        if !activated && !self.logical_down && self.last_edge_ns.is_some() {
+            return;
+        }
+        // Release wins ties: millisecond timestamps cannot prove that an
+        // activation in the same clock tick happened after a deactivation.
+        if self.last_edge_ns.is_some_and(|last| {
+            observed_at_ns < last || (observed_at_ns == last && (activated || !self.logical_down))
+        }) {
+            return;
+        }
+        self.last_edge_ns = Some(observed_at_ns);
+        if !activated {
+            self.logical_down = false;
+            self.release(PttReleaseReason::PortalDeactivated { observed_at_ns });
+            return;
+        }
+        if self.logical_down {
+            return;
+        }
+        self.logical_down = true;
+        // Receipt bounds only the lease; original observation remains the child's
+        // freshness/fence authority even after a long portal-approval delay.
         let expires_at_ns = now.saturating_add(PTT_LEASE_NS);
+        // Expiry/overflow closes a logical hold until a genuine deactivation.
+        if self.pending_deactivated.is_some() {
+            return;
+        }
         self.held_until = Some(expires_at_ns);
         self.renewed_at = now;
         self.push(Event::PttPressed {
-            observed_at_ns: now,
+            observed_at_ns,
             expires_at_ns,
         });
     }
@@ -78,16 +210,28 @@ impl State {
         };
         if now == 0 || now >= expiry {
             self.release(if now == 0 {
-                PttReleaseReason::UnavailableOrReset
+                PttReleaseReason::PortalFreshnessUnavailable
             } else {
                 PttReleaseReason::LeaseExpired
             });
+            if now == 0 {
+                self.push(Event::ResyncRequired);
+            }
         } else if now.saturating_sub(self.renewed_at) >= RENEW_NS {
             let expires_at_ns = now.saturating_add(PTT_LEASE_NS);
             self.held_until = Some(expires_at_ns);
             self.renewed_at = now;
             self.push(Event::PttRenewed { expires_at_ns });
         }
+    }
+
+    fn pop_event(&mut self) -> Option<Event> {
+        if let Some(observed_at_ns) = self.pending_deactivated.take() {
+            return Some(Event::PttReleased {
+                reason: PttReleaseReason::PortalDeactivated { observed_at_ns },
+            });
+        }
+        self.events.pop_front()
     }
 }
 
@@ -207,7 +351,7 @@ impl PortalPtt {
         {
             state.release(PttReleaseReason::LeaseExpired);
         }
-        state.events.pop_front()
+        state.pop_event()
     }
 
     pub(crate) fn shutdown(&mut self) {
@@ -289,11 +433,12 @@ async fn run_configuration(
         }
         let activated = portal.receive_activated().await.ok()?;
         let deactivated = portal.receive_deactivated().await.ok()?;
+        let session_started_ns = monotonic_ns();
         let session = portal
             .create_session(CreateSessionOptions::default())
             .await
             .ok()?;
-        Some((portal, session, activated, deactivated))
+        Some((portal, session, activated, deactivated, session_started_ns))
     };
     let result = {
         let setup = bounded(setup, IO_TIMEOUT).fuse();
@@ -304,7 +449,7 @@ async fn run_configuration(
             result = setup => result,
         }
     };
-    let Some(Some((portal, session, activated, deactivated))) = result else {
+    let Some(Some((portal, session, activated, deactivated, session_started_ns))) = result else {
         return Outcome::Failed;
     };
     let active = async {
@@ -334,9 +479,11 @@ async fn run_configuration(
         }) {
             return None;
         }
+        if !state.lock().unwrap().registered(generation) {
+            return None;
+        }
+        let mut timeline = PortalTimeline::new(session_started_ns);
         futures::pin_mut!(activated, deactivated, closed);
-        // Separate subscriptions may drain out of order; never reopen on an old press.
-        let mut last_release = None;
         loop {
             let timer = futures_timer::Delay::new(Duration::from_millis(25)).fuse();
             let pressed = activated.next().fuse();
@@ -344,23 +491,23 @@ async fn run_configuration(
             let closed_event = closed.next().fuse();
             futures::pin_mut!(timer, pressed, released, closed_event);
             enum Edge {
-                Press,
-                Release,
+                Press(Duration),
+                Release(Duration),
                 Tick,
             }
             let edge = select_biased! {
                 _ = closed_event => return None,
                 event = released => {
                     let event = event?;
-                    if event.session_handle().as_str() != path || event.shortcut_id() != SHORTCUT_ID { continue; }
-                    last_release = Some(event.timestamp());
-                    Edge::Release
+                    if event.session_handle().as_str() != path { return None; }
+                    if event.shortcut_id() != SHORTCUT_ID { continue; }
+                    Edge::Release(event.timestamp())
                 },
                 event = pressed => {
                     let event = event?;
-                    if event.session_handle().as_str() != path || event.shortcut_id() != SHORTCUT_ID { continue; }
-                    if last_release.is_some_and(|timestamp| event.timestamp() <= timestamp) { continue; }
-                    Edge::Press
+                    if event.session_handle().as_str() != path { return None; }
+                    if event.shortcut_id() != SHORTCUT_ID { continue; }
+                    Edge::Press(event.timestamp())
                 },
                 _ = timer => Edge::Tick,
             };
@@ -368,10 +515,21 @@ async fn run_configuration(
             if current.generation != generation {
                 return None;
             }
+            let now = monotonic_ns();
+            let is_activation = matches!(edge, Edge::Press(_));
             match edge {
-                Edge::Press => current.press(monotonic_ns()),
-                Edge::Release => current.release(PttReleaseReason::PhysicalKeyUp),
-                Edge::Tick => current.tick(monotonic_ns()),
+                Edge::Press(timestamp) | Edge::Release(timestamp) => {
+                    if !current.portal_edge(
+                        generation,
+                        is_activation,
+                        timestamp,
+                        now,
+                        &mut timeline,
+                    ) {
+                        return None;
+                    }
+                }
+                Edge::Tick => current.tick(now),
             }
         }
         #[allow(unreachable_code)]
@@ -508,155 +666,471 @@ mod tests {
     }
 
     #[test]
-    fn lease_renewal_expiry_and_no_reopening() {
-        let mut state = State::default();
-        state.press(1);
-        assert_eq!(state.held_until, Some(1 + PTT_LEASE_NS));
-        state.tick(1 + RENEW_NS);
-        assert!(matches!(
-            state.events.back(),
-            Some(Event::PttRenewed { .. })
+    fn undefined_timestamp_base_cancels_without_receipt_time_calibration() {
+        for base_ms in [1, 50_000, u64::MAX - 100] {
+            let mut timeline = PortalTimeline::new(1_000_000_000);
+            assert_eq!(
+                timeline.observe(Duration::from_millis(base_ms), 1_200_000_000),
+                Some(999_000_000)
+            );
+            assert_eq!(
+                timeline.observe(Duration::from_millis(base_ms + 10), 1_200_000_000),
+                Some(1_009_000_000)
+            );
+        }
+    }
+
+    #[test]
+    fn queued_portal_signals_stay_before_fence_until_a_fresh_logical_cycle() {
+        let mut timeline = PortalTimeline::new(1_000_000_000);
+        let mut state = registered_state();
+        let fence = 1_010_000_000;
+        for (activated, timestamp_ms, receipt_ns, after_fence) in [
+            (true, 50_000, 1_020_000_000, false),
+            (false, 50_005, 1_025_000_000, false),
+            (true, 50_006, 1_026_000_000, false),
+            (false, 50_030, 1_040_000_000, true),
+            (true, 50_031, 1_041_000_000, true),
+        ] {
+            let observed = timeline
+                .observe(Duration::from_millis(timestamp_ms), receipt_ns)
+                .unwrap();
+            assert_eq!(observed > fence, after_fence);
+            state.edge(0, activated, observed, receipt_ns);
+            if activated {
+                assert!(matches!(
+                    state.pop_event(),
+                    Some(Event::PttPressed { observed_at_ns, .. }) if observed_at_ns == observed
+                ));
+            } else {
+                assert_eq!(state.pop_event(), Some(deactivated(observed)));
+            }
+        }
+    }
+
+    #[test]
+    fn kde_zero_and_constant_clocks_report_unverifiable_not_release_proof() {
+        for constant_ms in [0, 500] {
+            let mut timeline = PortalTimeline::new(1_000_000_000);
+            let mut state = registered_state();
+            let timestamp = Duration::from_millis(constant_ms);
+            if constant_ms != 0 {
+                assert!(state.portal_edge(0, true, timestamp, 1_010_000_000, &mut timeline));
+                assert!(matches!(state.pop_event(), Some(Event::PttPressed { .. })));
+            }
+            assert!(!state.portal_edge(0, false, timestamp, 1_020_000_000, &mut timeline));
+            assert_eq!(
+                state.pop_event(),
+                Some(Event::PttReleased {
+                    reason: PttReleaseReason::PortalFreshnessUnavailable,
+                })
+            );
+            assert_eq!(state.pop_event(), Some(Event::ResyncRequired));
+            assert!(state.held_until.is_none());
+            // A later signal cannot reopen the failed session.
+            assert!(!state.portal_edge(
+                0,
+                true,
+                Duration::from_millis(501),
+                1_030_000_000,
+                &mut timeline,
+            ));
+            assert!(state.pop_event().is_none());
+        }
+    }
+
+    #[test]
+    fn seconds_style_values_fail_age_cap_without_rescaling_or_catchup() {
+        let mut timeline = PortalTimeline::new(1_000_000_000);
+        let mut state = registered_state();
+        assert!(state.portal_edge(
+            0,
+            true,
+            Duration::from_millis(42),
+            1_100_000_000,
+            &mut timeline,
         ));
-        state.tick(1 + RENEW_NS + PTT_LEASE_NS);
+        state.pop_event();
+        assert!(!state.portal_edge(
+            0,
+            false,
+            Duration::from_millis(43),
+            2_100_000_000,
+            &mut timeline,
+        ));
         assert_eq!(
-            state.events.pop_front(),
+            state.pop_event(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::PortalFreshnessUnavailable,
+            })
+        );
+        assert_eq!(state.pop_event(), Some(Event::ResyncRequired));
+        // No units guessing, new receipt anchor, or reopening after failure.
+        assert!(!state.portal_edge(
+            0,
+            true,
+            Duration::from_millis(44),
+            3_100_000_000,
+            &mut timeline,
+        ));
+        assert!(state.pop_event().is_none());
+    }
+
+    #[test]
+    fn zero_regression_future_and_unmappable_timestamp_jumps_fail_closed() {
+        let mut zero = PortalTimeline::new(1_000_000_000);
+        assert_eq!(zero.observe(Duration::ZERO, 1_100_000_000), None);
+        for timestamp in [499, 500, 1_500, u64::MAX] {
+            let mut timeline = PortalTimeline::new(1_000_000_000);
+            assert_eq!(
+                timeline.observe(Duration::from_millis(500), 1_100_000_000),
+                Some(999_000_000)
+            );
+            assert_eq!(
+                timeline.observe(Duration::from_millis(timestamp), 1_200_000_000),
+                None
+            );
+        }
+        let mut invalid_host = PortalTimeline::new(1);
+        assert_eq!(invalid_host.observe(Duration::from_millis(1), 10), None);
+    }
+
+    #[test]
+    fn fresh_millisecond_cycle_at_age_limit_retains_original_time_and_receipt_lease() {
+        let mut timeline = PortalTimeline::new(1_000_000_000);
+        let mut state = registered_state();
+        let mapped_release = 999_000_000;
+        let release_receipt = mapped_release + PTT_LEASE_NS;
+        assert!(state.portal_edge(
+            0,
+            false,
+            Duration::from_millis(50_000),
+            release_receipt,
+            &mut timeline,
+        ));
+        assert_eq!(state.pop_event(), Some(deactivated(mapped_release)));
+        let mapped_activation = mapped_release + 10_000_000;
+        let activation_receipt = release_receipt + 10_000_000;
+        assert!(state.portal_edge(
+            0,
+            true,
+            Duration::from_millis(50_010),
+            activation_receipt,
+            &mut timeline,
+        ));
+        assert_eq!(
+            state.pop_event(),
+            Some(Event::PttPressed {
+                observed_at_ns: mapped_activation,
+                expires_at_ns: activation_receipt + PTT_LEASE_NS,
+            })
+        );
+    }
+
+    #[test]
+    fn excessive_initial_lag_closes_both_edges_without_receipt_relabel_or_catchup() {
+        for activated in [false, true] {
+            let mut timeline = PortalTimeline::new(1_000_000_000);
+            let mut state = registered_state();
+            let now = 999_000_000 + PTT_LEASE_NS + 1;
+            assert!(!state.portal_edge(
+                0,
+                activated,
+                Duration::from_millis(50_000),
+                now,
+                &mut timeline,
+            ));
+            assert_eq!(
+                state.pop_event(),
+                Some(Event::PttReleased {
+                    reason: PttReleaseReason::PortalFreshnessUnavailable,
+                })
+            );
+            assert_eq!(state.pop_event(), Some(Event::ResyncRequired));
+            assert!(state.held_until.is_none());
+            assert!(!state.portal_edge(
+                0,
+                false,
+                Duration::from_millis(50_001),
+                now + 1_000_000,
+                &mut timeline,
+            ));
+            assert!(!state.portal_edge(
+                0,
+                true,
+                Duration::from_millis(50_002),
+                now + 2_000_000,
+                &mut timeline,
+            ));
+            assert!(state.pop_event().is_none());
+        }
+    }
+
+    #[test]
+    fn replacement_session_uses_its_own_lower_bound_and_timestamp_base() {
+        let fence = 2_000_000_000;
+        let mut old = PortalTimeline::new(1_000_000_000);
+        let mut new = PortalTimeline::new(3_000_000_000);
+        let old_observed = old
+            .observe(Duration::from_millis(50_000), 1_010_000_000)
+            .unwrap();
+        let new_observed = new
+            .observe(Duration::from_millis(7), 3_010_000_000)
+            .unwrap();
+        assert!(old_observed <= fence);
+        assert!(new_observed > fence);
+        let mut state = registered_state();
+        state.generation = 1;
+        assert!(state.registered(1));
+        state.edge(0, false, old_observed, 3_010_000_000);
+        assert!(state.pop_event().is_none());
+        state.edge(1, false, new_observed, 3_010_000_000);
+        assert_eq!(state.pop_event(), Some(deactivated(new_observed)));
+    }
+
+    fn registered_state() -> State {
+        let mut state = State::default();
+        assert!(state.registered(0));
+        state
+    }
+
+    fn deactivated(observed_at_ns: u64) -> Event {
+        Event::PttReleased {
+            reason: PttReleaseReason::PortalDeactivated { observed_at_ns },
+        }
+    }
+
+    #[test]
+    fn modifier_logical_deactivation_then_reactivation_is_not_physical_up() {
+        let mut state = registered_state();
+        state.edge(0, true, 10, 10);
+        assert!(matches!(state.pop_event(), Some(Event::PttPressed { .. })));
+        // A modifier can deactivate the chord while its non-modifier stays held.
+        state.edge(0, false, 20, 20);
+        assert_eq!(state.pop_event(), Some(deactivated(20)));
+        state.edge(0, true, 30, 30);
+        assert_eq!(
+            state.pop_event(),
+            Some(Event::PttPressed {
+                observed_at_ns: 30,
+                expires_at_ns: 30 + PTT_LEASE_NS,
+            })
+        );
+    }
+
+    #[test]
+    fn expiry_and_held_renewals_never_reopen() {
+        let mut state = registered_state();
+        state.edge(0, true, 1, 1);
+        state.tick(1 + RENEW_NS);
+        state.tick(1 + RENEW_NS * 2);
+        assert_eq!(state.events.len(), 2);
+        assert!(matches!(state.events[1], Event::PttRenewed { .. }));
+        state.tick(1 + RENEW_NS * 2 + PTT_LEASE_NS);
+        assert_eq!(
+            state.pop_event(),
             Some(Event::PttReleased {
                 reason: PttReleaseReason::LeaseExpired,
             })
         );
-        state.tick(1_000_000_000);
+        state.tick(2_000_000_000);
+        state.edge(0, true, 2_000_000_001, 2_000_000_001);
+        assert!(state.pop_event().is_none());
         assert!(state.held_until.is_none());
-        assert!(state.events.is_empty());
+        state.edge(0, false, 2_000_000_002, 2_000_000_002);
+        assert_eq!(state.pop_event(), Some(deactivated(2_000_000_002)));
+        state.edge(0, true, 2_000_000_003, 2_000_000_003);
+        assert!(matches!(state.pop_event(), Some(Event::PttPressed { .. })));
     }
 
     #[test]
-    fn release_cancellation_and_overflow_fail_closed() {
-        let mut state = State::default();
-        state.press(1);
-        state.release(PttReleaseReason::PhysicalKeyUp);
+    fn duplicates_stale_edges_and_same_tick_activation_do_not_rearm() {
+        let mut state = registered_state();
+        state.edge(0, true, 10, 10);
+        state.edge(0, true, 10, 11);
+        assert_eq!(state.events.len(), 1);
+        state.edge(0, false, 20, 20);
+        state.edge(0, false, 20, 21);
+        state.edge(0, false, 21, 22);
+        state.edge(0, true, 19, 22);
+        state.edge(0, true, 20, 23);
+        assert_eq!(state.pop_event(), Some(deactivated(20)));
+        assert!(state.pop_event().is_none());
+        assert!(state.held_until.is_none());
+        state.edge(0, true, 21, 24);
+        assert!(matches!(state.pop_event(), Some(Event::PttPressed { .. })));
+        state.edge(0, false, 19, 25);
+        assert!(state.held_until.is_some());
+    }
+
+    #[test]
+    fn queued_edges_keep_original_time_across_a_child_fence() {
+        let mut state = registered_state();
+        let fence = 100;
+        state.edge(0, false, 90, 110);
+        assert_eq!(state.pop_event(), Some(deactivated(90)));
+        state.edge(0, true, 95, 120);
+        let Some(Event::PttPressed {
+            observed_at_ns,
+            expires_at_ns,
+        }) = state.pop_event()
+        else {
+            panic!("expected original queued activation");
+        };
+        assert!(observed_at_ns < fence);
+        assert_eq!(expires_at_ns, 120 + PTT_LEASE_NS);
+        state.edge(0, false, 130, 140);
+        assert_eq!(state.pop_event(), Some(deactivated(130)));
+        state.edge(0, true, 150, 160);
+        assert!(matches!(
+            state.pop_event(),
+            Some(Event::PttPressed {
+                observed_at_ns: 150,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stalled_queued_activation_expires_and_held_renewals_cannot_reopen() {
+        let mut state = registered_state();
+        state.edge(0, true, 10, 10 + PTT_LEASE_NS);
+        state.tick(10 + PTT_LEASE_NS * 2);
         assert_eq!(
-            state.events.pop_front(),
+            state.pop_event(),
             Some(Event::PttReleased {
-                reason: PttReleaseReason::PhysicalKeyUp,
+                reason: PttReleaseReason::LeaseExpired,
             })
         );
-        state.press(2);
+        state.edge(0, true, 10 + PTT_LEASE_NS * 3, 10 + PTT_LEASE_NS * 3);
+        assert!(state.pop_event().is_none());
+        assert!(state.held_until.is_none());
+    }
+
+    #[test]
+    fn reset_and_session_replacement_reject_old_session_edges() {
+        let mut state = registered_state();
+        state.edge(0, true, 10, 10);
+        state.release(PttReleaseReason::UnavailableOrReset);
+        state.edge(0, false, 20, 20);
+        state.edge(0, true, 30, 30);
+        assert_eq!(
+            state.pop_event(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::UnavailableOrReset,
+            })
+        );
+        assert!(state.pop_event().is_none());
+        state.generation = 1;
+        assert!(!state.registered(0));
+        assert!(state.registered(1));
+        state.edge(0, false, 40, 40);
+        state.edge(0, true, 50, 50);
+        assert!(state.pop_event().is_none());
+        state.edge(1, false, 60, 60);
+        assert_eq!(state.pop_event(), Some(deactivated(60)));
+        state.edge(1, true, 70, 70);
+        assert!(matches!(state.pop_event(), Some(Event::PttPressed { .. })));
+    }
+
+    #[test]
+    fn full_queue_preserves_original_logical_release_through_resets() {
+        let mut state = registered_state();
+        state.edge(0, true, 10, 10);
+        state.pop_event();
         for _ in 0..QUEUE_CAPACITY {
             state.push(Event::ResyncRequired);
         }
-        assert!(state.held_until.is_none());
-        assert!(state.events.contains(&Event::PttReleased {
-            reason: PttReleaseReason::UnavailableOrReset,
-        }));
+        state.edge(0, false, 20, 20);
+        for _ in 0..QUEUE_CAPACITY * 2 {
+            state.push(Event::ResyncRequired);
+        }
+        state.release(PttReleaseReason::UnavailableOrReset);
         assert!(state.events.len() <= QUEUE_CAPACITY);
-        state.release(PttReleaseReason::UnavailableOrReset);
-        state.tick(100_000_002);
-        assert!(!state
-            .events
-            .iter()
-            .any(|event| matches!(event, Event::PttRenewed { .. } | Event::PttPressed { .. })));
-    }
-
-    #[test]
-    fn ordering_and_renewal_coalescing() {
-        let mut state = State::default();
-        state.press(1);
-        state.tick(RENEW_NS + 1);
-        state.tick(RENEW_NS * 2 + 1);
-        assert_eq!(state.events.len(), 2);
-        assert!(matches!(state.events[0], Event::PttPressed { .. }));
-        assert!(matches!(state.events[1], Event::PttRenewed { .. }));
-        state.release(PttReleaseReason::UnavailableOrReset);
-        state.press(RENEW_NS * 2 + 2);
-        assert_eq!(
-            state.events[0],
-            Event::PttReleased {
-                reason: PttReleaseReason::UnavailableOrReset,
-            }
-        );
-        assert!(matches!(state.events[1], Event::PttPressed { .. }));
-    }
-
-    #[test]
-    fn physical_release_is_not_coalesced_with_synthetic_closure() {
-        for reason in [
-            PttReleaseReason::LeaseExpired,
-            PttReleaseReason::UnavailableOrReset,
-        ] {
-            let mut state = State::default();
-            state.press(1);
-            state.release(reason);
-            state.release(PttReleaseReason::PhysicalKeyUp);
-            assert_eq!(
-                state.events.pop_front(),
-                Some(Event::PttReleased { reason })
-            );
-            assert_eq!(
-                state.events.pop_front(),
-                Some(Event::PttReleased {
-                    reason: PttReleaseReason::PhysicalKeyUp,
-                })
-            );
-            assert!(state.events.is_empty());
+        assert_eq!(state.pop_event(), Some(deactivated(20)));
+        while let Some(event) = state.pop_event() {
+            assert!(!matches!(
+                event,
+                Event::PttReleased {
+                    reason: PttReleaseReason::PortalDeactivated { .. }
+                } | Event::PttPressed { .. }
+                    | Event::PttRenewed { .. }
+            ));
         }
     }
 
     #[test]
-    fn invalid_clock_closes_without_claiming_physical_release() {
-        let mut state = State::default();
-        state.press(1);
+    fn lost_host_clock_closes_the_session_without_rearm() {
+        let mut state = registered_state();
+        state.edge(0, true, 10, 10);
         state.tick(0);
         assert_eq!(
-            state.events.pop_front(),
+            state.pop_event(),
             Some(Event::PttReleased {
-                reason: PttReleaseReason::UnavailableOrReset,
+                reason: PttReleaseReason::PortalFreshnessUnavailable,
             })
         );
-        assert!(state.held_until.is_none());
-        assert!(state.events.is_empty());
+        assert_eq!(state.pop_event(), Some(Event::ResyncRequired));
+        state.tick(RENEW_NS);
+        state.edge(0, false, 20, 20);
+        assert!(state.pop_event().is_none());
     }
 
     #[test]
-    fn reconfiguration_and_shutdown_never_claim_physical_release() {
+    fn invalid_clock_closes_without_claiming_logical_release() {
+        for (observed, now) in [(0, 20), (30, 20), (20, 0)] {
+            let mut state = registered_state();
+            state.edge(0, true, 10, 10);
+            state.edge(0, false, observed, now);
+            assert_eq!(
+                state.pop_event(),
+                Some(Event::PttReleased {
+                    reason: PttReleaseReason::UnavailableOrReset,
+                })
+            );
+            assert_eq!(state.pop_event(), Some(Event::ResyncRequired));
+            assert!(state.held_until.is_none());
+            assert!(state.live_generation.is_none());
+        }
+    }
+
+    #[test]
+    fn reconfiguration_admission_failure_and_shutdown_are_not_release_proof() {
         let (commands, receiver) = mpsc::channel(1);
         let (done_tx, done) = std::sync::mpsc::channel();
         drop(done_tx);
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(Mutex::new(registered_state()));
         let mut ptt = PortalPtt {
             commands: Some(commands),
             state: state.clone(),
             thread: None,
             done,
         };
-        state.lock().unwrap().press(1);
+        state.lock().unwrap().edge(0, true, 1, 1);
         ptt.configure(None, &[]).unwrap();
         assert_eq!(
-            state.lock().unwrap().events.pop_front(),
+            state.lock().unwrap().pop_event(),
             Some(Event::PttReleased {
                 reason: PttReleaseReason::UnavailableOrReset,
             })
         );
         drop(receiver);
-        state.lock().unwrap().press(2);
         assert_eq!(
             ptt.configure(None, &[]),
             Err(BackendError::ServerUnavailable)
         );
-        assert_eq!(
-            state.lock().unwrap().events.pop_front(),
-            Some(Event::PttReleased {
-                reason: PttReleaseReason::UnavailableOrReset,
-            })
-        );
-        state.lock().unwrap().press(3);
         ptt.shutdown();
-        assert_eq!(
-            state.lock().unwrap().events.pop_front(),
-            Some(Event::PttReleased {
-                reason: PttReleaseReason::UnavailableOrReset,
-            })
-        );
-        assert!(state.lock().unwrap().held_until.is_none());
+        let mut state = state.lock().unwrap();
+        assert!(state.held_until.is_none());
+        assert!(state.live_generation.is_none());
+        while let Some(event) = state.pop_event() {
+            assert!(!matches!(
+                event,
+                Event::PttReleased {
+                    reason: PttReleaseReason::PortalDeactivated { .. }
+                }
+            ));
+        }
     }
 
     #[test]

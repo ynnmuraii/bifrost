@@ -704,6 +704,13 @@ fn ptt_observes_release_unregisters_and_lock_session_timeout_fail_closed() {
             backend.apply(ScriptEvent::PttPress),
             Err(BackendError::Unsupported)
         );
+        backend.apply(ScriptEvent::PttRelease).unwrap();
+        assert_eq!(
+            backend.poll_event(),
+            Some(Event::PttReleased {
+                reason: PttReleaseReason::PhysicalKeyUp,
+            })
+        );
     }
     backend.configure_ptt(Some(hotkey()), &[]).unwrap();
     backend.apply(ScriptEvent::PttPress).unwrap();
@@ -806,6 +813,91 @@ fn physical_release_remains_observable_after_lease_expiry_or_overflow() {
 }
 
 #[test]
+fn full_queue_preserves_actual_up_through_further_overflow_and_reset() {
+    let mut backend = backend();
+    backend.configure_ptt(Some(hotkey()), &[]).unwrap();
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    drain(&mut backend);
+    for _ in 0..EVENT_CAPACITY {
+        backend
+            .apply(ScriptEvent::SetMute {
+                device: id("mic"),
+                muted: false,
+            })
+            .unwrap();
+    }
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    for _ in 0..=EVENT_CAPACITY {
+        backend
+            .apply(ScriptEvent::SetMute {
+                device: id("mic"),
+                muted: true,
+            })
+            .unwrap();
+    }
+    backend.configure_ptt(Some(hotkey()), &[]).unwrap();
+    assert_eq!(backend.poll_event(), Some(Event::ResyncRequired));
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::PhysicalKeyUp,
+        })
+    );
+    drain(&mut backend);
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    assert_eq!(backend.poll_event(), None);
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    assert!(matches!(
+        backend.poll_event(),
+        Some(Event::PttPressed { .. })
+    ));
+}
+
+#[test]
+fn lease_expiry_blocks_same_physical_hold_until_actual_up_and_fresh_press() {
+    let mut backend = backend();
+    backend.configure_ptt(Some(hotkey()), &[]).unwrap();
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    assert_eq!(backend.poll_event(), None);
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    drain(&mut backend);
+    backend
+        .apply(ScriptEvent::AdvanceTime {
+            now_ns: PTT_LEASE_NS,
+        })
+        .unwrap();
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::LeaseExpired,
+        })
+    );
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    assert_eq!(
+        backend.apply(ScriptEvent::PttRenew),
+        Err(BackendError::Stopped)
+    );
+    assert_eq!(backend.poll_event(), None);
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::PhysicalKeyUp,
+        })
+    );
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    assert_eq!(backend.poll_event(), None);
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttPressed {
+            observed_at_ns: PTT_LEASE_NS,
+            expires_at_ns: PTT_LEASE_NS * 2,
+        })
+    );
+}
+
+#[test]
 fn bounded_poll_overflow_revokes_held_press_and_discards_stale_edges() {
     let mut backend = backend();
     backend.configure_ptt(Some(hotkey()), &[]).unwrap();
@@ -828,6 +920,15 @@ fn bounded_poll_overflow_revokes_held_press_and_discards_stale_edges() {
         count += 1;
     }
     assert!(count <= EVENT_CAPACITY);
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    assert_eq!(backend.poll_event(), None);
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::PhysicalKeyUp,
+        })
+    );
     backend.apply(ScriptEvent::PttPress).unwrap();
     assert_eq!(
         backend.poll_event(),
@@ -1178,6 +1279,15 @@ fn ptt_lease_renewal_expiry_and_stalled_consumer_fail_closed() {
     assert_eq!(
         backend.apply(ScriptEvent::PttRenew),
         Err(BackendError::Stopped)
+    );
+    backend.apply(ScriptEvent::PttPress).unwrap();
+    assert_eq!(backend.poll_event(), None);
+    backend.apply(ScriptEvent::PttRelease).unwrap();
+    assert_eq!(
+        backend.poll_event(),
+        Some(Event::PttReleased {
+            reason: PttReleaseReason::PhysicalKeyUp,
+        })
     );
     // Even if Press was queued while the consumer stalled, its absolute expiry
     // prevents reopening when it is eventually consumed.

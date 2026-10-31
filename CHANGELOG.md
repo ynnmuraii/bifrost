@@ -8,6 +8,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Fixes**
 
+- Live audio health updates no longer invalidate settings, start or gain actions. Stale configuration/consent changes, future snapshots and A→B→A edits remain rejected without automatic retries.
+- Latch microphone mute/PTT release before bounded GUI admission, so continued polling cannot keep an old hold alive after queue saturation. Rejected stale/busy unmute requests leave legitimate holds untouched.
+- Keep an observed safety mute and its runtime recovery intent even when configuration persistence fails; report the write error without reopening the microphone.
+- Preserve absent/automatic/manual group-policy states through TOML, IPC and GUI edits; legacy Source pins survive restart instead of silently becoming automatic.
+- Treat zero native media token/revision as stale/unavailable, never an implicit current session; preserve a typed operation failure without executing a child command.
 - Starting a newer pairing ceremony cancels the previous pending SAS exchange on both computers. Old prompts, confirmations and delayed dial results cannot approve or replace the newest attempt; existing window/handshake budgets remain in force. Pairing outcome IPC now carries the ceremony identity and cancellation code for correlated clients.
 - GUI pairing results are matched to the visible ceremony, including after its answer acknowledgement. Superseded confirmations cannot close a newer prompt; cancellation is explained in English and Russian instead of exposing a raw error code.
 - Superseded pairing attempts show a neutral informational notice without a failure prefix. The audio-settings headphones and popup-player speaker now have distinct sidebar glyphs, tooltips and accessible button names.
@@ -55,7 +60,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Recover Listener health when valid decoded PCM resumes after Wi-Fi loss instead of retaining a permanent degraded label; distinguish jitter rebuffer episodes from native zero-fill callbacks, keep peer receiver quality separate from local Source state, and fall back safely when a native render position stops advancing.
 - Document Listener-first authenticated UDP hole punching and one-second idle traffic as runtime invariants; report bounded path-probe/authentication observations on health and terminal timeouts without guessing which firewall blocked traffic.
 - Keep audio-child lifecycle and path-failure diagnostics in a separate bounded rotating log while retaining null stdio; log only allowlisted scalar fields and prevent dependency traces from exposing session keys, now-playing metadata or PCM, including at DEBUG level.
-- Release-all talk cancellation bypasses full control queues, fences stale grants and held native keys, and preserves explicitly persistent unmute; only a proven physical key-up can rearm native push-to-talk after a safety fence.
+- Release-all talk cancellation bypasses full control queues, fences stale grants and held native keys, and preserves explicitly persistent unmute. Newer explicit mute invalidates older queued unmute; targeted revoke cannot cancel a newer grant, and old release-all never replays into new mic ownership.
+- Report native PTT registration and arming separately; rearming needs configured-key release or a distinct trusted portal logical release in the current safety epoch. Saturated supervisor safety admission reaps the child; genuine releases survive bounded Dry/Linux queue overflow.
+- Fail closed on unverifiable portal clocks, including current KDE zero timestamps and mapped events older than 250 ms; delayed first events may also disable native PTT. GUI hold-to-talk remains available independently.
+- Windows PTT preserves original queued press timestamps and rearms only from a non-injected native release of its configured non-modifier key; unavailable polling or releasing one modifier side cannot masquerade as chord release. Registration starts unarmed, and a saturated release queue retains its pending rearm edge without allowing a press through.
 
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
@@ -138,6 +146,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Исправления**
 
+- Обновления аудиометрик больше не мешают настройкам, запуску и громкости. Устаревшие изменения конфигурации/разрешений, будущие снимки и возврат A→B→A по-прежнему отклоняются без автоматических повторов.
+- Фиксировать выключение микрофона и отпускание PTT до ограниченной очереди GUI: опрос состояния не продлевает старое удержание при переполнении. Отклонённое устаревшее или занятое включение не отменяет действующее удержание.
+- Сохранять подтверждённое выключение микрофона и безопасное состояние восстановления при ошибке записи конфигурации; сообщать об ошибке, не включая микрофон обратно.
+- Сохранять отсутствие, автоматический и ручной режим группы при записи TOML, обмене IPC и изменениях GUI; старые ручные группы Source переживают перезапуск.
+- Нулевые идентификатор или ревизия медиасессии означают недоступную/устаревшую цель, а не выбор текущей: команда дочернему процессу не выполняется, GUI получает служебный код отказа.
 - Новая попытка сопряжения отменяет предыдущую незавершённую сверку SAS на обоих компьютерах. Старые запросы, подтверждения и запоздавшие результаты подключения не могут подтвердить или подменить новую попытку; ограничения окна и числа подключений сохранены. IPC результата сопряжения дополнен идентификатором церемонии и кодом отмены для клиентов с проверкой соответствия.
 - GUI сопоставляет результаты сопряжения с текущей церемонией, в том числе после подтверждения отправки ответа. Запоздавшие подтверждения не закрывают новый код; отмена объясняется по-русски и по-английски вместо показа служебного кода ошибки.
 - Отменённая предыдущая попытка сопряжения показывается нейтральным уведомлением без префикса ошибки. Настройки звука отмечены наушниками, мини-плеер — динамиком; у кнопок боковой панели разные подсказки и доступные имена.
@@ -181,7 +194,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 **Внутренний аудиотракт**
 
-- Общий отзыв разрешений говорить обходит заполненные очереди, блокирует старые продления и удерживаемые нативные клавиши, сохраняя явное постоянное включение микрофона; после защитного отзыва нативный PTT возобновляется только при подтверждённом физическом отпускании и новом нажатии.
+- Общий отзыв разрешений говорить обходит заполненные очереди и сохраняет явное постоянное включение микрофона. Новое mute отменяет старое отложенное unmute; адресный отзыв не отменяет новое разрешение, а старый общий отзыв не применяется к новому владению микрофоном.
+- Регистрация нативной PTT отделена от готовности: нужны отпускание настроенной клавиши либо отдельное доверенное логическое отпускание портала в текущей эпохе защиты. Переполнение защитной очереди супервизора завершает дочерний процесс; реальные отпускания сохраняются при переполнении Dry/Linux.
+- Непроверяемые часы портала, включая нулевые метки текущего KDE и события старше 250 мс, закрывают нативную PTT; задержка первого события тоже может сделать её недоступной. Кнопка «удерживать для разговора» в интерфейсе остаётся независимой.
+- PTT Windows сохраняет исходное время отложенных нажатий и возобновляется только после нативного, неинжектированного отпускания настроенной немодификаторной клавиши; недоступность опроса и отпускание одной стороны модификатора не считаются отпусканием сочетания. Регистрация требует отпускания PTT-клавиши для готовности, а заполненная очередь сохраняет подтверждение без пропуска новых нажатий.
 
 - Состояние Listener восстанавливается после возобновления декодированного PCM при потерях Wi-Fi, а не остаётся навсегда ухудшенным; эпизоды повторного буферизования отделены от нативных callback с заполнением тишиной, отчёты удалённого приёмника — от локального состояния Source, а остановившаяся нативная позиция безопасно переключается на резервные часы.
 - Закреплены инварианты исходящего аутентифицированного UDP-запроса Listener до ожидания Source и секундного служебного трафика; Health и завершение по тайм-ауту передают ограниченные наблюдения проверки пути и аутентификации без догадок о виновном брандмауэре.

@@ -108,6 +108,7 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 One headset on a single **Listener**, system sound from up to three authorized **Sources**. **Mix All** plays them together; **Follow Focus** makes the focused computer primary and quietens the others. Audio is off by default.
 The popup mini-player shows now-playing information and media buttons where the player supports them, plus local per-source volume/mute. Each Source separately permits its Listener's media commands; this is off by default.
 Optional system-wide mic mute/PTT controls the Listener's physical microphone, affecting all apps using it. Enable it separately on both computers and grant each controlling Source permission on the Listener; microphone control is off by default, and no microphone audio is streamed.
+**Release all PTT** is an emergency release of every GUI/hotkey talk grant on that Listener. Held hotkeys must be released before pressing again. In PTT mode this returns to muted idle; an independently, explicitly unmuted microphone stays unmuted—use **Mute microphone** to close it.
 
 1. Use the same audio-capable build on both computers, pair them, and keep both cores running.
 2. On the headset computer, open **Audio settings → Use this computer as the listener**, choose its output, apply, then enable audio.
@@ -243,6 +244,22 @@ reaped and samples remain in memory. No microphone mute or synthesized input is 
 Child mic/PTT tests use Dry mute targets for grants, expiry and persistent toggles.
 Windows registration-only tests temporarily reserve Ctrl+Alt+Shift+F23/F24 and release
 them; they never press keys or mutate a real capture endpoint.
+
+Windows global PTT starts **unarmed** after registration; after a safety fence it
+also requires a confirmed physical release of the non-modifier PTT key before a
+new press can talk. If needed, press and release that PTT key once to arm it, then
+press the configured chord again to talk. A narrowly filtered, non-suppressing
+native observer accepts only non-injected key-up events for that PTT key; it
+stores no unrelated keys. Modifier changes can revoke but cannot rearm: releasing
+one side does not prove its other side is up.
+Unavailable/zero asynchronous key state only revokes a lease, never rearms it.
+Failure to install the release observer reports `Unsupported`; use GUI PTT instead.
+Hook timeout/removal also fails closed; reconfigure PTT to reinstall the observer.
+Registration-only tests do not verify actual native physical edges or desktop
+transitions. Configured is not an armed-state acknowledgment: integrations must
+explain the release-to-arm requirement, and use the physical-release event to
+distinguish it from reset/expiry. Delayed initial presses retain their conservative
+native message timestamp, not the time the event queue is drained.
 
 ## License
 

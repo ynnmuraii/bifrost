@@ -464,11 +464,22 @@ pub enum DeviceEvent {
     Invalidated(DeviceId),
 }
 
-/// Provenance of a closed PTT gate; only a native key-up observation ends a physical hold.
+/// Provenance of a closed PTT gate; synthetic closure never supplies release proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PttReleaseReason {
-    /// A backend observed the physical release edge, independently of lease state.
+    /// A native, non-injected release edge of the configured non-modifier key,
+    /// observed independently of lease state. This is not a shortcut/modifier release.
     PhysicalKeyUp,
+    /// Compositor-trusted logical deactivation of the current registered shortcut
+    /// in its live portal session, not proof of a raw physical key-up.
+    /// `observed_at_ns` preserves the original edge's conservative host-monotonic
+    /// timestamp, so queued pre-fence edges cannot rearm a newer safety fence.
+    PortalDeactivated { observed_at_ns: u64 },
+    /// The portal cannot prove the original edge's freshness in the host clock.
+    /// Synthetic closure only: zero/constant timestamps, unmappable clock units,
+    /// clock discontinuity or mapped edge age greater than `PTT_LEASE_NS`
+    /// never supply release proof.
+    PortalFreshnessUnavailable,
     /// The held press exceeded its absolute observation deadline.
     LeaseExpired,
     /// Observation was lost or invalidated; the physical key may still be held.
@@ -492,6 +503,12 @@ pub enum Event {
     },
     /// Absolute host-monotonic times in nanoseconds (QPC-derived on Windows,
     /// CLOCK_MONOTONIC on Linux; Dry uses explicitly advanced logical time).
+    /// Portal observation time is a conservative session-relative lower bound of
+    /// the original compositor edge; it MUST be checked against the safety fence
+    /// and a fresh `PortalDeactivated` proof, never replaced with receipt time.
+    /// Both portal edges require mapped age <= `PTT_LEASE_NS` at admission.
+    /// Portal expiry instead bounds the observation lease from host receipt time;
+    /// that lease cannot establish freshness or authorize a pre-fence activation.
     /// Consumers MUST check expiry at use time, including after queue/control stalls.
     PttPressed {
         observed_at_ns: u64,

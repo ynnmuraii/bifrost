@@ -368,6 +368,8 @@ enum MicControlOp {
   MIC_CONTROL_OP_PRESS = 2;
   MIC_CONTROL_OP_RENEW = 3;
   MIC_CONTROL_OP_RELEASE = 4;
+  // Explicit GUI/tray emergency release of all talk grants; persistent state is unchanged.
+  MIC_CONTROL_OP_RELEASE_ALL = 5;
 }
 message MicControl {
   bytes group_id = 1;
@@ -392,6 +394,8 @@ message MicState {
   uint64 challenge = 10;
   uint64 expires_ns = 11;
   bool desired_muted = 12;
+  // Monotonic authority safety fence, not a clock. Zero is the initial baseline.
+  uint64 talk_generation = 13;
 }
 message MicAck {
   bytes group_id = 1;

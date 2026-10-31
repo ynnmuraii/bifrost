@@ -22,6 +22,8 @@ pub(crate) struct Privacy {
     pub release_epoch: AtomicU64,
     pub failed: AtomicBool,
     pub active: AtomicBool,
+    pub native_registered: AtomicBool,
+    pub native_failure_reason: AtomicU64,
     sender: mpsc::SyncSender<Reduction>,
     receiver: Mutex<mpsc::Receiver<Reduction>>,
     wake: mpsc::SyncSender<()>,
@@ -41,6 +43,8 @@ impl Privacy {
             release_epoch: AtomicU64::new(0),
             failed: AtomicBool::new(false),
             active: AtomicBool::new(false),
+            native_registered: AtomicBool::new(false),
+            native_failure_reason: AtomicU64::new(3),
             sender,
             receiver: Mutex::new(receiver),
             wake,
@@ -53,10 +57,40 @@ impl Privacy {
             self.grant_highwater.load(Ordering::Acquire),
             Ordering::AcqRel,
         );
-        self.native_fence_ns
-            .store(now_ns.unwrap_or(u64::MAX), Ordering::Release);
-        self.native_epoch.store(epoch, Ordering::Release);
+        self.fence_native(now_ns);
         epoch
+    }
+    pub fn fence_native(&self, now_ns: Option<u64>) {
+        self.native_fence_ns
+            .store(now_ns.unwrap_or(0), Ordering::Release);
+        self.native_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+    pub fn fenced_status(&self, now_ns: Option<u64>) -> w::PttStatus {
+        let registered = self.native_registered.load(Ordering::Acquire);
+        let state = if registered && now_ns.is_some() { 2 } else { 3 };
+        let reason = if now_ns.is_none() {
+            1
+        } else if state == 3 {
+            match self.native_failure_reason.load(Ordering::Acquire) {
+                1..=3 => self.native_failure_reason.load(Ordering::Acquire) as i32,
+                _ => 3,
+            }
+        } else {
+            0
+        };
+        w::PttStatus {
+            state,
+            registered,
+            reason,
+            safety_epoch: self.native_epoch.load(Ordering::Acquire),
+        }
+    }
+    pub fn revoke_scoped(&self, grant_id: u64) {
+        // Fresh grant IDs are monotonic. Never poison an unseen future ID, and
+        // never advance the all-talk epoch for a different grant's revocation.
+        if grant_id != 0 && grant_id <= self.grant_highwater.load(Ordering::Acquire) {
+            self.revoked_through.fetch_max(grant_id, Ordering::AcqRel);
+        }
     }
     /// True means queued to an owned guard; false is an already-closed, guardless release.
     pub fn admit(&self, id: u64, message: &Msg) -> Option<Result<bool, i32>> {
@@ -88,7 +122,7 @@ impl Privacy {
                 Reduction::Mute(id, *expected_generation)
             }
             Msg::PttRevoke(request) => {
-                self.talk_epoch.fetch_add(1, Ordering::AcqRel);
+                self.revoke_scoped(request.grant_id);
                 Reduction::Revoke(id, request.grant_id)
             }
             Msg::ReleaseMicMute(_) => {

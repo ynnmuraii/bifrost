@@ -653,6 +653,8 @@ impl Session {
                 }
                 match audio.submit(request) {
                     Ok(()) => return,
+                    // A full queue still latches microphone safety; it does not acknowledge
+                    // native completion or persistence, so retain the correlated error.
                     Err(request) => request,
                 }
             } else {

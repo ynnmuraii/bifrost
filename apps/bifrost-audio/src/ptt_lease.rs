@@ -10,7 +10,7 @@ pub(crate) struct Forwarder {
 impl Forwarder {
     pub(crate) fn fence(&mut self, native_fence_ns: u64, revoked_through: u64) {
         self.held = None;
-        self.native_fence_ns = Some(native_fence_ns);
+        self.native_fence_ns = (native_fence_ns != 0).then_some(native_fence_ns);
         self.native_blocked = true;
         self.revoked_through = self.revoked_through.max(revoked_through);
     }
@@ -33,6 +33,7 @@ impl Forwarder {
         if event.grant_id != 0 {
             if event.grant_id <= self.revoked_through && matches!(event.kind, 1 | 2 | 5) {
                 return Some(w::PttEvent {
+                    safety_epoch: 0,
                     grant_id: event.grant_id,
                     ..released(2)
                 });
@@ -41,6 +42,7 @@ impl Forwarder {
                 && host_ns.is_none_or(|clock| event.expires_at_ns <= clock)
             {
                 return Some(w::PttEvent {
+                    safety_epoch: 0,
                     kind: 3,
                     grant_id: event.grant_id,
                     reason: 1,
@@ -51,9 +53,10 @@ impl Forwarder {
         }
         if event.kind == 3 {
             self.held = None;
-            if event.reason == 8 {
+            if matches!(event.reason, 8 | 9) && host_ns.is_some() {
                 self.native_blocked = false;
-            } else if !matches!(event.reason, 1..=4 | 6 | 7) {
+            } else if matches!(event.reason, 8 | 9) || !matches!(event.reason, 1..=4 | 6 | 7) {
+                self.native_blocked = true;
                 return Some(released(7));
             }
             return Some(event);
@@ -106,6 +109,7 @@ impl Forwarder {
 }
 fn released(reason: i32) -> w::PttEvent {
     w::PttEvent {
+        safety_epoch: 0,
         kind: 3,
         reason,
         ..Default::default()
@@ -170,6 +174,7 @@ mod tests {
         let mut forward = Forwarder::default();
         forward.accept(
             w::PttEvent {
+                safety_epoch: 0,
                 kind: 1,
                 observed_at_ns: 0,
                 expires_at_ns: PTT_LEASE_NS,
@@ -203,6 +208,7 @@ mod tests {
         let now = Instant::now();
         forward.fence(100, 7);
         let press = |observed| w::PttEvent {
+            safety_epoch: 0,
             kind: 1,
             observed_at_ns: observed,
             expires_at_ns: 1_000_000,
@@ -219,12 +225,14 @@ mod tests {
         assert!(forward.accept(released(8), Some(201), now).is_some());
         assert_eq!(forward.accept(press(202), Some(202), now).unwrap().kind, 1);
         let old = w::PttEvent {
+            safety_epoch: 0,
             grant_id: 7,
             ..press(202)
         };
         let revoked = forward.accept(old, Some(202), now).unwrap();
         assert_eq!((revoked.grant_id, revoked.kind, revoked.reason), (7, 3, 2));
         let fresh = w::PttEvent {
+            safety_epoch: 0,
             grant_id: 8,
             ..press(202)
         };

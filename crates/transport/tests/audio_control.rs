@@ -864,6 +864,7 @@ fn mic_media_bodies(cap: i32) -> Vec<wire::AudioControl> {
             Body::MicState(wire::MicState {
                 group_id: vec![1; 16],
                 revision: 1,
+                talk_generation: 7,
                 ..Default::default()
             }),
             Body::MicAck(wire::MicAck {
@@ -878,6 +879,13 @@ fn mic_media_bodies(cap: i32) -> Vec<wire::AudioControl> {
                 expected_revision: 1,
                 op: wire::MicControlOp::SetMute as i32,
                 muted: true,
+                ..Default::default()
+            }),
+            Body::MicControl(wire::MicControl {
+                group_id: vec![1; 16],
+                request_id: vec![3; 16],
+                expected_revision: 1,
+                op: wire::MicControlOp::ReleaseAll as i32,
                 ..Default::default()
             }),
         ]

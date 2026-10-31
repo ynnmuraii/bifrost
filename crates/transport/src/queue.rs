@@ -667,6 +667,7 @@ impl InputQueue {
                 Some(protocol::wire::audio_control::Body::Stop(_)) => true,
                 Some(protocol::wire::audio_control::Body::MicControl(control)) => {
                     control.op == protocol::wire::MicControlOp::Release as i32
+                        || control.op == protocol::wire::MicControlOp::ReleaseAll as i32
                         || (control.op == protocol::wire::MicControlOp::SetMute as i32
                             && control.muted)
                 }
@@ -1346,11 +1347,18 @@ mod tests {
             .push(mic_control(wire::MicControlOp::Release, false))
             .unwrap();
         queue
+            .push(mic_control(wire::MicControlOp::ReleaseAll, false))
+            .unwrap();
+        queue
             .push(Outbound::Guaranteed(fr::Message::EnterCommit {
                 lease_id: LEASE,
             }))
             .unwrap();
-        for op in [wire::MicControlOp::SetMute, wire::MicControlOp::Release] {
+        for op in [
+            wire::MicControlOp::SetMute,
+            wire::MicControlOp::Release,
+            wire::MicControlOp::ReleaseAll,
+        ] {
             let Some(Intent::Outbound(Outbound::AudioControl(message))) = queue.pop() else {
                 panic!("privacy must bypass metadata");
             };

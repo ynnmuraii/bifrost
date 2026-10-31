@@ -299,6 +299,15 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
                         return Err(AudioViolation::Shape);
                     }
                 }
+                Ok(wire::MicControlOp::ReleaseAll) => {
+                    if control.muted
+                        || !control.press_id.is_empty()
+                        || control.challenge != 0
+                        || control.expires_ns != 0
+                    {
+                        return Err(AudioViolation::Shape);
+                    }
+                }
                 _ => return Err(AudioViolation::Shape),
             }
         }

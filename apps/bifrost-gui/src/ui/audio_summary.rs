@@ -14,6 +14,7 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
         .data_mut(|data| data.get_temp::<bool>(held_id))
         .unwrap_or(false);
     let mut held = false;
+    let mut fresh_press = false;
     let mut release_requested = false;
     egui::Frame::new()
         .fill(pal.bg2)
@@ -112,6 +113,43 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                     summary.push_str(&format!(" · {}", text(lang, Key::AudioPttPressed)));
                 }
                 widgets::wrapped(ui, &summary, 13.0, super::theme::fam::sans(), pal.ink);
+                if status
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.microphone.as_ref())
+                    .is_some_and(|config| config.ptt_enabled)
+                {
+                    let state = mic
+                        .native_ptt_arming
+                        .and_then(|value| ipc::AudioPttArmingState::try_from(value).ok());
+                    let key = match state {
+                        Some(ipc::AudioPttArmingState::Armed) => Key::AudioNativePttArmed,
+                        Some(ipc::AudioPttArmingState::NeedsPhysicalRelease) => {
+                            Key::AudioNativePttNeedsRelease
+                        }
+                        Some(ipc::AudioPttArmingState::Unavailable) => {
+                            match mic.native_ptt_unavailable_reason.and_then(|value| {
+                                ipc::AudioPttUnavailableReason::try_from(value).ok()
+                            }) {
+                                Some(ipc::AudioPttUnavailableReason::HostClockUnavailable) => {
+                                    Key::AudioNativePttHostClockUnavailable
+                                }
+                                Some(
+                                    ipc::AudioPttUnavailableReason::PortalFreshnessUnverifiable,
+                                ) => Key::AudioNativePttPortalFreshnessUnverifiable,
+                                Some(ipc::AudioPttUnavailableReason::RegistrationUnavailable) => {
+                                    Key::AudioNativePttRegistrationUnavailable
+                                }
+                                _ => Key::AudioNativePttUnavailable,
+                            }
+                        }
+                        _ => Key::AudioNativePttUnknown,
+                    };
+                    widgets::hint(ui, pal, text(lang, key));
+                    if state == Some(ipc::AudioPttArmingState::NeedsPhysicalRelease) {
+                        widgets::hint(ui, pal, text(lang, Key::AudioNativePttArmHint));
+                    }
+                }
             }
             let connected = vm.connection.is_connected();
             let available = connected && vm.audio.available;
@@ -165,12 +203,27 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                             pal,
                             text(lang, Key::AudioPttPress),
                             can_hold,
-                        );
+                        )
+                        .on_hover_text(text(lang, Key::AudioPttReleaseHint));
                         // Response helpers acquire egui memory: evaluate outside the input lock.
                         let pointer_held = response.is_pointer_button_down_on();
                         let focused_button = response.has_focus();
                         held = can_hold
                             && ui.ctx().input(|input| {
+                                fresh_press = pointer_held
+                                    && input.pointer.button_pressed(egui::PointerButton::Primary)
+                                    || focused_button
+                                        && input.events.iter().any(|event| {
+                                            matches!(
+                                                event,
+                                                egui::Event::Key {
+                                                    key: egui::Key::Space | egui::Key::Enter,
+                                                    pressed: true,
+                                                    repeat: false,
+                                                    ..
+                                                }
+                                            )
+                                        });
                                 input.focused
                                     && (pointer_held
                                         || focused_button
@@ -184,6 +237,7 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                     .as_ref()
                     .is_some_and(|mic| mic.ptt_pressed)
                     && widgets::small_button(ui, pal, text(lang, Key::AudioPttRelease), connected)
+                        .on_hover_text(text(lang, Key::AudioPttReleaseHint))
                         .clicked()
                 {
                     held = false;
@@ -214,9 +268,16 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
                 }
             });
         });
-    // Also release when the microphone/config/snapshot disappears, not only on pointer-up.
-    if release_requested || held != was_held || !held && vm.audio.gui_ptt_held {
-        actions.push(Action::Audio(AudioAction::SetPtt(held)));
+    // A status refresh/reconnect is not a user emergency release or a fresh press.
+    let observed_release = ui.ctx().input(|input| {
+        input.pointer.button_released(egui::PointerButton::Primary)
+            || input.key_released(egui::Key::Space)
+            || input.key_released(egui::Key::Enter)
+    });
+    if release_requested || !held && (was_held || vm.audio.gui_ptt_held) && observed_release {
+        actions.push(Action::Audio(AudioAction::SetPtt(false)));
+    } else if held && !was_held && fresh_press {
+        actions.push(Action::Audio(AudioAction::SetPtt(true)));
     }
     ui.data_mut(|data| data.insert_temp(held_id, held));
 }

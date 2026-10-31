@@ -218,6 +218,43 @@ impl Audio {
                 if mic.capture_active {
                     labels.push(text(lang, Key::TrayAudioCaptureActive).into());
                 }
+                if status
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.microphone.as_ref())
+                    .is_some_and(|config| config.control_enabled && config.ptt_enabled)
+                {
+                    let state = mic
+                        .native_ptt_arming
+                        .and_then(|value| wire::AudioPttArmingState::try_from(value).ok());
+                    let key = match state {
+                        Some(wire::AudioPttArmingState::Armed) => Key::AudioNativePttArmed,
+                        Some(wire::AudioPttArmingState::NeedsPhysicalRelease) => {
+                            Key::AudioNativePttNeedsRelease
+                        }
+                        Some(wire::AudioPttArmingState::Unavailable) => {
+                            match mic.native_ptt_unavailable_reason.and_then(|value| {
+                                wire::AudioPttUnavailableReason::try_from(value).ok()
+                            }) {
+                                Some(wire::AudioPttUnavailableReason::HostClockUnavailable) => {
+                                    Key::AudioNativePttHostClockUnavailable
+                                }
+                                Some(
+                                    wire::AudioPttUnavailableReason::PortalFreshnessUnverifiable,
+                                ) => Key::AudioNativePttPortalFreshnessUnverifiable,
+                                Some(wire::AudioPttUnavailableReason::RegistrationUnavailable) => {
+                                    Key::AudioNativePttRegistrationUnavailable
+                                }
+                                _ => Key::AudioNativePttUnavailable,
+                            }
+                        }
+                        _ => Key::AudioNativePttUnknown,
+                    };
+                    labels.push(text(lang, key).into());
+                    if state == Some(wire::AudioPttArmingState::NeedsPhysicalRelease) {
+                        labels.push(text(lang, Key::AudioNativePttArmHint).into());
+                    }
+                }
             }
             if labels.is_empty() {
                 labels.push(text(lang, Key::TrayAudioIdle).into());
@@ -336,6 +373,98 @@ mod tests {
         let mut audio = Audio::default();
         audio.receive(0, &Msg::AudioStatus(snapshot()));
         audio
+    }
+
+    #[test]
+    fn native_ptt_observations_are_localized_without_inventing_readiness() {
+        for (state, reason, key) in [
+            (None, None, Key::AudioNativePttUnknown),
+            (
+                Some(wire::AudioPttArmingState::Armed),
+                None,
+                Key::AudioNativePttArmed,
+            ),
+            (
+                Some(wire::AudioPttArmingState::NeedsPhysicalRelease),
+                None,
+                Key::AudioNativePttNeedsRelease,
+            ),
+            (
+                Some(wire::AudioPttArmingState::Unavailable),
+                None,
+                Key::AudioNativePttUnavailable,
+            ),
+            (
+                Some(wire::AudioPttArmingState::Unavailable),
+                Some(wire::AudioPttUnavailableReason::HostClockUnavailable),
+                Key::AudioNativePttHostClockUnavailable,
+            ),
+            (
+                Some(wire::AudioPttArmingState::Unavailable),
+                Some(wire::AudioPttUnavailableReason::PortalFreshnessUnverifiable),
+                Key::AudioNativePttPortalFreshnessUnverifiable,
+            ),
+            (
+                Some(wire::AudioPttArmingState::Unavailable),
+                Some(wire::AudioPttUnavailableReason::RegistrationUnavailable),
+                Key::AudioNativePttRegistrationUnavailable,
+            ),
+        ] {
+            let mut value = snapshot();
+            let mic = value.config.as_mut().unwrap().microphone.as_mut().unwrap();
+            mic.control_enabled = true;
+            mic.ptt_enabled = true;
+            value.microphone.as_mut().unwrap().native_ptt_arming = state.map(|state| state as i32);
+            value
+                .microphone
+                .as_mut()
+                .unwrap()
+                .native_ptt_unavailable_reason = reason.map(|reason| reason as i32);
+            let mut audio = Audio::default();
+            audio.receive(0, &Msg::AudioStatus(value));
+            assert_eq!(
+                audio
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .microphone
+                    .as_ref()
+                    .unwrap()
+                    .native_ptt_arming,
+                state.map(|state| state as i32)
+            );
+            assert_eq!(
+                audio
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .microphone
+                    .as_ref()
+                    .unwrap()
+                    .native_ptt_unavailable_reason,
+                reason.map(|reason| reason as i32)
+            );
+            for lang in [Lang::En, Lang::Ru] {
+                let labels = audio.labels(lang);
+                assert!(labels.iter().any(|label| label == text(lang, key)));
+                assert_eq!(
+                    labels
+                        .iter()
+                        .any(|label| label == text(lang, Key::AudioNativePttArmHint)),
+                    state == Some(wire::AudioPttArmingState::NeedsPhysicalRelease)
+                );
+                assert_eq!(
+                    labels
+                        .iter()
+                        .any(|label| label == text(lang, Key::AudioNativePttArmed)),
+                    state == Some(wire::AudioPttArmingState::Armed)
+                );
+            }
+            assert!(matches!(
+                audio.request(&Action::MicPttRelease),
+                Some(Msg::SetPtt(wire::SetPtt { pressed: false, .. }))
+            ));
+        }
     }
 
     #[test]

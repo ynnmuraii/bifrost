@@ -115,11 +115,31 @@ impl Window {
         }
     }
 
+    /// Drain a deliberately pipelined fixture connection up to its ingress barrier.
+    pub fn answers_through(&mut self, id: u64) -> Vec<(u64, gui_frame::Msg)> {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut answers = Vec::new();
+        loop {
+            let frame = self.recv(deadline);
+            let message = frame.msg.expect("GUI message");
+            if frame.request_id == 0 {
+                self.events.push(message);
+            } else {
+                let done = frame.request_id == id;
+                answers.push((frame.request_id, message));
+                if done {
+                    return answers;
+                }
+            }
+        }
+    }
+
     pub fn request(&mut self, message: gui_frame::Msg) -> gui_frame::Msg {
         let id = self.send(message);
         self.answer(id)
     }
 
+    #[track_caller]
     pub fn op(&mut self, message: gui_frame::Msg) {
         assert_ok(self.request(message));
     }
@@ -162,6 +182,7 @@ impl Window {
         }
     }
 
+    #[track_caller]
     pub fn configure(&mut self, config: wire::AudioConfig) {
         let revision = self.status().revision;
         self.op(gui_frame::Msg::SetAudio(wire::SetAudio {
@@ -173,6 +194,7 @@ impl Window {
     /// Local configuration ACKs are not a barrier for the peer's authenticated
     /// consent Hello. Wait on the actual Start result, without production retries
     /// or changing consent policy; all other failures remain immediate.
+    #[track_caller]
     pub fn start(&mut self, peer: &[u8]) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -258,6 +280,7 @@ impl Window {
     }
 }
 
+#[track_caller]
 pub fn assert_ok(message: gui_frame::Msg) {
     match message {
         gui_frame::Msg::OpResult(result) => assert!(result.ok, "operation rejected: {result:?}"),

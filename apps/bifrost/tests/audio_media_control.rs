@@ -205,6 +205,24 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
 
     // Exercise both transitions against the child's current token and revision.
     let mut current = media(&mut listener, &session_id);
+    for (token, revision) in [(0, current.revision), (current.session_token, 0), (0, 0)] {
+        let mut unavailable = current.clone();
+        unavailable.session_token = token;
+        unavailable.revision = revision;
+        denied(
+            listener.request(command(
+                &source_id,
+                &session_id,
+                &unavailable,
+                wire::AudioMediaCommand::Toggle,
+            )),
+            ipc::audio::codes::AUDIO_STALE_MEDIA,
+        );
+        let unchanged = media(&mut source, &session_id);
+        assert_eq!(unchanged.session_token, current.session_token);
+        assert_eq!(unchanged.revision, current.revision);
+        assert_eq!(unchanged.playback, current.playback);
+    }
     let stale = current.clone();
     for _ in 0..2 {
         let (requested, expected_playback) = opposite_command(&current);

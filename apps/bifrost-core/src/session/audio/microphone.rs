@@ -23,6 +23,11 @@ struct PendingMic {
     previous: bool,
     endpoint_generation: u64,
 }
+enum PttOutcome {
+    ReleaseComplete(PendingMic),
+    Observe,
+    Ignore,
+}
 struct Recovery {
     worker_generation: [u8; 16],
     request: u64,
@@ -63,6 +68,14 @@ pub(super) struct State {
     acquire: Option<(u64, u64)>,
     configured: Option<(u64, bool, String)>,
     pending: Option<PendingMic>,
+    pending_release: Option<PendingMic>,
+    native_fence: u64,
+    native_suppressed: bool,
+    native_epoch: Option<u64>,
+    native_epoch_floor: Option<u64>,
+    native_epoch_exhausted: bool,
+    native_status: Option<worker::PttStatus>,
+    native_worker_generation: Option<[u8; 16]>,
     outbound: BTreeMap<[u8; 16], (fsm::Parent, Request, u64)>,
     remote: Option<Remote>,
     held: Option<Held>,
@@ -86,6 +99,227 @@ pub(super) struct State {
     warned_native_orphan: bool,
 }
 impl State {
+    fn ptt_outcome(
+        &mut self,
+        worker_generation: [u8; 16],
+        request: u64,
+        event: &worker::PttEvent,
+        now: Option<u64>,
+    ) -> PttOutcome {
+        // A correlated command outcome is not a native release observation or proof.
+        if self.pending_release.as_ref().is_some_and(|pending| {
+            pending.worker_generation == worker_generation && pending.request == request
+        }) {
+            return PttOutcome::ReleaseComplete(self.pending_release.take().unwrap());
+        }
+        if event.grant_id == 0 && !self.native_after_fence(event, request, now) {
+            PttOutcome::Ignore
+        } else {
+            PttOutcome::Observe
+        }
+    }
+    fn bind_native_worker(&mut self, generation: [u8; 16]) {
+        if self.native_worker_generation == Some(generation) {
+            return;
+        }
+        self.native_worker_generation = Some(generation);
+        self.native_epoch = None;
+        self.native_epoch_floor = None;
+        self.native_epoch_exhausted = false;
+        self.native_status = None;
+        self.native_suppressed = true;
+        self.native_fence = 0;
+        self.native_press = None;
+        self.native_parent = None;
+        self.native_expires = 0;
+    }
+    fn take_holds(&mut self) -> [Option<(fsm::Parent, [u8; 16])>; 2] {
+        let gui = self.held.take().map(|held| (held.parent, held.press));
+        let native = self.native_parent.take().zip(self.native_press.take());
+        self.native_expires = 0;
+        [gui, native]
+    }
+    fn fence_holds(&mut self, now: u64) {
+        self.native_fence = now;
+        self.native_epoch_floor = self
+            .native_epoch
+            .unwrap_or(0)
+            .max(self.native_epoch_floor.unwrap_or(0))
+            .checked_add(1);
+        self.native_epoch_exhausted |= self.native_epoch_floor.is_none();
+        self.native_suppressed = true;
+        self.take_holds();
+    }
+    fn observe_native_epoch(&mut self, epoch: u64) -> bool {
+        if self.native_epoch_exhausted
+            || self.native_epoch_floor.is_some_and(|floor| epoch < floor)
+            || self.native_epoch.is_some_and(|current| epoch < current)
+        {
+            return false;
+        }
+        if self.native_epoch != Some(epoch) {
+            self.native_epoch = Some(epoch);
+            self.native_suppressed = true;
+            self.native_press = None;
+            self.native_parent = None;
+            self.native_expires = 0;
+        }
+        true
+    }
+    fn observe_native_status(&mut self, status: &worker::PttStatus) -> bool {
+        if !self.observe_native_epoch(status.safety_epoch) {
+            return false;
+        }
+        if !status.registered || status.state == worker::PttArmingState::Unavailable as i32 {
+            self.native_press = None;
+            self.native_parent = None;
+            self.native_expires = 0;
+        }
+        self.native_status = Some(status.clone());
+        true
+    }
+    fn native_arming(&self) -> Option<i32> {
+        let status = self.native_status.as_ref().filter(|status| {
+            Some(status.safety_epoch) == self.native_epoch
+                && !self.native_epoch_exhausted
+                && self
+                    .native_epoch_floor
+                    .is_none_or(|floor| status.safety_epoch >= floor)
+        })?;
+        Some(
+            if !status.registered || status.state == worker::PttArmingState::Unavailable as i32 {
+                gui::AudioPttArmingState::Unavailable as i32
+            } else if self.native_suppressed
+                || self.native_fence == u64::MAX
+                || status.state != worker::PttArmingState::Armed as i32
+            {
+                gui::AudioPttArmingState::NeedsPhysicalRelease as i32
+            } else {
+                gui::AudioPttArmingState::Armed as i32
+            },
+        )
+    }
+    fn native_unavailable_reason(&self) -> Option<i32> {
+        if self.native_arming() != Some(gui::AudioPttArmingState::Unavailable as i32) {
+            return None;
+        }
+        let status = self.native_status.as_ref()?;
+        if status.state != worker::PttArmingState::Unavailable as i32 {
+            return None;
+        }
+        match worker::PttUnavailableReason::try_from(status.reason) {
+            Ok(worker::PttUnavailableReason::HostClockUnavailable) => {
+                Some(gui::AudioPttUnavailableReason::HostClockUnavailable as i32)
+            }
+            Ok(worker::PttUnavailableReason::PortalFreshnessUnverifiable) => {
+                Some(gui::AudioPttUnavailableReason::PortalFreshnessUnverifiable as i32)
+            }
+            Ok(worker::PttUnavailableReason::RegistrationUnavailable) => {
+                Some(gui::AudioPttUnavailableReason::RegistrationUnavailable as i32)
+            }
+            _ => None,
+        }
+    }
+    fn recover_native_clock_fence(&mut self, now: Option<u64>) {
+        if self.native_fence != u64::MAX || self.native_suppressed || self.native_epoch_exhausted {
+            return;
+        }
+        let armed = self.native_status.as_ref().is_some_and(|status| {
+            Some(status.safety_epoch) == self.native_epoch
+                && status.safety_epoch != 0
+                && self
+                    .native_epoch_floor
+                    .is_none_or(|floor| status.safety_epoch >= floor)
+                && status.registered
+                && status.state == worker::PttArmingState::Armed as i32
+        });
+        if let (true, Some(now)) = (armed, now.filter(|now| *now != u64::MAX)) {
+            self.native_fence = now;
+        }
+    }
+    fn native_after_fence(
+        &mut self,
+        event: &worker::PttEvent,
+        request_id: u64,
+        now: Option<u64>,
+    ) -> bool {
+        if !self.observe_native_epoch(event.safety_epoch) {
+            return false;
+        }
+        if event.kind == worker::PttEventKind::Released as i32 {
+            self.native_suppressed = !(event.grant_id == 0
+                && request_id == 0
+                && event.safety_epoch != 0
+                && matches!(
+                    worker::PttReleaseReason::try_from(event.reason),
+                    Ok(worker::PttReleaseReason::PhysicalRelease
+                        | worker::PttReleaseReason::PortalRelease)
+                ));
+            self.recover_native_clock_fence(now);
+        }
+        match worker::PttEventKind::try_from(event.kind) {
+            Ok(worker::PttEventKind::Pressed) => {
+                self.native_arming() == Some(gui::AudioPttArmingState::Armed as i32)
+                    && event.observed_at_ns > self.native_fence
+            }
+            Ok(worker::PttEventKind::Renewed) => {
+                self.native_arming() == Some(gui::AudioPttArmingState::Armed as i32)
+                    && self.native_press.is_some()
+            }
+            _ => true,
+        }
+    }
+    fn take_activation(&mut self, mute: bool) -> Option<PendingMic> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| mute || pending.muted.is_none())
+        {
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+    fn gui_activation(&self, op: Op, revision: u64, current: u64) -> Result<(), ResultCode> {
+        if matches!(op, Op::Release | Op::ReleaseAll | Op::SetMute(true)) {
+            return Ok(());
+        }
+        if revision != current {
+            return Err(ResultCode::StaleRevision);
+        }
+        if self.pending.is_some() || self.pending_release.is_some() || self.outbound.len() >= 16 {
+            return Err(ResultCode::Busy);
+        }
+        Ok(())
+    }
+    fn set_local_intent(&mut self, muted: bool) {
+        self.config_muted = Some(muted);
+        self.authority.set_local_muted(muted);
+    }
+    fn remote_talk_generation(
+        &self,
+        parent: fsm::Parent,
+        state: &net::MicState,
+    ) -> std::cmp::Ordering {
+        self.remote
+            .as_ref()
+            .filter(|remote| remote.parent == parent)
+            .map_or(std::cmp::Ordering::Equal, |remote| {
+                state.talk_generation.cmp(&remote.state.talk_generation)
+            })
+    }
+    fn fence_remote_talk_generation(
+        &mut self,
+        parent: fsm::Parent,
+        state: &net::MicState,
+        now: u64,
+    ) -> bool {
+        if self.remote_talk_generation(parent, state) != std::cmp::Ordering::Greater {
+            return false;
+        }
+        self.fence_holds(now);
+        true
+    }
     fn update_remote(
         &mut self,
         parent: fsm::Parent,
@@ -93,6 +327,16 @@ impl State {
         now_ms: u64,
         now_ns: u64,
     ) -> Option<[u8; 16]> {
+        if self.remote.as_ref().is_some_and(|remote| {
+            remote.parent == parent
+                && (state.talk_generation < remote.state.talk_generation
+                    || state.revision < remote.state.revision
+                    || (state.revision == remote.state.revision
+                        && (state.expires_ns < remote.state.expires_ns
+                            || state.challenge < remote.state.challenge)))
+        }) {
+            return None;
+        }
         let fresh = self.remote.as_ref().is_none_or(|remote| {
             remote.parent != parent
                 || state.revision > remote.state.revision
@@ -149,6 +393,9 @@ impl State {
                 pending = self.pending.is_some(),
                 "microphone first native active event without a logical grant"
             );
+        }
+        if active && !matches {
+            return;
         }
         if active {
             self.actual_grant = event.grant_id;
@@ -262,7 +509,30 @@ fn gui_result(result: ResultCode) -> Result<(), Code> {
     }
 }
 impl Actor {
+    fn mic_bind_native_worker(&mut self) {
+        if let Some(worker) = &self.worker {
+            self.mic
+                .bind_native_worker(super::generation(worker.generation, self.worker_epoch));
+        }
+    }
+    pub(super) fn mic_safety_endpoint(&self) -> Option<u64> {
+        if self.config.role != config::AudioRole::Listener {
+            return None;
+        }
+        self.mic
+            .endpoint
+            .as_ref()
+            .filter(|snapshot| snapshot.guard_active)
+            .map(|snapshot| snapshot.generation)
+    }
     pub(super) async fn mic_stop(&mut self) {
+        self.clear_gui_safety_target();
+        self.mic_bind_native_worker();
+        let now = host_ns().unwrap_or(u64::MAX);
+        self.mic.fence_holds(now);
+        if self.mic_effect(Effect::ReleaseAll, now).await {
+            return;
+        }
         if let (Some(w), Some(grant)) = (&self.worker, self.mic.authority.grant) {
             if let Err(error) = w.handle.ptt_revoke(grant.id).await {
                 if self.native_privacy_failure(&error) {
@@ -338,13 +608,12 @@ impl Actor {
         }
     }
     async fn mic_begin_recovery(&mut self, raw_generation: u64, snapshot: &worker::MuteSnapshot) {
+        self.mic_bind_native_worker();
         self.mic.recovered = false;
         self.mic.recovery_error = None;
         self.mic.recovery = None;
         self.mic.authority.revoke();
-        self.mic.held = None;
-        self.mic.native_expires = 0;
-        self.mic.native_press = None;
+        self.mic.take_holds();
         self.mic.actual_grant = 0;
         self.mic.configured = None;
         self.mic.authority.ptt_enabled = self.config.microphone.ptt_enabled;
@@ -366,6 +635,9 @@ impl Actor {
         if w.handle.configure_ptt(None, Vec::new()).await.is_err() {
             self.mic.recovery_error = Some(ResultCode::DeviceGone);
             return;
+        }
+        if muted {
+            self.mic.fence_holds(host_ns().unwrap_or(u64::MAX));
         }
         match w.handle.set_mic_mute(snapshot.generation, muted).await {
             Ok(request) => {
@@ -489,6 +761,8 @@ impl Actor {
                 if let Ok(id) = request_id.as_slice().try_into() {
                     self.mic.authority.complete(parent, id, policy_result(code));
                 }
+                self.mic_publish_state(parent, host_ns().unwrap_or(u64::MAX))
+                    .await;
                 self.mic_send(
                     parent,
                     net::audio_control::Body::MicAck(net::MicAck {
@@ -516,11 +790,15 @@ impl Actor {
                         capture_active: false,
                         target_node_id: remote.parent.peer.to_vec(),
                         control_active: remote.state.supported,
+                        native_ptt_arming: self.mic.native_arming(),
+                        native_ptt_unavailable_reason: self.mic.native_unavailable_reason(),
                     };
                 }
             }
             return gui::AudioMicrophoneState {
                 muted: false,
+                native_ptt_arming: self.mic.native_arming(),
+                native_ptt_unavailable_reason: self.mic.native_unavailable_reason(),
                 ..Default::default()
             };
         }
@@ -541,20 +819,22 @@ impl Actor {
                 Vec::new()
             },
             control_active: self.mic_enabled() && self.mic_ready(),
+            native_ptt_arming: self.mic.native_arming(),
+            native_ptt_unavailable_reason: self.mic.native_unavailable_reason(),
         }
     }
     pub(super) fn mic_reset(&mut self) {
         self.mic.authority.reset();
         self.mic.lock_paused = false;
         self.mic.endpoint = None;
+        self.publish_gui_safety_target();
         self.mic.acquire = None;
         self.mic.configured = None;
-        self.mic.native_expires = 0;
-        self.mic.native_press = None;
-        self.mic.held = None;
+        self.mic.take_holds();
+        self.mic.native_suppressed = true;
+        self.mic.native_status = None;
         self.mic.remote = None;
         self.mic.actual_grant = 0;
-        self.mic.native_parent = None;
         self.mic.recovery = None;
         self.mic.recovered = false;
         self.mic.privacy_effect = None;
@@ -569,8 +849,47 @@ impl Actor {
                 let _ = r.out.try_send((r.request_id, error.clone()));
             }
         }
+        if let Some(pending) = self.mic.pending_release.take() {
+            if let Reply::Gui(request) = pending.reply {
+                let _ = request.out.try_send((request.request_id, error.clone()));
+            }
+        }
         for (_, (_, r, _)) in std::mem::take(&mut self.mic.outbound) {
             let _ = r.out.try_send((r.request_id, error.clone()));
+        }
+        self.dirty = true;
+    }
+    pub(super) async fn mic_gui_safety(&mut self, mute: bool) {
+        self.mic_bind_native_worker();
+        let now = host_ns().unwrap_or(u64::MAX);
+        self.mic.fence_holds(now);
+        self.mic.authority.release_all();
+        if mute {
+            self.config.microphone.muted = true;
+            self.mic.set_local_intent(true);
+            self.mic.recovery = None;
+        }
+        if let Some(pending) = self.mic.take_activation(mute) {
+            self.mic_reply(pending.reply, ResultCode::Cancelled).await;
+        }
+        if self.mic_effect(Effect::ReleaseAll, now).await {
+            return;
+        }
+        if self.config.role == config::AudioRole::Source {
+            if let Some(parent) = self.mic.remote.as_ref().map(|remote| remote.parent) {
+                self.mic_source_control(
+                    parent,
+                    [0; 16],
+                    if mute {
+                        Op::SetMute(true)
+                    } else {
+                        Op::ReleaseAll
+                    },
+                )
+                .await;
+            }
+        } else if mute && self.mic_effect(Effect::SetMute(true), now).await {
+            return;
         }
         self.dirty = true;
     }
@@ -580,7 +899,7 @@ impl Actor {
                 (Op::SetMute(v.muted), v.expected_revision)
             }
             gui::gui_frame::Msg::SetPtt(v) => (
-                if v.pressed { Op::Press } else { Op::Release },
+                if v.pressed { Op::Press } else { Op::ReleaseAll },
                 v.expected_revision,
             ),
             _ => return,
@@ -593,44 +912,16 @@ impl Actor {
             reply(&request, gui_result(ResultCode::Disabled)).await;
             return;
         }
-        if matches!(op, Op::SetMute(_)) {
-            self.mic.held = None;
-            self.mic.native_press = None;
-            self.mic.native_parent = None;
-            self.mic.native_expires = 0;
-        }
-        if !matches!(op, Op::Release | Op::SetMute(true)) && revision != self.revision {
-            reply(&request, gui_result(ResultCode::StaleRevision)).await;
-            return;
-        }
-        if self.mic.pending.is_some() && !matches!(op, Op::Release | Op::SetMute(true)) {
-            reply(&request, gui_result(ResultCode::Busy)).await;
+        if let Err(code) = self.mic.gui_activation(op, revision, self.revision) {
+            reply(&request, gui_result(code)).await;
             return;
         }
         if self.mic.outbound.len() >= 16 {
-            if !matches!(op, Op::Release | Op::SetMute(true)) {
-                reply(&request, gui_result(ResultCode::Busy)).await;
-                return;
-            }
             if let Some((_, (_, r, _))) = self.mic.outbound.pop_first() {
                 reply(&r, gui_result(ResultCode::Cancelled)).await;
             }
         }
-        if op == Op::Release && self.mic.held.is_none() {
-            reply(&request, Ok(())).await;
-            return;
-        }
         let connection = request.connection_id;
-        if op == Op::Release
-            && self
-                .mic
-                .held
-                .as_ref()
-                .is_some_and(|h| h.connection != connection)
-        {
-            reply(&request, gui_result(ResultCode::Conflict)).await;
-            return;
-        }
         let press = if op == Op::Press {
             if self.mic.held.is_some() {
                 reply(&request, gui_result(ResultCode::Conflict)).await;
@@ -650,6 +941,9 @@ impl Actor {
             };
             remote.parent
         };
+        if matches!(op, Op::SetMute(_) | Op::ReleaseAll) {
+            self.mic.take_holds();
+        }
         if op == Op::Press {
             self.mic.held = Some(Held {
                 connection,
@@ -658,7 +952,7 @@ impl Actor {
                 parent,
                 next: self.now() + 100,
             });
-        } else if op == Op::Release {
+        } else if op == Op::ReleaseAll {
             self.mic.held = None;
         }
         if self.config.role == config::AudioRole::Source {
@@ -676,7 +970,7 @@ impl Actor {
                 expected_revision: remote.state.revision,
                 op: wire_op(op) as i32,
                 muted: matches!(op, Op::SetMute(true)),
-                press_id: if matches!(op, Op::SetMute(_)) {
+                press_id: if matches!(op, Op::SetMute(_) | Op::ReleaseAll) {
                     Vec::new()
                 } else {
                     press.to_vec()
@@ -744,7 +1038,7 @@ impl Actor {
             }
         }
         let local = parent.peer == *self.local.as_bytes();
-        if !self.mic_ready() && c.op != Op::Release {
+        if !self.mic_ready() && !matches!(c.op, Op::Release | Op::ReleaseAll) {
             if c.op == Op::SetMute(true)
                 && self.mic.endpoint.as_ref().is_some_and(|s| s.guard_active)
             {
@@ -761,7 +1055,7 @@ impl Actor {
                 return;
             }
         }
-        if self.mic.pending.is_some() {
+        if self.mic.pending.is_some() && c.op != Op::ReleaseAll {
             if matches!(c.op, Op::Release | Op::SetMute(true)) {
                 let pending = self.mic.pending.take().unwrap();
                 self.mic_reply(pending.reply, ResultCode::Cancelled).await;
@@ -811,6 +1105,13 @@ impl Actor {
             }
         }
         let previous = self.mic.endpoint.as_ref().is_none_or(|s| s.muted);
+        if matches!(decision.effect, Effect::ReleaseAll | Effect::SetMute(true)) {
+            self.mic_bind_native_worker();
+            self.mic.fence_holds(now);
+            if let Some(pending) = self.mic.take_activation(false) {
+                self.mic_reply(pending.reply, ResultCode::Cancelled).await;
+            }
+        }
         let write = match decision.effect {
             Effect::SetMute(muted) => {
                 let revoke = self.mic.authority.revoke();
@@ -834,6 +1135,13 @@ impl Actor {
                 }
                 self.mic.configured = None;
                 w.handle.set_mic_mute(generation, muted).await
+            }
+            Effect::ReleaseAll => {
+                let Some(w) = &self.worker else {
+                    self.mic_reply(to, ResultCode::DeviceGone).await;
+                    return;
+                };
+                w.handle.ptt_release_all().await
             }
             Effect::Grant(g) => {
                 let Some(w) = &self.worker else {
@@ -866,7 +1174,7 @@ impl Actor {
                     self.worker.as_ref().map(|w| w.generation).unwrap_or(0),
                     self.worker_epoch,
                 );
-                self.mic.pending = Some(PendingMic {
+                let pending = PendingMic {
                     reply: to,
                     worker_generation,
                     request,
@@ -883,7 +1191,14 @@ impl Actor {
                         .as_ref()
                         .map(|s| s.generation)
                         .unwrap_or(0),
-                });
+                };
+                if c.op == Op::ReleaseAll {
+                    if let Some(previous) = self.mic.pending_release.replace(pending) {
+                        self.mic_reply(previous.reply, ResultCode::Cancelled).await;
+                    }
+                } else {
+                    self.mic.pending = Some(pending);
+                }
             }
             Err(error) => {
                 if self.native_privacy_failure(&error) {
@@ -900,6 +1215,7 @@ impl Actor {
         self.dirty = true;
     }
     async fn mic_effect(&mut self, effect: Effect, _now: u64) -> bool {
+        self.mic_bind_native_worker();
         let Some(w) = &self.worker else {
             return false;
         };
@@ -908,9 +1224,14 @@ impl Actor {
                 let Some(endpoint) = &self.mic.endpoint else {
                     return false;
                 };
-                w.handle.set_mic_mute(endpoint.generation, muted).await
+                let generation = endpoint.generation;
+                if muted {
+                    self.mic.fence_holds(host_ns().unwrap_or(u64::MAX));
+                }
+                w.handle.set_mic_mute(generation, muted).await
             }
             Effect::Revoke(id) => w.handle.ptt_revoke(id).await,
+            Effect::ReleaseAll => w.handle.ptt_release_all().await,
             Effect::Grant(g) => {
                 let ttl = (g.expires_ns.saturating_sub(host_ns().unwrap_or(u64::MAX)) / 1_000_000)
                     .min(250) as u32;
@@ -955,6 +1276,7 @@ impl Actor {
                     Ok(MicControlOp::Press) => Op::Press,
                     Ok(MicControlOp::Renew) => Op::Renew,
                     Ok(MicControlOp::Release) => Op::Release,
+                    Ok(MicControlOp::ReleaseAll) => Op::ReleaseAll,
                     _ => return,
                 };
                 let press = if c.press_id.is_empty() {
@@ -991,13 +1313,22 @@ impl Actor {
                 {
                     return;
                 }
-                if self
-                    .mic
-                    .remote
-                    .as_ref()
-                    .is_some_and(|r| r.parent == parent && r.state.revision > s.revision)
-                {
+                if self.mic.remote.as_ref().is_some_and(|r| {
+                    r.parent == parent
+                        && (r.state.revision > s.revision
+                            || r.state.talk_generation > s.talk_generation)
+                }) {
                     return;
+                }
+                let now = host_ns().unwrap_or(u64::MAX);
+                self.mic_bind_native_worker();
+                if self.mic.fence_remote_talk_generation(parent, s, now) {
+                    // A safety event changes activation CAS even when visible facts are identical.
+                    self.last_status = None;
+                    self.dirty = true;
+                    if self.mic_effect(Effect::ReleaseAll, now).await {
+                        return;
+                    }
                 }
                 let ms = self.now();
                 if let Some(now) = host_ns() {
@@ -1065,6 +1396,20 @@ impl Actor {
             }
         }
         match event {
+            AudioSupervisorEvent::PttStatus { generation, status } => {
+                if !self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.alive && worker.generation == *generation)
+                {
+                    return;
+                }
+                self.mic_bind_native_worker();
+                if self.mic.observe_native_status(status) {
+                    self.mic.recover_native_clock_fence(host_ns());
+                    self.dirty = true;
+                }
+            }
             AudioSupervisorEvent::MuteSnapshot {
                 generation,
                 request_id,
@@ -1107,6 +1452,7 @@ impl Actor {
                 }
                 self.mic.authority.observe(snapshot.muted);
                 self.mic.endpoint = Some(snapshot.clone());
+                self.publish_gui_safety_target();
                 self.dirty = true;
                 if acquired || replaced {
                     self.mic_begin_recovery(*generation, snapshot).await;
@@ -1138,6 +1484,8 @@ impl Actor {
                     let code = if snapshot.generation != p.endpoint_generation {
                         ResultCode::DeviceGone
                     } else if !allowed {
+                        self.mic_bind_native_worker();
+                        self.mic.fence_holds(host_ns().unwrap_or(u64::MAX));
                         if let Some(w) = &self.worker {
                             if let Err(error) =
                                 w.handle.set_mic_mute(snapshot.generation, true).await
@@ -1158,32 +1506,39 @@ impl Actor {
                     } else {
                         let mut next = self.config.clone();
                         next.microphone.muted = desired;
-                        match self.save(next.clone()).await {
-                            Ok(()) => {
-                                self.config = next;
-                                self.mic.config_muted = Some(desired);
-                                self.mic.authority.set_local_muted(desired);
-                                self.mic.recovered = true;
-                                self.mic.recovery_error = None;
-                                ResultCode::Ok
+                        let saved = self.save(next.clone()).await;
+                        if saved.is_ok() || desired {
+                            // Observed safety mute survives disk failure and child recovery.
+                            self.config = next;
+                            self.mic.set_local_intent(desired);
+                            self.mic.recovered = true;
+                            self.mic.recovery_error = None;
+                        } else {
+                            if p.previous {
+                                self.mic_bind_native_worker();
+                                self.mic.fence_holds(host_ns().unwrap_or(u64::MAX));
                             }
-                            Err(_) => {
-                                if let Some(w) = &self.worker {
-                                    if let Err(error) =
-                                        w.handle.set_mic_mute(snapshot.generation, p.previous).await
-                                    {
-                                        if self.native_privacy_failure(&error) {
-                                            self.mic_reply(p.reply, ResultCode::DeviceGone).await;
-                                            return;
-                                        }
+                            if let Some(w) = &self.worker {
+                                if let Err(error) =
+                                    w.handle.set_mic_mute(snapshot.generation, p.previous).await
+                                {
+                                    if self.native_privacy_failure(&error) {
+                                        self.mic_reply(p.reply, ResultCode::DeviceGone).await;
+                                        return;
                                     }
                                 }
-                                self.mic
-                                    .authority
-                                    .set_local_muted(self.config.microphone.muted);
-                                ResultCode::Conflict
                             }
+                            self.mic
+                                .authority
+                                .set_local_muted(self.config.microphone.muted);
                         }
+                        if let Err(error) = saved {
+                            if let Reply::Gui(request) = p.reply {
+                                reply(&request, Err(error)).await;
+                            }
+                            return;
+                        }
+                        ResultCode::Ok
                     };
                     self.mic_reply(p.reply, code).await;
                 }
@@ -1193,14 +1548,36 @@ impl Actor {
                 request_id,
                 event,
             } => {
-                if !self.mic_enabled() {
-                    return;
-                }
                 if !self
                     .worker
                     .as_ref()
                     .is_some_and(|w| w.alive && w.generation == *generation)
                 {
+                    return;
+                }
+                self.mic_bind_native_worker();
+                match self.mic.ptt_outcome(
+                    super::generation(*generation, self.worker_epoch),
+                    *request_id,
+                    event,
+                    host_ns(),
+                ) {
+                    PttOutcome::ReleaseComplete(pending) => {
+                        self.mic_reply(
+                            pending.reply,
+                            ptt_result(event, host_ns().unwrap_or(u64::MAX)),
+                        )
+                        .await;
+                        self.dirty = true;
+                        return;
+                    }
+                    PttOutcome::Ignore => return,
+                    PttOutcome::Observe => {}
+                }
+                if event.grant_id == 0 {
+                    self.dirty = true;
+                }
+                if !self.mic_enabled() {
                     return;
                 }
                 if self.config.role == config::AudioRole::Listener && !self.mic_ready() {
@@ -1285,6 +1662,15 @@ impl Actor {
             return;
         };
         let ms = self.now();
+        if self
+            .mic
+            .pending_release
+            .as_ref()
+            .is_some_and(|pending| pending.deadline <= ms)
+        {
+            let pending = self.mic.pending_release.take().unwrap();
+            self.mic_reply(pending.reply, ResultCode::Timeout).await;
+        }
         if self.mic.recovery.as_ref().is_some_and(|r| r.deadline <= ms) {
             self.mic.recovery = None;
             self.mic.recovered = false;
@@ -1326,15 +1712,9 @@ impl Actor {
                 if let Some(pending) = self.mic.pending.take() {
                     self.mic_reply(pending.reply, ResultCode::Cancelled).await;
                 }
-                if let Some(held) = self.mic.held.take() {
-                    self.mic_release(held.parent, held.press, now).await;
-                }
-                if let (Some(press), Some(parent)) =
-                    (self.mic.native_press.take(), self.mic.native_parent.take())
-                {
+                for (parent, press) in self.mic.take_holds().into_iter().flatten() {
                     self.mic_release(parent, press, now).await;
                 }
-                self.mic.native_expires = 0;
                 self.mic.remote = None;
                 if !self.mic.lock_paused {
                     if let Some(w) = &self.worker {
@@ -1384,6 +1764,7 @@ impl Actor {
                 self.mic_stop().await;
             }
             self.mic.endpoint = None;
+            self.publish_gui_safety_target();
             self.mic.acquire = None;
             self.mic.native_press = None;
             self.mic.native_parent = None;
@@ -1537,56 +1918,74 @@ impl Actor {
         if ms.saturating_sub(self.mic.last_publish) >= 100 {
             self.mic.last_publish = ms;
             if self.config.role == config::AudioRole::Listener {
-                let (challenge, expires_ns) = self.mic.authority.challenge(now);
                 for parent in allowed.into_iter().flatten() {
-                    let grant = self
-                        .mic
-                        .authority
-                        .grant
-                        .filter(|g| g.id == self.mic.actual_grant && g.expires_ns > now);
-                    let native = self
-                        .mic
-                        .native_press
-                        .filter(|_| self.mic.native_expires > now);
-                    let active = self.mic_ready()
-                        && self.config.microphone.ptt_enabled
-                        && (grant.is_some() || native.is_some())
-                        && self.mic.endpoint.as_ref().is_some_and(|s| !s.muted);
-                    self.mic_send(
-                        parent,
-                        net::audio_control::Body::MicState(net::MicState {
-                            group_id: self.config.group_id.unwrap().0.to_vec(),
-                            revision: self.mic.authority.revision,
-                            muted: self.mic.endpoint.as_ref().is_some_and(|s| s.muted),
-                            ptt_enabled: self.config.microphone.ptt_enabled,
-                            ptt_active: active,
-                            supported: self.mic_ready(),
-                            reason: self.mic_state_reason() as i32,
-                            controller_node_id: if active {
-                                grant
-                                    .map(|g| g.parent.peer.to_vec())
-                                    .unwrap_or_else(|| self.local.as_bytes().to_vec())
-                            } else {
-                                Vec::new()
-                            },
-                            press_id: if active {
-                                grant
-                                    .map(|g| g.press)
-                                    .or(native)
-                                    .map(|p| p.to_vec())
-                                    .unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            },
-                            challenge,
-                            expires_ns,
-                            desired_muted: self.mic.authority.desired_muted,
-                        }),
-                    )
-                    .await;
+                    self.mic_publish_state(parent, now).await;
                 }
             }
         }
+    }
+    async fn mic_publish_state(&mut self, parent: fsm::Parent, now: u64) {
+        if !self.mic_parent_allowed(parent) {
+            return;
+        }
+        let Some(group) = self.config.group_id else {
+            return;
+        };
+        let (challenge, expires_ns) = self.mic.authority.challenge(now);
+        let grant = self
+            .mic
+            .authority
+            .grant
+            .filter(|grant| grant.id == self.mic.actual_grant && grant.expires_ns > now);
+        let native = self
+            .mic
+            .native_press
+            .filter(|_| self.mic.native_expires > now);
+        let active = self.mic_ready()
+            && self.config.microphone.ptt_enabled
+            && (grant.is_some() || native.is_some())
+            && self
+                .mic
+                .endpoint
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.muted);
+        self.mic_send(
+            parent,
+            net::audio_control::Body::MicState(net::MicState {
+                group_id: group.0.to_vec(),
+                revision: self.mic.authority.revision,
+                muted: self
+                    .mic
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.muted),
+                ptt_enabled: self.config.microphone.ptt_enabled,
+                ptt_active: active,
+                supported: self.mic_ready(),
+                reason: self.mic_state_reason() as i32,
+                controller_node_id: if active {
+                    grant
+                        .map(|grant| grant.parent.peer.to_vec())
+                        .unwrap_or_else(|| self.local.as_bytes().to_vec())
+                } else {
+                    Vec::new()
+                },
+                press_id: if active {
+                    grant
+                        .map(|grant| grant.press)
+                        .or(native)
+                        .map(|press| press.to_vec())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                challenge,
+                expires_ns,
+                desired_muted: self.mic.authority.desired_muted,
+                talk_generation: self.mic.authority.talk_generation,
+            }),
+        )
+        .await;
     }
     async fn mic_source_control(&mut self, parent: fsm::Parent, press: [u8; 16], op: Op) {
         if !self.mic_parent_allowed(parent) {
@@ -1602,17 +2001,21 @@ impl Actor {
                         request_id: request.to_vec(),
                         expected_revision: r.state.revision,
                         op: wire_op(op) as i32,
-                        muted: false,
-                        press_id: press.to_vec(),
-                        challenge: if op == Op::Release {
-                            0
+                        muted: matches!(op, Op::SetMute(true)),
+                        press_id: if matches!(op, Op::SetMute(_) | Op::ReleaseAll) {
+                            Vec::new()
                         } else {
-                            r.state.challenge
+                            press.to_vec()
                         },
-                        expires_ns: if op == Op::Release {
-                            0
+                        challenge: if matches!(op, Op::Press | Op::Renew) {
+                            r.state.challenge
                         } else {
+                            0
+                        },
+                        expires_ns: if matches!(op, Op::Press | Op::Renew) {
                             r.state.expires_ns
+                        } else {
+                            0
                         },
                     }),
                 )
@@ -1670,6 +2073,7 @@ fn wire_op(op: Op) -> MicControlOp {
         Op::Press => MicControlOp::Press,
         Op::Renew => MicControlOp::Renew,
         Op::Release => MicControlOp::Release,
+        Op::ReleaseAll => MicControlOp::ReleaseAll,
     }
 }
 fn hotkey(text: &str) -> Result<worker::PttHotkey, Code> {
@@ -1725,9 +2129,883 @@ fn reserved_hotkeys(bindings: &config::HotkeyBindings) -> Result<Vec<worker::Ptt
         .map(|(_, text)| hotkey(text))
         .collect()
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn correlated_release_ack_completes_without_native_epoch_proof_or_persistent_cancellation() {
+        let parent = fsm::Parent {
+            peer: [1; 32],
+            connection_id: [2; 16],
+            generation: [3; 16],
+        };
+        let worker_generation = [4; 16];
+        let mut state = State::default();
+        state.bind_native_worker(worker_generation);
+        state.set_local_intent(false);
+        state.observe_native_status(&arming_status(
+            0,
+            worker::PttArmingState::NeedsPhysicalRelease,
+        ));
+        state.fence_holds(100);
+        state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+        let pending = |request, muted| PendingMic {
+            reply: Reply::Network(parent, id(request, parent.connection_id).to_vec()),
+            worker_generation,
+            request,
+            deadline: 1000,
+            muted,
+            previous: false,
+            endpoint_generation: 5,
+        };
+        state.pending = Some(pending(8, Some(false)));
+        state.pending_release = Some(pending(7, None));
+        // Owned-guard ReleaseAll uses the remote command-outcome epoch, not a native proof epoch.
+        let ack = worker::PttEvent {
+            grant_id: 0,
+            kind: worker::PttEventKind::Released as i32,
+            reason: worker::PttReleaseReason::Revoked as i32,
+            safety_epoch: 0,
+            ..Default::default()
+        };
+        assert!(!state.native_after_fence(&ack, 7, Some(200)));
+        for (generation, request) in [([6; 16], 7), (worker_generation, 0), (worker_generation, 8)]
+        {
+            assert!(matches!(
+                state.ptt_outcome(generation, request, &ack, Some(200)),
+                PttOutcome::Ignore
+            ));
+        }
+        let PttOutcome::ReleaseComplete(completed) =
+            state.ptt_outcome(worker_generation, 7, &ack, Some(200))
+        else {
+            panic!("correlated release must complete before native epoch filtering");
+        };
+        assert_eq!(completed.request, 7);
+        assert_eq!(ptt_result(&ack, 200), ResultCode::Ok);
+        assert!(state.pending_release.is_none());
+        assert_eq!(state.pending.as_ref().unwrap().request, 8);
+        assert_eq!(state.pending.as_ref().unwrap().muted, Some(false));
+        assert_eq!(state.native_epoch, Some(1));
+        assert_eq!(state.native_epoch_floor, Some(1));
+        assert_eq!(state.native_fence, 100);
+        assert!(state.native_suppressed);
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        assert_eq!(state.config_muted, Some(false));
+        assert!(!state.authority.recovery_muted());
+        assert!(state.endpoint.is_none());
+        assert!(matches!(
+            state.ptt_outcome(worker_generation, 0, &ack, Some(200)),
+            PttOutcome::Ignore
+        ));
+    }
+    #[test]
+    fn clock_fence_recovers_in_either_proof_status_order_without_a_second_release() {
+        for proof in [
+            worker::PttReleaseReason::PhysicalRelease,
+            worker::PttReleaseReason::PortalRelease,
+        ] {
+            for proof_first in [false, true] {
+                for clock_ready in [false, true] {
+                    let mut state = State::default();
+                    state.bind_native_worker([1; 16]);
+                    state.observe_native_status(&arming_status(
+                        0,
+                        worker::PttArmingState::NeedsPhysicalRelease,
+                    ));
+                    state.fence_holds(u64::MAX);
+                    state.observe_native_status(&arming_status(
+                        1,
+                        worker::PttArmingState::NeedsPhysicalRelease,
+                    ));
+                    let mut event = worker::PttEvent {
+                        kind: worker::PttEventKind::Released as i32,
+                        reason: worker::PttReleaseReason::Revoked as i32,
+                        safety_epoch: 1,
+                        ..Default::default()
+                    };
+                    state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+                    state.recover_native_clock_fence(Some(200));
+                    assert_eq!(state.native_fence, u64::MAX);
+                    assert!(state.native_after_fence(&event, 0, Some(200)));
+                    assert_eq!(state.native_fence, u64::MAX);
+                    event.reason = proof as i32;
+                    assert!(state.native_after_fence(&event, 7, Some(200)));
+                    assert_eq!(state.native_fence, u64::MAX);
+                    event.safety_epoch = 0;
+                    assert!(!state.native_after_fence(&event, 0, Some(200)));
+                    assert_eq!(state.native_fence, u64::MAX);
+                    event.safety_epoch = 1;
+                    state.observe_native_status(&arming_status(
+                        1,
+                        worker::PttArmingState::NeedsPhysicalRelease,
+                    ));
+                    let clock = clock_ready.then_some(200);
+                    if proof_first {
+                        assert!(state.native_after_fence(&event, 0, clock));
+                        assert_eq!(state.native_fence, u64::MAX);
+                        assert_ne!(
+                            state.native_arming(),
+                            Some(gui::AudioPttArmingState::Armed as i32)
+                        );
+                        state.recover_native_clock_fence(Some(200));
+                        assert_eq!(state.native_fence, u64::MAX);
+                        state.observe_native_status(&arming_status(
+                            1,
+                            worker::PttArmingState::Armed,
+                        ));
+                        state.recover_native_clock_fence(clock);
+                    } else {
+                        state.observe_native_status(&arming_status(
+                            1,
+                            worker::PttArmingState::Armed,
+                        ));
+                        state.recover_native_clock_fence(clock);
+                        assert_eq!(state.native_fence, u64::MAX);
+                        assert!(state.native_after_fence(&event, 0, clock));
+                    }
+                    if !clock_ready {
+                        assert_eq!(state.native_fence, u64::MAX);
+                        assert_ne!(
+                            state.native_arming(),
+                            Some(gui::AudioPttArmingState::Armed as i32)
+                        );
+                        state.recover_native_clock_fence(Some(u64::MAX));
+                        assert_eq!(state.native_fence, u64::MAX);
+                        state.observe_native_status(&arming_status(
+                            1,
+                            worker::PttArmingState::Armed,
+                        ));
+                        state.recover_native_clock_fence(Some(200));
+                    }
+                    assert_eq!(state.native_fence, 200);
+                    assert_eq!(
+                        state.native_arming(),
+                        Some(gui::AudioPttArmingState::Armed as i32)
+                    );
+                    event.kind = worker::PttEventKind::Pressed as i32;
+                    event.expires_at_ns = 250;
+                    for observed in [199, 200] {
+                        event.observed_at_ns = observed;
+                        assert!(!state.native_after_fence(&event, 0, Some(202)));
+                    }
+                    event.observed_at_ns = 201;
+                    assert!(state.native_after_fence(&event, 0, Some(202)));
+                    assert!(native_live(&event, 202));
+                }
+            }
+        }
+    }
+    #[test]
+    fn clock_repair_forgets_proof_after_synthetic_release_new_epoch_or_next_fence() {
+        for next_fence in [false, true] {
+            let mut state = State::default();
+            state.observe_native_status(&arming_status(
+                0,
+                worker::PttArmingState::NeedsPhysicalRelease,
+            ));
+            state.fence_holds(u64::MAX);
+            state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+            let mut event = worker::PttEvent {
+                kind: worker::PttEventKind::Released as i32,
+                reason: worker::PttReleaseReason::PhysicalRelease as i32,
+                safety_epoch: 1,
+                ..Default::default()
+            };
+            assert!(state.native_after_fence(&event, 0, None));
+            event.reason = worker::PttReleaseReason::Revoked as i32;
+            assert!(state.native_after_fence(&event, 0, Some(200)));
+            state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+            state.recover_native_clock_fence(Some(200));
+            assert_eq!(state.native_fence, u64::MAX);
+            event.reason = worker::PttReleaseReason::PhysicalRelease as i32;
+            assert!(state.native_after_fence(&event, 0, None));
+            if next_fence {
+                state.fence_holds(u64::MAX);
+            }
+            state.observe_native_status(&arming_status(2, worker::PttArmingState::Armed));
+            state.recover_native_clock_fence(Some(200));
+            assert_eq!(state.native_fence, u64::MAX);
+            assert!(!state.native_after_fence(&event, 0, Some(200)));
+            event.safety_epoch = 2;
+            assert!(state.native_after_fence(&event, 0, Some(200)));
+            assert_eq!(state.native_fence, 200);
+        }
+    }
+    #[test]
+    fn clock_recovery_cannot_repair_exhausted_native_epoch_counter() {
+        let mut state = State::default();
+        state.observe_native_status(&arming_status(u64::MAX, worker::PttArmingState::Armed));
+        state.fence_holds(u64::MAX);
+        let event = worker::PttEvent {
+            kind: worker::PttEventKind::Released as i32,
+            reason: worker::PttReleaseReason::PhysicalRelease as i32,
+            safety_epoch: u64::MAX,
+            ..Default::default()
+        };
+        assert!(!state.native_after_fence(&event, 0, Some(200)));
+        state.recover_native_clock_fence(Some(200));
+        assert!(state.native_epoch_exhausted);
+        assert_eq!(state.native_fence, u64::MAX);
+        assert_eq!(state.native_arming(), None);
+    }
+    #[test]
+    fn synthetic_terminal_native_events_withdraw_existing_armed_readiness() {
+        let parent = fsm::Parent {
+            peer: [1; 32],
+            connection_id: [2; 16],
+            generation: [3; 16],
+        };
+        for reason in [
+            worker::PttReleaseReason::Expired,
+            worker::PttReleaseReason::Revoked,
+            worker::PttReleaseReason::Replaced,
+            worker::PttReleaseReason::ExplicitMute,
+            worker::PttReleaseReason::BackendFailed,
+        ] {
+            let mut state = State::default();
+            state.set_local_intent(false);
+            let (out, _receive) = mpsc::channel(1);
+            state.held = Some(Held {
+                connection: [4; 16],
+                out,
+                press: [5; 16],
+                parent,
+                next: 100,
+            });
+            state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+            let mut event = worker::PttEvent {
+                kind: worker::PttEventKind::Released as i32,
+                reason: worker::PttReleaseReason::PhysicalRelease as i32,
+                safety_epoch: 1,
+                ..Default::default()
+            };
+            assert!(state.native_after_fence(&event, 0, Some(500)));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::Armed as i32)
+            );
+            event.reason = reason as i32;
+            assert!(state.native_after_fence(&event, 0, Some(500)));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+            );
+            assert_eq!(state.held.as_ref().unwrap().press, [5; 16]);
+            assert_eq!(state.config_muted, Some(false));
+            assert!(!state.authority.recovery_muted());
+            event.kind = worker::PttEventKind::Renewed as i32;
+            event.expires_at_ns = 200;
+            assert!(!state.native_after_fence(&event, 0, Some(500)));
+            state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+            );
+            event.kind = worker::PttEventKind::Released as i32;
+            event.reason = worker::PttReleaseReason::PortalRelease as i32;
+            event.observed_at_ns = 100;
+            assert!(state.native_after_fence(&event, 0, Some(500)));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::Armed as i32)
+            );
+            event.kind = worker::PttEventKind::Pressed as i32;
+            event.observed_at_ns = 101;
+            assert!(state.native_after_fence(&event, 0, Some(500)));
+            assert_eq!(state.held.as_ref().unwrap().press, [5; 16]);
+            assert!(!state.authority.recovery_muted());
+        }
+    }
+    #[test]
+    fn correlated_or_remote_release_outcomes_never_prove_native_rearming() {
+        let mut state = State::default();
+        state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+        for reason in [
+            worker::PttReleaseReason::PhysicalRelease,
+            worker::PttReleaseReason::PortalRelease,
+        ] {
+            let mut event = worker::PttEvent {
+                kind: worker::PttEventKind::Released as i32,
+                reason: reason as i32,
+                safety_epoch: 1,
+                ..Default::default()
+            };
+            assert!(state.native_after_fence(&event, 7, Some(500)));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+            );
+            event.grant_id = 9;
+            assert!(state.native_after_fence(&event, 0, Some(500)));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+            );
+            event.grant_id = 0;
+            assert!(state.native_after_fence(&event, 0, Some(500)));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::Armed as i32)
+            );
+        }
+    }
+    fn arming_status(epoch: u64, state: worker::PttArmingState) -> worker::PttStatus {
+        worker::PttStatus {
+            state: state as i32,
+            safety_epoch: epoch,
+            registered: true,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn trusted_portal_logical_release_is_distinct_and_current_epoch_only() {
+        let mut state = State::default();
+        state.bind_native_worker([1; 16]);
+        state.observe_native_status(&arming_status(
+            0,
+            worker::PttArmingState::NeedsPhysicalRelease,
+        ));
+        state.fence_holds(100);
+        state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed));
+        let mut event = worker::PttEvent {
+            kind: worker::PttEventKind::Released as i32,
+            reason: worker::PttReleaseReason::PortalRelease as i32,
+            observed_at_ns: 101,
+            safety_epoch: 0,
+            ..Default::default()
+        };
+        assert_ne!(
+            event.reason,
+            worker::PttReleaseReason::PhysicalRelease as i32
+        );
+        assert!(!state.native_after_fence(&event, 0, Some(500)));
+        event.safety_epoch = 1;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::Armed as i32)
+        );
+        state.fence_holds(200);
+        assert!(!state.native_after_fence(&event, 0, Some(500)));
+        state.observe_native_status(&arming_status(2, worker::PttArmingState::Armed));
+        event.safety_epoch = 2;
+        event.reason = worker::PttReleaseReason::Expired as i32;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        event.reason = worker::PttReleaseReason::PortalRelease as i32;
+        event.observed_at_ns = 201;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        event.kind = worker::PttEventKind::Pressed as i32;
+        event.observed_at_ns = 202;
+        event.expires_at_ns = 250;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        assert!(native_live(&event, 203));
+    }
+    #[test]
+    fn gui_unavailable_reason_requires_current_actual_unavailable_status() {
+        let mut state = State::default();
+        assert_eq!(state.native_unavailable_reason(), None);
+        for (reason, gui_reason) in [
+            (1, gui::AudioPttUnavailableReason::HostClockUnavailable),
+            (
+                2,
+                gui::AudioPttUnavailableReason::PortalFreshnessUnverifiable,
+            ),
+            (3, gui::AudioPttUnavailableReason::RegistrationUnavailable),
+        ] {
+            let status = worker::PttStatus {
+                reason,
+                ..arming_status(0, worker::PttArmingState::Unavailable)
+            };
+            assert!(state.observe_native_status(&status));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::Unavailable as i32)
+            );
+            assert_eq!(state.native_unavailable_reason(), Some(gui_reason as i32));
+        }
+        for reason in [0, 4] {
+            state.observe_native_status(&worker::PttStatus {
+                reason,
+                ..arming_status(0, worker::PttArmingState::Unavailable)
+            });
+            assert_eq!(state.native_unavailable_reason(), None);
+        }
+        state.observe_native_status(&worker::PttStatus {
+            reason: 3,
+            ..arming_status(0, worker::PttArmingState::NeedsPhysicalRelease)
+        });
+        assert_eq!(state.native_unavailable_reason(), None);
+        assert_eq!(state.gui_activation(Op::Press, 7, 7), Ok(()));
+        state.fence_holds(100);
+        assert!(!state.observe_native_status(&worker::PttStatus {
+            reason: 1,
+            ..arming_status(0, worker::PttArmingState::Unavailable)
+        }));
+        assert_eq!(state.native_unavailable_reason(), None);
+    }
+    #[test]
+    fn repeated_native_safety_commands_require_latest_epoch_but_duplicates_do_not_raise_floor() {
+        let mut state = State::default();
+        state.bind_native_worker([1; 16]);
+        state.observe_native_status(&arming_status(
+            0,
+            worker::PttArmingState::NeedsPhysicalRelease,
+        ));
+        let parent = fsm::Parent {
+            peer: [1; 32],
+            connection_id: [2; 16],
+            generation: [3; 16],
+        };
+        let first = Control {
+            request: id(1, parent.connection_id),
+            revision: 0,
+            op: Op::ReleaseAll,
+            press: [0; 16],
+            challenge: 0,
+            expires_ns: 0,
+        };
+        let second = Control {
+            request: id(2, parent.connection_id),
+            ..first
+        };
+        for (now, control) in [(100, first), (101, second), (102, second)] {
+            let decision = state.authority.decide(now, parent, true, true, control);
+            if decision.effect == Effect::ReleaseAll {
+                state.fence_holds(now);
+            }
+        }
+        assert_eq!(state.native_epoch_floor, Some(2));
+        assert!(!state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed)));
+        let mut event = worker::PttEvent {
+            kind: worker::PttEventKind::Released as i32,
+            reason: worker::PttReleaseReason::PhysicalRelease as i32,
+            safety_epoch: 1,
+            ..Default::default()
+        };
+        assert!(!state.native_after_fence(&event, 0, Some(500)));
+        assert!(state.observe_native_status(&arming_status(2, worker::PttArmingState::Armed)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        event.safety_epoch = 2;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::Armed as i32)
+        );
+        event.kind = worker::PttEventKind::Pressed as i32;
+        event.observed_at_ns = 103;
+        event.expires_at_ns = 200;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        assert!(native_live(&event, 104));
+    }
+    #[test]
+    fn epoch_zero_is_observed_but_status_alone_never_rearms_native_ptt() {
+        let mut state = State::default();
+        state.bind_native_worker([1; 16]);
+        assert_eq!(state.native_arming(), None);
+        assert!(state.observe_native_status(&arming_status(
+            0,
+            worker::PttArmingState::NeedsPhysicalRelease
+        )));
+        assert_eq!(state.native_epoch, Some(0));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        assert!(state.observe_native_status(&arming_status(0, worker::PttArmingState::Armed)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        let mut release = worker::PttEvent {
+            kind: worker::PttEventKind::Released as i32,
+            reason: worker::PttReleaseReason::PhysicalRelease as i32,
+            safety_epoch: 0,
+            ..Default::default()
+        };
+        assert!(state.native_after_fence(&release, 0, Some(500)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        state.fence_holds(100);
+        assert_eq!(state.native_arming(), None);
+        assert!(!state.observe_native_status(&arming_status(0, worker::PttArmingState::Armed)));
+        assert!(!state.native_after_fence(&release, 0, Some(500)));
+        assert!(state.observe_native_status(&arming_status(1, worker::PttArmingState::Armed)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        assert!(!state.native_after_fence(&release, 0, Some(500)));
+        release.safety_epoch = 1;
+        for reason in [
+            worker::PttReleaseReason::Revoked,
+            worker::PttReleaseReason::Expired,
+            worker::PttReleaseReason::PersistentUnmute,
+        ] {
+            release.reason = reason as i32;
+            assert!(state.native_after_fence(&release, 0, Some(500)));
+            assert_eq!(
+                state.native_arming(),
+                Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+            );
+        }
+        release.reason = worker::PttReleaseReason::PhysicalRelease as i32;
+        assert!(state.native_after_fence(&release, 0, Some(500)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::Armed as i32)
+        );
+        assert!(state.observe_native_status(&arming_status(1, worker::PttArmingState::Unavailable)));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::Unavailable as i32)
+        );
+    }
+    #[test]
+    fn only_replacement_worker_resets_native_epoch_baseline() {
+        let mut state = State::default();
+        state.bind_native_worker([1; 16]);
+        state.observe_native_status(&arming_status(
+            0,
+            worker::PttArmingState::NeedsPhysicalRelease,
+        ));
+        state.fence_holds(100);
+        state.native_status = None;
+        state.bind_native_worker([1; 16]);
+        assert_eq!(state.native_epoch_floor, Some(1));
+        assert!(!state.observe_native_status(&arming_status(0, worker::PttArmingState::Armed)));
+        state.bind_native_worker([2; 16]);
+        assert!(state.observe_native_status(&arming_status(
+            0,
+            worker::PttArmingState::NeedsPhysicalRelease
+        )));
+        assert_eq!(
+            state.native_arming(),
+            Some(gui::AudioPttArmingState::NeedsPhysicalRelease as i32)
+        );
+        state.observe_native_status(&arming_status(u64::MAX, worker::PttArmingState::Armed));
+        state.fence_holds(200);
+        assert!(state.native_epoch_exhausted);
+        assert!(
+            !state.observe_native_status(&arming_status(u64::MAX, worker::PttArmingState::Armed))
+        );
+        assert_eq!(state.native_arming(), None);
+    }
+    #[test]
+    fn stale_remote_revision_or_expiry_cannot_replace_cas_or_challenge() {
+        let parent = fsm::Parent {
+            peer: [1; 32],
+            connection_id: [2; 16],
+            generation: [3; 16],
+        };
+        let mut state = State::default();
+        let current = net::MicState {
+            revision: 8,
+            challenge: 9,
+            expires_ns: 250_000_000,
+            ..Default::default()
+        };
+        state.update_remote(parent, &current, 0, 100);
+        for stale in [
+            net::MicState {
+                revision: 7,
+                challenge: 8,
+                ..current.clone()
+            },
+            net::MicState {
+                challenge: 8,
+                expires_ns: 200_000_000,
+                ..current.clone()
+            },
+            net::MicState {
+                challenge: 8,
+                ..current.clone()
+            },
+        ] {
+            assert_eq!(state.update_remote(parent, &stale, 1, 101), None);
+            assert_eq!(state.remote.as_ref().unwrap().state, current);
+        }
+        let unsupported = net::MicState {
+            revision: current.revision + 1,
+            supported: false,
+            challenge: 0,
+            expires_ns: 0,
+            ..current.clone()
+        };
+        state.update_remote(parent, &unsupported, 1, 101);
+        assert_eq!(state.remote.as_ref().unwrap().state, unsupported);
+        let replacement = fsm::Parent {
+            generation: [4; 16],
+            ..parent
+        };
+        let baseline = net::MicState {
+            revision: 1,
+            challenge: 1,
+            expires_ns: 100,
+            ..Default::default()
+        };
+        state.update_remote(replacement, &baseline, 1, 101);
+        assert_eq!(state.remote.as_ref().unwrap().state, baseline);
+    }
+    #[test]
+    fn unchanged_visible_remote_safety_event_forces_queued_activation_cas() {
+        let parent = fsm::Parent {
+            peer: [1; 32],
+            connection_id: [2; 16],
+            generation: [3; 16],
+        };
+        let mut state = State::default();
+        let initial = net::MicState {
+            revision: 7,
+            supported: true,
+            ptt_enabled: true,
+            muted: true,
+            ..Default::default()
+        };
+        assert!(!state.fence_remote_talk_generation(parent, &initial, 100));
+        state.update_remote(parent, &initial, 0, 100);
+        let queued_gui_revision = 7;
+        assert_eq!(
+            state.gui_activation(Op::Press, queued_gui_revision, 7),
+            Ok(())
+        );
+        let safety = net::MicState {
+            talk_generation: 1,
+            ..initial.clone()
+        };
+        assert_eq!(safety.muted, initial.muted);
+        assert_eq!(safety.ptt_active, initial.ptt_active);
+        assert!(state.fence_remote_talk_generation(parent, &safety, 200));
+        // The event forces publication, bypassing equal visible-status suppression.
+        let published_gui_revision = queued_gui_revision + 1;
+        assert_eq!(
+            state.gui_activation(Op::Press, queued_gui_revision, published_gui_revision),
+            Err(ResultCode::StaleRevision)
+        );
+        state.update_remote(parent, &safety, 0, 200);
+        assert!(!state.fence_remote_talk_generation(parent, &safety, 201));
+        assert_eq!(state.update_remote(parent, &initial, 0, 202), None);
+        assert_eq!(state.remote.as_ref().unwrap().state.talk_generation, 1);
+        let replacement = fsm::Parent {
+            generation: [4; 16],
+            ..parent
+        };
+        assert!(!state.fence_remote_talk_generation(replacement, &safety, 203));
+        state.update_remote(replacement, &initial, 0, 203);
+        assert_eq!(state.remote.as_ref().unwrap().state.talk_generation, 0);
+        assert!(!state.fence_remote_talk_generation(replacement, &initial, 204));
+    }
+    #[test]
+    fn global_release_preserves_pending_persistent_intent_and_correlation() {
+        let parent = fsm::Parent {
+            peer: [1; 32],
+            connection_id: [2; 16],
+            generation: [3; 16],
+        };
+        for muted in [Some(false), Some(true), None] {
+            let mut state = State::default();
+            state.set_local_intent(false);
+            state.pending = Some(PendingMic {
+                reply: Reply::Network(parent, id(1, parent.connection_id).to_vec()),
+                worker_generation: [4; 16],
+                request: 5,
+                deadline: 1000,
+                muted,
+                previous: true,
+                endpoint_generation: 6,
+            });
+            let cancelled = state.take_activation(false);
+            assert_eq!(cancelled.is_some(), muted.is_none());
+            state.authority.release_all();
+            if muted.is_some() {
+                let pending = state.pending.as_ref().unwrap();
+                assert_eq!(pending.worker_generation, [4; 16]);
+                assert_eq!(pending.request, 5);
+                assert_eq!(pending.muted, muted);
+                assert_eq!(pending.endpoint_generation, 6);
+            }
+            assert_eq!(state.config_muted, Some(false));
+            assert!(!state.authority.desired_muted);
+            assert!(!state.authority.recovery_muted());
+        }
+    }
+    #[test]
+    fn global_release_fence_rejects_queued_native_edges_and_ownerless_renewals() {
+        let mut state = State::default();
+        state.native_press = Some([1; 16]);
+        state.native_expires = 200;
+        state.fence_holds(100);
+        assert!(state.observe_native_status(&worker::PttStatus {
+            state: worker::PttArmingState::Armed as i32,
+            safety_epoch: 1,
+            registered: true,
+            ..Default::default()
+        }));
+        let mut event = worker::PttEvent {
+            kind: worker::PttEventKind::Pressed as i32,
+            observed_at_ns: 99,
+            expires_at_ns: 200,
+            safety_epoch: 1,
+            ..Default::default()
+        };
+        assert!(!state.native_after_fence(&event, 0, Some(500)));
+        event.kind = worker::PttEventKind::Renewed as i32;
+        event.observed_at_ns = 0;
+        assert!(!state.native_after_fence(&event, 0, Some(500)));
+        event.kind = worker::PttEventKind::Released as i32;
+        event.reason = worker::PttReleaseReason::Revoked as i32;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        assert!(state.native_suppressed);
+        event.kind = worker::PttEventKind::Pressed as i32;
+        event.observed_at_ns = 101;
+        assert!(!state.native_after_fence(&event, 0, Some(500)));
+        event.kind = worker::PttEventKind::Released as i32;
+        event.reason = worker::PttReleaseReason::PhysicalRelease as i32;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        assert!(!state.native_suppressed);
+        event.kind = worker::PttEventKind::Pressed as i32;
+        event.observed_at_ns = 101;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+        state.native_press = Some([1; 16]);
+        event.kind = worker::PttEventKind::Renewed as i32;
+        event.observed_at_ns = 0;
+        assert!(state.native_after_fence(&event, 0, Some(500)));
+    }
+    #[test]
+    fn rejected_unmute_preserves_both_hold_owners_and_fresh_state_renewal() {
+        for stale in [true, false] {
+            let parent = fsm::Parent {
+                peer: [1; 32],
+                connection_id: [2; 16],
+                generation: [3; 16],
+            };
+            let (out, _receive) = mpsc::channel(1);
+            let mut state = State::default();
+            state.held = Some(Held {
+                connection: [4; 16],
+                out: out.clone(),
+                press: [5; 16],
+                parent,
+                next: 100,
+            });
+            state.native_parent = Some(parent);
+            state.native_press = Some([6; 16]);
+            state.native_expires = 250_000_000;
+            state.pending = Some(PendingMic {
+                reply: Reply::Gui(Request {
+                    request_id: 1,
+                    connection_id: [4; 16],
+                    message: gui::gui_frame::Msg::SetPtt(gui::SetPtt {
+                        pressed: true,
+                        expected_revision: 7,
+                    }),
+                    out,
+                }),
+                worker_generation: [7; 16],
+                request: 1,
+                deadline: 1000,
+                muted: None,
+                previous: true,
+                endpoint_generation: 1,
+            });
+            assert_eq!(
+                state.gui_activation(Op::SetMute(false), if stale { 6 } else { 7 }, 7),
+                Err(if stale {
+                    ResultCode::StaleRevision
+                } else {
+                    ResultCode::Busy
+                })
+            );
+            assert_eq!(state.native_press, Some([6; 16]));
+            assert_eq!(state.native_parent, Some(parent));
+            assert_eq!(state.native_expires, 250_000_000);
+            let remote = net::MicState {
+                revision: 8,
+                supported: true,
+                ptt_enabled: true,
+                expires_ns: 300_000_000,
+                ..Default::default()
+            };
+            assert_eq!(
+                state.update_remote(parent, &remote, 100, 100_000_000),
+                Some([5; 16])
+            );
+            assert_eq!(state.held.as_ref().unwrap().next, 200);
+            assert_eq!(state.gui_activation(Op::SetMute(true), 0, 7), Ok(()));
+            assert_eq!(state.gui_activation(Op::Release, 0, 7), Ok(()));
+        }
+    }
+    #[test]
+    fn safety_cancellation_removes_every_renewal_owner() {
+        let parent = fsm::Parent {
+            peer: [1; 32],
+            connection_id: [2; 16],
+            generation: [3; 16],
+        };
+        let (out, _receive) = mpsc::channel(1);
+        let mut state = State::default();
+        state.held = Some(Held {
+            connection: [4; 16],
+            out,
+            press: [5; 16],
+            parent,
+            next: 100,
+        });
+        state.native_parent = Some(parent);
+        state.native_press = Some([6; 16]);
+        state.native_expires = 250_000_000;
+        assert_eq!(
+            state.take_holds(),
+            [Some((parent, [5; 16])), Some((parent, [6; 16]))]
+        );
+        for now in [100, 200, 300] {
+            let remote = net::MicState {
+                revision: now,
+                supported: true,
+                ptt_enabled: true,
+                expires_ns: now * 1_000_000 + policy::LEASE_NS,
+                ..Default::default()
+            };
+            assert_eq!(
+                state.update_remote(parent, &remote, now, now * 1_000_000),
+                None
+            );
+        }
+        assert!(state.held.is_none());
+        assert!(state.native_parent.is_none());
+        assert!(state.native_press.is_none());
+        assert_eq!(state.native_expires, 0);
+    }
+    #[test]
+    fn retained_local_safety_mute_is_the_replacement_child_recovery_base() {
+        let mut state = State::default();
+        state.set_local_intent(false);
+        state.authority.observe(true);
+        state.set_local_intent(true);
+        assert!(state.authority.muted);
+        assert_eq!(state.config_muted, Some(true));
+        assert!(state.authority.desired_muted_by.is_none());
+        state.authority.reset();
+        state.sync_config_intent(true);
+        assert_eq!(
+            state.authority.recovery_mode,
+            Some(policy::RecoveryMode::Persistent(true))
+        );
+        assert!(state.authority.recovery_muted());
+    }
     #[test]
     fn hid_conversion_and_all_kvm_reservations() {
         assert_eq!(hotkey("Ctrl+Alt+Shift+F12").unwrap().key_code, 69);

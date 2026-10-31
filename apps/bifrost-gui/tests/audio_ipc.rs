@@ -81,6 +81,64 @@ fn snapshot(revision: u64) -> ipc::AudioStatus {
 }
 
 #[test]
+fn native_ptt_observations_survive_status_mapping_without_synthetic_gui_intents() {
+    for state in [
+        None,
+        Some(ipc::AudioPttArmingState::Armed as i32),
+        Some(ipc::AudioPttArmingState::NeedsPhysicalRelease as i32),
+        Some(ipc::AudioPttArmingState::Unavailable as i32),
+    ] {
+        let mut vm = view();
+        let mut status = snapshot(5);
+        status.microphone.as_mut().unwrap().native_ptt_arming = state;
+        vm.apply(event(Msg::AudioStatus(status)));
+        assert_eq!(
+            vm.audio
+                .status
+                .as_ref()
+                .unwrap()
+                .microphone
+                .as_ref()
+                .unwrap()
+                .native_ptt_arming,
+            state
+        );
+        assert!(!vm.audio.gui_ptt_held);
+        assert!(vm.take_outgoing().is_empty());
+    }
+}
+
+#[test]
+fn native_ptt_unavailable_reason_survives_gui_status_mapping() {
+    for reason in [
+        None,
+        Some(ipc::AudioPttUnavailableReason::HostClockUnavailable as i32),
+        Some(ipc::AudioPttUnavailableReason::PortalFreshnessUnverifiable as i32),
+        Some(ipc::AudioPttUnavailableReason::RegistrationUnavailable as i32),
+    ] {
+        let mut vm = view();
+        let mut status = snapshot(5);
+        let mic = status.microphone.as_mut().unwrap();
+        mic.native_ptt_arming = Some(ipc::AudioPttArmingState::Unavailable as i32);
+        mic.native_ptt_unavailable_reason = reason;
+        vm.apply(event(Msg::AudioStatus(status)));
+        assert_eq!(
+            vm.audio
+                .status
+                .as_ref()
+                .unwrap()
+                .microphone
+                .as_ref()
+                .unwrap()
+                .native_ptt_unavailable_reason,
+            reason
+        );
+        assert!(!vm.audio.gui_ptt_held);
+        assert!(vm.take_outgoing().is_empty());
+    }
+}
+
+#[test]
 fn status_mapping_preserves_presence_permissions_identity_and_current_health() {
     let mut vm = view();
     vm.apply(event(Msg::AudioStatus(snapshot(5))));
@@ -102,6 +160,27 @@ fn status_mapping_preserves_presence_permissions_identity_and_current_health() {
     assert!(vm.audio_player.cards.is_empty());
     vm.apply(event(Msg::AudioStatus(snapshot(1)))); // Revision namespace resets on connection loss.
     assert_eq!(vm.audio.status.as_ref().unwrap().revision, 1);
+}
+
+#[test]
+fn unavailable_native_media_identity_is_display_only_never_an_implicit_current_command() {
+    for (token, revision) in [(0, 3), (7, 0), (0, 0)] {
+        let mut value = snapshot(5);
+        let media = value.sessions[0].media_info.as_mut().unwrap();
+        media.session_token = token;
+        media.revision = revision;
+        let mut vm = view();
+        vm.apply(event(Msg::AudioStatus(value)));
+        let id = vm.audio_player.cards[0].stream_id.clone();
+        assert!(audio::player_request(
+            vm.audio.status.as_ref().unwrap(),
+            &AudioPlayerAction::PlayPause(id)
+        )
+        .is_none());
+        assert!(vm.audio.status.as_ref().unwrap().sessions[0]
+            .media_info
+            .is_some());
+    }
 }
 
 #[test]
