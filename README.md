@@ -2,7 +2,7 @@
 
 **A rainbow bridge between your computers.**
 
-Bifrost is a software KVM: share one keyboard, mouse and text clipboard across Windows and Linux computers on your LAN. Connections are encrypted with mutual TLS, and you pair computers by comparing a six-digit code on both screens. This is my personal project and an early release—not a polished replacement for every hardware KVM.
+Bifrost is a software KVM: share one keyboard, mouse and text clipboard—and, optionally, system audio—across Windows and Linux computers on your LAN. Control connections use mutual TLS, and you pair computers by comparing a six-digit code on both screens. This is my personal project and an early release—not a polished replacement for every hardware KVM.
 
 ![Bifrost in dark mode](assets/readme/main-dark.png)
 ![Bifrost in light mode](assets/readme/main-light.png)
@@ -17,11 +17,13 @@ Bifrost is a software KVM: share one keyboard, mouse and text clipboard across W
 - A freely arranged monitor map, edge links across gaps and an animated ASCII bridge.
 - Edge glow to show where input is going.
 - Shared **text** clipboard with history, follow-cursor/broadcast policies and **Send to…**; separately opt-in **PNG images on Windows, X11 and KDE Wayland (data-control)** (images are never kept in history; no files).
+- Optional **shared audio**: one headset on a Listener, with system sound from authorized Sources; mix all sources or follow input focus.
+- A popup audio mini-player with local per-source volume and mute. Remote media-control permission is separate and off by default.
 - Game mode guards against accidental edge switches in fullscreen apps; manual mode is available on Wayland.
 - Configurable switching hotkeys and an emergency release shortcut.
 - Russian and English, light and dark themes.
 - System tray and a per-user **Start at login** toggle in Settings.
-- One executable for the window, core and input agent—no separate service to install.
+- One executable for the window, core, input agent and optional isolated audio worker—no separate service to install.
 - Version badges on the map and coordinated updates of trusted computers, with the requesting computer updated last.
 
 The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–1000 ms). Challenges run every `min(TTL/5, 100 ms)`, or 100 ms by default. This fixed budget accommodates a 500 ms TCP stall when renewals resume in time; it cannot guarantee survival through unlimited loss. There is no grace period or adaptive extension: core and agent deadlines stay anchored to challenge issuance plus TTL. The control-return bound is TTL + 100 ms scheduling allowance (1100 ms by default); repeat guard (150 ms) and agent core-silence timeout (300 ms) are unchanged.
@@ -56,6 +58,8 @@ Download **`bifrost-0.4.0-windows-x86_64.exe`**, put it somewhere you want to ke
 
 The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902 + UDP 47902 (discovery)** (multicast `239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
+For shared audio, usually no extra UDP rule is needed on stateful LAN firewalls after the pinned TCP link is established; at least one TCP 47901 direction must be reachable. If audio path validation fails, allow **UDP 47903 from the Source's LAN address on the Listener** (or the configured audio port), scoped to the private network. This does not bypass Windows Firewall, access-point/client isolation or VPN policy.
+
 Settings are created automatically in `%APPDATA%\bifrost`; logs go to `%LOCALAPPDATA%\bifrost`. An existing `lan-workspace` directory from 0.3.x is moved there automatically on the first start (see *Updating* below). To start Bifrost when you sign in, enable **Settings → Start at login**. The login entry runs `gui --login`, which starts the core even with an existing configuration. Opening the window manually does not restart a deliberately stopped core; first-run setup and an update restart still start it. Login entries created by older versions need the toggle turned off and on once to adopt this behavior. The entry uses the executable's current path: if you move the file later, turn the toggle off and on again.
 
 ### Linux · x86_64
@@ -71,7 +75,7 @@ No `sudo`: this installs `~/.local/bin/bifrost`, an application-menu entry and i
 
 **Settings → Start at login** creates a per-user autostart entry with `gui --login`, so login starts the core; a manual application-menu launch preserves a stopped core. For an entry created by an older version, turn this setting off and on once.
 
-Runtime: X11 works too; Wayland needs `xdg-desktop-portal` with RemoteDesktop/InputCapture and a compatible backend (KDE Plasma ≥6.1 or GNOME ≥45). The GitHub Linux build targets **glibc 2.35 or newer** (Ubuntu 22.04 baseline); older distributions should build from source. Allow **TCP 47901/47902 + UDP 47902 (discovery)** on your LAN firewall. UDP 47902 is separate from TCP 47902 clipboard; discovery does not require enabling clipboard.
+Runtime: X11 works too; Wayland input sharing needs `xdg-desktop-portal` with RemoteDesktop/InputCapture and a compatible backend (KDE Plasma ≥6.1 or GNOME ≥45). The GitHub Linux build targets **glibc 2.35 or newer** (Ubuntu 22.04 baseline); older distributions should build from source. Allow **TCP 47901/47902 + UDP 47902 (discovery)** on your LAN firewall. UDP 47902 is separate from TCP 47902 clipboard; discovery does not require enabling clipboard. Shared audio usually needs no extra UDP rule on stateful LAN firewalls after the pinned TCP link; TCP 47901 must be reachable in at least one direction. If path validation fails, allow **UDP 47903 from the Source's LAN address on the Listener** (or `audio.media_port`). Bifrost adds no firewall rules; AP/client isolation and VPN policy still apply.
 
 ## Quick start
 
@@ -99,15 +103,38 @@ For routed input, capable peers acknowledge application before the first press i
 
 Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited to selected LAN adapters; VPN adapters are used only when explicitly selected. Wi-Fi multicast filtering, guest/client isolation or separate VLANs may hide computers. **Enter the address manually** if the list is empty; TCP connectivity is still required, so manual entry cannot bypass network isolation.
 
+## Shared audio
+
+One headset on a single **Listener**, system sound from up to three authorized **Sources**. **Mix All** plays them together; **Follow Focus** makes the focused computer primary and quietens the others. Audio is off by default.
+The popup mini-player provides local per-source volume and mute. Per-peer remote media-control permission is separate and off by default.
+
+1. Use the same audio-capable build on both computers, pair them, and keep both cores running.
+2. On the headset computer, open **Audio settings → Use this computer as the listener**, choose its output, apply, then enable audio.
+3. On each Source, select the **Trusted Listener**, apply while sharing is disabled, wait for group confirmation, then enable audio.
+4. Allow sending on the Source and receiving on the Listener, apply, then **Start system audio** from the Source.
+
+**Firewall:** usually no extra UDP rule is needed on stateful LAN firewalls after the pinned TCP link; TCP 47901 must be reachable in at least one direction. If path validation fails, allow UDP 47903 from the Source's LAN address on the Listener (or `audio.media_port`). No rules are added automatically; Windows Firewall, AP/client isolation and VPN restrictions are not bypassed.
+**Privacy:** pairing alone grants no audio permission. Bilateral consent gates capture and playback; ChaCha20-Poly1305 session keys come from the pinned mutual-TLS link. Audio payloads and session keys are never logged or persisted.
+
+| Platform | Audio backend |
+| --- | --- |
+| Windows 11 | WASAPI process-loopback excludes the audio worker's own process tree. |
+| Linux | PipeWire/PulseAudio through the local Pulse protocol; monitor capture and playback, without per-process exclusion. |
+
+- **Latency:** device buffers affect delay; Wi-Fi uses more buffering and Bluetooth can add substantial latency. Prefer a wired LAN when delay matters.
+- **No microphone streaming or virtual microphone yet:** a Listener's headset mic does not appear on a Source; dependent microphone-target routing/UX is also deferred.
+- **No macOS or AEC; no native global X11 PTT:** headphones are recommended to avoid acoustic feedback. See the [commented configuration example](crates/config/examples-data/config.example.toml) for defaults and downgrade precautions.
+
 ## Platform support
 
-| Platform | Status |
-| --- | --- |
-| Windows 11 | Capture and receive input |
-| Linux X11 | Capture and receive input |
-| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required |
-| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer |
-| wlroots-based Wayland desktops | Not supported |
+| Platform | Input sharing | Shared audio |
+| --- | --- | --- |
+| Windows 11 | Capture and receive input | WASAPI system audio; excludes the audio worker's own process tree |
+| Linux X11 | Capture and receive input | Pulse-compatible monitor capture/playback; no native global X11 PTT |
+| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible monitor capture/playback |
+| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible monitor capture/playback |
+| wlroots-based Wayland desktops | Not supported | Not a supported Bifrost desktop |
+| macOS | Not supported | Not supported |
 
 ## Known limitations
 
@@ -116,6 +143,9 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 - Wayland shows a desktop-portal permission dialog on first use. Support depends on your compositor and portal backend.
 - The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
 - Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
+- Shared audio is off by default and requires explicit permissions on both computers; pairing does not grant audio consent. A Source selects one Listener.
+- Linux monitor capture cannot exclude individual applications. Microphone streaming, virtual-microphone routing and dependent target UX are deferred; native global X11 PTT is unsupported.
+- Audio includes driver/device buffering and is not a hard-realtime or studio-monitoring link. Wi-Fi and Bluetooth can add delay; there is no AEC, so headphones are recommended.
 
 ## Build from source
 
