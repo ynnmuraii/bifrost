@@ -14,10 +14,10 @@ use audio_backend::{
     RenderRequest, Stream, StreamSnapshot, StreamStatus,
 };
 use audio_model::{
-    Header, PacketKind,
     jitter::Profile,
     packet::{HEADER_LEN, MAX_DATAGRAM_LEN},
     status::{AudioHealth, ClockSource, DriftDiagnostics, LatencyDiagnostics, StreamHealth},
+    Header, PacketKind,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use rtrb::{Consumer, RingBuffer};
@@ -26,9 +26,9 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc::{self, Receiver as EventReceiver, SyncSender},
+        Arc, Mutex, MutexGuard,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -149,6 +149,7 @@ struct Shared {
     render_clock: AtomicU64,
     render_native_clock: AtomicU64,
     render_native_observed_ns: AtomicU64,
+    render_callback_ns: AtomicU64,
     callback_underruns: AtomicU64,
     callback_limiter: AtomicU64,
     capture_dropped: AtomicU64,
@@ -192,6 +193,7 @@ impl Shared {
             render_clock: AtomicU64::new(0),
             render_native_clock: AtomicU64::new(0),
             render_native_observed_ns: AtomicU64::new(0),
+            render_callback_ns: AtomicU64::new(0),
             callback_underruns: AtomicU64::new(0),
             callback_limiter: AtomicU64::new(0),
             capture_dropped: AtomicU64::new(0),
@@ -261,6 +263,16 @@ impl Shared {
             lock(&self.stats).state = StreamHealth::Ready;
             let _ = events.try_send(MediaEvent::Started);
         }
+    }
+    fn native_render_now(&self) -> Option<u64> {
+        let observed = self.render_native_observed_ns.load(Ordering::Acquire);
+        let now = self.clock.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let elapsed = now.saturating_sub(observed);
+        (observed > 0 && elapsed <= 100_000_000).then(|| {
+            self.render_native_clock
+                .load(Ordering::Acquire)
+                .saturating_add(elapsed.saturating_mul(48_000) / 1_000_000_000)
+        })
     }
     fn observe_capture_gap(&self, native_flag: bool, silent: bool, gap_ns: u64) -> bool {
         if native_flag {
@@ -1021,6 +1033,16 @@ impl SourceWorker {
         let mut capture_epoch = None;
         let mut discontinuities = 0;
         let mut activated = false;
+        {
+            let mut stats = lock(&self.context.shared.stats);
+            stats.latency.packetization_us =
+                (self.frame as u64 * 1_000_000 / 48_000).min(2_000_000) as u32;
+            stats.latency.codec_lookahead_us = self
+                .sender
+                .codec_lookahead_us()
+                .map_err(media_reason)?
+                .min(2_000_000);
+        }
         while !self.context.shared.is_stopped() {
             self.context
                 .shared
@@ -1184,7 +1206,7 @@ impl SourceWorker {
                 next_frame = next_frame.max(capture_due);
             }
             if Instant::now() >= next_frame {
-                let available = self.input.slots().min(needed * 2);
+                let available = (self.input.slots() / 2).min(needed) * 2;
                 input[..needed * 2].fill(0.0);
                 for sample in &mut input[..available] {
                     *sample = self.input.pop().map_err(|_| StopReason::WorkerFailed)?;
@@ -1214,6 +1236,17 @@ impl SourceWorker {
                     // Never send a catch-up burst after a stalled callback or scheduler.
                     next_frame = Instant::now() + frame_duration;
                 }
+            }
+            {
+                let mut stats = lock(&self.context.shared.stats);
+                // One frame is packet assembly, not additional capture backlog.
+                stats.latency.capture_queue_us =
+                    (((self.input.slots() / 2).saturating_sub(needed)) as u64 * 1_000_000
+                        / u64::from(self.rate))
+                    .min(2_000_000) as u32;
+                stats.latency.resampler_delay_us = self.converter.as_ref().map_or(0, |converter| {
+                    (converter.output_delay() as u64 * 1_000_000 / 48_000).min(2_000_000) as u32
+                });
             }
             let deadline = next_keepalive.min(next_frame);
             if drained < 64 {

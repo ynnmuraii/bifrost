@@ -1,6 +1,6 @@
 use ipc::{
-    Framed,
     audio_worker::{self as contract, AudioLink},
+    Framed,
 };
 use prost::Message;
 use protocol::audio_worker::{self as w, audio_frame::Msg};
@@ -246,6 +246,7 @@ fn pages_health_and_generation_are_bounded() {
             sent_media_packets: 1,
             drift: None,
             clock_source: 0,
+            latency: None,
             native_discontinuity_flags: 0,
         }],
     }));
@@ -329,12 +330,10 @@ async fn link_roundtrip_extracts_single_use_secrets_and_binds_generation() {
     assert_eq!(&*key, &[167; 32]);
     assert_eq!(&*prefix, &[9; 4]);
     assert_eq!(child.generation(), Some(7));
-    assert!(
-        child
-            .send(0, Msg::Ping(w::Ping { serial: 1 }))
-            .await
-            .is_err()
-    );
+    assert!(child
+        .send(0, Msg::Ping(w::Ping { serial: 1 }))
+        .await
+        .is_err());
     core.send(
         3,
         Msg::RenewSession(w::RenewSession {
@@ -350,18 +349,16 @@ async fn link_roundtrip_extracts_single_use_secrets_and_binds_generation() {
     assert!(
         matches!(received.frame.msg, Some(Msg::RenewSession(renew)) if renew.session_id == vec![3; 16] && renew.ttl_ms == 1000)
     );
-    assert!(
-        child
-            .send(
-                4,
-                Msg::RenewSession(w::RenewSession {
-                    session_id: vec![3; 16],
-                    ttl_ms: 1000,
-                }),
-            )
-            .await
-            .is_err()
-    );
+    assert!(child
+        .send(
+            4,
+            Msg::RenewSession(w::RenewSession {
+                session_id: vec![3; 16],
+                ttl_ms: 1000,
+            }),
+        )
+        .await
+        .is_err());
 }
 #[tokio::test]
 async fn invalid_frames_do_not_advance_sequence() {
@@ -867,5 +864,50 @@ fn acquire_mute_stable_ids_and_default_roles_follow_existing_selection_bounds() 
             .is_ok(),
             matches!(role, 1 | 2)
         );
+    }
+}
+
+#[test]
+fn latency_health_bounds_each_observed_stage_and_preserves_unknown_native_depth() {
+    let valid = |latency| {
+        let mut frame = frame(Msg::Health(w::Health {
+            sessions: vec![w::SessionHealth {
+                session_id: vec![1; 16],
+                counters: Some(w::AudioHealth::default()),
+                state: 2,
+                latency: Some(latency),
+                ..Default::default()
+            }],
+        }));
+        frame.request_id = 0;
+        contract::validate_frame(&frame).is_ok()
+    };
+    assert!(valid(w::LatencyDiagnostics::default()));
+    assert!(valid(w::LatencyDiagnostics {
+        packetization_us: 2_000_000,
+        capture_queue_us: 2_000_000,
+        codec_lookahead_us: 2_000_000,
+        jitter_target_us: 2_000_000,
+        jitter_buffer_us: 2_000_000,
+        decoded_queue_us: 2_000_000,
+        render_queue_us: 2_000_000,
+        resampler_delay_us: 2_000_000,
+        native_render_buffer_us: Some(2_000_000),
+    }));
+    for index in 0..9 {
+        let mut latency = w::LatencyDiagnostics::default();
+        match index {
+            0 => latency.packetization_us = 2_000_001,
+            1 => latency.capture_queue_us = 2_000_001,
+            2 => latency.codec_lookahead_us = 2_000_001,
+            3 => latency.jitter_target_us = 2_000_001,
+            4 => latency.jitter_buffer_us = 2_000_001,
+            5 => latency.decoded_queue_us = 2_000_001,
+            6 => latency.render_queue_us = 2_000_001,
+            7 => latency.resampler_delay_us = 2_000_001,
+            8 => latency.native_render_buffer_us = Some(2_000_001),
+            _ => unreachable!(),
+        }
+        assert!(!valid(latency), "unbounded stage {index}");
     }
 }

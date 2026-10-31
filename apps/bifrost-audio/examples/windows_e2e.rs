@@ -4,7 +4,7 @@
 //! The child owns both real workers, so listener output cannot feed its source.
 #[cfg(windows)]
 mod windows {
-    use audio_model::packet::{MAX_DATAGRAM_LEN, PacketKind};
+    use audio_model::packet::{PacketKind, MAX_DATAGRAM_LEN};
     use ipc::{
         audio_worker::{AudioLink, LaunchToken},
         peer::SameUser,
@@ -20,8 +20,8 @@ mod windows {
         net::UdpSocket,
         process::{Child, Command, Stdio},
         sync::{
-            Arc,
             atomic::{AtomicU64, Ordering},
+            Arc,
         },
         thread,
         time::{Duration, Instant},
@@ -67,9 +67,7 @@ mod windows {
                 "Explicit consent required: --audible (plays 1 kHz for six seconds)".into(),
             );
         }
-        println!(
-            "Audible Windows E2E: no endpoint, volume, mute, input or installed configuration changes."
-        );
+        println!("Audible Windows E2E: no endpoint, volume, mute, input or installed configuration changes.");
         let mut child = HelperChild(
             Command::new(std::env::current_exe()?)
                 .args(["--audible", "--harness"])
@@ -211,46 +209,37 @@ mod windows {
                     worker.observed_capture |= session.capture_active == Some(true);
                     worker.sent = worker.sent.max(session.sent_media_packets);
                     if let Some(drift) = session.drift {
-                        println!(
-                            "DRIFT {label} ratio_ppm={} filtered_fill_error_frames={:.3} coarse_corrections={} clock_source={}",
-                            drift.ratio_ppm,
-                            drift.filtered_fill_error_frames,
-                            drift.coarse_corrections,
-                            session.clock_source
-                        );
+                        println!("DRIFT {label} ratio_ppm={} filtered_fill_error_frames={:.3} coarse_corrections={} clock_source={}", drift.ratio_ppm, drift.filtered_fill_error_frames, drift.coarse_corrections, session.clock_source);
                     } else {
                         println!(
                             "DRIFT {label} receiver_PI=absent clock_source={}",
                             session.clock_source
                         );
                     }
-                    println!(
-                        "NATIVE_FLAGS {label} count={}",
-                        session.native_discontinuity_flags
-                    );
-                    if let Some(counters) = session.counters {
+                    if let Some(stage) = session.latency {
                         println!(
-                            "HEALTH {label} sent={} received={} delta_received={} loss={} delta_loss={} underruns={} delta_underruns={} late={} concealed={} discontinuities={}",
-                            session.sent_media_packets,
-                            counters.received_packets,
-                            counters.received_packets.saturating_sub(worker.received),
-                            counters.lost_frames,
-                            counters
-                                .lost_frames
-                                .saturating_sub(worker.counters.lost_frames),
-                            counters.underruns,
-                            counters.underruns.saturating_sub(worker.counters.underruns),
-                            counters.late_frames,
-                            counters.concealed_frames,
-                            counters.discontinuities
+                            "STAGES {label} packetization_us={} capture_queue_us={} codec_lookahead_us={} jitter_target_us={} jitter_buffer_us={} decoded_queue_us={} render_queue_us={} resampler_delay_us={} native_render_buffer_us={:?} native_discontinuity_flags={}; jitter occupancy overlaps target",
+                            stage.packetization_us, stage.capture_queue_us,
+                            stage.codec_lookahead_us, stage.jitter_target_us,
+                            stage.jitter_buffer_us, stage.decoded_queue_us,
+                            stage.render_queue_us, stage.resampler_delay_us,
+                            stage.native_render_buffer_us, session.native_discontinuity_flags,
                         );
+                    }
+                    if let Some(counters) = session.counters {
+                        println!("HEALTH {label} sent={} received={} delta_received={} loss={} delta_loss={} underruns={} delta_underruns={} late={} concealed={} discontinuities={}",
+                            session.sent_media_packets, counters.received_packets,
+                            counters.received_packets.saturating_sub(worker.received),
+                            counters.lost_frames, counters.lost_frames.saturating_sub(worker.counters.lost_frames),
+                            counters.underruns, counters.underruns.saturating_sub(worker.counters.underruns),
+                            counters.late_frames, counters.concealed_frames, counters.discontinuities);
                         worker.received = counters.received_packets;
                         worker.counters = counters;
                     }
                 }
             }
             Some(Msg::Error(error)) => {
-                return Err(format!("{label} worker error code={}", error.code).into());
+                return Err(format!("{label} worker error code={}", error.code).into())
             }
             Some(Msg::SessionEvent(event)) if event.reason != 0 => {
                 return Err(format!("{label} unexpected stop reason={}", event.reason).into());
@@ -323,12 +312,7 @@ mod windows {
         let sample_span = frames.len().saturating_sub(1);
         let ppm =
             (sample_span as f64 / (qpc_span as f64 * 48_000.0 / 10_000_000.0) - 1.0) * 1_000_000.0;
-        println!(
-            "CLOCK {label} delivered_sample_vs_QPC_drift_ppm={ppm:.3} duration_ms={:.1} native_position_first={} native_position_last={}; independent capture estimate, NOT the worker receiver PI ratio",
-            qpc_span as f64 / 10_000.0,
-            first.device_position,
-            last.device_position
-        );
+        println!("CLOCK {label} delivered_sample_vs_QPC_drift_ppm={ppm:.3} duration_ms={:.1} native_position_first={} native_position_last={}; independent capture estimate, NOT the worker receiver PI ratio", qpc_span as f64 / 10_000.0, first.device_position, last.device_position);
         Ok(())
     }
 
@@ -458,10 +442,7 @@ mod windows {
             .checked_sub(direct_onset)
             .ok_or("listener onset precedes helper")? as f64
             / 10_000.0;
-        println!(
-            "LATENCY common_WASAPI_QPC raw_relay_E2E_ms={latency:.2} injected_delay_ms=500 delay_subtracted_estimate_ms={:.2} (NOT native direct E2E latency; 10ms onset windows)",
-            latency - 500.0
-        );
+        println!("LATENCY common_WASAPI_QPC raw_relay_E2E_ms={latency:.2} injected_delay_ms=500 delay_subtracted_estimate_ms={:.2} (NOT native direct E2E latency; 10ms onset windows)", latency - 500.0);
         let baseline = report(
             "endpoint_before_helper",
             &endpoint_pcm,
@@ -524,9 +505,7 @@ mod windows {
         {
             return Err("probe ring overflow invalidates measurement".into());
         }
-        println!(
-            "PASS real WindowsBackend workers + same-user named pipes + encrypted UDP + endpoint network-only tone; endpoint settings untouched"
-        );
+        println!("PASS real WindowsBackend workers + same-user named pipes + encrypted UDP + endpoint network-only tone; endpoint settings untouched");
         Ok(())
     }
 }

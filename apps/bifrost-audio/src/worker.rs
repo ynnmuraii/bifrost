@@ -5,7 +5,7 @@ use audio_media::{
     socket::MediaSocket,
 };
 use audio_model::{jitter::Profile, status::StreamHealth};
-use ring::digest::{SHA256, digest};
+use ring::digest::{digest, SHA256};
 use std::{
     net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket},
     sync::mpsc::{Receiver, RecvTimeoutError},
@@ -589,6 +589,17 @@ where
                         coarse_corrections: drift.coarse_corrections,
                     }),
                     clock_source: i32::from(snapshot.clock_source as u8),
+                    latency: Some(w::LatencyDiagnostics {
+                        packetization_us: snapshot.latency.packetization_us,
+                        capture_queue_us: snapshot.latency.capture_queue_us,
+                        codec_lookahead_us: snapshot.latency.codec_lookahead_us,
+                        jitter_target_us: snapshot.latency.jitter_target_us,
+                        jitter_buffer_us: snapshot.latency.jitter_buffer_us,
+                        decoded_queue_us: snapshot.latency.decoded_queue_us,
+                        render_queue_us: snapshot.latency.render_queue_us,
+                        resampler_delay_us: snapshot.latency.resampler_delay_us,
+                        native_render_buffer_us: snapshot.latency.native_render_buffer_us,
+                    }),
                     native_discontinuity_flags: snapshot.native_discontinuity_flags,
                 }
             })

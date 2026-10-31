@@ -212,6 +212,9 @@ impl Receiver {
             coarse_corrections: self.coarse_corrections,
         }
     }
+    pub fn next_playout_deadline(&self) -> Option<u64> {
+        self.jitter.next_deadline()
+    }
     /// Encoded media and interpolation delay only; caller-owned PCM queues are separate.
     /// Jitter storage overlaps its scheduling target and must not be added to it.
     pub fn latency_diagnostics(&self) -> LatencyDiagnostics {

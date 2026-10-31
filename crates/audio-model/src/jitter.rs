@@ -111,6 +111,9 @@ impl JitterBuffer {
     pub fn target_samples(&self) -> u32 {
         self.target
     }
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.expected.map(|_| self.deadline)
+    }
     pub fn buffered_frames(&self) -> usize {
         self.occupied.count_ones() as usize
     }
