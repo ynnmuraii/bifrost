@@ -162,6 +162,37 @@ The example reports the Listener's worker Health drift-controller ratio, fill er
 coarse corrections beside its independent delivered-sample/QPC capture estimate. These
 measure different quantities; Source has no receiver drift controller.
 
+For a Windows timing-only diagnostic, run
+`cargo run -p platform-audio-win --example hw_probe -- --timing`.
+It initializes—but never starts—capture/render clients and prints actual buffer capacities,
+engine periods and available native latency queries. It plays no tone and changes no
+endpoint settings; process-loopback period/latency queries may report unsupported.
+
+For long-run Windows audio measurements, add `--seconds 60` to `windows_e2e --audible`.
+The helper streams into a bounded ring; the probe retains only onset/tail PCM and reports
+steady-state underruns after two seconds of tone warmup.
+
+Windows render attempts `IAudioClient3` shared/event mode with the smallest supported
+fundamental-multiple period at or above **5 ms**. The floor keeps a two-period queue
+at roughly 10 ms rather than relying on a minimum-period scheduling deadline. The
+adapter queues at most **two periods**, capped by the actual WASAPI buffer capacity.
+Process-loopback capture retains its existing EXCLUDE behavior and format.
+Unsupported exact formats, unavailable interfaces/periods and an engine period locked
+by another application fall back to the legacy shared-mode/conversion path. Native
+stream snapshots report the selected mode, period, capacity, queue limit and typed
+fallback reason/HRESULT. Legacy clients query the current shared engine period rather
+than assuming the default; when that query is unsupported, the snapshot explicitly
+labels the default-period estimate. Shared engine periods are endpoint-wide and can
+affect other applications; no endpoint routing, volume or mute setting is changed.
+
+`hw_probe --timing --period min|5ms|10ms` reports negotiated versus legacy timing without
+starting streams. For explicit audible candidate stress, use
+`cargo run -p platform-audio-win --example hw_probe -- --stress-period 5ms --seconds 60`.
+It uses a bounded tone ring and reports post-warmup source exhaustion separately from
+zero-padding observations and the two-period engine-starvation heuristic. The heuristic
+is not a driver xrun counter; on a buffer smaller than two periods, zero padding alone
+does not establish starvation.
+
 ## License
 
 [MIT](LICENSE). Distributed third-party components are listed in [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).
