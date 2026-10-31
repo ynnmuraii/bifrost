@@ -208,7 +208,7 @@ mod live {
             },
             SessionConfig {
                 authorized: Arc::new(AtomicBool::new(true)),
-                socket: source_socket,
+                socket: audio_media::socket::MediaSocket::new(source_socket).unwrap(),
                 peer: listener_address,
                 session_id: [7; 16],
                 profile: Profile::Ethernet,
@@ -224,7 +224,7 @@ mod live {
             },
             SessionConfig {
                 authorized: Arc::new(AtomicBool::new(true)),
-                socket: listener_socket,
+                socket: audio_media::socket::MediaSocket::new(listener_socket).unwrap(),
                 peer: source_address,
                 session_id: [7; 16],
                 profile: Profile::Ethernet,

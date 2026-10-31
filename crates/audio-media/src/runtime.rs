@@ -5,9 +5,9 @@ use crate::{
     control::ReceiverReport,
     crypto::{CryptoError, DirectionMaterial, Opener, Sealer},
     keys::{Endpoint, SessionKeys},
-    mixer::Mixer,
     native_rate::NativeRate,
     pipeline::{MediaError, Receiver, Sender},
+    socket::{MediaSocket, Notification, SessionEndpoint},
 };
 use audio_backend::{
     AudioFormat, Backend, BackendError, CaptureSpec, DeviceEvent, Event as BackendEvent,
@@ -20,11 +20,11 @@ use audio_model::{
     Header, PacketKind,
 };
 use ring::rand::{SecureRandom, SystemRandom};
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::{Consumer, RingBuffer};
 use rubato::FixedAsync;
 use std::{
     io,
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc::{self, Receiver as EventReceiver, SyncSender},
@@ -34,6 +34,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod listener_group;
+pub use listener_group::ListenerGroup;
+
 pub const PCM_RING_SAMPLES: usize = 32_768;
 pub const EVENT_CAPACITY: usize = 16;
 pub const STOP_DEADLINE: Duration = Duration::from_secs(2);
@@ -42,7 +45,7 @@ const IO_TIMEOUT: Duration = Duration::from_millis(2);
 /// Socket is bound by the caller; peer must match the authenticated parent's IP and accepted port.
 /// The engine pins that complete tuple. Authenticated rebinding is intentionally unsupported.
 pub struct SessionConfig {
-    pub socket: UdpSocket,
+    pub socket: Arc<MediaSocket>,
     pub peer: SocketAddr,
     pub session_id: [u8; 16],
     pub profile: Profile,
@@ -93,6 +96,7 @@ pub enum EngineError {
     Unauthorized,
     InvalidGain,
     StopTimeout,
+    GroupFull,
     WorkerPanicked,
 }
 impl From<BackendError> for EngineError {
@@ -137,6 +141,7 @@ struct Shared {
     render_frames: AtomicU64,
     render_clock: AtomicU64,
     callback_underruns: AtomicU64,
+    callback_limiter: AtomicU64,
     capture_dropped: AtomicU64,
     capture_discontinuities: AtomicU64,
     last_media_ms: AtomicU64,
@@ -146,6 +151,8 @@ struct Shared {
     last_capture_ms: AtomicU64,
     sent_media_packets: AtomicU64,
     last_send_ms: AtomicU64,
+    notification: Arc<Notification>,
+    socket_rejected: Arc<AtomicU64>,
     stats: Mutex<Stats>,
 }
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -169,6 +176,7 @@ impl Shared {
             render_frames: AtomicU64::new(0),
             render_clock: AtomicU64::new(0),
             callback_underruns: AtomicU64::new(0),
+            callback_limiter: AtomicU64::new(0),
             capture_dropped: AtomicU64::new(0),
             capture_discontinuities: AtomicU64::new(0),
             last_media_ms: AtomicU64::new(0),
@@ -178,6 +186,8 @@ impl Shared {
             last_capture_ms: AtomicU64::new(0),
             sent_media_packets: AtomicU64::new(0),
             last_send_ms: AtomicU64::new(0),
+            notification: Arc::new(Notification::new()),
+            socket_rejected: Arc::new(AtomicU64::new(0)),
             stats: Mutex::new(Stats {
                 health: AudioHealth::default(),
                 state: StreamHealth::Buffering,
@@ -196,7 +206,9 @@ impl Shared {
         let _ = self
             .reason
             .compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire);
-        self.stopped.store(true, Ordering::Release);
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            self.notification.notify();
+        }
     }
     fn reason(&self) -> StopReason {
         match self.reason.load(Ordering::Acquire) {
@@ -253,10 +265,16 @@ pub struct MediaSession<S: Stream + 'static> {
     initial_position: Option<u64>,
     last_native: StreamSnapshot,
     source: bool,
+    group_native: Option<Arc<Mutex<StreamSnapshot>>>,
+    group_owner: Option<Box<ListenerGroup<S>>>,
+    stop_attempted: bool,
 }
 impl<S: Stream + 'static> MediaSession<S> {
     /// Enables deterministic Dry pumping or owner-thread platform-specific control only.
     pub fn stream_mut(&mut self) -> Option<&mut S> {
+        if let Some(group) = self.group_owner.as_mut() {
+            return group.stream_mut();
+        }
         self.stream.as_mut()
     }
     pub fn set_gain(&self, gain: f32) -> Result<(), EngineError> {
@@ -274,6 +292,12 @@ impl<S: Stream + 'static> MediaSession<S> {
         Ok(())
     }
     fn refresh(&mut self) {
+        if let Some(group) = self.group_owner.as_mut() {
+            group.refresh();
+        }
+        if let Some(native) = &self.group_native {
+            self.last_native = *lock(native);
+        }
         if let Some(stream) = self.stream.as_ref() {
             let snapshot = stream.snapshot();
             self.last_native = snapshot;
@@ -309,6 +333,9 @@ impl<S: Stream + 'static> MediaSession<S> {
         health.underruns = health
             .underruns
             .saturating_add(self.shared.callback_underruns.load(Ordering::Acquire));
+        health.limiter_frames = health
+            .limiter_frames
+            .saturating_add(self.shared.callback_limiter.load(Ordering::Acquire));
         health.discontinuities = health
             .discontinuities
             .saturating_add(self.shared.capture_discontinuities.load(Ordering::Acquire));
@@ -327,7 +354,9 @@ impl<S: Stream + 'static> MediaSession<S> {
             sending: !stopped
                 && media > 0
                 && now.saturating_sub(self.shared.last_send_ms.load(Ordering::Acquire)) < 100,
-            rejected_datagrams: stats.rejected,
+            rejected_datagrams: stats
+                .rejected
+                .saturating_add(self.shared.socket_rejected.load(Ordering::Acquire)),
             capture_dropped_frames: self
                 .shared
                 .capture_dropped
@@ -341,6 +370,9 @@ impl<S: Stream + 'static> MediaSession<S> {
         self.events.try_recv().ok()
     }
     pub fn on_backend_event(&mut self, event: &BackendEvent) {
+        if let Some(group) = self.group_owner.as_mut() {
+            group.on_backend_event(event);
+        }
         let relevant = match event {
             BackendEvent::ResyncRequired => true,
             BackendEvent::Device(
@@ -355,7 +387,11 @@ impl<S: Stream + 'static> MediaSession<S> {
         }
     }
     pub fn stop(&mut self) -> Result<(), EngineError> {
+        self.stop_attempted = true;
         self.shared.request_stop(StopReason::User);
+        if let Some(group) = self.group_owner.as_mut() {
+            group.stop()?;
+        }
         let deadline = Instant::now() + STOP_DEADLINE;
         if let Some(mut stream) = self.stream.take() {
             self.native_stop = Some(
@@ -395,18 +431,12 @@ impl<S: Stream + 'static> MediaSession<S> {
 }
 impl<S: Stream + 'static> Drop for MediaSession<S> {
     fn drop(&mut self) {
-        if self.stream.is_some() || !self.shared.stopped.load(Ordering::Acquire) {
+        if !self.stop_attempted {
             let _ = self.stop();
         }
     }
 }
 
-fn socket_setup(socket: &UdpSocket) -> Result<(), EngineError> {
-    socket.set_nonblocking(false)?;
-    socket.set_read_timeout(Some(IO_TIMEOUT))?;
-    socket.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(())
-}
 fn valid_format(format: AudioFormat) -> bool {
     format.channels == 2 && (8_000..=audio_backend::MAX_SAMPLE_RATE).contains(&format.sample_rate)
 }
@@ -428,6 +458,9 @@ fn make_session<S: Stream + 'static>(
         initial_position: snapshot.device_position,
         last_native: snapshot,
         source,
+        group_native: None,
+        group_owner: None,
+        stop_attempted: false,
     }
 }
 
@@ -443,9 +476,14 @@ where
     if !config.authorized.load(Ordering::Acquire) {
         return Err(EngineError::Unauthorized);
     }
-    socket_setup(&config.socket)?;
     let start = Instant::now();
     let shared = Arc::new(Shared::new(config.authorized.clone()));
+    let endpoint = config.socket.register(
+        config.session_id,
+        config.peer,
+        shared.socket_rejected.clone(),
+        shared.notification.clone(),
+    )?;
     let (events_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
     let (mut producer, consumer) = RingBuffer::<f32>::new(PCM_RING_SAMPLES);
     let callback_shared = shared.clone();
@@ -491,6 +529,7 @@ where
             for &sample in block.samples {
                 let _ = producer.push(sample);
             }
+            callback_shared.notification.notify();
         }),
     )?;
     let format = stream.format();
@@ -528,8 +567,7 @@ where
     let path = PathState::new(start)?;
     let mut session = make_session(stream, shared.clone(), events, events_tx.clone(), true);
     let context = Context {
-        socket: config.socket,
-        peer: config.peer,
+        endpoint,
         shared,
         events: events_tx,
         start,
@@ -566,137 +604,14 @@ where
     if !config.authorized.load(Ordering::Acquire) {
         return Err(EngineError::Unauthorized);
     }
-    socket_setup(&config.socket)?;
-    let start = Instant::now();
-    let shared = Arc::new(Shared::new(config.authorized.clone()));
-    let (events_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
-    let (producer, mut consumer) = RingBuffer::<f32>::new(PCM_RING_SAMPLES);
-    let callback_shared = shared.clone();
-    let mut stream = backend.start_render(
-        request,
-        Box::new(move |output| {
-            if callback_shared.is_stopped() {
-                output.fill(0.0);
-                return;
-            }
-            if !output.len().is_multiple_of(2) {
-                output.fill(0.0);
-                callback_shared
-                    .callback_invalid
-                    .store(true, Ordering::Release);
-                return;
-            }
-            let mut underrun = false;
-            for frame in output.as_chunks_mut::<2>().0 {
-                // Never consume half a stereo frame if a producer is interrupted between pushes.
-                if consumer.slots() >= 2 {
-                    frame[0] = consumer.pop().unwrap_or(0.0);
-                    frame[1] = consumer.pop().unwrap_or(0.0);
-                } else {
-                    frame.fill(0.0);
-                    underrun = true;
-                }
-            }
-            if underrun {
-                callback_shared
-                    .callback_underruns
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            let total = callback_shared
-                .render_frames
-                .fetch_add((output.len() / 2) as u64, Ordering::AcqRel)
-                + (output.len() / 2) as u64;
-            let rate = callback_shared.native_rate.load(Ordering::Acquire);
-            if rate > 0 {
-                let clock = (u128::from(total) * 48_000 / u128::from(rate))
-                    .min(u128::from(u64::MAX)) as u64;
-                callback_shared
-                    .render_clock
-                    .fetch_max(clock, Ordering::AcqRel);
-            }
-        }),
-    )?;
-    let format = stream.format();
-    if !config.authorized.load(Ordering::Acquire) {
-        stream.stop()?;
-        return Err(EngineError::Unauthorized);
-    }
-    if !valid_format(format) {
-        stream.stop()?;
-        return Err(EngineError::InvalidFormat);
-    }
-    shared
-        .native_rate
-        .store(format.sample_rate, Ordering::Release);
-    let frame = usize::from(config.profile.frame_samples());
-    let converter = if format.sample_rate != 48_000 {
-        Some(NativeRate::new(
-            48_000,
-            format.sample_rate,
-            240,
-            FixedAsync::Input,
-        )?)
-    } else {
-        None
-    };
-    let keys = SessionKeys::new(
-        Endpoint::MediaReceiver,
-        config.session_id,
-        0,
-        material.forward,
-        material.reverse,
-    )
-    .map_err(MediaError::Crypto)?;
-    let receiver = Arc::new(Mutex::new(Receiver::new(
-        config.profile,
-        keys.receive,
-        frame as u32,
-    )?));
-    let path = PathState::new(start)?;
-    let mut session = make_session(stream, shared.clone(), events, events_tx.clone(), false);
-    let feeder = PlayoutWorker {
-        shared: shared.clone(),
-        events: events_tx.clone(),
-        receiver: receiver.clone(),
-        output: producer,
-        converter,
-        rate: format.sample_rate,
-        start,
-    };
-    let context = Context {
-        socket: config.socket,
-        peer: config.peer,
-        shared,
-        events: events_tx,
-        start,
-    };
-    let mut worker = ReceiveWorker {
-        context,
-        receiver,
-        sealer: keys.send,
-        path,
-    };
-    if let Err(reason) = worker.send_probe(&mut [0; MAX_DATAGRAM_LEN]) {
-        worker.context.finish(Err(reason));
-        return Ok(session);
-    }
-    // Keep the first probe off callbacks and independent of receive-thread scheduling.
-    session.workers.push(
-        thread::Builder::new()
-            .name("bfa-playout".into())
-            .spawn(move || feeder.run())?,
-    );
-    session.workers.push(
-        thread::Builder::new()
-            .name("bfa-receive".into())
-            .spawn(move || worker.run())?,
-    );
+    let mut group = ListenerGroup::new(backend, request)?;
+    let mut session = group.join(config, material)?;
+    session.group_owner = Some(Box::new(group));
     Ok(session)
 }
 
 struct Context {
-    socket: UdpSocket,
-    peer: SocketAddr,
+    endpoint: SessionEndpoint,
     shared: Arc<Shared>,
     events: SyncSender<MediaEvent>,
     start: Instant,
@@ -718,7 +633,7 @@ impl Context {
         if self.shared.is_stopped() {
             return Err(self.shared.reason());
         }
-        match self.socket.send_to(packet, self.peer) {
+        match self.endpoint.send(packet) {
             Ok(n) if n == packet.len() => {
                 lock(&self.shared.stats).sent += 1;
                 if packet.get(5) == Some(&(PacketKind::Opus as u8)) {
@@ -745,27 +660,11 @@ impl Context {
             _ => Err(StopReason::NetworkFailure),
         }
     }
-    fn receive(&self, packet: &mut [u8]) -> Result<Option<usize>, StopReason> {
-        match self.socket.recv_from(packet) {
-            Ok((n, peer)) if peer == self.peer && n <= MAX_DATAGRAM_LEN => Ok(Some(n)),
-            Ok(_) => {
-                lock(&self.shared.stats).rejected += 1;
-                Ok(None)
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) if self.startup_refusal(&error) => Ok(None),
-            // Winsock reports truncation as WSAEMSGSIZE instead of returning the filled buffer.
-            Err(error) if cfg!(windows) && error.raw_os_error() == Some(10040) => {
-                lock(&self.shared.stats).rejected += 1;
+    fn receive(&mut self, packet: &mut [u8]) -> Result<Option<usize>, StopReason> {
+        match self.endpoint.try_recv(packet) {
+            Ok(Some(n)) => Ok(Some(n)),
+            Ok(None) => {
+                self.shared.notification.wait_timeout(IO_TIMEOUT);
                 Ok(None)
             }
             Err(_) => Err(StopReason::NetworkFailure),
@@ -1118,137 +1017,24 @@ impl ReceiveWorker {
     }
 }
 
-struct PlayoutWorker {
-    shared: Arc<Shared>,
-    events: SyncSender<MediaEvent>,
-    receiver: Arc<Mutex<Receiver>>,
-    output: Producer<f32>,
-    converter: Option<NativeRate>,
-    rate: u32,
-    start: Instant,
-}
-impl PlayoutWorker {
-    fn run(mut self) {
-        let result = self.process();
-        if let Err(reason) = result {
-            self.shared.request_stop(reason);
-        }
-        self.shared.finish(&self.events);
-    }
-    fn process(&mut self) -> Result<(), StopReason> {
-        let capacity = lock(&self.receiver).output_capacity_samples();
-        let mut decoded = vec![0.0; capacity];
-        let mut mixed = vec![0.0; capacity];
-        let mut mixer = Mixer::new(480);
-        let mut staging = [0.0; 480];
-        let mut staged = 0;
-        let converted_capacity = self
-            .converter
-            .as_ref()
-            .map_or(0, NativeRate::max_output_frames)
-            * 2;
-        let mut converted = vec![0.0; converted_capacity];
-        while !self.shared.is_stopped() {
-            if self.shared.callback_invalid.load(Ordering::Acquire) {
-                self.shared.invalidate(&self.events);
-                return Err(StopReason::DeviceInvalidated);
-            }
-            let now = self.shared.render_clock.load(Ordering::Acquire);
-            let fill = (PCM_RING_SAMPLES - self.output.slots()) as f64 / 2.0 * 48_000.0
-                / f64::from(self.rate);
-            let (n, mut health) = {
-                let mut receiver = lock(&self.receiver);
-                let n = receiver
-                    .playout(now, fill, &mut decoded)
-                    .map_err(media_reason)?;
-                (n, receiver.health())
-            };
-            if n > 0 {
-                let gain = if self.shared.muted.load(Ordering::Acquire) {
-                    0.0
-                } else {
-                    f32::from_bits(self.shared.gain.load(Ordering::Acquire))
-                };
-                mixer
-                    .set_gain(0, gain)
-                    .map_err(|_| StopReason::WorkerFailed)?;
-                mixer
-                    .process(&[&decoded[..n * 2]], &mut mixed[..n * 2])
-                    .map_err(|_| StopReason::WorkerFailed)?;
-                if let Some(converter) = self.converter.as_mut() {
-                    for &sample in &mixed[..n * 2] {
-                        staging[staged] = sample;
-                        staged += 1;
-                        if staged == staging.len() {
-                            let frames = converter
-                                .process(&staging, &mut converted)
-                                .map_err(media_reason)?;
-                            push_pcm(
-                                &mut self.output,
-                                &converted[..frames * 2],
-                                &self.shared,
-                                &self.events,
-                            );
-                            staged = 0;
-                        }
-                    }
-                } else {
-                    push_pcm(
-                        &mut self.output,
-                        &mixed[..n * 2],
-                        &self.shared,
-                        &self.events,
-                    );
-                }
-            }
-            health.limiter_frames = mixer.limited_frames();
-            let increased_loss = {
-                let mut stats = lock(&self.shared.stats);
-                let increased = health.lost_frames > stats.health.lost_frames;
-                stats.health = health;
-                increased
-            };
-            if increased_loss {
-                self.shared.degraded(&self.events);
-            }
-            if self.shared.started.load(Ordering::Acquire)
-                && self.start.elapsed().as_millis() as u64
-                    > self.shared.last_media_ms.load(Ordering::Acquire) + 1000
-            {
-                self.shared.degraded(&self.events);
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        Ok(())
-    }
-}
-fn push_pcm(
-    output: &mut Producer<f32>,
-    pcm: &[f32],
-    shared: &Shared,
-    events: &SyncSender<MediaEvent>,
-) {
-    if output.slots() < pcm.len() {
-        shared.degraded(events);
-        return;
-    }
-    for &sample in pcm {
-        let _ = output.push(sample);
-    }
-}
-
 #[cfg(test)]
 mod path_tests {
     use super::*;
     #[test]
     fn startup_icmp_refusal_never_validates_and_stops_being_transient_after_validation() {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = MediaSocket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
         let peer = socket.local_addr().unwrap();
         let (events, _) = mpsc::sync_channel(EVENT_CAPACITY);
         let shared = Arc::new(Shared::new(Arc::new(AtomicBool::new(true))));
         let context = Context {
-            socket,
-            peer,
+            endpoint: socket
+                .register(
+                    [1; 16],
+                    peer,
+                    shared.socket_rejected.clone(),
+                    shared.notification.clone(),
+                )
+                .unwrap(),
             shared,
             events,
             start: Instant::now(),

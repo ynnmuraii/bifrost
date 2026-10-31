@@ -32,6 +32,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback-only tests cover loss/reorder/injection and device invalidation; core/IPC integration remains disabled.
 - Both audio endpoints immediately authenticate the UDP path; Listener startup attempts its first challenge before returning, enabling Listener-first commit ordering and stateful outbound firewall state. Media remains gated on validation, with the existing three-attempt/500 ms-window/two-second bounds; a two-sided stateful-firewall relay test verifies recovery and audio flow.
 
+**Shared Listener media**
+
+- Mix up to three independently authenticated sessions into one native Listener render stream with stable lanes, per-session gain/mute ramps and aggregate limiting. Queued authorization-subset frames let the realtime callback revoke one input without muting the others, taking locks or allocating.
+- Use one configured UDP port per audio child for all sessions, with one event-driven reader and bounded session-ID/pinned-peer demultiplexing. Unknown and cross-session tuple injections are silent drops; cryptographic counters and replay windows remain session-local.
+
 **Linux audio backend internals**
 
 - Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
@@ -76,6 +81,11 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле.
 - Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства; интеграция core/IPC пока не включена.
 - Оба конца аудиосеанса сразу проверяют UDP-путь; Listener пытается отправить первый аутентифицированный запрос до возврата из запуска, позволяя сначала открыть исходящее состояние межсетевого экрана. Медиа остаётся закрытым до проверки пути; сохранены три попытки, окна 500 мс и предел две секунды. Тест с двусторонним stateful-фильтром проверяет восстановление пути и доставку звука.
+
+**Общий аудиовыход Listener**
+
+- До трёх независимо проверяемых сеансов микшируются в один нативный поток Listener со стабильными входами, плавной громкостью/заглушением и общим лимитером. Подготовленные варианты разрешённых входов позволяют callback немедленно отключить один источник, не заглушая остальные, без блокировок и выделений памяти.
+- Все сеансы аудиопроцесса используют один настроенный UDP-порт, один событийный поток приёма и ограниченную маршрутизацию по ID сеанса и закреплённому адресу отправителя. Неизвестные и подменённые межсеансовые пакеты молча отбрасываются; криптосчётчики и защита от повторов остаются отдельными для каждого сеанса.
 
 **Внутренний аудиобэкенд Linux**
 

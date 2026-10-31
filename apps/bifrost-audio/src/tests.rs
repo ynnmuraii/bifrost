@@ -298,6 +298,281 @@ mod local {
             ExitReason::Shutdown
         );
     }
+    async fn drive_many(
+        sources: &mut [Fixture],
+        listener: &mut Fixture,
+        duration: Duration,
+    ) -> w::Health {
+        let deadline = Instant::now() + duration;
+        let mut health = w::Health::default();
+        let mut ping = tokio::time::interval(Duration::from_millis(100));
+        let mut serial = 1;
+        while Instant::now() < deadline {
+            tokio::select! {
+                _ = ping.tick() => {
+                    for source in sources.iter_mut() {
+                        source.core.send(0, Msg::Ping(w::Ping { serial })).await.unwrap();
+                    }
+                    listener.core.send(0, Msg::Ping(w::Ping { serial })).await.unwrap();
+                    serial += 1;
+                }
+                frame = listener.core.recv() => {
+                    match frame.unwrap().frame.msg {
+                        Some(Msg::Health(current)) => health = current,
+                        Some(Msg::Error(error)) => panic!("listener error: {}", error.code),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        health
+    }
+    #[tokio::test]
+    async fn listener_child_shares_one_render_pump_across_three_independent_sessions() {
+        let mut listener = child().await;
+        let mut sources = Vec::new();
+        let (_, b) = ports();
+        for index in 0..3u8 {
+            let source = child().await;
+            let (a, _) = ports();
+            let setup = |role, local, peer| {
+                let mut session = start(role, local, peer);
+                session.session_id = vec![40 + index; 16];
+                session.profile = if index == 1 { 2 } else { 1 };
+                session.forward.as_mut().unwrap().key = vec![60 + index; 32];
+                session.reverse.as_mut().unwrap().key = vec![70 + index; 32];
+                session.forward.as_mut().unwrap().nonce_prefix = vec![80 + index; 4];
+                session.reverse.as_mut().unwrap().nonce_prefix = vec![90 + index; 4];
+                session
+            };
+            listener
+                .core
+                .send(2, Msg::StartSession(setup(2, b, a)))
+                .await
+                .unwrap();
+            let mut source = source;
+            source
+                .core
+                .send(2, Msg::StartSession(setup(1, a, b)))
+                .await
+                .unwrap();
+            sources.push(source);
+        }
+        let pumps = listener.observed.pumps.load(Ordering::Relaxed);
+        let health = drive_many(&mut sources, &mut listener, Duration::from_millis(1600)).await;
+        assert_eq!(health.sessions.len(), 3);
+        assert!(health.sessions.iter().all(|session| session
+            .counters
+            .as_ref()
+            .unwrap()
+            .received_packets
+            > 10));
+        // Three session-local native streams would pump three times per owner tick.
+        let pumped = listener.observed.pumps.load(Ordering::Relaxed) - pumps;
+        assert!((100..220).contains(&pumped), "render pumps: {pumped}");
+        assert!(listener.observed.rms() > 0.1);
+        listener
+            .core
+            .send(
+                3,
+                Msg::SetGain(w::SetGain {
+                    session_id: vec![41; 16],
+                    gain_percent: 25,
+                    muted: true,
+                }),
+            )
+            .await
+            .unwrap();
+        listener
+            .core
+            .send(
+                4,
+                Msg::StopSession(w::StopSession {
+                    session_id: vec![40; 16],
+                }),
+            )
+            .await
+            .unwrap();
+        let remaining = drive_many(&mut sources, &mut listener, Duration::from_millis(1200)).await;
+        assert_eq!(remaining.sessions.len(), 2);
+        for session in &remaining.sessions {
+            let before = health
+                .sessions
+                .iter()
+                .find(|before| before.session_id == session.session_id)
+                .unwrap();
+            assert!(
+                session.counters.as_ref().unwrap().received_packets
+                    > before.counters.as_ref().unwrap().received_packets
+            );
+        }
+        assert!(listener.observed.rms() > 0.05);
+        for id in [41, 42] {
+            listener
+                .core
+                .send(
+                    5,
+                    Msg::StopSession(w::StopSession {
+                        session_id: vec![id; 16],
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        drive_many(&mut sources, &mut listener, Duration::from_millis(200)).await;
+        let stopped_pumps = listener.observed.pumps.load(Ordering::Relaxed);
+        drive_many(&mut sources, &mut listener, Duration::from_millis(150)).await;
+        assert_eq!(
+            listener.observed.pumps.load(Ordering::Relaxed),
+            stopped_pumps
+        );
+        for source in &mut sources {
+            source
+                .core
+                .send(6, Msg::Shutdown(w::Shutdown {}))
+                .await
+                .unwrap();
+        }
+        listener
+            .core
+            .send(6, Msg::Shutdown(w::Shutdown {}))
+            .await
+            .unwrap();
+        for source in sources {
+            assert_eq!(source.handle.await.unwrap().unwrap(), ExitReason::Shutdown);
+        }
+        assert_eq!(
+            listener.handle.await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+    #[tokio::test]
+    async fn source_child_shares_one_socket_for_three_sessions() {
+        let mut listener = child().await;
+        let mut sources = vec![child().await];
+        let (a, b) = ports();
+        for index in 0..3u8 {
+            for (role, local, peer) in [(2, b, a), (1, a, b)] {
+                let mut session = start(role, local, peer);
+                session.session_id = vec![100 + index; 16];
+                session.forward.as_mut().unwrap().key = vec![110 + index; 32];
+                session.reverse.as_mut().unwrap().key = vec![120 + index; 32];
+                session.forward.as_mut().unwrap().nonce_prefix = vec![130 + index; 4];
+                session.reverse.as_mut().unwrap().nonce_prefix = vec![140 + index; 4];
+                if role == 2 {
+                    listener
+                        .core
+                        .send(2, Msg::StartSession(session))
+                        .await
+                        .unwrap();
+                } else {
+                    sources[0]
+                        .core
+                        .send(2, Msg::StartSession(session))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let health = drive_many(&mut sources, &mut listener, Duration::from_millis(1600)).await;
+        assert_eq!(health.sessions.len(), 3);
+        assert!(health.sessions.iter().all(|session| session
+            .counters
+            .as_ref()
+            .unwrap()
+            .received_packets
+            > 10));
+        assert!(listener.observed.rms() > 0.1);
+        sources[0]
+            .core
+            .send(6, Msg::Shutdown(w::Shutdown {}))
+            .await
+            .unwrap();
+        listener
+            .core
+            .send(6, Msg::Shutdown(w::Shutdown {}))
+            .await
+            .unwrap();
+        assert_eq!(
+            sources.remove(0).handle.await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+        assert_eq!(
+            listener.handle.await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+    #[tokio::test]
+    async fn failed_first_start_releases_socket_and_later_bind_must_match() {
+        let mut fixture = child().await;
+        let (a, b) = ports();
+        let mut failed = start(2, a, b);
+        failed.render = Some(w::DeviceSelection {
+            selector: Some(w::device_selection::Selector::DeviceId("MISSING".into())),
+        });
+        fixture
+            .core
+            .send(2, Msg::StartSession(failed))
+            .await
+            .unwrap();
+        loop {
+            if let Msg::Error(error) = next(&mut fixture.core).await {
+                assert_eq!(error.session_id, vec![13; 16]);
+                break;
+            }
+        }
+        drop(UdpSocket::bind(("127.0.0.1", a as u16)).unwrap());
+        let mut first = start(1, a, b);
+        first.session_id = vec![14; 16];
+        first.forward.as_mut().unwrap().key = vec![23; 32];
+        first.reverse.as_mut().unwrap().key = vec![24; 32];
+        fixture
+            .core
+            .send(3, Msg::StartSession(first))
+            .await
+            .unwrap();
+        let mut incompatible = start(1, b, a);
+        incompatible.session_id = vec![15; 16];
+        incompatible.forward.as_mut().unwrap().key = vec![25; 32];
+        incompatible.reverse.as_mut().unwrap().key = vec![26; 32];
+        fixture
+            .core
+            .send(4, Msg::StartSession(incompatible))
+            .await
+            .unwrap();
+        loop {
+            if let Msg::Error(error) = next(&mut fixture.core).await {
+                assert_eq!(error.session_id, vec![15; 16]);
+                assert_eq!(error.code, 6);
+                break;
+            }
+        }
+        fixture
+            .core
+            .send(
+                5,
+                Msg::StopSession(w::StopSession {
+                    session_id: vec![14; 16],
+                }),
+            )
+            .await
+            .unwrap();
+        loop {
+            if let Msg::SessionEvent(event) = next(&mut fixture.core).await {
+                if event.kind == 5 {
+                    assert_eq!(event.session_id, vec![14; 16]);
+                    break;
+                }
+            }
+        }
+        drop(UdpSocket::bind(("127.0.0.1", a as u16)).unwrap());
+        fixture
+            .core
+            .send(6, Msg::Shutdown(w::Shutdown {}))
+            .await
+            .unwrap();
+        assert_eq!(fixture.handle.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
     #[tokio::test]
     async fn silence_exits_and_bad_attach_cannot_probe() {
         let mut fixture = child().await;

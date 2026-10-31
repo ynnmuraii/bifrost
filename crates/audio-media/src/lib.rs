@@ -9,3 +9,4 @@ pub mod mixer;
 mod native_rate;
 pub mod pipeline;
 pub mod runtime;
+pub mod socket;

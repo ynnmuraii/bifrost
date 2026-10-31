@@ -81,7 +81,7 @@ fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow()
         AudioFormat, Capabilities, CaptureSpec, Device, DeviceId, DeviceSelection, Direction,
         RenderRequest,
     };
-    use audio_media::runtime::{start_listener, start_source, SessionConfig, SessionMaterial};
+    use audio_media::runtime::{start_source, ListenerGroup, SessionConfig, SessionMaterial};
     use std::net::UdpSocket;
     let mut backend = DryBackend::new(Capabilities {
         system_capture: true,
@@ -101,7 +101,7 @@ fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow()
         }))
         .unwrap();
     let a = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let b = audio_media::socket::MediaSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
     let aa = a.local_addr().unwrap();
     let ba = b.local_addr().unwrap();
     let keys = || SessionMaterial {
@@ -118,7 +118,7 @@ fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow()
         },
         SessionConfig {
             authorized: Arc::new(AtomicBool::new(true)),
-            socket: a,
+            socket: audio_media::socket::MediaSocket::new(a).unwrap(),
             peer: ba,
             session_id: [3; 16],
             profile: Profile::Ethernet,
@@ -126,7 +126,7 @@ fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow()
         keys(),
     )
     .unwrap();
-    let mut listener = start_listener(
+    let mut group = ListenerGroup::new(
         &mut backend,
         RenderRequest {
             device: DeviceSelection::Explicit(id),
@@ -135,25 +135,60 @@ fn dry_capture_and_render_callbacks_do_not_allocate_even_on_overflow_underflow()
                 channels: 2,
             },
         },
-        SessionConfig {
-            authorized: Arc::new(AtomicBool::new(true)),
-            socket: b,
-            peer: aa,
-            session_id: [3; 16],
-            profile: Profile::Ethernet,
-        },
-        keys(),
     )
     .unwrap();
+    let mut listener = group
+        .join(
+            SessionConfig {
+                authorized: Arc::new(AtomicBool::new(true)),
+                socket: b.clone(),
+                peer: aa,
+                session_id: [3; 16],
+                profile: Profile::Ethernet,
+            },
+            keys(),
+        )
+        .unwrap();
+    let mut extra_listeners = Vec::new();
+    for index in 0..2u8 {
+        extra_listeners.push(
+            group
+                .join(
+                    SessionConfig {
+                        authorized: Arc::new(AtomicBool::new(true)),
+                        socket: b.clone(),
+                        peer: aa,
+                        session_id: [10 + index; 16],
+                        profile: Profile::Wifi,
+                    },
+                    SessionMaterial {
+                        forward: DirectionMaterial::new(
+                            Zeroizing::new([20 + index; 32]),
+                            Zeroizing::new([30 + index; 4]),
+                        ),
+                        reverse: DirectionMaterial::new(
+                            Zeroizing::new([40 + index; 32]),
+                            Zeroizing::new([50 + index; 4]),
+                        ),
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
     // Setup/worker allocations occur outside this thread's counted interval.
     ALLOCATIONS.with(|n| n.set(0));
     ENABLED.with(|flag| flag.set(true));
     for _ in 0..100 {
         source.stream_mut().unwrap().pump(480).unwrap();
-        listener.stream_mut().unwrap().pump(441).unwrap();
+        group.stream_mut().unwrap().pump(441).unwrap();
     }
     ENABLED.with(|flag| flag.set(false));
     assert_eq!(ALLOCATIONS.with(Cell::get), 0);
     source.stop().unwrap();
     listener.stop().unwrap();
+    for listener in &mut extra_listeners {
+        listener.stop().unwrap();
+    }
+    group.stop().unwrap();
 }

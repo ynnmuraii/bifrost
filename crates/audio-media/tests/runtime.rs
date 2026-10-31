@@ -203,7 +203,7 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
         },
         SessionConfig {
             authorized: Arc::new(AtomicBool::new(true)),
-            socket: listener_socket,
+            socket: audio_media::socket::MediaSocket::new(listener_socket).unwrap(),
             peer: relay.address(),
             session_id: [9; 16],
             profile,
@@ -222,7 +222,7 @@ fn exercise(capture_rate: u32, render_rate: u32, profile: Profile, loss: bool, s
         },
         SessionConfig {
             authorized: Arc::new(AtomicBool::new(true)),
-            socket: source_socket,
+            socket: audio_media::socket::MediaSocket::new(source_socket).unwrap(),
             peer: relay.address(),
             session_id: [9; 16],
             profile,
@@ -404,7 +404,7 @@ fn native_snapshot_invalidation_stops_without_a_forwarded_backend_event() {
         },
         SessionConfig {
             authorized: Arc::new(AtomicBool::new(true)),
-            socket: socket(),
+            socket: audio_media::socket::MediaSocket::new(socket()).unwrap(),
             peer: peer.local_addr().unwrap(),
             session_id: [9; 16],
             profile: Profile::Ethernet,
@@ -440,7 +440,7 @@ fn unvalidated_path_times_out_without_transmitting_captured_audio() {
         },
         SessionConfig {
             authorized: Arc::new(AtomicBool::new(true)),
-            socket: socket(),
+            socket: audio_media::socket::MediaSocket::new(socket()).unwrap(),
             peer: peer.local_addr().unwrap(),
             session_id: [9; 16],
             profile: Profile::Ethernet,
@@ -487,7 +487,7 @@ fn authorization_gate_rejects_start_and_revokes_existing_render() {
     let (mut backend, id) = backend(48_000);
     let peer = socket();
     let config = |authorized| SessionConfig {
-        socket: socket(),
+        socket: audio_media::socket::MediaSocket::new(socket()).unwrap(),
         peer: peer.local_addr().unwrap(),
         session_id: [33; 16],
         profile: Profile::Ethernet,
@@ -558,7 +558,7 @@ fn listener_returns_only_after_attempting_authenticated_initial_probe() {
             },
         },
         SessionConfig {
-            socket: socket(),
+            socket: audio_media::socket::MediaSocket::new(socket()).unwrap(),
             peer: peer.local_addr().unwrap(),
             session_id: [27; 16],
             profile: Profile::Ethernet,
@@ -594,7 +594,7 @@ fn listener_first_probe_tolerates_source_port_not_bound_yet() {
     let listener_socket = socket();
     let listener_address = listener_socket.local_addr().unwrap();
     let config = |socket, peer| SessionConfig {
-        socket,
+        socket: audio_media::socket::MediaSocket::new(socket).unwrap(),
         peer,
         session_id: [29; 16],
         profile: Profile::Ethernet,

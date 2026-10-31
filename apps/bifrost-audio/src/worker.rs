@@ -2,6 +2,7 @@ use super::*;
 use audio_media::{
     crypto::DirectionMaterial,
     runtime::{self as media, MediaSession},
+    socket::MediaSocket,
 };
 use audio_model::{jitter::Profile, status::StreamHealth};
 use ring::digest::{digest, SHA256};
@@ -37,6 +38,8 @@ where
     responses: mpsc::Sender<Response>,
     health: watch::Sender<w::Health>,
     sessions: Vec<Running<B::Stream>>,
+    listener: Option<media::ListenerGroup<B::Stream>>,
+    socket: Option<Arc<MediaSocket>>,
     used_ids: Vec<[u8; 16]>,
     used_keys: Vec<[u8; 32]>,
     inventory: Option<Inventory>,
@@ -62,6 +65,8 @@ pub(crate) fn run<B: Backend + 'static>(
         responses,
         health,
         sessions: Vec::with_capacity(contract::MAX_SESSIONS),
+        listener: None,
+        socket: None,
         used_ids: Vec::with_capacity(MAX_STARTS),
         used_keys: Vec::with_capacity(MAX_STARTS * 2),
         inventory: None,
@@ -86,6 +91,13 @@ pub(crate) fn run<B: Backend + 'static>(
                         }
                     }
                 }
+                if let Some(group) = worker.listener.as_mut() {
+                    if let Some(stream) = group.stream_mut() {
+                        if pump(stream).is_err() {
+                            group.on_backend_event(&Event::ResyncRequired);
+                        }
+                    }
+                }
             }
             next_pump += Duration::from_millis(10);
             if Instant::now().saturating_duration_since(next_pump) > Duration::from_millis(20) {
@@ -95,13 +107,18 @@ pub(crate) fn run<B: Backend + 'static>(
         worker.events();
         if Instant::now() >= next_health {
             worker.push_health();
-            next_health = Instant::now() + Duration::from_secs(1);
+            // The IPC task still sends at 1 Hz; a fresher watch slot avoids a second
+            // of phase lag and stale session membership when its timer fires first.
+            next_health = Instant::now() + Duration::from_millis(200);
         }
     }
     worker.shared.stop_all();
     for mut session in worker.sessions.drain(..) {
         let _ = session.media.stop();
         worker.shared.remove(&session.id);
+    }
+    if let Some(group) = worker.listener.as_mut() {
+        let _ = group.stop();
     }
 }
 impl<B: Backend + 'static> Worker<B>
@@ -170,6 +187,14 @@ where
             if let Some(id) = &start_id {
                 self.shared.revoke(id);
                 self.shared.remove(id);
+            }
+            if self.sessions.is_empty() {
+                if let Some(mut group) = self.listener.take() {
+                    if group.stop().is_err() {
+                        self.shared.stop_all();
+                    }
+                }
+                self.socket = None;
             }
             self.response(
                 request_id,
@@ -339,7 +364,16 @@ where
             start.local_scope_id,
         )?;
         let peer = socket_address(&start.peer_ip, start.peer_udp_port, start.peer_scope_id)?;
-        let socket = UdpSocket::bind(bind).map_err(|_| 7)?;
+        let socket = if let Some(socket) = &self.socket {
+            if socket.local_addr().map_err(|_| 7)? != bind {
+                return Err(6);
+            }
+            socket.clone()
+        } else {
+            let socket = MediaSocket::new(UdpSocket::bind(bind).map_err(|_| 7)?).map_err(|_| 7)?;
+            self.socket = Some(socket.clone());
+            socket
+        };
         let port = u32::from(socket.local_addr().map_err(|_| 7)?.port());
         let profile = if start.profile == 1 {
             Profile::Ethernet
@@ -359,11 +393,13 @@ where
             profile,
             authorized: authorized.clone(),
         };
-        let backend = self.backend().map_err(code)?;
         if !authorized.load(Ordering::Acquire) {
             return Err(6);
         }
         let media = if start.role == 1 {
+            if let Some(mut group) = self.listener.take() {
+                group.stop().map_err(|_| 8)?;
+            }
             let capture = start.capture.as_ref().ok_or(6)?;
             let spec = match capture.kind {
                 1 => CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
@@ -377,23 +413,27 @@ where
                 },
                 _ => return Err(1),
             };
-            media::start_source(backend, spec, config, material)
+            media::start_source(self.backend().map_err(code)?, spec, config, material)
         } else {
-            media::start_listener(
-                backend,
-                RenderRequest {
-                    device: selection(start.render.as_ref().ok_or(6)?)?,
-                    requested: format(),
-                },
-                config,
-                material,
-            )
+            let request = RenderRequest {
+                device: selection(start.render.as_ref().ok_or(6)?)?,
+                requested: format(),
+            };
+            if let Some(group) = &self.listener {
+                if !group.accepts(&request) {
+                    return Err(6);
+                }
+            } else {
+                let group = media::ListenerGroup::new(self.backend().map_err(code)?, request)
+                    .map_err(media_error)?;
+                self.listener = Some(group);
+            }
+            self.listener
+                .as_mut()
+                .expect("created above")
+                .join(config, material)
         }
-        .map_err(|error| match error {
-            media::EngineError::Backend(error) => code(error),
-            media::EngineError::Io(_) => 7,
-            _ => 8,
-        })?;
+        .map_err(media_error)?;
         self.sessions.push(Running {
             id,
             role: start.role,
@@ -407,7 +447,19 @@ where
         if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
             let mut session = self.sessions.remove(index);
             session.authorized.store(false, Ordering::Release);
-            let _ = session.media.stop();
+            if session.media.stop().is_err() {
+                self.shared.stop_all();
+                return;
+            }
+            if self.sessions.is_empty() {
+                if let Some(mut group) = self.listener.take() {
+                    if group.stop().is_err() {
+                        self.shared.stop_all();
+                        return;
+                    }
+                }
+                self.socket = None;
+            }
             self.shared.remove(id);
             self.event(id, 5, reason, 0);
         }
@@ -431,6 +483,9 @@ where
             };
             for session in &mut self.sessions {
                 session.media.on_backend_event(&event);
+            }
+            if let Some(group) = self.listener.as_mut() {
+                group.on_backend_event(&event);
             }
             let event = match event {
                 Event::Device(event) => Some(match event {
@@ -458,6 +513,9 @@ where
                 self.inventory = None;
                 self.response(0, Msg::BackendEvent(event));
             }
+        }
+        if let Some(group) = self.listener.as_mut() {
+            group.refresh();
         }
         let mut index = 0;
         while index < self.sessions.len() {
@@ -518,6 +576,13 @@ where
             })
             .collect();
         self.health.send_replace(w::Health { sessions });
+    }
+}
+fn media_error(error: media::EngineError) -> i32 {
+    match error {
+        media::EngineError::Backend(error) => code(error),
+        media::EngineError::Io(_) => 7,
+        _ => 8,
     }
 }
 fn format() -> AudioFormat {
