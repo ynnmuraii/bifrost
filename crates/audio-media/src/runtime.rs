@@ -16,7 +16,7 @@ use audio_backend::{
 use audio_model::{
     jitter::Profile,
     packet::{HEADER_LEN, MAX_DATAGRAM_LEN},
-    status::{AudioHealth, StreamHealth},
+    status::{AudioHealth, ClockSource, DriftDiagnostics, LatencyDiagnostics, StreamHealth},
     Header, PacketKind,
 };
 use ring::rand::{SecureRandom, SystemRandom};
@@ -40,7 +40,6 @@ pub use listener_group::ListenerGroup;
 pub const PCM_RING_SAMPLES: usize = 32_768;
 pub const EVENT_CAPACITY: usize = 16;
 pub const STOP_DEADLINE: Duration = Duration::from_secs(2);
-const IO_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// Socket is bound by the caller; peer must match the authenticated parent's IP and accepted port.
 /// The engine pins that complete tuple. Authenticated rebinding is intentionally unsupported.
@@ -85,6 +84,12 @@ pub struct HealthSnapshot {
     pub sending: bool,
     pub rejected_datagrams: u64,
     pub capture_dropped_frames: u64,
+    pub native_discontinuity_flags: u64,
+    pub drift: Option<DriftDiagnostics>,
+    pub clock_source: ClockSource,
+    pub latency: LatencyDiagnostics,
+    /// Worker loop entries, including notifications and deadline wakes; not native callbacks.
+    pub worker_wakeups: u64,
     pub native: StreamSnapshot,
 }
 #[derive(Debug)]
@@ -126,6 +131,8 @@ struct Stats {
     state: StreamHealth,
     sent: u64,
     rejected: u64,
+    drift: Option<DriftDiagnostics>,
+    latency: LatencyDiagnostics,
 }
 struct Shared {
     stopped: AtomicBool,
@@ -140,14 +147,23 @@ struct Shared {
     callback_invalid: AtomicBool,
     render_frames: AtomicU64,
     render_clock: AtomicU64,
+    render_native_clock: AtomicU64,
+    render_native_observed_ns: AtomicU64,
+    render_callback_ns: AtomicU64,
     callback_underruns: AtomicU64,
     callback_limiter: AtomicU64,
     capture_dropped: AtomicU64,
     capture_discontinuities: AtomicU64,
+    capture_silence: AtomicBool,
+    native_discontinuity_flags: AtomicU64,
+    capture_reanchor: AtomicBool,
     last_media_ms: AtomicU64,
     authorized: Arc<AtomicBool>,
     clock: Instant,
     capture_frames: AtomicU64,
+    capture_clock_ns: AtomicU64,
+    clock_source: AtomicU8,
+    worker_wakeups: AtomicU64,
     last_capture_ms: AtomicU64,
     sent_media_packets: AtomicU64,
     last_send_ms: AtomicU64,
@@ -175,14 +191,23 @@ impl Shared {
             callback_invalid: AtomicBool::new(false),
             render_frames: AtomicU64::new(0),
             render_clock: AtomicU64::new(0),
+            render_native_clock: AtomicU64::new(0),
+            render_native_observed_ns: AtomicU64::new(0),
+            render_callback_ns: AtomicU64::new(0),
             callback_underruns: AtomicU64::new(0),
             callback_limiter: AtomicU64::new(0),
             capture_dropped: AtomicU64::new(0),
             capture_discontinuities: AtomicU64::new(0),
+            capture_silence: AtomicBool::new(false),
+            native_discontinuity_flags: AtomicU64::new(0),
+            capture_reanchor: AtomicBool::new(false),
             last_media_ms: AtomicU64::new(0),
             authorized,
             clock: Instant::now(),
             capture_frames: AtomicU64::new(0),
+            capture_clock_ns: AtomicU64::new(0),
+            clock_source: AtomicU8::new(ClockSource::Unknown as u8),
+            worker_wakeups: AtomicU64::new(0),
             last_capture_ms: AtomicU64::new(0),
             sent_media_packets: AtomicU64::new(0),
             last_send_ms: AtomicU64::new(0),
@@ -193,6 +218,8 @@ impl Shared {
                 state: StreamHealth::Buffering,
                 sent: 0,
                 rejected: 0,
+                drift: None,
+                latency: LatencyDiagnostics::default(),
             }),
         }
     }
@@ -237,6 +264,28 @@ impl Shared {
             let _ = events.try_send(MediaEvent::Started);
         }
     }
+    fn native_render_now(&self) -> Option<u64> {
+        let observed = self.render_native_observed_ns.load(Ordering::Acquire);
+        let now = self.clock.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let elapsed = now.saturating_sub(observed);
+        (observed > 0 && elapsed <= 100_000_000).then(|| {
+            self.render_native_clock
+                .load(Ordering::Acquire)
+                .saturating_add(elapsed.saturating_mul(48_000) / 1_000_000_000)
+        })
+    }
+    fn observe_capture_gap(&self, native_flag: bool, silent: bool, gap_ns: u64) -> bool {
+        if native_flag {
+            self.native_discontinuity_flags
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let covered = self.capture_silence.swap(silent, Ordering::AcqRel);
+        let repair = gap_ns > 0 && !covered && self.started.load(Ordering::Acquire);
+        if repair {
+            self.capture_discontinuities.fetch_add(1, Ordering::Relaxed);
+        }
+        repair
+    }
     fn degraded(&self, events: &SyncSender<MediaEvent>) {
         lock(&self.stats).state = StreamHealth::Degraded;
         if !self.degraded.swap(true, Ordering::AcqRel) {
@@ -262,7 +311,7 @@ pub struct MediaSession<S: Stream + 'static> {
     event_tx: SyncSender<MediaEvent>,
     workers: Vec<JoinHandle<()>>,
     native_stop: Option<JoinHandle<Result<(), BackendError>>>,
-    initial_position: Option<u64>,
+    render_timeline: RenderClock,
     last_native: StreamSnapshot,
     source: bool,
     group_native: Option<Arc<Mutex<StreamSnapshot>>>,
@@ -311,18 +360,37 @@ impl<S: Stream + 'static> MediaSession<S> {
                 _ => {}
             }
             if !self.source {
-                if let (Some(position), Some(base), Some(frequency)) = (
-                    snapshot.device_position,
-                    self.initial_position,
-                    snapshot.clock_frequency,
-                ) {
-                    if frequency > 0 {
-                        let count = (u128::from(position.saturating_sub(base)) * 48_000
-                            / u128::from(frequency))
-                        .min(u128::from(u64::MAX)) as u64;
-                        self.shared.render_clock.fetch_max(count, Ordering::AcqRel);
-                    }
+                let submitted = self.shared.render_frames.load(Ordering::Acquire);
+                let changed = self.render_timeline.previous_native != snapshot.device_position
+                    || self.render_timeline.previous_host != snapshot.host_time_100ns;
+                self.render_timeline.published = self.shared.render_clock.load(Ordering::Acquire);
+                let (clock, source, pending) =
+                    self.render_timeline
+                        .observe(snapshot, submitted, Instant::now());
+                self.shared.render_clock.fetch_max(clock, Ordering::AcqRel);
+                if source == ClockSource::RenderDevicePosition && changed {
+                    self.shared
+                        .render_native_clock
+                        .store(clock, Ordering::Release);
+                    self.shared.render_native_observed_ns.store(
+                        (self
+                            .shared
+                            .clock
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64)
+                            .max(1),
+                        Ordering::Release,
+                    );
+                } else if source != ClockSource::RenderDevicePosition {
+                    self.shared
+                        .render_native_observed_ns
+                        .store(0, Ordering::Release);
                 }
+                self.shared
+                    .clock_source
+                    .store(source as u8, Ordering::Release);
+                lock(&self.shared.stats).latency.native_render_buffer_us = pending;
             }
         }
     }
@@ -362,6 +430,14 @@ impl<S: Stream + 'static> MediaSession<S> {
                 .capture_dropped
                 .load(Ordering::Acquire)
                 .saturating_add(self.last_native.dropped_capture_frames),
+            native_discontinuity_flags: self
+                .shared
+                .native_discontinuity_flags
+                .load(Ordering::Acquire),
+            drift: stats.drift,
+            clock_source: ClockSource::from_code(self.shared.clock_source.load(Ordering::Acquire)),
+            latency: stats.latency,
+            worker_wakeups: self.shared.worker_wakeups.load(Ordering::Relaxed),
             native: self.last_native,
         }
     }
@@ -455,12 +531,123 @@ fn make_session<S: Stream + 'static>(
         event_tx,
         workers: Vec::with_capacity(2),
         native_stop: None,
-        initial_position: snapshot.device_position,
+        render_timeline: RenderClock::new(snapshot),
         last_native: snapshot,
         source,
         group_native: None,
         group_owner: None,
         stop_attempted: false,
+    }
+}
+
+/// Playback progress is not callback submission: hardware can trail by its prebuffer.
+#[derive(Default)]
+struct RenderClock {
+    origin: Option<u64>,
+    previous_native: Option<u64>,
+    previous_host: Option<u64>,
+    changed_at: Option<Instant>,
+    native_anchor: Option<(u64, u64)>,
+    callback_anchor: Option<(u64, u64)>,
+    played: u64,
+    published: u64,
+}
+impl RenderClock {
+    fn new(snapshot: StreamSnapshot) -> Self {
+        Self {
+            origin: snapshot.device_position,
+            ..Self::default()
+        }
+    }
+    fn observe(
+        &mut self,
+        snapshot: StreamSnapshot,
+        submitted: u64,
+        now: Instant,
+    ) -> (u64, ClockSource, Option<u32>) {
+        let native = match (
+            snapshot.device_position,
+            snapshot.clock_frequency,
+            snapshot.host_time_100ns,
+        ) {
+            (Some(position), Some(frequency), Some(host)) if frequency > 0 => {
+                let monotonic = self.previous_native.is_none_or(|last| position >= last)
+                    && self.previous_host.is_none_or(|last| host >= last);
+                if monotonic {
+                    if self.previous_host != Some(host) || self.previous_native != Some(position) {
+                        self.changed_at = Some(now);
+                    }
+                    self.previous_host = Some(host);
+                    self.previous_native = Some(position);
+                }
+                let fresh = self
+                    .changed_at
+                    .is_none_or(|last| now.duration_since(last) < Duration::from_millis(100));
+                let origin = *self.origin.get_or_insert(position);
+                (monotonic && fresh && position >= origin).then(|| {
+                    (u128::from(position - origin) * 48_000 / u128::from(frequency))
+                        .min(u128::from(u64::MAX)) as u64
+                })
+            }
+            _ => None,
+        };
+        if let Some(native) = native {
+            let (anchor, played) = *self
+                .native_anchor
+                .get_or_insert((native, self.played.max(self.published)));
+            self.played = played.saturating_add(native.saturating_sub(anchor));
+            self.callback_anchor = None;
+            let pending = (submitted.saturating_sub(native).saturating_mul(1_000_000) / 48_000)
+                .min(2_000_000) as u32;
+            (
+                self.played,
+                ClockSource::RenderDevicePosition,
+                Some(pending),
+            )
+        } else {
+            let (anchor, played) = *self
+                .callback_anchor
+                .get_or_insert((submitted, self.played.max(self.published)));
+            self.played = played.saturating_add(submitted.saturating_sub(anchor));
+            self.native_anchor = None;
+            (self.played, ClockSource::RenderCallbackFrames, None)
+        }
+    }
+}
+
+#[derive(Default)]
+struct CaptureClock {
+    previous_host: Option<u64>,
+    previous_duration: u64,
+    elapsed_ns: u64,
+}
+
+impl CaptureClock {
+    fn advance(
+        &mut self,
+        timestamp: u64,
+        valid: bool,
+        frames: usize,
+        rate: u32,
+    ) -> (u64, ClockSource) {
+        let duration = (frames as u64).saturating_mul(1_000_000_000) / u64::from(rate.max(1));
+        let host_delta = self
+            .previous_host
+            .filter(|previous| valid && timestamp > *previous)
+            .map(|previous| timestamp - previous);
+        let source = if valid && (self.previous_host.is_none() || host_delta.is_some()) {
+            ClockSource::CaptureHostTimestamp
+        } else {
+            ClockSource::CaptureCallbackFrames
+        };
+        self.elapsed_ns = self
+            .elapsed_ns
+            .saturating_add(host_delta.unwrap_or(self.previous_duration))
+            .saturating_add(duration)
+            .saturating_sub(self.previous_duration);
+        self.previous_host = valid.then_some(timestamp);
+        self.previous_duration = duration;
+        (self.elapsed_ns, source)
     }
 }
 
@@ -476,6 +663,8 @@ where
     if !config.authorized.load(Ordering::Acquire) {
         return Err(EngineError::Unauthorized);
     }
+    // MediaSocket already provides nonblocking session queues and one event-driven
+    // reader; no per-session socket timeout can gate the encoder cadence.
     let start = Instant::now();
     let shared = Arc::new(Shared::new(config.authorized.clone()));
     let endpoint = config.socket.register(
@@ -487,6 +676,8 @@ where
     let (events_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
     let (mut producer, consumer) = RingBuffer::<f32>::new(PCM_RING_SAMPLES);
     let callback_shared = shared.clone();
+    let mut capture_clock = CaptureClock::default();
+    let mut capture_end_ns: Option<u64> = None;
     let mut stream = backend.start_capture(
         spec,
         Box::new(move |block| {
@@ -504,26 +695,73 @@ where
             }
             let expected = callback_shared.native_rate.load(Ordering::Acquire);
             if block.format.channels != 2
-                || block.samples.len() != block.frames * 2
+                || (!block.samples.is_empty() && block.samples.len() != block.frames * 2)
                 || (expected != 0 && block.format.sample_rate != expected)
             {
                 callback_shared
                     .callback_invalid
                     .store(true, Ordering::Release);
+                callback_shared.notification.notify();
                 return;
             }
-            if block.discontinuity {
-                callback_shared
-                    .capture_discontinuities
-                    .fetch_add(1, Ordering::Relaxed);
+            // Process-loopback position may stay constant: only host time or callback frames
+            // advance the capture clock. Device position is deliberately never consulted.
+            let (clock_ns, source) = capture_clock.advance(
+                block.timestamp_ns,
+                block.timestamp_valid,
+                block.frames,
+                block.format.sample_rate,
+            );
+            // Time advances even when PCM is dropped; path validation must not
+            // anchor its capture epoch to the last block that fit in the ring.
+            callback_shared
+                .capture_clock_ns
+                .store(clock_ns, Ordering::Release);
+            callback_shared
+                .clock_source
+                .store(source as u8, Ordering::Release);
+            let duration_ns = (block.frames as u64).saturating_mul(1_000_000_000)
+                / u64::from(block.format.sample_rate.max(1));
+            let gap_ns = capture_end_ns
+                .filter(|_| block.timestamp_valid)
+                .map_or(0, |end| block.timestamp_ns.saturating_sub(end));
+            capture_end_ns = block
+                .timestamp_valid
+                .then_some(block.timestamp_ns.saturating_add(duration_ns));
+            // Timestamp rounding/native block jitter is not a missing capture span.
+            let gap_ns = if gap_ns > 2_000_000 { gap_ns } else { 0 };
+            if callback_shared.observe_capture_gap(
+                block.discontinuity,
+                block.samples.is_empty(),
+                gap_ns,
+            ) {
+                if gap_ns <= 200_000_000 {
+                    let missing = (u128::from(gap_ns) * u128::from(block.format.sample_rate)
+                        / 1_000_000_000) as usize;
+                    if producer.slots() >= missing * 2 + block.samples.len() {
+                        for _ in 0..missing * 2 {
+                            let _ = producer.push(0.0);
+                        }
+                    } else {
+                        callback_shared
+                            .capture_reanchor
+                            .store(true, Ordering::Release);
+                    }
+                } else {
+                    callback_shared
+                        .capture_reanchor
+                        .store(true, Ordering::Release);
+                }
             }
             if producer.slots() < block.samples.len() {
                 callback_shared
                     .capture_dropped
                     .fetch_add(block.frames as u64, Ordering::Relaxed);
-                callback_shared
-                    .capture_discontinuities
-                    .fetch_add(1, Ordering::Relaxed);
+                if callback_shared.started.load(Ordering::Acquire) {
+                    callback_shared
+                        .capture_discontinuities
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
             for &sample in block.samples {
@@ -663,12 +901,14 @@ impl Context {
     fn receive(&mut self, packet: &mut [u8]) -> Result<Option<usize>, StopReason> {
         match self.endpoint.try_recv(packet) {
             Ok(Some(n)) => Ok(Some(n)),
-            Ok(None) => {
-                self.shared.notification.wait_timeout(IO_TIMEOUT);
-                Ok(None)
-            }
+            Ok(None) => Ok(None),
             Err(_) => Err(StopReason::NetworkFailure),
         }
+    }
+    fn wait_until(&self, deadline: Instant) {
+        self.shared
+            .notification
+            .wait_timeout(deadline.saturating_duration_since(Instant::now()));
     }
     fn finish(&self, result: Result<(), StopReason>) {
         if let Err(reason) = result {
@@ -712,6 +952,15 @@ impl PathState {
             validated: false,
             last_reply: None,
         })
+    }
+    fn deadline(&self) -> Option<Instant> {
+        if self.validated {
+            None
+        } else if self.attempts < 3 {
+            Some(self.next.min(self.start + Duration::from_secs(2)))
+        } else {
+            Some(self.start + Duration::from_secs(2))
+        }
     }
     fn probe(&mut self) -> Result<Option<[u8; 16]>, StopReason> {
         if self.validated {
@@ -781,11 +1030,42 @@ impl SourceWorker {
         let mut next_frame = Instant::now();
         let mut next_keepalive = Instant::now();
         let mut dropped = 0;
+        let mut capture_epoch = None;
         let mut discontinuities = 0;
+        let mut activated = false;
+        {
+            let mut stats = lock(&self.context.shared.stats);
+            stats.latency.packetization_us =
+                (self.frame as u64 * 1_000_000 / 48_000).min(2_000_000) as u32;
+            stats.latency.codec_lookahead_us = self
+                .sender
+                .codec_lookahead_us()
+                .map_err(media_reason)?
+                .min(2_000_000);
+        }
         while !self.context.shared.is_stopped() {
+            self.context
+                .shared
+                .worker_wakeups
+                .fetch_add(1, Ordering::Relaxed);
             if self.context.shared.callback_invalid.load(Ordering::Acquire) {
                 self.context.shared.invalidate(&self.context.events);
                 return Err(StopReason::DeviceInvalidated);
+            }
+            if self
+                .context
+                .shared
+                .capture_reanchor
+                .swap(false, Ordering::AcqRel)
+            {
+                capture_epoch = None;
+                for _ in 0..self.input.slots() {
+                    let _ = self.input.pop();
+                }
+                if let Some(converter) = self.converter.as_mut() {
+                    converter.reset();
+                }
+                next_frame = Instant::now();
             }
             let current = self
                 .context
@@ -811,10 +1091,12 @@ impl SourceWorker {
                     .map_err(crypto_reason)?;
                 self.context.send(&outgoing[..n])?;
             }
-            for _ in 0..8 {
+            let mut drained = 0;
+            while drained < 64 && !self.context.shared.is_stopped() {
                 let Some(n) = self.context.receive(&mut packet)? else {
                     break;
                 };
+                drained += 1;
                 match self.opener.open(&mut packet[..n], |_| true) {
                     Ok((header, payload)) => {
                         if self.path.control(header, payload) {
@@ -844,8 +1126,31 @@ impl SourceWorker {
                     Err(_) => lock(&self.context.shared.stats).rejected += 1,
                 }
             }
+            if self.context.shared.is_stopped() {
+                break;
+            }
             if !self.path.validated {
+                // Discard only the current snapshot so a hot callback cannot starve control.
+                for _ in 0..self.input.slots() {
+                    let _ = self.input.pop();
+                }
+                if drained < 64 {
+                    self.context
+                        .wait_until(self.path.deadline().expect("unvalidated path deadline"));
+                }
                 continue;
+            }
+            if !activated {
+                // Authentication activates the live edge, never the preactivation ring tail.
+                for _ in 0..self.input.slots() {
+                    let _ = self.input.pop();
+                }
+                if let Some(converter) = self.converter.as_mut() {
+                    converter.reset();
+                }
+                dropped = self.context.shared.capture_dropped.load(Ordering::Acquire);
+                next_frame = Instant::now();
+                activated = true;
             }
             self.context.shared.started(&self.context.events);
             if Instant::now() >= next_keepalive {
@@ -869,7 +1174,6 @@ impl SourceWorker {
                 for _ in 0..needed * 2 {
                     let _ = self.input.pop();
                 }
-                self.sender.skip_frame();
                 self.context.shared.degraded(&self.context.events);
                 if let Some(converter) = self.converter.as_mut() {
                     converter.reset();
@@ -877,9 +1181,6 @@ impl SourceWorker {
             }
             let current_dropped = self.context.shared.capture_dropped.load(Ordering::Acquire);
             if current_dropped > dropped {
-                let missing = ((current_dropped - dropped) * 48_000 / u64::from(self.rate))
-                    .div_ceil(self.frame as u64);
-                self.sender.skip_frames(missing);
                 dropped = current_dropped;
                 self.context.shared.degraded(&self.context.events);
             }
@@ -887,10 +1188,34 @@ impl SourceWorker {
                 .converter
                 .as_ref()
                 .map_or(self.frame, NativeRate::input_frames);
-            if self.input.slots() >= needed * 2 && Instant::now() >= next_frame {
-                for sample in &mut input[..needed * 2] {
+            if self.input.slots() >= needed * 2 {
+                let clock = Duration::from_nanos(
+                    self.context.shared.capture_clock_ns.load(Ordering::Acquire),
+                );
+                let epoch = *capture_epoch.get_or_insert_with(|| {
+                    Instant::now()
+                        .checked_sub(clock)
+                        .unwrap_or_else(Instant::now)
+                });
+                let queued = Duration::from_nanos(
+                    (self.input.slots() / 2) as u64 * 1_000_000_000 / u64::from(self.rate),
+                );
+                // Host/QPC progression (or callback-frame fallback) bounds the oldest PCM's
+                // send time, while the absolute media grid still prevents catch-up bursts.
+                let capture_due = epoch + clock.saturating_sub(queued);
+                next_frame = next_frame.max(capture_due);
+            }
+            if Instant::now() >= next_frame {
+                let available = (self.input.slots() / 2).min(needed) * 2;
+                input[..needed * 2].fill(0.0);
+                for sample in &mut input[..available] {
                     *sample = self.input.pop().map_err(|_| StopReason::WorkerFailed)?;
                 }
+                let synthesized = available < needed * 2;
+                self.context
+                    .shared
+                    .capture_silence
+                    .store(synthesized, Ordering::Release);
                 if let Some(converter) = self.converter.as_mut() {
                     let n = converter
                         .process(&input[..needed * 2], &mut pcm)
@@ -907,9 +1232,25 @@ impl SourceWorker {
                     .map_err(media_reason)?;
                 self.context.send(&outgoing[..n])?;
                 next_frame += frame_duration;
-                if Instant::now().saturating_duration_since(next_frame) > frame_duration * 2 {
+                if Instant::now() >= next_frame {
+                    // Never send a catch-up burst after a stalled callback or scheduler.
                     next_frame = Instant::now() + frame_duration;
                 }
+            }
+            {
+                let mut stats = lock(&self.context.shared.stats);
+                // One frame is packet assembly, not additional capture backlog.
+                stats.latency.capture_queue_us =
+                    (((self.input.slots() / 2).saturating_sub(needed)) as u64 * 1_000_000
+                        / u64::from(self.rate))
+                    .min(2_000_000) as u32;
+                stats.latency.resampler_delay_us = self.converter.as_ref().map_or(0, |converter| {
+                    (converter.output_delay() as u64 * 1_000_000 / 48_000).min(2_000_000) as u32
+                });
+            }
+            let deadline = next_keepalive.min(next_frame);
+            if drained < 64 {
+                self.context.wait_until(deadline);
             }
         }
         Ok(())
@@ -949,8 +1290,17 @@ impl ReceiveWorker {
         let mut outgoing = [0; MAX_DATAGRAM_LEN];
         let mut next_report = Instant::now();
         while !self.context.shared.is_stopped() {
+            self.context
+                .shared
+                .worker_wakeups
+                .fetch_add(1, Ordering::Relaxed);
             self.send_probe(&mut outgoing)?;
-            if let Some(n) = self.context.receive(&mut packet)? {
+            let mut drained = 0;
+            while drained < 64 && !self.context.shared.is_stopped() {
+                let Some(n) = self.context.receive(&mut packet)? else {
+                    break;
+                };
+                drained += 1;
                 let now = self.context.shared.render_clock.load(Ordering::Acquire);
                 let result = lock(&self.receiver).receive(now, &mut packet[..n], |header| {
                     header.kind != PacketKind::Opus || self.path.validated
@@ -1012,6 +1362,12 @@ impl ReceiveWorker {
                     next_report = Instant::now() + Duration::from_secs(1);
                 }
             }
+            // Revisit stop/path/report deadlines even under a continuously full queue.
+            // A full batch can leave queued packets after their notification was consumed.
+            if drained < 64 {
+                self.context
+                    .wait_until(self.path.deadline().unwrap_or(next_report));
+            }
         }
         Ok(())
     }
@@ -1020,6 +1376,300 @@ impl ReceiveWorker {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+    #[test]
+    fn render_playback_clock_tracks_hardware_behind_submitted_callbacks() {
+        let now = Instant::now();
+        let mut snapshot = StreamSnapshot {
+            status: StreamStatus::Running,
+            device_position: Some(9000),
+            clock_frequency: Some(48_000),
+            host_time_100ns: Some(1000),
+            underrun_frames: 0,
+            dropped_capture_frames: 0,
+        };
+        let mut clock = RenderClock::new(snapshot);
+        assert_eq!(
+            clock.observe(snapshot, 1920, now),
+            (0, ClockSource::RenderDevicePosition, Some(40_000))
+        );
+        snapshot.device_position = Some(9480);
+        snapshot.host_time_100ns = Some(101000);
+        assert_eq!(
+            clock.observe(snapshot, 2880, now + Duration::from_millis(10)),
+            (480, ClockSource::RenderDevicePosition, Some(50_000))
+        );
+        // Stale hardware cannot pin playout forever; fallback changes no clock epoch.
+        assert_eq!(
+            clock.observe(snapshot, 3360, now + Duration::from_millis(120)),
+            (480, ClockSource::RenderCallbackFrames, None)
+        );
+        assert_eq!(
+            clock
+                .observe(snapshot, 3840, now + Duration::from_millis(130))
+                .0,
+            960
+        );
+        snapshot.device_position = Some(9960);
+        snapshot.host_time_100ns = Some(201000);
+        assert_eq!(
+            clock
+                .observe(snapshot, 4320, now + Duration::from_millis(140))
+                .0,
+            960
+        );
+        snapshot.device_position = Some(10440);
+        snapshot.host_time_100ns = Some(301000);
+        assert_eq!(
+            clock
+                .observe(snapshot, 4800, now + Duration::from_millis(150))
+                .0,
+            1440
+        );
+        snapshot.host_time_100ns = None;
+        assert_eq!(
+            clock
+                .observe(snapshot, 5280, now + Duration::from_millis(160))
+                .1,
+            ClockSource::RenderCallbackFrames
+        );
+        clock.published = 2400;
+        snapshot.host_time_100ns = Some(401000);
+        snapshot.device_position = Some(10920);
+        assert_eq!(
+            clock
+                .observe(snapshot, 5760, now + Duration::from_millis(170))
+                .0,
+            2400,
+            "native recovery must align to extrapolated callback fallback, not rewind"
+        );
+        snapshot.clock_frequency = Some(0);
+        assert_eq!(
+            clock
+                .observe(snapshot, 6240, now + Duration::from_millis(180))
+                .1,
+            ClockSource::RenderCallbackFrames
+        );
+    }
+
+    #[test]
+    fn exhausted_path_attempts_wait_for_timeout_not_expired_probe() {
+        let start = Instant::now();
+        let mut path = PathState::new(start).unwrap();
+        path.attempts = 3;
+        path.next = start - Duration::from_secs(1);
+        assert_eq!(path.deadline(), Some(start + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn actual_capture_callback_publishes_clock_even_when_ring_overflows() {
+        use audio_backend::dry::{DryBackend, ScriptEvent};
+        use audio_backend::{Capabilities, Device, DeviceId, DeviceSelection, Direction};
+        use zeroize::Zeroizing;
+        let mut backend = DryBackend::new(Capabilities {
+            system_capture: true,
+            ..Default::default()
+        });
+        let id = DeviceId::new("DRY_CLOCK_OVERFLOW").unwrap();
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        backend
+            .apply(ScriptEvent::UpsertDevice(Device {
+                id: id.clone(),
+                label: "Dry clock overflow".into(),
+                direction: Direction::Render,
+                format,
+            }))
+            .unwrap();
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut source = start_source(
+            &mut backend,
+            CaptureSpec::Monitor {
+                sink: DeviceSelection::Explicit(id),
+                format,
+            },
+            SessionConfig {
+                socket: MediaSocket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+                    .unwrap(),
+                peer: peer.local_addr().unwrap(),
+                session_id: [77; 16],
+                profile: Profile::Ethernet,
+                authorized: Arc::new(AtomicBool::new(true)),
+            },
+            SessionMaterial {
+                forward: DirectionMaterial::new(Zeroizing::new([1; 32]), Zeroizing::new([2; 4])),
+                reverse: DirectionMaterial::new(Zeroizing::new([3; 32]), Zeroizing::new([4; 4])),
+            },
+        )
+        .unwrap();
+        let shared = source.shared.clone();
+        // Park the encoder at its off-RT status mutex; the capture callback must not need it.
+        let status = lock(&shared.stats);
+        shared
+            .capture_discontinuities
+            .fetch_add(1, Ordering::Release);
+        shared.notification.notify();
+        // More than two ring capacities also covers a previously running drain iteration.
+        for _ in 0..112 {
+            source.stream_mut().unwrap().pump(480).unwrap();
+        }
+        assert!(shared.capture_dropped.load(Ordering::Acquire) > 0);
+        assert_eq!(
+            shared.capture_clock_ns.load(Ordering::Acquire),
+            1_120_000_000
+        );
+        drop(status);
+        source.stop().unwrap();
+    }
+
+    #[test]
+    fn discontinuities_ignore_activation_and_covered_silence_not_zero_pcm() {
+        let shared = Shared::new(Arc::new(AtomicBool::new(true)));
+        shared.observe_capture_gap(true, false, 10_000_000);
+        assert_eq!(shared.capture_discontinuities.load(Ordering::Acquire), 0);
+        shared.started.store(true, Ordering::Release);
+        shared.observe_capture_gap(true, false, 0);
+        assert_eq!(shared.capture_discontinuities.load(Ordering::Acquire), 0);
+        shared.capture_silence.store(true, Ordering::Release);
+        shared.observe_capture_gap(true, false, 10_000_000);
+        assert_eq!(shared.capture_discontinuities.load(Ordering::Acquire), 0);
+        shared.observe_capture_gap(true, false, 10_000_000);
+        assert_eq!(shared.capture_discontinuities.load(Ordering::Acquire), 1);
+        assert_eq!(shared.native_discontinuity_flags.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn constant_capture_position_host_clock_and_fallback_keep_media_flowing() {
+        use audio_backend::CaptureBlock;
+        use zeroize::Zeroizing;
+        for valid in [true, false] {
+            let socket =
+                MediaSocket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let shared = Arc::new(Shared::new(Arc::new(AtomicBool::new(true))));
+            let endpoint = socket
+                .register(
+                    [8; 16],
+                    peer.local_addr().unwrap(),
+                    shared.socket_rejected.clone(),
+                    shared.notification.clone(),
+                )
+                .unwrap();
+            let (events, _events_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+            let (mut producer, input) = RingBuffer::new(PCM_RING_SAMPLES);
+            let keys = SessionKeys::new(
+                Endpoint::MediaSender,
+                [8; 16],
+                0,
+                DirectionMaterial::new(Zeroizing::new([1; 32]), Zeroizing::new([2; 4])),
+                DirectionMaterial::new(Zeroizing::new([3; 32]), Zeroizing::new([4; 4])),
+            )
+            .unwrap();
+            let start = Instant::now();
+            let mut path = PathState::new(start).unwrap();
+            path.validated = true;
+            let worker = SourceWorker {
+                context: Context {
+                    endpoint,
+                    shared: shared.clone(),
+                    events,
+                    start,
+                },
+                sender: Sender::new(Profile::Ethernet, keys.send, 0).unwrap(),
+                opener: keys.receive,
+                input,
+                converter: None,
+                frame: 480,
+                rate: 48_000,
+                path,
+            };
+            let worker = thread::spawn(move || worker.run());
+            let samples = [0.0; 960];
+            let mut clock = CaptureClock::default();
+            let mut previous = 0;
+            for index in 0..30 {
+                let block = CaptureBlock {
+                    samples: &samples,
+                    frames: 480,
+                    format: AudioFormat {
+                        sample_rate: 48_000,
+                        channels: 2,
+                    },
+                    timestamp_ns: 9_000_000_000 + index * 10_000_000,
+                    timestamp_valid: valid,
+                    device_position: Some(0),
+                    discontinuity: false,
+                };
+                let (time, source) = clock.advance(
+                    block.timestamp_ns,
+                    block.timestamp_valid,
+                    block.frames,
+                    block.format.sample_rate,
+                );
+                assert!(time > previous);
+                previous = time;
+                assert_eq!(
+                    source,
+                    if valid {
+                        ClockSource::CaptureHostTimestamp
+                    } else {
+                        ClockSource::CaptureCallbackFrames
+                    }
+                );
+                shared.capture_clock_ns.store(time, Ordering::Release);
+                for &sample in block.samples {
+                    producer.push(sample).unwrap();
+                }
+                shared.notification.notify();
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(shared.sent_media_packets.load(Ordering::Acquire) >= 28);
+            let before_idle = shared.worker_wakeups.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(200));
+            let silence_wakes = shared.worker_wakeups.load(Ordering::Relaxed) - before_idle;
+            assert!(
+                (15..=25).contains(&silence_wakes),
+                "media deadlines, not idle polling: {silence_wakes}"
+            );
+            assert!(shared.worker_wakeups.load(Ordering::Relaxed) < 160);
+            let stopped = Instant::now();
+            shared.request_stop(StopReason::User);
+            worker.join().unwrap();
+            assert!(stopped.elapsed() < Duration::from_millis(200));
+        }
+    }
+
+    #[test]
+    fn capture_host_clock_authority_uses_host_delta_and_invalid_time_uses_frames() {
+        let mut clock = CaptureClock::default();
+        assert_eq!(clock.advance(0, true, 480, 48_000).0, 10_000_000);
+        assert_eq!(clock.advance(15_000_000, true, 480, 48_000).0, 25_000_000);
+        assert_eq!(
+            clock.advance(u64::MAX, false, 480, 48_000),
+            (35_000_000, ClockSource::CaptureCallbackFrames),
+        );
+        assert_eq!(clock.advance(0, false, 480, 48_000).0, 45_000_000);
+    }
+
+    #[test]
+    fn capture_clock_keeps_advancing_past_ring_capacity() {
+        // Clock progression is independent of PCM retention. Delayed path validation
+        // now drains preactivation PCM, so force a full ring at this narrower seam.
+        let (mut producer, _consumer) = RingBuffer::<f32>::new(PCM_RING_SAMPLES);
+        for _ in 0..PCM_RING_SAMPLES {
+            producer.push(0.5).unwrap();
+        }
+        let mut clock = CaptureClock::default();
+        let mut elapsed = 0;
+        for index in 0..56 {
+            assert!(producer.slots() < 960);
+            elapsed = clock.advance(index * 10_000_000, true, 480, 48_000).0;
+        }
+        assert_eq!(elapsed, 560_000_000);
+    }
+
     #[test]
     fn startup_icmp_refusal_never_validates_and_stops_being_transient_after_validation() {
         let socket = MediaSocket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();

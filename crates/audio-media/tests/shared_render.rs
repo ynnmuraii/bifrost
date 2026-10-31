@@ -14,7 +14,7 @@ use audio_model::jitter::Profile;
 use std::{
     net::UdpSocket,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -26,6 +26,8 @@ struct ToneBackend {
     dry: DryBackend,
     frequency: f64,
     render_opens: usize,
+    silent_until: u64,
+    onset: Option<(Instant, Arc<AtomicU64>)>,
 }
 impl ToneBackend {
     fn new(frequency: f64, rate: u32) -> Self {
@@ -59,6 +61,8 @@ impl ToneBackend {
             dry,
             frequency,
             render_opens: 0,
+            silent_until: 0,
+            onset: None,
         }
     }
 }
@@ -83,11 +87,18 @@ impl Backend for ToneBackend {
         mut callback: CaptureCallback,
     ) -> Result<DryStream, BackendError> {
         let frequency = self.frequency;
+        let silent_until = self.silent_until;
+        let onset = self.onset.clone();
         let mut scratch = [0.0; MAX_CAPTURE_BLOCK_FRAMES * 2];
         let mut position = 0u64;
         self.dry.start_capture(
             request,
             Box::new(move |block| {
+                if position <= silent_until && position + block.frames as u64 > silent_until {
+                    if let Some((clock, observed)) = &onset {
+                        observed.store(clock.elapsed().as_nanos() as u64 + 1, Ordering::Release);
+                    }
+                }
                 for (index, frame) in scratch[..block.frames * 2]
                     .as_chunks_mut::<2>()
                     .0
@@ -99,6 +110,11 @@ impl Backend for ToneBackend {
                             / f64::from(block.format.sample_rate))
                         .sin() as f32
                             * 0.22;
+                    let sample = if position + index as u64 >= silent_until {
+                        sample
+                    } else {
+                        0.0
+                    };
                     *frame = [sample; 2];
                 }
                 position += block.frames as u64;
@@ -195,6 +211,23 @@ fn three_sources_share_one_socket_and_one_listener_port() {
     exercise(48_000, true);
 }
 fn exercise(rate: u32, shared_source: bool) {
+    // The attack must not stall this fixture's simulated native device clock.
+    let mut attack_sealer =
+        audio_media::crypto::Sealer::new(material(0).forward, [1; 16], 0).unwrap();
+    let mut attack = [0; audio_model::packet::MAX_DATAGRAM_LEN];
+    let mut attack_len = 0;
+    for _ in 0..4096 {
+        attack_len = attack_sealer
+            .seal(
+                0,
+                audio_model::PacketKind::PathChallenge,
+                0,
+                0,
+                &[0; 16],
+                &mut attack,
+            )
+            .unwrap();
+    }
     let frequencies = [600.0, 1100.0, 1700.0];
     let mut output_backend = ToneBackend::new(0.0, rate);
     let mut group = ListenerGroup::new(&mut output_backend, request()).unwrap();
@@ -271,41 +304,29 @@ fn exercise(rate: u32, shared_source: bool) {
     let mut windows: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::new());
     let mut actions = [false; 6];
     let start = Instant::now();
+    let mut media_start: Option<Instant> = None;
     let mut due = Duration::ZERO;
     let mut last_position = 0;
     let mut injected = false;
     let mut received_at_injection = None;
-    // A replacement route may need the bounded 500 ms path-probe retry before media starts.
-    while start.elapsed() < Duration::from_millis(4500) {
+    let mut rejected_at_injection = None;
+    // Compare gains only after all paths and tones exist, never against a retry/PLC transient.
+    // Startup latency has its own strict onset and delayed-validation regressions.
+    while media_start.is_none_or(|ready| ready.elapsed() < Duration::from_millis(4500)) {
         let elapsed = start.elapsed();
-        let ms = elapsed.as_millis();
+        if media_start.is_none() {
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "all three tones failed to start"
+            );
+        }
+        let ms = media_start.map_or(0, |ready| ready.elapsed().as_millis());
         if ms >= 700 && !injected {
             if let Some(socket) = &inject_from_b {
-                let rejected_before = listeners[0].snapshot().rejected_datagrams;
-                let mut sealer =
-                    audio_media::crypto::Sealer::new(material(0).forward, [1; 16], 0).unwrap();
-                let mut packet = [0; audio_model::packet::MAX_DATAGRAM_LEN];
-                // Advance beyond legitimate A's replay window; wrong-tuple packets must never reach it.
-                for number in 0..4096 {
-                    let n = sealer
-                        .seal(
-                            0,
-                            audio_model::PacketKind::PathChallenge,
-                            0,
-                            0,
-                            &[0; 16],
-                            &mut packet,
-                        )
-                        .unwrap();
-                    if number == 4095 {
-                        socket.send_to(&packet[..n], listener_address).unwrap();
-                    }
-                }
-                thread::sleep(Duration::from_millis(10));
-                assert_eq!(
-                    listeners[0].snapshot().rejected_datagrams,
-                    rejected_before + 1
-                );
+                rejected_at_injection = Some(listeners[0].snapshot().rejected_datagrams);
+                socket
+                    .send_to(&attack[..attack_len], listener_address)
+                    .unwrap();
                 assert!(listeners[0].snapshot().health.received_packets > 10);
                 received_at_injection = Some(listeners[0].snapshot().health.received_packets);
             }
@@ -317,6 +338,10 @@ fn exercise(rate: u32, shared_source: bool) {
                     0 => {
                         if let Some(before) = received_at_injection {
                             assert!(listeners[0].snapshot().health.received_packets > before);
+                            assert_eq!(
+                                listeners[0].snapshot().rejected_datagrams,
+                                rejected_at_injection.unwrap() + 1
+                            );
                         }
                         listeners[1].set_gain(0.25).unwrap();
                     }
@@ -376,6 +401,22 @@ fn exercise(rate: u32, shared_source: bool) {
             last_position = stream.processed_frames();
             let samples = stream.rendered_samples().collect::<Vec<_>>();
             let tail = &samples[samples.len() - frames * 2..];
+            if media_start.is_none()
+                && sources
+                    .iter_mut()
+                    .all(|source| source.snapshot().sent_media_packets > 0)
+                && listeners
+                    .iter_mut()
+                    .all(|listener| listener.snapshot().health.received_packets > 0)
+            {
+                let mono = tail.iter().step_by(2).copied().collect::<Vec<_>>();
+                if frequencies
+                    .iter()
+                    .all(|&frequency| amplitude(&mono, frequency, rate) > 0.04)
+                {
+                    media_start = Some(Instant::now());
+                }
+            }
             if (2300..2450).contains(&ms) || (3100..3250).contains(&ms) {
                 let remaining = tail.iter().step_by(2).copied().collect::<Vec<_>>();
                 assert!(
@@ -534,4 +575,106 @@ fn authorization_revocation_silences_already_mixed_pcm_without_waiting_for_contr
     assert!(group.stream_mut().is_none());
     source.stop().unwrap();
     group.stop().unwrap();
+}
+
+#[test]
+fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
+    let mut output_backend = ToneBackend::new(0.0, 48_000);
+    let mut group = ListenerGroup::new(&mut output_backend, request()).unwrap();
+    let listener_socket = socket();
+    let source_socket = socket();
+    let config = |socket, peer| SessionConfig {
+        socket,
+        peer,
+        session_id: [61; 16],
+        profile: Profile::Ethernet,
+        authorized: Arc::new(AtomicBool::new(true)),
+    };
+    let mut listener = group
+        .join(
+            config(listener_socket.clone(), source_socket.local_addr().unwrap()),
+            material(61),
+        )
+        .unwrap();
+    let mut source_backend = ToneBackend::new(1230.0, 48_000);
+    source_backend.silent_until = 48_000;
+    let timeline = Instant::now();
+    let capture_onset = Arc::new(AtomicU64::new(0));
+    source_backend.onset = Some((timeline, capture_onset.clone()));
+    let mut source = start_source(
+        &mut source_backend,
+        CaptureSpec::SystemExcludingOwnProcessTree {
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        },
+        config(source_socket, listener_socket.local_addr().unwrap()),
+        material(61),
+    )
+    .unwrap();
+    let mut rendered = Vec::with_capacity(140 * 480);
+    let start = Instant::now();
+    let mut warmup_health = None;
+    let mut stages = Vec::new();
+    let mut output_onset = None;
+    for frame in 0..140 {
+        let due = start + Duration::from_millis(frame * 10);
+        thread::sleep(due.saturating_duration_since(Instant::now()));
+        source.stream_mut().unwrap().pump(480).unwrap();
+        let output = group.stream_mut().unwrap();
+        let render_at = timeline.elapsed().as_secs_f64();
+        output.pump(480).unwrap();
+        let recent: Vec<f32> = output.rendered_samples().collect();
+        if output_onset.is_none() {
+            if let Some(offset) = recent[recent.len() - 960..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .position(|frame| frame[0].abs() > 0.01)
+            {
+                output_onset = Some(render_at + offset as f64 / 48_000.0);
+            }
+        }
+        rendered.extend(
+            recent[recent.len() - 960..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|frame| frame[0]),
+        );
+        group.refresh();
+        if frame == 80 {
+            warmup_health = Some(listener.snapshot().health);
+        }
+        if frame >= 90 {
+            stages.push((source.snapshot().latency, listener.snapshot().latency));
+        }
+    }
+    let health = listener.snapshot().health;
+    let warmup = warmup_health.unwrap();
+    source.stop().unwrap();
+    listener.stop().unwrap();
+    group.stop().unwrap();
+    let captured = capture_onset.load(Ordering::Acquire);
+    assert!(captured > 0, "capture onset observed");
+    let captured_seconds = (captured - 1) as f64 / 1_000_000_000.0;
+    // Dry delivers a complete capture block at each pump. Charge its 10ms acquisition
+    // and an explicit 20ms hardware FIFO model; neither is a Windows hardware measurement.
+    // Compare real callback instants: a loaded host may delay a Dry pump without
+    // advancing its logical frame counter. Frame-index subtraction invents latency.
+    let latency_ms =
+        (output_onset.expect("tone rendered") - captured_seconds) * 1000.0 + 10.0 + 20.0;
+    println!("actual Dry/socket/shared-mixer onset={latency_ms:.4}ms including modeled capture10ms/native20ms; stages={:?}", stages.last());
+    assert!(
+        (55.0..=86.0).contains(&latency_ms),
+        "wired runtime {latency_ms}ms"
+    );
+    assert_eq!(health.lost_frames, warmup.lost_frames, "post-warmup loss");
+    assert_eq!(
+        health.late_frames, warmup.late_frames,
+        "post-warmup late frames"
+    );
+    assert_eq!(health.underruns, warmup.underruns, "post-warmup underruns");
+    assert!(rendered.iter().all(|sample| sample.is_finite()));
 }

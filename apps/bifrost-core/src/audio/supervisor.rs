@@ -1052,13 +1052,28 @@ mod tests {
                         listener.renew_session([13; 16], 1000).await.unwrap();
                     },
                     event = source_events.recv() => match event.expect("source events") {
-                        AudioSupervisorEvent::Health { health, .. } => sending |= health.sessions.iter().any(|session| session.sending == Some(true) && session.capture_active == Some(true) && session.sent_media_packets > 0),
+                        AudioSupervisorEvent::Health { health, .. } => {
+                            if let Some(session) = health.sessions.iter().find(|session| session.sending == Some(true) && session.capture_active == Some(true) && session.sent_media_packets > 0) {
+                                assert_eq!(session.clock_source, 1, "Dry capture uses valid host timestamps");
+                                assert!(session.drift.is_none(), "Source does not run a drift PI");
+                                sending = true;
+                            }
+                        },
                         AudioSupervisorEvent::Failed { reason, .. } => panic!("source failed: {reason}"),
                         AudioSupervisorEvent::CommandRejected { error, .. } => panic!("source rejected: {error:?}"),
                         _ => {}
                     },
                     event = listener_events.recv() => match event.expect("listener events") {
-                        AudioSupervisorEvent::Health { health, .. } => receiving |= health.sessions.iter().any(|session| session.counters.as_ref().is_some_and(|counters| counters.received_packets > 0)),
+                        AudioSupervisorEvent::Health { health, .. } => {
+                            if let Some(session) = health.sessions.iter().find(|session| session.counters.as_ref().is_some_and(|counters| counters.received_packets > 0) && session.drift.is_some()) {
+                                let drift = session.drift.as_ref().unwrap();
+                                assert!((-1000..=1000).contains(&drift.ratio_ppm));
+                                assert!(drift.filtered_fill_error_frames.is_finite());
+                                assert!(drift.filtered_fill_error_frames.abs() <= 48_000.0);
+                                assert!([3, 4].contains(&session.clock_source), "Listener identifies its actual render clock");
+                                receiving = true;
+                            }
+                        },
                         AudioSupervisorEvent::Failed { reason, .. } => panic!("listener failed: {reason}"),
                         AudioSupervisorEvent::CommandRejected { error, .. } => panic!("listener rejected: {error:?}"),
                         _ => {}

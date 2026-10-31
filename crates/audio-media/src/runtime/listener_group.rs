@@ -1,6 +1,7 @@
 //! One native output, independently authenticated receivers, and an off-RT summing worker.
 use super::*;
 use crate::mixer::{Mixer, MAX_INPUTS};
+use audio_model::status::ClockSource;
 use rtrb::Producer;
 use std::{collections::VecDeque, sync::OnceLock};
 
@@ -47,6 +48,8 @@ struct Input {
     receiver: Arc<Mutex<Receiver>>,
     decoded: Vec<f32>,
     queue: VecDeque<f32>,
+    queue_target: usize,
+    queue_limit: usize,
     converter: Option<NativeRate>,
     converted: Vec<f32>,
     staging: [f32; 480],
@@ -85,6 +88,9 @@ impl<S: Stream + 'static> ListenerGroup<S> {
         let (producer, mut consumer) = RingBuffer::<MixedFrame>::new(PCM_RING_SAMPLES / 2);
         let callback_shared = shared.clone();
         let callback_gates = gates.clone();
+        let callback_quantum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let native_quantum = callback_quantum.clone();
+        let mut submitted_native_frames = 0u64;
         let mut stream = backend.start_render(
             request.clone(),
             Box::new(move |output| {
@@ -97,6 +103,7 @@ impl<S: Stream + 'static> ListenerGroup<S> {
                     }
                     return;
                 }
+                native_quantum.store(output.len() / 2, Ordering::Release);
                 let mut underrun = false;
                 for frame in output.as_chunks_mut::<2>().0 {
                     match consumer.pop() {
@@ -112,17 +119,40 @@ impl<S: Stream + 'static> ListenerGroup<S> {
                         .callback_underruns
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                let total = callback_shared
-                    .render_frames
-                    .fetch_add((output.len() / 2) as u64, Ordering::AcqRel)
-                    + (output.len() / 2) as u64;
                 let rate = callback_shared.native_rate.load(Ordering::Acquire);
                 if rate > 0 {
-                    callback_shared.render_clock.fetch_max(
-                        total.saturating_mul(48_000) / u64::from(rate),
-                        Ordering::AcqRel,
+                    submitted_native_frames =
+                        submitted_native_frames.saturating_add((output.len() / 2) as u64);
+                    let total = submitted_native_frames.saturating_mul(48_000) / u64::from(rate);
+                    let frames = total.saturating_sub(
+                        callback_shared.render_frames.swap(total, Ordering::AcqRel),
                     );
+                    if let Some(clock) = callback_shared.native_render_now() {
+                        callback_shared
+                            .render_clock
+                            .fetch_max(clock, Ordering::AcqRel);
+                        callback_shared
+                            .clock_source
+                            .store(ClockSource::RenderDevicePosition as u8, Ordering::Release);
+                    } else {
+                        callback_shared
+                            .render_clock
+                            .fetch_add(frames, Ordering::AcqRel);
+                        callback_shared
+                            .clock_source
+                            .store(ClockSource::RenderCallbackFrames as u8, Ordering::Release);
+                    }
                 }
+                callback_shared.render_callback_ns.store(
+                    (callback_shared
+                        .clock
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64)
+                        .max(1),
+                    Ordering::Release,
+                );
+                callback_shared.notification.notify();
             }),
         )?;
         let format = stream.format();
@@ -145,7 +175,13 @@ impl<S: Stream + 'static> ListenerGroup<S> {
             thread::Builder::new()
                 .name("bfa-mix".into())
                 .spawn(move || {
-                    mix_loop(shared, mix_inputs, producer, format.sample_rate);
+                    mix_loop(
+                        shared,
+                        mix_inputs,
+                        producer,
+                        format.sample_rate,
+                        callback_quantum,
+                    );
                 })?,
         );
         Ok(Self {
@@ -171,6 +207,10 @@ impl<S: Stream + 'static> ListenerGroup<S> {
         for input in inputs.slots.iter().flatten() {
             input.shared.render_clock.store(
                 self.output.shared.render_clock.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            input.shared.clock_source.store(
+                self.output.shared.clock_source.load(Ordering::Acquire),
                 Ordering::Release,
             );
             if self.output.shared.is_stopped() {
@@ -276,12 +316,17 @@ impl<S: Stream + 'static> ListenerGroup<S> {
             .set(shared.clone())
             .map_err(|_| EngineError::GroupFull)?;
         inputs.mixer.reset_input(slot);
+        let native_frame =
+            (u64::from(rate) * u64::from(config.profile.frame_samples())).div_ceil(48_000) as usize;
+        let queue_limit = (native_frame * 3 + rate.div_ceil(200) as usize) * 2;
         inputs.slots[slot] = Some(Input {
             shared: shared.clone(),
             events: tx.clone(),
             receiver,
             decoded: vec![0.0; capacity],
-            queue: VecDeque::with_capacity(PCM_RING_SAMPLES),
+            queue: VecDeque::with_capacity(queue_limit),
+            queue_target: (rate / 200).max(1) as usize * 2,
+            queue_limit,
             converter,
             converted,
             staging: [0.0; 480],
@@ -303,7 +348,7 @@ impl<S: Stream + 'static> ListenerGroup<S> {
             event_tx: tx,
             workers: Vec::with_capacity(1),
             native_stop: None,
-            initial_position: None,
+            render_timeline: RenderClock::default(),
             last_native: *lock(&self.native),
             source: false,
             group_native: Some(self.native.clone()),
@@ -341,8 +386,9 @@ fn mix_loop(
     inputs: Arc<Mutex<Inputs>>,
     mut output: Producer<MixedFrame>,
     rate: u32,
+    callback_quantum: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    let block = (rate / 100).max(1) as usize;
+    let block = (rate / 200).max(1) as usize;
     let mut scratch: [Vec<f32>; MAX_INPUTS] = std::array::from_fn(|_| vec![0.0; block * 2]);
     let mut mixed = vec![[[0.0; 2]; 1 << MAX_INPUTS]; block];
     while !shared.is_stopped() {
@@ -350,13 +396,29 @@ fn mix_loop(
             shared.request_stop(StopReason::DeviceInvalidated);
             break;
         }
+        let target = callback_quantum
+            .load(Ordering::Acquire)
+            .max((rate / 100) as usize)
+            .min(PCM_RING_SAMPLES / 2 - block);
+        if PCM_RING_SAMPLES / 2 - output.slots() >= target {
+            shared.notification.wait_timeout(Duration::from_millis(100));
+            continue;
+        }
+        if let Some(clock) = shared.native_render_now() {
+            shared.render_clock.fetch_max(clock, Ordering::AcqRel);
+        }
         let now = shared.render_clock.load(Ordering::Acquire);
         let mut inputs = lock(&inputs);
+        let mut next_decode = None;
         for slot in 0..MAX_INPUTS {
             let Some(input) = inputs.slots[slot].as_mut() else {
                 continue;
             };
             input.shared.render_clock.store(now, Ordering::Release);
+            input.shared.clock_source.store(
+                shared.clock_source.load(Ordering::Acquire),
+                Ordering::Release,
+            );
             input.shared.callback_underruns.store(
                 shared
                     .callback_underruns
@@ -371,7 +433,12 @@ fn mix_loop(
             }
             let fill = input.queue.len() as f64 / 2.0 * 48_000.0 / f64::from(rate)
                 + (PCM_RING_SAMPLES / 2 - output.slots()) as f64 * 48_000.0 / f64::from(rate);
-            let result = lock(&input.receiver).playout(now, fill, &mut input.decoded);
+            // Stop decoding ahead of playback; leave encoded media in its bounded jitter buffer.
+            let result = if input.queue.len() < input.queue_target {
+                lock(&input.receiver).playout(now, fill, &mut input.decoded)
+            } else {
+                Ok(0)
+            };
             match result {
                 Ok(n) => {
                     let mut overflow = false;
@@ -382,7 +449,7 @@ fn mix_loop(
                             if input.staged == input.staging.len() {
                                 match converter.process(&input.staging, &mut input.converted) {
                                     Ok(frames) => {
-                                        if input.queue.len() + frames * 2 <= PCM_RING_SAMPLES {
+                                        if input.queue.len() + frames * 2 <= input.queue_limit {
                                             input.queue.extend(&input.converted[..frames * 2]);
                                         } else {
                                             overflow = true;
@@ -393,7 +460,7 @@ fn mix_loop(
                                 input.staged = 0;
                             }
                         }
-                    } else if input.queue.len() + n * 2 <= PCM_RING_SAMPLES {
+                    } else if input.queue.len() + n * 2 <= input.queue_limit {
                         input.queue.extend(&input.decoded[..n * 2]);
                     } else {
                         overflow = true;
@@ -404,10 +471,42 @@ fn mix_loop(
                 }
                 Err(error) => input.shared.request_stop(media_reason(error)),
             }
-            let health = lock(&input.receiver).health();
+            let receiver = lock(&input.receiver);
+            let health = receiver.health();
+            let drift = receiver.drift_diagnostics();
+            let mut latency = receiver.latency_diagnostics();
+            if input.queue.len() < block * 2 {
+                if let Some(deadline) = receiver
+                    .next_playout_deadline()
+                    .filter(|deadline| *deadline > now)
+                {
+                    next_decode =
+                        Some(next_decode.map_or(deadline, |next: u64| next.min(deadline)));
+                }
+            }
+            latency.decoded_queue_us = ((input.queue.len() as u64 / 2) * 1_000_000
+                / u64::from(rate)
+                + (input.staged as u64 / 2) * 1_000_000 / 48_000)
+                .min(2_000_000) as u32;
+            latency.render_queue_us = ((PCM_RING_SAMPLES / 2 - output.slots()) as u64 * 1_000_000
+                / u64::from(rate))
+            .min(2_000_000) as u32;
+            latency.resampler_delay_us = latency
+                .resampler_delay_us
+                .saturating_add(
+                    (input.converter.as_ref().map_or(0, NativeRate::output_delay) as u64
+                        * 1_000_000
+                        / u64::from(rate))
+                    .min(2_000_000) as u32,
+                )
+                .min(2_000_000);
+            latency.native_render_buffer_us = lock(&shared.stats).latency.native_render_buffer_us;
+            drop(receiver);
             let mut stats = lock(&input.shared.stats);
             let lost = health.lost_frames > stats.health.lost_frames;
             stats.health = health;
+            stats.drift = Some(drift);
+            stats.latency = latency;
             drop(stats);
             if lost
                 || input.shared.started.load(Ordering::Acquire)
@@ -417,8 +516,27 @@ fn mix_loop(
                 input.shared.degraded(&input.events);
             }
         }
-        // Keep one 10 ms aggregate block queued; never build latency during a stalled device.
-        if output.slots() >= block && PCM_RING_SAMPLES / 2 - output.slots() < block {
+        if let Some(deadline) = next_decode.filter(|_| shared.native_render_now().is_some()) {
+            let now_ns = shared.clock.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let callback_ns = shared.render_callback_ns.load(Ordering::Acquire);
+            let until_callback = (callback_quantum.load(Ordering::Acquire) as u64)
+                .saturating_mul(1_000_000_000)
+                / u64::from(rate);
+            let safe_wait = until_callback
+                .saturating_sub(now_ns.saturating_sub(callback_ns))
+                .saturating_sub(1_000_000);
+            let wait = deadline.saturating_sub(now).saturating_mul(1_000_000_000) / 48_000;
+            if callback_ns > 0 && wait > 0 && wait <= safe_wait {
+                // Do not queue a whole silent native period just before a jitter deadline.
+                drop(inputs);
+                shared
+                    .notification
+                    .wait_timeout(Duration::from_nanos(wait.min(5_000_000)));
+                continue;
+            }
+        }
+        // Five-ms sums, but retain a full callback quantum so larger native requests don't starve.
+        if output.slots() >= block && PCM_RING_SAMPLES / 2 - output.slots() < target {
             let entries = std::array::from_fn(|slot| {
                 inputs.slots[slot]
                     .as_ref()
@@ -457,7 +575,7 @@ fn mix_loop(
             }
         }
         drop(inputs);
-        thread::sleep(Duration::from_millis(1));
+        // Refill the complete native quantum before parking, not one 5ms block per sleep.
     }
     for input in lock(&inputs).slots.iter().flatten() {
         input.shared.request_stop(shared.reason());
@@ -534,6 +652,10 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(
+            ClockSource::from_code(group.output.shared.clock_source.load(Ordering::Acquire)),
+            ClockSource::Unknown,
+        );
         let mut stream = group.output.stream.take().unwrap();
         let guard = lock(&group.inputs);
         let (tx, rx) = mpsc::sync_channel(1);
@@ -545,6 +667,10 @@ mod tests {
         drop(guard);
         let (result, stream) = result.expect("callback waited for the mixing lock");
         result.unwrap();
+        assert_eq!(
+            ClockSource::from_code(group.output.shared.clock_source.load(Ordering::Acquire)),
+            ClockSource::RenderCallbackFrames,
+        );
         group.output.stream = Some(stream);
         callback.join().unwrap();
         group.stop().unwrap();

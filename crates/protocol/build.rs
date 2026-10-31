@@ -30,6 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".bifrost.audio_worker.v1.Attach",
             ".bifrost.audio_worker.v1.DirectionMaterial",
             ".bifrost.audio_worker.v1.StartSession",
+            ".bifrost.audio_worker.v1.MediaInfo",
+            ".bifrost.audio_worker.v1.MediaSessions",
         ])
         .compile_fds(audio_fds)?;
 

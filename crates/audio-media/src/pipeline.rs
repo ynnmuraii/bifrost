@@ -8,7 +8,7 @@ use audio_model::{
     drift::{CoarseCorrection, DriftController},
     jitter::{InsertError, JitterBuffer, Playout, Profile},
     packet::MAX_PAYLOAD_LEN,
-    status::AudioHealth,
+    status::{AudioHealth, DriftDiagnostics, LatencyDiagnostics},
     Header, PacketKind,
 };
 use audioadapter_buffers::direct::InterleavedSlice;
@@ -56,6 +56,13 @@ impl Sender {
             encoded: [0; MAX_PAYLOAD_LEN],
         })
     }
+    /// Algorithmic delay queried from the configured Opus encoder, not a profile estimate.
+    pub fn codec_lookahead_us(&mut self) -> Result<u32, MediaError> {
+        Ok(
+            (u64::from(self.encoder.lookahead_samples()?) * 1_000_000 / 48_000).min(2_000_000)
+                as u32,
+        )
+    }
     /// One caller-paced frame. A failed send is never retried by this layer.
     pub fn encode(
         &mut self,
@@ -76,14 +83,6 @@ impl Sender {
             &self.encoded[..n],
             datagram,
         )?)
-    }
-    pub(crate) fn skip_frame(&mut self) {
-        self.skip_frames(1);
-    }
-    pub(crate) fn skip_frames(&mut self, count: u64) {
-        self.timestamp = self
-            .timestamp
-            .wrapping_add(count.wrapping_mul(u64::from(self.profile.frame_samples())) as u32);
     }
     /// Control/probes share the same owned nonce counter as media packets.
     pub(crate) fn control(
@@ -167,6 +166,7 @@ pub struct Receiver {
     decoder: OpusDecoder,
     resampler: DriftResampler,
     drift: DriftController,
+    coarse_corrections: u64,
     profile: Profile,
     render_target: u32,
     jitter_target: u32,
@@ -188,6 +188,7 @@ impl Receiver {
             decoder: OpusDecoder::new(profile)?,
             resampler: DriftResampler::new(usize::from(profile.frame_samples()))?,
             drift: DriftController::new(render_target, profile.frame_samples()),
+            coarse_corrections: 0,
             profile,
             render_target,
             jitter_target: profile.initial_delay(),
@@ -203,6 +204,29 @@ impl Receiver {
     }
     pub fn health(&self) -> AudioHealth {
         self.jitter.health()
+    }
+    pub fn drift_diagnostics(&self) -> DriftDiagnostics {
+        DriftDiagnostics {
+            ratio_ppm: self.drift.ratio_ppm().round() as i32,
+            filtered_fill_error_frames: self.drift.filtered_fill_error_frames(),
+            coarse_corrections: self.coarse_corrections,
+        }
+    }
+    pub fn next_playout_deadline(&self) -> Option<u64> {
+        self.jitter.next_deadline()
+    }
+    /// Encoded media and interpolation delay only; caller-owned PCM queues are separate.
+    /// Jitter storage overlaps its scheduling target and must not be added to it.
+    pub fn latency_diagnostics(&self) -> LatencyDiagnostics {
+        LatencyDiagnostics {
+            jitter_target_us: (u64::from(self.jitter.target_samples()) * 1_000_000 / 48_000)
+                .min(2_000_000) as u32,
+            jitter_buffer_us: (u64::from(self.jitter.buffered_samples()) * 1_000_000 / 48_000)
+                .min(2_000_000) as u32,
+            resampler_delay_us: (self.resampler.output_delay() as u64 * 1_000_000 / 48_000)
+                .min(2_000_000) as u32,
+            ..LatencyDiagnostics::default()
+        }
     }
     pub fn target_delay_samples(&self) -> u32 {
         self.jitter.target_samples()
@@ -340,6 +364,7 @@ impl Receiver {
         match update.correction {
             CoarseCorrection::None => Ok(n),
             CoarseCorrection::DropFrame => {
+                self.coarse_corrections = self.coarse_corrections.saturating_add(1);
                 self.fade_in = true;
                 Ok(0)
             }
@@ -355,8 +380,115 @@ impl Receiver {
                             previous * (1.0 - gain) + output[(n + i) * 2 + ch] * gain;
                     }
                 }
+                self.coarse_corrections = self.coarse_corrections.saturating_add(1);
                 Ok(n * 2)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::DirectionMaterial;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn authenticated_controls_do_not_anchor_first_media_or_inflate_jitter() {
+        let material = || DirectionMaterial::new(Zeroizing::new([42; 32]), Zeroizing::new([12; 4]));
+        let mut sender = Sender::new(
+            Profile::Ethernet,
+            Sealer::new(material(), [8; 16], 0).unwrap(),
+            98_765_431,
+        )
+        .unwrap();
+        let mut receiver = Receiver::new(
+            Profile::Ethernet,
+            Opener::new(material(), [8; 16]).unwrap(),
+            480,
+        )
+        .unwrap();
+        let mut packet = [0; 1200];
+        let mut output = vec![0.0; receiver.output_capacity_samples()];
+        for ms in (0..500).step_by(10) {
+            let n = sender
+                .control(ms, PacketKind::Keepalive, &[1], &mut packet)
+                .unwrap();
+            receiver
+                .receive(ms * 48, &mut packet[..n], |_| true)
+                .unwrap();
+            assert_eq!(receiver.playout(ms * 48, 0.0, &mut output).unwrap(), 0);
+        }
+        assert_eq!(receiver.latency_diagnostics().jitter_buffer_us, 0);
+        for frame in 0..160 {
+            let now = 24_000 + frame * 480;
+            let pcm = if frame < 110 { [0.0; 960] } else { [0.1; 960] };
+            let n = sender.encode(now / 48, &pcm, &mut packet).unwrap();
+            receiver.receive(now, &mut packet[..n], |_| true).unwrap();
+            receiver.playout(now, 480.0, &mut output).unwrap();
+        }
+        let health = receiver.health();
+        assert_eq!(health.received_packets, 160);
+        assert_eq!(health.lost_frames, 0);
+        assert_eq!(health.late_frames, 0);
+        assert_eq!(health.concealed_frames, 0);
+        assert_eq!(health.discontinuities, 0);
+        assert_eq!(health.underruns, 0);
+        assert_eq!(receiver.target_delay_samples(), 1440);
+        assert_eq!(receiver.drift_diagnostics().coarse_corrections, 0);
+    }
+
+    #[test]
+    fn diagnostics_count_applied_drop_duplicate_and_survive_rebuffer() {
+        let material = || DirectionMaterial::new(Zeroizing::new([42; 32]), Zeroizing::new([12; 4]));
+        let mut sender = Sender::new(
+            Profile::Ethernet,
+            Sealer::new(material(), [8; 16], 0).unwrap(),
+            0,
+        )
+        .unwrap();
+        let mut receiver = Receiver::new(
+            Profile::Ethernet,
+            Opener::new(material(), [8; 16]).unwrap(),
+            480,
+        )
+        .unwrap();
+        let mut output = vec![0.0; receiver.output_capacity_samples()];
+        let mut packet = [0; 1200];
+        assert_eq!(receiver.playout(0, 5000.0, &mut output).unwrap(), 0);
+        assert_eq!(receiver.drift_diagnostics().coarse_corrections, 0);
+        let mut applied = 0;
+        let mut drops = 0;
+        let mut duplicates = 0;
+        for frame in 0..100 {
+            let now = frame * 480;
+            let n = sender.encode(now / 48, &[0.0; 960], &mut packet).unwrap();
+            receiver.receive(now, &mut packet[..n], |_| true).unwrap();
+            let fill = if frame < 50 { 5000.0 } else { -1000.0 };
+            let n = receiver.playout(now, fill, &mut output).unwrap();
+            let count = receiver.drift_diagnostics().coarse_corrections;
+            if count > applied {
+                assert_eq!(count, applied + 1);
+                if frame < 50 {
+                    assert_eq!(n, 0);
+                    drops += 1;
+                } else {
+                    assert!(n > 480);
+                    duplicates += 1;
+                }
+                applied = count;
+            }
+        }
+        assert!(drops > 0 && duplicates > 0);
+        receiver.drift.reset(480);
+        assert_eq!(receiver.drift_diagnostics().coarse_corrections, applied);
+        for frame in 100..140 {
+            receiver.playout(frame * 480, 480.0, &mut output).unwrap();
+        }
+        assert!(receiver.paused);
+        let diagnostics = receiver.drift_diagnostics();
+        assert_eq!(diagnostics.coarse_corrections, applied);
+        assert_eq!(diagnostics.ratio_ppm, 0);
+        assert_eq!(diagnostics.filtered_fill_error_frames, 0.0);
     }
 }

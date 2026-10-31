@@ -28,9 +28,10 @@ impl Notification {
     }
 
     pub fn notify(&self) {
-        self.pending.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.get() {
-            worker.unpark();
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            if let Some(worker) = self.worker.get() {
+                worker.unpark();
+            }
         }
     }
 
@@ -39,6 +40,14 @@ impl Notification {
     pub fn wait_timeout(&self, timeout: Duration) {
         self.worker.get_or_init(thread::current);
         if !self.pending.swap(false, Ordering::AcqRel) {
+            // WaitOnAddress-backed park timeouts are coarse on Windows. Use std's
+            // high-resolution sleep for the final media-frame deadline instead.
+            // Notifications stay latched; stop can be delayed by at most 10 ms.
+            #[cfg(windows)]
+            if timeout <= Duration::from_millis(10) {
+                thread::sleep(timeout);
+                return;
+            }
             // An intervening notify leaves an unpark token, even before park begins.
             thread::park_timeout(timeout);
         }
@@ -333,6 +342,39 @@ mod tests {
 
     fn udp() -> UdpSocket {
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()
+    }
+
+    #[test]
+    fn notification_preserves_pre_wait_and_racing_wakes() {
+        let notification = Arc::new(Notification::new());
+        notification.notify();
+        notification.notify();
+        let start = Instant::now();
+        notification.wait_timeout(Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_millis(100));
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_notification = Arc::new(Notification::new());
+        let producer_notification = worker_notification.clone();
+        let published = Arc::new(AtomicU64::new(0));
+        let observed = published.clone();
+        let worker = thread::spawn(move || {
+            for sequence in 1..=100 {
+                ready_tx.send(()).unwrap();
+                while observed.load(Ordering::Acquire) < sequence {
+                    worker_notification.wait_timeout(Duration::from_secs(1));
+                }
+                done_tx.send(()).unwrap();
+            }
+        });
+        for sequence in 1..=100 {
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            published.store(sequence, Ordering::Release);
+            producer_notification.notify();
+            done_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        }
+        worker.join().unwrap();
     }
 
     #[test]

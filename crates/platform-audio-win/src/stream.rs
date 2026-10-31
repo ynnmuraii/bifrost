@@ -31,6 +31,10 @@ enum CaptureSink {
     Ring(Producer<CapturedFrame>),
     Callback(audio_backend::CaptureCallback),
 }
+enum CaptureTarget {
+    Process { pid: u32, include: bool },
+    DefaultEndpointForProbe,
+}
 enum RenderSource {
     Ring(Consumer<StereoFrame>),
     Callback(audio_backend::RenderCallback),
@@ -227,7 +231,13 @@ pub fn start_capture_excluding(
             "process loopback requires Windows build 20348",
         ));
     }
-    start_process_capture(pid, false, CaptureSink::Ring(sink))
+    start_capture(
+        CaptureTarget::Process {
+            pid,
+            include: false,
+        },
+        CaptureSink::Ring(sink),
+    )
 }
 /// Diagnostic positive control used by hw_probe; never use this for a Source.
 #[doc(hidden)]
@@ -240,7 +250,27 @@ pub fn start_capture_including_for_probe(
             "process loopback requires Windows build 20348",
         ));
     }
-    start_process_capture(pid, true, CaptureSink::Ring(sink))
+    start_capture(
+        CaptureTarget::Process { pid, include: true },
+        CaptureSink::Ring(sink),
+    )
+}
+/// Diagnostic capture of the entire default multimedia render endpoint, not a process.
+///
+/// The endpoint is resolved once at startup; default changes do not retarget the stream.
+/// Shared-mode engine conversion requests 48 kHz f32 stereo even for a 44.1 kHz or
+/// multichannel mix. Unsupported conversion fails startup; native mix bytes are never
+/// reinterpreted as stereo. This does not alter endpoint selection, volume or mute.
+/// Silence may produce no packets. Ring overflow and invalidation follow the same
+/// rules as process capture. Never use this whole-endpoint probe as a Source.
+#[doc(hidden)]
+pub fn start_endpoint_loopback_for_probe(
+    sink: Producer<CapturedFrame>,
+) -> Result<StreamHandle, Error> {
+    start_capture(
+        CaptureTarget::DefaultEndpointForProbe,
+        CaptureSink::Ring(sink),
+    )
 }
 pub(crate) fn start_capture_callback(
     callback: audio_backend::CaptureCallback,
@@ -250,18 +280,29 @@ pub(crate) fn start_capture_callback(
             "process loopback requires Windows build 20348",
         ));
     }
-    start_process_capture(std::process::id(), false, CaptureSink::Callback(callback))
+    start_capture(
+        CaptureTarget::Process {
+            pid: std::process::id(),
+            include: false,
+        },
+        CaptureSink::Callback(callback),
+    )
 }
 
-fn start_process_capture(
-    pid: u32,
-    include: bool,
-    mut sink: CaptureSink,
-) -> Result<StreamHandle, Error> {
+fn start_capture(target: CaptureTarget, mut sink: CaptureSink) -> Result<StreamHandle, Error> {
     start_worker(move |state, ready| {
         let setup = || -> Result<_, Error> {
             let apartment = Apartment::mta()?;
-            let mut client = AudioClient::new_application_loopback_client(pid, include)?;
+            let mut client = match target {
+                CaptureTarget::Process { pid, include } => {
+                    AudioClient::new_application_loopback_client(pid, include)?
+                }
+                CaptureTarget::DefaultEndpointForProbe => DeviceEnumerator::new()?
+                    .get_default_device_for_role(&Direction::Render, &wasapi::Role::Multimedia)?
+                    .get_iaudioclient()?,
+            };
+            // A render endpoint + Capture sets LOOPBACK; autoconvert adds
+            // AUTOCONVERTPCM | SRC_DEFAULT_QUALITY for this exact client format.
             client.initialize_client(
                 &format(),
                 &Direction::Capture,
@@ -628,6 +669,11 @@ mod tests {
     fn explicit_format_and_ring_handoff() {
         let f = format();
         assert_eq!(f.get_samplespersec(), SAMPLE_RATE);
+        assert_eq!(f.get_nchannels(), 2);
+        assert_eq!(f.get_bitspersample(), 32);
+        assert_eq!(f.get_validbitspersample(), 32);
+        assert_eq!(f.get_blockalign(), 8);
+        assert_eq!(f.get_subformat().unwrap(), SampleType::Float);
         let (mut tx, mut rx) = rtrb::RingBuffer::new(2);
         let frame = CapturedFrame {
             samples: [0.25, -0.25],

@@ -15,6 +15,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Disable TLS session resumption so every runtime and pairing connection re-runs certificate pin verification.
 - Bind clipboard grants to the authenticated peer as well as the parent link, and fail closed when a live parent's negotiated version is missing.
 - Fix boxed auxiliary exporter storage with the locked zeroize version while retaining a stable heap allocation and erasure before deallocation.
+- Keep Unix-only audio-child test helpers out of Windows builds so all-target clippy remains warning-free.
+- Keep Source pacing independent of Winsock's coarse receive timeout: shared UDP reception and capture-ring notifications wake media workers without a millisecond polling loop.
 
 **New**
 
@@ -41,6 +43,19 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback tests cover loss/reorder/injection and device invalidation.
 - Both audio endpoints immediately authenticate the UDP path; Listener startup attempts its first challenge before returning, enabling Listener-first commit ordering and stateful outbound firewall state. Media remains gated on validation, with the existing three-attempt/500 ms-window/two-second bounds; a two-sided stateful-firewall relay test verifies recovery and audio flow.
 
+**Audio worker timing**
+
+- Source and UDP receiver workers wait on lock-free capture/packet notifications and absolute media/control deadlines instead of idle polling. Capture clock hints prefer valid host/QPC timestamps and never use capture device positions, which may remain constant between process-loopback packets.
+- Keep the Source host clock advancing when its capture ring overflows before path validation, preventing a permanently future capture epoch. On Windows, short media deadlines use high-resolution waits instead of coarse park timeouts while long idle waits remain event-driven.
+- Expose bounded drift ratio ppm, filtered fill error, applied coarse-correction count and actual clock authority through private worker Health. Source reports no drift controller; Listener observations survive PI resets.
+- Bound Source inbound work to 64 packets before revisiting shutdown and media/control deadlines, so pinned-peer invalid-tag floods cannot starve pacing or shutdown.
+- Print receiver drift diagnostics and clock authority in the Windows audible E2E example alongside independent capture-clock estimates.
+- Drive Listener drift timing from a valid native playback position/frequency/host snapshot, not callback submission. Preserve a monotonic timeline across fallback and report native queued depth without assuming unknown depth is zero.
+- Discard preactivation capture and flush the live edge once when the UDP path validates, rather than transmitting old ring contents. Regression coverage keeps jitter anchoring on the first authenticated media frame, not control traffic or preactivation timestamps.
+- Keep an uninterrupted transmitted sample grid through capture silence without DTX. Fill uncovered host-time gaps with bounded silence (at most 200 ms), reanchor larger gaps, and report native discontinuity flags separately from actual capture repairs.
+- Expose bounded per-stage latency observations, use 5 ms aggregate mix blocks with a native-callback quantum floor, and bound decoded lane queues. A deterministic wired chirp fixture with a modeled 20 ms native FIFO improves from 86.688 to 81.688 ms without changing jitter profile targets; native hardware timing requires platform verification.
+- Wake the mixer from render consumption and refill a complete native quantum before parking. When safe before the next callback, honor an imminent jitter deadline rather than queueing an extra silent output period.
+
 **Shared Listener media**
 
 - Mix up to three independently authenticated sessions into one native Listener render stream with stable lanes, per-session gain/mute ramps and aggregate limiting. Queued authorization-subset frames let the realtime callback revoke one input without muting the others, taking locks or allocating.
@@ -58,6 +73,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Add a separate private audio-worker protobuf/AudioLink contract with bounded commands, version/generation/sequence checks, explicit backend probing, one-use secret extraction and recursive Debug redaction. Reuse existing same-user IPC endpoints; no samples or secrets enter GUI messages.
 - Add the internal audio child role behind the default-enabled binary `audio` feature. It lazily owns native/Dry backends and at most three authorized UDP sessions, revokes media on core silence/disconnect, rejects reused session/key material, and pushes bounded actual capture/send observations. No native device is opened before an explicit command; core supervision remains a separate integration step.
+- Add an explicitly audible Windows audio-child E2E example with same-user named-pipe authorization, encrypted UDP, process-tree exclusion and endpoint-loopback verification of a listener-only tone tail. Diagnostic capture requests 48 kHz stereo conversion without changing endpoint settings.
 
 **Audio process supervision**
 
@@ -67,6 +83,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Require explicit per-session authorization grants of at most one second, renewed independently of IPC Ping. Expiration gates queued render PCM and outgoing media, stops only the expired session, and cannot be resurrected by a stale renewal.
 - Distinguish native `Started` acknowledgment from `PathValidated`, so the Listener can acknowledge initialization before the Source exists without deadlocking the commit handshake. Supervisor shutdown also has reserved admission during restart/backoff.
+
+**Audio M5/M6 worker contract**
+
+- Add bounded private microphone-mute/PTT and opt-in media-watch/command messages. Metadata is Debug-redacted, command completions are correlated, and lease/timestamp/hotkey validation remains fail-closed; core integration is separate.
 
 ### Русский
 
@@ -79,6 +99,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Возобновление TLS отключено: каждое рабочее и сопрягающее соединение заново проверяет закреплённый сертификат.
 - Разрешения буфера обмена привязаны к удостоверенному узлу и родительскому соединению; отсутствие согласованной версии живого родителя обрабатывается безопасным отказом.
 - Исправлено хранение корневого секрета экспорта с закреплённой версией zeroize: сохраняются стабильное размещение в куче и стирание до освобождения памяти.
+- Unix-only вспомогательный метод тестов аудиопроцесса исключён из сборки Windows, чтобы clippy всех целей не выдавал предупреждение.
+- Темп Source больше не зависит от грубого таймера приёма Winsock: общий UDP-приём и уведомления кольца захвата пробуждают обработчики без миллисекундного опроса.
 
 **Новое**
 
@@ -105,6 +127,19 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства.
 - Оба конца аудиосеанса сразу проверяют UDP-путь; Listener пытается отправить первый аутентифицированный запрос до возврата из запуска, позволяя сначала открыть исходящее состояние межсетевого экрана. Медиа остаётся закрытым до проверки пути; сохранены три попытки, окна 500 мс и предел две секунды. Тест с двусторонним stateful-фильтром проверяет восстановление пути и доставку звука.
 
+**Время аудиопроцесса**
+
+- Обработчики Source и UDP-приёма ждут уведомлений захвата/пакетов без блокировок в callback и абсолютных сроков медиа/управления вместо опроса пустых очередей. Часы захвата используют достоверные временные метки host/QPC, а не позиции устройства, которые могут оставаться неизменными между пакетами process-loopback.
+- Часы Source продолжают идти при переполнении кольца захвата до подтверждения пути, не позволяя эпохе захвата навсегда уйти в будущее. В Windows короткие медиадедлайны используют высокоточное ожидание вместо грубого park timeout; длинные ожидания сохраняют пробуждение по событиям.
+- Закрытые сводки Health передают ограниченные ppm ресэмплинга, фильтрованную ошибку наполнения, число применённых грубых коррекций и фактический источник часов. У Source нет ПИ-регулятора дрейфа; счётчик Listener сохраняется при сбросах ПИ.
+- Входящая обработка Source ограничена 64 пакетами перед повторной проверкой остановки и сроков медиа/управления: поток пакетов с неверным тегом от закреплённого адреса не блокирует темп передачи и завершение.
+- Звуковой E2E-пример Windows выводит диагностику дрейфа приёмника и источник часов рядом с независимой оценкой часов захвата.
+- Часы дрейфа Listener используют достоверные нативные позицию воспроизведения, частоту и время host, а не число переданных callback кадров. Переходы на резервные часы сохраняют монотонность; неизвестная глубина нативного буфера не подменяется нулём.
+- Захват до подтверждения UDP-пути отбрасывается, а при активации один раз очищается старый хвост кольца. Регрессионные тесты закрепляют начало джиттера по первому проверенному медиакадру, а не управляющим пакетам и времени до активации.
+- При тишине захвата сохраняется непрерывная временная сетка отправленных кадров без DTX. Непокрытые разрывы времени host заполняются тишиной до 200 мс; большие разрывы переустанавливают опорную точку. Нативные флаги discontinuity учитываются отдельно от реальных исправлений захвата.
+- Добавлены ограниченные наблюдения задержки по стадиям, блоки общего микшера 5 мс с запасом не меньше нативного callback и ограниченные очереди декодированных входов. Детерминированный тест с моделью нативного FIFO 20 мс улучшился с 86,688 до 81,688 мс без изменения профилей джиттера; нативные задержки проверяются на соответствующей платформе.
+- Микшер пробуждается при потреблении выхода и перед ожиданием заполняет весь нативный квант. Если запас до следующего callback позволяет, он ждёт близкий срок джиттера вместо постановки лишнего периода тишины в очередь.
+
 **Общий аудиовыход Listener**
 
 - До трёх независимо проверяемых сеансов микшируются в один нативный поток Listener со стабильными входами, плавной громкостью/заглушением и общим лимитером. Подготовленные варианты разрешённых входов позволяют callback немедленно отключить один источник, не заглушая остальные, без блокировок и выделений памяти.
@@ -122,6 +157,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Добавлен отдельный закрытый контракт protobuf/AudioLink аудиопроцесса с ограниченными командами, проверкой версии/поколения/последовательности, явным запросом проверки бэкенда, одноразовым извлечением секретов и скрытием их в Debug. Используются существующие локальные IPC-каналы того же пользователя; сэмплы и секреты не попадают в GUI.
 - Добавлена внутренняя роль дочернего аудиопроцесса под включённой по умолчанию функцией сборки `audio`. Бэкенды native/Dry создаются только по запросу; не более трёх разрешённых UDP-сеансов останавливаются при потере core, повторное использование сеансов/ключей отклоняется, фактические захват/отправка передаются в ограниченных сводках. До явной команды устройства не открываются; надзор core интегрируется отдельно.
+- Добавлен явно запускаемый звуковой E2E-пример аудиопроцесса Windows: авторизация через локальные named pipes, шифрованный UDP, исключение дерева процесса и проверка тона слушателя через endpoint loopback после остановки источника. Диагностический захват запрашивает преобразование в 48 кГц stereo без изменения настроек устройства.
 
 **Надзор аудиопроцесса**
 
@@ -131,6 +167,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Каждый сеанс получает отдельное явное разрешение не более чем на секунду; продление не связано с IPC Ping. Истечение закрывает вывод подготовленного PCM и передачу медиа только этого сеанса; запоздалое продление не восстанавливает его.
 - Нативное подтверждение `Started` отделено от `PathValidated`: Listener подтверждает инициализацию до запуска Source, не блокируя commit. Остановка надзора имеет отдельный канал, доступный и во время перезапуска/backoff.
+
+**Контракт аудиопроцесса M5/M6**
+
+- Добавлены ограниченные закрытые сообщения микрофонного mute/PTT и явно включаемых медиаданных/команд. Метаданные скрыты в Debug, результаты команд связаны с запросами, сроки PTT и сочетания клавиш проверяются с безопасным отказом; интеграция core выполняется отдельно.
 
 ## 0.4.0 — 2026-10-30
 

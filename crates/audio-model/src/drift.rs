@@ -45,6 +45,14 @@ impl DriftController {
         self.last = None;
         self.saturated_since = None;
     }
+    /// Current PI actuator setting, before integer telemetry rounding.
+    pub fn ratio_ppm(&self) -> f64 {
+        self.ppm
+    }
+    /// Low-pass filtered decoded-ring fill error, in per-channel PCM frames.
+    pub fn filtered_fill_error_frames(&self) -> f64 {
+        self.filtered
+    }
     /// `now_ms` comes from the render clock. Calls faster than 100 ms are ignored.
     /// Normal clamp is ±1000 ppm; slew is at most 100 ppm/s, filter time constant 10 s.
     pub fn update(&mut self, now_ms: u64, fill_samples: f64) -> DriftUpdate {
@@ -120,6 +128,8 @@ mod tests {
         let mut c = DriftController::new(1440, 480);
         c.update(0, 1440.0);
         assert!(c.update(100, 1500.0).ratio < 1.0);
+        assert!(c.ratio_ppm() < 0.0);
+        assert!((c.filtered_fill_error_frames() - 60.0 * 0.1 / 10.1).abs() < 1e-12);
         assert_eq!(
             c.update(200, 2500.0).correction,
             CoarseCorrection::DropFrame
@@ -128,6 +138,11 @@ mod tests {
             c.update(300, 300.0).correction,
             CoarseCorrection::DuplicateFrame
         );
+        assert_eq!(c.ratio_ppm(), 0.0);
+        assert_eq!(c.filtered_fill_error_frames(), 0.0);
+        c.update(400, 1380.0);
+        assert!(c.ratio_ppm() > 0.0);
+        assert!(c.filtered_fill_error_frames() < 0.0);
     }
     #[test]
     fn hundred_ppm_clocks_converge_over_four_hours() {

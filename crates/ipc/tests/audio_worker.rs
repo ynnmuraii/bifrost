@@ -244,12 +244,67 @@ fn pages_health_and_generation_are_bounded() {
             capture_active: Some(false),
             sending: Some(true),
             sent_media_packets: 1,
+            drift: None,
+            clock_source: 0,
+            latency: None,
+            native_discontinuity_flags: 0,
         }],
     }));
     health.request_id = 0;
     assert!(contract::validate_frame(&health).is_ok());
     health.worker_generation = 0;
     assert!(contract::validate_frame(&health).is_err());
+}
+#[test]
+fn drift_health_validates_numeric_bounds_and_clock_codes() {
+    let session = w::SessionHealth {
+        session_id: vec![1; 16],
+        counters: Some(w::AudioHealth::default()),
+        state: 2,
+        ..Default::default()
+    };
+    let valid = |session| {
+        let mut message = frame(Msg::Health(w::Health {
+            sessions: vec![session],
+        }));
+        message.request_id = 0;
+        contract::validate_frame(&message).is_ok()
+    };
+    assert!(valid(session.clone()));
+    for clock_source in 0..=4 {
+        for (ratio_ppm, error) in [(-5000, -48_000.0), (5000, 48_000.0), (0, 0.0)] {
+            let mut session = session.clone();
+            session.clock_source = clock_source;
+            session.drift = Some(w::DriftDiagnostics {
+                ratio_ppm,
+                filtered_fill_error_frames: error,
+                coarse_corrections: u64::MAX,
+            });
+            assert!(valid(session));
+        }
+    }
+    for clock_source in [-1, 5, i32::MAX] {
+        let mut session = session.clone();
+        session.clock_source = clock_source;
+        assert!(!valid(session));
+    }
+    for (ratio_ppm, error) in [
+        (-5001, 0.0),
+        (5001, 0.0),
+        (0, -48_000.1),
+        (0, 48_000.1),
+        (0, f64::NAN),
+        (0, f64::INFINITY),
+        (0, f64::NEG_INFINITY),
+    ] {
+        let mut session = session.clone();
+        session.drift = Some(w::DriftDiagnostics {
+            ratio_ppm,
+            filtered_fill_error_frames: error,
+            coarse_corrections: 0,
+        });
+        assert!(!valid(session));
+    }
 }
 #[tokio::test]
 async fn link_roundtrip_extracts_single_use_secrets_and_binds_generation() {
@@ -332,4 +387,527 @@ fn launch_token_file_is_bounded_and_one_use() {
     assert!(!path.exists());
     assert!(contract::take_launch_token(&path).is_err());
     std::fs::remove_dir(root).unwrap();
+}
+
+fn microphone_selection() -> w::DeviceSelection {
+    w::DeviceSelection {
+        selector: Some(w::device_selection::Selector::FollowDefault(2)),
+    }
+}
+
+fn hotkey(key_code: u32) -> w::PttHotkey {
+    w::PttHotkey {
+        key_code,
+        control: true,
+        ..Default::default()
+    }
+}
+
+fn media_info(token: u64) -> w::MediaInfo {
+    w::MediaInfo {
+        token,
+        revision: 1,
+        app_id: "player".into(),
+        title: "PRIVATE_TRACK_TITLE".into(),
+        subtitle: "PRIVATE_TRACK_ARTIST".into(),
+        position_ms: None,
+        duration_ms: None,
+        state: 0,
+        commands: 31,
+    }
+}
+
+fn media_snapshot() -> w::MediaSessions {
+    w::MediaSessions {
+        sessions: vec![media_info(1)],
+        current_token: Some(1),
+        revision: 1,
+    }
+}
+
+fn m5_m6_requests() -> Vec<Msg> {
+    vec![
+        Msg::AcquireMicMute(w::AcquireMicMute {
+            selection: Some(microphone_selection()),
+        }),
+        Msg::SetMicMute(w::SetMicMute {
+            expected_generation: 1,
+            muted: true,
+        }),
+        Msg::ReleaseMicMute(w::ReleaseMicMute {}),
+        Msg::ConfigurePtt(w::ConfigurePtt {
+            binding: Some(hotkey(0x04)),
+            reserved: vec![hotkey(0x05)],
+        }),
+        Msg::SetMediaWatch(w::SetMediaWatch { enabled: true }),
+        Msg::MediaCommand(w::MediaCommand {
+            token: 1,
+            expected_revision: 1,
+            command: 1,
+        }),
+    ]
+}
+
+fn m5_m6_responses() -> Vec<Msg> {
+    vec![
+        Msg::MuteSnapshot(w::MuteSnapshot {
+            endpoint_id: "MICROPHONE".into(),
+            generation: 1,
+            muted: true,
+            guard_active: true,
+        }),
+        Msg::PttEvent(w::PttEvent {
+            kind: 3,
+            observed_at_ns: 0,
+            expires_at_ns: 0,
+        }),
+        Msg::MediaSessions(media_snapshot()),
+        Msg::MediaCommandResult(w::MediaCommandResult { result: 1 }),
+    ]
+}
+
+#[test]
+fn m5_m6_exact_tags_and_outer_request_correlations() {
+    let messages = m5_m6_requests().into_iter().chain(m5_m6_responses());
+    for (message, tag) in messages.zip([18u32, 19, 20, 21, 30, 31, 47, 48, 60, 61]) {
+        // A minimal envelope contains only the oneof field and its length-delimited body.
+        let encoded = w::AudioFrame {
+            msg: Some(message.clone()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let key = (u32::from(encoded[0] & 0x7f)) | (u32::from(encoded[1]) << 7);
+        assert_eq!(key, (tag << 3) | 2);
+        for request_id in [0, 1, u64::MAX] {
+            let mut candidate = frame(message.clone());
+            candidate.request_id = request_id;
+            let valid = match tag {
+                47 | 48 => true,
+                60 => request_id == 0,
+                _ => request_id != 0,
+            };
+            assert_eq!(
+                contract::validate_frame(&candidate).is_ok(),
+                valid,
+                "tag {tag}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mute_selection_endpoint_and_generation_are_strict() {
+    for selection in [
+        None,
+        Some(w::DeviceSelection { selector: None }),
+        Some(w::DeviceSelection {
+            selector: Some(w::device_selection::Selector::FollowDefault(0)),
+        }),
+        Some(w::DeviceSelection {
+            selector: Some(w::device_selection::Selector::DeviceId(String::new())),
+        }),
+    ] {
+        assert!(
+            contract::validate_frame(&frame(Msg::AcquireMicMute(w::AcquireMicMute { selection })))
+                .is_err()
+        );
+    }
+    for generation in [0, 1, u64::MAX] {
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::SetMicMute(w::SetMicMute {
+                expected_generation: generation,
+                muted: false,
+            })))
+            .is_ok(),
+            generation != 0
+        );
+        for endpoint_id in [
+            "".to_owned(),
+            "é".repeat(256),
+            "é".repeat(257),
+            "mic\n".into(),
+        ] {
+            let valid = generation != 0 && endpoint_id.len() == 512;
+            assert_eq!(
+                contract::validate_frame(&frame(Msg::MuteSnapshot(w::MuteSnapshot {
+                    endpoint_id,
+                    generation,
+                    muted: false,
+                    guard_active: false,
+                })))
+                .is_ok(),
+                valid
+            );
+        }
+    }
+}
+
+#[test]
+fn ptt_hotkeys_enforce_hid_bounds_uniqueness_and_collisions() {
+    for key_code in [0, 3, 4, 0x73, 0x74, u32::MAX] {
+        let request = w::ConfigurePtt {
+            binding: Some(hotkey(key_code)),
+            reserved: vec![],
+        };
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::ConfigurePtt(request))).is_ok(),
+            (4..=0x73).contains(&key_code)
+        );
+    }
+    for count in [0, 16, 17] {
+        let request = w::ConfigurePtt {
+            binding: None,
+            reserved: (0..count).map(|index| hotkey(4 + index)).collect(),
+        };
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::ConfigurePtt(request))).is_ok(),
+            count <= 16
+        );
+    }
+    for request in [
+        w::ConfigurePtt {
+            binding: Some(hotkey(4)),
+            reserved: vec![hotkey(4)],
+        },
+        w::ConfigurePtt {
+            binding: None,
+            reserved: vec![hotkey(4), hotkey(4)],
+        },
+        w::ConfigurePtt {
+            binding: None,
+            reserved: vec![hotkey(0)],
+        },
+    ] {
+        assert!(contract::validate_frame(&frame(Msg::ConfigurePtt(request))).is_err());
+    }
+    let mut different_modifiers = hotkey(4);
+    different_modifiers.shift = true;
+    assert!(
+        contract::validate_frame(&frame(Msg::ConfigurePtt(w::ConfigurePtt {
+            binding: Some(hotkey(4)),
+            reserved: vec![different_modifiers],
+        })))
+        .is_ok()
+    );
+}
+
+#[test]
+fn ptt_event_timestamps_do_not_wrap_or_extend_press_grants() {
+    for kind in [-1, 0, 1, 2, 3, 4, i32::MAX] {
+        for (observed_at_ns, expires_at_ns) in [
+            (0, 0),
+            (0, 1),
+            (1, 1),
+            (1, 2),
+            (1, 250_000_001),
+            (1, 250_000_002),
+            (u64::MAX, 1),
+            (u64::MAX - 1, u64::MAX),
+        ] {
+            let valid = match kind {
+                1 => {
+                    expires_at_ns > observed_at_ns && expires_at_ns - observed_at_ns <= 250_000_000
+                }
+                2 => observed_at_ns == 0 && expires_at_ns > 0,
+                3 => observed_at_ns == 0 && expires_at_ns == 0,
+                _ => false,
+            };
+            assert_eq!(
+                contract::validate_frame(&frame(Msg::PttEvent(w::PttEvent {
+                    kind,
+                    observed_at_ns,
+                    expires_at_ns,
+                })))
+                .is_ok(),
+                valid,
+                "{kind}/{observed_at_ns}/{expires_at_ns}"
+            );
+        }
+    }
+}
+
+fn valid_media(snapshot: w::MediaSessions) -> bool {
+    let mut candidate = frame(Msg::MediaSessions(snapshot));
+    candidate.request_id = 0;
+    contract::validate_frame(&candidate).is_ok()
+}
+
+#[test]
+fn media_snapshot_bounds_tokens_revisions_and_optional_times() {
+    for count in [0, 1, 32, 33] {
+        assert_eq!(
+            valid_media(w::MediaSessions {
+                sessions: (1..=count).map(media_info).collect(),
+                current_token: None,
+                revision: 1,
+            }),
+            count <= 32
+        );
+    }
+    for mutation in 0..8 {
+        let mut snapshot = media_snapshot();
+        match mutation {
+            0 => snapshot.revision = 0,
+            1 => snapshot.sessions[0].revision = 0,
+            2 => snapshot.sessions[0].token = 0,
+            3 => snapshot.sessions.push(snapshot.sessions[0].clone()),
+            4 => snapshot.current_token = Some(0),
+            5 => snapshot.current_token = Some(2),
+            6 => snapshot.sessions[0].commands = 32,
+            7 => snapshot.sessions[0].state = 4,
+            _ => unreachable!(),
+        }
+        assert!(!valid_media(snapshot), "mutation {mutation}");
+    }
+    for state in [-1, 0, 1, 2, 3, 4, i32::MAX] {
+        for commands in [0, 1, 31, 32, u32::MAX] {
+            for (position_ms, duration_ms) in [
+                (None, None),
+                (Some(0), None),
+                (None, Some(0)),
+                (Some(u64::MAX), Some(1)),
+                (Some(0), Some(u64::MAX)),
+            ] {
+                let mut snapshot = media_snapshot();
+                let session = &mut snapshot.sessions[0];
+                session.state = state;
+                session.commands = commands;
+                session.position_ms = position_ms;
+                session.duration_ms = duration_ms;
+                assert_eq!(
+                    valid_media(snapshot),
+                    (0..=3).contains(&state) && commands <= 31
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn media_metadata_limits_count_utf8_bytes_and_reject_controls() {
+    for field in 0..3 {
+        let max = if field == 0 { 128 } else { 256 };
+        for value in [
+            String::new(),
+            "é".repeat(max / 2),
+            "é".repeat(max / 2 + 1),
+            "private\n".into(),
+        ] {
+            let valid = value.len() <= max && !value.chars().any(char::is_control);
+            let mut snapshot = media_snapshot();
+            let session = &mut snapshot.sessions[0];
+            match field {
+                0 => session.app_id = value,
+                1 => session.title = value,
+                2 => session.subtitle = value,
+                _ => unreachable!(),
+            }
+            assert_eq!(valid_media(snapshot), valid, "field {field}");
+        }
+    }
+}
+
+#[test]
+fn media_command_enums_tokens_and_revisions_are_closed() {
+    for command in [-1, 0, 1, 2, 3, 4, 5, 6, i32::MAX] {
+        for token in [0, 1, u64::MAX] {
+            for expected_revision in [0, 1, u64::MAX] {
+                assert_eq!(
+                    contract::validate_frame(&frame(Msg::MediaCommand(w::MediaCommand {
+                        token,
+                        expected_revision,
+                        command,
+                    })))
+                    .is_ok(),
+                    token != 0 && expected_revision != 0 && (1..=5).contains(&command)
+                );
+            }
+        }
+    }
+    for result in [-1, 0, 1, 2, 3, 4, 5, 6, i32::MAX] {
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::MediaCommandResult(w::MediaCommandResult {
+                result,
+            })))
+            .is_ok(),
+            (1..=5).contains(&result)
+        );
+    }
+}
+
+#[test]
+fn raw_nested_and_received_media_debug_redact_metadata() {
+    let snapshot = media_snapshot();
+    let received = contract::Received {
+        frame: frame(Msg::MediaSessions(snapshot.clone())),
+        secrets: None,
+        token: None,
+    };
+    for text in [
+        format!("{:?}", snapshot.sessions[0]),
+        format!("{snapshot:?}"),
+        format!("{:?}", received.frame),
+        format!("{received:?}"),
+    ] {
+        assert!(text.contains("REDACTED"));
+        assert!(!text.contains("PRIVATE_TRACK_TITLE"));
+        assert!(!text.contains("PRIVATE_TRACK_ARTIST"));
+    }
+}
+
+#[tokio::test]
+async fn m5_m6_link_roundtrips_enforce_direction_and_redact_metadata() {
+    let (a, b) = tokio::io::duplex(65536);
+    let mut core = AudioLink::core(a, 7).unwrap();
+    let mut child = AudioLink::worker(b);
+    core.send(1, attach()).await.unwrap();
+    child.recv().await.unwrap();
+    child.send(1, ready()).await.unwrap();
+    core.recv().await.unwrap();
+    for message in m5_m6_requests() {
+        assert!(child.send(2, message.clone()).await.is_err());
+        core.send(2, message.clone()).await.unwrap();
+        assert_eq!(child.recv().await.unwrap().frame.msg, Some(message));
+    }
+    for message in m5_m6_responses() {
+        let id = if matches!(&message, Msg::MediaSessions(_)) {
+            0
+        } else {
+            2
+        };
+        assert!(core.send(id, message.clone()).await.is_err());
+        child.send(id, message.clone()).await.unwrap();
+        let received = core.recv().await.unwrap();
+        assert!(format!("{received:?}").contains("REDACTED"));
+        assert_eq!(received.frame.msg, Some(message));
+    }
+}
+
+#[test]
+fn maximum_media_snapshot_remains_within_private_frame_limit() {
+    let mut snapshot = w::MediaSessions {
+        sessions: (1..=32).map(media_info).collect(),
+        current_token: Some(32),
+        revision: u64::MAX,
+    };
+    for session in &mut snapshot.sessions {
+        session.app_id = "a".repeat(128);
+        session.title = "t".repeat(256);
+        session.subtitle = "s".repeat(256);
+        session.revision = u64::MAX;
+        session.position_ms = Some(u64::MAX);
+        session.duration_ms = Some(u64::MAX);
+    }
+    let mut candidate = frame(Msg::MediaSessions(snapshot));
+    candidate.request_id = 0;
+    assert!(candidate.encoded_len() <= 64 * 1024);
+    assert!(contract::validate_frame(&candidate).is_ok());
+}
+
+#[tokio::test]
+async fn wrong_direction_m5_m6_receives_do_not_advance_sequence() {
+    for message in m5_m6_requests() {
+        let (a, b) = tokio::io::duplex(65536);
+        let mut raw = Framed::ipc(a);
+        let mut core = AudioLink::core(b, 7).unwrap();
+        raw.send(&frame(ready())).await.unwrap();
+        core.recv().await.unwrap();
+        let mut wrong_direction = frame(message);
+        wrong_direction.seq = 2;
+        raw.send(&wrong_direction).await.unwrap();
+        assert!(core.recv().await.is_err());
+        assert_eq!(core.inbound_expected(), 2);
+    }
+    for message in m5_m6_responses() {
+        let (a, b) = tokio::io::duplex(65536);
+        let mut raw = Framed::ipc(a);
+        let mut child = AudioLink::worker(b);
+        raw.send(&frame(attach())).await.unwrap();
+        child.recv().await.unwrap();
+        let mut wrong_direction = frame(message);
+        wrong_direction.seq = 2;
+        if matches!(&wrong_direction.msg, Some(Msg::MediaSessions(_))) {
+            wrong_direction.request_id = 0;
+        }
+        raw.send(&wrong_direction).await.unwrap();
+        assert!(child.recv().await.is_err());
+        assert_eq!(child.inbound_expected(), 2);
+    }
+}
+
+#[test]
+fn acquire_mute_stable_ids_and_default_roles_follow_existing_selection_bounds() {
+    for device_id in [
+        "m".to_owned(),
+        "é".repeat(256),
+        "é".repeat(257),
+        "mic\0".into(),
+    ] {
+        let valid = device_id.len() <= 512 && !device_id.chars().any(char::is_control);
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::AcquireMicMute(w::AcquireMicMute {
+                selection: Some(w::DeviceSelection {
+                    selector: Some(w::device_selection::Selector::DeviceId(device_id)),
+                }),
+            })))
+            .is_ok(),
+            valid
+        );
+    }
+    for role in [-1, 0, 1, 2, 3, i32::MAX] {
+        assert_eq!(
+            contract::validate_frame(&frame(Msg::AcquireMicMute(w::AcquireMicMute {
+                selection: Some(w::DeviceSelection {
+                    selector: Some(w::device_selection::Selector::FollowDefault(role)),
+                }),
+            })))
+            .is_ok(),
+            matches!(role, 1 | 2)
+        );
+    }
+}
+
+#[test]
+fn latency_health_bounds_each_observed_stage_and_preserves_unknown_native_depth() {
+    let valid = |latency| {
+        let mut frame = frame(Msg::Health(w::Health {
+            sessions: vec![w::SessionHealth {
+                session_id: vec![1; 16],
+                counters: Some(w::AudioHealth::default()),
+                state: 2,
+                latency: Some(latency),
+                ..Default::default()
+            }],
+        }));
+        frame.request_id = 0;
+        contract::validate_frame(&frame).is_ok()
+    };
+    assert!(valid(w::LatencyDiagnostics::default()));
+    assert!(valid(w::LatencyDiagnostics {
+        packetization_us: 2_000_000,
+        capture_queue_us: 2_000_000,
+        codec_lookahead_us: 2_000_000,
+        jitter_target_us: 2_000_000,
+        jitter_buffer_us: 2_000_000,
+        decoded_queue_us: 2_000_000,
+        render_queue_us: 2_000_000,
+        resampler_delay_us: 2_000_000,
+        native_render_buffer_us: Some(2_000_000),
+    }));
+    for index in 0..9 {
+        let mut latency = w::LatencyDiagnostics::default();
+        match index {
+            0 => latency.packetization_us = 2_000_001,
+            1 => latency.capture_queue_us = 2_000_001,
+            2 => latency.codec_lookahead_us = 2_000_001,
+            3 => latency.jitter_target_us = 2_000_001,
+            4 => latency.jitter_buffer_us = 2_000_001,
+            5 => latency.decoded_queue_us = 2_000_001,
+            6 => latency.render_queue_us = 2_000_001,
+            7 => latency.resampler_delay_us = 2_000_001,
+            8 => latency.native_render_buffer_us = Some(2_000_001),
+            _ => unreachable!(),
+        }
+        assert!(!valid(latency), "unbounded stage {index}");
+    }
 }

@@ -42,6 +42,10 @@ impl NativeRate {
     pub fn max_output_frames(&self) -> usize {
         self.inner.output_frames_max()
     }
+    /// Group delay in output-rate frames, as reported by the active rubato converter.
+    pub fn output_delay(&self) -> usize {
+        self.inner.output_delay()
+    }
     pub fn reset(&mut self) {
         self.inner.reset();
     }

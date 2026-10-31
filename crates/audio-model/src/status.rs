@@ -11,6 +11,52 @@ pub const MAX_MEDIA_TITLE_BYTES: usize = 256;
 pub const MAX_MEDIA_SUBTITLE_BYTES: usize = 256;
 pub const MAX_SOURCE_NAME_BYTES: usize = 128;
 
+/// Clock actually used by the media worker, not merely a native position capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClockSource {
+    #[default]
+    Unknown = 0,
+    CaptureHostTimestamp = 1,
+    CaptureCallbackFrames = 2,
+    RenderDevicePosition = 3,
+    RenderCallbackFrames = 4,
+}
+impl ClockSource {
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::CaptureHostTimestamp,
+            2 => Self::CaptureCallbackFrames,
+            3 => Self::RenderDevicePosition,
+            4 => Self::RenderCallbackFrames,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Per-session PI observations; absent when that direction has no drift controller.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DriftDiagnostics {
+    pub ratio_ppm: i32,
+    pub filtered_fill_error_frames: f64,
+    pub coarse_corrections: u64,
+}
+
+/// Bounded local stage observations in microseconds, not a synchronized network latency.
+/// Jitter occupancy and target overlap; never add both to an end-to-end estimate.
+/// Native output depth is unknown without a valid device playhead/host-clock snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LatencyDiagnostics {
+    pub packetization_us: u32,
+    pub capture_queue_us: u32,
+    pub codec_lookahead_us: u32,
+    pub jitter_target_us: u32,
+    pub jitter_buffer_us: u32,
+    pub decoded_queue_us: u32,
+    pub render_queue_us: u32,
+    pub resampler_delay_us: u32,
+    pub native_render_buffer_us: Option<u32>,
+}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AudioRole {
     #[default]
