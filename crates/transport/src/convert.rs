@@ -46,6 +46,9 @@ pub(crate) const IMPLEMENTED_CAPABILITIES: &[i32] = &[
     wire::Capability::UnpairNotice as i32,
     wire::Capability::ClipboardSession as i32,
     wire::Capability::ClipboardImage as i32,
+    wire::Capability::AudioControlV1 as i32,
+    wire::Capability::SystemAudioSource as i32,
+    wire::Capability::AudioListener as i32,
 ];
 
 /// A message that cannot be expressed on the wire.
@@ -57,6 +60,9 @@ pub enum ConvertError {
     /// A decoded value violates a bounded wire contract.
     #[error("wire contract violation: {0:?}")]
     Violation(protocol::validate::Violation),
+    /// Audio metadata failure; never a reason to tear down the input link.
+    #[error("audio contract violation: {0:?}")]
+    Audio(protocol::validate::AudioViolation),
     /// A `oneof` arm or enum value the contract does not define.
     #[error("unsupported wire value: {0}")]
     Unsupported(&'static str),
@@ -361,6 +367,16 @@ pub fn from_envelope(envelope: &wire::Envelope) -> Result<fr::Message, ConvertEr
 /// mirror instead of being forced into it. Core is the only consumer of both.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inbound {
+    /// Bounded metadata bound to this authenticated parent-link generation.
+    Audio {
+        message: wire::AudioControl,
+        connection_id: [u8; 16],
+    },
+    /// The coordinator must invalidate audio only, leaving input leases intact.
+    AudioRejected {
+        violation: protocol::validate::AudioViolation,
+        connection_id: [u8; 16],
+    },
     /// Authenticated self-only pairing revocation.
     Unpaired(wire::Unpaired),
     /// Replacement advertised capability set; unknown optional enum values remain raw.
@@ -476,6 +492,30 @@ pub fn inbound_from_envelope(envelope: &wire::Envelope) -> Result<Inbound, Conve
     use wire::envelope::Payload;
 
     match envelope.payload.as_ref() {
+        Some(Payload::AudioControl(message)) => {
+            protocol::validate::audio_control(message).map_err(ConvertError::Audio)?;
+            if !envelope.lease_id.is_empty() {
+                return Err(ConvertError::Audio(
+                    protocol::validate::AudioViolation::Lease,
+                ));
+            }
+            let connection_id = envelope.connection_id.as_slice().try_into().map_err(|_| {
+                ConvertError::Violation(protocol::validate::Violation::ConnectionIdLen {
+                    len: envelope.connection_id.len(),
+                })
+            })?;
+            if let Some(wire::audio_control::Body::Offer(offer)) = &message.body {
+                if offer.parent_connection_id != envelope.connection_id {
+                    return Err(ConvertError::Audio(
+                        protocol::validate::AudioViolation::ParentConnection,
+                    ));
+                }
+            }
+            Ok(Inbound::Audio {
+                message: message.clone(),
+                connection_id,
+            })
+        }
         Some(Payload::Unpaired(notice)) => Ok(Inbound::Unpaired(notice.clone())),
         Some(Payload::ClipboardApplied(applied)) => {
             validate_clipboard_applied(applied)?;
@@ -1163,6 +1203,9 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::RemoteUpdate
             | WireCapability::ClipboardApplyAck
             | WireCapability::UnpairNotice
+            | WireCapability::AudioControlV1
+            | WireCapability::SystemAudioSource
+            | WireCapability::AudioListener
             | WireCapability::ClipboardSession => {}
         }
     }

@@ -2855,6 +2855,10 @@ impl Session {
                     return;
                 }
                 match message {
+                    // No audio coordinator is active: this core does not advertise
+                    // AUDIO_CONTROL_V1 and never authorizes remote activation.
+                    transport::convert::Inbound::Audio { .. }
+                    | transport::convert::Inbound::AudioRejected { .. } => {}
                     transport::convert::Inbound::Unpaired(notice) => {
                         self.receive_unpaired(peer, notice).await;
                     }

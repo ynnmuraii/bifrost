@@ -4686,6 +4686,7 @@ dependencies = [
  "identity",
  "input-model",
  "logging",
+ "prost",
  "protocol",
  "ring",
  "rustls",

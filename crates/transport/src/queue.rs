@@ -118,6 +118,8 @@ pub fn motion_batch(lease_id: [u8; 16], events: Vec<InputEvent>) -> fr::Message 
 pub enum Outbound {
     /// Must be delivered: control, or any batch with an edge in it.
     Guaranteed(fr::Message),
+    /// Bounded audio metadata; admission failure never closes input.
+    AudioControl(protocol::wire::AudioControl),
     /// Replacement capability advertisement: guaranteed control, never coalesced.
     CapabilitiesChanged(Vec<i32>),
     /// Remote update control: guaranteed, never coalesced or dropped.
@@ -155,6 +157,7 @@ impl Outbound {
         match self {
             Outbound::Motion { events, .. } => Some(events),
             Outbound::Guaranteed(_)
+            | Outbound::AudioControl(_)
             | Outbound::CapabilitiesChanged(_)
             | Outbound::UpdateRequest(_)
             | Outbound::UpdateResult(_)
@@ -170,6 +173,7 @@ impl Outbound {
         match self {
             Outbound::Motion { lease_id, .. } => Some(*lease_id),
             Outbound::Guaranteed(_)
+            | Outbound::AudioControl(_)
             | Outbound::CapabilitiesChanged(_)
             | Outbound::UpdateRequest(_)
             | Outbound::UpdateResult(_)
@@ -237,11 +241,20 @@ struct QueueState {
     ordered: VecDeque<(u64, Intent)>,
     urgent: VecDeque<Intent>,
     auxiliary: VecDeque<(u64, Intent)>,
+    audio_stops: VecDeque<Intent>,
+    local_audio: bool,
+    remote_audio: bool,
     urgent_run: u8,
     input_run: u8,
 }
 
 impl QueueState {
+    fn purge_audio(&mut self) {
+        self.auxiliary
+            .retain(|(_, intent)| !matches!(intent, Intent::Outbound(Outbound::AudioControl(_))));
+        self.audio_stops.clear();
+    }
+
     fn next_admission(&mut self) -> Result<u64, crate::TransportError> {
         self.admission = self
             .admission
@@ -283,12 +296,54 @@ impl InputQueue {
                 ordered: VecDeque::new(),
                 urgent: VecDeque::new(),
                 auxiliary: VecDeque::new(),
+                audio_stops: VecDeque::new(),
+                local_audio: false,
+                remote_audio: false,
                 urgent_run: 0,
                 input_run: 0,
             }),
             capacity,
             wake: Notify::new(),
         }
+    }
+
+    pub fn set_local_audio(&self, capabilities: &[i32]) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.local_audio =
+            capabilities.contains(&(protocol::wire::Capability::AudioControlV1 as i32));
+        if !state.local_audio {
+            state.purge_audio();
+        }
+    }
+
+    /// Re-enabling is visible only after its announcement reached the wire.
+    pub fn local_capabilities_written(&self, capabilities: &[i32]) {
+        let cap = protocol::wire::Capability::AudioControlV1 as i32;
+        if !capabilities.contains(&cap) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A withdrawal admitted while this write was in flight wins immediately.
+        if !state.auxiliary.iter().any(|(_, intent)| {
+            matches!(intent, Intent::Outbound(Outbound::CapabilitiesChanged(caps))
+                if !caps.contains(&cap))
+        }) {
+            state.local_audio = true;
+        }
+    }
+
+    pub fn set_remote_audio(&self, capabilities: &[i32]) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.remote_audio =
+            capabilities.contains(&(protocol::wire::Capability::AudioControlV1 as i32));
+        if !state.remote_audio {
+            state.purge_audio();
+        }
+    }
+
+    pub fn audio_allowed(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.ready && state.local_audio && state.remote_audio && !state.closed && !state.refusing
     }
 
     pub fn begin_close(&self) -> Instant {
@@ -324,6 +379,7 @@ impl InputQueue {
         state.ordered.clear();
         state.urgent.clear();
         state.auxiliary.clear();
+        state.audio_stops.clear();
         state.refusal = Some(Intent::Refuse {
             connection_id,
             code,
@@ -355,6 +411,7 @@ impl InputQueue {
         state.ordered.clear();
         state.urgent.clear();
         state.auxiliary.clear();
+        state.audio_stops.clear();
         self.wake.notify_one();
     }
 
@@ -516,6 +573,35 @@ impl InputQueue {
         if state.closed || state.refusing {
             return Err(crate::TransportError::LinkClosed);
         }
+        if let Outbound::AudioControl(message) = &item {
+            use protocol::validate::AudioViolation;
+            if !state.ready || !state.local_audio || !state.remote_audio {
+                return Err(crate::TransportError::Audio(AudioViolation::Capability));
+            }
+            let stop = matches!(
+                message.body,
+                Some(protocol::wire::audio_control::Body::Stop(_))
+            );
+            if stop {
+                if state.audio_stops.len() == 4 {
+                    return Err(crate::TransportError::Audio(AudioViolation::QueueFull));
+                }
+                state.audio_stops.push_back(Intent::Outbound(item));
+                drop(state);
+                self.wake.notify_one();
+                return Ok(());
+            }
+            // Audio has its own eight-item budget inside the ordered metadata
+            // FIFO, leaving all sixteen existing metadata admissions available.
+            let audio_count = state
+                .auxiliary
+                .iter()
+                .filter(|(_, intent)| matches!(intent, Intent::Outbound(Outbound::AudioControl(_))))
+                .count();
+            if audio_count == 8 {
+                return Err(crate::TransportError::Audio(AudioViolation::QueueFull));
+            }
+        }
         let admission = state.next_admission()?;
         if let Outbound::Guaranteed(message) = &item {
             match message {
@@ -598,10 +684,25 @@ impl InputQueue {
             }
             state.urgent.push_back(Intent::Outbound(item));
         } else {
-            if state.auxiliary.len() == 16 {
+            if !matches!(&item, Outbound::AudioControl(_))
+                && state
+                    .auxiliary
+                    .iter()
+                    .filter(|(_, intent)| {
+                        !matches!(intent, Intent::Outbound(Outbound::AudioControl(_)))
+                    })
+                    .count()
+                    == 16
+            {
                 return Err(crate::TransportError::Protocol(
                     "auxiliary queue overflow".into(),
                 ));
+            }
+            if let Outbound::CapabilitiesChanged(capabilities) = &item {
+                if !capabilities.contains(&(protocol::wire::Capability::AudioControlV1 as i32)) {
+                    state.local_audio = false;
+                    state.purge_audio();
+                }
             }
             state
                 .auxiliary
@@ -693,13 +794,18 @@ impl InputQueue {
                 .all(|(_, intent)| matches!(intent, Intent::Input { .. }))
         });
         let input_waiting = !state.ordered.is_empty() || state.latest.is_some() || auxiliary_ready;
-        if !blocked && !state.urgent.is_empty() && (state.urgent_run < 8 || !input_waiting) {
+        if (!state.audio_stops.is_empty() || (!blocked && !state.urgent.is_empty()))
+            && (state.urgent_run < 8 || !input_waiting)
+        {
             state.urgent_run = if input_waiting {
                 state.urgent_run.saturating_add(1)
             } else {
                 0
             };
-            return state.urgent.pop_front();
+            return state
+                .audio_stops
+                .pop_front()
+                .or_else(|| state.urgent.pop_front());
         }
         state.urgent_run = 0;
         // A fence may depend on metadata already admitted (notably Topology before
@@ -756,6 +862,94 @@ mod tests {
 
     const CONNECTION: [u8; 16] = [1; 16];
     const LEASE: [u8; 16] = [2; 16];
+
+    fn audio_stop() -> Outbound {
+        Outbound::AudioControl(wire::AudioControl {
+            control_version: 1,
+            body: Some(wire::audio_control::Body::Stop(wire::AudioStop {
+                session_id: vec![3; 16],
+                reason: wire::AudioStopCode::UserStop as i32,
+            })),
+        })
+    }
+
+    #[test]
+    fn audio_stop_bypasses_blocked_lease_urgent_but_yields_to_waiting_input() {
+        let queue = InputQueue::new(16);
+        let caps = [wire::Capability::AudioControlV1 as i32];
+        queue.set_local_audio(&caps);
+        queue.set_remote_audio(&caps);
+        queue.ready(false);
+        queue
+            .push(Outbound::Guaranteed(fr::Message::EnterCommit {
+                lease_id: LEASE,
+            }))
+            .unwrap();
+        queue
+            .push(Outbound::Guaranteed(fr::Message::LeaseRenew {
+                lease_id: LEASE,
+                nonce: [5; 16],
+            }))
+            .unwrap();
+        queue.push(audio_stop()).unwrap();
+        assert!(matches!(
+            queue.pop(),
+            Some(Intent::Outbound(Outbound::AudioControl(_)))
+        ));
+        queue.state.lock().unwrap().urgent_run = 8;
+        queue.push(audio_stop()).unwrap();
+        assert!(matches!(
+            queue.pop(),
+            Some(Intent::Outbound(Outbound::Guaranteed(
+                fr::Message::EnterCommit { .. }
+            )))
+        ));
+        assert!(matches!(
+            queue.pop(),
+            Some(Intent::Outbound(Outbound::AudioControl(_)))
+        ));
+    }
+
+    #[test]
+    fn reenable_waits_for_write_and_inflight_enable_cannot_undo_withdrawal() {
+        let queue = InputQueue::new(16);
+        let caps = vec![wire::Capability::AudioControlV1 as i32];
+        queue.set_local_audio(&caps);
+        queue.set_remote_audio(&caps);
+        queue.ready(false);
+        queue.push(audio_stop()).unwrap();
+        queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
+        assert!(!queue.audio_allowed());
+        assert!(matches!(
+            queue.pop(),
+            Some(Intent::Outbound(Outbound::CapabilitiesChanged(_)))
+        ));
+        queue
+            .push(Outbound::CapabilitiesChanged(caps.clone()))
+            .unwrap();
+        assert!(queue.push(audio_stop()).is_err());
+        assert!(matches!(
+            queue.pop(),
+            Some(Intent::Outbound(Outbound::CapabilitiesChanged(_)))
+        ));
+        assert!(queue.push(audio_stop()).is_err());
+        queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
+        queue.local_capabilities_written(&caps);
+        assert!(!queue.audio_allowed());
+        queue.pop().unwrap();
+        queue
+            .push(Outbound::CapabilitiesChanged(caps.clone()))
+            .unwrap();
+        queue.pop().unwrap();
+        queue.local_capabilities_written(&caps);
+        assert!(queue.audio_allowed());
+        queue.push(audio_stop()).unwrap();
+        assert!(matches!(
+            queue.pop(),
+            Some(Intent::Outbound(Outbound::AudioControl(_)))
+        ));
+        assert!(queue.pop().is_none());
+    }
 
     fn motion() -> InputSample {
         InputSample {

@@ -800,12 +800,13 @@ async fn blocked_writer_does_not_block_reader_or_coordinator_dispatch() {
             }));
         }
         write_frame(&mut sender, &envelope).await.unwrap();
-        let (frame, _) = frames_rx.recv().await.unwrap().unwrap();
+        let (frame, audio_violation, _) = frames_rx.recv().await.unwrap().unwrap();
         state
             .on_frame(
                 &queue,
                 &mut handshake,
                 &frame,
+                audio_violation,
                 &wire::Hello::default(),
                 &reports_tx,
             )
@@ -1113,4 +1114,84 @@ fn later_metadata_stays_behind_a_fence_with_a_long_ordered_input_prefix() {
             convert::LayoutMessage::Topology(_)
         )))
     ));
+}
+
+#[tokio::test]
+async fn audio_reenable_is_committed_after_write_before_reserved_stop() {
+    let queue = queue(4);
+    let caps = vec![wire::Capability::AudioControlV1 as i32];
+    queue.set_remote_audio(&caps);
+    queue.push(Outbound::CapabilitiesChanged(caps)).unwrap();
+    let stop = || {
+        Outbound::AudioControl(wire::AudioControl {
+            control_version: 1,
+            body: Some(wire::audio_control::Body::Stop(wire::AudioStop {
+                session_id: vec![3; 16],
+                reason: wire::AudioStopCode::UserStop as i32,
+            })),
+        })
+    };
+    assert!(queue.push(stop()).is_err());
+    let announcement = queue.pop().unwrap();
+    assert!(queue.push(stop()).is_err());
+    let mut writer = ScriptedWriter::new(4096);
+    let mut state = writer_state();
+    let metrics = Mutex::new(InputMetrics::default());
+    let tracker = Mutex::new(AckTracker::default());
+    write_intent(
+        &mut writer,
+        announcement,
+        &mut state,
+        &queue,
+        &metrics,
+        &tracker,
+    )
+    .await
+    .unwrap();
+    assert!(queue.audio_allowed());
+    queue.push(stop()).unwrap();
+    write_intent(
+        &mut writer,
+        queue.pop().unwrap(),
+        &mut state,
+        &queue,
+        &metrics,
+        &tracker,
+    )
+    .await
+    .unwrap();
+    let bytes = writer.bytes.lock().unwrap().clone();
+    let mut reader = bytes.as_slice();
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap().payload,
+        Some(wire::envelope::Payload::CapabilitiesChanged(_))
+    ));
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap().payload,
+        Some(wire::envelope::Payload::AudioControl(_))
+    ));
+}
+
+#[tokio::test]
+async fn failed_capability_announcement_does_not_reenable_audio() {
+    let queue = queue(4);
+    let caps = vec![wire::Capability::AudioControlV1 as i32];
+    queue.set_remote_audio(&caps);
+    queue.push(Outbound::CapabilitiesChanged(caps)).unwrap();
+    let mut writer = ScriptedWriter::new(4096);
+    writer.zero = true;
+    let mut state = writer_state();
+    let metrics = Mutex::new(InputMetrics::default());
+    let tracker = Mutex::new(AckTracker::default());
+    assert!(write_intent(
+        &mut writer,
+        queue.pop().unwrap(),
+        &mut state,
+        &queue,
+        &metrics,
+        &tracker
+    )
+    .await
+    .is_err());
+    assert!(!queue.audio_allowed());
 }

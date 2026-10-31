@@ -331,6 +331,15 @@ fn a_motion_only_batch_keeps_its_lease_through_the_droppable_path() {
 #[test]
 fn updates_never_enter_the_coalescible_motion_path() {
     for item in [
+        Outbound::AudioControl(protocol::wire::AudioControl {
+            control_version: 1,
+            body: Some(protocol::wire::audio_control::Body::Stop(
+                protocol::wire::AudioStop {
+                    session_id: vec![1; 16],
+                    reason: protocol::wire::AudioStopCode::UserStop as i32,
+                },
+            )),
+        }),
         Outbound::UpdateRequest(protocol::wire::UpdateRequest {
             target_version: "1.2.3".into(),
         }),

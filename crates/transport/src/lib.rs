@@ -48,6 +48,9 @@ pub enum TransportError {
     /// Framing, sequence or conversion violation.
     #[error("protocol violation: {0}")]
     Protocol(String),
+    /// Bounded auxiliary audio failure; input remains healthy.
+    #[error("audio control rejected: {0:?}")]
+    Audio(protocol::validate::AudioViolation),
     /// The link's task is gone.
     #[error("the link is closed")]
     LinkClosed,

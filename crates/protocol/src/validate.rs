@@ -18,6 +18,9 @@ use crate::limits::{
 };
 use crate::wire;
 
+mod audio;
+pub use audio::{audio_control, audio_control_wire_size, audio_format, AudioViolation};
+
 /// A decoded message that is structurally valid Protobuf but violates a limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Violation {

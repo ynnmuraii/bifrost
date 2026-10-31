@@ -714,6 +714,17 @@ impl LinkManager {
             .and_then(|link| link.handle.auxiliary_secret())
     }
 
+    /// Sends bounded audio metadata only on the currently admitted input link.
+    /// The handle enforces both endpoints' current capability advertisements.
+    pub async fn send_audio_control(
+        &self,
+        peer: &NodeId,
+        message: wire::AudioControl,
+    ) -> Result<(), TransportError> {
+        let handle = self.handle(peer).await.ok_or(TransportError::LinkClosed)?;
+        handle.send_audio_control(message).await
+    }
+
     /// Samples cumulative lease counters for the current or last established connection.
     ///
     /// Counters survive link removal so final lease diagnostics can include link loss.

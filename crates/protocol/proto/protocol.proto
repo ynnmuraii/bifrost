@@ -56,6 +56,7 @@ message Envelope {
     ClipboardApplied clipboard_applied = 44; // only to peers advertising CLIPBOARD_APPLY_ACK
     ClipboardRoute clipboard_route = 45;     // metadata-only routing; same capability gate
     Unpaired unpaired = 46; // authenticated sender revokes only its own pairing
+    AudioControl audio_control = 59; // bounded auxiliary metadata; never samples
   }
 }
 
@@ -83,6 +84,11 @@ enum Capability {
   CAPABILITY_UNPAIR_NOTICE = 13;
   CAPABILITY_CLIPBOARD_SESSION = 14;
   CAPABILITY_CLIPBOARD_IMAGE = 15;
+  CAPABILITY_AUDIO_CONTROL_V1 = 16;
+  CAPABILITY_SYSTEM_AUDIO_SOURCE = 17;
+  // Future: 18 mic-control, 19 focus-report.
+  CAPABILITY_AUDIO_LISTENER = 20;
+  // Future: 21 mic-stream, 22 virtual-mic, 23 media-control.
 }
 
 enum SessionKind {
@@ -169,6 +175,143 @@ message Hello {
 // Replaces only the sender's advertised capability set, not its identity or Hello.
 // The same 64-entry wire bound applies, counting unknown values and duplicates.
 message CapabilitiesChanged { repeated Capability capabilities = 1; }
+
+// Audio is independent of input leases. Only endpoints' UDP ports travel here:
+// the destination IP is inherited from the authenticated parent TLS connection.
+message AudioControl {
+  uint32 control_version = 1; // exactly 1; complete message <= 2048 bytes
+  oneof body {
+    AudioHello hello = 10;
+    AudioOffer offer = 11;
+    AudioAnswer answer = 12;
+    AudioCommit commit = 13;
+    AudioStop stop = 14;
+    AudioKeepalive keepalive = 15;
+    AudioReport report = 16;
+    // Future: 17 focus, 18 mic-state, 19 mic-ack.
+    AudioConsentChanged consent = 20;
+    // Future: 21 focus-request.
+  }
+}
+enum AudioNodeRole {
+  AUDIO_NODE_ROLE_UNSPECIFIED = 0;
+  AUDIO_NODE_ROLE_SOURCE = 1;
+  AUDIO_NODE_ROLE_LISTENER = 2;
+}
+enum AudioStreamKind {
+  AUDIO_STREAM_KIND_UNSPECIFIED = 0;
+  AUDIO_STREAM_KIND_SYSTEM = 1;
+  // Future: 2 microphone.
+}
+enum AudioStopCode {
+  AUDIO_STOP_CODE_UNSPECIFIED = 0;
+  AUDIO_STOP_CODE_DISABLED = 1;
+  AUDIO_STOP_CODE_CONSENT_REQUIRED = 2;
+  AUDIO_STOP_CODE_ROLE_CONFLICT = 3;
+  AUDIO_STOP_CODE_UNSUPPORTED_FORMAT = 4;
+  AUDIO_STOP_CODE_DEVICE_UNAVAILABLE = 5;
+  AUDIO_STOP_CODE_VIRTUAL_MIC_MISSING = 6;
+  AUDIO_STOP_CODE_PARENT_LOST = 7;
+  AUDIO_STOP_CODE_WORKER_LOST = 8;
+  AUDIO_STOP_CODE_TIMEOUT = 9;
+  AUDIO_STOP_CODE_RATE_LIMITED = 10;
+  AUDIO_STOP_CODE_REVOKED = 11;
+  AUDIO_STOP_CODE_USER_STOP = 12;
+  AUDIO_STOP_CODE_PROTOCOL_VIOLATION = 13;
+}
+enum AudioCodec {
+  AUDIO_CODEC_UNSPECIFIED = 0;
+  AUDIO_CODEC_OPUS = 1;
+}
+enum AudioAead {
+  AUDIO_AEAD_UNSPECIFIED = 0;
+  AUDIO_AEAD_CHACHA20_POLY1305 = 1;
+}
+enum AudioLatencyProfile {
+  AUDIO_LATENCY_PROFILE_UNSPECIFIED = 0;
+  AUDIO_LATENCY_PROFILE_ETHERNET = 1;
+  AUDIO_LATENCY_PROFILE_WIFI = 2;
+}
+enum AudioDeviceState {
+  AUDIO_DEVICE_STATE_UNSPECIFIED = 0;
+  AUDIO_DEVICE_STATE_READY = 1;
+  AUDIO_DEVICE_STATE_UNAVAILABLE = 2;
+  AUDIO_DEVICE_STATE_REBUFFERING = 3;
+}
+message AudioFormat {
+  uint32 media_version = 1;
+  AudioCodec codec = 2;
+  uint32 sample_rate = 3;
+  uint32 channels = 4;
+  uint32 frame_samples = 5;
+  uint32 bitrate_bps = 6;
+  bool fec = 7;
+  AudioLatencyProfile profile = 8;
+  uint32 max_datagram_bytes = 9;
+  AudioAead aead = 10;
+}
+message AudioHello {
+  bytes group_id = 1; // Listener:16; unresolved Source: empty or16
+  bytes listener_node_id = 2; // selected Listener, exactly32
+  AudioNodeRole role = 3;
+  uint32 udp_port = 4;
+  repeated uint32 media_versions = 5; // 1..4 distinct nonzero, includes1
+  uint32 consent_revision = 6;
+  uint32 directions = 7; // send1, receive2; permissions, not activation
+  bool listener_available = 8;
+}
+message AudioOffer {
+  bytes session_id = 1; //16
+  bytes session_nonce = 2; //32, fresh Listener contribution
+  bytes parent_connection_id = 3; //16, must match authenticated envelope
+  bytes group_id = 4; //16
+  bytes listener_node_id = 5; //32
+  bytes source_node_id = 6; //32
+  AudioStreamKind kind = 7;
+  AudioFormat format = 8;
+  uint32 udp_port = 9;
+  uint32 consent_revision = 10;
+  uint32 key_epoch = 11; //1
+  uint32 control_ttl_ms = 12; //3000
+}
+message AudioAnswer {
+  bytes session_id = 1;
+  bool accepted = 2;
+  AudioStopCode reason = 3; // accepted:0; refused:known nonzero
+  AudioFormat accepted_format = 4; // absent on refusal
+  uint32 udp_port = 5; // zero on refusal
+  uint32 consent_revision = 6;
+  bytes source_nonce = 7; // accepted: fresh32; refusal:empty
+}
+message AudioCommit {
+  bytes session_id = 1;
+  bytes transcript_sha256 = 2; //32
+  uint32 key_epoch = 3; //1
+  bool start_muted = 4;
+}
+message AudioStop {
+  bytes session_id = 1;
+  AudioStopCode reason = 2;
+}
+message AudioKeepalive {
+  bytes session_id = 1;
+  uint64 control_serial = 2;
+  uint32 authorized_for_ms = 3; //1..3000
+}
+message AudioReport {
+  bytes session_id = 1;
+  uint64 received_packets = 2;
+  uint64 lost_packets = 3;
+  uint32 buffer_ms = 4; // <=1000
+  uint32 underruns = 5;
+  uint32 suggested_loss_pct = 6; // <=100
+  AudioDeviceState device_state = 7;
+}
+message AudioConsentChanged {
+  bytes group_id = 1;
+  uint32 consent_revision = 2;
+  uint32 allowed_directions = 3;
+}
 
 // Only a version is supplied: releases are resolved from the receiver's trusted source.
 message UpdateRequest { string target_version = 1; }

@@ -35,4 +35,5 @@ toml = "1"
 windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+prost = "0.14"
 tokio = { version = "1", features = ["test-util"] }

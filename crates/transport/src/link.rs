@@ -195,6 +195,14 @@ impl Stream {
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<wire::Envelope, TransportError> {
+    read_frame_detailed(reader)
+        .await
+        .map(|(envelope, _)| envelope)
+}
+
+async fn read_frame_detailed<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(wire::Envelope, Option<validate::AudioViolation>), TransportError> {
     let mut prefix = [0u8; 4];
     reader.read_exact(&mut prefix).await?;
     let length = u32::from_be_bytes(prefix) as usize;
@@ -204,15 +212,15 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
             "frame length {length} outside 1..={limit}"
         )));
     }
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).await?;
-    // Re-attach the prefix so the protocol crate performs the authoritative checks.
-    let mut framed = Vec::with_capacity(4 + length);
-    framed.extend_from_slice(&prefix);
-    framed.extend_from_slice(&body);
-    decode_message::<wire::Envelope>(Channel::InputControl, &framed)
+    let mut framed = vec![0u8; 4 + length];
+    framed[..4].copy_from_slice(&prefix);
+    reader.read_exact(&mut framed[4..]).await?;
+    let audio_violation = validate::audio_control_wire_size(&framed[4..])
+        .map_err(|error| TransportError::Protocol(format!("{error:?}")))?;
+    let envelope = decode_message::<wire::Envelope>(Channel::InputControl, &framed)
         .map_err(|error| TransportError::Protocol(format!("{error:?}")))?
-        .ok_or_else(|| TransportError::Protocol("incomplete frame".into()))
+        .ok_or_else(|| TransportError::Protocol("incomplete frame".into()))?;
+    Ok((envelope, audio_violation))
 }
 
 /// The input stream is terminal after either deadline; partial frames are never resumed.
@@ -302,7 +310,7 @@ mod tests {
                 ..Default::default()
             };
             write_frame(&mut sender, &envelope).await.unwrap();
-            let (decoded, _) = frames_rx.recv().await.unwrap().unwrap();
+            let (decoded, _, _) = frames_rx.recv().await.unwrap().unwrap();
             let raw = format!("{:?}", counters.lease_challenge_trace([7; 16]));
             let raw_stage = match &decoded.payload {
                 Some(wire::envelope::Payload::LeaseChallenge(_)) => "challenge_raw_decode",
@@ -814,6 +822,32 @@ impl LinkHandle {
         }
     }
 
+    /// Requires current bilateral opt-in capability, not merely implementation support.
+    /// An audio validation/admission error never terminates a healthy input link.
+    pub async fn send_audio_control(
+        &self,
+        message: wire::AudioControl,
+    ) -> Result<(), TransportError> {
+        validate::audio_control(&message).map_err(TransportError::Audio)?;
+        if !self.queue.audio_allowed() {
+            return Err(TransportError::Audio(validate::AudioViolation::Capability));
+        }
+        if let Some(wire::audio_control::Body::Offer(offer)) = &message.body {
+            let binding = self
+                .auxiliary_secret()
+                .ok_or(TransportError::Audio(
+                    validate::AudioViolation::ParentConnection,
+                ))?
+                .binding();
+            if offer.parent_connection_id.as_slice() != binding.connection_id {
+                return Err(TransportError::Audio(
+                    validate::AudioViolation::ParentConnection,
+                ));
+            }
+        }
+        self.admit(self.queue.push(Outbound::AudioControl(message)))
+    }
+
     pub async fn send_capabilities(&self, capabilities: Vec<i32>) -> Result<(), TransportError> {
         self.admit(self.queue.push(Outbound::CapabilitiesChanged(capabilities)))
     }
@@ -1037,6 +1071,7 @@ pub struct LinkConfig {
 /// Spawns independent reader, coordinator and writer tasks.
 pub fn spawn(config: LinkConfig) -> Result<Link, TransportError> {
     let queue = Arc::new(InputQueue::new(config.queue_capacity));
+    queue.set_local_audio(&config.local_hello.capabilities);
     let (terminal, _) = tokio::sync::watch::channel(None);
     let diagnostics = Arc::new(LeaseTransportCounters::default());
     let metrics = Arc::new(Mutex::new(InputMetrics::default()));
@@ -1212,14 +1247,14 @@ async fn run(config: LinkConfig, handle: LinkHandle) {
                             }
                             break reason_from(error);
                         }
-                        Some(Ok((envelope, decoded_at))) => {
+                        Some(Ok((envelope, audio_violation, decoded_at))) => {
                             metrics.lock().unwrap_or_else(|e| e.into_inner())
                                 .record(Stage::InboundDispatch, duration_us(tokio::time::Instant::now().duration_since(decoded_at)));
                             let outcome = tokio::select! {
                                 biased;
                                 _ = failure.changed() => Err(failure.borrow().clone().unwrap_or(LinkDownReason::LocalClosed)),
                                 () = shutdown.notified() => Err(LinkDownReason::LocalClosed),
-                                result = state.on_frame(&queue, &mut handshake, &envelope, &local_hello, &reports) => result,
+                                result = state.on_frame(&queue, &mut handshake, &envelope, audio_violation, &local_hello, &reports) => result,
                             };
                             if let Err(reason) = outcome { break reason; }
                         }
@@ -1488,6 +1523,7 @@ impl LinkState {
         queue: &InputQueue,
         handshake: &mut HelloHandshake,
         envelope: &wire::Envelope,
+        audio_violation: Option<validate::AudioViolation>,
         local_hello: &wire::Hello,
         reports: &mpsc::Sender<LinkReport>,
     ) -> Result<(), LinkDownReason> {
@@ -1630,6 +1666,7 @@ impl LinkState {
                     },
                 );
             }
+            queue.set_remote_audio(&hello.capabilities);
             queue.ready(self.unpair_notice);
             return reports
                 .send(LinkReport::Up {
@@ -1707,6 +1744,7 @@ impl LinkState {
                         .refuse(queue, envelope, wire::ErrorCode::InvalidFrame)
                         .await);
                 }
+                queue.set_remote_audio(&changed.capabilities);
             }
             _ => {}
         }
@@ -1714,8 +1752,17 @@ impl LinkState {
         // on the wire, whether or not this build could read it (audit F4 keeps the link up).
         self.lease_diagnostics
             .record(envelope.payload.as_ref(), false);
-        let message = match convert::inbound_from_envelope(envelope) {
+        let converted = if let Some(violation) = audio_violation {
+            Err(convert::ConvertError::Audio(violation))
+        } else {
+            convert::inbound_from_envelope(envelope)
+        };
+        let message = match converted {
             Ok(message) => message,
+            Err(convert::ConvertError::Audio(violation)) => convert::Inbound::AudioRejected {
+                violation,
+                connection_id: self.connection_id,
+            },
             Err(convert::ConvertError::Violation(violation)) => {
                 return Err(self.refuse(queue, envelope, violation.error_code()).await);
             }
@@ -1736,6 +1783,15 @@ impl LinkState {
                 }
                 return Ok(());
             }
+        };
+        let message = if matches!(message, convert::Inbound::Audio { .. }) && !queue.audio_allowed()
+        {
+            convert::Inbound::AudioRejected {
+                violation: validate::AudioViolation::Capability,
+                connection_id: self.connection_id,
+            }
+        } else {
+            message
         };
         match &message {
             convert::Inbound::Focus(fr::Message::InputBatch { events, .. }) => {
@@ -1833,19 +1889,26 @@ impl WriterState {
     }
 }
 
+type ReceivedFrame = (
+    wire::Envelope,
+    Option<validate::AudioViolation>,
+    tokio::time::Instant,
+);
+
 async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: ReadHalf<R>,
-    frames: mpsc::Sender<Result<(wire::Envelope, tokio::time::Instant), TransportError>>,
+    frames: mpsc::Sender<Result<ReceivedFrame, TransportError>>,
     lease_diagnostics: Arc<LeaseTransportCounters>,
 ) {
     loop {
-        let frame = read_frame(&mut reader).await;
+        let frame = read_frame_detailed(&mut reader).await;
         let decoded_at = tokio::time::Instant::now();
-        if let Ok(envelope) = &frame {
+        if let Ok((envelope, _)) = &frame {
             lease_diagnostics.record_trace(envelope, true, false);
         }
         let stop = frame.is_err();
-        let frame = frame.map(|envelope| (envelope, decoded_at));
+        let frame =
+            frame.map(|(envelope, audio_violation)| (envelope, audio_violation, decoded_at));
         let queued = frames.send(frame).await;
         if queued.is_err() || stop {
             return;
@@ -2015,6 +2078,14 @@ async fn write_intent<W: AsyncWrite + Unpin>(
             envelope
         }
         Intent::Outbound(item) => match item {
+            Outbound::AudioControl(message) => {
+                // Withdrawal purges queued metadata; recheck items already selected by
+                // the writer too. Never consume an envelope sequence for a dropped item.
+                if !queue.audio_allowed() {
+                    return Ok(());
+                }
+                state.envelope(wire::envelope::Payload::AudioControl(message))
+            }
             Outbound::Guaranteed(message) => {
                 if let fr::Message::Leave { lease_id, .. } | fr::Message::LeaveAck { lease_id } =
                     &message
@@ -2103,6 +2174,9 @@ async fn write_intent<W: AsyncWrite + Unpin>(
         metrics.increment(Counter::AckPendingExpired, expired);
     }
     write_measured(writer, &envelope, metrics).await?;
+    if let Some(wire::envelope::Payload::CapabilitiesChanged(changed)) = &envelope.payload {
+        queue.local_capabilities_written(&changed.capabilities);
+    }
     state.lease_diagnostics.record_trace(&envelope, false, true);
     state
         .lease_diagnostics
@@ -2161,3 +2235,116 @@ async fn report_down(
 #[cfg(test)]
 #[path = "link/input_pipeline_tests.rs"]
 mod input_pipeline_tests;
+
+#[cfg(test)]
+mod audio_admission_tests {
+    use super::*;
+    use protocol::validate::AudioViolation;
+
+    fn report() -> wire::AudioControl {
+        wire::AudioControl {
+            control_version: 1,
+            body: Some(wire::audio_control::Body::Report(wire::AudioReport {
+                session_id: vec![1; 16],
+                device_state: wire::AudioDeviceState::Ready as i32,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_saturation_is_nonfatal_and_stop_has_reserved_priority() {
+        let handle = LinkHandle::for_counter_test(NodeId::new([2; 32]));
+        let caps = [wire::Capability::AudioControlV1 as i32];
+        handle.queue.set_local_audio(&caps);
+        handle.queue.set_remote_audio(&caps);
+        // Capability support cannot bypass the Hello barrier.
+        assert!(matches!(
+            handle.send_audio_control(report()).await,
+            Err(TransportError::Audio(AudioViolation::Capability))
+        ));
+        assert!(handle.queue.pop().is_none());
+        handle.queue.ready(false);
+        for _ in 0..8 {
+            handle.send_audio_control(report()).await.unwrap();
+        }
+        assert!(matches!(
+            handle.send_audio_control(report()).await,
+            Err(TransportError::Audio(AudioViolation::QueueFull))
+        ));
+        assert!(handle.terminal.borrow().is_none());
+        handle
+            .send_audio_control(wire::AudioControl {
+                control_version: 1,
+                body: Some(wire::audio_control::Body::Stop(wire::AudioStop {
+                    session_id: vec![1; 16],
+                    reason: wire::AudioStopCode::UserStop as i32,
+                })),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            handle.queue.pop(),
+            Some(Intent::Outbound(Outbound::AudioControl(
+                wire::AudioControl {
+                    body: Some(wire::audio_control::Body::Stop(_)),
+                    ..
+                }
+            )))
+        ));
+        handle
+            .send(fr::Message::LeaseRenew {
+                lease_id: [3; 16],
+                nonce: [7; 16],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            handle.queue.pop(),
+            Some(Intent::Outbound(Outbound::Guaranteed(
+                fr::Message::LeaseRenew { .. }
+            )))
+        ));
+        // A local withdrawal purges queued audio without losing KVM controls.
+        handle.send_capabilities(vec![]).await.unwrap();
+        assert!(matches!(
+            handle.send_audio_control(report()).await,
+            Err(TransportError::Audio(AudioViolation::Capability))
+        ));
+        assert!(matches!(
+            handle.queue.pop(),
+            Some(Intent::Outbound(Outbound::CapabilitiesChanged(_)))
+        ));
+        assert!(handle.queue.pop().is_none());
+        assert!(handle.terminal.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn audio_budget_preserves_all_existing_metadata_slots() {
+        let handle = LinkHandle::for_counter_test(NodeId::new([2; 32]));
+        let caps = vec![wire::Capability::AudioControlV1 as i32];
+        handle.queue.set_local_audio(&caps);
+        handle.queue.set_remote_audio(&caps);
+        handle.queue.ready(false);
+        for _ in 0..8 {
+            handle.send_audio_control(report()).await.unwrap();
+        }
+        for _ in 0..16 {
+            handle.send_capabilities(caps.clone()).await.unwrap();
+        }
+        assert!(matches!(
+            handle.send_audio_control(report()).await,
+            Err(TransportError::Audio(AudioViolation::QueueFull))
+        ));
+        assert!(handle.terminal.borrow().is_none());
+        handle.queue.set_remote_audio(&[]);
+        assert!(!handle.queue.audio_allowed());
+        for _ in 0..16 {
+            assert!(matches!(
+                handle.queue.pop(),
+                Some(Intent::Outbound(Outbound::CapabilitiesChanged(_)))
+            ));
+        }
+        assert!(handle.queue.pop().is_none());
+    }
+}

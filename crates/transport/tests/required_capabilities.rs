@@ -272,11 +272,14 @@ async fn normal_legacy_peers_still_establish_in_both_tls_roles() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn capture_and_inject_requirements_use_static_support_not_runtime_offers() {
+async fn implemented_requirements_use_static_support_not_runtime_offers() {
     for direction in [Direction::Incoming, Direction::Outgoing] {
         for capability in [
             wire::Capability::Capture as i32,
             wire::Capability::Inject as i32,
+            wire::Capability::AudioControlV1 as i32,
+            wire::Capability::SystemAudioSource as i32,
+            wire::Capability::AudioListener as i32,
         ] {
             for available in [false, true] {
                 let (mut session, mut remote) = Session::new(

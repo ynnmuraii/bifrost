@@ -32,6 +32,10 @@ fn round_trip(message: &LayoutMessage) -> LayoutMessage {
         Inbound::ClipboardApplied(other) => panic!("expected layout, got clipboard ack: {other:?}"),
         Inbound::ClipboardRoute(other) => panic!("expected layout, got clipboard route: {other:?}"),
         Inbound::Unpaired(other) => panic!("expected layout, got unpair notice: {other:?}"),
+        Inbound::Audio { message, .. } => panic!("expected layout, got audio: {message:?}"),
+        Inbound::AudioRejected { violation, .. } => {
+            panic!("expected layout, got audio rejection: {violation:?}")
+        }
     }
 }
 

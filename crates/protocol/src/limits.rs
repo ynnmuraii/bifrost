@@ -60,6 +60,14 @@ pub const MAX_FRAME_PAIRING: usize = 8_192;
 /// `AgentFrame`/`GuiFrame` body limit on local IPC: 65536 bytes.
 pub const MAX_FRAME_IPC: usize = 65_536;
 
+/// Complete encoded AudioControl ceiling, independent of the input frame ceiling.
+pub const MAX_AUDIO_CONTROL_BYTES: usize = 2_048;
+pub const MAX_AUDIO_MEDIA_VERSIONS: usize = 4;
+pub const AUDIO_CONTROL_VERSION: u32 = 1;
+pub const AUDIO_CONTROL_TTL_MS: u32 = 3_000;
+pub const AUDIO_DIRECTION_SEND: u32 = 1;
+pub const AUDIO_DIRECTION_RECEIVE: u32 = 2;
+
 /// Text payload hard cap, never widened by image support.
 pub const MAX_CLIPBOARD_PAYLOAD_BYTES: u64 = 1_048_576;
 pub const MAX_CLIPBOARD_IMAGE_PAYLOAD_BYTES: u64 = 33_554_432;
