@@ -476,6 +476,8 @@ where
     if !config.authorized.load(Ordering::Acquire) {
         return Err(EngineError::Unauthorized);
     }
+    // MediaSocket already provides nonblocking session queues and one event-driven
+    // reader; no per-session socket timeout can gate the encoder cadence.
     let start = Instant::now();
     let shared = Arc::new(Shared::new(config.authorized.clone()));
     let endpoint = config.socket.register(
@@ -845,6 +847,7 @@ impl SourceWorker {
                 }
             }
             if !self.path.validated {
+                thread::sleep(Duration::from_millis(1));
                 continue;
             }
             self.context.shared.started(&self.context.events);
@@ -911,6 +914,16 @@ impl SourceWorker {
                     next_frame = Instant::now() + frame_duration;
                 }
             }
+            // The absolute media grid, not receive timeouts or sleep durations, owns pacing.
+            // Poll the capture ring at most every millisecond without busy-spinning.
+            let wait = next_frame
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(1));
+            thread::sleep(if wait.is_zero() {
+                Duration::from_millis(1)
+            } else {
+                wait
+            });
         }
         Ok(())
     }

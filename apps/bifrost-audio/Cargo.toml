@@ -28,3 +28,7 @@ platform-audio-win = { path = "../../crates/platform-audio-win" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+rtrb = "0.3"
+windows-sys = { workspace = true, features = ["Win32_System_Performance"] }

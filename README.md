@@ -119,11 +119,22 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 
 ## Build from source
 
-Use [Rust via rustup](https://rustup.rs/) with the repository's toolchain (Rust 1.99 or newer). Windows needs the MSVC C++ build tools and Windows SDK. On Ubuntu/Debian, CI uses:
+Use [Rust via rustup](https://rustup.rs/) with the repository's toolchain (Rust 1.99 or newer). Windows needs the MSVC C++ build tools and Windows SDK.
+
+The default-enabled `audio` feature builds bundled, statically linked libopus and needs CMake
+on the build host (not on the machine running Bifrost). On Windows, a non-admin installation
+with Python is `python -m pip install --user cmake`; this was exercised with CMake **4.4.4**.
+For the current shell only, add Python's user scripts directory (reported by
+`python -m site --user-base`, followed by `Python311/Scripts` for Python 3.11 on Windows)
+to `PATH`; do not change the system-wide environment. Alternatively set `CMAKE` to the
+absolute path of that installation's `cmake.exe`. A build without audio uses
+`cargo build --release -p bifrost --no-default-features`.
+
+On Ubuntu/Debian, install CMake alongside the other build/test prerequisites:
 
 ```sh
 sudo apt-get update
-sudo apt-get install --yes --no-install-recommends build-essential binutils xvfb xauth
+sudo apt-get install --yes --no-install-recommends build-essential cmake binutils xvfb xauth
 cargo build --release -p bifrost
 ```
 
@@ -137,6 +148,16 @@ cargo test --workspace
 ```
 
 Do **not** run ignored tests on your everyday desktop: some intentionally drive real input. Linux CI runs tests under `xvfb-run -a -s "-screen 0 1280x1024x24 -noreset"`.
+
+For an explicitly audible Windows audio smoke, run
+`cargo run -p bifrost-audio --example windows_e2e -- --audible`.
+It plays a six-second 1 kHz tone on the default multimedia output, opens two native audio
+workers and ephemeral localhost UDP sockets, and captures render loopback in memory.
+It never changes endpoint routing, volume or mute. A 500 ms test-only ciphertext delay
+separates the listener's remaining output from the helper's direct tone; reported latency
+includes that delay, and the delay-subtracted value is only an estimate. Muted or
+loopback-suppressed endpoints can fail the signal assertions; do not change real endpoint
+settings just to obtain a pass.
 
 ## License
 
