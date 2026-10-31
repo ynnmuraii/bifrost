@@ -552,6 +552,8 @@ where
     Ok(session)
 }
 
+/// Attempts the Listener's authenticated challenge before returning. Commit/start the
+/// Listener before the Source to establish outbound firewall state first; both sides probe.
 pub fn start_listener<B: Backend>(
     backend: &mut B,
     request: RenderRequest,
@@ -668,17 +670,22 @@ where
         events: events_tx,
         start,
     };
-    session.workers.push(
-        thread::Builder::new()
-            .name("bfa-playout".into())
-            .spawn(move || feeder.run())?,
-    );
-    let worker = ReceiveWorker {
+    let mut worker = ReceiveWorker {
         context,
         receiver,
         sealer: keys.send,
         path,
     };
+    if let Err(reason) = worker.send_probe(&mut [0; MAX_DATAGRAM_LEN]) {
+        worker.context.finish(Err(reason));
+        return Ok(session);
+    }
+    // Keep the first probe off callbacks and independent of receive-thread scheduling.
+    session.workers.push(
+        thread::Builder::new()
+            .name("bfa-playout".into())
+            .spawn(move || feeder.run())?,
+    );
     session.workers.push(
         thread::Builder::new()
             .name("bfa-receive".into())
@@ -695,6 +702,15 @@ struct Context {
     start: Instant,
 }
 impl Context {
+    // The peer may not have bound UDP yet when the Listener commits first. ICMP
+    // refusal is not authentication evidence; only the existing probe deadline decides.
+    fn startup_refusal(&self, error: &io::Error) -> bool {
+        !self.shared.started.load(Ordering::Acquire)
+            && (matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+            ) || cfg!(windows) && error.raw_os_error() == Some(10054))
+    }
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
@@ -725,6 +741,7 @@ impl Context {
                 self.shared.degraded(&self.events);
                 Ok(())
             }
+            Err(error) if self.startup_refusal(&error) => Ok(()),
             _ => Err(StopReason::NetworkFailure),
         }
     }
@@ -745,6 +762,7 @@ impl Context {
             {
                 Ok(None)
             }
+            Err(error) if self.startup_refusal(&error) => Ok(None),
             // Winsock reports truncation as WSAEMSGSIZE instead of returning the filled buffer.
             Err(error) if cfg!(windows) && error.raw_os_error() == Some(10040) => {
                 lock(&self.shared.stats).rejected += 1;
@@ -1006,6 +1024,23 @@ struct ReceiveWorker {
     path: PathState,
 }
 impl ReceiveWorker {
+    fn send_probe(&mut self, outgoing: &mut [u8]) -> Result<(), StopReason> {
+        if let Some(token) = self.path.probe()? {
+            let n = self
+                .sealer
+                .seal(
+                    self.context.now_ms(),
+                    PacketKind::PathChallenge,
+                    0,
+                    0,
+                    &token,
+                    outgoing,
+                )
+                .map_err(crypto_reason)?;
+            self.context.send(&outgoing[..n])?;
+        }
+        Ok(())
+    }
     fn run(mut self) {
         let result = self.process();
         self.context.finish(result);
@@ -1015,20 +1050,7 @@ impl ReceiveWorker {
         let mut outgoing = [0; MAX_DATAGRAM_LEN];
         let mut next_report = Instant::now();
         while !self.context.shared.is_stopped() {
-            if let Some(token) = self.path.probe()? {
-                let n = self
-                    .sealer
-                    .seal(
-                        self.context.now_ms(),
-                        PacketKind::PathChallenge,
-                        0,
-                        0,
-                        &token,
-                        &mut outgoing,
-                    )
-                    .map_err(crypto_reason)?;
-                self.context.send(&outgoing[..n])?;
-            }
+            self.send_probe(&mut outgoing)?;
             if let Some(n) = self.context.receive(&mut packet)? {
                 let now = self.context.shared.render_clock.load(Ordering::Acquire);
                 let result = lock(&self.receiver).receive(now, &mut packet[..n], |header| {
@@ -1212,5 +1234,34 @@ fn push_pcm(
     }
     for &sample in pcm {
         let _ = output.push(sample);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    #[test]
+    fn startup_icmp_refusal_never_validates_and_stops_being_transient_after_validation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = socket.local_addr().unwrap();
+        let (events, _) = mpsc::sync_channel(EVENT_CAPACITY);
+        let shared = Arc::new(Shared::new(Arc::new(AtomicBool::new(true))));
+        let context = Context {
+            socket,
+            peer,
+            shared,
+            events,
+            start: Instant::now(),
+        };
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            assert!(context.startup_refusal(&io::Error::from(kind)));
+        }
+        assert!(!context.shared.started.load(Ordering::Acquire));
+        assert!(!context.startup_refusal(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        context.shared.started.store(true, Ordering::Release);
+        assert!(!context.startup_refusal(&io::Error::from(io::ErrorKind::ConnectionRefused)));
     }
 }

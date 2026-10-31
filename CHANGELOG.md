@@ -30,6 +30,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
 - Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling.
 - Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback-only tests cover loss/reorder/injection and device invalidation; core/IPC integration remains disabled.
+- Both audio endpoints immediately authenticate the UDP path; Listener startup attempts its first challenge before returning, enabling Listener-first commit ordering and stateful outbound firewall state. Media remains gated on validation, with the existing three-attempt/500 ms-window/two-second bounds; a two-sided stateful-firewall relay test verifies recovery and audio flow.
 
 **Linux audio backend internals**
 
@@ -70,6 +71,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
 - Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле.
 - Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства; интеграция core/IPC пока не включена.
+- Оба конца аудиосеанса сразу проверяют UDP-путь; Listener пытается отправить первый аутентифицированный запрос до возврата из запуска, позволяя сначала открыть исходящее состояние межсетевого экрана. Медиа остаётся закрытым до проверки пути; сохранены три попытки, окна 500 мс и предел две секунды. Тест с двусторонним stateful-фильтром проверяет восстановление пути и доставку звука.
 
 **Внутренний аудиобэкенд Linux**
 
