@@ -5,6 +5,7 @@ mod admission;
 mod media;
 mod microphone;
 mod safety;
+mod sharing;
 mod wire;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -53,6 +54,7 @@ pub(super) fn is_request(message: &gui::gui_frame::Msg) -> bool {
         message,
         Msg::GetAudioStatus(_)
             | Msg::SetAudio(_)
+            | Msg::SetSystemAudioSharing(_)
             | Msg::StartAudio(_)
             | Msg::StopAudio(_)
             | Msg::SetMicrophoneMute(_)
@@ -109,6 +111,7 @@ pub(super) struct Coordinator {
     commands: mpsc::Sender<Command>,
     gui_commands: mpsc::Sender<safety::Command>,
     gui_safety: watch::Sender<safety::Latch>,
+    system_intents: watch::Sender<sharing::Intent>,
     links: watch::Sender<Links>,
     focus: watch::Sender<CommittedFocus>,
     control: watch::Sender<ControlContext>,
@@ -130,6 +133,10 @@ impl Coordinator {
         let (commands, rx) = mpsc::channel(COMMANDS);
         let (gui_commands, gui_rx) = mpsc::channel(16);
         let (gui_safety, safety_rx) = watch::channel(safety::Latch::default());
+        let (system_intents, system_rx) = watch::channel(sharing::Intent::default());
+        let system_requested = config.enabled
+            && config.system_sharing == Some(true)
+            && config.role == config::AudioRole::Listener;
         let (gui_safety_target, target_rx) = watch::channel(None);
         let independent_safety_rx = safety_rx.clone();
         let (links, link_rx) = watch::channel(Links::default());
@@ -155,6 +162,13 @@ impl Coordinator {
             gui_commands: gui_rx,
             gui_safety: safety_rx,
             applied_gui_safety: 0,
+            system_intents: system_rx,
+            applied_system_off: 0,
+            system_off_result: Ok(()),
+            system_requested,
+            system_error: None,
+            system_start: None,
+            system_session: None,
             gui_safety_target,
             links: link_rx,
             stopping: stop_rx,
@@ -211,6 +225,7 @@ impl Coordinator {
             commands,
             gui_commands,
             gui_safety,
+            system_intents,
             links,
             focus: focus_tx,
             control,
@@ -399,7 +414,14 @@ impl Coordinator {
         }
     }
     pub(super) fn submit(&self, request: Request) -> Result<(), (u64, mpsc::Sender<Outgoing>)> {
-        safety::submit(&self.gui_commands, &self.gui_safety, request)
+        if matches!(
+            &request.message,
+            gui::gui_frame::Msg::SetSystemAudioSharing(_)
+        ) {
+            sharing::submit(&self.system_intents, request)
+        } else {
+            safety::submit(&self.gui_commands, &self.gui_safety, request)
+        }
     }
     pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.caps.changed().await
@@ -482,6 +504,13 @@ struct Actor {
     gui_commands: mpsc::Receiver<safety::Command>,
     gui_safety: watch::Receiver<safety::Latch>,
     applied_gui_safety: u64,
+    system_intents: watch::Receiver<sharing::Intent>,
+    applied_system_off: u64,
+    system_off_result: Result<(), Code>,
+    system_requested: bool,
+    system_error: Option<Code>,
+    system_start: Option<sharing::Start>,
+    system_session: Option<[u8; 16]>,
     gui_safety_target: watch::Sender<Option<safety::Target>>,
     links: watch::Receiver<Links>,
     stopping: watch::Receiver<bool>,
@@ -584,7 +613,7 @@ impl Actor {
         }
     }
     fn allowed(&self, peer: NodeId) -> bool {
-        permitted(&self.config, peer)
+        self.system_enabled() && permitted(&self.config, peer)
     }
     fn feed(&mut self, input: fsm::Input) -> Result<(), Code> {
         self.scratch_effects.clear();
@@ -638,7 +667,7 @@ impl Actor {
             config::AudioRole::Listener => Some(model::AudioRole::Listener),
         };
         self.feed(fsm::Input::Configure(fsm::Settings {
-            enabled: self.config.enabled,
+            enabled: self.system_enabled(),
             role,
             group: self.config.group_id.map(|id| id.0),
             group_override: self.config.effective_group_override(),
@@ -671,11 +700,15 @@ impl Actor {
                 .as_ref()
                 .is_some_and(|worker| worker.alive && worker.model_ready)
             {
-                if available(self.ready.as_ref(), worker::Capability::SystemCapture) {
+                if self.system_enabled()
+                    && available(self.ready.as_ref(), worker::Capability::SystemCapture)
+                {
                     bits[len] = net::Capability::SystemAudioSource as i32;
                     len += 1;
                 }
-                if available(self.ready.as_ref(), worker::Capability::Render) {
+                if self.system_enabled()
+                    && available(self.ready.as_ref(), worker::Capability::Render)
+                {
                     bits[len] = net::Capability::AudioListener as i32;
                     len += 1;
                 }
@@ -712,7 +745,7 @@ impl Actor {
         self.publish("initial");
         self.sync_links();
         self.drain().await;
-        if self.config.enabled {
+        if self.worker_needed() {
             let _ = self.ensure_worker().await;
             self.drain().await;
         }
@@ -728,6 +761,11 @@ impl Actor {
                     cause = "gui_safety";
                     if changed.is_err() { break; }
                     self.sync_gui_safety().await;
+                }
+                changed = self.system_intents.changed() => {
+                    cause = "system_intent";
+                    if changed.is_err() { break; }
+                    self.system_intent().await;
                 }
                 changed = self.focus_rx.changed() => {
                     cause = "focus";
@@ -817,6 +855,7 @@ impl Actor {
                     }
                 }
             }
+            let _ = self.sync_system_off().await;
             self.drain().await;
             self.service_focus().await;
             self.apply_gains().await;
@@ -827,6 +866,7 @@ impl Actor {
             self.publish_caps();
             self.publish(cause);
             self.service_deferred().await;
+            self.service_system_start().await;
         }
         self.stop_all(fsm::Reason::UserStop);
         self.drain().await;
@@ -949,10 +989,23 @@ impl Actor {
     }
     async fn drain(&mut self) {
         while let Some(effect) = self.effects.pop_front() {
+            if !self.system_enabled()
+                && matches!(
+                    &effect,
+                    fsm::Effect::GenerateSourceNonce { .. }
+                        | fsm::Effect::GenerateListenerOffer { .. }
+                        | fsm::Effect::DeriveKeys { .. }
+                        | fsm::Effect::PrepareChild { .. }
+                        | fsm::Effect::StartChild { .. }
+                        | fsm::Effect::RenewChild { .. }
+                )
+            {
+                continue;
+            }
             match effect {
                 fsm::Effect::PublishStatus => self.publish("model"),
                 fsm::Effect::PublishConfiguration(settings) => {
-                    if self.configuration_error.is_some() {
+                    if self.configuration_error.is_some() || !self.system_enabled() {
                         continue;
                     }
                     // FSM enabled is the activation gate; persisted enabled is explicit user
@@ -976,7 +1029,7 @@ impl Actor {
                     if self.configuration_error.is_some() {
                         continue;
                     }
-                    if !self.config.enabled || self.config.role != config::AudioRole::Listener {
+                    if !self.system_enabled() || self.config.role != config::AudioRole::Listener {
                         continue;
                     }
                     if let Ok(group) = identity::random16() {
@@ -1041,6 +1094,7 @@ impl Actor {
                 fsm::Effect::StartRequestResult {
                     request_id, result, ..
                 } => {
+                    self.system_start_result(request_id, result);
                     self.retry.retain(|(_, message)| {
                         !matches!(message,
                         fsm::Control::StartRequest(request) if request.request_id == request_id)
@@ -1162,7 +1216,7 @@ impl Actor {
                     view,
                     authorized_for_ms,
                 } => {
-                    if self.current(view.parent) {
+                    if self.system_enabled() && self.current(view.parent) {
                         if let Some(worker) = &self.worker {
                             if worker.alive
                                 && worker.model_ready
@@ -1238,7 +1292,7 @@ impl Actor {
         self.current(parent).then_some(material)
     }
     async fn start_child(&mut self, view: fsm::SessionView) {
-        if !self.current(view.parent) {
+        if !self.system_enabled() || !self.current(view.parent) {
             return;
         }
         let peer_id = NodeId::new(view.parent.peer);
@@ -1355,7 +1409,7 @@ impl Actor {
         // Native SessionEvent::Started, never this write ACK, calls ChildStarted.
     }
     async fn ensure_worker(&mut self) -> Result<(), Code> {
-        if !self.config.enabled {
+        if !self.worker_needed() {
             return Err(ipc::audio::codes::AUDIO_UNAVAILABLE);
         }
         if self.worker.is_some() {
@@ -1933,7 +1987,7 @@ impl Actor {
         for (parent, message) in retry {
             self.send_control(parent, message).await;
         }
-        if self.worker.is_none() && !self.worker_failed {
+        if self.worker_needed() && self.worker.is_none() && !self.worker_failed {
             let _ = self.ensure_worker().await;
         }
         let now = self.now();
@@ -2489,6 +2543,15 @@ impl Actor {
             self.mic_reset();
         }
         self.config = next;
+        if !self.config.system_enabled() {
+            self.system_requested = false;
+            self.system_start = None;
+            self.system_session = None;
+        } else if self.config.role == config::AudioRole::Listener
+            && self.config.system_sharing == Some(true)
+        {
+            self.system_requested = true;
+        }
         self.publish_gui_safety_target();
         self.configuration_error = None;
         self.worker_failed = false;
@@ -2614,7 +2677,7 @@ impl Actor {
         (local.0 != remote).then_some(ipc::audio::codes::AUDIO_GROUP_MISMATCH)
     }
     fn start_ready(&self, peer: NodeId) -> bool {
-        self.config.enabled
+        self.system_enabled()
             && self.configuration_error.is_none()
             && self
                 .worker
@@ -2774,6 +2837,8 @@ impl Actor {
             }
             next.peers.push(config::AudioPeerConfig {
                 node_id: config::audio::HexId(id),
+                system_send_override: None,
+                system_receive_override: None,
                 allow_media_control: false,
                 allow_mic_control: false,
                 gain_percent: set.gain_percent,
@@ -2790,6 +2855,8 @@ impl Actor {
         let mut status = model::AudioStatus {
             revision: self.revision,
             enabled: self.config.enabled,
+            system_sharing_requested: self.config.system_sharing.map(|_| self.system_enabled()),
+            system_sharing_error: self.system_error.map(str::to_owned),
             role,
             mode: match self.config.mode {
                 config::AudioMode::MixAll => model::AudioMode::MixAll,
@@ -3220,14 +3287,11 @@ fn background_percent(config: &config::AudioConfig) -> u32 {
 
 fn permitted(config: &config::AudioConfig, peer: NodeId) -> bool {
     let id = config::audio::HexId(*peer.as_bytes());
-    config.enabled
-        && match config.role {
-            config::AudioRole::Source => {
-                config.listener_node_id == Some(id) && config.allow_send_to.contains(&id)
-            }
-            config::AudioRole::Listener => config.allow_system_audio_from.contains(&id),
-            config::AudioRole::Off => false,
-        }
+    match config.role {
+        config::AudioRole::Source => config.system_send_allowed(id),
+        config::AudioRole::Listener => config.system_receive_allowed(id),
+        config::AudioRole::Off => false,
+    }
 }
 
 fn supervisor_code(error: AudioSupervisorError) -> Code {

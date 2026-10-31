@@ -634,6 +634,7 @@ impl Session {
             &request.message,
             Msg::GetAudioStatus(_)
                 | Msg::SetAudio(_)
+                | Msg::SetSystemAudioSharing(_)
                 | Msg::StartAudio(_)
                 | Msg::StopAudio(_)
                 | Msg::SetMicrophoneMute(_)
@@ -647,7 +648,7 @@ impl Session {
             let (request_id, out) = if let Some(audio) = &self.audio {
                 if matches!(
                     &request.message,
-                    Msg::SetAudio(_) | Msg::SetAudioPeerGain(_)
+                    Msg::SetAudio(_) | Msg::SetSystemAudioSharing(_) | Msg::SetAudioPeerGain(_)
                 ) {
                     audio.trusted(&self.trust);
                 }

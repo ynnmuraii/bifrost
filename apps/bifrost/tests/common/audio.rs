@@ -342,6 +342,7 @@ pub fn config(
 ) -> wire::AudioConfig {
     wire::AudioConfig {
         enabled: true,
+        system_sharing: None,
         role: role as i32,
         listener_node_id: listener.to_vec(),
         group_id: Vec::new(),

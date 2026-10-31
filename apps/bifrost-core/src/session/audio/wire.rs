@@ -520,6 +520,7 @@ pub fn encode_config(
             .unwrap_or_default(),
         group_id: config.group_id.map(|id| id.0.to_vec()).unwrap_or_default(),
         group_id_override: config.group_id_override,
+        system_sharing: config.system_sharing,
         mode: match config.mode {
             cfg::AudioMode::MixAll => wire::AudioMode::MixAll as i32,
             cfg::AudioMode::FollowFocus => wire::AudioMode::FollowFocus as i32,
@@ -566,6 +567,9 @@ pub fn encode_config(
                     allow_mic_control: preference.is_some_and(|peer| peer.allow_mic_control),
                     allow_media_control: preference.is_some_and(|peer| peer.allow_media_control),
                     volume_percent: preference.map_or(100, |peer| peer.gain_percent),
+                    system_send_override: preference.and_then(|peer| peer.system_send_override),
+                    system_receive_override: preference
+                        .and_then(|peer| peer.system_receive_override),
                 }
             })
             .collect(),
@@ -598,6 +602,7 @@ pub fn decode_config(
     let wire_role = ipc::audio::decode_role(value.role)?;
     let mut result = cfg::AudioConfig {
         enabled: value.enabled,
+        system_sharing: value.system_sharing,
         role: match wire_role {
             wire::AudioRole::Source
                 if previous.role == cfg::AudioRole::Off
@@ -701,6 +706,8 @@ pub fn decode_config(
         let prior = previous.peers.iter().find(|p| p.node_id == id);
         result.peers.push(cfg::AudioPeerConfig {
             node_id: id,
+            system_send_override: peer.system_send_override,
+            system_receive_override: peer.system_receive_override,
             allow_media_control: peer.allow_media_control,
             allow_mic_control: peer.allow_mic_control,
             gain_percent: peer.volume_percent,
@@ -933,6 +940,8 @@ pub fn encode_status(
         .collect();
     let result = wire::AudioStatus {
         revision: status.revision,
+        system_sharing_requested: status.system_sharing_requested,
+        system_sharing_error: status.system_sharing_error.clone().unwrap_or_default(),
         enabled: status.enabled,
         role: encode_role(status.role),
         mode: encode_mode(status.mode),
@@ -998,6 +1007,7 @@ pub fn same_control_state(old: &wire::AudioStatus, new: &wire::AudioStatus) -> b
     old.enabled == new.enabled
         && old.role == new.role
         && old.mode == new.mode
+        && old.system_sharing_requested == new.system_sharing_requested
         && old.config == new.config
         && old.backend == new.backend
         && old.microphone == new.microphone
@@ -1224,6 +1234,8 @@ mod tests {
             allow_system_audio_from: vec![peer],
             peers: vec![cfg::AudioPeerConfig {
                 node_id: peer,
+                system_send_override: None,
+                system_receive_override: None,
                 allow_media_control: false,
                 allow_mic_control: false,
                 gain_percent: 37,
@@ -1509,6 +1521,8 @@ mod tests {
         let snapshot = model::AudioStatus {
             revision: u64::MAX,
             enabled: true,
+            system_sharing_requested: None,
+            system_sharing_error: None,
             role: model::AudioRole::Listener,
             mode: model::AudioMode::MixAll,
             backend: vec![model::CapabilityAvailability {
@@ -1681,6 +1695,8 @@ mod media_consent_tests {
             listener_node_id: Some(peer),
             peers: vec![cfg::AudioPeerConfig {
                 node_id: peer,
+                system_send_override: None,
+                system_receive_override: None,
                 allow_media_control: true,
                 allow_mic_control: false,
                 gain_percent: 100,
@@ -1829,6 +1845,8 @@ fn full_config_preserves_explicit_denied_peer_preferences() {
         role: cfg::AudioRole::Listener,
         peers: vec![cfg::AudioPeerConfig {
             node_id: peer,
+            system_send_override: None,
+            system_receive_override: None,
             allow_media_control: false,
             allow_mic_control: false,
             gain_percent: 100,
