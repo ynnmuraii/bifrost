@@ -7,6 +7,7 @@ pub mod jitter;
 pub mod keys;
 pub mod packet;
 pub mod replay;
+pub mod session;
 pub mod status;
 
 pub use packet::{validate_datagram, Header, PacketError, PacketKind};
