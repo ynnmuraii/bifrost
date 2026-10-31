@@ -24,6 +24,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling.
 - Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback-only tests cover loss/reorder/injection and device invalidation; core/IPC integration remains disabled.
 
+**Linux audio backend internals**
+
+- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute, media sessions and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
+
 ### Русский
 
 **Исправления**
@@ -43,6 +47,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
 - Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле.
 - Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства; интеграция core/IPC пока не включена.
+
+**Внутренний аудиобэкенд Linux**
+
+- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса, безопасное владение заглушением, медиасеансы и глобальный PTT явно недоступны. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
 
 ## 0.4.0 — 2026-10-30
 
