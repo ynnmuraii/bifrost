@@ -401,6 +401,152 @@ fn higher_self_owner_gossip_reclaims_without_an_old_echo_cancelling_it() {
 }
 
 #[test]
+fn delayed_stale_refusal_restarts_superseding_claim_with_a_fresh_serial() {
+    for gossip in [
+        hello(PEER, LOCAL, 7),
+        net(Message::OwnerState {
+            serial: 7,
+            owner: Some(LOCAL),
+            granted: false,
+        }),
+    ] {
+        let mut r = router(LOCAL).with_claim_on_startup(true);
+        r.on_start(0);
+        assert_eq!(r.ownership().pending_claim().unwrap().serial, 2);
+        r.handle(10, gossip);
+        assert_eq!(r.ownership().pending_claim().unwrap().serial, 8);
+
+        // There is no claim serial in this refusal; it can still answer claim 2.
+        // Cancel claim 8, but preserve the intent by issuing a fresh claim.
+        let out = r.handle(
+            20,
+            net(Message::ProtocolError {
+                code: ErrorCode::StaleOwnerSerial,
+                related_seq: 0,
+            }),
+        );
+        assert!(out.contains(&notice(Notice::ClaimRefused {
+            code: Some(ErrorCode::StaleOwnerSerial),
+        })));
+        assert!(out.contains(&Output::CancelTimer(Timer::ClaimGrant)));
+        assert!(out.contains(&Output::Broadcast(Message::OwnerClaim {
+            serial: 9,
+            reason: ClaimReason::Startup,
+        })));
+        assert!(out.contains(&arm(Timer::ClaimGrant, 620)));
+        assert_eq!(r.ownership().pending_claim().unwrap().serial, 9);
+        assert_eq!(r.ownership().state(), OwnershipState::Claiming);
+        assert_eq!(r.serial(), 7);
+        no_grant(&r.handle(600, Input::TimerExpired(Timer::ClaimGrant)));
+        no_grant(&r.handle(610, Input::TimerExpired(Timer::ClaimGrant)));
+        assert_eq!(
+            effects(&r.handle(620, Input::TimerExpired(Timer::ClaimGrant))),
+            vec![grant(9, LOCAL)]
+        );
+        assert!(r.is_owner());
+        assert_eq!(r.owner(), Some(&LOCAL));
+        assert_eq!(r.serial(), 9);
+        assert_eq!(r.max_seen_serial(), 9);
+        assert!(r.lease().is_idle());
+        assert_eq!(r.focus(), FocusState::Local);
+        assert!(r.handle(621, switch(SwitchTrigger::Edge)).contains(&begin(
+            CaptureKind::Temporary,
+            id(1),
+            200
+        )));
+        assert!(r
+            .handle(
+                622,
+                Input::Agent(AgentEvent::CaptureReady { lease_id: id(1) }),
+            )
+            .contains(&send(prepare(id(1), 9))));
+    }
+}
+
+#[test]
+fn delayed_stale_refusal_during_release_waits_for_the_new_claim_deadline() {
+    let mut r = active();
+    r.handle(20, claim());
+    r.handle(30, hello(PEER, LOCAL, 7));
+    assert_eq!(r.ownership().pending_claim().unwrap().serial, 8);
+    let out = r.handle(630, Input::TimerExpired(Timer::ClaimGrant));
+    assert!(out.contains(&release(L)));
+    no_grant(&out);
+    assert_eq!(r.focus(), FocusState::Releasing);
+
+    let out = r.handle(
+        631,
+        net(Message::ProtocolError {
+            code: ErrorCode::StaleOwnerSerial,
+            related_seq: 0,
+        }),
+    );
+    no_grant(&out);
+    assert!(out.contains(&arm(Timer::ClaimGrant, 1231)));
+    assert_eq!(r.ownership().pending_claim().unwrap().serial, 9);
+    no_grant(&r.handle(632, Input::Agent(AgentEvent::Released { lease_id: L })));
+    assert!(r.lease().is_idle());
+    assert_eq!(r.focus(), FocusState::Local);
+    assert_eq!(r.ownership().state(), OwnershipState::Claiming);
+    no_grant(&r.handle(1230, Input::TimerExpired(Timer::ClaimGrant)));
+    assert_eq!(
+        effects(&r.handle(1231, Input::TimerExpired(Timer::ClaimGrant))),
+        vec![grant(9, LOCAL)]
+    );
+    assert!(r.is_owner());
+    assert_eq!(r.serial(), 9);
+}
+
+#[test]
+fn superseding_claim_retry_preserves_refusal_and_newer_owner_safety() {
+    for code in [ErrorCode::CannotOwn, ErrorCode::StaleOwnerSerial] {
+        let mut r = router(LOCAL).with_claim_on_startup(true);
+        r.on_start(0);
+        if code == ErrorCode::CannotOwn {
+            r.handle(10, hello(PEER, LOCAL, 7));
+        }
+        let out = r.handle(
+            20,
+            net(Message::ProtocolError {
+                code,
+                related_seq: 0,
+            }),
+        );
+        assert_eq!(
+            effects(&out),
+            vec![notice(Notice::ClaimRefused { code: Some(code) })]
+        );
+        no_grant(&r.handle(620, Input::TimerExpired(Timer::ClaimGrant)));
+        assert!(r.ownership().pending_claim().is_none());
+        assert_eq!(r.ownership().state(), OwnershipState::Follower);
+    }
+
+    let mut r = router(LOCAL).with_claim_on_startup(true);
+    r.on_start(0);
+    r.handle(10, hello(PEER, LOCAL, 7));
+    r.handle(
+        20,
+        net(Message::ProtocolError {
+            code: ErrorCode::StaleOwnerSerial,
+            related_seq: 0,
+        }),
+    );
+    r.handle(
+        21,
+        net(Message::OwnerState {
+            serial: 10,
+            owner: Some(PEER),
+            granted: true,
+        }),
+    );
+    no_grant(&r.handle(620, Input::TimerExpired(Timer::ClaimGrant)));
+    assert_eq!(r.owner(), Some(&PEER));
+    assert_eq!(r.serial(), 10);
+    assert_eq!(r.ownership().state(), OwnershipState::Follower);
+    assert!(r.ownership().pending_claim().is_none());
+}
+
+#[test]
 fn stale_enter_ack_reclaims_and_allows_the_next_edge() {
     let mut r = preparing();
     let out = r.handle(12, net(ack(id(1), Some(ErrorCode::StaleOwnerSerial))));
@@ -1388,6 +1534,145 @@ fn s28_higher_owner_state_abandons_claim() {
     assert_eq!(r.ownership().state(), OwnershipState::Follower);
     no_grant(&r.handle(610, Input::TimerExpired(Timer::ClaimGrant)));
 }
+#[test]
+fn reordered_startup_claim_refusal_converges_without_poisoning_input() {
+    for refuse_after_settlement in [false, true] {
+        let mut older = router(LOCAL).with_claim_on_startup(true);
+        let mut newer = FocusRouter::new(
+            PEER,
+            Timing::default(),
+            SequentialIds::default(),
+            capabilities(),
+        )
+        .with_persisted_ownership(7, Some((7, PEER)))
+        .with_claim_on_startup(true);
+
+        // Both claims were formed before the peers learned each other's owner pair.
+        assert!(older
+            .on_start(0)
+            .contains(&Output::Broadcast(Message::OwnerClaim {
+                serial: 2,
+                reason: ClaimReason::Startup,
+            })));
+        assert!(newer
+            .on_start(0)
+            .contains(&Output::Broadcast(Message::OwnerClaim {
+                serial: 8,
+                reason: ClaimReason::Startup,
+            })));
+        older.handle(1, hello(PEER, PEER, 7));
+        newer.handle(1, hello(LOCAL, LOCAL, 1));
+        assert!(older.ownership().pending_claim().is_none());
+        assert_eq!(older.owner(), Some(&PEER));
+
+        // The older claim reaches the peer after its Hello has settled locally.
+        // This is the Notice::Rejected that core logs as "peer refused".
+        let out = newer.handle(
+            2,
+            Input::Net {
+                from: LOCAL,
+                message: Message::OwnerClaim {
+                    serial: 2,
+                    reason: ClaimReason::Startup,
+                },
+            },
+        );
+        let refusal = Message::ProtocolError {
+            code: ErrorCode::StaleOwnerSerial,
+            related_seq: 0,
+        };
+        assert_eq!(
+            effects(&out),
+            vec![
+                Output::Send {
+                    peer: LOCAL,
+                    message: refusal.clone(),
+                },
+                notice(Notice::Rejected {
+                    peer: LOCAL,
+                    code: ErrorCode::StaleOwnerSerial,
+                }),
+            ]
+        );
+        if !refuse_after_settlement {
+            older.handle(3, net(refusal.clone()));
+        }
+        let out = older.handle(
+            4,
+            net(Message::OwnerClaim {
+                serial: 8,
+                reason: ClaimReason::Startup,
+            }),
+        );
+        assert_eq!(
+            effects(&out),
+            vec![send(Message::OwnerState {
+                serial: 7,
+                owner: Some(PEER),
+                granted: false,
+            })]
+        );
+        newer.handle(
+            5,
+            Input::Net {
+                from: LOCAL,
+                message: Message::OwnerState {
+                    serial: 7,
+                    owner: Some(PEER),
+                    granted: false,
+                },
+            },
+        );
+        assert_eq!(
+            effects(&newer.handle(600, Input::TimerExpired(Timer::ClaimGrant))),
+            vec![grant(8, PEER)]
+        );
+        older.handle(
+            601,
+            net(Message::OwnerState {
+                serial: 8,
+                owner: Some(PEER),
+                granted: true,
+            }),
+        );
+        if refuse_after_settlement {
+            older.handle(602, net(refusal));
+        }
+        no_grant(&older.handle(603, Input::TimerExpired(Timer::ClaimGrant)));
+        for r in [&older, &newer] {
+            assert_eq!(r.owner(), Some(&PEER));
+            assert_eq!(r.serial(), 8);
+            assert_eq!(r.max_seen_serial(), 8);
+            assert!(r.ownership().pending_claim().is_none());
+            assert!(r.lease().is_idle());
+            assert_eq!(r.focus(), FocusState::Local);
+        }
+        assert!(!older.is_owner());
+        assert!(newer.is_owner());
+
+        // A refused ownership claim must not burn a lease or poison the input link.
+        assert!(older
+            .handle(604, net(prepare(L, 8)))
+            .contains(&Output::Agent(AgentCommand::PrepareInject { lease_id: L })));
+        let out = older.handle(605, Input::Agent(AgentEvent::Ready { lease_id: L }));
+        assert!(out.contains(&send(ack(L, None))));
+        older.handle(606, net(Message::EnterCommit { lease_id: L }));
+        let Message::InputBatch { events, .. } = batch(1, 1) else {
+            unreachable!()
+        };
+        let out = older.handle(607, net(batch(1, 1)));
+        assert!(out.contains(&Output::Agent(AgentCommand::Inject {
+            lease_id: L,
+            input_batch_seq: 1,
+            events,
+        })));
+        assert_eq!(older.focus(), FocusState::Remote);
+        assert_eq!(older.lease().receiver().unwrap().last_input_batch_seq, 1);
+        assert_eq!(older.owner(), Some(&PEER));
+        assert_eq!(older.serial(), 8);
+    }
+}
+
 #[test]
 fn s29_protocol_refusal_cancels_self_grant() {
     for code in [ErrorCode::CannotOwn, ErrorCode::StaleOwnerSerial] {

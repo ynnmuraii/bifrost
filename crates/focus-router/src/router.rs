@@ -156,6 +156,8 @@ pub struct FocusRouter<I: Identifiers = crate::flow::SequentialIds> {
     require_emergency_hotkey: bool,
     claim_on_startup: bool,
     ownership: Ownership,
+    /// Self-owner gossip replaced a claim whose uncorrelated refusal may still arrive.
+    retry_stale_reclaim: bool,
     lease: LeaseSlot,
     diagnostics: Option<crate::diagnostics::Accounting>,
     pressed: PressedSet,
@@ -184,6 +186,7 @@ impl<I: Identifiers> FocusRouter<I> {
             own_capabilities,
             require_emergency_hotkey: true,
             claim_on_startup: false,
+            retry_stale_reclaim: false,
             lease: LeaseSlot::Idle,
             diagnostics: None,
             pressed: PressedSet::default(),
@@ -644,6 +647,7 @@ impl<I: Identifiers> FocusRouter<I> {
         if self.ownership.pending_claim().is_some() {
             return;
         }
+        self.retry_stale_reclaim = false;
         let serial = self
             .ownership
             .begin_claim(reason, now_ms, self.timing.claim_grant_timeout_ms);
@@ -786,6 +790,7 @@ impl<I: Identifiers> FocusRouter<I> {
             self.ownership.adopt(serial, owner);
             if reclaim {
                 self.begin_claim(now_ms, ClaimReason::Startup, out);
+                self.retry_stale_reclaim = pending.is_some();
             }
             return;
         }
@@ -825,18 +830,36 @@ impl<I: Identifiers> FocusRouter<I> {
 
     fn on_protocol_error(
         &mut self,
-        _now_ms: u64,
+        now_ms: u64,
         from: NodeId,
         code: ErrorCode,
         out: &mut Vec<Output>,
     ) {
         match code {
             ErrorCode::CannotOwn | ErrorCode::StaleOwnerSerial => {
-                if self.ownership.pending_claim().is_some() {
+                let retry = code == ErrorCode::StaleOwnerSerial
+                    && self.retry_stale_reclaim
+                    && self.ownership.pending_claim().is_some();
+                if let Some(claim) = self.ownership.pending_claim() {
                     self.ownership.abandon_claim();
                     out.push(Output::CancelTimer(Timer::ClaimGrant));
+                    if retry {
+                        self.ownership.observe_serial(claim.serial);
+                    }
                 }
                 out.push(Output::Notice(Notice::ClaimRefused { code: Some(code) }));
+                if retry {
+                    if matches!(
+                        self.pending_ownership,
+                        Some(PendingOwnership::SelfGrant { .. })
+                    ) {
+                        self.pending_ownership = None;
+                    }
+                    // The refusal may answer the superseded claim. Do not grant the
+                    // refused one: publish a fresh serial and wait a full timeout.
+                    self.begin_claim(now_ms, ClaimReason::Startup, out);
+                }
+                self.retry_stale_reclaim = retry;
             }
             ErrorCode::NotOwner
             | ErrorCode::UnsupportedSession
