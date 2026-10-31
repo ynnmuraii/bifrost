@@ -1650,6 +1650,7 @@ impl ViewModel {
         // A status announces a revision, not its links. Advance the CAS base only when its
         // TopologyDoc arrives; otherwise a queued drop could race ahead on stale geometry.
         self.status = Some(status);
+        self.refresh_audio_peer_names();
     }
 
     /// A whole document: the editor's base, as long as it is not older than the one held.

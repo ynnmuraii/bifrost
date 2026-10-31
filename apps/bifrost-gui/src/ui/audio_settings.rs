@@ -77,8 +77,18 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
                 }
             });
         }
-        use_listener =
-            primary_action(ui, pal, text(lang, Key::AudioUseThisListener), true).clicked();
+        if config.role == AudioRole::Listener as i32
+            && audio
+                .status
+                .as_ref()
+                .and_then(|status| status.config.as_ref())
+                .is_some_and(|saved| saved.role == AudioRole::Listener as i32)
+        {
+            widgets::hint(ui, pal, text(lang, Key::AudioThisComputerListener));
+        } else {
+            use_listener =
+                primary_action(ui, pal, text(lang, Key::AudioUseThisListener), true).clicked();
+        }
         let group_ready = config.group_id.len() == 16
             && (config.role == AudioRole::Listener as i32 || config.listener_node_id.len() == 32);
         widgets::hint(

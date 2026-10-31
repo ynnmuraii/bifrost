@@ -208,9 +208,32 @@ impl ViewModel {
         }
         self.audio.error = None;
         self.audio.available = true;
-        let cards = map_cards(&model, self.look.language);
+        let cards = map_cards(
+            &model,
+            self.status
+                .as_ref()
+                .map_or(&[][..], |status| &status.members),
+        );
         self.audio.status = Some(status);
         self.audio_player.replace_cards(cards);
+    }
+    pub(crate) fn refresh_audio_peer_names(&mut self) {
+        let Some(audio) = &self.audio.status else {
+            return;
+        };
+        let members = self
+            .status
+            .as_ref()
+            .map_or(&[][..], |status| &status.members);
+        for card in &mut self.audio_player.cards {
+            if let Some(session) = audio
+                .sessions
+                .iter()
+                .find(|session| matches_id(&card.stream_id, &session.session_id))
+            {
+                card.source_name = peer_name(members, &session.peer);
+            }
+        }
     }
     pub fn audio_result(&mut self, id: u64, kind: AudioRequest, result: ipc::OpResult) {
         if kind == AudioRequest::Devices {
@@ -416,7 +439,10 @@ pub fn stream_id(id: &[u8]) -> String {
     }
     out
 }
-pub fn map_cards(status: &model::AudioStatus, lang: Lang) -> Vec<AudioPlayerCard> {
+pub fn map_cards(
+    status: &model::AudioStatus,
+    members: &[ipc::MemberStatus],
+) -> Vec<AudioPlayerCard> {
     if !status.enabled {
         return Vec::new();
     }
@@ -430,11 +456,7 @@ pub fn map_cards(status: &model::AudioStatus, lang: Lang) -> Vec<AudioPlayerCard
             let allowed = media_allowed(s);
             AudioPlayerCard {
                 stream_id: stream_id(&s.session_id),
-                source_name: if s.source_name.is_empty() {
-                    text(lang, Key::AudioSource).into()
-                } else {
-                    s.source_name.clone()
-                },
+                source_name: peer_name(members, &s.peer),
                 title: media
                     .filter(|m| !m.title.is_empty())
                     .map(|m| m.title.clone()),
@@ -474,6 +496,33 @@ pub fn map_cards(status: &model::AudioStatus, lang: Lang) -> Vec<AudioPlayerCard
             }
         })
         .collect()
+}
+
+pub(crate) fn peer_name(members: &[ipc::MemberStatus], id: &[u8]) -> String {
+    members
+        .iter()
+        .find(|member| matches_id(&member.node_id, id))
+        .filter(|member| !member.display_name.trim().is_empty())
+        .map_or_else(
+            || stream_id(&id[..id.len().min(4)]),
+            |member| member.display_name.clone(),
+        )
+}
+
+pub(crate) fn matches_id(hex: &str, id: &[u8]) -> bool {
+    hex.len() == id.len() * 2
+        && hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(id)
+            .all(|(pair, byte)| {
+                let digit = |b: u8| (b as char).to_digit(16);
+                digit(pair[0])
+                    .zip(digit(pair[1]))
+                    .is_some_and(|(hi, lo)| (hi * 16 + lo) as u8 == *byte)
+            })
 }
 
 pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> Option<Msg> {

@@ -66,7 +66,7 @@ fn fixture(lang: Lang, theme: Theme, scene: &str) -> ViewModel {
     if scene == "error" {
         vm.audio.error = Some(text(lang, Key::AudioDeviceUnavailable).into());
     }
-    if matches!(scene, "active" | "source") {
+    if matches!(scene, "active" | "source" | "source-no-mic") {
         let status = vm.audio.status.as_mut().unwrap();
         status.enabled = true;
         let config = status.config.as_mut().unwrap();
@@ -119,6 +119,19 @@ fn fixture(lang: Lang, theme: Theme, scene: &str) -> ViewModel {
             capture_active: false,
             target_node_id: [0xbb, 0x22].repeat(16),
         });
+    }
+    if scene == "source-no-mic" {
+        let status = vm.audio.status.as_mut().unwrap();
+        status
+            .config
+            .as_mut()
+            .unwrap()
+            .microphone
+            .as_mut()
+            .unwrap()
+            .control_enabled = false;
+        status.microphone.as_mut().unwrap().ptt_pressed = false;
+        vm.audio.draft = status.config.clone().unwrap();
     }
     vm
 }
@@ -269,6 +282,121 @@ fn settings_render_localized_without_mutating_drafts_in_both_themes() {
 }
 
 #[test]
+fn listener_state_replaces_the_redundant_action_in_both_locales_and_themes() {
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for (scene, draft_listener) in [
+                ("ready", false),
+                ("ready", true),
+                ("listener", false),
+                ("listener", true),
+            ] {
+                let mut vm = fixture(lang, theme, scene);
+                vm.audio.draft.role = if draft_listener {
+                    ipc::AudioRole::Listener as i32
+                } else {
+                    ipc::AudioRole::Source as i32
+                };
+                vm.audio.dirty = vm.audio.draft.role
+                    != vm
+                        .audio
+                        .status
+                        .as_ref()
+                        .unwrap()
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .role;
+                if vm.audio.dirty {
+                    vm.audio.draft.group_id.clear();
+                }
+                let configured_listener = scene == "listener" && draft_listener;
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                let size = egui::vec2(760.0, 6000.0);
+                frame(&ctx, &vm, size, Vec::new());
+                let (output, _) = frame(&ctx, &vm, size, Vec::new());
+                let values = labels(&output);
+                for (key, visible) in [
+                    (Key::AudioUseThisListener, !configured_listener),
+                    (Key::AudioThisComputerListener, configured_listener),
+                ] {
+                    assert_eq!(values.iter().any(|(s, _)| s == text(lang, key)), visible);
+                }
+                if !configured_listener {
+                    let at = values
+                        .iter()
+                        .find(|(s, _)| s == text(lang, Key::AudioUseThisListener))
+                        .unwrap()
+                        .1
+                        .center();
+                    let (_, actions) = frame(&ctx, &vm, size, click(at));
+                    assert!(actions.iter().any(|action| matches!(
+                        action,
+                        Action::Audio(AudioAction::UseThisListener)
+                    )));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn microphone_summary_uses_committed_control_config_and_preserves_release() {
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for enabled in [true, false] {
+                let mut vm = fixture(lang, theme, "active");
+                vm.audio
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .config
+                    .as_mut()
+                    .unwrap()
+                    .microphone
+                    .as_mut()
+                    .unwrap()
+                    .control_enabled = enabled;
+                vm.audio.draft.microphone.as_mut().unwrap().control_enabled = !enabled;
+                vm.audio.gui_ptt_held = !enabled;
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                let size = egui::vec2(760.0, 6000.0);
+                frame(&ctx, &vm, size, Vec::new());
+                let (output, actions) = frame(&ctx, &vm, size, Vec::new());
+                let values = labels(&output);
+                assert_eq!(
+                    values
+                        .iter()
+                        .any(|(s, _)| s.contains(text(lang, Key::AudioMicNotMuted))),
+                    enabled,
+                );
+                for key in [Key::AudioMicMute, Key::AudioPttPress] {
+                    assert_eq!(values.iter().any(|(s, _)| s == text(lang, key)), enabled);
+                }
+                // A held snapshot retains release even after microphone control is disabled.
+                let release = values
+                    .iter()
+                    .find(|(s, _)| s == text(lang, Key::AudioPttRelease))
+                    .expect("urgent release stays reachable")
+                    .1
+                    .center();
+                let (_, released) = frame(&ctx, &vm, size, click(release));
+                assert!(released
+                    .iter()
+                    .any(|action| matches!(action, Action::Audio(AudioAction::SetPtt(false)))));
+                if !enabled {
+                    assert!(actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Audio(AudioAction::SetPtt(false)))));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn enabled_checkbox_emits_only_draft_and_unavailable_checkbox_emits_nothing() {
     for available in [true, false] {
         let vm = fixture(
@@ -358,6 +486,7 @@ fn optional_offscreen_settings_pngs() {
                     "ready",
                     "pending",
                     "source",
+                    "source-no-mic",
                     "listener",
                     "error",
                 ] {
@@ -571,17 +700,12 @@ fn listener_group_setup_is_primary_and_advanced_fields_are_collapsed() {
             .iter()
             .any(|(s, _)| s.eq_ignore_ascii_case(text(Lang::En, key))));
     }
-    let at = values
+    assert!(values
         .iter()
-        .find(|(s, _)| s == text(Lang::En, Key::AudioUseThisListener))
-        .unwrap()
-        .1
-        .center();
-    let (_, actions) = frame(&ctx, &vm, size, click(at));
-    assert!(matches!(
-        actions.as_slice(),
-        [Action::Audio(AudioAction::UseThisListener)]
-    ));
+        .any(|(s, _)| s == text(Lang::En, Key::AudioThisComputerListener)));
+    assert!(!values
+        .iter()
+        .any(|(s, _)| s == text(Lang::En, Key::AudioUseThisListener)));
     assert_eq!(vm.audio.draft, before);
     let at = values
         .iter()

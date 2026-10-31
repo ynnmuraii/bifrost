@@ -153,6 +153,42 @@ fn cards_render_in_both_languages_and_themes_without_a_display() {
 }
 
 #[test]
+fn system_audio_app_glyph_is_distinct_from_volume_without_changing_media_cards() {
+    fn monitors(shape: &Shape) -> usize {
+        match shape {
+            Shape::Rect(rect) if rect.rect.width() == 14.0 && rect.rect.height() == 9.0 => 1,
+            Shape::Vec(children) => children.iter().map(monitors).sum(),
+            _ => 0,
+        }
+    }
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for media in [true, false] {
+                let mut card = card("system");
+                card.app = AppKind::System;
+                card.has_media_session = media;
+                if !media {
+                    card.title = None;
+                    card.subtitle = None;
+                }
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                draw_frame(&ctx, &[card.clone()], theme, lang, Vec::new());
+                let (output, _) = draw_frame(&ctx, &[card], theme, lang, Vec::new());
+                assert_eq!(
+                    output
+                        .shapes
+                        .iter()
+                        .map(|shape| monitors(&shape.shape))
+                        .sum::<usize>(),
+                    usize::from(!media),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn disabled_media_controls_never_emit_commands_but_local_mute_does() {
     let ctx = egui::Context::default();
     ui::install_fonts(&ctx);

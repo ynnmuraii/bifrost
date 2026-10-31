@@ -135,22 +135,7 @@ impl Stream for WindowsStream {
         self.feedback
     }
     fn snapshot(&self) -> StreamSnapshot {
-        let native = self.native.snapshot();
-        StreamSnapshot {
-            status: match native.status {
-                StreamStatus::Running => audio_backend::StreamStatus::Running,
-                StreamStatus::Stopped => audio_backend::StreamStatus::Stopped,
-                StreamStatus::DeviceInvalidated => audio_backend::StreamStatus::DeviceInvalidated,
-                StreamStatus::Failed(code) => {
-                    audio_backend::StreamStatus::Failed(map_hresult(code))
-                }
-            },
-            device_position: native.clock_valid.then_some(native.device_position),
-            clock_frequency: (native.clock_frequency != 0).then_some(native.clock_frequency),
-            host_time_100ns: native.clock_valid.then_some(native.qpc_100ns),
-            underrun_frames: native.underrun_frames,
-            dropped_capture_frames: native.dropped_capture_frames,
-        }
+        stream_snapshot(self.native.snapshot())
     }
     fn stop(&mut self) -> Result<(), BackendError> {
         self.native.stop();
@@ -160,6 +145,24 @@ impl Stream for WindowsStream {
             StreamStatus::Failed(code) => Err(map_hresult(code)),
             StreamStatus::Running => Err(BackendError::ServerUnavailable),
         }
+    }
+}
+fn stream_snapshot(native: stream::StreamSnapshot) -> StreamSnapshot {
+    StreamSnapshot {
+        status: match native.status {
+            StreamStatus::Running => audio_backend::StreamStatus::Running,
+            StreamStatus::Stopped => audio_backend::StreamStatus::Stopped,
+            StreamStatus::DeviceInvalidated => audio_backend::StreamStatus::DeviceInvalidated,
+            StreamStatus::Failed(code) => audio_backend::StreamStatus::Failed(map_hresult(code)),
+        },
+        // Only render supplies a device-clock frequency. Capture's packet-local
+        // position may reset while its independently valid QPC keeps advancing.
+        device_position: (native.clock_valid && native.clock_frequency != 0)
+            .then_some(native.device_position),
+        clock_frequency: (native.clock_frequency != 0).then_some(native.clock_frequency),
+        host_time_100ns: native.clock_valid.then_some(native.qpc_100ns),
+        underrun_frames: native.underrun_frames,
+        dropped_capture_frames: native.dropped_capture_frames,
     }
 }
 impl Backend for WindowsBackend {
@@ -418,6 +421,69 @@ fn binding(hotkey: PttHotkey) -> Result<HotkeyBinding, BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn process_capture_snapshot_hides_resetting_positions_but_keeps_qpc() {
+        let mut native = stream::StreamSnapshot {
+            status: StreamStatus::Running,
+            transferred_frames: 480,
+            dropped_capture_frames: 3,
+            underrun_frames: 0,
+            device_position: 479,
+            clock_frequency: 0,
+            qpc_100ns: 1_099_791,
+            clock_valid: true,
+        };
+        let before = stream_snapshot(native);
+        native.device_position = 0;
+        native.qpc_100ns = 1_100_000;
+        let after = stream_snapshot(native);
+        for snapshot in [before, after] {
+            assert_eq!(snapshot.device_position, None);
+            assert_eq!(snapshot.clock_frequency, None);
+            assert_eq!(snapshot.dropped_capture_frames, 3);
+        }
+        assert_eq!(before.host_time_100ns, Some(1_099_791));
+        assert_eq!(after.host_time_100ns, Some(1_100_000));
+        assert!(after.host_time_100ns > before.host_time_100ns);
+        native.clock_valid = false;
+        let invalid = stream_snapshot(native);
+        assert_eq!(invalid.device_position, None);
+        assert_eq!(invalid.host_time_100ns, None);
+    }
+
+    #[test]
+    fn render_snapshot_preserves_monotonic_device_clock_and_frequency() {
+        let mut native = stream::StreamSnapshot {
+            status: StreamStatus::Running,
+            transferred_frames: 0,
+            dropped_capture_frames: 0,
+            underrun_frames: 7,
+            device_position: 0,
+            clock_frequency: 10_000_000,
+            qpc_100ns: 0,
+            clock_valid: true,
+        };
+        let mut previous = None;
+        for position in [0, 100_000, 200_000] {
+            native.device_position = position;
+            native.qpc_100ns = position;
+            let snapshot = stream_snapshot(native);
+            assert_eq!(snapshot.device_position, Some(position));
+            assert_eq!(snapshot.clock_frequency, Some(10_000_000));
+            assert_eq!(snapshot.host_time_100ns, Some(position));
+            assert_eq!(snapshot.underrun_frames, 7);
+            if let Some(previous) = previous {
+                assert!(snapshot.device_position > Some(previous));
+            }
+            previous = snapshot.device_position;
+        }
+        native.clock_valid = false;
+        let invalid = stream_snapshot(native);
+        assert_eq!(invalid.device_position, None);
+        assert_eq!(invalid.host_time_100ns, None);
+        assert_eq!(invalid.clock_frequency, Some(10_000_000));
+    }
+
     #[test]
     fn construction_has_no_native_handles_and_hid_is_not_vk() {
         let mut backend = WindowsBackend::new().unwrap();

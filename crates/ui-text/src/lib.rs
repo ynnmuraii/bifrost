@@ -246,6 +246,7 @@ pub enum Key {
     AudioAdvanced,
     AudioDetails,
     AudioUseThisListener,
+    AudioThisComputerListener,
     AudioGroupAutomatic,
     AudioGroupPending,
     AudioMixAllHint,
@@ -1194,6 +1195,7 @@ const fn ru(key: Key) -> &'static str {
         Key::AudioAdvanced => "Дополнительно",
         Key::AudioDetails => "Подробности",
         Key::AudioUseThisListener => "Слушать на этом компьютере",
+        Key::AudioThisComputerListener => "Этот компьютер — приёмник",
         Key::AudioGroupAutomatic => "Аудиогруппой управляет приёмник. Примените настройки, чтобы сохранить выбор.",
         Key::AudioGroupPending => "Сохраните выбор приёмника при выключенном аудио. Перед включением передачи служба должна подтвердить его группу.",
         Key::AudioMixAllHint => "Все разрешённые источники звучат одновременно.",
@@ -1795,6 +1797,7 @@ const fn en(key: Key) -> &'static str {
         Key::AudioAdvanced => "Advanced",
         Key::AudioDetails => "Details",
         Key::AudioUseThisListener => "Use this computer as the listener",
+        Key::AudioThisComputerListener => "This computer is the listener",
         Key::AudioGroupAutomatic => "The listener manages the audio group. Apply to save your selection.",
         Key::AudioGroupPending => "Save the listener selection while audio is disabled. The service must confirm its group before sharing can be enabled.",
         Key::AudioMixAllHint => "All authorized sources are mixed together.",
@@ -2447,7 +2450,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 543] = [
+    pub const EVERY: [Key; 544] = [
         Key::AudioHide,
         Key::AudioPlayer,
         Key::AudioSettings,
@@ -2604,6 +2607,7 @@ mod tests {
         Key::AudioAdvanced,
         Key::AudioDetails,
         Key::AudioUseThisListener,
+        Key::AudioThisComputerListener,
         Key::AudioGroupAutomatic,
         Key::AudioGroupPending,
         Key::AudioMixAllHint,
