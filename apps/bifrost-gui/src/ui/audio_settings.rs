@@ -33,6 +33,13 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
     let mut apply = false;
     ui.spacing_mut().item_spacing.y = 10.0;
     super::audio_summary::draw(ui, pal, vm, actions);
+    let listener_first = audio
+        .status
+        .as_ref()
+        .is_some_and(|status| status.role == AudioRole::Listener as i32);
+    if listener_first {
+        receive_control(ui, pal, vm, editable, actions);
+    }
     ui.add_space(12.0);
     ui.add_enabled_ui(editable, |ui| {
         setting(ui, pal, text(lang, Key::AudioListenerTarget), |ui| {
@@ -67,18 +74,9 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
             },
         ),
     );
-    ui.add_space(12.0);
-    let mut receive = audio.sharing_requested(AudioRole::Listener);
-    if ui
-        .add_enabled(
-            if receive { connected } else { editable },
-            egui::Checkbox::new(&mut receive, text(lang, Key::AudioReceiveSystem)),
-        )
-        .changed()
-    {
-        actions.push(Action::Audio(AudioAction::Receive(receive)));
+    if !listener_first {
+        receive_control(ui, pal, vm, editable, actions);
     }
-    widgets::hint(ui, pal, text(lang, Key::AudioReceiveHint));
     ui.add_space(12.0);
     ui.collapsing(text(lang, Key::AudioAdvanced), |ui| {
         ui.add_enabled_ui(editable, |ui| {
@@ -216,6 +214,32 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
     if apply {
         actions.push(Action::Audio(AudioAction::ApplyConfig));
     }
+}
+
+fn receive_control(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    editable: bool,
+    actions: &mut Vec<Action>,
+) {
+    ui.add_space(12.0);
+    let lang = vm.look.language;
+    let mut receive = vm.audio.sharing_requested(AudioRole::Listener);
+    if ui
+        .add_enabled(
+            if receive {
+                vm.connection.is_connected()
+            } else {
+                editable
+            },
+            egui::Checkbox::new(&mut receive, text(lang, Key::AudioReceiveSystem)),
+        )
+        .changed()
+    {
+        actions.push(Action::Audio(AudioAction::Receive(receive)));
+    }
+    widgets::hint(ui, pal, text(lang, Key::AudioReceiveHint));
 }
 
 fn primary_action(ui: &mut egui::Ui, pal: &Palette, label: &str, enabled: bool) -> egui::Response {

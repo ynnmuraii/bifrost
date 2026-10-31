@@ -871,7 +871,13 @@ fn actual_audio_modal_scrolls_to_apply_without_horizontal_clipping() {
                     let values = labels(&output);
                     let title = values
                         .iter()
-                        .find(|(s, _)| s == Modal::Audio.title(lang))
+                        .find(|(s, _)| {
+                            s == if width < 568.0 {
+                                text(lang, Key::AudioDiagnostics)
+                            } else {
+                                Modal::Audio.title(lang)
+                            }
+                        })
                         .unwrap();
                     let modal_right = width * 0.5 + ((width - 48.0).min(680.0)) * 0.5;
                     assert!(title.1.max.x <= modal_right - 60.0, "title overlaps close");
@@ -1261,5 +1267,56 @@ fn denied_switch_keeps_inline_recovery_message_across_unrelated_telemetry() {
         assert!(labels(&output)
             .iter()
             .any(|(s, _)| s == text(lang, Key::AudioSystemConsentRequired)));
+    }
+}
+
+#[test]
+fn main_audio_tasks_follow_current_role_without_duplicate_pending_or_error_instructions() {
+    for lang in [Lang::En, Lang::Ru] {
+        for scene in ["ready", "listener", "pending", "error"] {
+            let mut vm = fixture(lang, Theme::Dark, scene);
+            if scene == "pending" {
+                vm.audio.system_intent = Some((ipc::AudioRole::Source, true));
+            }
+            if scene == "error" {
+                vm.audio.status.as_mut().unwrap().system_sharing_requested = Some(false);
+            }
+            let ctx = egui::Context::default();
+            ui::install_fonts(&ctx);
+            let size = egui::vec2(320.0, 1600.0);
+            frame(&ctx, &vm, size, Vec::new());
+            let (output, actions) = frame(&ctx, &vm, size, Vec::new());
+            assert!(actions.is_empty());
+            let values = labels(&output);
+            let top = |key| {
+                values
+                    .iter()
+                    .find(|(s, _)| s == text(lang, key) || s == &text(lang, key).to_uppercase())
+                    .unwrap()
+                    .1
+                    .top()
+            };
+            if scene == "listener" {
+                assert!(top(Key::AudioReceiveSystem) < top(Key::AudioListenerTarget));
+            } else {
+                assert!(top(Key::AudioListenerTarget) < top(Key::AudioShareSystem));
+            }
+            if scene == "pending" {
+                assert!(values
+                    .iter()
+                    .any(|(s, _)| s == text(lang, Key::AudioSharingRequested)));
+                assert!(!values
+                    .iter()
+                    .any(|(s, _)| s == text(lang, Key::AudioPending)));
+            }
+            if scene == "error" {
+                assert!(values
+                    .iter()
+                    .any(|(s, _)| s == text(lang, Key::AudioDeviceUnavailable)));
+                assert!(!values
+                    .iter()
+                    .any(|(s, _)| s == text(lang, Key::AudioSharingStopped)));
+            }
+        }
     }
 }

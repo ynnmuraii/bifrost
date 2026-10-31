@@ -32,7 +32,13 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
             if let Some(error) = vm.audio.error_message(lang) {
                 widgets::wrapped(ui, error, 13.0, super::theme::fam::sans(), pal.accent_ink);
             }
-            if vm.audio.pending {
+            let source_connecting = vm.audio.sharing_requested(AudioRole::Source)
+                && vm
+                    .audio
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.sessions.is_empty());
+            if vm.audio.pending && !source_connecting {
                 widgets::hint(ui, pal, text(lang, Key::AudioPending));
             }
             let Some(status) = &vm.audio.status else {
@@ -53,7 +59,10 @@ pub(super) fn draw(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &m
             if !vm.audio.available {
                 widgets::hint(ui, pal, text(lang, Key::AudioUnavailable));
             }
-            if status.sessions.is_empty() {
+            if status.sessions.is_empty()
+                && vm.audio.error_message(lang).is_none()
+                && (!vm.audio.pending || source_connecting)
+            {
                 let key = if vm.audio.sharing_requested(AudioRole::Listener) {
                     Key::AudioReceivingReady
                 } else if vm.audio.sharing_requested(AudioRole::Source) {

@@ -280,7 +280,12 @@ fn header(
     let tx = num.max.x + 16.0;
     let title_width = (head.max.x - 16.0 - 44.0 - 16.0 - tx).max(1.0);
     let mut title_job = egui::text::LayoutJob::simple_singleline(
-        modal.title(lang).to_owned(),
+        if modal == Modal::Audio && rect.width() < 520.0 {
+            text(lang, Key::AudioDiagnostics)
+        } else {
+            modal.title(lang)
+        }
+        .to_owned(),
         font(24.0, fam::sans_semibold()),
         pal.ink,
     );
