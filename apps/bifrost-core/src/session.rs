@@ -1248,7 +1248,8 @@ impl Session {
 
     /// Runs until `quit`, a signal, or a fatal link error.
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let result = self.run_inner().await;
+        // Keep the large input-loop poll frame outside this shutdown wrapper's stack frame.
+        let result = Box::pin(self.run_inner()).await;
         #[cfg(feature = "audio")]
         if let Some(mut audio) = self.audio.take() {
             audio.shutdown().await;
