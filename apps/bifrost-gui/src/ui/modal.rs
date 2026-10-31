@@ -273,12 +273,17 @@ fn header(
     let galley = painter.layout_no_wrap(modal.num().to_owned(), font(20.0, fam::pixel()), pal.ink);
     widgets::centre_galley(&painter, num, galley, pal.ink);
     // Title and the «load» line: `bifrost layout [########################] ok · sub`.
-    let title = painter.layout_no_wrap(
+    let tx = num.max.x + 16.0;
+    let title_width = (head.max.x - 16.0 - 44.0 - 16.0 - tx).max(1.0);
+    let mut title_job = egui::text::LayoutJob::simple_singleline(
         modal.title(lang).to_owned(),
         font(24.0, fam::sans_semibold()),
         pal.ink,
     );
-    let tx = num.max.x + 16.0;
+    title_job.wrap.max_width = title_width;
+    title_job.wrap.max_rows = 1;
+    title_job.wrap.break_anywhere = true;
+    let title = painter.layout_job(title_job);
     let title_h = title.size().y;
     painter.galley(Pos2::new(tx, head.min.y + 16.0), title, pal.ink);
     let filled = ((progress * 24.0).floor() as usize).min(24);
@@ -307,6 +312,9 @@ fn header(
             mono(pal.ink2, fam::mono()),
         );
     }
+    job.wrap.max_width = title_width;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
     let load = painter.layout_job(job);
     painter.galley(
         Pos2::new(tx, head.min.y + 16.0 + title_h + 5.0),

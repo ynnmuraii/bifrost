@@ -20,6 +20,7 @@
 mod appearance;
 pub mod audio_player;
 pub mod audio_settings;
+mod audio_summary;
 mod bridge;
 mod dock;
 mod field;

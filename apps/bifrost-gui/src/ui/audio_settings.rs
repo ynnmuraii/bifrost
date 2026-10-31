@@ -10,6 +10,12 @@ use crate::view_model::{Action, ViewModel};
 
 /// Draw settings without issuing IPC or inferring successful activation.
 pub fn body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
+    egui::Frame::NONE.inner_margin(24.0).show(ui, |ui| {
+        contents(ui, pal, vm, actions);
+    });
+}
+
+fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     if !ui.ctx().fonts(|fonts| {
         fonts
             .definitions()
@@ -22,281 +28,401 @@ pub fn body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
     }
     let lang = vm.look.language;
     let audio = &vm.audio;
-    let ready = audio.available && audio.status.is_some();
-    let editable = ready && !audio.pending;
+    let editable = audio.available && audio.status.is_some() && !audio.pending;
     let mut config = audio.draft.clone();
     let mut valid_group = true;
     let mut apply = false;
-    let mut create_group = false;
-    egui::ScrollArea::vertical()
-        .id_salt("audio-settings-scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 10.0;
-            diagnostics(ui, pal, vm, actions);
-            if let Some(error) = &audio.error {
-                widgets::wrapped(ui, error, 13.0, super::theme::fam::sans(), pal.accent);
+    let mut use_listener = false;
+    ui.spacing_mut().item_spacing.y = 10.0;
+    super::audio_summary::draw(ui, pal, vm, actions);
+    if let Some(error) = &audio.error {
+        widgets::wrapped(ui, error, 13.0, super::theme::fam::sans(), pal.accent_ink);
+    }
+    if audio.pending {
+        widgets::hint(ui, pal, text(lang, Key::AudioPending));
+    }
+    ui.add_enabled_ui(editable, |ui| {
+        section(ui, pal, text(lang, Key::AudioRoleSection));
+        setting(ui, pal, text(lang, Key::AudioRole), |ui| {
+            let previous = config.role;
+            enum_choice(
+                ui,
+                "audio-role",
+                &mut config.role,
+                &[
+                    (AudioRole::Source as i32, text(lang, Key::AudioSource)),
+                    (AudioRole::Listener as i32, text(lang, Key::AudioListener)),
+                ],
+                lang,
+            );
+            if previous != config.role {
+                config.enabled = false;
+                config.listener_node_id.clear();
+                config.group_id.clear();
             }
-            if !ready {
-                widgets::hint(
-                    ui,
-                    pal,
-                    text(
-                        lang,
-                        if audio.available {
-                            Key::AudioWaiting
-                        } else {
-                            Key::AudioUnavailable
-                        },
-                    ),
-                );
-            }
-            if audio.pending {
-                widgets::hint(ui, pal, text(lang, Key::AudioPending));
-            }
-            if widgets::small_button(ui, pal, text(lang, Key::AudioRefresh), !audio.pending)
-                .clicked()
-            {
-                actions.push(Action::Audio(AudioAction::Refresh));
-            }
-            ui.add_enabled_ui(editable, |ui| {
-                section(ui, pal, text(lang, Key::AudioSettings));
-                ui.checkbox(&mut config.enabled, text(lang, Key::AudioEnabled));
-                setting(ui, pal, text(lang, Key::AudioRole), |ui| {
-                    enum_choice(
-                        ui,
-                        "audio-role",
-                        &mut config.role,
-                        &[
-                            (AudioRole::Source as i32, text(lang, Key::AudioSource)),
-                            (AudioRole::Listener as i32, text(lang, Key::AudioListener)),
-                        ],
-                        lang,
-                    );
-                    widgets::hint(ui, pal, text(lang, Key::AudioRoleWarning));
-                });
-                setting(ui, pal, text(lang, Key::AudioListenerTarget), |ui| {
-                    peer_selector(ui, vm, "audio-listener", &mut config.listener_node_id);
-                });
-                setting(ui, pal, text(lang, Key::AudioGroup), |ui| {
-                    // Keep partial text locally so malformed input never changes the wire draft.
-                    let id = ui.id().with("audio-group-input");
-                    let mut group = ui
-                        .data_mut(|data| data.get_temp::<String>(id))
-                        .unwrap_or_else(|| hex(&config.group_id));
-                    let label = ui.label(text(lang, Key::AudioGroup));
-                    let response = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut group)
-                                .desired_width((ui.available_width() - 8.0).max(24.0))
-                                .char_limit(32),
-                        )
-                        .labelled_by(label.id);
-                    let parsed = parse_hex(&group, 16);
-                    valid_group = parsed.is_some() && (!config.enabled || !group.is_empty());
-                    if response.changed() {
-                        if let Some(bytes) = parsed {
-                            config.group_id = bytes;
-                        }
-                        ui.data_mut(|data| data.insert_temp(id, group));
-                    } else if !response.has_focus() && valid_group && group != hex(&config.group_id)
-                    {
-                        ui.data_mut(|data| data.remove::<String>(id));
-                    }
-                    if config.role == AudioRole::Listener as i32
-                        && widgets::small_button(ui, pal, text(lang, Key::AudioCreateGroup), true)
-                            .clicked()
-                    {
-                        ui.data_mut(|data| data.remove::<String>(id));
-                        create_group = true;
-                    }
-                    widgets::hint(
-                        ui,
-                        pal,
-                        text(
-                            lang,
-                            if valid_group {
-                                Key::AudioGroupHint
-                            } else {
-                                Key::AudioInvalidGroup
-                            },
-                        ),
-                    );
-                });
-                setting(ui, pal, text(lang, Key::AudioMode), |ui| {
-                    enum_choice(
-                        ui,
-                        "audio-mode",
-                        &mut config.mode,
-                        &[
-                            (AudioMode::MixAll as i32, text(lang, Key::AudioMixAll)),
-                            (
-                                AudioMode::FollowFocus as i32,
-                                text(lang, Key::AudioFollowFocus),
-                            ),
-                        ],
-                        lang,
-                    );
-                });
-                setting(ui, pal, text(lang, Key::AudioProfile), |ui| {
-                    enum_choice(
-                        ui,
-                        "audio-profile",
-                        &mut config.profile,
-                        &[
-                            (
-                                AudioProfile::Ethernet as i32,
-                                text(lang, Key::AudioEthernet),
-                            ),
-                            (AudioProfile::Wifi as i32, text(lang, Key::AudioWifi)),
-                        ],
-                        lang,
-                    );
-                });
-                section(ui, pal, text(lang, Key::AudioDevices));
-                device_selector(
-                    ui,
-                    pal,
-                    vm,
-                    AudioDeviceKind::Output,
-                    Key::AudioOutputDevice,
-                    &mut config.output_device,
-                    actions,
-                );
-                device_selector(
-                    ui,
-                    pal,
-                    vm,
-                    AudioDeviceKind::Capture,
-                    Key::AudioCaptureDevice,
-                    &mut config.capture_device,
-                    actions,
-                );
-                ui.checkbox(
-                    &mut config.output_fallback_to_default,
-                    text(lang, Key::AudioOutputFallback),
-                );
-                ui.checkbox(
-                    &mut config.resume_system_audio,
-                    text(lang, Key::AudioResume),
-                );
-                section(ui, pal, text(lang, Key::AudioTuning));
-                setting(ui, pal, text(lang, Key::AudioUdpPort), |ui| {
-                    let label = ui.label(text(lang, Key::AudioUdpPort));
-                    ui.add(egui::DragValue::new(&mut config.udp_port).range(1..=65535))
-                        .labelled_by(label.id);
-                });
-                setting(ui, pal, text(lang, Key::AudioDebounce), |ui| {
-                    let label = ui.label(text(lang, Key::AudioDebounce));
-                    ui.add(egui::DragValue::new(&mut config.focus_debounce_ms).range(100..=2000))
-                        .labelled_by(label.id);
-                });
-                setting(ui, pal, text(lang, Key::AudioRamp), |ui| {
-                    let label = ui.label(text(lang, Key::AudioRamp));
-                    ui.add(egui::DragValue::new(&mut config.focus_ramp_ms).range(20..=1000))
-                        .labelled_by(label.id);
-                });
-                setting(ui, pal, text(lang, Key::AudioBackgroundGain), |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut config.background_gain_db, -60..=0)
-                            .text(text(lang, Key::AudioBackgroundGain)),
-                    );
-                });
-                ui.checkbox(
-                    &mut config.background_mute,
-                    text(lang, Key::AudioBackgroundMute),
-                );
-                section(ui, pal, text(lang, Key::AudioPermissions));
-                widgets::hint(ui, pal, text(lang, Key::AudioPermissionHint));
-                permissions(ui, pal, vm, &mut config, actions);
-                section(ui, pal, text(lang, Key::AudioMicrophone));
-                widgets::hint(ui, pal, text(lang, Key::AudioMicPrivacy));
-                let mic = config
-                    .microphone
-                    .get_or_insert_with(|| ipc::AudioMicrophoneConfig {
-                        muted: true,
-                        capture_device: "default".into(),
-                        ..Default::default()
-                    });
-                ui.checkbox(&mut mic.control_enabled, text(lang, Key::AudioMicControl));
-                device_selector(
-                    ui,
-                    pal,
-                    vm,
-                    AudioDeviceKind::Microphone,
-                    Key::AudioMicDevice,
-                    &mut mic.capture_device,
-                    actions,
-                );
-                ui.checkbox(
-                    &mut mic.allow_default_mic_changes,
-                    text(lang, Key::AudioAllowDefaultMic),
-                );
-                ui.checkbox(&mut mic.muted, text(lang, Key::AudioMicSavedMute));
-                ui.checkbox(&mut mic.ptt_enabled, text(lang, Key::AudioPttEnabled));
-                setting(ui, pal, text(lang, Key::AudioPttHotkey), |ui| {
-                    let label = ui.label(text(lang, Key::AudioPttHotkey));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut mic.ptt_hotkey)
-                            .desired_width((ui.available_width() - 8.0).max(24.0))
-                            .char_limit(128),
-                    )
-                    .labelled_by(label.id);
-                });
-                setting(ui, pal, text(lang, Key::AudioPttTarget), |ui| {
-                    peer_selector(ui, vm, "audio-mic-target", &mut mic.pinned_target_node_id);
-                });
-                widgets::hint(ui, pal, text(lang, Key::AudioMicStreamingDeferred));
-                // Deferred streaming is not a working toggle or a fabricated virtual endpoint.
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(
-                        &mut mic.streaming_enabled,
-                        text(lang, Key::AudioMicStreaming),
-                    ),
-                );
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(
-                        &mut mic.experimental_acknowledged,
-                        text(lang, Key::AudioExperimentalAcknowledged),
-                    ),
-                );
-                setting(ui, pal, text(lang, Key::AudioVirtualDevice), |ui| {
-                    let label = ui.label(text(lang, Key::AudioVirtualDevice));
-                    ui.add_enabled(
-                        false,
-                        egui::TextEdit::singleline(&mut mic.virtual_device)
-                            .desired_width((ui.available_width() - 8.0).max(24.0)),
-                    )
-                    .labelled_by(label.id);
-                });
-                widgets::hint(ui, pal, text(lang, Key::AudioDraftHint));
-                let changed = config != audio.draft
-                    || audio
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.config.as_ref())
-                        .is_some_and(|saved| saved != &config);
-                apply = widgets::button(
-                    ui,
-                    pal,
-                    text(lang, Key::AudioApply),
-                    widgets::Kind::Solid,
-                    valid_group && changed,
-                )
-                .clicked();
-            });
+            widgets::hint(ui, pal, text(lang, Key::AudioRoleWarning));
         });
+        if config.role == AudioRole::Source as i32 {
+            setting(ui, pal, text(lang, Key::AudioListenerTarget), |ui| {
+                let previous = config.listener_node_id.clone();
+                peer_selector(ui, vm, "audio-listener", &mut config.listener_node_id);
+                if previous != config.listener_node_id {
+                    inherit_listener_group(
+                        &mut config,
+                        audio
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.config.as_ref()),
+                    );
+                }
+            });
+        }
+        use_listener =
+            primary_action(ui, pal, text(lang, Key::AudioUseThisListener), true).clicked();
+        let group_ready = config.group_id.len() == 16
+            && (config.role == AudioRole::Listener as i32 || config.listener_node_id.len() == 32);
+        widgets::hint(
+            ui,
+            pal,
+            text(
+                lang,
+                if group_ready {
+                    Key::AudioGroupAutomatic
+                } else {
+                    Key::AudioGroupPending
+                },
+            ),
+        );
+        ui.add_enabled(
+            group_ready || config.enabled,
+            egui::Checkbox::new(&mut config.enabled, text(lang, Key::AudioEnabled)),
+        );
+
+        section(ui, pal, text(lang, Key::AudioDevices));
+        device_selector(
+            ui,
+            pal,
+            vm,
+            AudioDeviceKind::Output,
+            Key::AudioOutputDevice,
+            &mut config.output_device,
+            actions,
+        );
+        device_selector(
+            ui,
+            pal,
+            vm,
+            AudioDeviceKind::Capture,
+            Key::AudioCaptureDevice,
+            &mut config.capture_device,
+            actions,
+        );
+
+        section(ui, pal, text(lang, Key::AudioMode));
+        setting(ui, pal, text(lang, Key::AudioMode), |ui| {
+            enum_choice(
+                ui,
+                "audio-mode",
+                &mut config.mode,
+                &[
+                    (AudioMode::MixAll as i32, text(lang, Key::AudioMixAll)),
+                    (
+                        AudioMode::FollowFocus as i32,
+                        text(lang, Key::AudioFollowFocus),
+                    ),
+                ],
+                lang,
+            );
+            widgets::hint(
+                ui,
+                pal,
+                text(
+                    lang,
+                    if config.mode == AudioMode::FollowFocus as i32 {
+                        Key::AudioFollowFocusHint
+                    } else {
+                        Key::AudioMixAllHint
+                    },
+                ),
+            );
+        });
+        section(ui, pal, text(lang, Key::AudioProfile));
+        setting(ui, pal, text(lang, Key::AudioProfile), |ui| {
+            enum_choice(
+                ui,
+                "audio-profile",
+                &mut config.profile,
+                &[
+                    (
+                        AudioProfile::Ethernet as i32,
+                        text(lang, Key::AudioEthernet),
+                    ),
+                    (AudioProfile::Wifi as i32, text(lang, Key::AudioWifi)),
+                ],
+                lang,
+            );
+            widgets::hint(
+                ui,
+                pal,
+                text(
+                    lang,
+                    if config.profile == AudioProfile::Wifi as i32 {
+                        Key::AudioWifiHint
+                    } else {
+                        Key::AudioEthernetHint
+                    },
+                ),
+            );
+        });
+
+        section(ui, pal, text(lang, Key::AudioPermissions));
+        widgets::hint(ui, pal, text(lang, Key::AudioPermissionHint));
+        permissions(ui, pal, vm, &mut config, actions);
+
+        section(ui, pal, text(lang, Key::AudioMicrophone));
+        widgets::hint(ui, pal, text(lang, Key::AudioMicPrivacy));
+        let mic = config
+            .microphone
+            .get_or_insert_with(|| ipc::AudioMicrophoneConfig {
+                muted: true,
+                capture_device: "default".into(),
+                ..Default::default()
+            });
+        ui.checkbox(&mut mic.control_enabled, text(lang, Key::AudioMicControl));
+        ui.checkbox(&mut mic.muted, text(lang, Key::AudioMicSavedMute));
+        ui.checkbox(&mut mic.ptt_enabled, text(lang, Key::AudioPttEnabled));
+        if mic.ptt_enabled {
+            setting(ui, pal, text(lang, Key::AudioPttHotkey), |ui| {
+                text_field(
+                    ui,
+                    text(lang, Key::AudioPttHotkey),
+                    &mut mic.ptt_hotkey,
+                    128,
+                );
+            });
+        }
+        if mic.control_enabled {
+            device_selector(
+                ui,
+                pal,
+                vm,
+                AudioDeviceKind::Microphone,
+                Key::AudioMicDevice,
+                &mut mic.capture_device,
+                actions,
+            );
+            setting(ui, pal, text(lang, Key::AudioPttTarget), |ui| {
+                peer_selector(ui, vm, "audio-mic-target", &mut mic.pinned_target_node_id);
+            });
+        }
+        ui.add_space(12.0);
+        ui.collapsing(text(lang, Key::AudioAdvanced), |ui| {
+            valid_group = advanced(ui, pal, vm, &mut config);
+        });
+        widgets::hint(ui, pal, text(lang, Key::AudioDraftHint));
+        let changed = audio
+            .status
+            .as_ref()
+            .and_then(|status| status.config.as_ref())
+            .is_some_and(|saved| saved != &config);
+        apply =
+            primary_action(ui, pal, text(lang, Key::AudioApply), valid_group && changed).clicked();
+    });
     if editable && config != audio.draft {
         actions.push(Action::Audio(AudioAction::EditConfig(Box::new(config))));
     }
-    if create_group {
-        actions.push(Action::Audio(AudioAction::CreateGroup));
+    if use_listener {
+        actions.push(Action::Audio(AudioAction::UseThisListener));
     }
     if apply {
         actions.push(Action::Audio(AudioAction::ApplyConfig));
     }
+}
+
+fn inherit_listener_group(config: &mut ipc::AudioConfig, saved: Option<&ipc::AudioConfig>) {
+    config.group_id = saved
+        .filter(|saved| {
+            saved.role == AudioRole::Source as i32
+                && saved.listener_node_id == config.listener_node_id
+        })
+        .map_or_else(Vec::new, |saved| saved.group_id.clone());
+    if config.group_id.len() != 16 {
+        config.enabled = false;
+    }
+}
+
+fn primary_action(ui: &mut egui::Ui, pal: &Palette, label: &str, enabled: bool) -> egui::Response {
+    // Match the shared pill while allowing its full accessibility label to wrap in small modals.
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(18.0, 8.0);
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(
+                egui::RichText::new(label)
+                    .font(super::theme::font(13.0, super::theme::fam::sans_medium()))
+                    .color(pal.bg),
+            )
+            .fill(pal.ink)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(super::theme::R_BTN)
+            .min_size(egui::vec2(0.0, 44.0))
+            .wrap(),
+        )
+    })
+    .inner
+}
+
+fn slider(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    enabled: bool,
+    slider: egui::Slider<'_>,
+) -> egui::Response {
+    ui.scope(|ui| {
+        // The same visible rail and circular handle as Appearance's particle-speed control.
+        ui.spacing_mut().slider_width = (ui.available_width() - 80.0).clamp(80.0, 200.0);
+        let visuals = ui.visuals_mut();
+        visuals.widgets.inactive.bg_fill = pal.line;
+        visuals.widgets.hovered.bg_fill = pal.line;
+        visuals.widgets.active.bg_fill = pal.line;
+        visuals.selection.bg_fill = pal.accent;
+        visuals.slider_trailing_fill = true;
+        visuals.handle_shape = egui::style::HandleShape::Circle;
+        ui.add_enabled(enabled, slider)
+    })
+    .inner
+}
+
+fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, limit: usize) {
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .desired_width((ui.available_width() - 8.0).max(24.0))
+            .char_limit(limit),
+    );
+    response.widget_info(|| {
+        let mut info =
+            egui::WidgetInfo::text_edit(ui.is_enabled(), value.as_str(), value.as_str(), "");
+        info.label = Some(label.to_owned());
+        info
+    });
+}
+
+fn advanced(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    config: &mut ipc::AudioConfig,
+) -> bool {
+    let lang = vm.look.language;
+    let mut valid_group = true;
+    setting(ui, pal, text(lang, Key::AudioGroup), |ui| {
+        let id = ui.id().with("audio-group-input");
+        let mut group = ui
+            .data_mut(|data| data.get_temp::<String>(id))
+            .unwrap_or_else(|| hex(&config.group_id));
+        let previous = group.clone();
+        text_field(ui, text(lang, Key::AudioGroup), &mut group, 32);
+        let parsed = parse_hex(&group, 16);
+        valid_group = parsed.is_some() && (!config.enabled || !group.is_empty());
+        if group != previous {
+            if let Some(bytes) = parsed {
+                config.group_id = bytes;
+            }
+            ui.data_mut(|data| data.insert_temp(id, group));
+        }
+        if !valid_group {
+            widgets::hint(ui, pal, text(lang, Key::AudioInvalidGroup));
+        }
+    });
+    setting(ui, pal, text(lang, Key::AudioUdpPort), |ui| {
+        ui.add(egui::DragValue::new(&mut config.udp_port).range(1..=65535))
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::DragValue,
+                    ui.is_enabled(),
+                    text(lang, Key::AudioUdpPort),
+                )
+            });
+    });
+    setting(ui, pal, text(lang, Key::AudioDebounce), |ui| {
+        ui.add(egui::DragValue::new(&mut config.focus_debounce_ms).range(100..=2000))
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::DragValue,
+                    ui.is_enabled(),
+                    text(lang, Key::AudioDebounce),
+                )
+            });
+    });
+    setting(ui, pal, text(lang, Key::AudioRamp), |ui| {
+        ui.add(egui::DragValue::new(&mut config.focus_ramp_ms).range(20..=1000))
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::DragValue,
+                    ui.is_enabled(),
+                    text(lang, Key::AudioRamp),
+                )
+            });
+    });
+    setting(ui, pal, text(lang, Key::AudioBackgroundGain), |ui| {
+        let response = slider(
+            ui,
+            pal,
+            true,
+            egui::Slider::new(&mut config.background_gain_db, -60..=0),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::slider(
+                ui.is_enabled(),
+                f64::from(config.background_gain_db),
+                text(lang, Key::AudioBackgroundGain),
+            )
+        });
+    });
+    ui.checkbox(
+        &mut config.background_mute,
+        text(lang, Key::AudioBackgroundMute),
+    );
+    ui.checkbox(
+        &mut config.output_fallback_to_default,
+        text(lang, Key::AudioOutputFallback),
+    );
+    ui.checkbox(
+        &mut config.resume_system_audio,
+        text(lang, Key::AudioResume),
+    );
+    if let Some(mic) = &mut config.microphone {
+        ui.checkbox(
+            &mut mic.allow_default_mic_changes,
+            text(lang, Key::AudioAllowDefaultMic),
+        );
+        widgets::hint(ui, pal, text(lang, Key::AudioMicStreamingDeferred));
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(
+                &mut mic.streaming_enabled,
+                text(lang, Key::AudioMicStreaming),
+            ),
+        );
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(
+                &mut mic.experimental_acknowledged,
+                text(lang, Key::AudioExperimentalAcknowledged),
+            ),
+        );
+        setting(ui, pal, text(lang, Key::AudioVirtualDevice), |ui| {
+            ui.add_enabled_ui(false, |ui| {
+                text_field(
+                    ui,
+                    text(lang, Key::AudioVirtualDevice),
+                    &mut mic.virtual_device,
+                    256,
+                );
+            });
+        });
+    }
+    valid_group
 }
 
 fn section(ui: &mut egui::Ui, pal: &Palette, label: &str) {
@@ -308,7 +434,13 @@ fn section(ui: &mut egui::Ui, pal: &Palette, label: &str) {
 fn setting(ui: &mut egui::Ui, pal: &Palette, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.push_id(label, |ui| {
         if ui.available_width() < 520.0 {
-            widgets::hint(ui, pal, label);
+            widgets::wrapped(
+                ui,
+                &label.to_uppercase(),
+                11.0,
+                super::theme::fam::mono(),
+                pal.ink2,
+            );
             add(ui);
             ui.add_space(6.0);
         } else {
@@ -367,22 +499,11 @@ fn parse_hex(value: &str, bytes: usize) -> Option<Vec<u8>> {
 }
 
 fn peer_selector(ui: &mut egui::Ui, vm: &ViewModel, id: &str, selected: &mut Vec<u8>) {
-    let current = hex(selected);
-    let label = vm
-        .status
-        .as_ref()
-        .and_then(|s| {
-            s.members
-                .iter()
-                .find(|p| p.node_id.eq_ignore_ascii_case(&current))
-        })
-        .map(|p| p.display_name.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(if selected.is_empty() {
-            text(vm.look.language, Key::AudioNoTarget)
-        } else {
-            &current
-        });
+    let label = if selected.is_empty() {
+        text(vm.look.language, Key::AudioNoTarget).to_owned()
+    } else {
+        super::audio_summary::peer_name(vm, selected)
+    };
     egui::ComboBox::from_id_salt(id)
         .selected_text(label)
         .width(ui.available_width().min(280.0))
@@ -396,14 +517,10 @@ fn peer_selector(ui: &mut egui::Ui, vm: &ViewModel, id: &str, selected: &mut Vec
                 for peer in status
                     .members
                     .iter()
-                    .filter(|p| p.node_id != status.local_node_id)
+                    .filter(|peer| peer.node_id != status.local_node_id)
                 {
                     if let Some(bytes) = parse_hex(&peer.node_id, 32) {
-                        let name = if peer.display_name.is_empty() {
-                            &peer.node_id
-                        } else {
-                            &peer.display_name
-                        };
+                        let name = super::audio_summary::peer_name(vm, &bytes);
                         ui.selectable_value(selected, bytes, name);
                     }
                 }
@@ -429,9 +546,16 @@ fn device_selector(
             .filter(|p| p.kind == kind as i32)
             .max_by_key(|p| p.revision);
         let current = page.and_then(|p| p.devices.iter().find(|d| d.id == *selected));
-        let label = current
-            .map(|d| d.name.as_str())
-            .unwrap_or(selected.as_str());
+        let label = if selected == "default" {
+            text(lang, Key::AudioDefaultDevice)
+        } else if selected == "default_monitor" {
+            text(lang, Key::AudioDefaultCapture)
+        } else {
+            current
+                .map(|device| device.name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(text(lang, Key::AudioDeviceMissing))
+        };
         egui::ComboBox::from_id_salt(("audio-device", kind as i32))
             .selected_text(label)
             .width(ui.available_width().min(280.0))
@@ -488,13 +612,13 @@ fn permissions(
     for member in status
         .members
         .iter()
-        .filter(|p| p.node_id != status.local_node_id)
+        .filter(|member| member.node_id != status.local_node_id)
     {
         let Some(node_id) = parse_hex(&member.node_id, 32) else {
             continue;
         };
         found = true;
-        let index = config.peers.iter().position(|p| p.node_id == node_id);
+        let index = config.peers.iter().position(|peer| peer.node_id == node_id);
         let can_configure = index.is_some() || config.peers.len() < 3;
         let can_send =
             config.role == AudioRole::Source as i32 && config.listener_node_id == node_id;
@@ -504,21 +628,24 @@ fn permissions(
             volume_percent: 100,
             ..Default::default()
         };
-        let peer = if let Some(i) = index {
-            &mut config.peers[i]
+        let peer = if let Some(index) = index {
+            &mut config.peers[index]
         } else {
             &mut added
         };
         let mut changed = false;
         let mut remove = false;
         ui.push_id(&member.node_id, |ui| {
-            let name = if member.display_name.is_empty() {
-                &member.node_id
-            } else {
-                &member.display_name
-            };
-            ui.collapsing(name, |ui| {
-                ui.add_enabled_ui(can_configure, |ui| {
+            ui.add_space(8.0);
+            widgets::text(
+                ui,
+                &super::audio_summary::peer_name(vm, &node_id),
+                14.0,
+                super::theme::fam::sans_semibold(),
+                pal.ink,
+            );
+            ui.add_enabled_ui(can_configure, |ui| {
+                ui.horizontal_wrapped(|ui| {
                     changed |= ui
                         .add_enabled(
                             can_send || peer.allow_system_send,
@@ -538,18 +665,29 @@ fn permissions(
                         )
                         .changed();
                     changed |= ui
-                        .checkbox(
-                            &mut peer.allow_mic_control,
-                            text(lang, Key::AudioMicControlPermission),
-                        )
-                        .changed();
-                    changed |= ui
                         .add_enabled(
                             can_media || peer.allow_media_control,
                             egui::Checkbox::new(
                                 &mut peer.allow_media_control,
                                 text(lang, Key::AudioMediaPermission),
                             ),
+                        )
+                        .changed();
+                });
+                let volume_label = widgets::hint(ui, pal, text(lang, Key::AudioPeerVolume));
+                changed |= slider(
+                    ui,
+                    pal,
+                    can_receive,
+                    egui::Slider::new(&mut peer.volume_percent, 0..=100).suffix("%"),
+                )
+                .labelled_by(volume_label.id)
+                .changed();
+                ui.collapsing(text(lang, Key::AudioMicrophone), |ui| {
+                    changed |= ui
+                        .checkbox(
+                            &mut peer.allow_mic_control,
+                            text(lang, Key::AudioMicControlPermission),
                         )
                         .changed();
                     changed |= ui
@@ -570,41 +708,36 @@ fn permissions(
                             ),
                         )
                         .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut peer.volume_percent, 0..=100)
-                                .text(text(lang, Key::AudioPeerVolume)),
-                        )
-                        .changed();
+                    if index.is_some() {
+                        remove =
+                            widgets::small_button(ui, pal, text(lang, Key::AudioRemovePeer), true)
+                                .clicked();
+                    }
                 });
-                if index.is_some() {
-                    remove = widgets::small_button(ui, pal, text(lang, Key::AudioRemovePeer), true)
-                        .clicked();
-                }
-                // Start is based only on applied authoritative configuration, never this draft.
-                let can_start = member.online
-                    && vm.audio.status.as_ref().is_some_and(|s| {
-                        s.enabled
-                            && s.config.as_ref().is_some_and(|saved| {
-                                saved.peers.iter().any(|p| {
-                                    p.node_id == node_id
-                                        && (if s.role == AudioRole::Source as i32 {
-                                            p.allow_system_send && saved.listener_node_id == node_id
-                                        } else {
-                                            p.allow_system_receive
-                                        })
-                                })
-                            })
-                    });
-                if widgets::small_button(ui, pal, text(lang, Key::AudioStart), can_start).clicked()
-                {
-                    actions.push(Action::Audio(AudioAction::Start(node_id.clone())));
-                }
             });
+            // Starting is permitted only by applied consent, never by a draft checkbox.
+            let can_start = member.online
+                && vm.audio.status.as_ref().is_some_and(|status| {
+                    status.enabled
+                        && status.config.as_ref().is_some_and(|saved| {
+                            saved.peers.iter().any(|peer| {
+                                peer.node_id == node_id
+                                    && if status.role == AudioRole::Source as i32 {
+                                        peer.allow_system_send && saved.listener_node_id == node_id
+                                    } else {
+                                        peer.allow_system_receive
+                                    }
+                            })
+                        })
+                });
+            if primary_action(ui, pal, text(lang, Key::AudioStart), can_start).clicked() {
+                actions.push(Action::Audio(AudioAction::Start(node_id.clone())));
+            }
+            ui.separator();
         });
-        if let Some(i) = index {
+        if let Some(index) = index {
             if remove {
-                config.peers.remove(i);
+                config.peers.remove(index);
             }
         } else if changed {
             added.node_id = node_id;
@@ -615,15 +748,15 @@ fn permissions(
         widgets::hint(ui, pal, text(lang, Key::AudioNoPeers));
     }
     config.peers.retain(|peer| {
-        let trusted = status
+        if status
             .members
             .iter()
-            .any(|p| parse_hex(&p.node_id, 32).as_ref() == Some(&peer.node_id));
-        if trusted {
+            .any(|member| parse_hex(&member.node_id, 32).as_ref() == Some(&peer.node_id))
+        {
             return true;
         }
         widgets::hint(ui, pal, text(lang, Key::AudioUntrustedPeer));
-        widgets::hint(ui, pal, &hex(&peer.node_id));
+        widgets::hint(ui, pal, &super::audio_summary::peer_name(vm, &peer.node_id));
         !ui.push_id(&peer.node_id, |ui| {
             widgets::small_button(ui, pal, text(lang, Key::AudioRemovePeer), true).clicked()
         })
@@ -631,281 +764,26 @@ fn permissions(
     });
 }
 
-fn diagnostics(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
-    let lang = vm.look.language;
-    section(ui, pal, text(lang, Key::AudioDiagnostics));
-    let Some(status) = &vm.audio.status else {
-        return;
-    };
-    let connected = vm.connection.is_connected();
-    let available = connected && vm.audio.available;
-    ui.horizontal_wrapped(|ui| {
-        if widgets::small_button(
-            ui,
-            pal,
-            text(lang, Key::AudioStopAll),
-            connected && !status.sessions.is_empty(),
-        )
-        .clicked()
-        {
-            actions.push(Action::Audio(AudioAction::StopAll));
-        }
-        if let Some(mic) = &status.microphone {
-            let can_mute = if mic.muted {
-                available && mic.control_active && !vm.audio.pending
-            } else {
-                connected
-            };
-            if widgets::small_button(
-                ui,
-                pal,
-                text(
-                    lang,
-                    if mic.muted {
-                        Key::AudioMicUnmute
-                    } else {
-                        Key::AudioMicMute
-                    },
-                ),
-                can_mute,
-            )
-            .clicked()
-            {
-                actions.push(Action::Audio(AudioAction::SetMicrophoneMute(!mic.muted)));
-            }
-            let held_id = ui.id().with("audio-ptt-held");
-            let was_held = ui
-                .data_mut(|data| data.get_temp::<bool>(held_id))
-                .unwrap_or(false);
-            let ptt_enabled = status
-                .config
-                .as_ref()
-                .and_then(|c| c.microphone.as_ref())
-                .is_some_and(|m| m.control_enabled && m.ptt_enabled);
-            let can_hold =
-                available && mic.control_active && ptt_enabled && (was_held || !vm.audio.pending);
-            let response = widgets::small_button(ui, pal, text(lang, Key::AudioPttPress), can_hold);
-            // Response helpers read egui memory; never call them while holding Context::input.
-            let pointer_held = response.is_pointer_button_down_on();
-            let focused_button = response.has_focus();
-            let held = can_hold
-                && ui.ctx().input(|input| {
-                    input.focused
-                        && (pointer_held
-                            || focused_button
-                                && (input.key_down(egui::Key::Space)
-                                    || input.key_down(egui::Key::Enter)))
-                });
-            if held != was_held {
-                actions.push(Action::Audio(AudioAction::SetPtt(held)));
-                ui.data_mut(|data| data.insert_temp(held_id, held));
-            }
-            if mic.ptt_pressed
-                && widgets::small_button(ui, pal, text(lang, Key::AudioPttRelease), connected)
-                    .clicked()
-            {
-                actions.push(Action::Audio(AudioAction::SetPtt(false)));
-            }
-        }
-    });
-    ui.collapsing(text(lang, Key::AudioDevices), |ui| {
-        for (capability, key) in [
-            (
-                ipc::AudioBackendCapability::SystemCapture,
-                Key::AudioCapabilityCapture,
-            ),
-            (
-                ipc::AudioBackendCapability::Render,
-                Key::AudioCapabilityRender,
-            ),
-            (
-                ipc::AudioBackendCapability::EndpointMute,
-                Key::AudioCapabilityMute,
-            ),
-            (
-                ipc::AudioBackendCapability::GlobalPtt,
-                Key::AudioCapabilityPtt,
-            ),
-            (
-                ipc::AudioBackendCapability::MediaSessions,
-                Key::AudioCapabilityMedia,
-            ),
-        ] {
-            let report = status
-                .backend
-                .iter()
-                .find(|b| b.capability == capability as i32);
-            let availability = match report.map(|b| b.availability) {
-                Some(v) if v == ipc::AudioAvailability::Available as i32 => Key::AudioAvailable,
-                Some(v) if v == ipc::AudioAvailability::Unsupported as i32 => Key::AudioUnsupported,
-                _ => Key::AudioUnknown,
-            };
-            widgets::hint(
-                ui,
-                pal,
-                &format!("{}: {}", text(lang, key), text(lang, availability)),
-            );
-            if let Some(report) =
-                report.filter(|b| b.availability != ipc::AudioAvailability::Available as i32)
-            {
-                let reason = match ipc::AudioUnavailableReason::try_from(report.reason).ok() {
-                    Some(ipc::AudioUnavailableReason::FeatureNotBuilt) => Key::AudioReasonFeature,
-                    Some(ipc::AudioUnavailableReason::NotSupportedByPlatform) => {
-                        Key::AudioReasonPlatform
-                    }
-                    Some(ipc::AudioUnavailableReason::OsBuildTooOld) => Key::AudioReasonOs,
-                    Some(ipc::AudioUnavailableReason::ProcessExclusionUnavailable) => {
-                        Key::AudioReasonExclusion
-                    }
-                    Some(ipc::AudioUnavailableReason::ReleaseObservationUnavailable) => {
-                        Key::AudioReasonRelease
-                    }
-                    Some(ipc::AudioUnavailableReason::ServerUnavailable) => Key::AudioReasonServer,
-                    Some(ipc::AudioUnavailableReason::PermissionDenied) => {
-                        Key::AudioReasonPermission
-                    }
-                    Some(ipc::AudioUnavailableReason::DeviceGone) => Key::AudioReasonDevice,
-                    Some(ipc::AudioUnavailableReason::DeviceNotSelected) => {
-                        Key::AudioReasonSelection
-                    }
-                    Some(ipc::AudioUnavailableReason::WorkerUnavailable) => Key::AudioReasonWorker,
-                    _ => Key::AudioUnknown,
-                };
-                widgets::hint(ui, pal, text(lang, reason));
-            }
-        }
-    });
-    if status.sessions.is_empty() {
-        widgets::hint(ui, pal, text(lang, Key::AudioIdle));
-    }
-    for session in &status.sessions {
-        let state = match ipc::AudioSessionState::try_from(session.state).ok() {
-            Some(ipc::AudioSessionState::Idle) => Key::AudioStateIdle,
-            Some(ipc::AudioSessionState::AwaitConsent) => Key::AudioStateConsent,
-            Some(ipc::AudioSessionState::Preparing) => Key::AudioStatePreparing,
-            Some(ipc::AudioSessionState::AwaitCommit) => Key::AudioStateCommit,
-            Some(ipc::AudioSessionState::PathValidation) => Key::AudioStatePath,
-            Some(ipc::AudioSessionState::Running) => Key::AudioStateRunning,
-            Some(ipc::AudioSessionState::Rebuffering) => Key::AudioStateRebuffering,
-            Some(ipc::AudioSessionState::DevicePaused) => Key::AudioStateDevicePaused,
-            Some(ipc::AudioSessionState::Stopping) => Key::AudioStateStopping,
-            Some(ipc::AudioSessionState::Failed) => Key::AudioStateFailed,
-            _ => Key::AudioUnknown,
-        };
-        let active = matches!(
-            ipc::AudioSessionState::try_from(session.state),
-            Ok(ipc::AudioSessionState::Running | ipc::AudioSessionState::Rebuffering)
-        );
-        let direction = if session.local_role == AudioRole::Source as i32 {
-            match session.sending {
-                Some(true) => Key::AudioSharing,
-                Some(false) => Key::AudioNotSending,
-                None => Key::AudioSendingUnknown,
-            }
-        } else if active {
-            Key::AudioReceiving
-        } else {
-            Key::AudioListener
-        };
-        if session.local_role == AudioRole::Source as i32 {
-            match session.capture_active {
-                Some(active) => widgets::hint(
-                    ui,
-                    pal,
-                    text(
-                        lang,
-                        if active {
-                            Key::AudioSystemCaptureActive
-                        } else {
-                            Key::AudioSystemCaptureInactive
-                        },
-                    ),
-                ),
-                None => widgets::hint(
-                    ui,
-                    pal,
-                    &format!(
-                        "{}: {}",
-                        text(lang, Key::AudioCapabilityCapture),
-                        text(lang, Key::AudioUnknown)
-                    ),
-                ),
-            };
-        }
-        let name = if session.source_name.is_empty() {
-            hex(&session.peer)
-        } else {
-            session.source_name.clone()
-        };
-        widgets::hint(
-            ui,
-            pal,
-            &format!("{} {} · {}", text(lang, direction), name, text(lang, state)),
-        );
-        if let Some(latency) = session.latency_estimate_ms {
-            widgets::hint(
-                ui,
-                pal,
-                &format!("{}: {latency}", text(lang, Key::AudioLatency)),
-            );
-        }
-        if let Some(health) = &session.health {
-            widgets::hint(
-                ui,
-                pal,
-                &format!(
-                    "{}: {} / {} / {} / {} / {} / {} / {}",
-                    text(lang, Key::AudioHealthCounters),
-                    health.received_packets,
-                    health.lost_frames,
-                    health.late_frames,
-                    health.concealed_frames,
-                    health.underruns,
-                    health.discontinuities,
-                    health.limiter_frames
-                ),
-            );
-        }
-    }
-    if let Some(mic) = &status.microphone {
-        widgets::hint(
-            ui,
-            pal,
-            text(
-                lang,
-                if mic.muted {
-                    Key::AudioMicMuted
-                } else {
-                    Key::AudioMicNotMuted
-                },
-            ),
-        );
-        if mic.control_active {
-            widgets::hint(ui, pal, text(lang, Key::AudioMicControlActive));
-        }
-        if mic.capture_active {
-            widgets::hint(ui, pal, text(lang, Key::AudioMicCaptureActive));
-        }
-        if mic.ptt_pressed {
-            widgets::hint(ui, pal, text(lang, Key::AudioPttPressed));
-        }
-        if !mic.target_node_id.is_empty() {
-            widgets::hint(
-                ui,
-                pal,
-                &format!(
-                    "{}: {}",
-                    text(lang, Key::AudioPttTarget),
-                    hex(&mic.target_node_id)
-                ),
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{hex, parse_hex};
+    use super::{hex, inherit_listener_group, parse_hex};
+
+    #[test]
+    fn source_listener_selection_never_reuses_another_listeners_group() {
+        let mut saved = crate::audio::default_config();
+        saved.listener_node_id = vec![1; 32];
+        saved.group_id = vec![7; 16];
+        let mut draft = saved.clone();
+        draft.listener_node_id = vec![2; 32];
+        draft.enabled = true;
+        inherit_listener_group(&mut draft, Some(&saved));
+        assert!(draft.group_id.is_empty());
+        assert!(!draft.enabled);
+        draft.listener_node_id = saved.listener_node_id.clone();
+        inherit_listener_group(&mut draft, Some(&saved));
+        assert_eq!(draft.group_id, saved.group_id);
+        assert!(!draft.enabled);
+    }
 
     #[test]
     fn identifiers_are_explicit_exact_length_hex_not_discovery_guesses() {

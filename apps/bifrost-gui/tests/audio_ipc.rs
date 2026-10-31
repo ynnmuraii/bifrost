@@ -215,7 +215,7 @@ fn unsupported_and_timeout_rollback_pending_without_claiming_success() {
 fn explicit_group_creation_edits_only_the_listener_draft() {
     let mut vm = view();
     vm.apply(event(Msg::AudioStatus(snapshot(5))));
-    vm.audio_action(&AudioAction::CreateGroup, Instant::now());
+    vm.audio_action(&AudioAction::UseThisListener, Instant::now());
     assert_eq!(vm.audio.draft.group_id.len(), 16);
     assert!(vm.audio.dirty);
     assert_eq!(

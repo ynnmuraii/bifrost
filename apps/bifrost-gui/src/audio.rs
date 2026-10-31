@@ -18,7 +18,7 @@ pub enum AudioAction {
     EditConfig(Box<ipc::AudioConfig>),
     ApplyConfig,
     Refresh,
-    CreateGroup,
+    UseThisListener,
     ListDevices(ipc::AudioDeviceKind),
     Start(Vec<u8>),
     StopAll,
@@ -257,18 +257,24 @@ impl ViewModel {
                 self.audio.dirty = true;
                 return;
             }
-            AudioAction::CreateGroup => {
+            AudioAction::UseThisListener => {
                 use ring::rand::SecureRandom;
-                if self.audio.draft.role != ipc::AudioRole::Listener as i32 {
-                    return;
-                }
-                let mut id = vec![0; 16];
-                if ring::rand::SystemRandom::new().fill(&mut id).is_ok() {
+                let was_listener = self.audio.draft.role == ipc::AudioRole::Listener as i32;
+                if !was_listener || self.audio.draft.group_id.len() != 16 {
+                    let mut id = vec![0; 16];
+                    if ring::rand::SystemRandom::new().fill(&mut id).is_err() {
+                        self.audio.error =
+                            Some(text(self.look.language, Key::AudioUnavailable).into());
+                        return;
+                    }
                     self.audio.draft.group_id = id;
-                    self.audio.dirty = true;
-                } else {
-                    self.audio.error = Some(text(self.look.language, Key::AudioUnavailable).into());
                 }
+                self.audio.draft.role = ipc::AudioRole::Listener as i32;
+                self.audio.draft.listener_node_id.clear();
+                if !was_listener {
+                    self.audio.draft.enabled = false;
+                }
+                self.audio.dirty = true;
                 return;
             }
             AudioAction::OpenSettings => {
