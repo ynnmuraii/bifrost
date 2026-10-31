@@ -51,7 +51,7 @@ fn legacy_default_stays_audio_free_and_roundtrips() {
 }
 
 #[test]
-fn unresolved_source_is_preserved_but_cannot_enable() {
+fn unresolved_source_preserves_enabled_intent_without_inventing_group() {
     let text = format!("role = 'source'\nlistener_node_id = '{}'", "aB".repeat(32));
     let config = parse(&text).unwrap();
     config.validate().unwrap();
@@ -60,8 +60,13 @@ fn unresolved_source_is_preserved_but_cannot_enable() {
     assert_eq!(restored, config);
     assert!(saved.contains(&"ab".repeat(32)));
     assert!(restored.audio.group_id.is_none());
-    assert!(!valid(&format!("{text}\nenabled = true")));
+    assert!(valid(&format!("{text}\nenabled = true")));
     assert!(valid("role = 'listener'\nenabled = true"));
+    let pending = parse(&format!("{text}\nenabled = true")).unwrap();
+    let restored = Config::from_str(&pending.to_toml().unwrap()).unwrap();
+    assert!(restored.audio.enabled);
+    assert!(restored.audio.group_id.is_none());
+    assert!(!valid("role = 'source'\nenabled = true"));
 }
 
 #[test]
@@ -255,6 +260,7 @@ fn first_audio_save_preserves_original_once_and_serializes_concurrent_changes() 
     );
     let mut invalid = saved.audio;
     invalid.enabled = true;
+    invalid.listener_node_id = None;
     let before = fs::read_to_string(&path).unwrap();
     assert!(save_audio_locked(&path, invalid).is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), before);

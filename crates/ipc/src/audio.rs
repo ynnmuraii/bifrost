@@ -120,10 +120,6 @@ pub fn validate_config(config: &wire::AudioConfig) -> Result<()> {
     id(&config.listener_node_id, 32, true)?;
     id(&config.group_id, 16, true)?;
     require(
-        !config.enabled || config.group_id.len() == 16,
-        "enabled audio requires group",
-    )?;
-    require(
         !config.enabled || role != wire::AudioRole::Source || config.listener_node_id.len() == 32,
         "enabled source requires listener",
     )?;

@@ -51,7 +51,7 @@ fn validates_config_ranges_and_security_structure() {
     }
     let mut c = config();
     c.enabled = true;
-    assert!(validate_config(&c).is_err());
+    assert!(validate_config(&c).is_ok());
     c.group_id = vec![1; 16];
     assert!(validate_config(&c).is_ok());
     c.role = wire::AudioRole::Source as i32;
@@ -81,6 +81,43 @@ fn validates_config_ranges_and_security_structure() {
     c.output_device = "default".into();
     c.microphone.as_mut().unwrap().ptt_enabled = true;
     assert!(validate_config(&c).is_err());
+}
+
+#[test]
+fn enabled_listener_accepts_empty_group() {
+    let mut c = config();
+    c.enabled = true;
+    assert!(validate_config(&c).is_ok());
+    let mut s = status();
+    s.enabled = true;
+    s.config = Some(c);
+    assert!(validate_status(&s).is_ok());
+}
+
+#[test]
+fn enabled_source_with_listener_accepts_empty_group() {
+    let mut c = config();
+    c.enabled = true;
+    c.role = wire::AudioRole::Source as i32;
+    c.listener_node_id = vec![2; 32];
+    assert!(validate_config(&c).is_ok());
+}
+
+#[test]
+fn enabled_source_without_listener_rejects_empty_group() {
+    let mut c = config();
+    c.enabled = true;
+    c.role = wire::AudioRole::Source as i32;
+    assert!(validate_config(&c).is_err());
+}
+
+#[test]
+fn nonempty_group_requires_exactly_sixteen_bytes() {
+    for length in [1, 15, 17, 32] {
+        let mut c = config();
+        c.group_id = vec![1; length];
+        assert!(validate_config(&c).is_err());
+    }
 }
 #[test]
 fn exact_stop_identity_and_correlation_are_required() {

@@ -335,9 +335,9 @@ impl AudioConfig {
                         "Source sends only to its selected Listener and never receives",
                     ));
                 }
-                // A disabled groupless selection is WaitingForListener. Never invent a group.
-                if self.enabled && (self.listener_node_id.is_none() || self.group_id.is_none()) {
-                    return Err(invalid("audio.enabled", "Source needs selected Listener and authenticated resolved group before enabling"));
+                // Enabled is desired intent; activation still waits for authenticated group resolution.
+                if self.enabled && self.listener_node_id.is_none() {
+                    return Err(invalid("audio.enabled", "Source needs a selected Listener"));
                 }
             }
             AudioRole::Listener => {
