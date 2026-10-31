@@ -14,6 +14,9 @@ pub const MAX_SESSIONS: usize = 3;
 pub const DEVICES_PER_PAGE: usize = 16;
 pub const MAX_DEVICES: usize = 64;
 pub const MAX_COMMAND_BYTES: usize = 8192;
+pub const MAX_PTT_RESERVED: usize = 16;
+pub const MAX_MEDIA_SESSIONS: usize = 32;
+pub const MAX_PTT_GRANT_NS: u64 = 250_000_000;
 
 pub struct LaunchToken(Zeroizing<[u8; 32]>);
 impl LaunchToken {
@@ -227,6 +230,12 @@ fn selection(value: &w::DeviceSelection) -> Result<(), IpcError> {
         _ => Err(invalid()),
     }
 }
+fn hotkey(value: &w::PttHotkey) -> Result<(), IpcError> {
+    if !(0x04..=0x73).contains(&value.key_code) {
+        return Err(invalid());
+    }
+    Ok(())
+}
 fn port(port: u32, default: bool) -> bool {
     (port == 0 && default) || (port > 0 && port <= 65535 && port != 47902)
 }
@@ -257,6 +266,12 @@ fn is_core(message: &w::audio_frame::Msg) -> bool {
             | w::audio_frame::Msg::Ping(_)
             | w::audio_frame::Msg::Shutdown(_)
             | w::audio_frame::Msg::ProbeBackend(_)
+            | w::audio_frame::Msg::AcquireMicMute(_)
+            | w::audio_frame::Msg::SetMicMute(_)
+            | w::audio_frame::Msg::ReleaseMicMute(_)
+            | w::audio_frame::Msg::ConfigurePtt(_)
+            | w::audio_frame::Msg::SetMediaWatch(_)
+            | w::audio_frame::Msg::MediaCommand(_)
     )
 }
 /// Semantic validation occurs before sequence state changes or any native/key use.
@@ -286,9 +301,25 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             | Msg::Ready(_)
             | Msg::Devices(_)
     );
+    let correlated = correlated
+        || matches!(
+            message,
+            Msg::AcquireMicMute(_)
+                | Msg::SetMicMute(_)
+                | Msg::ReleaseMicMute(_)
+                | Msg::ConfigurePtt(_)
+                | Msg::SetMediaWatch(_)
+                | Msg::MediaCommand(_)
+                | Msg::MediaCommandResult(_)
+        );
     let pushed = matches!(
         message,
-        Msg::Ping(_) | Msg::Pong(_) | Msg::SessionEvent(_) | Msg::Health(_) | Msg::BackendEvent(_)
+        Msg::Ping(_)
+            | Msg::Pong(_)
+            | Msg::SessionEvent(_)
+            | Msg::Health(_)
+            | Msg::BackendEvent(_)
+            | Msg::MediaSessions(_)
     );
     if correlated && frame.request_id == 0 || pushed && frame.request_id != 0 {
         return Err(invalid());
@@ -485,6 +516,93 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 return Err(invalid());
             }
         }
+        Msg::AcquireMicMute(request) => {
+            selection(request.selection.as_ref().ok_or_else(invalid)?)?;
+        }
+        Msg::SetMicMute(request) => {
+            if request.expected_generation == 0 {
+                return Err(invalid());
+            }
+        }
+        Msg::ConfigurePtt(request) => {
+            if request.reserved.len() > MAX_PTT_RESERVED {
+                return Err(invalid());
+            }
+            if let Some(binding) = &request.binding {
+                hotkey(binding)?;
+            }
+            for (index, reserved) in request.reserved.iter().enumerate() {
+                hotkey(reserved)?;
+                if request.binding.as_ref() == Some(reserved)
+                    || request.reserved[..index].contains(reserved)
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        Msg::MuteSnapshot(snapshot) => {
+            text(&snapshot.endpoint_id, 512, false)?;
+            if snapshot.generation == 0 {
+                return Err(invalid());
+            }
+        }
+        Msg::PttEvent(event) => {
+            let valid = match event.kind {
+                1 => {
+                    event.expires_at_ns > event.observed_at_ns
+                        && event.expires_at_ns - event.observed_at_ns <= MAX_PTT_GRANT_NS
+                }
+                2 => event.observed_at_ns == 0 && event.expires_at_ns > 0,
+                3 => event.observed_at_ns == 0 && event.expires_at_ns == 0,
+                _ => false,
+            };
+            if !valid {
+                return Err(invalid());
+            }
+        }
+        Msg::MediaCommand(command) => {
+            if command.token == 0
+                || command.expected_revision == 0
+                || !matches!(command.command, 1..=5)
+            {
+                return Err(invalid());
+            }
+        }
+        Msg::MediaSessions(snapshot) => {
+            if snapshot.revision == 0 || snapshot.sessions.len() > MAX_MEDIA_SESSIONS {
+                return Err(invalid());
+            }
+            for (index, session) in snapshot.sessions.iter().enumerate() {
+                text(&session.app_id, 128, true)?;
+                text(&session.title, 256, true)?;
+                text(&session.subtitle, 256, true)?;
+                if session.token == 0
+                    || session.revision == 0
+                    || !matches!(session.state, 0..=3)
+                    || session.commands & !31 != 0
+                    || snapshot.sessions[..index]
+                        .iter()
+                        .any(|other| other.token == session.token)
+                {
+                    return Err(invalid());
+                }
+            }
+            if snapshot.current_token.is_some_and(|token| {
+                token == 0
+                    || !snapshot
+                        .sessions
+                        .iter()
+                        .any(|session| session.token == token)
+            }) {
+                return Err(invalid());
+            }
+        }
+        Msg::MediaCommandResult(result) => {
+            if !matches!(result.result, 1..=5) {
+                return Err(invalid());
+            }
+        }
+        Msg::ReleaseMicMute(_) | Msg::SetMediaWatch(_) => {}
         Msg::Shutdown(_) | Msg::ProbeBackend(_) => {}
     }
     if frame.encoded_len() > protocol::Channel::Ipc.max_frame_len() {

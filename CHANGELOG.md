@@ -67,6 +67,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Require explicit per-session authorization grants of at most one second, renewed independently of IPC Ping. Expiration gates queued render PCM and outgoing media, stops only the expired session, and cannot be resurrected by a stale renewal.
 - Distinguish native `Started` acknowledgment from `PathValidated`, so the Listener can acknowledge initialization before the Source exists without deadlocking the commit handshake. Supervisor shutdown also has reserved admission during restart/backoff.
 
+**Audio M5/M6 worker contract**
+
+- Add bounded private microphone-mute/PTT and opt-in media-watch/command messages. Metadata is Debug-redacted, command completions are correlated, and lease/timestamp/hotkey validation remains fail-closed; core integration is separate.
+
 ### Русский
 
 **Исправления**
@@ -129,6 +133,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Каждый сеанс получает отдельное явное разрешение не более чем на секунду; продление не связано с IPC Ping. Истечение закрывает вывод подготовленного PCM и передачу медиа только этого сеанса; запоздалое продление не восстанавливает его.
 - Нативное подтверждение `Started` отделено от `PathValidated`: Listener подтверждает инициализацию до запуска Source, не блокируя commit. Остановка надзора имеет отдельный канал, доступный и во время перезапуска/backoff.
+
+**Контракт аудиопроцесса M5/M6**
+
+- Добавлены ограниченные закрытые сообщения микрофонного mute/PTT и явно включаемых медиаданных/команд. Метаданные скрыты в Debug, результаты команд связаны с запросами, сроки PTT и сочетания клавиш проверяются с безопасным отказом; интеграция core выполняется отдельно.
 
 ## 0.4.0 — 2026-10-30
 

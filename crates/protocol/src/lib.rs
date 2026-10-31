@@ -231,6 +231,8 @@ redacted_audio_debug!(
     audio_worker::Attach,
     audio_worker::DirectionMaterial,
     audio_worker::StartSession,
+    audio_worker::MediaInfo,
+    audio_worker::MediaSessions,
 );
 
 impl Drop for audio_worker::Attach {
