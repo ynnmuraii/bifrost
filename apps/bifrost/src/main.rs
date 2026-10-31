@@ -52,6 +52,18 @@ fn main() -> ExitCode {
             args.remove(0);
             bifrost_agent::run_agent(args)
         }
+        #[cfg(feature = "audio")]
+        Some("audio") => {
+            console::attach_parent();
+            args.remove(0);
+            bifrost_audio::run_audio(args)
+        }
+        #[cfg(not(feature = "audio"))]
+        Some("audio") => {
+            console::attach_parent();
+            eprintln!("bifrost: audio support is disabled in this build");
+            ExitCode::FAILURE
+        }
         Some(_) => {
             console::attach_parent();
             bifrost_core::run_core(args)
@@ -62,11 +74,11 @@ fn main() -> ExitCode {
 /// Moves the pre-0.4.0 application directories once, before any role reads them.
 ///
 /// Explicit slots stay untouched, except legacy default paths forwarded by a
-/// pre-0.4.0 updater. `--root`, help/version and the agent role remain inert.
+/// pre-0.4.0 updater. `--root`, help/version and the agent/audio roles remain inert.
 fn adopt_default_directories(args: &mut [String]) {
     let quiet = args
         .first()
-        .is_some_and(|arg| matches!(arg.as_str(), "--version" | "-V" | "agent"));
+        .is_some_and(|arg| matches!(arg.as_str(), "--version" | "-V" | "agent" | "audio"));
     let help = args.iter().any(|arg| arg == "--help" || arg == "-h");
     if !quiet && !help {
         config::relocate::adopt(args);

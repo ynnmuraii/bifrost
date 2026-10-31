@@ -14,8 +14,13 @@ publish = false
 name = "bifrost"
 path = "src/main.rs"
 
+[features]
+default = ["audio"]
+audio = ["dep:bifrost-audio"]
+
 [dependencies]
 bifrost-agent = { path = "../bifrost-agent" }
+bifrost-audio = { path = "../bifrost-audio", optional = true }
 bifrost-core = { path = "../bifrost-core" }
 bifrost-gui = { path = "../bifrost-gui" }
 bifrost-tray = { path = "../bifrost-tray" }

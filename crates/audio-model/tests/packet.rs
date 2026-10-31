@@ -211,6 +211,12 @@ fn exact_datagram_lengths_and_opaque_ciphertext_and_tag() {
     let mut malformed = [0; HEADER_LEN + TAG_LEN];
     malformed[..HEADER_LEN].copy_from_slice(&header().encode().unwrap());
     malformed[4] = 2;
+    // Exact size precedes header semantics under the S3 acceptance contract.
+    assert_eq!(
+        validate_datagram(&malformed),
+        Err(PacketError::InvalidDatagramLength)
+    );
+    malformed[42..44].copy_from_slice(&0u16.to_be_bytes());
     assert_eq!(
         validate_datagram(&malformed),
         Err(PacketError::UnsupportedVersion(2))

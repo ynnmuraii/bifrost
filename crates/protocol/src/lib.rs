@@ -53,6 +53,12 @@ pub mod validate;
 /// should name `bifrost::…` directly.
 #[allow(clippy::all)]
 pub mod bifrost {
+    /// Private core/audio-child contract, isolated from GUI messages.
+    pub mod audio_worker {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/bifrost.audio_worker.v1.rs"));
+        }
+    }
     /// `bifrost.v1` (`proto/protocol.proto`): the wire contract.
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/bifrost.v1.rs"));
@@ -206,5 +212,35 @@ mod metadata_roundtrip_tests {
             .unwrap()
             .system_name
             .is_empty());
+    }
+}
+
+/// Private audio-child messages (`bifrost.audio_worker.v1`).
+pub use bifrost::audio_worker::v1 as audio_worker;
+
+macro_rules! redacted_audio_debug {
+    ($($message:ty),+ $(,)?) => {$(
+        impl std::fmt::Debug for $message {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("[REDACTED audio-worker secrets]")
+            }
+        }
+    )+};
+}
+redacted_audio_debug!(
+    audio_worker::Attach,
+    audio_worker::DirectionMaterial,
+    audio_worker::StartSession,
+);
+
+impl Drop for audio_worker::Attach {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.launch_token);
+    }
+}
+impl Drop for audio_worker::DirectionMaterial {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.key);
+        zeroize::Zeroize::zeroize(&mut self.nonce_prefix);
     }
 }

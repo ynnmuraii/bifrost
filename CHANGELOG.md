@@ -24,6 +24,22 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Preserve unknown native playback states and expose the OS-selected current media-session token in the shared backend contract and Windows adapter.
 - Add bounded revisioned local audio IPC, an authoritative remote-audio popup, bilingual audio settings/device selection and tray privacy/mute/stop controls. Audio controls report unavailable until a core implements the audio handlers; this change does not activate audio capture or transport. Media metadata is transient and redacted from debug output.
 
+**Audio media internals**
+
+- Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
+- Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
+- Add an internal media-worker crate with monotonic-counter ChaCha20-Poly1305, canonical key-context vectors, bundled Opus PLC/conditional FEC and preallocated near-unity drift resampling.
+- Add explicitly started audio media sessions with bounded callback rings, UDP path authentication/reports, filtered native-rate conversion, local gain/mute ramps, a three-input soft-limited mix point and bounded worker shutdown. Dry/loopback-only tests cover loss/reorder/injection and device invalidation; core/IPC integration remains disabled.
+
+**Linux audio backend internals**
+
+- Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute, media sessions and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
+
+**Audio child IPC**
+
+- Add a separate private audio-worker protobuf/AudioLink contract with bounded commands, version/generation/sequence checks, explicit backend probing, one-use secret extraction and recursive Debug redaction. Reuse existing same-user IPC endpoints; no samples or secrets enter GUI messages.
+- Add the internal audio child role behind the default-enabled binary `audio` feature. It lazily owns native/Dry backends and at most three authorized UDP sessions, revokes media on core silence/disconnect, rejects reused session/key material, and pushes bounded actual capture/send observations. No native device is opened before an explicit command; core supervision remains a separate integration step.
+
 ### Русский
 
 **Исправления**
@@ -43,6 +59,22 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Внутренний контракт аудиобэкенда дополнен снимками часов и состояния потока, достоверностью временных меток, проверкой конфликтов горячих клавиш и возобновляемыми ограниченными по времени нажатиями PTT; нативный звук и горячие клавиши не включаются.
 - Общий контракт бэкенда и адаптер Windows сохраняют неизвестные состояния воспроизведения и предоставляют выбранный ОС текущий медиасеанс.
 - Добавлены ограниченный локальный аудио-IPC с ревизиями, плеер удалённых потоков по подтверждённому состоянию, двуязычные аудионастройки/выбор устройств и индикаторы приватности/отключение звука/остановка в трее. До реализации обработчиков в службе управление честно показывает недоступность; изменение не запускает захват или передачу аудио. Метаданные медиасеансов не сохраняются и скрыты в отладочном выводе.
+
+**Внутренний аудиотракт**
+
+- Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования. Аудиоустройства и сетевые сеансы не активируются.
+- Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
+- Добавлен внутренний аудиотракт: ChaCha20-Poly1305 с монотонным счётчиком, канонический контекст ключей, встроенный Opus с PLC/условным FEC и ресэмплинг дрейфа без выделений в рабочем цикле.
+- Добавлены явно запускаемые аудиосеансы с ограниченными кольцевыми буферами, проверкой UDP-пути и отчётами, преобразованием частоты, плавной локальной громкостью/заглушением, микшером трёх входов и ограниченным ожиданием остановки. Тесты Dry/loopback проверяют потери, перестановку, инъекции и потерю устройства; интеграция core/IPC пока не включена.
+
+**Внутренний аудиобэкенд Linux**
+
+- Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса, безопасное владение заглушением, медиасеансы и глобальный PTT явно недоступны. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
+
+**IPC дочернего аудиопроцесса**
+
+- Добавлен отдельный закрытый контракт protobuf/AudioLink аудиопроцесса с ограниченными командами, проверкой версии/поколения/последовательности, явным запросом проверки бэкенда, одноразовым извлечением секретов и скрытием их в Debug. Используются существующие локальные IPC-каналы того же пользователя; сэмплы и секреты не попадают в GUI.
+- Добавлена внутренняя роль дочернего аудиопроцесса под включённой по умолчанию функцией сборки `audio`. Бэкенды native/Dry создаются только по запросу; не более трёх разрешённых UDP-сеансов останавливаются при потере core, повторное использование сеансов/ключей отклоняется, фактические захват/отправка передаются в ограниченных сводках. До явной команды устройства не открываются; надзор core интегрируется отдельно.
 
 ## 0.4.0 — 2026-10-30
 

@@ -17,6 +17,7 @@ protocol = { path = "../protocol" }
 # only geometry, protocol, serde and toml) and one-way.
 config = { path = "../config" }
 prost = "0.14"
+zeroize = "1"
 # `net` covers Unix sockets and Windows named pipes; tokio has no separate
 # feature for them, so it also compiles TCP/UDP. The agent's "no network
 # sockets" invariant is therefore enforced by the CI symbol check described in
