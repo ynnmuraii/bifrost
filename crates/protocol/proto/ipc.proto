@@ -526,7 +526,12 @@ enum PairingOutcome {
   PAIRING_OUTCOME_REJECTED = 2;
   PAIRING_OUTCOME_FAILED = 3;
 }
-message PairingResult { PairingOutcome outcome = 1; string peer_name = 2; }
+message PairingResult {
+  PairingOutcome outcome = 1;
+  string peer_name = 2;
+  bytes ceremony_id = 3; // matches PairingPrompt.attempt_id; never clears a different prompt
+  string error_code = 4; // PAIRING_CANCELLED when superseded by a newer local dial
+}
 
 // ---------- layout editor model (gui <-> core) ----------
 // TopologyDoc is the applied layout document plus the display geometry of every

@@ -633,6 +633,8 @@ pub fn duo(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 pub enum Icon {
     /// Remote system audio.
     Audio,
+    /// Audio settings, distinct from the speaker glyph of the popup player.
+    Headphones,
     /// «Пары».
     Pairs,
     /// «Клавиши».
@@ -659,6 +661,21 @@ enum Prim {
 fn prims(icon: Icon) -> &'static [Prim] {
     use Prim::{Line, Rect as R};
     match icon {
+        Icon::Headphones => &[
+            Line(&[
+                (4.0, 14.0),
+                (4.0, 10.0),
+                (5.0, 6.5),
+                (8.0, 4.0),
+                (11.0, 3.5),
+                (14.0, 4.0),
+                (17.0, 6.5),
+                (18.0, 10.0),
+                (18.0, 14.0),
+            ]),
+            R(2.75, 11.0, 4.5, 7.0, 2.0),
+            R(14.75, 11.0, 4.5, 7.0, 2.0),
+        ],
         Icon::Audio => &[
             Line(&[
                 (3.0, 9.0),

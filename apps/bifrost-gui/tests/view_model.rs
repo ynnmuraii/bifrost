@@ -419,7 +419,10 @@ fn clipboard_images_refusal_clears_the_pending_switch() {
     assert_eq!(vm.settings.clipboard_images_pending, Some(true));
     verdict(&mut vm, id, Some("CONFIG_SAVE_FAILED"));
     assert_eq!(vm.settings.clipboard_images_pending, None);
-    assert!(vm.outcome.as_ref().is_some_and(|outcome| !outcome.ok));
+    assert!(vm
+        .outcome
+        .as_ref()
+        .is_some_and(|outcome| !outcome.is_success()));
 }
 
 #[test]
@@ -880,7 +883,9 @@ fn a_lost_service_takes_its_outcome_sentence_with_it() {
         }),
     ));
     assert!(
-        vm.outcome.as_ref().is_some_and(|outcome| outcome.ok),
+        vm.outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.is_success()),
         "the success is shown while the service is there"
     );
 
@@ -1374,7 +1379,7 @@ fn a_clipboard_refusal_is_explained_where_the_switch_is() {
         }),
     ));
     let outcome = vm.outcome.as_ref().expect("a refusal is a toast");
-    assert!(!outcome.ok);
+    assert!(!outcome.is_success());
     assert!(outcome.line(ui_text::Lang::Ru).contains("буфер"));
 }
 
@@ -1386,6 +1391,7 @@ fn a_successful_pairing_promises_what_actually_happens() {
     vm.apply(event(Msg::PairingResult(protocol::ipc::PairingResult {
         outcome: protocol::ipc::PairingOutcome::Paired as i32,
         peer_name: pairing_prompt().peer_name,
+        ..Default::default()
     })));
     vm.apply(answer(
         id,
@@ -1395,7 +1401,7 @@ fn a_successful_pairing_promises_what_actually_happens() {
         }),
     ));
     let outcome = vm.outcome.as_ref().expect("the result is shown");
-    assert!(outcome.ok);
+    assert!(outcome.is_success());
     assert_eq!(
         outcome.line(ui_text::Lang::Ru),
         "Готово: linux-box сопряжён"
@@ -1587,7 +1593,7 @@ fn conflict_reloads_and_retries_the_latest_drop_only_once() {
     assert!(vm.editor.save.wanted.is_none());
     assert!(vm.editor.save.sent.is_none());
     assert_eq!(vm.editor.placement, vm.editor.baseline);
-    assert!(!vm.outcome.as_ref().expect("conflict toast").ok);
+    assert!(!vm.outcome.as_ref().expect("conflict toast").is_success());
 }
 
 #[test]
@@ -1630,7 +1636,7 @@ fn invalid_drops_roll_back_without_sending_or_losing_an_accepted_drop() {
     verdict(&mut vm, id, Some("BAD_REQUEST"));
     assert_eq!(vm.editor.placement, baseline);
     assert!(vm.editor.save.wanted.is_none());
-    assert!(!vm.outcome.as_ref().expect("refusal toast").ok);
+    assert!(!vm.outcome.as_ref().expect("refusal toast").is_success());
 }
 
 #[test]
@@ -1880,6 +1886,7 @@ fn a_pair_is_made_through_the_code_and_stays_on_screen_until_done() {
     vm.apply(event(Msg::PairingResult(protocol::ipc::PairingResult {
         outcome: protocol::ipc::PairingOutcome::Paired as i32,
         peer_name: pairing_prompt().peer_name,
+        ..Default::default()
     })));
     vm.apply(answer(
         id,
@@ -2129,7 +2136,7 @@ fn the_address_button_writes_the_file_and_says_so() {
         .applied
         .as_ref()
         .expect("«Применить» answers in words");
-    assert!(applied.ok, "{}", applied.line(ui_text::Lang::Ru));
+    assert!(applied.is_success(), "{}", applied.line(ui_text::Lang::Ru));
     assert_eq!(applied.text, "Адрес сохранён");
     // What the screen shows is what the file now names, and the pick is spent.
     assert_eq!(vm.config.listen_address, "192.168.1.10");
@@ -2156,7 +2163,7 @@ fn an_address_that_cannot_be_written_is_said_in_words() {
         .applied
         .as_ref()
         .expect("a failure is a sentence, never a silence");
-    assert!(!applied.ok, "{}", applied.line(ui_text::Lang::Ru));
+    assert!(!applied.is_success(), "{}", applied.line(ui_text::Lang::Ru));
     assert!(
         applied.text.starts_with("адрес не сохранён ("),
         "the sentence carries the reason: {}",
@@ -2244,7 +2251,7 @@ fn a_shutdown_timeout_only_falls_back_to_this_windows_pid() {
             .service
             .line
             .as_ref()
-            .is_some_and(|line| !line.ok),
+            .is_some_and(|line| !line.is_success()),
         "failure is shown when no graceful shutdown answer arrives"
     );
 
@@ -2275,7 +2282,7 @@ fn an_unsent_shutdown_request_releases_the_stop_controls() {
         .service
         .line
         .as_ref()
-        .is_some_and(|line| !line.ok));
+        .is_some_and(|line| !line.is_success()));
 }
 
 // ---------------------------------------------------------------- the service
@@ -2312,7 +2319,7 @@ fn a_failed_core_stop_reports_the_short_reason_in_both_languages() {
             .line
             .as_ref()
             .expect("the failure reason");
-        assert!(!line.ok);
+        assert!(!line.is_success());
         assert_eq!(line.text, expected);
         assert_eq!(vm.settings.service.restart, None);
     }

@@ -397,6 +397,7 @@ pub enum Key {
     TheServiceSentAnEmptyFrame,
     /// «Сопряжение: партнёр {} предлагает сверить код»
     PairingOffersACodeToCompare,
+    PairingCancelled,
     /// «без имени»
     WithoutAName,
     /// «Служба прислала неожиданный кадр ({})»
@@ -1293,6 +1294,7 @@ const fn ru(key: Key) -> &'static str {
         Key::TheSettingsWereCreatedAutomaticallyConfigToml => "Настройки созданы автоматически (config.toml)",
         Key::TheServiceSentAnEmptyFrame => "Служба прислала пустой кадр",
         Key::PairingOffersACodeToCompare => "Сопряжение: партнёр {} предлагает сверить код",
+        Key::PairingCancelled => "Сопряжение отменено: начата новая попытка. Старый код больше не действует.",
         Key::WithoutAName => "без имени",
         Key::TheServiceSentAnUnexpectedFrame => "Служба прислала неожиданный кадр ({})",
         Key::LayoutRevisionFrom => "Раскладка: ревизия {} от {}",
@@ -1895,6 +1897,7 @@ const fn en(key: Key) -> &'static str {
         Key::TheSettingsWereCreatedAutomaticallyConfigToml => "The settings were created automatically (config.toml)",
         Key::TheServiceSentAnEmptyFrame => "The service sent an empty frame",
         Key::PairingOffersACodeToCompare => "Pairing: {} offers a code to compare",
+        Key::PairingCancelled => "Pairing cancelled: a newer attempt started. The old code is no longer valid.",
         Key::WithoutAName => "without a name",
         Key::TheServiceSentAnUnexpectedFrame => "The service sent an unexpected frame ({})",
         Key::LayoutRevisionFrom => "Layout: revision {} from {}",
@@ -2450,7 +2453,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 544] = [
+    pub const EVERY: [Key; 545] = [
         Key::AudioHide,
         Key::AudioPlayer,
         Key::AudioSettings,
@@ -2673,6 +2676,7 @@ mod tests {
         Key::TheSettingsWereCreatedAutomaticallyConfigToml,
         Key::TheServiceSentAnEmptyFrame,
         Key::PairingOffersACodeToCompare,
+        Key::PairingCancelled,
         Key::WithoutAName,
         Key::TheServiceSentAnUnexpectedFrame,
         Key::LayoutRevisionFrom,

@@ -209,11 +209,22 @@ async fn window_on_running_core(paths: &Paths) -> Result<Option<Result<(), Failu
     print!("codes match? [y/N] ");
     std::io::stdout().flush().ok();
 
-    let approved = ask().await?;
     let Some(ceremony) = fields.get("ceremony") else {
         return Err(Failure::Run(
             "the core did not name the ceremony id".to_owned(),
         ));
+    };
+    let input = ask();
+    tokio::pin!(input);
+    let approved = loop {
+        tokio::select! {
+            biased;
+            answer = &mut input => break answer?,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                ask_core(&endpoint, &format!("pair-state {ceremony}"), Duration::from_secs(5))
+                    .await.map_err(Failure::Run)?;
+            }
+        }
     };
     let answer = format!(
         "pair-answer {ceremony} {}",
@@ -271,7 +282,7 @@ impl Fields {
 
 /// Shows the SAS, asks, and commits only a mutual approval.
 async fn confirm(
-    driver: PairingDriver,
+    mut driver: PairingDriver,
     trust: &mut TrustStore,
     trust_path: &Path,
     opener: bool,
@@ -287,18 +298,29 @@ async fn confirm(
     std::io::stdout().flush().ok();
 
     let address = peer_address(opener, driver.address(), driver.peer_listen_port());
-    let approved = ask().await?;
-    if !approved {
-        driver
-            .reject()
-            .await
-            .map_err(|error| Failure::Run(error.to_string()))?;
-        println!("rejected; nothing was written");
-        return Ok(());
-    }
-    let paired: PairedPeer = driver
-        .approve()
-        .await
+    let (answer, decision) = tokio::sync::oneshot::channel();
+    let input = async {
+        let approved = ask().await?;
+        let _ = answer.send(approved);
+        Ok::<bool, Failure>(approved)
+    };
+    let ceremony = tokio::time::timeout(WINDOW, driver.decide(decision));
+    tokio::pin!(ceremony);
+    let result = tokio::select! {
+        biased;
+        approved = input => {
+            let approved = approved?;
+            let result = ceremony.await;
+            if !approved {
+                println!("rejected; nothing was written");
+                return Ok(());
+            }
+            result
+        }
+        result = &mut ceremony => result,
+    };
+    let paired: PairedPeer = result
+        .map_err(|_| Failure::Run("pairing timed out".to_owned()))?
         .map_err(|error| Failure::Run(error.to_string()))?;
     let record = paired.trusted_peer(identity::now_unix_ms(), address);
     let node_id = record.node_id;
@@ -350,16 +372,22 @@ pub(crate) fn peer_address(
 
 /// Reads one y/n answer from stdin without blocking the runtime.
 async fn ask() -> Result<bool, Failure> {
-    tokio::task::spawn_blocking(|| {
-        let mut answer = String::new();
-        match std::io::stdin().read_line(&mut answer) {
-            Ok(0) => false,
-            Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-            Err(_) => false,
-        }
-    })
-    .await
-    .map_err(|error| Failure::Run(format!("cannot read the answer: {error}")))
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("pairing-answer".to_owned())
+        .spawn(move || {
+            let mut answer = String::new();
+            let approved = match std::io::stdin().read_line(&mut answer) {
+                Ok(0) => false,
+                Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+                Err(_) => false,
+            };
+            let _ = sender.send(approved);
+        })
+        .map_err(|error| Failure::Run(format!("cannot read the answer: {error}")))?;
+    receiver
+        .await
+        .map_err(|error| Failure::Run(format!("cannot read the answer: {error}")))
 }
 
 #[cfg(test)]

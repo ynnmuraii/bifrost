@@ -148,6 +148,8 @@ pub enum Request {
     PairOpen(Option<u32>),
     /// `pair-prompt`: wait for the next ceremony's six digits.
     PairPrompt,
+    /// `pair-state <ceremony-hex>`: whether that exact SAS prompt is still answerable.
+    PairState(String),
     /// `pair-answer <attempt-hex> approve|reject`: the user's decision.
     PairAnswer {
         /// The `attempt_id` the prompt named, as 32 hex characters.
@@ -248,6 +250,7 @@ impl Request {
             },
             "pair-prompt" if argument.is_empty() => Ok(Request::PairPrompt),
             "pair-prompt" => Err("pair-prompt takes no argument".to_owned()),
+            "pair-state" if !argument.is_empty() => Ok(Request::PairState(argument.to_owned())),
             "pair-answer" => match argument.split_once(char::is_whitespace) {
                 Some((attempt, answer)) => match answer.trim() {
                     "approve" | "yes" | "y" => Ok(Request::PairAnswer {

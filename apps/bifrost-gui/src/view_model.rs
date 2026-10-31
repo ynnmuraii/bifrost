@@ -365,12 +365,19 @@ pub struct StartedCore {
     pub pid: Option<u32>,
 }
 
+/// Presentation and semantics of a completed operation or informational notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeKind {
+    Success,
+    Failure,
+    Info,
+}
+
 /// A finished operation, as the window shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// `true` for «Готово», `false` for «Не получилось».
-    pub ok: bool,
-    /// The sentence, already in Russian.
+    pub kind: OutcomeKind,
+    /// The already-localized sentence.
     pub text: String,
 }
 
@@ -378,7 +385,7 @@ impl Outcome {
     /// A success.
     pub fn done(text: impl Into<String>) -> Self {
         Outcome {
-            ok: true,
+            kind: OutcomeKind::Success,
             text: text.into(),
         }
     }
@@ -386,17 +393,29 @@ impl Outcome {
     /// A failure.
     pub fn failed(text: impl Into<String>) -> Self {
         Outcome {
-            ok: false,
+            kind: OutcomeKind::Failure,
             text: text.into(),
         }
     }
 
+    /// An informational notice: neither an error nor a successful operation.
+    pub fn info(text: impl Into<String>) -> Self {
+        Outcome {
+            kind: OutcomeKind::Info,
+            text: text.into(),
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.kind == OutcomeKind::Success
+    }
+
     /// The line as the screens draw it.
     pub fn line(&self, lang: Lang) -> String {
-        if self.ok {
-            fill(lang, Key::Done, &[&self.text])
-        } else {
-            fill(lang, Key::Failed, &[&self.text])
+        match self.kind {
+            OutcomeKind::Success => fill(lang, Key::Done, &[&self.text]),
+            OutcomeKind::Failure => fill(lang, Key::Failed, &[&self.text]),
+            OutcomeKind::Info => self.text.clone(),
         }
     }
 }
@@ -701,6 +720,8 @@ pub struct Pairing {
     pub window: Option<ipc::PairingWindow>,
     /// The six-digit confirmation of ADR-010, waiting for an answer.
     pub prompt: Option<ipc::PairingPrompt>,
+    /// Visible SAS identity, retained after its answer ACK removes the prompt.
+    pub ceremony_id: Option<[u8; 16]>,
     /// The address field of «Подключиться по адресу».
     pub address: String,
     /// `true` once «Подробнее» was opened (ADR-010: the full fingerprints live there).
@@ -1108,6 +1129,7 @@ impl ViewModel {
         // its own timeout, and pretending it is still counting down would be a lie.
         self.pairing.window = None;
         self.pairing.prompt = None;
+        self.pairing.ceremony_id = None;
         self.pairing.window_deadline = None;
         self.pairing.dialing = false;
         self.pairing.paired = None;
@@ -1400,7 +1422,7 @@ impl ViewModel {
                         .lan
                         .applied
                         .as_ref()
-                        .is_some_and(|applied| applied.ok)
+                        .is_some_and(Outcome::is_success)
                     {
                         self.settings.lan.applied =
                             Some(Outcome::done("Адрес сохранён, служба перезапущена"));
@@ -1453,6 +1475,15 @@ impl ViewModel {
             self.connection = Connection::Connected;
         }
         self.silent = false;
+        // A terminal event for an older ceremony cannot retire a newer request or prompt.
+        if let Msg::PairingResult(result) = &msg {
+            if !result.ceremony_id.is_empty()
+                && self.pairing.ceremony_id.as_ref().map(|id| id.as_slice())
+                    != Some(result.ceremony_id.as_slice())
+            {
+                return;
+            }
+        }
         // The read half of the contract answers with the state itself (`Status`,
         // `TopologyDoc`) and still carries the `request_id` it answers, so
         // those requests are retired here; the write half answers with an `OpResult`, which
@@ -1480,6 +1511,10 @@ impl ViewModel {
                         .unwrap_or_else(|| text(lang, Key::ComputerTitle));
                     let line = fill_named(lang, Key::NameIsPaired, &[("name", &name)]);
                     self.set_outcome(Outcome::done(line));
+                } else if result.error_code == "PAIRING_CANCELLED" {
+                    self.set_outcome(Outcome::info(text(lang, Key::PairingCancelled)));
+                } else if !result.error_code.is_empty() {
+                    self.set_outcome(Outcome::failed(code_label(lang, &result.error_code)));
                 }
             }
             Msg::IncomingPairingRequest(prompt) => {
@@ -1494,6 +1529,11 @@ impl ViewModel {
                 self.outgoing_pair_request = Some(request);
             }
             Msg::PairingPrompt(prompt) => {
+                let ceremony_id = prompt.attempt_id.as_slice().try_into().ok();
+                if self.pairing.ceremony_id.is_some() && self.pairing.ceremony_id != ceremony_id {
+                    self.reset_pairing_flow();
+                }
+                self.pairing.ceremony_id = ceremony_id;
                 self.push_log(fill(
                     lang,
                     Key::PairingOffersACodeToCompare,
@@ -1799,6 +1839,19 @@ impl ViewModel {
         }
     }
 
+    /// Starting a new dial/request supersedes pending answers belonging to its predecessor.
+    fn reset_pairing_flow(&mut self) {
+        self.finish_pairing(false);
+        self.pairing.ceremony_id = None;
+        self.pairing.details = false;
+        self.inflight.retain(|request| {
+            !matches!(
+                request.request,
+                Request::PairWith | Request::PairingAnswer | Request::PairingRequest
+            )
+        });
+    }
+
     /// A ceremony ended: the code and the dialling state are over, and a success stays on
     /// screen until «Готово».
     fn finish_pairing(&mut self, paired: bool) {
@@ -1947,7 +2000,11 @@ impl ViewModel {
         if matches!(request, Request::PairWith | Request::PairingAnswer) {
             self.finish_pairing(false);
         }
-        self.set_outcome(Outcome::failed(failure));
+        self.set_outcome(if code == "PAIRING_CANCELLED" {
+            Outcome::info(failure)
+        } else {
+            Outcome::failed(failure)
+        });
     }
 
     /// Shows `outcome` as the toast; its timer starts when it is first drawn.
@@ -2618,14 +2675,22 @@ impl ViewModel {
             Action::ShowDiscovered(node_id) => {
                 self.look.hidden_discovered.remove(node_id);
             }
-            Action::DonePairing => self.pairing.paired = None,
+            Action::DonePairing => {
+                self.pairing.paired = None;
+                self.pairing.ceremony_id = None;
+            }
             Action::RequestPairing(_) => {
+                self.reset_pairing_flow();
                 self.modal = None;
                 self.appearance_open = false;
                 self.look.dock_open = true;
                 self.pairing.paired = None;
             }
+            Action::AnswerPairingRequest { accept: true, .. } => {
+                self.reset_pairing_flow();
+            }
             Action::PairWith(address) => {
+                self.reset_pairing_flow();
                 self.modal = None;
                 self.appearance_open = false;
                 self.look.dock_open = true;
@@ -3261,7 +3326,7 @@ impl Bridge {
                     .lan
                     .applied
                     .as_ref()
-                    .is_some_and(|applied| applied.ok) =>
+                    .is_some_and(Outcome::is_success) =>
             {
                 self.restart_core(now);
             }
@@ -4272,6 +4337,7 @@ fn code_label(lang: Lang, code: &str) -> String {
         "CLIPBOARD_DISABLED" => text(lang, Key::TheClipboardDidNotTurnOn).to_owned(),
         "EXPORT_FAILED" => text(lang, Key::CouldNotWriteTheDiagnosticsFile).to_owned(),
         "PAIRING_FAILED" => text(lang, Key::ThePairingCouldNotBeAgreed).to_owned(),
+        "PAIRING_CANCELLED" => text(lang, Key::PairingCancelled).to_owned(),
         "PAIRING_GONE" => text(lang, Key::ThePairingWindowIsAlreadyClosed).to_owned(),
         "PAIRING_WINDOW_OPEN" => text(lang, Key::ThePairingWindowIsAlreadyOpen).to_owned(),
         "NO_WINDOW" => text(lang, Key::ThePairingWindowIsNotOpen).to_owned(),
@@ -4413,7 +4479,14 @@ mod restart_tests {
             "timeout never launches a duplicate"
         );
         assert!(bridge.view.settings.service.restart.is_none());
-        assert!(!bridge.view.settings.service.line.as_ref().unwrap().ok);
+        assert!(!bridge
+            .view
+            .settings
+            .service
+            .line
+            .as_ref()
+            .unwrap()
+            .is_success());
     }
 
     #[tokio::test]

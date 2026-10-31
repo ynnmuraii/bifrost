@@ -101,6 +101,66 @@ async fn accept_input_once(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn overlapping_dials_cancel_on_either_endpoint_and_newest_can_pair() {
+    for cancel_opener in [false, true] {
+        let root = temp_dir("overlapping");
+        let a = identity_at(&root, "node-a");
+        let b = identity_at(&root, "node-b");
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut window = open_window(0).unwrap();
+        let (first_opener, first_dialer) = tokio::join!(
+            accept_one(&listener, &a, &mut window, 0, 47901, "WORKSTATION"),
+            dial(address, &b, DIAL_TIMEOUT, 47901, "LAPTOP"),
+        );
+        let mut first_opener = first_opener.unwrap();
+        let mut first_dialer = first_dialer.unwrap();
+        let (second_opener, second_dialer) = tokio::join!(
+            accept_one(&listener, &a, &mut window, 1, 47901, "WORKSTATION"),
+            dial(address, &b, DIAL_TIMEOUT, 47901, "LAPTOP"),
+        );
+        let mut second_opener = second_opener.unwrap();
+        let mut second_dialer = second_dialer.unwrap();
+        let (opener_answer, opener_decision) = tokio::sync::oneshot::channel();
+        let (dialer_answer, dialer_decision) = tokio::sync::oneshot::channel();
+        let (cancel, stale_answer) = if cancel_opener {
+            (opener_answer, dialer_answer)
+        } else {
+            (dialer_answer, opener_answer)
+        };
+        cancel.send(false).unwrap();
+        // The opposite endpoint has not answered: rejection must still arrive immediately.
+        let (opener, dialer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                first_opener.decide(opener_decision),
+                first_dialer.decide(dialer_decision),
+            )
+        })
+        .await
+        .expect("cancellation does not wait for stale user input");
+        assert!(matches!(opener, Err(identity::PairError::Rejected(_))));
+        assert!(matches!(dialer, Err(identity::PairError::Rejected(_))));
+        // An answer held by the old prompt can no longer enter either ceremony.
+        assert!(stale_answer.send(true).is_err());
+        let (opener_answer, opener_decision) = tokio::sync::oneshot::channel();
+        let (dialer_answer, dialer_decision) = tokio::sync::oneshot::channel();
+        opener_answer.send(true).unwrap();
+        dialer_answer.send(true).unwrap();
+        let (opener, dialer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                second_opener.decide(opener_decision),
+                second_dialer.decide(dialer_decision),
+            )
+        })
+        .await
+        .expect("the newest ceremony completes");
+        assert_eq!(opener.unwrap().node_id, b.node_id());
+        assert_eq!(dialer.unwrap().node_id, a.node_id());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_loopback_pairing_commits_on_both_sides_with_one_code() {
     let root = temp_dir("pair");
     let a = Arc::new(identity_at(&root, "node-a"));

@@ -54,6 +54,26 @@ fn opener_at_comparing() -> PairingFsm {
 }
 
 #[test]
+fn local_approval_can_be_cancelled_before_the_peer_confirms() {
+    let mut fsm = opener_at_comparing();
+    fsm.handle(PairingInput::LocalDecision { approved: true });
+    assert_eq!(fsm.state(), PairingState::LocalApproved);
+    let outputs = fsm.handle(PairingInput::LocalDecision { approved: false });
+    assert_eq!(fsm.state(), PairingState::Rejected);
+    assert!(outputs.contains(&PairingOutput::SendDecision {
+        approved: false,
+        peer_node_id: remote(),
+    }));
+    assert!(fsm
+        .handle(PairingInput::RemoteDecision {
+            approved: true,
+            peer_node_id: local(),
+        })
+        .is_empty());
+    assert_eq!(fsm.state(), PairingState::Rejected);
+}
+
+#[test]
 fn the_window_opener_listens_and_sends_hello_first() {
     let mut fsm = opener();
     assert_eq!(fsm.state(), PairingState::Off);

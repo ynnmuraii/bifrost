@@ -134,6 +134,9 @@ struct Ceremony {
     /// When the unanswered code stops being a code anybody may confirm, on the loop's
     /// millisecond scale: the ceremony deadline, [`DECISION_TIMEOUT`] after the prompt.
     prompt_deadline_ms: u64,
+    cancel: Option<oneshot::Sender<()>>,
+    superseded: bool,
+    window_attempt: Option<AttemptId>,
 }
 
 /// Everything the loop knows about pairing.
@@ -145,7 +148,7 @@ pub struct Pairing {
     /// [`CeremonyId`] — unique per connection, not the window's shared `attempt_id`.
     ceremonies: HashMap<CeremonyId, Ceremony>,
     /// A dial that has not produced a prompt yet (`PairWith`).
-    dial: Option<oneshot::Sender<Verdict>>,
+    dial: Option<(CeremonyId, oneshot::Sender<Verdict>)>,
     /// Who is waiting for the next prompt (the control channel's `pair-prompt`).
     waiting: Vec<oneshot::Sender<Prompt>>,
     /// The next ceremony's counter half, so two ceremonies opened in the same millisecond can
@@ -185,6 +188,14 @@ impl Pairing {
             .filter(|ceremony| ceremony.answer.is_some() && now_ms < ceremony.prompt_deadline_ms)
             .filter_map(|ceremony| ceremony.prompt.as_ref())
             .min_by_key(|prompt| prompt.ceremony_id)
+    }
+
+    pub fn is_pending(&self, id: &CeremonyId, now_ms: u64) -> bool {
+        self.ceremonies.get(id).is_some_and(|ceremony| {
+            !ceremony.superseded
+                && ceremony.answer.is_some()
+                && now_ms < ceremony.prompt_deadline_ms
+        })
     }
 
     /// Opens the window: a fresh `attempt_id`, the gate opened, the address to type.
@@ -278,20 +289,32 @@ impl Pairing {
 
     /// One ceremony is over: the window counts the attempt, and a spent window closes
     /// (`identity::PairingWindow::finish` — «3 попытки на 120 s»).
-    pub fn finish(&self, now_ms: u64) {
-        self.gate.finish(now_ms);
+    pub fn finish(&self, now_ms: u64, attempt_id: AttemptId) {
+        self.gate.finish(now_ms, attempt_id);
     }
 
-    /// Registers a ceremony the loop will follow, and hands back its unique key and the answer
-    /// channel.
+    /// Registers the newest ceremony and cancels every older pending one.
     ///
-    /// Both sides call this once per connection: the opener when the listener hands it a
-    /// [`transport::PairingConnection`], the dialer before it dials. The key is generated here,
-    /// so the window's shared protocol `attempt_id` never keys two ceremonies together
-    /// (`docs/05-protocol.md` «не более 3 ожидающих peers» admits concurrent dialers).
-    pub fn begin(&mut self) -> (CeremonyId, oneshot::Receiver<bool>) {
+    /// The per-connection key fences queued prompts, outcomes and user answers; the
+    /// admitted window id is kept separately for handshake-budget accounting.
+    pub fn begin(&mut self) -> (CeremonyId, oneshot::Receiver<bool>, oneshot::Receiver<()>) {
+        for ceremony in self.ceremonies.values_mut() {
+            ceremony.superseded = true;
+            ceremony.prompt = None;
+            ceremony.answer = None;
+            if let Some(cancel) = ceremony.cancel.take() {
+                let _ = cancel.send(());
+            }
+            if let Some(reply) = ceremony.reply.take() {
+                let _ = reply.send(Err((
+                    "PAIRING_CANCELLED".to_owned(),
+                    "a newer pairing attempt replaced this ceremony".to_owned(),
+                )));
+            }
+        }
         let ceremony_id = self.next_ceremony_id();
         let (answer, receiver) = oneshot::channel();
+        let (cancel, cancelled) = oneshot::channel();
         self.ceremonies.insert(
             ceremony_id,
             Ceremony {
@@ -300,9 +323,19 @@ impl Pairing {
                 address: None,
                 prompt: None,
                 prompt_deadline_ms: u64::MAX,
+                cancel: Some(cancel),
+                superseded: false,
+                window_attempt: None,
             },
         );
-        (ceremony_id, receiver)
+        (ceremony_id, receiver, cancelled)
+    }
+
+    /// Binds only accepted ceremonies to their admitted window's accounting.
+    pub fn accepted(&mut self, ceremony_id: CeremonyId, attempt_id: AttemptId) {
+        if let Some(ceremony) = self.ceremonies.get_mut(&ceremony_id) {
+            ceremony.window_attempt = Some(attempt_id);
+        }
     }
 
     /// A [`CeremonyId`] no live ceremony holds: a monotonic counter plus a random tail, so it
@@ -333,6 +366,12 @@ impl Pairing {
                 "no ceremony is waiting for an answer with that ceremony id".to_owned(),
             ));
         };
+        if ceremony.superseded {
+            return Err((
+                "PAIRING_CANCELLED".to_owned(),
+                "a newer pairing attempt replaced this ceremony".to_owned(),
+            ));
+        }
         let Some(answer) = ceremony.answer.take() else {
             return Err((
                 "ALREADY_ANSWERED".to_owned(),
@@ -367,12 +406,12 @@ impl Pairing {
     }
 
     /// A dial has started: the reply waits for the driver (or the failure).
-    pub fn dial_started(&mut self) -> oneshot::Receiver<Verdict> {
+    pub fn dial_started(&mut self, ceremony_id: CeremonyId) -> oneshot::Receiver<Verdict> {
         let (sender, receiver) = oneshot::channel();
-        if let Some(previous) = self.dial.replace(sender) {
+        if let Some((_, previous)) = self.dial.replace((ceremony_id, sender)) {
             let _ = previous.send(Err((
-                "PAIRING_BUSY".to_owned(),
-                "another dial was already in flight".to_owned(),
+                "PAIRING_CANCELLED".to_owned(),
+                "a newer pairing attempt replaced this dial".to_owned(),
             )));
         }
         receiver
@@ -383,7 +422,7 @@ impl Pairing {
     /// with it.
     pub fn dial_failed(&mut self, ceremony_id: &CeremonyId, code: &str, detail: String) {
         self.ceremonies.remove(ceremony_id);
-        if let Some(dial) = self.dial.take() {
+        if let Some((_, dial)) = self.dial.take_if(|(id, _)| id == ceremony_id) {
             let _ = dial.send(Err((code.to_owned(), detail)));
         }
     }
@@ -406,7 +445,11 @@ impl Pairing {
             }
             Event::Prompt(prompt) => {
                 let prompt = *prompt;
-                if let Some(ceremony) = self.ceremonies.get_mut(&prompt.ceremony_id) {
+                let ceremony = self.ceremonies.get_mut(&prompt.ceremony_id)?;
+                if ceremony.superseded {
+                    return None;
+                }
+                {
                     ceremony.address = prompt.address.clone();
                     ceremony.prompt = Some(prompt.clone());
                     ceremony.prompt_deadline_ms = now_ms.saturating_add(
@@ -417,7 +460,7 @@ impl Pairing {
                 for waiter in std::mem::take(&mut self.waiting) {
                     let _ = waiter.send(prompt.clone());
                 }
-                if let Some(dial) = self.dial.take() {
+                if let Some((_, dial)) = self.dial.take_if(|(id, _)| *id == prompt.ceremony_id) {
                     let _ = dial.send(Ok(()));
                 }
                 Some(PublishedEvent::Prompt(prompt))
@@ -426,28 +469,47 @@ impl Pairing {
                 ceremony_id,
                 outcome,
             } => {
-                let ceremony = self.ceremonies.remove(&ceremony_id);
+                let ceremony = self.ceremonies.remove(&ceremony_id)?;
+                let cancelled = ceremony.superseded
+                    || ceremony.window_attempt.is_some_and(|attempt| {
+                        self.window
+                            .as_ref()
+                            .is_none_or(|window| window.attempt_id != attempt)
+                    });
+                let outcome = if cancelled {
+                    Outcome::Rejected
+                } else {
+                    outcome
+                };
                 // The window counts this ceremony whichever way it ended (`pending -= 1`,
                 // `attempts += 1`), and `PairingGate::finish` closes it once the three
                 // handshakes are spent. A successful pairing closes it at once
                 // (`docs/05-protocol.md`: «Коммит: ... paired-канал закрывается»).
-                self.finish(now_ms);
+                if let Some(attempt_id) = ceremony.window_attempt {
+                    self.finish(now_ms, attempt_id);
+                }
                 let paired = matches!(outcome, Outcome::Paired(_));
-                let window_closed = if paired || self.gate.window(now_ms).is_none() {
+                let window_closed = if !cancelled && (paired || self.gate.window(now_ms).is_none())
+                {
                     self.close()
                 } else {
                     None
                 };
                 let status = match &outcome {
+                    _ if cancelled => {
+                        "pairing cancelled: this attempt is no longer active".to_owned()
+                    }
                     Outcome::Paired(peer) => format!("paired with {}", peer.display_name),
                     Outcome::Rejected => "pairing rejected".to_owned(),
                     Outcome::Failed(detail) => format!("pairing failed: {detail}"),
                 };
-                let address = ceremony.as_ref().and_then(|c| c.address.clone());
+                let address = ceremony.address;
                 // Who waits for the verdict, if anybody: the caller resolves it *after* it
                 // made the outcome durable (see the method's own comment).
-                let reply = ceremony.and_then(|ceremony| ceremony.reply);
+                let reply = ceremony.reply;
                 Some(PublishedEvent::Finished {
+                    ceremony_id,
+                    cancelled,
                     outcome,
                     window_closed,
                     address,
@@ -466,6 +528,8 @@ pub enum PublishedEvent {
     /// A ceremony ended: push the closed window (when it was this node's), report the
     /// outcome in the status line, and let the loop persist a fresh `TrustedPeer`.
     Finished {
+        ceremony_id: CeremonyId,
+        cancelled: bool,
         /// How it ended.
         outcome: Outcome,
         /// The window that just closed, if this node opened it.
@@ -499,9 +563,10 @@ pub fn peer_address(opener: bool, observed: Option<&str>, listen_port: u16) -> O
 /// The task owns the driver, so a peer that stalls delays one ceremony and nothing else:
 /// not the loop, and not the other candidates the window may admit.
 pub async fn run(
-    driver: PairingDriver,
+    mut driver: PairingDriver,
     ceremony_id: CeremonyId,
     answer: oneshot::Receiver<bool>,
+    mut cancelled: oneshot::Receiver<()>,
     opener: bool,
     local_fingerprint: String,
     events: mpsc::Sender<Event>,
@@ -518,20 +583,19 @@ pub async fn run(
     if events.send(Event::Prompt(Box::new(prompt))).await.is_err() {
         return;
     }
-    // A window that closes, or a GUI that goes away without answering, means "no": the
-    // ceremony must not hold a TLS connection open for its own sake.
-    let approve = answer.await.unwrap_or(false);
-    let outcome = if approve {
-        match tokio::time::timeout(DECISION_TIMEOUT, driver.approve()).await {
-            Ok(Ok(peer)) => Outcome::Paired(Box::new(peer)),
-            Ok(Err(error)) => Outcome::Failed(error.to_string()),
-            Err(_) => Outcome::Failed("the other computer did not confirm in time".to_owned()),
+    let outcome = tokio::select! {
+        biased;
+        _ = &mut cancelled => {
+            let _ = tokio::time::timeout(DECISION_TIMEOUT, driver.reject()).await;
+            Outcome::Rejected
         }
-    } else {
-        match tokio::time::timeout(DECISION_TIMEOUT, driver.reject()).await {
-            Ok(Ok(())) => Outcome::Rejected,
-            Ok(Err(error)) => Outcome::Failed(error.to_string()),
-            Err(_) => Outcome::Failed("the other computer did not answer in time".to_owned()),
+        result = tokio::time::timeout(DECISION_TIMEOUT, driver.decide(answer)) => {
+            match result {
+                Ok(Ok(peer)) => Outcome::Paired(Box::new(peer)),
+                Ok(Err(identity::PairError::Rejected(_))) => Outcome::Rejected,
+                Ok(Err(error)) => Outcome::Failed(error.to_string()),
+                Err(_) => Outcome::Failed("the other computer did not confirm in time".to_owned()),
+            }
         }
     };
     let _ = events
@@ -554,43 +618,97 @@ mod tests {
         pairing
     }
 
-    /// R4: a second concurrent dialer of the same window must not clobber the first.
-    ///
-    /// The window's protocol `attempt_id` is shared by every connection it admits, so keying
-    /// ceremonies by it made `Pairing::begin` overwrite the first ceremony's answer channel.
-    /// Each connection now has its own [`CeremonyId`].
     #[test]
-    fn two_ceremonies_in_one_window_do_not_clobber_each_other() {
+    fn newest_dial_cancels_first_and_fences_queued_events() {
         let mut pairing = open_pairing();
-        let (first, _answer_first) = pairing.begin();
-        let (second, _answer_second) = pairing.begin();
-        assert_ne!(first, second, "every connection gets its own ceremony id");
-        assert_eq!(pairing.ceremonies.len(), 2, "both ceremonies are tracked");
-
-        // Answering the first leaves the second untouched.
-        let _first_reply = pairing
-            .answer(&first, true)
-            .expect("the first ceremony is answerable");
-        assert!(
-            pairing.ceremonies.contains_key(&second),
-            "answering one ceremony must not drop the other"
+        let (first, _answer_first, mut cancelled) = pairing.begin();
+        let mut first_dial = pairing.dial_started(first);
+        let (second, _answer_second, _cancelled) = pairing.begin();
+        let mut second_dial = pairing.dial_started(second);
+        assert_ne!(first, second);
+        assert_eq!(cancelled.try_recv(), Ok(()));
+        assert_eq!(
+            first_dial.try_recv().unwrap().unwrap_err().0,
+            "PAIRING_CANCELLED"
         );
-
+        assert_eq!(
+            pairing.answer(&first, true).unwrap_err().0,
+            "PAIRING_CANCELLED"
+        );
+        assert!(pairing
+            .on_event(super::expiry_tests::prompt(first), 1)
+            .is_none());
         pairing.on_event(
-            Event::Finished {
-                ceremony_id: second,
-                outcome: Outcome::Rejected,
+            Event::DialFailed {
+                ceremony_id: first,
+                code: "OLD_FAILURE".into(),
+                detail: String::new(),
             },
             1,
         );
-        assert!(pairing.ceremonies.contains_key(&first));
+        assert!(matches!(
+            second_dial.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            pairing.on_event(super::expiry_tests::prompt(second), 2),
+            Some(PublishedEvent::Prompt(_))
+        ));
+        assert!(second_dial.try_recv().unwrap().is_ok());
+        assert_eq!(pairing.pending_prompt(3).unwrap().ceremony_id, second);
+        assert!(pairing.answer(&second, true).is_ok());
+    }
+
+    #[test]
+    fn stale_success_never_commits_or_closes_the_newest_window() {
+        let mut pairing = open_pairing();
+        let (first, _answer, _cancelled) = pairing.begin();
+        let (second, _answer, _cancelled) = pairing.begin();
+        let peer = PairedPeer {
+            node_id: geometry::NodeId::new([9; 32]),
+            display_name: "LAPTOP".to_owned(),
+            sas: identity::SasCode::from_exporter_bytes([0; identity::sas::EXPORTER_BYTES]),
+            fingerprint: String::new(),
+        };
+        assert!(matches!(
+            pairing.on_event(
+                Event::Finished {
+                    ceremony_id: first,
+                    outcome: Outcome::Paired(Box::new(peer.clone())),
+                },
+                1
+            ),
+            Some(PublishedEvent::Finished {
+                outcome: Outcome::Rejected,
+                cancelled: true,
+                window_closed: None,
+                ..
+            })
+        ));
+        assert!(pairing.window().is_some());
+        assert!(pairing.answer(&first, true).is_err());
+        assert!(matches!(
+            pairing.on_event(
+                Event::Finished {
+                    ceremony_id: second,
+                    outcome: Outcome::Paired(Box::new(peer)),
+                },
+                2
+            ),
+            Some(PublishedEvent::Finished {
+                outcome: Outcome::Paired(_),
+                cancelled: false,
+                window_closed: Some(_),
+                ..
+            })
+        ));
     }
 
     /// R4: a rejected attempt is one of the window's three; it must not close it.
     #[test]
     fn a_rejected_attempt_leaves_the_window_open() {
         let mut pairing = open_pairing();
-        let (ceremony, _answer) = pairing.begin();
+        let (ceremony, _answer, _cancelled) = pairing.begin();
         pairing.on_event(
             Event::Finished {
                 ceremony_id: ceremony,
@@ -613,7 +731,7 @@ mod tests {
 mod expiry_tests {
     use super::*;
 
-    fn prompt(ceremony_id: CeremonyId) -> Event {
+    pub(super) fn prompt(ceremony_id: CeremonyId) -> Event {
         Event::Prompt(Box::new(Prompt {
             ceremony_id,
             peer_name: "dead".to_owned(),
@@ -630,7 +748,7 @@ mod expiry_tests {
     #[test]
     fn a_prompt_expires_with_its_ceremony_and_is_not_replayed() {
         let mut pairing = Pairing::default();
-        let (id, mut answer) = pairing.begin();
+        let (id, mut answer, _cancelled) = pairing.begin();
         pairing.on_event(prompt(id), 1_000);
         assert!(pairing.pending_prompt(1_001).is_some());
         let deadline = 1_000 + u64::try_from(DECISION_TIMEOUT.as_millis()).expect("fits");
